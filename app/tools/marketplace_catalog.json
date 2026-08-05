@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "surface": "app.plugins.bootstrap.build_full_registry(enable_mcp=False, enable_plugins=False)",
-  "surface_note": "Catalogued from the Python agent tool registry, not from `prism tools`. `prism tools` merges this registry with the Rust command-tools (crates/agent/src/command_tools.rs) and any MCP servers found at runtime; those Rust tools are thin wrappers over `prism <subcommand>` and cannot exist without the PRISM binary, so they are not separately installable and have nothing to publish. Only the Python registry holds tools with their own pip dependencies. The registry is 72 tools by default and 69 with PRISM_DISABLE_MEMORY=1 (the three artifact-store tools register only when the memory subsystem is on); every one of the 72 is judged here.",
-  "verified_on": "2026-07-27",
+  "surface_note": "Catalogued from the Python agent tool registry, not from `prism tools`. `prism tools` merges this registry with the Rust command-tools (crates/agent/src/command_tools.rs) and any MCP servers found at runtime; those Rust tools are thin wrappers over `prism <subcommand>` and cannot exist without the PRISM binary, so they are not separately installable and have nothing to publish. Only the Python registry holds tools with their own pip dependencies. The registry is 92 tools by default and 89 with PRISM_DISABLE_MEMORY=1 (the three artifact-store tools register only when the memory subsystem is on); every one of the 92 is judged here.",
+  "verified_on": "2026-08-05",
   "entries": [
     {
       "slug": "prism",
@@ -358,6 +358,99 @@
           "note": "ASE is NOT installed on the verification host, so no CIF was parsed. What was verified: structure_import returns {error: 'structure_import needs ase (Atomic Simulation Environment)', install_hint: \"pip install 'prism-platform[mace]'\", requires_extra: 'mace'} rather than raising ImportError."
         }
       }
+    },
+    {
+      "slug": "prism-mace",
+      "name": "PRISM MACE Atomistic Compute",
+      "resource_type": "cli_tool",
+      "description": "Atomistic compute on MACE foundation interatomic potentials: build a supercell from composition + phase and relax it to a local minimum (mace_relax_structure), equilibrate it with NVT molecular dynamics (mace_md_equilibrate), screen dynamic stability with finite-displacement harmonic phonons (mace_phonon_harmonic), and compute elastic constants (mace_compute_elastic) and dilute-solute energetics (mace_compute_dilute_solute). Every primitive is approval-gated, returns a JobHandle to poll with the bundled mace job tools, and caches results by canonical (structure, head, calc params) so re-asking is free. Feed it structures from the prism-structure-io entry — a cache_ref threads straight in. Requires the [mace] extra.",
+      "tags": ["mace", "machine-learning-potential", "relaxation", "molecular-dynamics", "phonons", "elasticity", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "Mirdyne (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["mace"],
+      "tools": [
+        {"name": "mace_relax_structure", "requires_extras": ["mace"]},
+        {"name": "mace_md_equilibrate", "requires_extras": ["mace"]},
+        {"name": "mace_phonon_harmonic", "requires_extras": ["mace"]},
+        {"name": "mace_compute_elastic", "requires_extras": ["mace"]},
+        {"name": "mace_compute_dilute_solute", "requires_extras": ["mace"]}
+      ],
+      "modules": ["app.tools.mace"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["mace_relax_structure", "mace_md_equilibrate", "mace_phonon_harmonic", "mace_compute_elastic", "mace_compute_dilute_solute"],
+        "requires_extras": ["mace"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "mace",
+          "command": "pip install mace-torch torch ase numpy huggingface-hub phonopy",
+          "extra_command": "pip install 'prism-platform[mace]'",
+          "note": "prism-platform is NOT on PyPI (verified 2026-07-27, HTTP 404) — `command` is the form that works inside an existing PRISM venv. Foundation weights (MACE-MP-0, MIT) are fetched on first use via huggingface-hub; ASL-licensed weights stay behind the MACE_ACCEPT_ASL_LICENSE gate."
+        },
+        "dependency_licenses": {
+          "mace-torch": "MIT",
+          "torch": "BSD-3-Clause",
+          "ase": "LGPL-2.1-or-later",
+          "numpy": "BSD-3-Clause",
+          "huggingface-hub": "Apache-2.0",
+          "phonopy": "BSD-3-Clause"
+        },
+        "license_notes": [
+          "The [mace] extra installs mace-torch (MIT code). Verification here ran on the MIT-licensed MACE-MP-0 foundation weights from the local HuggingFace cache; ASL-licensed weights (e.g. MACE-MH-1) remain behind the MACE_ACCEPT_ASL_LICENSE gate and were not touched.",
+          "ASE is LGPL-2.1-or-later — weak copyleft. It is imported, not vendored; redistributors bundling ASE must honour the LGPL."
+        ],
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-08-05",
+          "note": "Exercised end-to-end offline on 2026-08-05 (HF_HUB_OFFLINE=1, MACE-MP-0 weights already in the local HuggingFace cache, no network). mace_relax_structure(Fe100, bcc, backend=local) succeeded in ~1.5 s: energy_per_atom -8.3055 eV, fmax 4e-15 eV/A, cache:// structure + provenance refs. mace_md_equilibrate(T_K=300, ps=0.1) consumed that cache_ref and succeeded in 109 s: mean_T_K 214 K with RDF and trajectory refs. mace_get_job polled both jobs through the local SQLite job store to succeeded, and mace_estimate_cost(relax_structure, n_atoms=64) returned a real read-only estimate (240 s, USD 0.12). phonon_harmonic / compute_elastic / compute_dilute_solute were NOT run here; they share the supercell-build, job-store and cache paths the two runs exercised. Probing also surfaced drift between the tools' declared input schemas and their enforced validation (n_atoms declared min 8 / enforced 100, fmax declared max 1.0 / enforced 0.5, max_steps declared min 1 / enforced 10) — reported, not fixed by this catalog."
+        }
+      }
+    },
+    {
+      "slug": "prism-quantum-espresso-io",
+      "name": "PRISM Quantum ESPRESSO I/O",
+      "resource_type": "cli_tool",
+      "description": "The pyiron-free Quantum ESPRESSO path: qe_write_input builds a pw.x .in file (namelists, cutoffs, Monkhorst-Pack k-points, pseudo_dir) from any structure pymatgen can read; qe_resolve_pseudopotentials maps elements to the .upf files present in a directory; qe_parse_output turns a pw.x .out file into converged energy/forces/stress/wall time — and refuses unconverged or truncated output rather than reporting plausible-looking numbers. These tools never execute pw.x: they generate the input a real allocation consumes and read the output it produces. Requires the [qe] extra.",
+      "tags": ["quantum-espresso", "dft", "input-generation", "parsing", "pseudopotentials", "materials", "prism-tool"],
+      "license": "MIT",
+      "author": "Mirdyne (PRISM)",
+      "version": "1.0.0",
+      "requires_extras": ["qe"],
+      "tools": [
+        {"name": "qe_resolve_pseudopotentials", "requires_extras": ["qe"]},
+        {"name": "qe_write_input", "requires_extras": ["qe"]},
+        {"name": "qe_parse_output", "requires_extras": ["qe"]}
+      ],
+      "modules": ["app.tools.simulation.qe"],
+      "metadata": {
+        "provider": "prism",
+        "kind": "agent_tools",
+        "tools": ["qe_resolve_pseudopotentials", "qe_write_input", "qe_parse_output"],
+        "requires_extras": ["qe"],
+        "install": {
+          "method": "python_extra",
+          "package": "prism-platform",
+          "extra": "qe",
+          "command": "pip install ase pymatgen",
+          "extra_command": "pip install 'prism-platform[qe]'",
+          "note": "prism-platform is NOT on PyPI (verified 2026-07-27, HTTP 404) — `command` is the form that works inside an existing PRISM venv. The pw.x binary itself is not part of this entry and is not required by it: the tools generate input for, and parse output of, a pw.x run performed on whatever allocation the user has."
+        },
+        "dependency_licenses": {
+          "ase": "LGPL-2.1-or-later",
+          "pymatgen": "MIT"
+        },
+        "license_notes": [
+          "ASE is LGPL-2.1-or-later — weak copyleft. It is imported, not vendored; redistributors bundling ASE must honour the LGPL."
+        ],
+        "verification": {
+          "level": "end_to_end",
+          "date": "2026-08-05",
+          "note": "All three tools exercised end-to-end offline on 2026-08-05. qe_write_input wrote a real Si scf input (2-atom diamond cell, ecutwfc 60 Ry / ecutrho 480 Ry, 8x8x8 Monkhorst-Pack grid, pseudo_dir wired). qe_resolve_pseudopotentials mapped [Si] to Si.pbesol-n-rrkjus_psl.1.0.0.UPF in a local directory. qe_parse_output parsed the converged pw.x fixture shipped in tests/test_qe_io.py: converged=true, total_energy -308.6031 eV (-22.68191071 Ry via ASE units), wall time 12.0 s; the same suite asserts unconverged and truncated outputs yield explicit failures with no numbers. No pw.x binary exists on this machine and none was needed — the tools generate and parse, they do not execute."
+        }
+      }
     }
   ],
   "bundled": {
@@ -409,6 +502,18 @@
     "screen_materials": "Materials-informatics helper added after the published catalog verification; bundled pending an end-to-end marketplace review.",
     "structure_similarity": "Structure-similarity helper added after the published catalog verification; bundled pending an end-to-end marketplace review.",
     "suggest_next_experiments": "Active-learning helper added after the published catalog verification; bundled pending an end-to-end marketplace review.",
+    "mace_estimate_cost": "Budgeting guard for the mace primitives: read-only wall-time/GPU-seconds/USD estimate before submitting; only makes sense alongside the primitives it budgets.",
+    "mace_get_job": "Job-management surface for the mace primitives: polls the local SQLite job store for a JobHandle's status/result; not independently useful.",
+    "mace_list_jobs": "Job-management surface for the mace primitives: inventories the local MACE job store by status/tool; only meaningful alongside the primitives that fill it.",
+    "mace_cancel_job": "Job-management surface for the mace primitives: cancels a queued/running MACE job; not independently useful.",
+    "mace_get_cached_structure": "Result plumbing for the mace primitives: resolves the cache:// refs they emit into inline CIF plus provenance path; only makes sense alongside those primitives.",
+    "evaluate_candidate": "Tiered evaluation ladder: tier 0 is the bundled HEA empirical screen and tiers 1-3 delegate to the mace/calphad/qe capabilities already accounted for elsewhere in this catalog; installs nothing of its own — tiers whose extras are absent report unavailable with install hints rather than fabricating numbers.",
+    "evaluation_tier_status": "Status surface: reports which evaluation tiers this machine can run, with install hints for the missing ones; infrastructure, nothing to install.",
+    "cold_start_foundation_bootstrap": "Addendum E cold-start campaign workflow (Phase 0): fine-tunes a MACE-MP-0 target head from local .npz artifacts; campaign orchestration in the same family as materials_discovery, bundled pending an end-to-end marketplace review.",
+    "cold_start_calphad_augmentation": "Addendum E cold-start campaign workflow (Phase 1): augments sparse targets with CALPHAD equilibrium data via the calphad extra; campaign orchestration, bundled pending an end-to-end marketplace review.",
+    "cold_start_active_learning": "Addendum E cold-start campaign workflow (Phase 2): uncertainty-weighted acquisition loop over the augmented data; campaign orchestration, bundled pending an end-to-end marketplace review.",
+    "cold_start_campaign_handoff": "Addendum E cold-start campaign workflow (Phase 3): hands the cold-started campaign off to normal operation; campaign orchestration, bundled pending an end-to-end marketplace review.",
+    "polymer_insulation_properties": "Polymer electrical-insulation evaluator (citation-mandated Fox-Flory Tg; dielectric and thermal properties honestly unavailable) is bundled pending end-to-end marketplace verification of the new polymer extra.",
     "symbolic_check": "Agent verification primitive; stays bundled with the agent rather than being published as a standalone materials tool."
   }
 }
