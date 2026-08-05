@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn unfixable_rows_carry_the_command() {
+    fn unfixable_rows_name_the_condition_without_sending_the_user_away() {
         let platform = vec![
             row("Platform", "api.marc27.com unreachable", false),
             row("Policy Engine", "OPA/Rego loaded", true),
@@ -634,7 +634,11 @@ mod tests {
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["PRISM credentials", "Platform"]);
         assert!(rows.iter().all(|r| !r.ok));
-        assert!(rows[0].result.contains("prism login"));
+        // The row must state what is wrong, not instruct the reader to quit and
+        // run something — the remedy belongs in the surface they are already in.
+        // Guarded repo-wide by crates/server/tests/no_exit_to_cli.rs.
+        assert!(rows[0].result.contains("not authenticated"));
+        assert!(!rows[0].result.contains("prism login"));
         assert!(rows[1].result.contains("unreachable"));
     }
 
