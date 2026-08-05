@@ -204,7 +204,7 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
 
 /// Command we print when the venv cannot be rebuilt here.
 const VENV_MANUAL: &str = "install Python 3.11+ (macOS: `brew install python@3.12`, \
-     Debian/Ubuntu: `sudo apt-get install -y python3-venv`) then re-run `prism doctor --fix`";
+     Debian/Ubuntu: `sudo apt-get install -y python3-venv`), then repair again";
 
 /// Turn a repair attempt into a row whose verdict comes from **re-running the
 /// check**, never from what the repair claims about itself.
@@ -441,7 +441,7 @@ fn check_venv_tools(venv_python: &Path) -> BootCheck {
         // broken loops on the same error. `--fix` removes it and rebuilds,
         // which is the step that works in both cases.
         format!(
-            "missing {}: {} — run: prism doctor --fix",
+            "missing {}: {} — repairable",
             if missing.len() == 1 {
                 "1 declared dependency".to_string()
             } else {
@@ -498,7 +498,7 @@ mod tests {
             "thing",
             Ok("rebuilt it".to_string()),
             || false,
-            "run: prism fixit",
+            "repairable",
         );
         assert!(
             !row.ok,
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn optional_and_downstream_failures_are_not_dressed_up_as_repairs() {
         let platform = vec![
-            row("Local Node", "offline — run prism node up", false),
+            row("Local Node", "offline — node not started", false),
             row("Knowledge Graph", "unavailable", false),
             row("Marketplace", "unavailable", false),
             row("Compute", "unavailable", false),

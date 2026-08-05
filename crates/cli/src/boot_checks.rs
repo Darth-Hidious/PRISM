@@ -39,7 +39,7 @@ async fn rejection_line(resp: reqwest::Response) -> String {
         .clone()
         .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
     let action = match error.action() {
-        Some(action) if action.contains("prism login") => "run prism login",
+        Some(action) if action.contains("prism login") => "not authenticated",
         Some(_) => "credential not permitted here",
         None => "see prism doctor",
     };
@@ -327,7 +327,7 @@ async fn push_local_checks(client: &reqwest::Client, checks: &mut Vec<boot::Boot
         result: if node_ok {
             "online at :7327".into()
         } else {
-            "offline — run prism node up".into()
+            "offline — node not started".into()
         },
         ok: node_ok,
         dots: 4,

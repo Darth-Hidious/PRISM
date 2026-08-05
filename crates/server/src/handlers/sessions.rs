@@ -85,8 +85,8 @@ pub async fn create_session(
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
                     error: "Remote session creation requires a `platform_token` \
-                            (obtain one with `prism login` — the platform device \
-                            flow); a bare user_id never establishes identity."
+                            issued by the platform device flow; a bare user_id \
+                            never establishes identity."
                         .into(),
                 }),
             ));
@@ -105,7 +105,7 @@ pub async fn create_session(
                     Json(ErrorResponse {
                         error: "This node is not linked to a hosted platform, so it \
                                 cannot verify remote identities. Remote sessions are \
-                                unavailable until the node owner runs `prism login`."
+                                unavailable until the node owner authenticates."
                             .into(),
                     }),
                 ));

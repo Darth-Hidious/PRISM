@@ -115,7 +115,7 @@ pub async fn run_if_first_launch(
     match choose_route(&local_servers)? {
         Route::Platform => {
             println!("\n  Hosted login is disabled by default. Set PRISM_ALLOW_INTERACTIVE_AUTH=1");
-            println!("  and run `prism login --interactive-auth` from a TTY, or provide a PAT.\n");
+            println!("  interactive authentication needs a TTY; a PAT also works.\n");
             perform_full_login(
                 paths,
                 endpoints,

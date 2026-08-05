@@ -2220,7 +2220,7 @@ async fn main() -> Result<()> {
             PyironCommands::Status => match pyiron_cmd::status()? {
                 Some(v) => println!("PyIron {v} (venv: ~/.prism/venv)"),
                 None => println!(
-                    "PyIron is not installed. Run `prism pyiron install` — \
+                    "PyIron is not installed; the pyiron extra provides it — \
                      simulation tools will also auto-install it on first use."
                 ),
             },
@@ -2947,7 +2947,7 @@ async fn main() -> Result<()> {
                                 // refreshed), never the stale startup
                                 // binding.
                                 let effective_creds = effective_creds.as_ref().ok_or_else(|| {
-                                        anyhow!("token expired without stored session; run `prism login --token <PAT>` or set MARC27_API_KEY")
+                                        anyhow!("token expired without a stored session; re-authentication or MARC27_API_KEY is required")
                                     })?;
                                 let refreshed = refresh_access_token(
                                     &paths,
@@ -5102,7 +5102,7 @@ async fn handle_federation_command(
                 println!("  (no peers — platform enumeration coming in F1 chunk 3)");
                 println!();
                 println!("  Trust is transitive via the platform root CA.");
-                println!("  Run `prism federation whoami` to see your own identity.");
+                println!("  Your own identity is shown by federation whoami.");
                 println!("  See docs/prism_fabric_v1_spec.md for the full design.");
                 println!();
             }
@@ -5412,7 +5412,7 @@ fn handle_configure(
         eprintln!(
             "No changes specified. Use --url, --model, --embedding-model, or --llm-provider."
         );
-        eprintln!("Run `prism configure --show` to see current config.");
+        eprintln!("Current config is shown by configure --show.");
         return Ok(());
     }
 
@@ -7082,7 +7082,7 @@ fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
         .as_ref()
         .and_then(|creds| creds.project_id.clone())
         .ok_or_else(|| {
-            anyhow!("No active project selected. Run `prism login` or set MARC27_PROJECT_ID.")
+            anyhow!("No active project selected; authenticate or set MARC27_PROJECT_ID.")
         })
 }
 
@@ -9311,9 +9311,9 @@ async fn create_dashboard_session(
     let creds = state
         .credentials
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `prism login` first."))?;
+        .ok_or_else(|| anyhow::anyhow!("Not authenticated."))?;
     let user_id = creds.user_id.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("Stored credentials are missing user_id. Run `prism login` again.")
+        anyhow::anyhow!("Stored credentials are missing user_id; re-authentication required.")
     })?;
 
     // The local CLI is the node operator on this machine, so the FIRST
@@ -10534,7 +10534,7 @@ async fn select_project(
         })?
     } else {
         bail!(
-            "multiple organizations require a selection; set MARC27_PROJECT_ID=<project_id> and rerun `prism login --token <PAT>`"
+            "multiple organizations require a selection; set MARC27_PROJECT_ID=<project_id>, then re-authenticate"
         );
     };
 
@@ -10572,7 +10572,7 @@ async fn select_project(
         })?
     } else {
         bail!(
-            "multiple projects require a selection; set MARC27_PROJECT_ID=<project_id> and rerun `prism login --token <PAT>`"
+            "multiple projects require a selection; set MARC27_PROJECT_ID=<project_id>, then re-authenticate"
         );
     };
 
