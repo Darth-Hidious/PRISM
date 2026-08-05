@@ -18,9 +18,10 @@ pub mod middleware;
 pub mod router;
 pub mod ws;
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
@@ -61,6 +62,25 @@ pub struct ServiceSnapshot {
     pub healthy: bool,
 }
 
+const OFFLINE_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
+const OFFLINE_SESSION_STORE_FILE: &str = "offline_sessions.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OfflineSessionRecord {
+    expires_at_unix: i64,
+}
+
+#[derive(Default)]
+struct OfflineSessionStore {
+    records: BTreeMap<String, OfflineSessionRecord>,
+    loaded_path: Option<PathBuf>,
+}
+
+pub(crate) struct OfflineSessionCapability {
+    pub token: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Shared state for the PRISM node HTTP server.
 pub struct NodeState {
     pub node_name: String,
@@ -72,10 +92,11 @@ pub struct NodeState {
     pub rbac_db_path: Option<PathBuf>,
     /// Path to the session SQLite database.
     pub session_db_path: Option<PathBuf>,
-    /// Server-issued bearer capabilities for standalone mode. They live only
-    /// for this process: stable enough for chat resume, unguessable by another
-    /// local process, and intentionally invalid after a server restart.
-    offline_session_tokens: RwLock<HashSet<String>>,
+    /// Server-issued bearer capabilities for standalone mode. Active tokens
+    /// are persisted beside the server's other state so a solo session can
+    /// resume after restart; each record carries its real expiry and logout
+    /// removes it durably.
+    offline_session_tokens: RwLock<OfflineSessionStore>,
     /// In-memory tool registry (populated by scanning tool directories).
     pub tool_registry: RwLock<prism_core::registry::ToolRegistry>,
     /// Mesh handle for peer discovery.
@@ -129,7 +150,7 @@ impl NodeState {
             audit_db_path: None,
             rbac_db_path: None,
             session_db_path: None,
-            offline_session_tokens: RwLock::new(HashSet::new()),
+            offline_session_tokens: RwLock::new(OfflineSessionStore::default()),
             tool_registry: RwLock::new(prism_core::registry::ToolRegistry::new()),
             mesh: RwLock::new(prism_mesh::MeshHandle::Offline),
             subscriptions: Arc::new(RwLock::new(
@@ -148,20 +169,124 @@ impl NodeState {
         }
     }
 
-    pub(crate) fn mint_offline_session_token(&self) -> String {
+    fn offline_session_store_path(&self) -> Option<PathBuf> {
+        self.audit_db_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join(OFFLINE_SESSION_STORE_FILE))
+    }
+
+    fn hydrate_offline_sessions(&self, store: &mut OfflineSessionStore) -> std::io::Result<()> {
+        let Some(path) = self.offline_session_store_path() else {
+            return Ok(());
+        };
+        if store.loaded_path.as_ref() == Some(&path) {
+            return Ok(());
+        }
+
+        let records = match std::fs::read(&path) {
+            Ok(data) => serde_json::from_slice::<BTreeMap<String, OfflineSessionRecord>>(&data)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error),
+        };
+        store.records.extend(records);
+        store.loaded_path = Some(path);
+        Ok(())
+    }
+
+    fn persist_offline_sessions(&self, store: &OfflineSessionStore) -> std::io::Result<()> {
+        let Some(path) = self.offline_session_store_path() else {
+            return Ok(());
+        };
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(
+            ".{OFFLINE_SESSION_STORE_FILE}.{}.tmp",
+            Uuid::new_v4()
+        ));
+        let data = serde_json::to_vec_pretty(&store.records)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        if let Err(error) = (|| {
+            file.write_all(&data)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &path)
+        })() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mint_offline_session(&self) -> std::io::Result<OfflineSessionCapability> {
         let token = Uuid::new_v4().to_string();
-        self.offline_session_tokens
+        let expires_at_unix = chrono::Utc::now().timestamp() + OFFLINE_SESSION_TTL_SECS;
+        let expires_at = chrono::DateTime::from_timestamp(expires_at_unix, 0)
+            .expect("24-hour session expiry is in range");
+        let mut store = self
+            .offline_session_tokens
             .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(token.clone());
-        token
+            .unwrap_or_else(|error| error.into_inner());
+        self.hydrate_offline_sessions(&mut store)?;
+        let now = chrono::Utc::now().timestamp();
+        store
+            .records
+            .retain(|_, record| record.expires_at_unix > now);
+        store
+            .records
+            .insert(token.clone(), OfflineSessionRecord { expires_at_unix });
+        if let Err(error) = self.persist_offline_sessions(&store) {
+            store.records.remove(&token);
+            return Err(error);
+        }
+        Ok(OfflineSessionCapability { token, expires_at })
     }
 
     pub(crate) fn is_valid_offline_session_token(&self, token: &str) -> bool {
-        self.offline_session_tokens
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(token)
+        let mut store = self
+            .offline_session_tokens
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Err(error) = self.hydrate_offline_sessions(&mut store) {
+            tracing::error!(error = %error, "failed to load standalone session capabilities");
+            return false;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let before = store.records.len();
+        store
+            .records
+            .retain(|_, record| record.expires_at_unix > now);
+        if store.records.len() != before
+            && let Err(error) = self.persist_offline_sessions(&store)
+        {
+            tracing::warn!(error = %error, "failed to prune expired standalone sessions");
+        }
+        store.records.contains_key(token)
+    }
+
+    pub(crate) fn revoke_offline_session_token(&self, token: &str) -> std::io::Result<bool> {
+        let mut store = self
+            .offline_session_tokens
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        self.hydrate_offline_sessions(&mut store)?;
+        let Some(record) = store.records.remove(token) else {
+            return Ok(false);
+        };
+        if let Err(error) = self.persist_offline_sessions(&store) {
+            store.records.insert(token.to_string(), record);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     /// Broadcast a [`WsEvent`] to all connected WebSocket clients.
@@ -252,6 +377,46 @@ pub async fn start_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_session_capability_survives_server_restart() {
+        let state_dir = tempfile::tempdir().expect("state directory");
+        let mut first_server = NodeState::new("offline-node".into());
+        first_server.audit_db_path = Some(state_dir.path().join("audit.db"));
+        let capability = first_server
+            .mint_offline_session()
+            .expect("mint standalone session");
+        assert!(first_server.is_valid_offline_session_token(&capability.token));
+        drop(first_server);
+
+        let mut restarted_server = NodeState::new("offline-node".into());
+        restarted_server.audit_db_path = Some(state_dir.path().join("audit.db"));
+        assert!(
+            restarted_server.is_valid_offline_session_token(&capability.token),
+            "a standalone bearer must remain valid across a server restart"
+        );
+    }
+
+    #[test]
+    fn offline_session_capability_expires() {
+        let state = NodeState::new("offline-node".into());
+        state
+            .offline_session_tokens
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .records
+            .insert(
+                "expired-token".into(),
+                OfflineSessionRecord {
+                    expires_at_unix: chrono::Utc::now().timestamp() - 1,
+                },
+            );
+
+        assert!(
+            !state.is_valid_offline_session_token("expired-token"),
+            "expired standalone bearers must be rejected"
+        );
+    }
 
     #[test]
     fn node_state_update_services() {

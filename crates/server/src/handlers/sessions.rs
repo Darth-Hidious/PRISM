@@ -142,14 +142,22 @@ pub async fn create_session(
     }
 
     let Some(ref db_path) = state.session_db_path else {
-        // Offline auth is a process-lifetime capability gate, not an identity
-        // system. The server remembers this unguessable bearer so repeated
-        // requests can resume their own chat while caller-chosen strings fail.
-        let session_id = state.mint_offline_session_token();
+        // Offline auth is a durable local capability gate, not an identity
+        // system. The unguessable bearer survives restart until its persisted
+        // expiry and scopes repeated chat requests to the same solo caller.
+        let capability = state.mint_offline_session().map_err(|error| {
+            tracing::error!(error = %error, "failed to persist standalone session");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to create standalone session.".into(),
+                }),
+            )
+        })?;
         return Ok(Json(SessionResponse {
-            session_id,
+            session_id: capability.token,
             user_id: ANONYMOUS_LOCAL_USER_ID.to_string(),
-            expires_at: (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+            expires_at: capability.expires_at.to_rfc3339(),
         }));
     };
 
@@ -230,12 +238,18 @@ pub async fn destroy_session(
     };
 
     let Some(ref db_path) = state.session_db_path else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "Session management not configured.".into(),
-            }),
-        ));
+        state
+            .revoke_offline_session_token(&session_id)
+            .map_err(|error| {
+                tracing::error!(error = %error, "failed to revoke standalone session");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Failed to revoke standalone session.".into(),
+                    }),
+                )
+            })?;
+        return Ok(Json(serde_json::json!({ "status": "ok" })));
     };
 
     let mgr = prism_core::session::SessionManager::new(db_path, chrono::Duration::hours(24))
@@ -264,7 +278,7 @@ pub async fn destroy_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateSessionRequest, SessionGate, create_session, session_gate};
+    use super::{CreateSessionRequest, SessionGate, create_session, destroy_session, session_gate};
     use crate::NodeState;
     use crate::middleware::ANONYMOUS_LOCAL_USER_ID;
     use axum::Json;
@@ -335,6 +349,32 @@ mod tests {
         assert!(!state.is_valid_offline_session_token("caller-chosen-token"));
         assert_eq!(first.user_id, ANONYMOUS_LOCAL_USER_ID);
         assert_eq!(second.user_id, ANONYMOUS_LOCAL_USER_ID);
+    }
+
+    #[tokio::test]
+    async fn offline_logout_revokes_session_capability() {
+        use axum::extract::State;
+
+        let state = std::sync::Arc::new(NodeState::new("offline-node".into()));
+        let capability = state
+            .mint_offline_session()
+            .expect("mint standalone session");
+        assert!(state.is_valid_offline_session_token(&capability.token));
+
+        if let Err((status, Json(error))) = destroy_session(
+            State(state.clone()),
+            Some(axum::Extension(crate::middleware::SessionToken(
+                capability.token.clone(),
+            ))),
+        )
+        .await
+        {
+            panic!("standalone logout failed ({status}): {}", error.error);
+        }
+        assert!(
+            !state.is_valid_offline_session_token(&capability.token),
+            "logout must revoke the standalone bearer"
+        );
     }
 
     #[tokio::test]

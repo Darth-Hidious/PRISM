@@ -266,7 +266,10 @@ for line in sys.stdin:
             node.platform_client = Some(prism_client::PlatformClient::new("http://127.0.0.1:1"));
         }
         assert!(node.chat.set(Arc::new(service)).is_ok());
-        let token = node.mint_offline_session_token();
+        let token = node
+            .mint_offline_session()
+            .expect("mint offline session")
+            .token;
         Some((crate::router::build_router(Arc::new(node)), token))
     }
 

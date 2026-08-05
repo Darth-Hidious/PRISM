@@ -79,8 +79,8 @@ fn chat_service(state: &NodeState) -> Option<Arc<ChatService>> {
 fn chat_owner(user: &AuthenticatedUser, token: &SessionToken) -> String {
     if user.is_anonymous_local() {
         // auth_layer has validated either a durable session row or an
-        // unguessable process-lifetime standalone capability. Hash it into a
-        // stable owner key without persisting the bearer itself.
+        // unguessable, unexpired standalone capability. Hash it into a stable
+        // owner key without copying the bearer into chat ownership metadata.
         anonymous_caller_id(&token.0)
     } else {
         user.user_id.clone()
@@ -208,12 +208,89 @@ pub async fn get_session(
 mod tests {
     use super::{anonymous_caller_id, chat_owner};
     use crate::middleware::{AuthenticatedUser, SessionToken};
+    use prism_agent::service::{ChatRequest, ChatService};
+    use std::path::{Path, PathBuf};
+
+    const STUB_TOOL_SERVER: &str = r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("method") == "list_tools":
+        response = {"tools": []}
+    else:
+        response = {"error": "unexpected tool call"}
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+    fn find_python() -> Option<PathBuf> {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|_| PathBuf::from("python3"))
+    }
+
+    fn write_stub_tool_server(project: &Path) {
+        let app = project.join("app");
+        std::fs::create_dir_all(&app).expect("create stub app");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        std::fs::write(app.join("tool_server.py"), STUB_TOOL_SERVER)
+            .expect("write stub tool server");
+    }
+
+    async fn start_stub_llm() -> String {
+        let response = serde_json::json!({
+            "choices": [{ "delta": { "content": "SOLO_OK" } }]
+        });
+        let body = format!("data: {response}\n\ndata: [DONE]\n\n");
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(body))
+                        .expect("stub response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub LLM");
+        let address = listener.local_addr().expect("stub LLM address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}/v1")
+    }
+
+    fn llm_config(base_url: &str) -> prism_ingest::LlmConfig {
+        prism_ingest::LlmConfig {
+            base_url: base_url.to_string(),
+            model: "stub-model".into(),
+            timeout_secs: 30,
+            ..Default::default()
+        }
+    }
+
+    fn tool_server(project: &Path, python: &Path) -> prism_python_bridge::ToolServer {
+        prism_python_bridge::ToolServer {
+            python_bin: python.to_path_buf(),
+            project_root: project.to_path_buf(),
+            env: Default::default(),
+        }
+    }
 
     #[test]
     fn offline_chat_owner_is_stable_for_own_capability_and_scoped_from_anothers() {
         let state = crate::NodeState::new("offline-test".into());
-        let token_a = state.mint_offline_session_token();
-        let token_b = state.mint_offline_session_token();
+        let token_a = state.mint_offline_session().expect("mint token a").token;
+        let token_b = state.mint_offline_session().expect("mint token b").token;
         let user = AuthenticatedUser::anonymous_local();
         let owner_a = chat_owner(&user, &SessionToken(token_a.clone()));
         let owner_a_again = chat_owner(&user, &SessionToken(token_a.clone()));
@@ -227,5 +304,78 @@ mod tests {
         assert!(!owner_b.contains(&token_b));
         assert_eq!(owner_a, anonymous_caller_id(&token_a));
         assert_eq!(owner_b, anonymous_caller_id(&token_b));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn offline_solo_user_resumes_own_session_across_server_restart() {
+        let Some(python) = find_python() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let project = tempfile::tempdir().expect("stub project");
+        let state_dir = tempfile::tempdir().expect("server state");
+        let sessions_dir = state_dir.path().join("chat-sessions");
+        write_stub_tool_server(project.path());
+        let base_url = start_stub_llm().await;
+
+        let mut first_node = crate::NodeState::new("offline-node".into());
+        first_node.audit_db_path = Some(state_dir.path().join("audit.db"));
+        let capability = first_node
+            .mint_offline_session()
+            .expect("mint standalone session");
+        let owner = anonymous_caller_id(&capability.token);
+        let first_service = ChatService::spawn(
+            llm_config(&base_url),
+            tool_server(project.path(), &python),
+            Some(sessions_dir.clone()),
+        )
+        .await
+        .expect("start first chat service");
+        let (first_tx, _first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_turn = first_service
+            .chat(
+                ChatRequest {
+                    message: "start my solo session".into(),
+                    session_id: None,
+                    approve: Vec::new(),
+                },
+                &owner,
+                first_tx,
+            )
+            .await
+            .expect("first solo turn");
+        drop(first_service);
+        drop(first_node);
+
+        let mut restarted_node = crate::NodeState::new("offline-node".into());
+        restarted_node.audit_db_path = Some(state_dir.path().join("audit.db"));
+        assert!(
+            restarted_node.is_valid_offline_session_token(&capability.token),
+            "the original bearer must authenticate after restart"
+        );
+        let restarted_owner = anonymous_caller_id(&capability.token);
+        assert_eq!(restarted_owner, owner);
+        let restarted_service = ChatService::spawn(
+            llm_config(&base_url),
+            tool_server(project.path(), &python),
+            Some(sessions_dir),
+        )
+        .await
+        .expect("restart chat service");
+        let (resume_tx, _resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let resumed = restarted_service
+            .chat(
+                ChatRequest {
+                    message: "resume after restart".into(),
+                    session_id: Some(first_turn.session_id.clone()),
+                    approve: Vec::new(),
+                },
+                &restarted_owner,
+                resume_tx,
+            )
+            .await
+            .expect("resume solo session after restart");
+        assert_eq!(resumed.session_id, first_turn.session_id);
+        assert_eq!(resumed.answer, "SOLO_OK");
     }
 }

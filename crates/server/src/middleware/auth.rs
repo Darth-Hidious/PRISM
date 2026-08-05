@@ -103,7 +103,7 @@ struct ErrorBody {
 ///
 /// When `session_db_path` is configured, validates the token against the
 /// [`SessionManager`]. When not configured (standalone/local mode), accepts
-/// only a capability minted by this server process and records the caller as
+/// only an unexpired server-minted capability and records the caller as
 /// [`ANONYMOUS_LOCAL_USER_ID`]. The token scopes local resources but is never
 /// upgraded into an account identity.
 pub async fn auth_layer(
@@ -158,10 +158,10 @@ pub async fn auth_layer(
         }
     }
 
-    // Standalone/local mode: validate the unguessable, process-lifetime
-    // capability minted by POST /api/sessions. This keeps one local process
-    // from choosing another process's chat owner key while preserving resume
-    // for repeated requests carrying the same server-issued token.
+    // Standalone/local mode: validate the unguessable, persisted capability
+    // minted by POST /api/sessions. This keeps one local process from choosing
+    // another process's chat owner key while preserving resume across restart
+    // for requests carrying the same unexpired server-issued token.
     if !state.is_valid_offline_session_token(&t) {
         let body = ErrorBody {
             error: "unauthorized",
@@ -169,7 +169,7 @@ pub async fn auth_layer(
         };
         return (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
     }
-    tracing::debug!("validated standalone process capability");
+    tracing::debug!("validated standalone session capability");
     let user = AuthenticatedUser::anonymous_local();
     req.extensions_mut().insert(SessionToken(t));
     req.extensions_mut().insert(user);
@@ -265,9 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn standalone_accepts_only_server_issued_process_capabilities() {
+    fn standalone_accepts_only_server_issued_capabilities() {
         let state = crate::NodeState::new("offline-test".into());
-        let issued = state.mint_offline_session_token();
+        let issued = state
+            .mint_offline_session()
+            .expect("mint standalone session")
+            .token;
         assert!(state.is_valid_offline_session_token(&issued));
         assert!(!state.is_valid_offline_session_token("caller-chosen"));
 

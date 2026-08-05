@@ -97,8 +97,10 @@ pub async fn ws_upgrade(
                     .into_response();
             }
         }
-    } else {
+    } else if state.is_valid_offline_session_token(&t) {
         ANONYMOUS_LOCAL_USER_ID.to_string()
+    } else {
+        return (StatusCode::UNAUTHORIZED, "Session expired or invalid.").into_response();
     };
 
     // Enforce the connection concurrency limit ATOMICALLY: reserve the slot
