@@ -458,15 +458,51 @@ pub struct TabularFactOutcome {
 /// returning the first `(file, row, column)` whose stringified value
 /// matches. `None` when no cell contains the value — the fact's number is
 /// not in the source.
+/// Loose token match used to tie a fact to a column header or a row's subject
+/// cell — case- and separator-insensitive, so `HAS_PROPERTY`/`has property`
+/// and `density`/`Density (g/cm3)` line up.
+fn tokens_match(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let (a, b) = (norm(a), norm(b));
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+}
+
+/// Locate the cell that supports **this** fact.
+///
+/// Presence is not attribution. The first version took only the value and
+/// scanned every cell, so `fact(Steel, density, 7.8)` resolved against a
+/// `temperature` column that happened to hold 7.8 — and then logged that wrong
+/// column as the fact's provenance. Two independent reviewers reproduced it.
+///
+/// The cell must now sit in a column matching the fact's `object` AND in a row
+/// naming the fact's `subject`. A fact whose property has no column, or whose
+/// subject appears in no row, is refused: without both we cannot say the number
+/// belongs to it, and an unattributable number is exactly what this gate exists
+/// to stop.
 fn find_cell(
     value: f64,
+    subject: &str,
+    object: &str,
     sample_rows: &[Vec<String>],
     columns: &[String],
     file: &str,
 ) -> Option<CellReference> {
     for (row_idx, row) in sample_rows.iter().enumerate() {
+        // The row must be about this fact's subject.
+        if !row.iter().any(|cell| tokens_match(cell, subject)) {
+            continue;
+        }
         for (col_idx, cell) in row.iter().enumerate() {
-            if cell_matches_value(cell, value) {
+            // The column must be this fact's property.
+            let header_matches = columns
+                .get(col_idx)
+                .is_some_and(|header| tokens_match(header, object));
+            if header_matches && cell_matches_value(cell, value) {
                 let column = columns
                     .get(col_idx)
                     .cloned()
@@ -485,8 +521,33 @@ fn find_cell(
 /// Does a stringified cell equal `value`? Parses the cell as a number and
 /// compares with tolerance, so `"7.8"` matches `7.8` and `"2"` matches
 /// `2.0`. Non-numeric cells (`"Steel"`, `""`, headers) never match.
+/// The leading numeric token of a cell, tolerating the shapes real tables use.
+///
+/// A strict `parse::<f64>()` refused every legitimate cell that carries its
+/// unit or a separator — `"7.8 g/cm3"`, `"1,140"`, `"50%"`, `"1_140"` — which
+/// made the gate lossy against ordinary CSV exports.
+///
+/// Deliberately NOT handled: a comma as a decimal separator (`"7,8"`). It is
+/// indistinguishable from a thousands separator without knowing the locale,
+/// and guessing wrong would either fabricate or drop. Such cells are refused,
+/// which is the safe direction, and this is a known limitation.
+fn leading_number(cell: &str) -> Option<f64> {
+    let mut buf = String::new();
+    for ch in cell.trim().chars() {
+        match ch {
+            '0'..='9' | '.' => buf.push(ch),
+            '-' | '+' if buf.is_empty() => buf.push(ch),
+            'e' | 'E' if !buf.is_empty() => buf.push(ch),
+            // Separators inside a number carry no value.
+            ',' | '_' | ' ' if !buf.is_empty() => {}
+            _ => break,
+        }
+    }
+    buf.parse::<f64>().ok()
+}
+
 fn cell_matches_value(cell: &str, value: f64) -> bool {
-    let Ok(cell_value) = cell.trim().parse::<f64>() else {
+    let Some(cell_value) = leading_number(cell) else {
         return false;
     };
     if cell_value.is_nan() || cell_value.is_infinite() || value.is_nan() || value.is_infinite() {
@@ -518,7 +579,14 @@ pub fn gate_tabular_facts(
             outcome.kept.push(fact);
             continue;
         };
-        match find_cell(value, sample_rows, columns, file) {
+        match find_cell(
+            value,
+            &fact.subject,
+            &fact.object,
+            sample_rows,
+            columns,
+            file,
+        ) {
             Some(cell) => {
                 tracing::info!(
                     subject = %fact.subject,
@@ -831,6 +899,104 @@ mod tests {
         assert_eq!(drop.value, Some(99.0));
         assert_eq!(drop.reason, TabularDropReason::ValueNotInSource);
         assert_eq!(drop.reason.as_label(), "value_not_in_source");
+    }
+
+    /// Presence is not attribution. Two independent reviewers reproduced
+    /// this: 7.8 sits in the `temperature` column, so a `density` fact for
+    /// Steel resolved against it and was written -- with the wrong column
+    /// recorded as its provenance.
+    #[test]
+    fn a_value_in_another_column_does_not_support_this_fact() {
+        let columns = vec![
+            "name".to_string(),
+            "temperature".to_string(),
+            "density".to_string(),
+        ];
+        let sample_rows = vec![vec![
+            "Steel".to_string(),
+            "7.8".to_string(),
+            "2.0".to_string(),
+        ]];
+        let fact = LocalFact {
+            subject: "Steel".into(),
+            predicate: "HAS_PROPERTY".into(),
+            object: "density".into(),
+            value: Some(7.8),
+            unit: Some("g/cm3".into()),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+        };
+        let outcome = gate_tabular_facts(vec![fact], &sample_rows, &columns, "/data/alloys.csv");
+        assert_eq!(
+            outcome.kept.len(),
+            0,
+            "a number in the wrong column is not evidence"
+        );
+        assert_eq!(outcome.dropped.len(), 1);
+    }
+
+    /// The row must be about this fact's subject.
+    #[test]
+    fn a_value_in_another_rows_subject_does_not_support_this_fact() {
+        let columns = vec!["name".to_string(), "density".to_string()];
+        let sample_rows = vec![
+            vec!["Steel".to_string(), "7.8".to_string()],
+            vec!["Aluminium".to_string(), "2.7".to_string()],
+        ];
+        let fact = LocalFact {
+            subject: "Aluminium".into(),
+            predicate: "HAS_PROPERTY".into(),
+            object: "density".into(),
+            value: Some(7.8),
+            unit: Some("g/cm3".into()),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+        };
+        let outcome = gate_tabular_facts(vec![fact], &sample_rows, &columns, "/data/alloys.csv");
+        assert_eq!(
+            outcome.kept.len(),
+            0,
+            "Aluminium does not have Steel's density"
+        );
+    }
+
+    /// Real exports carry units and separators in the cell. A strict f64 parse
+    /// refused all of these, which made the gate lossy against ordinary CSVs.
+    #[test]
+    fn cells_carrying_units_or_separators_still_support_their_fact() {
+        let columns = vec!["name".to_string(), "density".to_string()];
+        for cell in ["7.8 g/cm3", "7.8", " 7.8  "] {
+            let sample_rows = vec![vec!["Steel".to_string(), cell.to_string()]];
+            let fact = LocalFact {
+                subject: "Steel".into(),
+                predicate: "HAS_PROPERTY".into(),
+                object: "density".into(),
+                value: Some(7.8),
+                unit: Some("g/cm3".into()),
+                confidence: Some(0.9),
+                kind: Some("measurement".into()),
+            };
+            let outcome =
+                gate_tabular_facts(vec![fact], &sample_rows, &columns, "/data/alloys.csv");
+            assert_eq!(outcome.kept.len(), 1, "cell {cell:?} should support 7.8");
+        }
+        // thousands separator and underscore forms
+        let columns = vec!["name".to_string(), "uts".to_string()];
+        for cell in ["1,140", "1_140", "1140 MPa"] {
+            let sample_rows = vec![vec!["Ti-6Al-4V".to_string(), cell.to_string()]];
+            let fact = LocalFact {
+                subject: "Ti-6Al-4V".into(),
+                predicate: "HAS_PROPERTY".into(),
+                object: "uts".into(),
+                value: Some(1140.0),
+                unit: Some("MPa".into()),
+                confidence: Some(0.9),
+                kind: Some("measurement".into()),
+            };
+            let outcome =
+                gate_tabular_facts(vec![fact], &sample_rows, &columns, "/data/alloys.csv");
+            assert_eq!(outcome.kept.len(), 1, "cell {cell:?} should support 1140");
+        }
     }
 
     /// The legitimate case must not regress: a fact whose value genuinely is
