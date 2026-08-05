@@ -11130,6 +11130,7 @@ async fn handle_run(
         name: name.to_string(),
         image: image.to_string(),
         inputs: inputs_json.clone(),
+        licence: None,
     };
 
     let (router, resolved_backend, target) = if let Some(ssh_target) = ssh {
