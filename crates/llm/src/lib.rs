@@ -1981,13 +1981,14 @@ impl<'a> LfmArgumentParser<'a> {
             match byte {
                 b'"' => in_string = true,
                 b'{' | b'[' => nesting.push(byte),
-                b'}' => {
-                    if nesting.pop() != Some(b'{') {
-                        bail!("LFM JSON argument has mismatched delimiters");
-                    }
-                }
-                b']' => {
-                    if nesting.pop() != Some(b'[') {
+                // Both closers run the identical rule, so they share an arm.
+                // NOT written as a match guard (`b'}' if nesting.pop() != …`)
+                // even though clippy suggests it: `pop()` mutates, and a guard
+                // that fails would fall through to `_ => {}` having already
+                // consumed the stack entry. Same result today, a trap later.
+                b'}' | b']' => {
+                    let opener = if byte == b'}' { b'{' } else { b'[' };
+                    if nesting.pop() != Some(opener) {
                         bail!("LFM JSON argument has mismatched delimiters");
                     }
                 }
