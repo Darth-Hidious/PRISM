@@ -14,7 +14,7 @@
 
 use serde_json::json;
 
-use prism_tui::app::{App, Focus, LineKind, Role, WorkspaceTab};
+use prism_tui::app::{App, Focus, LineKind, ObjectStatus, Role, WorkspaceTab};
 use prism_tui::backend::BackendHandle;
 use prism_tui::msg::{AgentMsg, parse_notification};
 
@@ -2620,5 +2620,212 @@ async fn all_scenarios_events_parse_without_unknown() {
             !found_unknown,
             "scenario {scenario_name} produced Unknown events"
         );
+    }
+}
+
+// ── Objects tab ───────────────────────────────────────────────────────
+
+#[test]
+fn object_update_running_never_renders_as_complete() {
+    // Honesty constraint: a running object must never render as complete.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: Some(5000),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 1);
+    let obj = &app.objects[0];
+    assert_eq!(obj.status, ObjectStatus::Running);
+    assert_eq!(obj.progress, Some((5000, 10000)));
+    assert!(
+        obj.detail.is_none(),
+        "running object must not have a result detail"
+    );
+
+    // Simulate an update with NO progress — must still be running.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    let obj = &app.objects[0];
+    assert_eq!(obj.status, ObjectStatus::Running);
+    assert!(
+        obj.progress.is_none(),
+        "no progress reported yet — must stay None, not invented"
+    );
+}
+
+#[test]
+fn object_update_failed_shows_error() {
+    // A failed simulation must NOT silently vanish or read as done.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-2".into(),
+        kind: "simulation".into(),
+        label: "MD NVT 500K".into(),
+        status: "running".into(),
+        progress_current: Some(2341),
+        progress_total: Some(5000),
+        detail: None,
+    });
+    // Now it fails.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-2".into(),
+        kind: "simulation".into(),
+        label: "MD NVT 500K".into(),
+        status: "failed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("divergence at step 2341".into()),
+    });
+    assert_eq!(app.objects.len(), 1);
+    let obj = &app.objects[0];
+    assert_eq!(obj.status, ObjectStatus::Failed);
+    assert_eq!(
+        obj.detail.as_deref(),
+        Some("divergence at step 2341"),
+        "failed sim must show its error"
+    );
+}
+
+#[test]
+fn object_tag_toggle_and_send_message_prefix() {
+    // Tagging must put the object into the outgoing message, using
+    // the same prefix mechanism as the standing goal.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "alloy-1".into(),
+        kind: "alloy".into(),
+        label: "CrMnFeCoNi".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("best HEA candidate".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "struct-1".into(),
+        kind: "structure".into(),
+        label: "W-BCC".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 2);
+
+    // Switch to Objects tab and tag the first one.
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.workspace_selected = 0;
+    app.focus = Focus::Workspace;
+    app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert!(app.objects[0].tagged, "t must tag the selected object");
+    assert!(!app.objects[1].tagged, "other objects stay untagged");
+
+    // Untag it.
+    app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert!(!app.objects[0].tagged, "second t must untag");
+
+    // Tag both and verify the outgoing message prefix.
+    app.objects[0].tagged = true;
+    app.objects[1].tagged = true;
+    // The send_message path writes to the backend (cat subprocess).
+    // We verify indirectly: tagged objects should produce a non-empty
+    // context block in the payload logic. Let's call send_message
+    // and check it doesn't panic (the cat backend absorbs the write).
+    app.focus = Focus::Input;
+    app.input.insert_str("analyze this");
+    // Should not panic even with tagged objects.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    // The message was sent — is_waiting flips true.
+    assert!(
+        app.is_waiting,
+        "send_message must set is_waiting after sending"
+    );
+}
+
+#[test]
+fn object_upsert_updates_in_place() {
+    // Same id must update in place, not create a duplicate.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD run".into(),
+        status: "running".into(),
+        progress_current: Some(100),
+        progress_total: Some(1000),
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 1);
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD run".into(),
+        status: "running".into(),
+        progress_current: Some(500),
+        progress_total: Some(1000),
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 1, "upsert must not duplicate");
+    assert_eq!(app.objects[0].progress, Some((500, 1000)));
+}
+
+#[test]
+fn objects_tab_empty_state_does_not_look_broken() {
+    // Empty tab must say so plainly.
+    let mut app = test_app();
+    assert!(app.objects.is_empty());
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.focus = Focus::Workspace;
+    // Enter on empty tab should toast, not open detail modal.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.view.open, "empty objects tab must not open a modal");
+    assert!(!app.toasts.is_empty(), "user must get feedback via a toast");
+}
+
+#[test]
+fn parse_object_update_notification() {
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.object.update",
+        "params": {
+            "id": "obj-1",
+            "kind": "polymer",
+            "label": "PEG-4000",
+            "status": "running",
+            "progress_current": 50,
+            "progress_total": 200,
+        },
+    });
+    let parsed = parse_notification(&msg);
+    match parsed {
+        AgentMsg::ObjectUpdate {
+            id,
+            kind,
+            label,
+            status,
+            progress_current,
+            progress_total,
+            detail,
+        } => {
+            assert_eq!(id, "obj-1");
+            assert_eq!(kind, "polymer");
+            assert_eq!(label, "PEG-4000");
+            assert_eq!(status, "running");
+            assert_eq!(progress_current, Some(50));
+            assert_eq!(progress_total, Some(200));
+            assert!(detail.is_none());
+        }
+        other => panic!("expected ObjectUpdate, got {other:?}"),
     }
 }

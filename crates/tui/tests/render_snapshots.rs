@@ -1219,6 +1219,74 @@ fn snapshot_workspace_activity_detail_100x30() {
     insta::assert_snapshot!("workspace_activity_detail_100x30", rendered);
 }
 
+/// Snapshot: the Objects tab with a mix of running, completed, and failed
+/// domain objects at 100x30.
+#[test]
+fn snapshot_workspace_objects_tab_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-1".into(),
+        kind: "structure".into(),
+        label: "W-BCC a=3.14A".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("E=-8.42 eV/atom".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-2".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K 10000 steps".into(),
+        status: "running".into(),
+        progress_current: Some(5000),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-3".into(),
+        kind: "alloy".into(),
+        label: "CrMnFeCoNi HEA".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("5 candidates".into()),
+    });
+    // Tag the alloy for the agent.
+    app.objects[2].tagged = true;
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-4".into(),
+        kind: "simulation".into(),
+        label: "MD NVT 500K".into(),
+        status: "failed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("divergence at step 2341".into()),
+    });
+    freeze_metrics(&mut app);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.workspace_selected = 1; // the running sim
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_objects_tab_100x30", rendered);
+}
+
+/// Snapshot: the Objects tab when empty — must say so plainly.
+#[test]
+fn snapshot_workspace_objects_empty_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    freeze_metrics(&mut app);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_objects_empty_100x30", rendered);
+}
+
 // ── Form pane (generic structured input) ────────────────────────────
 
 /// Snapshot: a form pane with every field kind at 100x30.

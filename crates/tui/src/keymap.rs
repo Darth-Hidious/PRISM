@@ -122,7 +122,7 @@ pub static KEYMAP: &[KeyBinding] = &[
     // ── Workspace sidebar ───────────────────────────────────────────
     KeyBinding {
         keys: "← / →",
-        description: "Switch Activity / Tools / Files",
+        description: "Switch Activity / Tools / Files / Objects",
         category: "Workspace sidebar",
     },
     KeyBinding {
@@ -132,12 +132,17 @@ pub static KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "Enter",
-        description: "Open details for the selected item (tool / file / event)",
+        description: "Open details for the selected item (tool / file / event / object)",
         category: "Workspace sidebar",
     },
     KeyBinding {
         keys: "Space",
         description: "Expand the selected item inline",
+        category: "Workspace sidebar",
+    },
+    KeyBinding {
+        keys: "t",
+        description: "Tag/untag object for agent (Objects tab)",
         category: "Workspace sidebar",
     },
     // ── Approvals ───────────────────────────────────────────────────

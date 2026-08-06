@@ -574,6 +574,14 @@ pub static CATALOG: &[Command] = &[
         keybind: "←/→",
         suggested: false,
     },
+    Command {
+        id: "workspace.objects",
+        title: "Workspace: Objects",
+        description: "Switch sidebar to domain Objects",
+        category: "Navigation",
+        keybind: "←/→",
+        suggested: false,
+    },
 ];
 
 /// Palette aliases: kept for muscle memory (they match a typed query

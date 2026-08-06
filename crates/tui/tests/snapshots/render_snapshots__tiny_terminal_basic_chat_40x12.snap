@@ -1,13 +1,12 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 406
 expression: rendered
 ---
  ‹ back  New ses│ Workspace
 response: PRISM▲│ [Activity] Tools Files
-TUI is running ║│
-in deterministi║│  1. prompt "Hello" •
-test mode.     █│
+TUI is running ║│Objects
+in deterministi║│
+test mode.     █│  1. prompt "Hello" •
                ▼│
 ┌ Prompt ──────┐│
 │ Type a messag││

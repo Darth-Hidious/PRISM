@@ -74,6 +74,89 @@ pub enum WorkspaceTab {
     Activity,
     Tools,
     Files,
+    Objects,
+}
+
+/// Domain-object kind (structure, alloy, polymer, simulation, result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Structure,
+    Alloy,
+    Polymer,
+    Simulation,
+    Result,
+}
+
+impl ObjectKind {
+    /// Parse from a backend string. Unknown kinds fall back to `Result`.
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "structure" | "crystal" => Self::Structure,
+            "alloy" | "hea" => Self::Alloy,
+            "polymer" => Self::Polymer,
+            "simulation" | "sim" | "md" => Self::Simulation,
+            _ => Self::Result,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Structure => "Structure",
+            Self::Alloy => "Alloy",
+            Self::Polymer => "Polymer",
+            Self::Simulation => "Simulation",
+            Self::Result => "Result",
+        }
+    }
+
+    /// Short glyph for the sidebar row.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            Self::Structure => "◇",
+            Self::Alloy => "⬡",
+            Self::Polymer => "⌇",
+            Self::Simulation => "▶",
+            Self::Result => "◆",
+        }
+    }
+}
+
+/// Status of a domain object in the Objects tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl ObjectStatus {
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "running" | "in_progress" | "active" => Self::Running,
+            "completed" | "done" | "success" | "finished" => Self::Completed,
+            "failed" | "error" | "errored" => Self::Failed,
+            _ => Self::Running,
+        }
+    }
+}
+
+/// One row of the Workspace *Objects* tab — a domain object the user
+/// can see, point at, and tag for the agent.
+#[derive(Debug, Clone)]
+pub struct WorkspaceObject {
+    /// Backend-assigned unique id (upsert key).
+    pub id: String,
+    pub kind: ObjectKind,
+    pub label: String,
+    pub status: ObjectStatus,
+    /// Live progress as (current_step, total_steps). `None` means the
+    /// backend hasn't reported progress yet — render as "running" with
+    /// no percentage (honesty constraint).
+    pub progress: Option<(u64, u64)>,
+    /// Tagged for the agent — prefixed into the next message.
+    pub tagged: bool,
+    /// Result summary (completed) or error message (failed).
+    pub detail: Option<String>,
 }
 
 /// A transient full-overlay modal, dismissed by any key.
@@ -502,10 +585,13 @@ pub struct App {
     /// Set at startup and on each turn boundary to trigger a cheap balance
     /// refresh in the event loop (never on every keystroke).
     pub needs_credits_refresh: bool,
-    // Workspace sidebar — the right-hand panel (Activity / Tools / Files)
+    // Workspace sidebar — the right-hand panel (Activity / Tools / Files / Objects)
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
     pub workspace_expanded: bool,
+    /// Domain objects (structures, alloys, simulations, …) shown in the
+    /// Objects tab. Upserted by `id` from `ui.object.update` notifications.
+    pub objects: Vec<WorkspaceObject>,
     /// Max chat scroll offset, recomputed by the renderer each frame
     /// (content height − viewport). Lets key handlers clamp/anchor scrolling
     /// without knowing the terminal size.
@@ -606,6 +692,7 @@ impl App {
             workspace_tab: WorkspaceTab::Activity,
             workspace_selected: 0,
             workspace_expanded: false,
+            objects: Vec::new(),
             view_max_scroll: std::cell::Cell::new(0),
             modal: None,
             goal: None,
@@ -1022,7 +1109,8 @@ impl App {
 
     /// Navigate the Workspace sidebar: ←/→ switch tab, ↑/↓ move selection,
     /// Enter opens a detail modal for the selected item, Space expands it
-    /// inline, i/Esc jump back to input.
+    /// inline, `t` tags/untags an object (Objects tab), i/Esc jump back
+    /// to input.
     fn handle_workspace_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => self.workspace_prev_tab(),
@@ -1039,9 +1127,27 @@ impl App {
             KeyCode::Char(' ') => {
                 self.workspace_expanded = !self.workspace_expanded;
             }
+            KeyCode::Char('t') => self.toggle_object_tag(),
             KeyCode::Char('?') => self.open_which_key(),
             KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Input,
             _ => {}
+        }
+    }
+
+    /// Toggle the tag on the currently selected object in the Objects tab.
+    /// Tagged objects are prefixed into the next message sent to the agent.
+    fn toggle_object_tag(&mut self) {
+        if self.workspace_tab != WorkspaceTab::Objects || self.objects.is_empty() {
+            return;
+        }
+        let sel = self.workspace_selected.min(self.objects.len() - 1);
+        self.objects[sel].tagged = !self.objects[sel].tagged;
+        let label = self.objects[sel].label.clone();
+        let tagged = self.objects[sel].tagged;
+        if tagged {
+            self.toast(format!("tagged: {label}"), ToastKind::Ok);
+        } else {
+            self.toast(format!("untagged: {label}"), ToastKind::Info);
         }
     }
 
@@ -1119,6 +1225,7 @@ impl App {
     ///     the per-tool config file at ~/.prism/tools.d/<tool>.toml.
     ///   - Files:    the file's content (text files, capped at 200 KB).
     ///   - Activity: the underlying event of that row as pretty JSON.
+    ///   - Objects:  the object's parameters and result summary.
     pub fn open_workspace_detail(&mut self) {
         match self.workspace_tab {
             WorkspaceTab::Tools => {
@@ -1160,6 +1267,32 @@ impl App {
                     .unwrap_or_else(|_| "(unrenderable event)".to_string());
                 self.open_detail_view(format!("Activity — {}. {}", sel + 1, entry.kind), body);
             }
+            WorkspaceTab::Objects => {
+                if self.objects.is_empty() {
+                    self.toast("no objects yet", ToastKind::Info);
+                    return;
+                }
+                let sel = self.workspace_selected.min(self.objects.len() - 1);
+                let obj = &self.objects[sel];
+                let mut body = format!(
+                    "Kind:     {}\nLabel:    {}\nStatus:   {:?}\nID:       {}\n",
+                    obj.kind.as_str(),
+                    obj.label,
+                    obj.status,
+                    obj.id,
+                );
+                if let Some((cur, tot)) = obj.progress {
+                    body.push_str(&format!("Progress: {cur}/{tot}\n"));
+                }
+                if obj.tagged {
+                    body.push_str("Tagged:   yes (sent to agent)\n");
+                }
+                if let Some(detail) = &obj.detail {
+                    body.push_str(&format!("\n---\n{detail}\n"));
+                }
+                let title = format!("{} — {}", obj.kind.as_str(), obj.label);
+                self.open_detail_view(title, body);
+            }
         }
     }
 
@@ -1177,7 +1310,8 @@ impl App {
         self.workspace_tab = match self.workspace_tab {
             WorkspaceTab::Activity => WorkspaceTab::Tools,
             WorkspaceTab::Tools => WorkspaceTab::Files,
-            WorkspaceTab::Files => WorkspaceTab::Activity,
+            WorkspaceTab::Files => WorkspaceTab::Objects,
+            WorkspaceTab::Objects => WorkspaceTab::Activity,
         };
         self.workspace_selected = 0;
         self.workspace_expanded = false;
@@ -1186,9 +1320,10 @@ impl App {
 
     fn workspace_prev_tab(&mut self) {
         self.workspace_tab = match self.workspace_tab {
-            WorkspaceTab::Activity => WorkspaceTab::Files,
+            WorkspaceTab::Activity => WorkspaceTab::Objects,
             WorkspaceTab::Tools => WorkspaceTab::Activity,
             WorkspaceTab::Files => WorkspaceTab::Tools,
+            WorkspaceTab::Objects => WorkspaceTab::Files,
         };
         self.workspace_selected = 0;
         self.workspace_expanded = false;
@@ -3159,6 +3294,12 @@ impl App {
                 self.workspace_expanded = false;
                 self.focus = Focus::Workspace;
             }
+            "workspace.objects" => {
+                self.workspace_tab = WorkspaceTab::Objects;
+                self.workspace_selected = 0;
+                self.workspace_expanded = false;
+                self.focus = Focus::Workspace;
+            }
             other if other.starts_with("slash.") => {
                 // Run any backend slash command, e.g. "slash.tools" → "/tools".
                 // No chat echo — the returned `ui.view` panel is the feedback.
@@ -3226,10 +3367,31 @@ impl App {
             // Inject the standing goal so it actually steers the agent. The
             // chat shows the user's clean text; the backend receives it with
             // the goal prefixed as context on every turn (survives compaction).
-            let payload = match &self.goal {
-                Some(goal) => format!("[Standing goal: {goal}]\n\n{trimmed}"),
-                None => trimmed.to_string(),
-            };
+            let mut payload = trimmed.to_string();
+            if let Some(goal) = &self.goal {
+                payload = format!("[Standing goal: {goal}]\n\n{payload}");
+            }
+            // Inject tagged objects so the LLM can see what the user pointed at.
+            let tagged: Vec<&WorkspaceObject> = self.objects.iter().filter(|o| o.tagged).collect();
+            if !tagged.is_empty() {
+                let mut ctx = String::from("[Tagged objects]\n");
+                for obj in &tagged {
+                    ctx.push_str(&format!(
+                        "- {} {} ({:?})",
+                        obj.kind.as_str(),
+                        obj.label,
+                        obj.status,
+                    ));
+                    if let Some((cur, tot)) = obj.progress {
+                        ctx.push_str(&format!(" [{cur}/{tot}]"));
+                    }
+                    if let Some(detail) = &obj.detail {
+                        ctx.push_str(&format!(": {detail}"));
+                    }
+                    ctx.push('\n');
+                }
+                payload = format!("{ctx}\n{payload}");
+            }
             let _ = self.backend.send_message(&payload);
         }
         self.is_waiting = true;
@@ -3676,6 +3838,44 @@ impl App {
                         "[{origin} notebook In[{}]] {body}",
                         parsed.execution_count
                     ));
+                }
+            }
+            AgentMsg::ObjectUpdate {
+                id,
+                kind,
+                label,
+                status,
+                progress_current,
+                progress_total,
+                detail,
+            } => {
+                let obj_kind = ObjectKind::from_str_loose(&kind);
+                let obj_status = ObjectStatus::from_str_loose(&status);
+                let progress = match (progress_current, progress_total) {
+                    (Some(c), Some(t)) => Some((c, t)),
+                    _ => None,
+                };
+                let label = sanitize_for_render(&label);
+                let detail = detail.map(|d| sanitize_for_render(&d));
+                // Upsert by id.
+                if let Some(existing) = self.objects.iter_mut().find(|o| o.id == id) {
+                    existing.kind = obj_kind;
+                    existing.label = label;
+                    existing.status = obj_status;
+                    existing.progress = progress;
+                    if let Some(d) = detail {
+                        existing.detail = Some(d);
+                    }
+                } else {
+                    self.objects.push(WorkspaceObject {
+                        id,
+                        kind: obj_kind,
+                        label,
+                        status: obj_status,
+                        progress,
+                        tagged: false,
+                        detail,
+                    });
                 }
             }
             AgentMsg::Unknown(_) => {}

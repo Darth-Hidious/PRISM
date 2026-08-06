@@ -199,6 +199,20 @@ pub enum AgentMsg {
         recoverable: Option<bool>,
     },
 
+    // ── Domain objects ─────────────────────────────────────────────
+    /// `ui.object.update` — upsert a domain object (structure, alloy,
+    /// simulation, …) into the Objects tab. The backend emits this on
+    /// creation, progress changes, and terminal state transitions.
+    ObjectUpdate {
+        id: String,
+        kind: String,
+        label: String,
+        status: String,
+        progress_current: Option<u64>,
+        progress_total: Option<u64>,
+        detail: Option<String>,
+    },
+
     // ── Legacy / fallback ────────────────────────────────────────────
     /// A generic error string.  Kept for backward compatibility with
     /// the old `"" => Error(err.to_string())` arm.  New code should
@@ -546,6 +560,36 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .map(str::to_string),
             python: params
                 .get("python")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+
+        // ── Domain objects ─────────────────────────────────────────
+        "ui.object.update" => AgentMsg::ObjectUpdate {
+            id: params
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            kind: params
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("result")
+                .to_string(),
+            label: params
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unnamed")
+                .to_string(),
+            status: params
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("running")
+                .to_string(),
+            progress_current: params.get("progress_current").and_then(|v| v.as_u64()),
+            progress_total: params.get("progress_total").and_then(|v| v.as_u64()),
+            detail: params
+                .get("detail")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         },
