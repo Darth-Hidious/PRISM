@@ -581,10 +581,14 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unnamed")
                 .to_string(),
+            // NOT "running". An absent status field is not evidence the job
+            // is running — it is evidence the backend told us nothing. The
+            // empty string parses to ObjectStatus::Unknown, which renders "?"
+            // instead of claiming a state nobody reported.
             status: params
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("running")
+                .unwrap_or("")
                 .to_string(),
             progress_current: params.get("progress_current").and_then(|v| v.as_u64()),
             progress_total: params.get("progress_total").and_then(|v| v.as_u64()),

@@ -3863,6 +3863,14 @@ impl App {
                 progress_total,
                 detail,
             } => {
+                // The id IS the identity — the upsert below matches on it. A
+                // notification with no id defaults to "" and every such update
+                // collapses onto ONE row, so two unrelated simulations would
+                // overwrite each other's status and progress in front of the
+                // user. An unaddressable update is dropped, not guessed at.
+                if id.trim().is_empty() {
+                    return;
+                }
                 let obj_kind = ObjectKind::from_str_loose(&kind);
                 let obj_status = ObjectStatus::from_str_loose(&status);
                 let progress = match (progress_current, progress_total) {

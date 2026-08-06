@@ -2739,6 +2739,88 @@ fn object_unrecognised_status_is_not_reported_as_running() {
     }
 }
 
+/// `parse_notification` defaulted an absent `status` to the literal "running"
+/// and an absent `id` to "". Both fabricate: the first claims a state the
+/// backend never reported, the second makes every anonymous update collapse
+/// onto ONE row, so unrelated simulations overwrite each other in front of
+/// the user. Mutations: restore `.unwrap_or("running")` in msg.rs, or delete
+/// the empty-id guard in app.rs — each fails this.
+#[test]
+fn object_update_without_id_or_status_is_not_invented() {
+    let mut app = test_app();
+
+    // No id at all — unaddressable, must be dropped rather than merged.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "".into(),
+        kind: "simulation".into(),
+        label: "anonymous A".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "   ".into(),
+        kind: "simulation".into(),
+        label: "anonymous B".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    assert!(
+        app.objects.is_empty(),
+        "an update with no id is unaddressable: nothing can target it again, so it \
+         becomes a row that never updates — and two updates sharing the SAME empty \
+         id silently overwrite each other. Leaked: {:?}",
+        app.objects.iter().map(|o| &o.label).collect::<Vec<_>>()
+    );
+
+    // Absent status (empty after parse_notification's default) is Unknown,
+    // NOT Running.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-x".into(),
+        kind: "simulation".into(),
+        label: "no status reported".into(),
+        status: "".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    assert_eq!(
+        app.objects[0].status,
+        ObjectStatus::Unknown,
+        "the backend reported no status — claiming Running invents it"
+    );
+}
+
+/// The PARSE-side default, which the test above does not reach — it builds an
+/// AgentMsg directly. I mutation-checked that: restoring
+/// `.unwrap_or("running")` in msg.rs left it green. A notification that omits
+/// `status` must not become Running on the way in.
+#[test]
+fn parsed_object_update_without_status_does_not_become_running() {
+    let msg = json!({
+        "method": "ui.object.update",
+        "params": { "id": "sim-p", "kind": "simulation", "label": "MD 300K" }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ObjectUpdate { status, .. } => {
+            assert_ne!(
+                status, "running",
+                "the notification carried no status — defaulting to `running` \
+                 reports a state the backend never sent"
+            );
+            assert_eq!(
+                ObjectStatus::from_str_loose(&status),
+                ObjectStatus::Unknown,
+                "an absent status must land on Unknown, got {status:?}"
+            );
+        }
+        other => panic!("expected ObjectUpdate, got {other:?}"),
+    }
+}
+
 #[test]
 fn object_update_failed_shows_error() {
     // A failed simulation must NOT silently vanish or read as done.
