@@ -49,6 +49,49 @@ FOX_FLORY_CITATION = (
     "581-591, DOI 10.1063/1.1699711"
 )
 
+ROTATABLE_FLEXIBILITY_DEFINITION = (
+    "rotatable_bond_fraction = NumRotatableBonds / heavy_atom_bond_count, "
+    "RDKit Lipinski.NumRotatableBonds over the count of bonds between heavy "
+    "atoms. Unitless, 0 = fully rigid."
+)
+
+
+def rotatable_bond_fraction(mol) -> float:
+    """Backbone flexibility as the fraction of heavy-atom bonds that rotate.
+
+    This is PRISM's OWN definition, stated above and returned with every
+    value. It is deliberately NOT presented as the ``Phi_mon`` descriptor of
+    Kim, Schroeder and Jackson (ACS Macromolecules, DOI 10.1021/acs.macromol.6c00564):
+    that paper reports a strong Tg correlation (rho = -0.760, empirical
+    inverse fit R^2 = 0.779) but its Supporting Information gives neither the
+    descriptor formula nor the fit coefficients -- both live in the main text
+    and its reference 8. Implementing a guessed formula and attributing the
+    resulting Tg to that paper would be exactly the unsourced estimate this
+    module exists to refuse.
+
+    So this returns a flexibility RANKING signal only. No Tg is derived from
+    it. When the Phi_mon definition and coefficients are obtained, a separate
+    cited method can be added alongside Fox-Flory.
+
+        >>> from rdkit import Chem
+        >>> round(rotatable_bond_fraction(Chem.MolFromSmiles("CCCCCC")), 4)
+        0.6
+        >>> rotatable_bond_fraction(Chem.MolFromSmiles("c1ccccc1"))
+        0.0
+    """
+    from rdkit.Chem import Lipinski
+
+    heavy_bonds = sum(
+        1
+        for bond in mol.GetBonds()
+        if bond.GetBeginAtom().GetAtomicNum() > 1
+        and bond.GetEndAtom().GetAtomicNum() > 1
+    )
+    if heavy_bonds == 0:
+        raise ValueError("molecule has no heavy-atom bonds; flexibility undefined")
+    return Lipinski.NumRotatableBonds(mol) / heavy_bonds
+
+
 def fox_flory_tg_k(
     number_average_molar_mass_g_per_mol: float,
     tg_infinity_k: float,
@@ -187,6 +230,35 @@ def evaluate_polymer_insulation(
             status["glass_transition_temperature_k"],
             EvidenceSource.CITED_COMPUTATION,
             [input_evidence],
+        )
+
+    # Re-parse from the validated identity rather than trusting a key:
+    # `_load_identity` parses SMILES only to VALIDATE and discards the mol, so
+    # reading a `_mol` key would be a branch that can never fire. Prefer the
+    # repeat unit (what actually governs backbone flexibility) over the monomer.
+    smiles = candidate.get("repeat_unit_smiles") or candidate.get("monomer_smiles")
+    mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) else None
+    if mol is not None:
+        fraction = rotatable_bond_fraction(mol)
+        status["rotatable_bond_fraction"] = {
+            "status": "computed",
+            "value": fraction,
+            "unit": "QUDT:UNITLESS",
+            "method": ROTATABLE_FLEXIBILITY_DEFINITION,
+            "citation": "PRISM-defined descriptor; see rotatable_bond_fraction docstring",
+        }
+        # SCREENING, never better: a ranking signal with no validated mapping
+        # to any property ABB asked for. It orders candidates by backbone
+        # flexibility; it does not predict Tg, modulus, or anything else.
+        stamp_evidence(
+            status["rotatable_bond_fraction"],
+            EvidenceSource.MODEL_ASSERTION,
+            [EvidenceClass.SCREENING],
+        )
+    else:
+        status["rotatable_bond_fraction"] = _unavailable(
+            "the candidate supplied neither repeat_unit_smiles nor "
+            "monomer_smiles, so no structure exists to measure flexibility on"
         )
 
     status["dielectric_constant"] = _unavailable(
