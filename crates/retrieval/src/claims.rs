@@ -450,20 +450,38 @@ const LABEL_WORDS: &[&str] = &[
     "schemes",
 ];
 
+/// Words that continue a label list: the number after one of these is a
+/// label when the number one step back sits a label word ("Tables 1 and 2").
+const LIST_CONTINUATIONS: &[&str] = &["and", "or", "to", "through"];
+
 /// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
 /// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
-/// not evidence for a property value.
+/// not evidence for a property value. The second number of a label list
+/// ("Tables 1 and 2") is caught by stepping back over the conjunction and
+/// the number before it, exactly once.
 fn preceding_word_is_label(hay: &str, start: usize) -> bool {
-    let prefix = hay[..start].trim_end_matches([' ', '.', ':']);
-    let word: String = prefix
+    let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']);
+    let mut word = trailing_word(prefix);
+    if LIST_CONTINUATIONS.contains(&word.as_str()) {
+        prefix = prefix[..prefix.len() - word.len()].trim_end_matches(|c: char| {
+            c.is_ascii_digit() || matches!(c, ',' | ' ' | '.' | ':' | '-' | '\u{2013}' | '\u{2014}')
+        });
+        word = trailing_word(prefix);
+    }
+    LABEL_WORDS.contains(&word.as_str())
+}
+
+/// The trailing alphanumeric word of `prefix`, empty when `prefix` ends
+/// in a non-word character.
+fn trailing_word(prefix: &str) -> String {
+    prefix
         .chars()
         .rev()
         .take_while(|c: &char| c.is_alphanumeric())
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .collect();
-    LABEL_WORDS.contains(&word.as_str())
+        .collect()
 }
 
 /// String forms under which a numeric value may legitimately appear in a
@@ -1151,6 +1169,38 @@ mod tests {
             supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &body_block.text).is_some(),
             "the real value after the citation must still stamp: {:?}",
             body_block.text
+        );
+    }
+
+    /// The list form of label references: in "Tables 1 and 2" the
+    /// number after the conjunction is a label too, but only the
+    /// immediately preceding word was checked, so 2 stamped. Walk back
+    /// over the conjunction and the number before it, exactly once.
+    /// (Mid-list comma items like "Refs. 25, 26" stay an open gap.)
+    #[test]
+    fn label_list_numbers_after_a_conjunction_are_not_support() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            2.0,
+            "Ti-6Al-4V data are listed in Tables 1 and 2.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            26.0,
+            "Ti-6Al-4V is discussed in Refs. 25 and 26.",
+        );
+        // Positive control: a real measurement after "and <number>"
+        // still stamps when the word one number back is not a label.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(960.0),
+                "The Ti-6Al-4V samples measured 950 and 960 MPa."
+            )
+            .is_some()
         );
     }
 
