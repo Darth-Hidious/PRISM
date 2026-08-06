@@ -282,11 +282,24 @@ fn evidential_number_occurrence(hay: &str, needle: &str) -> bool {
     false
 }
 
+/// Letters that may begin a unit token glued directly to a number in
+/// table and PDF-extracted text where the space was lost: "950MPa",
+/// "1073K", "50um" / "50\u{b5}m", "5wt%". Deliberately an allow-list,
+/// not every letter: digit-then-letter gluing like "950x" (magnification)
+/// or "2e5" (scientific notation) is not number+unit and stays rejected,
+/// so 'e' and 'x' are absent on purpose. '\u{b5}' is present because
+/// U+00B5 MICRO SIGN is alphabetic.
+const UNIT_INITIALS: &[char] = &[
+    'a', 'c', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 's', 't', 'u', 'v', 'w', '\u{b5}',
+];
+
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
 /// continues a grouped number ("1,140" is one number, in both directions),
 /// or to an alphanumeric. Otherwise "95" matches inside "950", "1.5" inside
-/// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V".
+/// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V". After the
+/// number, a letter from `UNIT_INITIALS` is allowed so glued units
+/// ("950MPa") still stamp.
 fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
@@ -302,7 +315,17 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     }
     if let Some(after) = hay[end..].chars().next() {
         if after.is_alphanumeric() {
-            return false;
+            if !UNIT_INITIALS.contains(&after) {
+                return false;
+            }
+            // A glued unit letter redeems a number, but never a digit
+            // inside a hyphen-joined designation (the "6" of "Ti-6Al-4V",
+            // ASCII or en/em dash).
+            if let Some(before) = hay[..start].chars().next_back()
+                && matches!(before, '-' | '\u{2013}' | '\u{2014}')
+            {
+                return false;
+            }
         }
         if after == '.' && hay[end + 1..].starts_with(|c: char| c.is_ascii_digit()) {
             return false;
@@ -724,6 +747,127 @@ mod tests {
                 "UTS",
                 Some(12.0),
                 "The Ti-6Al-4V samples measured 12, 15 and 950 MPa."
+            )
+            .is_some()
+        );
+    }
+
+    /// F-2: in materials tables and PDF-extracted text the space between
+    /// a number and its unit is often lost. A number glued to a
+    /// unit-initial letter must still stamp; a number glued to any other
+    /// letter must not.
+    #[test]
+    fn numbers_glued_to_their_unit_still_stamp() {
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "The Ti-6Al-4V UTS is 950MPa."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "temperature",
+                Some(1073.0),
+                "Ti-6Al-4V was annealed at 1073K."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "grain_size",
+                Some(50.0),
+                "CoCrFeNi grains of 50um were observed."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "grain_size",
+                Some(50.0),
+                "CoCrFeNi grains of 50\u{b5}m were observed."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "content",
+                Some(5.0),
+                "The CoCrFeNi alloy contains 5wt% Cr."
+            )
+            .is_some()
+        );
+
+        // Degree/percent glue was never broken (non-alphanumeric) and
+        // must keep stamping.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "temperature",
+                Some(500.0),
+                "Ti-6Al-4V was held at 500 \u{b0}C."
+            )
+            .is_some()
+        );
+
+        // Glued NON-unit letter: still dropped ("950x" is magnification,
+        // not 950 + a unit).
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "The Ti-6Al-4V image at 950x magnification."
+            )
+            .is_none()
+        );
+        // Digit glue is still the substring reject: 95 inside 950MPa.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(95.0),
+                "The Ti-6Al-4V UTS is 950MPa."
+            )
+            .is_none()
+        );
+
+        // A glued unit letter never redeems a digit inside a hyphen-joined
+        // designation, ASCII or en dash (the "6" of "Ti-6Al-4V").
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(6.0),
+                "The Ti-6Al-4V billets were 950MPa rated."
+            )
+            .is_none()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(6.0),
+                "The Ti\u{2013}6Al\u{2013}4V billets were 950MPa rated."
+            )
+            .is_none()
+        );
+
+        // En-dash positive control: the subject's hyphens do not match en
+        // dashes, so the fact survives ONLY through the object arm of the
+        // subject-OR-object rule. Do not flip that OR to AND.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa."
             )
             .is_some()
         );
