@@ -241,7 +241,10 @@ fn supporting_spans(text: &str) -> Vec<&str> {
                 && i + 1 < bytes.len()
                 && bytes[i - 1].is_ascii_digit()
                 && bytes[i + 1].is_ascii_digit();
-            if matches!(b, b'.' | b'!' | b'?' | b';') && !is_decimal_point {
+            let is_sentence_break = matches!(b, b'.' | b'!' | b'?' | b';')
+                && !is_decimal_point
+                && !(*b == b'.' && period_ends_abbreviation(line, i));
+            if is_sentence_break {
                 spans.push(&line[start..=i]);
                 start = i + 1;
             }
@@ -255,6 +258,30 @@ fn supporting_spans(text: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Words whose trailing period is an abbreviation, not a sentence end
+/// ("Fig.", "Ref.", "Eq."). Deliberately NOT `LABEL_WORDS`: words like
+/// "sample." or "run." legitimately end sentences in methods prose, and
+/// refusing to split there would fuse two sentences into one span and
+/// create fresh false co-occurrences.
+const ABBREV_LABEL_WORDS: &[&str] = &["fig", "figs", "ref", "refs", "eq", "eqs"];
+
+/// Does the word right before the period at byte index `dot` end in a
+/// label abbreviation? Such a period does not end a span: splitting on it
+/// strands the label's number in a fresh span where the label word is
+/// invisible, so "Fig. 2" stamps 2 as a measurement (H7).
+fn period_ends_abbreviation(line: &str, dot: usize) -> bool {
+    let word: String = line[..dot]
+        .chars()
+        .rev()
+        .take_while(|c: &char| c.is_alphanumeric())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>()
+        .to_lowercase();
+    ABBREV_LABEL_WORDS.contains(&word.as_str())
 }
 
 /// Does `hay` contain the value as an evidential measurement? At least one
@@ -390,6 +417,7 @@ const LABEL_WORDS: &[&str] = &[
     "section",
     "sections",
     "eq",
+    "eqs",
     "equation",
     "equations",
     "chapter",
@@ -1002,6 +1030,48 @@ mod tests {
         assert_eq!(
             supporting_quote("Inconel 718", "UTS", Some(1375.0), table).as_deref(),
             Some("Inconel 718 1375")
+        );
+    }
+
+    /// H7: an abbreviated label ("Fig. 2", "Ref. 25") used to defeat the
+    /// label rule: the abbreviating period ended the span, stranding the
+    /// number in a fresh span where the label word was invisible, so
+    /// `UTS = 2` stamped. The period of such an abbreviation must not end
+    /// a span. ("Table 3" / "Figure 2" without the period were already
+    /// blocked; the round-2 `Ref 25` fixture only worked because the
+    /// period was removed from it.)
+    #[test]
+    fn abbreviated_label_numbers_are_not_support() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            2.0,
+            "As shown in Fig. 2 Ti-6Al-4V was tested to failure.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            25.0,
+            "As reported in Ref. 25 Ti-6Al-4V is widely used.",
+        );
+        // "Eqs." joins the label family: the first number after it is a
+        // label. (The "and 8" tail is the list-form gap, recorded open.)
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            7.0,
+            "The fits are given in Eqs. 7 and 8 for Ti-6Al-4V UTS.",
+        );
+        // Positive control: a real value in the same sentence as an
+        // abbreviated label still stamps.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "As shown in Fig. 2 the Ti-6Al-4V UTS is 950 MPa."
+            )
+            .is_some()
         );
     }
 
