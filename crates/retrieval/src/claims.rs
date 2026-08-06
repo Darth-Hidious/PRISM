@@ -902,7 +902,12 @@ mod tests {
             "Ti-6Al-4V",
             "UTS",
             25.0,
-            "UTS data for Ti-6Al-4V appears in Ref. 25.",
+            // No period after "Ref": with "Ref." the span split strands
+            // the 25 in a span holding neither subject nor object, so the
+            // label rule never fires. This form exercises it for real:
+            // mutation-proven red when ref/refs are removed from
+            // LABEL_WORDS.
+            "UTS data for Ti-6Al-4V appears in Ref 25.",
         );
     }
 
@@ -918,15 +923,24 @@ mod tests {
 
     /// Fabrication path 1: a table must not act as one giant span. Rows
     /// are separate spans, so a number in one row cannot support a claim
-    /// whose subject lives in another row, and the "1" of "Table 1" / the
-    /// digit inside "718" cannot masquerade as a measurement.
+    /// whose subject lives in another row (the 1375 assert, mutation-proven
+    /// by fusing all rows into one span). The caption line also exercises
+    /// the label rule: the "1" of "Table 1" sits in a span that holds the
+    /// subject AND the object, so only the label rule keeps it from
+    /// stamping (the 1.0 assert, mutation-proven by disabling
+    /// `preceding_word_is_label`).
     #[test]
     fn properties_table_rows_are_separate_spans() {
-        let table = "Alloy UTS (MPa)\nTi-6Al-4V 950\nInconel 718 1375";
+        let table = "Table 1 UTS of Ti-6Al-4V and Inconel 718\n\
+                     Alloy UTS (MPa)\n\
+                     Ti-6Al-4V 950\n\
+                     Inconel 718 1375";
 
-        // Inconel's number cannot support a claim about Ti-6Al-4V.
+        // Inconel's number cannot support a claim about Ti-6Al-4V: the
+        // subject and 1375 never share a row.
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1375.0, table);
-        // No occurrence of a bare "1" can be a UTS value here.
+        // The "1" of "Table 1" is a label, not a UTS value, even though
+        // the caption span holds both the subject and the object.
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1.0, table);
 
         // Genuine rows still stamp: the alloy and its own number share a row.
