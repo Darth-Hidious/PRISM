@@ -586,6 +586,51 @@ fn workspace_tab_strip_never_wraps_at_any_width() {
     }
 }
 
+/// The acceptance criterion for the whole Objects tab: **a running object must
+/// never render as complete.**
+///
+/// `object_update_running_never_renders_as_complete` in tests/unit.rs carries
+/// that name but asserts only model state — it never renders anything, and it
+/// cannot, because the render harness (`render_app_to_string`) lives here. A
+/// test named after a render invariant that never renders is how the invariant
+/// goes unguarded. This checks the pixels.
+///
+/// The hard case is a job at FULL progress that has not reported completion —
+/// 10000/10000 and still `running`. That is exactly when a reader (or a
+/// rounding bug) is most tempted to call it done, and exactly when the user
+/// would stop waiting for a result that has not arrived.
+#[test]
+fn a_running_object_never_renders_as_done() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-full".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: Some(10_000),
+        progress_total: Some(10_000),
+        detail: None,
+    });
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("MD NPT 300K"))
+        .expect("the running object must be rendered at all");
+
+    assert!(
+        !row.contains("done"),
+        "a running object rendered as done — the user stops waiting for a \
+         result that has not arrived.\nrow: {row:?}"
+    );
+    assert!(
+        row.contains("100%") || row.contains("running"),
+        "a running object must render its progress or the word running.\nrow: {row:?}"
+    );
+}
+
 /// Snapshot: wide terminal basic chat at 200x60.
 #[test]
 fn snapshot_wide_terminal_basic_chat_200x60() {

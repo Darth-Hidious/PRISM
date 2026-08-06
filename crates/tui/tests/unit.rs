@@ -2626,8 +2626,12 @@ async fn all_scenarios_events_parse_without_unknown() {
 // ── Objects tab ───────────────────────────────────────────────────────
 
 #[test]
-fn object_update_running_never_renders_as_complete() {
-    // Honesty constraint: a running object must never render as complete.
+fn object_update_running_keeps_running_status_in_the_model() {
+    // MODEL-level only — this file has no render harness, so it cannot check
+    // anything about rendering and used to be named as if it did. The render
+    // invariant lives in tests/render_snapshots.rs
+    // (`a_running_object_never_renders_as_done`), which is where
+    // `render_app_to_string` is.
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ObjectUpdate {
         id: "sim-1".into(),
