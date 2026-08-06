@@ -709,14 +709,12 @@ mod tests {
             .unwrap();
         assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
         let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
+        // Exact row structure: three separate rows, so the two alloys'
+        // numbers (950 / 1375) never share one. This equality is the
+        // assertion; a weaker `.any()` after it could never fail first.
         assert_eq!(
             rows,
             vec!["Alloy UTS (MPa)", "Ti-6Al-4V 950", "Inconel 718 1375"]
-        );
-        // The two alloys' numbers never share a row.
-        assert!(
-            !rows.iter().any(|r| r.contains("950") && r.contains("1375")),
-            "rows fused: {rows:?}"
         );
     }
 
