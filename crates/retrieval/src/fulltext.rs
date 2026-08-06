@@ -379,6 +379,14 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         sink = Some(Sink::Caption);
                         text.clear();
                     }
+                    b"tr" if sink == Some(Sink::Wrap) => {
+                        // Preserve row structure: each row starts on its own
+                        // line so evidence spans never straddle rows. Rows
+                        // joined with spaces fuse the whole table into one
+                        // span, letting a number from one row "support" a
+                        // claim whose subject lives in another row.
+                        text.push('\n');
+                    }
                     b"p" if depth_body > 0 && sink.is_none() => {
                         sink = Some(Sink::Paragraph);
                         text.clear();
@@ -660,6 +668,55 @@ mod tests {
             ft.blocks.iter().any(|b| b.text == "After the wedge."),
             "a self-closing wrap wedged the sink; blocks: {:?}",
             ft.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// F2 regression (fabrication path 1): the JATS sink used to join
+    /// every chunk of a table with a space, so the whole table was ONE
+    /// evidence span: a number from one row could "support" a claim whose
+    /// subject appeared in a different row. Rows must stay separate lines
+    /// so `supporting_spans` splits the table into rows.
+    #[test]
+    fn jats_table_rows_stay_separate_lines() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Row structure probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <table-wrap>
+        <label>Table 1</label>
+        <caption><p>Mechanical properties.</p></caption>
+        <table>
+          <tr><th>Alloy</th><th>UTS (MPa)</th></tr>
+          <tr><td>Ti-6Al-4V</td><td>950</td></tr>
+          <tr><td>Inconel 718</td><td>1375</td></tr>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
+        let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
+        assert_eq!(
+            rows,
+            vec!["Alloy UTS (MPa)", "Ti-6Al-4V 950", "Inconel 718 1375"]
+        );
+        // The two alloys' numbers never share a row.
+        assert!(
+            !rows.iter().any(|r| r.contains("950") && r.contains("1375")),
+            "rows fused: {rows:?}"
         );
     }
 

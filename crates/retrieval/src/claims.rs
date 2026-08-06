@@ -188,7 +188,11 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 /// Support criteria (all case-insensitive, within one sentence/row span):
 /// * numeric fact: the value's number appears together with the subject or
 ///   the object (a bare number could be a citation, so the number alone is
-///   not enough);
+///   not enough). The number must occur as its own token — not as a
+///   substring of a longer number and not as a digit inside an alloy
+///   designation — and the occurrence must be evidential: a number inside
+///   a citation marker `[...]` or immediately after Table/Figure/Ref is a
+///   label, not a measurement;
 /// * non-numeric fact: both subject and object appear.
 #[must_use]
 pub fn supporting_quote(
@@ -203,7 +207,7 @@ pub fn supporting_quote(
         let hay = normalize_for_containment(span);
         let supported = match value {
             Some(v) => {
-                number_needles(v).iter().any(|n| hay.contains(&n[..]))
+                number_is_evidential(&hay, v)
                     && ((!subject_n.is_empty() && hay.contains(&subject_n))
                         || (!object_n.is_empty() && hay.contains(&object_n)))
             }
@@ -250,6 +254,96 @@ fn supporting_spans(text: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Does `hay` contain the value as an evidential measurement? At least one
+/// string form of the value must occur with clean token boundaries and must
+/// not be a citation marker or a Table/Figure/Ref label number.
+fn number_is_evidential(hay: &str, value: f64) -> bool {
+    number_needles(value)
+        .iter()
+        .any(|needle| evidential_number_occurrence(hay, needle))
+}
+
+/// Scan every occurrence of `needle` in `hay` for one that is real evidence.
+fn evidential_number_occurrence(hay: &str, needle: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(rel) = hay[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        if clean_number_boundary(hay, needle, start, end)
+            && !inside_citation_marker(hay, start)
+            && !preceding_word_is_label(hay, start)
+        {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
+}
+
+/// Token-boundary check: the occurrence must not be adjacent to a digit, to
+/// a decimal point that continues it, or to an alphanumeric. Otherwise "95"
+/// matches inside "950", "1.5" inside "11.5", and the "6" of "Ti-6Al-4V".
+fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
+    if let Some(before) = hay[..start].chars().next_back() {
+        if before.is_alphanumeric() {
+            return false;
+        }
+        if before == '.' && needle.starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    if let Some(after) = hay[end..].chars().next() {
+        if after.is_alphanumeric() {
+            return false;
+        }
+        if after == '.' && hay[end + 1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Is the occurrence inside a bracketed citation marker such as `[1140]`,
+/// `[11, 12]` or `[11–13]`? Walk back over the digits and separators a
+/// citation range may contain; if the first other character is `[`, the
+/// number is a citation, not a measurement.
+fn inside_citation_marker(hay: &str, start: usize) -> bool {
+    let prefix = hay[..start].trim_end_matches(|c: char| {
+        c.is_ascii_digit() || matches!(c, ',' | ' ' | '-' | '\u{2013}' | '\u{2014}')
+    });
+    prefix.ends_with('[')
+}
+
+/// Words after which a number is a label, never a measurement.
+const LABEL_WORDS: &[&str] = &[
+    "table",
+    "tables",
+    "figure",
+    "figures",
+    "fig",
+    "figs",
+    "ref",
+    "refs",
+    "reference",
+    "references",
+];
+
+/// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
+/// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
+/// not evidence for a property value.
+fn preceding_word_is_label(hay: &str, start: usize) -> bool {
+    let prefix = hay[..start].trim_end_matches([' ', '.', ':']);
+    let word: String = prefix
+        .chars()
+        .rev()
+        .take_while(|c: &char| c.is_alphanumeric())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    LABEL_WORDS.contains(&word.as_str())
 }
 
 /// String forms under which a numeric value may legitimately appear in a
@@ -509,5 +603,193 @@ mod tests {
         assert!(supporting_quote("Ti-6Al-4V", "alpha-beta", None, block).is_some());
         // Object absent from the block: no support.
         assert!(supporting_quote("Ti-6Al-4V", "omega phase", None, block).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Fabrication-path regression tests. Each one reproduces a confirmed
+    // false-stamp path and asserts the claim is DROPPED: no supporting
+    // quote found, and therefore refused at validate_and_stamp exactly as
+    // papers.rs runs it (supporting_quote -> quote None -> MissingQuote).
+    // ------------------------------------------------------------------
+
+    /// Mirrors the production flow in crates/cli/src/papers.rs: the quote
+    /// is whatever `supporting_quote` finds in the block, and a claim with
+    /// no quote must be refused by `validate_and_stamp`.
+    fn assert_dropped_end_to_end(subject: &str, object: &str, value: f64, block: &str) {
+        let quote = supporting_quote(subject, object, Some(value), block);
+        assert!(
+            quote.is_none(),
+            "fabricated support found for {subject}/{object}={value}: {quote:?}"
+        );
+        let claim = ExtractedClaim {
+            subject: subject.to_string(),
+            predicate: "has_measurement".to_string(),
+            object: object.to_string(),
+            value: Some(value),
+            unit: Some("QUDT:MegaPA".to_string()),
+            conditions: vec![],
+            confidence: Some(0.9),
+            kind: Some("measurement".to_string()),
+            evidence_class: "research".to_string(),
+            provenance: ClaimProvenance {
+                document_id: "10.1234/doc".to_string(),
+                document_url: "https://doi.org/10.1234/doc".to_string(),
+                source: "openalex".to_string(),
+                locator: locator(),
+                quote,
+            },
+        };
+        assert_eq!(
+            validate_and_stamp(claim, block).unwrap_err(),
+            ClaimRejection::MissingQuote
+        );
+    }
+
+    /// Fabrication path 2: substring number matching. The matched number
+    /// must stand on its own token boundary, or an order-of-magnitude-wrong
+    /// number passes the gate.
+    #[test]
+    fn substring_number_match_is_dropped() {
+        let uts_block = "The Ti-6Al-4V sample showed a UTS of 950 MPa.";
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 95.0, uts_block);
+
+        let conductivity_block = "The thermal conductivity of CoCrFeNi is 11.5 W/(m K).";
+        assert_dropped_end_to_end("CoCrFeNi", "thermal_conductivity", 1.5, conductivity_block);
+
+        // The genuine values in the same blocks still stamp.
+        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), uts_block).is_some());
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "thermal_conductivity",
+                Some(11.5),
+                conductivity_block
+            )
+            .is_some()
+        );
+    }
+
+    /// Fabrication path 3: a citation marker is not evidence. The exact
+    /// sentence the extractor prompt uses as its example must never stamp
+    /// the example's number.
+    #[test]
+    fn citation_marker_is_not_support() {
+        let block = "Ti-6Al-4V has been studied extensively in prior work [1140].";
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1140.0, block);
+    }
+
+    /// Fabrication path 3 (label form): a number immediately after
+    /// Table/Figure/Ref is a label, not a measurement.
+    #[test]
+    fn table_figure_ref_label_numbers_are_not_support() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            "Ti-6Al-4V properties are listed in Table 3.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            2.0,
+            "Ti-6Al-4V data appear in Figure 2.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            25.0,
+            "UTS data for Ti-6Al-4V appears in Ref. 25.",
+        );
+    }
+
+    /// Fabrication path 4: digits inside alloy designations are not
+    /// numeric prose. Alloy names are numeric by convention, so a block
+    /// with no measurement must not stamp the digits of the name.
+    #[test]
+    fn alloy_designation_digits_are_not_support() {
+        let block = "The Ti-6Al-4V samples were annealed and examined.";
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 6.0, block);
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 4.0, block);
+    }
+
+    /// Fabrication path 1: a table must not act as one giant span. Rows
+    /// are separate spans, so a number in one row cannot support a claim
+    /// whose subject lives in another row, and the "1" of "Table 1" / the
+    /// digit inside "718" cannot masquerade as a measurement.
+    #[test]
+    fn properties_table_rows_are_separate_spans() {
+        let table = "Alloy UTS (MPa)\nTi-6Al-4V 950\nInconel 718 1375";
+
+        // Inconel's number cannot support a claim about Ti-6Al-4V.
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1375.0, table);
+        // No occurrence of a bare "1" can be a UTS value here.
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1.0, table);
+
+        // Genuine rows still stamp: the alloy and its own number share a row.
+        assert_eq!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), table).as_deref(),
+            Some("Ti-6Al-4V 950")
+        );
+        assert_eq!(
+            supporting_quote("Inconel 718", "UTS", Some(1375.0), table).as_deref(),
+            Some("Inconel 718 1375")
+        );
+    }
+
+    /// Fabrication path 1, end to end through the real JATS sink: from one
+    /// properties table, neither `Ti-6Al-4V UTS = 1375` (Inconel's number)
+    /// nor `Ti-6Al-4V UTS = 1` (the "1" of "Table 1", or the digit inside
+    /// "718") may find support in ANY block of the document.
+    #[test]
+    fn jats_properties_table_supports_no_cross_row_claim() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Properties</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Mechanical properties of Ti-6Al-4V and Inconel 718 are shown in Table 1.</p>
+      <table-wrap>
+        <label>Table 1</label>
+        <caption><p>Mechanical properties.</p></caption>
+        <table>
+          <tr><th>Alloy</th><th>UTS (MPa)</th></tr>
+          <tr><td>Ti-6Al-4V</td><td>950</td></tr>
+          <tr><td>Inconel 718</td><td>1375</td></tr>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = crate::fulltext::parse_jats(body.as_bytes()).unwrap();
+        for block in &ft.blocks {
+            assert!(
+                supporting_quote("Ti-6Al-4V", "UTS", Some(1375.0), &block.text).is_none(),
+                "block {:?} fabricated support for Inconel's number: {:?}",
+                block.locator.kind,
+                block.text
+            );
+            assert!(
+                supporting_quote("Ti-6Al-4V", "UTS", Some(1.0), &block.text).is_none(),
+                "block {:?} fabricated support from a label digit: {:?}",
+                block.locator.kind,
+                block.text
+            );
+        }
+        // The genuine row still stamps in the table block.
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        assert_eq!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &table.text).as_deref(),
+            Some("Ti-6Al-4V 950")
+        );
     }
 }
