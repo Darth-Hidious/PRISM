@@ -153,8 +153,18 @@ async fn degraded_resume_does_not_lose_papers_or_claim_completeness() {
         4,
         "resume lost papers: the restart branch ate the page budget"
     );
-    // The replayed-then-refetched page 0 merges once, no more.
-    assert_eq!(run2.duplicates_merged, 1);
+    // This corpus contains NO duplicates: the four papers carry distinct
+    // arXiv ids and no DOI, so `dedup_key` yields four distinct keys. A
+    // restart re-reads pages it already walked, and re-reading a record is
+    // not merging two records — reporting it as a merge tells the user their
+    // corpus contained a duplicate work that never existed.
+    //
+    // Mutation: delete the `papers.drain(papers_before_source..)` rollback in
+    // `sweep.rs`'s restart branch and this reads 1.
+    assert_eq!(
+        run2.duplicates_merged, 0,
+        "a restart re-observed its own papers and called it a merge"
+    );
     // Page 1's replay failed on the network; pages 0..3 were then refetched,
     // pages 0/2/3 served from the still-cached entries, page 1 over the
     // network. Counts follow real traffic, not bookkeeping.
@@ -269,4 +279,103 @@ async fn resume_does_not_double_count_merged_duplicates() {
     );
     assert_eq!(run2.pages_from_cache, 2);
     assert_eq!(run2.pages_fetched, 0);
+}
+
+/// The OTHER half of the restart rollback: a genuine merge counted BEFORE the
+/// restart must not survive it and be counted a second time by the re-walk.
+///
+/// The existing degraded-resume test cannot see this. Its corpus has no
+/// duplicates, so `duplicates_before_source` is 0 and restoring it is `0 = 0`
+/// — a line that could be deleted with every test still green. Here pages 0
+/// and 1 serve the SAME arXiv id, so a real merge is on the books when the
+/// restart fires.
+///
+/// Mutation: delete `duplicates_merged = duplicates_before_source;` from
+/// `sweep.rs`'s restart branch and this reads 2 — the pre-restart merge plus
+/// the re-walk's, the exact double-count F4 exists to prevent.
+#[tokio::test]
+async fn a_merge_counted_before_a_restart_is_not_counted_again_after_it() {
+    let mut server = mockito::Server::new_async().await;
+
+    // Pages 0 and 1 are the SAME work: one real duplicate, merged once.
+    for start in [0usize, 1] {
+        server
+            .mock("GET", "/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "start".to_string(),
+                start.to_string(),
+            ))
+            .with_status(200)
+            .with_body(feed("2401.33330", "Twice Listed", None))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+    }
+    // Page 2 is healthy for run 1, then fails once in run 2 (its cache entry
+    // is dropped, so the replay must refetch and gets the 500) — that is what
+    // enters the restart branch — then healthy again for the re-walk.
+    server
+        .mock("GET", "/")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "start".to_string(),
+            "2".to_string(),
+        ))
+        .with_status(200)
+        .with_body(feed("2401.33332", "Paper C", None))
+        .expect(1)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "start".to_string(),
+            "2".to_string(),
+        ))
+        .with_status(500)
+        .with_body("upstream melt")
+        .expect(1)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "start".to_string(),
+            "2".to_string(),
+        ))
+        .with_status(200)
+        .with_body(feed("2401.33332", "Paper C", None))
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "start".to_string(),
+            "3".to_string(),
+        ))
+        .with_status(200)
+        .with_body(feed("2401.33333", "Paper D", None))
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let engine = engine_for(&server.url(), cache_dir.clone());
+    let plan = plan(4);
+    let state_path = sweep::default_state_path(dir.path(), &plan);
+
+    let run1 = engine.run_sweep(&plan, &state_path).await.unwrap();
+    assert_eq!(
+        run1.duplicates_merged, 1,
+        "pages 0 and 1 are the same work: exactly one real merge"
+    );
+
+    drop_cached_page(&cache_dir, 2);
+
+    let run2 = engine.run_sweep(&plan, &state_path).await.unwrap();
+    assert_eq!(
+        run2.duplicates_merged, 1,
+        "the pre-restart merge survived the rollback and was counted twice"
+    );
 }

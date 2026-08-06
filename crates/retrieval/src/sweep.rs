@@ -137,6 +137,11 @@ impl RetrievalEngine {
             let mut count_this_source = 0usize;
             let mut error_this_source: Option<String> = None;
             let mut exhausted = false;
+            // Where this source's contribution to the run begins. Sources are
+            // walked strictly sequentially, so everything it pushes is a
+            // contiguous tail — which is what makes a restart able to undo it.
+            let papers_before_source = papers.len();
+            let duplicates_before_source = duplicates_merged;
 
             loop {
                 if pages_this_source >= plan.max_pages_per_source {
@@ -202,6 +207,20 @@ impl RetrievalEngine {
                             // that is how resumes silently lost tail papers.
                             pages_this_source = 0;
                             count_this_source = 0;
+                            // Roll back what this source already contributed.
+                            // The restart rewinds its cursor, its completed
+                            // markers and its budgets; leaving its papers in
+                            // `seen` makes the re-walk re-observe every one of
+                            // them and report each as a MERGED DUPLICATE — a
+                            // merge the corpus never contained. `dedup_key`
+                            // collisions are how two DISTINCT records become
+                            // one work; re-reading the same record is not a
+                            // merge, and saying so in the outcome JSON is a
+                            // lie about the corpus.
+                            for replaced in papers.drain(papers_before_source..) {
+                                seen.remove(&replaced.dedup_key());
+                            }
+                            duplicates_merged = duplicates_before_source;
                         }
                     }
                     continue;
