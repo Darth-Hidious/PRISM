@@ -2859,6 +2859,36 @@ fn an_unknown_material_class_keeps_its_own_name() {
     );
 }
 
+/// Opening `ObjectKind` to `Other(String)` put BACKEND-SUPPLIED text on the
+/// path to the terminal for the first time — every variant used to be a
+/// `&'static str`. `label` and `detail` have always gone through
+/// `sanitize_for_render`; `kind` had never needed to, so it did not. That is
+/// an ANSI-injection vector into the sidebar, the exact class
+/// `snapshot_ansi_injection_sanitized` exists for.
+///
+/// Mutation: drop the `sanitize_for_render` around `kind` in `apply_agent_msg`
+/// and this fails.
+#[test]
+fn an_unknown_kind_cannot_carry_terminal_control_sequences() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-esc".into(),
+        kind: "cera\u{1b}[31mmic\u{7}".into(),
+        label: "evil".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    let rendered = app.objects[0].kind.as_str().to_string();
+    for (name, ch) in [("ESC", '\u{1b}'), ("BEL", '\u{7}')] {
+        assert!(
+            !rendered.contains(ch),
+            "{name} survived into the rendered kind: {rendered:?}"
+        );
+    }
+}
+
 #[test]
 fn object_update_failed_shows_error() {
     // A failed simulation must NOT silently vanish or read as done.

@@ -3891,7 +3891,12 @@ impl App {
                 if id.trim().is_empty() {
                     return;
                 }
-                let obj_kind = ObjectKind::from_str_loose(&kind);
+                // Sanitize BEFORE parsing. `kind` is backend-supplied and now
+                // reaches the terminal verbatim through `ObjectKind::Other`
+                // (5a3e3a46). While every variant was a &'static str this was
+                // safe; it is not any more. `label` and `detail` below have
+                // always been sanitized — kind had simply never needed it.
+                let obj_kind = ObjectKind::from_str_loose(&sanitize_for_render(&kind));
                 let obj_status = ObjectStatus::from_str_loose(&status);
                 let progress = match (progress_current, progress_total) {
                     (Some(c), Some(t)) => Some((c, t)),

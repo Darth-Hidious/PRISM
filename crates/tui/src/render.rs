@@ -971,7 +971,12 @@ fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: u
             Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
             Span::styled(format!("{glyph} "), Style::default().fg(t.dim)),
             Span::styled(
-                format!("{:<6} ", obj.kind.as_str()),
+                // `{:<6}` PADS to six but never truncates. Every variant used
+                // to be a short static string so that was fine; `Other` now
+                // carries an arbitrary backend name, and a long one would run
+                // over the label and shove the tag marker off the row — the
+                // same overflow class as the tab strip in 88b96329. Clip first.
+                format!("{:<6} ", clip(obj.kind.as_str(), 10)),
                 Style::default().fg(t.muted),
             ),
             Span::styled(label, Style::default().fg(t.text)),
