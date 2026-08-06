@@ -592,7 +592,7 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         " Workspace",
         Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
     )));
-    lines.push(workspace_tabs_line(app, t));
+    lines.push(workspace_tabs_line(app, t, w));
     if let Some(stats) = workspace_stats_line(app, t) {
         lines.push(stats);
     }
@@ -617,13 +617,30 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, inner);
 }
 
-fn workspace_tabs_line(app: &App, t: Theme) -> Line<'static> {
-    let tabs = [
+fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> Line<'static> {
+    // Four full labels are 31 columns. The sidebar is narrower than that on a
+    // small terminal, and the paragraph wraps — "Objects" dropped onto its own
+    // line, ate a row of the panel and shoved every entry down (caught at
+    // 40x12). Abbreviate instead of wrapping: a cramped strip is legible, a
+    // wrapped one silently costs a row of content.
+    const FULL: [(WorkspaceTab, &str); 4] = [
         (WorkspaceTab::Activity, "Activity"),
         (WorkspaceTab::Tools, "Tools"),
         (WorkspaceTab::Files, "Files"),
         (WorkspaceTab::Objects, "Objects"),
     ];
+    const SHORT: [(WorkspaceTab, &str); 4] = [
+        (WorkspaceTab::Activity, "Act"),
+        (WorkspaceTab::Tools, "Too"),
+        (WorkspaceTab::Files, "Fil"),
+        (WorkspaceTab::Objects, "Obj"),
+    ];
+    // Rendered width: a leading space, a space between each, and the active
+    // label gains two brackets.
+    let width_of = |set: &[(WorkspaceTab, &str); 4]| -> usize {
+        1 + set.iter().map(|(_, l)| l.len()).sum::<usize>() + (set.len() - 1) + 2
+    };
+    let tabs = if width_of(&FULL) <= w { FULL } else { SHORT };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (tab, label)) in tabs.iter().enumerate() {
         if i > 0 {

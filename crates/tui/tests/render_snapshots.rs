@@ -547,6 +547,45 @@ fn snapshot_tiny_terminal_basic_chat_40x12() {
     insta::assert_snapshot!("tiny_terminal_basic_chat_40x12", rendered);
 }
 
+/// The workspace tab strip must never WRAP, at any terminal width.
+///
+/// Adding a fourth tab pushed the full strip (`[Activity] Tools Files
+/// Objects`, 31 columns) past the sidebar width on a small terminal. The
+/// paragraph wrapped, "Objects" landed on its own line, and it silently cost a
+/// row of panel content — every entry shifted down. That regression shipped
+/// inside a 41-file bulk snapshot update and a reviewer caught it, not the
+/// suite: a snapshot records whatever it is given, so it cannot object to a
+/// layout getting worse. This asserts the invariant directly.
+///
+/// Mutation: make `workspace_tabs_line` always use the FULL labels and this
+/// fails at 40 columns.
+#[test]
+fn workspace_tab_strip_never_wraps_at_any_width() {
+    for (w, h) in [(40, 12), (60, 20), (100, 30), (200, 60)] {
+        let app = fake_app();
+        let rendered = render_app_to_string(&app, w, h);
+        let strip = rendered
+            .lines()
+            .find(|l| l.contains("[Activity]") || l.contains("[Act]"))
+            .unwrap_or_else(|| panic!("no workspace tab strip rendered at {w}x{h}"));
+        // All four tabs must sit on that ONE line. If the strip wrapped, the
+        // trailing tab is on the next line and this fails.
+        for (full, short) in [
+            ("Activity", "Act"),
+            ("Tools", "Too"),
+            ("Files", "Fil"),
+            ("Objects", "Obj"),
+        ] {
+            assert!(
+                strip.contains(full) || strip.contains(short),
+                "tab `{full}` missing from the strip at {w}x{h} — it wrapped \
+                 onto another line and stole a row of panel content.\n\
+                 strip: {strip:?}"
+            );
+        }
+    }
+}
+
 /// Snapshot: wide terminal basic chat at 200x60.
 #[test]
 fn snapshot_wide_terminal_basic_chat_200x60() {

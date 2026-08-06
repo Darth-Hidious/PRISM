@@ -3,10 +3,10 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New ses│ Workspace
-response: PRISM▲│ [Activity] Tools Files
-TUI is running ║│Objects
-in deterministi║│
-test mode.     █│  1. prompt "Hello" •
+response: PRISM▲│ [Act] Too Fil Obj
+TUI is running ║│
+in deterministi║│  1. prompt "Hello" •
+test mode.     █│
                ▼│
 ┌ Prompt ──────┐│
 │ Type a messag││
