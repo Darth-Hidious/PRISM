@@ -322,6 +322,9 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
     let mut sink: Option<Sink> = None;
     // Which element opened the current wrap: "table-wrap" or "fig".
     let mut wrap_element: Option<&'static str> = None;
+    // Inside a <xref ref-type="bibr"> whose text is being wrapped in [...]
+    // so it reads as the bracketed citation marker it is by construction.
+    let mut wrapping_bibr_xref = false;
     let mut current_label: Option<String> = None;
     let mut text = String::new();
 
@@ -340,6 +343,7 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                 &e.decode().unwrap_or_default(),
             )),
             Event::Start(e) => {
+                let mut start_chunk: Option<String> = None;
                 match e.local_name().as_ref() {
                     b"front" => depth_front += 1,
                     b"body" => depth_body += 1,
@@ -395,9 +399,25 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         sink = Some(Sink::Paragraph);
                         text.clear();
                     }
+                    // The text of a bibliographic-reference xref is a
+                    // citation marker by construction. Superscript numbering
+                    // renders it as a bare number ("studied 1140."), which
+                    // the claims guard cannot tell from a measurement; wrap
+                    // it in [...] so it reads as the bracketed citation it
+                    // is and the existing citation guard refuses it.
+                    b"xref" if sink.is_some() => {
+                        let is_bibr = e
+                            .attributes()
+                            .flatten()
+                            .any(|a| a.key.as_ref() == b"ref-type" && a.value.as_ref() == b"bibr");
+                        if is_bibr {
+                            wrapping_bibr_xref = true;
+                            start_chunk = Some("[".to_string());
+                        }
+                    }
                     _ => {}
                 }
-                None
+                start_chunk
             }
             // A self-closing tag carries no content and never gets an End
             // event: it must not open a sink or a depth, or the parser
@@ -453,6 +473,12 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         }
                         sink = Some(Sink::Wrap);
                     }
+                    b"xref" if wrapping_bibr_xref => {
+                        if sink.is_some() {
+                            text.push(']');
+                        }
+                        wrapping_bibr_xref = false;
+                    }
                     b"table-wrap" | b"fig"
                         if sink == Some(Sink::Wrap) || sink == Some(Sink::Caption) =>
                     {
@@ -491,7 +517,7 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                 text.pop();
                 current_label = Some(trimmed);
             } else {
-                if !text.is_empty() && !text.ends_with(' ') {
+                if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('[') {
                     text.push(' ');
                 }
                 text.push_str(&trimmed);
@@ -719,6 +745,42 @@ mod tests {
         assert_eq!(
             rows,
             vec!["Alloy UTS (MPa)", "Ti-6Al-4V 950", "Inconel 718 1375"]
+        );
+    }
+
+    /// H6: the text of a <xref ref-type="bibr"> is a citation marker by
+    /// construction; superscript numbering parses it to a bare number the
+    /// claims guard cannot tell from a measurement. The parser wraps it in
+    /// [...] so the existing bracketed-citation guard refuses it. Non-bibr
+    /// xrefs pass through untouched: the wrap must not reach beyond
+    /// bibliographic references.
+    #[test]
+    fn bibr_xref_text_is_wrapped_as_citation_marker() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Citation probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Ti-6Al-4V has been widely studied<sup><xref ref-type="bibr" rid="b1">1140</xref></sup>.</p>
+      <p>Properties are shown in <xref ref-type="fig">Fig. 2</xref>.</p>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let texts: Vec<&str> = ft.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Ti-6Al-4V has been widely studied [1140] ."),
+            "bibr xref not wrapped as a citation marker: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Properties are shown in Fig. 2 ."),
+            "a non-bibr xref must pass through untouched: {texts:?}"
         );
     }
 

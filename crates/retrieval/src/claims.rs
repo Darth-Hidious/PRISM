@@ -391,15 +391,33 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     true
 }
 
-/// Is the occurrence inside a bracketed citation marker such as `[1140]`,
-/// `[11, 12]` or `[11–13]`? Walk back over the digits and separators a
-/// citation range may contain; if the first other character is `[`, the
-/// number is a citation, not a measurement.
+/// Is the occurrence inside a citation marker? Bracketed styles
+/// (`[1140]`, `[11, 12]`, `[11–13]`) and the paren/brace styles that
+/// survive as bare numbers in text (`(1140)`, `{1140, 1141}`). Walk back
+/// over the digits and separators a citation range may contain; if the
+/// first other character is `[`, the number is a citation, not a
+/// measurement. `(` / `{` count only when the marker also CLOSES before
+/// any non-number text: "(950 MPa)" is a parenthesized value, not a
+/// citation, so a bracket-class rule that only looks backwards would
+/// refuse legitimate values.
 fn inside_citation_marker(hay: &str, start: usize) -> bool {
     let prefix = hay[..start].trim_end_matches(|c: char| {
         c.is_ascii_digit() || matches!(c, ',' | ' ' | '-' | '\u{2013}' | '\u{2014}')
     });
-    prefix.ends_with('[')
+    let Some(open) = prefix.chars().next_back() else {
+        return false;
+    };
+    match open {
+        '[' => true,
+        '(' | '{' => {
+            let close = if open == '(' { ')' } else { '}' };
+            let after = hay[start..].trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, ',' | ' ' | '-' | '\u{2013}' | '\u{2014}')
+            });
+            after.starts_with(close)
+        }
+        _ => false,
+    }
 }
 
 /// Words after which a number is a label, never a measurement.
@@ -1030,6 +1048,90 @@ mod tests {
         assert_eq!(
             supporting_quote("Inconel 718", "UTS", Some(1375.0), table).as_deref(),
             Some("Inconel 718 1375")
+        );
+    }
+
+    /// H6, prose side: parenthesized and braced citation numbers are
+    /// markers, not measurements. The closing-side check is what keeps
+    /// the legitimate parenthesized value "UTS (950 MPa)" stamping: a
+    /// bracket-class rule that only looks backwards would refuse it, so
+    /// '(' / '{' count as citation openers only when the marker closes
+    /// before any non-number text.
+    #[test]
+    fn paren_and_brace_citation_numbers_are_not_support() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            1140.0,
+            "Ti-6Al-4V has been widely studied (1140).",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            1140.0,
+            "Ti-6Al-4V has been widely studied {1140}.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            1140.0,
+            "Ti-6Al-4V has been widely studied (1140, 1141).",
+        );
+        // Positive control: a parenthesized value WITH its unit is not a
+        // citation and must stamp.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "The Ti-6Al-4V UTS (950 MPa) was reproducible."
+            )
+            .is_some()
+        );
+    }
+
+    /// H6 end to end through parse_jats: superscript bibr xrefs parse to
+    /// a bare number, and `prefix.ends_with('[')` never sees them. The
+    /// parser wraps bibr xref text in [...], so the bracketed-citation
+    /// guard refuses it: the extractor prompt's own example fact
+    /// (Ti-6Al-4V / UTS / 1140) must never stamp against this sentence.
+    /// A real value in the same sentence still stamps (the required
+    /// "real value after a citation" positive control).
+    #[test]
+    fn jats_bibr_xref_number_is_not_support() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Citations</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Ti-6Al-4V has been widely studied<sup><xref ref-type="bibr" rid="b1">1140</xref></sup>; its UTS is 950 MPa.</p>
+    </sec>
+  </body>
+</article>"#;
+        let ft = crate::fulltext::parse_jats(body.as_bytes()).unwrap();
+        for block in &ft.blocks {
+            assert!(
+                supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), &block.text).is_none(),
+                "block {:?} fabricated support from a superscript citation: {:?}",
+                block.locator.kind,
+                block.text
+            );
+        }
+        let body_block = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Body)
+            .unwrap();
+        assert!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &body_block.text).is_some(),
+            "the real value after the citation must still stamp: {:?}",
+            body_block.text
         );
     }
 
