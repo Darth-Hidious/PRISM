@@ -789,6 +789,25 @@ mod tests {
         );
     }
 
+    /// The two decimal-point guards in `clean_number_boundary` each do
+    /// work no other guard covers: the fractional digit of "11.5" matches
+    /// value 5 (only the BEFORE-'.' guard refuses it), and the integer
+    /// part matches value 11 (only the AFTER-'.' guard refuses it). The
+    /// pre-existing decimal case (1.5 vs 11.5) is caught by the
+    /// alphanumeric guards instead, so without these two asserts both
+    /// guards could be deleted with the whole suite green. Each guard is
+    /// mutation-proven red independently.
+    #[test]
+    fn decimal_point_guards_refuse_partial_number_matches() {
+        let block = "The CoCrFeNi conductivity is 11.5 W/(m K).";
+        // The fractional digit: only the before-'.' guard refuses it.
+        assert!(supporting_quote("CoCrFeNi", "conductivity", Some(5.0), block).is_none());
+        // The integer part: only the after-'.' guard refuses it.
+        assert!(supporting_quote("CoCrFeNi", "conductivity", Some(11.0), block).is_none());
+        // Positive control: 11.5 itself still stamps.
+        assert!(supporting_quote("CoCrFeNi", "conductivity", Some(11.5), block).is_some());
+    }
+
     /// F-1: a thousands comma adjacent to a digit is part of the number,
     /// in both directions. "1,140" must behave byte-for-byte like "1140":
     /// searching for 140 or 1 inside it finds nothing, exactly the
