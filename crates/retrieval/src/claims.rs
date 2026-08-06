@@ -189,8 +189,9 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 /// * numeric fact: the value's number appears together with the subject or
 ///   the object (a bare number could be a citation, so the number alone is
 ///   not enough). The number must occur as its own token — not as a
-///   substring of a longer number and not as a digit inside an alloy
-///   designation — and the occurrence must be evidential: a number inside
+///   substring of a longer number and not a digit of an alloy
+///   designation, glued (Ti-6Al-4V) or spaced (the claim's own Inconel 718)
+///   — and the occurrence must be evidential: a number inside
 ///   a citation marker `[...]` or immediately after Table/Figure/Ref is a
 ///   label, not a measurement;
 /// * non-numeric fact: both subject and object appear.
@@ -207,7 +208,7 @@ pub fn supporting_quote(
         let hay = normalize_for_containment(span);
         let supported = match value {
             Some(v) => {
-                number_is_evidential(&hay, v)
+                number_is_evidential(&hay, v, &subject_n, &object_n)
                     && ((!subject_n.is_empty() && hay.contains(&subject_n))
                         || (!object_n.is_empty() && hay.contains(&object_n)))
             }
@@ -257,16 +258,18 @@ fn supporting_spans(text: &str) -> Vec<&str> {
 }
 
 /// Does `hay` contain the value as an evidential measurement? At least one
-/// string form of the value must occur with clean token boundaries and must
-/// not be a citation marker or a Table/Figure/Ref label number.
-fn number_is_evidential(hay: &str, value: f64) -> bool {
+/// string form of the value must occur with clean token boundaries, must
+/// not be a citation marker or a Table/Figure/Ref label number, and must
+/// not sit inside an occurrence of the subject's or object's own name
+/// (the "718" of "Inconel 718").
+fn number_is_evidential(hay: &str, value: f64, subject_n: &str, object_n: &str) -> bool {
     number_needles(value)
         .iter()
-        .any(|needle| evidential_number_occurrence(hay, needle))
+        .any(|needle| evidential_number_occurrence(hay, needle, subject_n, object_n))
 }
 
 /// Scan every occurrence of `needle` in `hay` for one that is real evidence.
-fn evidential_number_occurrence(hay: &str, needle: &str) -> bool {
+fn evidential_number_occurrence(hay: &str, needle: &str, subject_n: &str, object_n: &str) -> bool {
     let mut search_from = 0usize;
     while let Some(rel) = hay[search_from..].find(needle) {
         let start = search_from + rel;
@@ -274,10 +277,34 @@ fn evidential_number_occurrence(hay: &str, needle: &str) -> bool {
         if clean_number_boundary(hay, needle, start, end)
             && !inside_citation_marker(hay, start)
             && !preceding_word_is_label(hay, start)
+            && !occurrence_inside_name(hay, start, end, subject_n)
+            && !occurrence_inside_name(hay, start, end, object_n)
         {
             return true;
         }
         search_from = start + 1;
+    }
+    false
+}
+
+/// Does the occurrence at [start, end) sit inside an occurrence of the
+/// claim's own subject/object name? Space-separated designations like
+/// "Inconel 718" have clean token boundaries around their trailing digits,
+/// so the boundary rule cannot tell the "718" of the name from a measured
+/// 718; positional containment inside the name can. An occurrence that
+/// repeats OUTSIDE the name is still evidence.
+fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut search_from = 0usize;
+    while let Some(rel) = hay[search_from..].find(name) {
+        let name_start = search_from + rel;
+        let name_end = name_start + name.len();
+        if name_start <= start && end <= name_end {
+            return true;
+        }
+        search_from = name_start + 1;
     }
     false
 }
@@ -360,6 +387,21 @@ const LABEL_WORDS: &[&str] = &[
     "refs",
     "reference",
     "references",
+    "section",
+    "sections",
+    "eq",
+    "equation",
+    "equations",
+    "chapter",
+    "chapters",
+    "sample",
+    "samples",
+    "run",
+    "runs",
+    "entry",
+    "entries",
+    "scheme",
+    "schemes",
 ];
 
 /// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
@@ -908,6 +950,58 @@ mod tests {
             // mutation-proven red when ref/refs are removed from
             // LABEL_WORDS.
             "UTS data for Ti-6Al-4V appears in Ref 25.",
+        );
+    }
+
+    /// F-3: the label vocabulary also covers Section/Eq/Chapter/Sample/
+    /// Run/Entry/Scheme labels. Mutation-proven: removing "section" from
+    /// LABEL_WORDS turns the first assert red.
+    #[test]
+    fn section_and_kindred_label_numbers_are_not_support() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            4.0,
+            "The Ti-6Al-4V results are in Section 4.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            7.0,
+            "The Ti-6Al-4V model is given in Eq 7.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            2.0,
+            "The Ti-6Al-4V route is shown in Scheme 2.",
+        );
+    }
+
+    /// F-4: the same protection for SPACE-separated designations, where
+    /// the boundary rule cannot help: the trailing digits of the claim's
+    /// own subject/object are part of the name, not a measurement.
+    /// Mutation-proven red when the inside-designation check is removed.
+    /// An occurrence that is genuinely repeated OUTSIDE the name still
+    /// stamps (last assert), so this is not a blanket digit-phobia.
+    #[test]
+    fn spaced_designation_digits_of_the_claims_own_name_are_not_support() {
+        let table = "Alloy UTS (MPa)\nTi-6Al-4V 950\nInconel 718 1375";
+        assert_dropped_end_to_end("Inconel 718", "UTS", 718.0, table);
+        // The digits recur as a real measurement beside the name: stamp.
+        assert!(
+            supporting_quote(
+                "Inconel 718",
+                "UTS",
+                Some(718.0),
+                "Inconel 718 showed a UTS of 718 MPa."
+            )
+            .is_some()
+        );
+        // Positive control: the genuine row still stamps verbatim.
+        assert_eq!(
+            supporting_quote("Inconel 718", "UTS", Some(1375.0), table).as_deref(),
+            Some("Inconel 718 1375")
         );
     }
 
