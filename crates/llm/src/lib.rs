@@ -2781,6 +2781,29 @@ mod tests {
         assert_eq!(arguments["limit"], 2);
     }
 
+    /// The close-delimiter arm had NO test — `grep "mismatched delimiters"`
+    /// matched only the `bail!`. Two closers were merged into one arm to clear
+    /// a clippy gate, so this pins what the merge must preserve: each closer
+    /// derives the opener IT closes.
+    ///
+    /// Only the accept case is asserted, and that is deliberate. I wrote the
+    /// obvious reject case first (`x=[1, 2}`) and mutation-checked it: with the
+    /// kind-check replaced by `pop().is_none()` the test still PASSED, because
+    /// any crossed-delimiter input is also invalid JSON and `serde_json` rejects
+    /// it one line later. That assertion could not fail, so it is not here.
+    /// The kind-check is defence in depth, not independently observable through
+    /// this API. The accept case IS observable: swapping the opener derivation
+    /// to `if byte == b'}' { b'[' } else { b'{' }` fails this test.
+    #[test]
+    fn lfm_argument_parser_accepts_correctly_nested_delimiters() {
+        let (_, arguments) = parse_native_tool_call(
+            "<|tool_call_start|>[f(x=[1, 2], y={\"k\": 3})]<|tool_call_end|>",
+        )
+        .expect("correctly nested delimiters must still parse");
+        assert_eq!(arguments["x"][1], 2);
+        assert_eq!(arguments["y"]["k"], 3);
+    }
+
     #[test]
     fn local_tool_response_maps_a_strict_final_answer() {
         let response = LlmClient::local_chat_response(
