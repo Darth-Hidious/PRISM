@@ -2825,6 +2825,40 @@ fn parsed_object_update_without_status_does_not_become_running() {
     }
 }
 
+/// PRISM is not a metals tool. A ceramic, composite, MOF or electrolyte used
+/// to collapse into `ObjectKind::Result` — the UI told the user a ceramic was
+/// a "Result", a label the backend never sent. Same class of lie as the status
+/// defect in 746ec620, and the same mistake the ml_train design warns about:
+/// class is DATA, not an enum arm.
+///
+/// Mutation: restore `_ => Self::Result` in `from_str_loose` and this fails.
+#[test]
+fn an_unknown_material_class_keeps_its_own_name() {
+    for kind in ["ceramic", "composite", "MOF", "electrolyte", "thin_film"] {
+        let parsed = prism_tui::app::ObjectKind::from_str_loose(kind);
+        assert_eq!(
+            parsed.as_str(),
+            kind,
+            "`{kind}` must render as itself, not be relabelled"
+        );
+        assert_ne!(
+            parsed,
+            prism_tui::app::ObjectKind::Result,
+            "`{kind}` collapsed into Result — that invents a label"
+        );
+    }
+    // The known kinds still resolve, and an empty kind is honestly a Result
+    // rather than an object named "".
+    assert_eq!(
+        prism_tui::app::ObjectKind::from_str_loose("polymer"),
+        prism_tui::app::ObjectKind::Polymer
+    );
+    assert_eq!(
+        prism_tui::app::ObjectKind::from_str_loose("  "),
+        prism_tui::app::ObjectKind::Result
+    );
+}
+
 #[test]
 fn object_update_failed_shows_error() {
     // A failed simulation must NOT silently vanish or read as done.

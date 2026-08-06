@@ -77,35 +77,52 @@ pub enum WorkspaceTab {
     Objects,
 }
 
-/// Domain-object kind (structure, alloy, polymer, simulation, result).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Domain-object kind.
+///
+/// The named variants are the kinds this build draws a distinct GLYPH for.
+/// They are NOT the set of materials PRISM supports — that set is open, and a
+/// closed enum here would be the same mistake the ml_train design calls out
+/// for model classes: "class is DATA, not an enum arm… turns every new family
+/// into a code change — backwards for a materials platform".
+///
+/// PRISM is not a metals tool. Ceramics, composites, MOFs, electrolytes, small
+/// molecules and whatever comes next arrive as `Other`, carrying their own
+/// name, and render as themselves. They used to collapse into `Result`, which
+/// told the user a ceramic was a "Result" — inventing a label the backend
+/// never sent, the same class of lie as the status defect fixed in 746ec620.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectKind {
     Structure,
     Alloy,
     Polymer,
     Simulation,
     Result,
+    /// A kind this build has no glyph for — carried VERBATIM, never guessed.
+    Other(String),
 }
 
 impl ObjectKind {
-    /// Parse from a backend string. Unknown kinds fall back to `Result`.
+    /// Parse from a backend string. An unrecognised kind keeps its own name.
     pub fn from_str_loose(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "structure" | "crystal" => Self::Structure,
             "alloy" | "hea" => Self::Alloy,
             "polymer" => Self::Polymer,
             "simulation" | "sim" | "md" => Self::Simulation,
-            _ => Self::Result,
+            "result" => Self::Result,
+            other if other.trim().is_empty() => Self::Result,
+            _ => Self::Other(s.trim().to_string()),
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Structure => "Structure",
             Self::Alloy => "Alloy",
             Self::Polymer => "Polymer",
             Self::Simulation => "Simulation",
             Self::Result => "Result",
+            Self::Other(name) => name,
         }
     }
 
@@ -117,6 +134,9 @@ impl ObjectKind {
             Self::Polymer => "⌇",
             Self::Simulation => "▶",
             Self::Result => "◆",
+            // Deliberately neutral: a glyph borrowed from another kind would
+            // imply we know what this is.
+            Self::Other(_) => "·",
         }
     }
 }
