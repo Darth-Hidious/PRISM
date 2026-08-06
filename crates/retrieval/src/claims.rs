@@ -1104,4 +1104,62 @@ mod tests {
             Some("Ti-6Al-4V 950")
         );
     }
+
+    /// Fabrication path 1, OASIS/CALS table model (H1): JATS permits two
+    /// table models; a paper using <tgroup>/<row>/<entry> is no less
+    /// protected than one using <tr>/<td>. From ONE OASIS table,
+    /// `Ti-6Al-4V UTS = 1375` (Inconel's number) must find no support in
+    /// any block; both genuine rows still stamp. Mutation-proven red when
+    /// `row` is removed from the row-boundary match in parse_jats.
+    #[test]
+    fn jats_oasis_table_supports_no_cross_row_claim() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Properties</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Mechanical properties are shown in Table 1.</p>
+      <table-wrap>
+        <label>Table 1</label>
+        <table>
+          <tgroup cols="2">
+            <tbody>
+              <row><entry>Ti-6Al-4V</entry><entry>950</entry></row>
+              <row><entry>Inconel 718</entry><entry>1375</entry></row>
+            </tbody>
+          </tgroup>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = crate::fulltext::parse_jats(body.as_bytes()).unwrap();
+        for block in &ft.blocks {
+            assert!(
+                supporting_quote("Ti-6Al-4V", "UTS", Some(1375.0), &block.text).is_none(),
+                "block {:?} fabricated support for Inconel's number: {:?}",
+                block.locator.kind,
+                block.text
+            );
+        }
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        assert_eq!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &table.text).as_deref(),
+            Some("Ti-6Al-4V 950")
+        );
+        assert_eq!(
+            supporting_quote("Inconel 718", "UTS", Some(1375.0), &table.text).as_deref(),
+            Some("Inconel 718 1375")
+        );
+    }
 }

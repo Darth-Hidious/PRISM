@@ -379,12 +379,16 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         sink = Some(Sink::Caption);
                         text.clear();
                     }
-                    b"tr" if sink == Some(Sink::Wrap) => {
+                    b"tr" | b"row" if sink == Some(Sink::Wrap) => {
                         // Preserve row structure: each row starts on its own
                         // line so evidence spans never straddle rows. Rows
                         // joined with spaces fuse the whole table into one
                         // span, letting a number from one row "support" a
                         // claim whose subject lives in another row.
+                        //
+                        // JATS permits TWO table models: XHTML (<tr>) and
+                        // OASIS/CALS (<tgroup>/<row>/<entry>); publishers use
+                        // both, so <row> is a row boundary exactly like <tr>.
                         text.push('\n');
                     }
                     b"p" if depth_body > 0 && sink.is_none() => {
@@ -716,6 +720,51 @@ mod tests {
             rows,
             vec!["Alloy UTS (MPa)", "Ti-6Al-4V 950", "Inconel 718 1375"]
         );
+    }
+
+    /// H1: JATS permits TWO table models. The OASIS/CALS model uses
+    /// <tgroup>/<row>/<entry> instead of <tr>/<td>, and half the corpus
+    /// uses it. A <row> must delimit rows exactly like <tr>, or the whole
+    /// OASIS table fuses into one span and a number from one row
+    /// "supports" a claim whose subject lives in another row.
+    #[test]
+    fn oasis_table_rows_stay_separate_lines() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>OASIS row probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <table-wrap>
+        <label>Table 1</label>
+        <table>
+          <tgroup cols="2">
+            <tbody>
+              <row><entry>Ti-6Al-4V</entry><entry>950</entry></row>
+              <row><entry>Inconel 718</entry><entry>1375</entry></row>
+            </tbody>
+          </tgroup>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
+        let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
+        // Exact row structure: two separate rows, so the two alloys'
+        // numbers (950 / 1375) never share one.
+        assert_eq!(rows, vec!["Ti-6Al-4V 950", "Inconel 718 1375"]);
     }
 
     #[test]
