@@ -2665,6 +2665,80 @@ fn object_update_running_never_renders_as_complete() {
     );
 }
 
+/// Notifications are not ordered. A `running` tick emitted just before the
+/// job finished can arrive after `completed` (retry, replay, the 50-step
+/// progress callback racing the finish). Before the guard, the upsert
+/// overwrote unconditionally and a finished simulation went back to
+/// "running" — the user would then wait for a result he already had.
+/// Mutation: delete the `if !existing.status.is_terminal()` guard in
+/// `app.rs` and this fails on the status assertion.
+#[test]
+fn object_terminal_status_is_never_resurrected_by_a_late_running() {
+    let mut app = test_app();
+    for status in ["running", "completed"] {
+        app.apply_agent_msg(AgentMsg::ObjectUpdate {
+            id: "sim-9".into(),
+            kind: "simulation".into(),
+            label: "MD NPT 300K".into(),
+            status: status.into(),
+            progress_current: Some(10000),
+            progress_total: Some(10000),
+            detail: None,
+        });
+    }
+    assert_eq!(app.objects[0].status, ObjectStatus::Completed);
+
+    // The straggler.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-9".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: Some(9950),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    assert_eq!(
+        app.objects[0].status,
+        ObjectStatus::Completed,
+        "a late `running` must not resurrect a finished object"
+    );
+    assert_eq!(
+        app.objects[0].progress,
+        Some((10000, 10000)),
+        "the stale progress must not overwrite the final one either"
+    );
+}
+
+/// An unrecognised status string used to fall through to `Running`, so a
+/// `cancelled` or `queued` object rendered as actively running — a state the
+/// backend never reported. Mutation: change the `_` arm back to
+/// `Self::Running` and this fails.
+#[test]
+fn object_unrecognised_status_is_not_reported_as_running() {
+    let mut app = test_app();
+    for (i, status) in ["cancelled", "queued", "skipped"].iter().enumerate() {
+        app.apply_agent_msg(AgentMsg::ObjectUpdate {
+            id: format!("obj-{i}"),
+            kind: "simulation".into(),
+            label: format!("job {i}"),
+            status: (*status).into(),
+            progress_current: None,
+            progress_total: None,
+            detail: None,
+        });
+    }
+    for obj in &app.objects {
+        assert_eq!(
+            obj.status,
+            ObjectStatus::Unknown,
+            "`{}` is not a status this build knows — claiming it is Running \
+             invents state the backend never reported",
+            obj.label
+        );
+    }
+}
+
 #[test]
 fn object_update_failed_shows_error() {
     // A failed simulation must NOT silently vanish or read as done.

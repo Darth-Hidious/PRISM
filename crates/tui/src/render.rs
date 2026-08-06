@@ -944,6 +944,8 @@ fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: u
             }
             ObjectStatus::Completed => ("done".to_string(), t.ok),
             ObjectStatus::Failed => ("FAILED".to_string(), t.err),
+            // Warn colour, not ok: we do not know this is fine.
+            ObjectStatus::Unknown => ("?".to_string(), t.warn),
         };
         let tag_marker = if obj.tagged { " ★" } else { "" };
         let label_budget = w.saturating_sub(12).max(3);

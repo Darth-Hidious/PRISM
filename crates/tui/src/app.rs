@@ -127,6 +127,20 @@ pub enum ObjectStatus {
     Running,
     Completed,
     Failed,
+    /// A status string this build does not recognise — `cancelled`, `queued`,
+    /// something a newer backend sends. Deliberately NOT folded into
+    /// `Running`: a cancelled simulation displayed as actively running is a
+    /// fabricated state, and the whole point of this tab is that the user can
+    /// trust what he is pointing at.
+    Unknown,
+}
+
+impl ObjectStatus {
+    /// Terminal states are final. A late or replayed `running` for an object
+    /// that already finished must not resurrect it.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
 }
 
 impl ObjectStatus {
@@ -135,7 +149,7 @@ impl ObjectStatus {
             "running" | "in_progress" | "active" => Self::Running,
             "completed" | "done" | "success" | "finished" => Self::Completed,
             "failed" | "error" | "errored" => Self::Failed,
-            _ => Self::Running,
+            _ => Self::Unknown,
         }
     }
 }
@@ -3861,8 +3875,16 @@ impl App {
                 if let Some(existing) = self.objects.iter_mut().find(|o| o.id == id) {
                     existing.kind = obj_kind;
                     existing.label = label;
-                    existing.status = obj_status;
-                    existing.progress = progress;
+                    // Terminal is final. Notifications are not ordered — a
+                    // `running` emitted before completion can arrive after it
+                    // (retry, replay, a slow 50-step progress tick racing the
+                    // finish). Letting that overwrite would show a finished
+                    // simulation as running again, and the user would wait on
+                    // a result he already has.
+                    if !existing.status.is_terminal() {
+                        existing.status = obj_status;
+                        existing.progress = progress;
+                    }
                     if let Some(d) = detail {
                         existing.detail = Some(d);
                     }
