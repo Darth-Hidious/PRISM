@@ -283,8 +283,10 @@ fn evidential_number_occurrence(hay: &str, needle: &str) -> bool {
 }
 
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
-/// a decimal point that continues it, or to an alphanumeric. Otherwise "95"
-/// matches inside "950", "1.5" inside "11.5", and the "6" of "Ti-6Al-4V".
+/// a decimal point that continues it, to a digit-adjacent comma that
+/// continues a grouped number ("1,140" is one number, in both directions),
+/// or to an alphanumeric. Otherwise "95" matches inside "950", "1.5" inside
+/// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V".
 fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
@@ -293,12 +295,19 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
         if before == '.' && needle.starts_with(|c: char| c.is_ascii_digit()) {
             return false;
         }
+        if before == ',' && hay[..start - before.len_utf8()].ends_with(|c: char| c.is_ascii_digit())
+        {
+            return false;
+        }
     }
     if let Some(after) = hay[end..].chars().next() {
         if after.is_alphanumeric() {
             return false;
         }
         if after == '.' && hay[end + 1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return false;
+        }
+        if after == ',' && hay[end + after.len_utf8()..].starts_with(|c: char| c.is_ascii_digit()) {
             return false;
         }
     }
@@ -664,6 +673,57 @@ mod tests {
                 "thermal_conductivity",
                 Some(11.5),
                 conductivity_block
+            )
+            .is_some()
+        );
+    }
+
+    /// F-1: a thousands comma adjacent to a digit is part of the number,
+    /// in both directions. "1,140" must behave byte-for-byte like "1140":
+    /// searching for 140 or 1 inside it finds nothing, exactly the
+    /// guarantee `substring_number_match_is_dropped` asserts for 95/950.
+    #[test]
+    fn comma_grouped_number_digits_are_not_token_boundaries() {
+        let block = "The Ti-6Al-4V UTS is 1,140 MPa.";
+        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(140.0), block).is_none());
+        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1.0), block).is_none());
+        // Control: the same fact written without grouping already drops 140.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(140.0),
+                "The Ti-6Al-4V UTS is 1140 MPa."
+            )
+            .is_none()
+        );
+        // The real value still stamps in the grouped form.
+        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), block).is_some());
+
+        assert!(supporting_quote("A", "UTS", Some(12.0), "A UTS is 12,345 MPa.").is_none());
+        assert!(supporting_quote("A", "UTS", Some(345.0), "A UTS is 12,345 MPa.").is_none());
+        assert!(supporting_quote("A", "UTS", Some(12345.0), "A UTS is 12,345 MPa.").is_some());
+
+        // Row form: the leading "1" is not a standalone value either.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1.0),
+                "Alloy UTS\nTi-6Al-4V 1,140\n..."
+            )
+            .is_none()
+        );
+
+        // A list comma is NOT number continuation: a value followed by a
+        // comma and a space must still stamp (pins the digit-adjacency
+        // condition against a blanket comma reject).
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(12.0),
+                "The Ti-6Al-4V samples measured 12, 15 and 950 MPa."
             )
             .is_some()
         );
