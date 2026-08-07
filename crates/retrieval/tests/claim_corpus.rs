@@ -1490,6 +1490,80 @@ fn corpus() -> Vec<CorpusCase> {
              them apart: 300 belongs to another column yet stamps as UTS — \
              row-span support is co-occurrence, not column binding",
         ),
+        // ---------------- KNOWN failures, range-guard gaps (round 11) -
+        // Round 9 recorded "spaced ranges, ASCII-typed ranges and
+        // negative ranges still stamp their endpoints"; round 10
+        // recorded only "spaced ranges" in the round that widened the
+        // negative shape from 2 glyphs to 4. Round 11 restored the
+        // record and pinned it. The guard sees digit/dash/digit
+        // adjacency only: a space defeats it, and the second dash of a
+        // double-dash is followed by a sign, not a digit.
+        known(
+            "The Ti-6Al-4V UTS ranged from -950--400 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "KNOWN: the low endpoint of a negative dash-range stamps as a \
+             point value — after -950 comes a dash and then ANOTHER dash, \
+             not a digit, so the run is never seen; the high endpoint \
+             (-400) drops Range because its before-arm works",
+        ),
+        known(
+            "The Ti-6Al-4V UTS ranged from -950 to -400 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "KNOWN: the word-form negative range stamps its LOW endpoint — \
+             'to' is not a dash, the adjacency guard never fires",
+        ),
+        known(
+            "The Ti-6Al-4V UTS ranged from -950 to -400 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -400.0,
+            Expect::MustDrop,
+            "KNOWN: the word-form negative range stamps its HIGH endpoint \
+             too — both bounds of a range asserted as point values",
+        ),
+        known(
+            "The Ti-6Al-4V UTS ranged from \u{2212}950 to \u{2212}400 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "KNOWN: the U+2212 twin of the negative word-range stamps too — \
+             both surviving sign glyphs carry the gap; round 10 briefly \
+             widened it to four glyphs, round 11 pinned the two",
+        ),
+        known(
+            "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustDrop,
+            "KNOWN: the SPACED-DASH range stamps its low endpoint — journal \
+             typesetting and pdf-extract both commonly emit this shape; the \
+             guard needs the digits glued to the dash",
+        ),
+        known(
+            "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "KNOWN: the spaced-dash range stamps its high endpoint too",
+        ),
+        known(
+            "The Ti-6Al-4V UTS was 950 - 1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustDrop,
+            "KNOWN: the ASCII spaced-dash twin stamps — the gap is the \
+             spaces, not the glyph",
+        ),
         known(
             "The Ti-6Al-4V microstructures are shown in 4a and 4b.",
             "Ti-6Al-4V",

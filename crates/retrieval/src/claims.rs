@@ -718,8 +718,17 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
 /// A SIGNED value is not a range endpoint: a range dash always has a
 /// digit before it, a minus sign does not ("-950" carries whitespace or
 /// line start before the dash), so signed needles survive this guard.
-/// Recorded residual gaps: spaced ranges ("950 to 1100") still stamp
-/// their endpoints.
+/// Recorded residual gaps, restored to the record round 11 (round 10
+/// recorded only the word form in the round that WIDENED the gap):
+/// spaced ranges ("950 to 1100"), spaced-dash ranges ("950 \u{2013}
+/// 1100" and its ASCII twin), and negative ranges (the low endpoint of
+/// "-950--400" stamps; "-950 to -400" stamps both endpoints) still
+/// stamp their endpoints — the guard only sees digit/dash/digit
+/// adjacency, so one space defeats it, and after the second dash of a
+/// double-dash comes a sign, not a digit. Round 10's reversal took the
+/// negative-range shape from two sign glyphs to four; round 11's
+/// revert restored the two ('-', U+2212) but not the drop. All pinned
+/// as KNOWN corpus rows.
 fn dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
     if let Some(after) = hay[end..].chars().next()
         && MINUS_CAPABLE_DASHES.contains(&after)
