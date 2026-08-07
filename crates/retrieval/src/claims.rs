@@ -20,6 +20,11 @@
 //! serialized claim deserializes into it at the ingest boundary. The
 //! vocabulary strings are the stable machine contract ("indeterminate",
 //! "research", "screening", "reference_validated").
+//!
+//! Known provenance caveat: ranges differ by fetch route. JATS preserves
+//! U+2013, whose endpoints this engine refuses; `pdf-extract` normalises
+//! ranges to '-', whose endpoints stamp (compound-friendly, by decision).
+//! The same paper yields different claims depending on how it was fetched.
 
 use serde::{Deserialize, Serialize};
 
@@ -806,6 +811,17 @@ fn trailing_word(prefix: &str) -> String {
 /// negative value appears under both minus glyphs, ASCII hyphen and
 /// U+2212 MINUS SIGN (the glyph typeset PDFs carry); without both, the
 /// true negative claim is dropped while its sign-flipped twin stamps.
+///
+/// DECIDED, NOT IMPLEMENTED (round 6): U+2013 EN DASH as a minus is NOT
+/// a needle glyph. Probed: "was \u{2013}950 MPa" drops the true -950
+/// and stamps the sign-flipped +950 — the compressive-to-tensile
+/// failure the U+2212 needles exist to prevent, under a different
+/// glyph. Adding U+2013 to the minus glyphs collides head-on with the
+/// en-dash range rule in `en_dash_range_endpoint`: the same character
+/// would have to mean "sign of this number" AND "this number is a
+/// range endpoint", and the two features want the character to mean
+/// opposite things. Stays decided until a source is found that emits
+/// U+2013 as a minus rather than a range dash.
 fn number_needles(value: f64) -> Vec<String> {
     let plain = format!("{value}");
     let mut out = vec![plain.clone()];
