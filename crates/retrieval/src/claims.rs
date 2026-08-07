@@ -519,11 +519,24 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             if !UNIT_INITIALS.contains(&after) {
                 return false;
             }
-            // A glued unit letter redeems a number, but never a digit
-            // inside a hyphen-joined designation (the "6" of "Ti-6Al-4V",
-            // ASCII or en/em dash).
+            // A glued unit letter redeems a number, but not a digit that
+            // a LETTER dash-joins into a designation (the "6" of
+            // "Ti-6Al-4V", ASCII or en/em dash). A dash preceded by a
+            // digit joins numeric runs instead, and the second number
+            // keeps its unit: "30-50um" layers and "5-10mm" grains are
+            // measurements — refusing the high endpoint while the low
+            // one stamped was the asymmetry that dropped the two
+            // most-quoted LPBF numbers. A dash leading the span (no char
+            // before it) keeps the refusal. Deletion of this clause is
+            // mutation-proven by the en-dash object-arm case in
+            // digit_dash_ranges_with_glued_units_stamp_the_high_endpoint:
+            // with it gone, the "6" of Ti\u{2013}6Al\u{2013}4V stamps.
             if let Some(before) = hay[..start].chars().next_back()
                 && matches!(before, '-' | '\u{2013}' | '\u{2014}')
+                && hay[..start - before.len_utf8()]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_digit())
             {
                 return false;
             }
@@ -2002,6 +2015,54 @@ mod tests {
             supporting_quote("Inconel 718", "UTS", Some(1375.0), &table.text).as_deref(),
             Some("Inconel 718 1375")
         );
+    }
+
+    /// Round 6: the dash-redemption clause in `clean_number_boundary`
+    /// refused EVERY digit with a dash before it and a unit letter after
+    /// it. That killed the high endpoint of digit-dash-digit ranges with
+    /// glued units — "30-50um" stamped 30 but dropped 50, "5-10mm"
+    /// dropped 10, same token, low endpoint lives, high one dies.
+    /// Letter-hyphenated designation digits must stay refused, and the
+    /// en-dash object-arm assert is the deletion killer: with the clause
+    /// gone, the "6" of Ti\u{2013}6Al\u{2013}4V stamps via the object
+    /// arm (the subject's ASCII hyphens mismatch the en-dash text, and
+    /// occurrence_inside_name sees nothing), so the clause survives in
+    /// narrowed form instead of being deleted. Mutations: deleting the
+    /// clause reddens the en-dash assert; swapping the digit condition
+    /// (`!c.is_ascii_digit()` -> `c.is_ascii_digit()`) reddens the harm
+    /// asserts.
+    #[test]
+    fn digit_dash_ranges_with_glued_units_stamp_the_high_endpoint() {
+        // The measured harms: the high endpoint is a measurement.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "layer_thickness",
+                Some(50.0),
+                "Ti-6Al-4V powder layers of 30-50um were deposited."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "grain_size",
+                Some(10.0),
+                "CoCrFeNi grains of 5-10mm were observed."
+            )
+            .is_some()
+        );
+        // Letter-dash designation digits stay refused. In the en-dash
+        // form ONLY this clause refuses the "6" — deletion turns it red.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            6.0,
+            "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa.",
+        );
+        // ASCII form: double-covered by occurrence_inside_name; kept as
+        // documentation of the class.
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 6.0, "The Ti-6Al-4V UTS is 950 MPa.");
     }
 
     /// Round 6: the walk-back used to compose comma steps with an
