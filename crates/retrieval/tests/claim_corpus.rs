@@ -1258,7 +1258,15 @@ fn corpus() -> Vec<CorpusCase> {
         // nonsense under EVERY glyph: the SignDomain guard refuses
         // these shapes for the right reason, without a glyph list,
         // while the true negatives (residual stress, Seebeck,
-        // temperature) ride genuinely signed quantities and survive.
+        // temperature) ride genuinely signed quantities — SignDomain
+        // does not refuse them. Caveat (round 15 item 1): on those
+        // SAME signed quantities the separator shapes FABRICATE via
+        // the '-' / U+2212 needles the guard cannot refuse (six
+        // MustDrop residual_stress rows below); SignDomain holds the
+        // fabrication only on NON-negative predicates, never on signed
+        // ones. And the 'true negatives' here still DROP (NoSpan recall
+        // loss, the KNOWN rows) — they pass the guard, they do not
+        // survive intact.
         // All four spellings of all three shapes below, one block per
         // shape; the candidate the measurement beat was the preceding
         // word (it misreads the line-start shapes, which have no word
