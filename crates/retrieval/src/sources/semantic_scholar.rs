@@ -5,12 +5,13 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, url_encode};
+use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::{FulltextFormat, Paper};
 
 const DEFAULT_BASE: &str = "https://api.semanticscholar.org/graph/v1";
 const FIELDS: &str = "title,authors,abstract,year,externalIds,url,openAccessPdf,venue";
 
+pub const ID: &str = "semantic_scholar";
 pub const INITIAL_CURSOR: &str = "0";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -26,12 +27,12 @@ pub async fn fetch_page(
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let offset: usize = cursor.parse().unwrap_or(0);
     let limit = ctx.limit.min(100);
-    let base = ctx.base(SourceId::SemanticScholar, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
         "{base}/paper/search?query={q}&limit={limit}&offset={offset}&fields={FIELDS}",
         q = url_encode(query)
     );
-    let (body, _cached) = ctx.fetch_cached(SourceId::SemanticScholar, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let papers = parse(&body)?;
     let next =
         (papers.len() >= limit && offset + limit <= 9_999).then(|| (offset + limit).to_string());
@@ -116,7 +117,7 @@ fn parse_paper(item: &Value) -> Option<Paper> {
         .unwrap_or_else(|| format!("https://www.semanticscholar.org/paper/{paper_id}"));
 
     Some(Paper {
-        source: SourceId::SemanticScholar.as_str().to_string(),
+        source: ID.to_string(),
         source_id: paper_id,
         title,
         authors,

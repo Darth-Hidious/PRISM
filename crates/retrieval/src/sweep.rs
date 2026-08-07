@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::RetrievalEngine;
 use crate::model::{Paper, SourceStatus};
-use crate::sources::{self, SourceId};
+use crate::sources::SourceId;
 
 /// What a sweep will do. Changing the plan invalidates a saved state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,7 +132,25 @@ impl RetrievalEngine {
 
         for id in &plan.sources {
             let source_start = Instant::now();
-            let mut cursor = sources::initial_cursor(*id).to_string();
+            // Resolve the configured source to its registry adapter. The eight
+            // built-ins always resolve; an unresolvable id is reported
+            // honestly and skipped, never fabricated.
+            let Some(src) = self.registry().get(id.as_str()) else {
+                source_status.push(SourceStatus {
+                    source: id.as_str().to_string(),
+                    status: "error".to_string(),
+                    count: 0,
+                    latency_ms: source_start.elapsed().as_secs_f64() * 1000.0,
+                    cache_hit: false,
+                    error: Some(format!(
+                        "no adapter registered for source '{}'",
+                        id.as_str()
+                    )),
+                });
+                finished = false;
+                continue;
+            };
+            let mut cursor = src.initial_cursor().to_string();
             let mut pages_this_source = 0usize;
             let mut count_this_source = 0usize;
             let mut error_this_source: Option<String> = None;
@@ -154,7 +172,7 @@ impl RetrievalEngine {
                     // the page still counts against the cap, so re-running
                     // a finished sweep is idempotent.
                     let network_before = ctx.network_fetches.load(Ordering::SeqCst);
-                    match sources::fetch_page(*id, &ctx, &plan.query, &cursor).await {
+                    match src.fetch_page(&ctx, &plan.query, &cursor).await {
                         Ok((replayed, next)) => {
                             // pages_from_cache measures "no network happened",
                             // not "was marked done": a completed page whose
@@ -197,7 +215,7 @@ impl RetrievalEngine {
                                  restarting source from the beginning",
                                 id.as_str()
                             );
-                            cursor = sources::initial_cursor(*id).to_string();
+                            cursor = src.initial_cursor().to_string();
                             state
                                 .completed
                                 .retain(|k| !k.starts_with(&format!("{}|", id.as_str())));
@@ -227,7 +245,7 @@ impl RetrievalEngine {
                 }
 
                 let network_before = ctx.network_fetches.load(Ordering::SeqCst);
-                let page_result = sources::fetch_page(*id, &ctx, &plan.query, &cursor).await;
+                let page_result = src.fetch_page(&ctx, &plan.query, &cursor).await;
                 match page_result {
                     Ok((found, next)) => {
                         // Same honesty as the replay path: count by real
@@ -281,7 +299,7 @@ impl RetrievalEngine {
 
             let latency_ms = source_start.elapsed().as_secs_f64() * 1000.0;
             source_status.push(SourceStatus {
-                source: id.as_str().to_string(),
+                source: src.id().to_string(),
                 status: if error_this_source.is_some() {
                     "error".to_string()
                 } else {

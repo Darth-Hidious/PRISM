@@ -4,11 +4,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, strip_markup, url_encode};
+use super::{FetchCtx, normalize_doi, strip_markup, url_encode};
 use crate::model::{FulltextFormat, Paper};
 
 const DEFAULT_BASE: &str = "https://doaj.org/api/search/articles";
 
+pub const ID: &str = "doaj";
 pub const INITIAL_CURSOR: &str = "1";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -24,12 +25,12 @@ pub async fn fetch_page(
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let page: usize = cursor.parse().unwrap_or(1);
     let page_size = ctx.limit.min(100);
-    let base = ctx.base(SourceId::Doaj, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
         "{base}/{q}?pageSize={page_size}&page={page}",
         q = url_encode(query)
     );
-    let (body, _cached) = ctx.fetch_cached(SourceId::Doaj, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let papers = parse(&body)?;
     let next = (papers.len() >= page_size).then(|| (page + 1).to_string());
     Ok((papers, next))
@@ -133,7 +134,7 @@ fn parse_entry(entry: &Value) -> Option<Paper> {
         .unwrap_or_else(|| format!("https://doaj.org/article/{doaj_id}"));
 
     Some(Paper {
-        source: SourceId::Doaj.as_str().to_string(),
+        source: ID.to_string(),
         source_id: doaj_id,
         title,
         authors,
