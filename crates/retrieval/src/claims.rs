@@ -558,6 +558,21 @@ fn unit_initial(c: char) -> bool {
         && (EXTRA_UNIT_INITIALS.contains(&c) || UNIT_TOKENS.iter().any(|t| t.starts_with(c)))
 }
 
+/// The dash class: every glyph the typeset world uses where a minus
+/// sign can stand. ASCII hyphen; U+2010 HYPHEN and U+2011
+/// NON-BREAKING HYPHEN are ordinary PDF-extractor output; U+2012 is
+/// literally named FIGURE DASH; U+2013 EN DASH and U+2014 EM DASH
+/// are the typeset range/sentence dashes; U+2015 HORIZONTAL BAR and
+/// U+FE63 SMALL HYPHEN-MINUS round out the measured set. Round 8
+/// listed only '-', U+2212 and U+2013 here and let the other six
+/// flip signs; round 9 made it a class. The joins-compound test
+/// inside `clean_number_boundary` separates every member: a range
+/// dash has a digit before it, a minus sign does not.
+const MINUS_CAPABLE_DASHES: &[char] = &[
+    '-', '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
+    '\u{fe63}',
+];
+
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
 /// continues a grouped number ("1,140" is one number, in both directions),
@@ -572,7 +587,7 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
         if before.is_alphanumeric() {
             return false;
         }
-        if matches!(before, '-' | '\u{2212}' | '\u{2013}') {
+        if MINUS_CAPABLE_DASHES.contains(&before) {
             // A leading minus is part of the number: an unsigned needle
             // must not match the digits of a signed token ("950" inside
             // "-950" or "\u{2212}950"), or the sign-flipped claim stamps
@@ -583,16 +598,19 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             // is the hyphen of a designation ("ti-6al-4v") or a
             // digit-joined compound, which the designation guards own.
             //
-            // U+2013 joins this list for the MINUS half only (round 7):
-            // some PDFs typeset negative values as "\u{2013}350 MPa",
-            // and the unsigned needle matched the digits, stamping a
-            // compressive stress as tensile. A range dash always has a
-            // digit before it, a minus sign does not — so the
-            // joins-compound test separates them, and
-            // `en_dash_range_endpoint` (checked first) keeps refusing
-            // the range case as Range. U+2013 is still NOT a needle
-            // glyph: the true "\u{2013}350" claim drops (accepted; see
-            // `number_needles`), only the sign-flipped twin is killed.
+            // The glyph set is the whole dash class
+            // (`MINUS_CAPABLE_DASHES`), not a hand-picked trio: round 7
+            // added U+2013 for the MINUS half only, round 8 recorded
+            // U+2014 as the unrecorded twin and fixed nothing, and
+            // round 9 measured the sign flip still stamping through
+            // U+2010, U+2011, U+2012, U+2015 and U+FE63. The
+            // joins-compound test separates every member the same way,
+            // and `en_dash_range_endpoint` (checked first) keeps
+            // refusing the U+2013 range case as Range. Only '-' and
+            // U+2212 are needle glyphs: the true "\u{2013}350" claim
+            // still drops (recorded recall loss; see `number_needles`
+            // and the corpus KNOWN cases), only the sign-flipped twin
+            // is killed.
             let joins_compound = hay[..start - before.len_utf8()]
                 .chars()
                 .next_back()
@@ -970,14 +988,15 @@ fn trailing_word(prefix: &str) -> String {
 /// as tensile. Reopen only if a source is found where dropping the
 /// true en-dash-minus value costs more than the fabrication it blocks.
 ///
-/// RECORDED, NOT FIXED (round 8): U+2014 EM DASH is the unrecorded
-/// twin of that decision. It is not a needle glyph either, but it is
-/// also NOT in the before-minus list in `clean_number_boundary`, so
-/// "was \u{2014}350 MPa" still stamps the sign-flipped +350 while the
-/// true -350 claim drops. The same range-dash/minus reasoning applies
-/// verbatim (a sentence dash before a digit joins no compound); the
-/// fix is a one-line list addition, deliberately not taken this round
-/// — the corpus carries it as a KNOWN failure.
+/// FIXED, ROUND 9 (was RECORDED, NOT FIXED, round 8): the U+2014
+/// twin was not alone — the sign flip stamped through U+2010,
+/// U+2011, U+2012, U+2014, U+2015 and U+FE63 as well. `clean_number_boundary`
+/// now refuses the unsigned needle after ANY glyph of the dash class
+/// (`MINUS_CAPABLE_DASHES`) that does not join a compound. The true
+/// negative under those glyphs still drops — none of them is a
+/// needle glyph; the corpus carries the U+2013/U+2014 recall halves
+/// as KNOWN failures and every glyph's sign-flipped twin as a
+/// MustDrop pin.
 fn number_needles(value: f64) -> Vec<String> {
     let plain = format!("{value}");
     let mut out = vec![plain.clone()];

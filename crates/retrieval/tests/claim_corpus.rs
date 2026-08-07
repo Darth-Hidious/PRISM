@@ -700,6 +700,60 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "the round-7 fix: the U+2013-minus sign flip drops",
         ),
+        // Dash-class pins (round 9): the sign flip must drop for EVERY
+        // glyph of MINUS_CAPABLE_DASHES, not a hand-picked trio. The
+        // true negatives under these glyphs still drop — none is a
+        // needle glyph; that recall-loss class is recorded by the
+        // KNOWN U+2013/U+2014 entries.
+        case(
+            "The residual stress in Ti-6Al-4V was \u{2014}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            350.0,
+            Expect::MustDrop,
+            "dash class round 9: the former KNOWN U+2014 twin now drops — \
+             marker removed at the tripwire's demand",
+        ),
+        case(
+            "The residual stress in Ti-6Al-4V was \u{2010}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            350.0,
+            Expect::MustDrop,
+            "dash class: U+2010 HYPHEN, ordinary PDF-extractor output",
+        ),
+        case(
+            "The residual stress in Ti-6Al-4V was \u{2011}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            350.0,
+            Expect::MustDrop,
+            "dash class: U+2011 NON-BREAKING HYPHEN, ordinary PDF-extractor output",
+        ),
+        case(
+            "The residual stress in Ti-6Al-4V was \u{2012}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            350.0,
+            Expect::MustDrop,
+            "dash class: U+2012, literally named FIGURE DASH",
+        ),
+        case(
+            "The residual stress in Ti-6Al-4V was \u{2015}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            350.0,
+            Expect::MustDrop,
+            "dash class: U+2015 HORIZONTAL BAR",
+        ),
+        case(
+            "The residual stress in Ti-6Al-4V was \u{fe63}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            350.0,
+            Expect::MustDrop,
+            "dash class: U+FE63 SMALL HYPHEN-MINUS",
+        ),
         // ---------------- MUST_DROP: refused U+2212 needles ----------
         // The round-5 UTF-8 advance panic: a rejected U+2212 occurrence
         // must advance by the minus's 3 bytes, not one byte, or the next
@@ -775,15 +829,6 @@ fn corpus() -> Vec<CorpusCase> {
             3.0,
             Expect::MustDrop,
             "KNOWN: same residue — spaced single-letter unit exempts a label number",
-        ),
-        known(
-            "The residual stress in Ti-6Al-4V was \u{2014}350 MPa.",
-            "Ti-6Al-4V",
-            "residual_stress",
-            350.0,
-            Expect::MustDrop,
-            "KNOWN: U+2014 as minus is the unrecorded twin of the U+2013 fix; \
-             the sign-flipped twin still stamps +350",
         ),
         known(
             "The Ti-6Al-4V fracture tests followed ASTM E1820-20b.",
