@@ -496,12 +496,32 @@ const LIST_CONTINUATIONS: &[&str] = &["and", "or", "to", "through"];
 
 /// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
 /// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
-/// not evidence for a property value. The second number of a label list
-/// ("Tables 1 and 2") is caught by stepping back over the conjunction and
-/// the number before it, exactly once.
+/// not evidence for a property value. Continuations of a label list are
+/// caught by stepping back over them to the head word: ", <number>"
+/// items repeatedly ("Refs. 25, 26"), then one conjunction and its
+/// number ("Tables 1 and 2"). The head word decides: a value list
+/// ("measured 950, 960 and 970 MPa") walks back to a non-label and
+/// stamps. Known cost of the mechanism: a value opening a clause after
+/// "Table N," ("As shown in Table 2, 950 MPa was measured") is dropped
+/// — a miss, never a false stamp.
 fn preceding_word_is_label(hay: &str, start: usize) -> bool {
     let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']);
     let mut word = trailing_word(prefix);
+    // Step back over ", <number>" list items repeatedly: in "Refs. 25,
+    // 26" the 26 is a label because the walk lands on the label word at
+    // the head of the list. The head word is the distinguishing feature:
+    // the same walk over a value list ("measured 950, 960, 970 MPa")
+    // lands on "measured", not a label, and everything stamps.
+    while word.is_empty() && prefix.ends_with(',') {
+        let before_comma = prefix[..prefix.len() - 1].trim_end_matches(' ');
+        let number = trailing_word(before_comma);
+        if number.is_empty() || !number.chars().all(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        prefix =
+            before_comma[..before_comma.len() - number.len()].trim_end_matches([' ', '.', ':']);
+        word = trailing_word(prefix);
+    }
     if LIST_CONTINUATIONS.contains(&word.as_str()) {
         prefix = prefix[..prefix.len() - word.len()].trim_end_matches(|c: char| {
             c.is_ascii_digit() || matches!(c, ',' | ' ' | '.' | ':' | '-' | '\u{2013}' | '\u{2014}')
@@ -1398,6 +1418,76 @@ mod tests {
                 "UTS",
                 Some(960.0),
                 "The Ti-6Al-4V samples measured 950 and 960 MPa."
+            )
+            .is_some()
+        );
+    }
+
+    /// Comma-separated reference lists: "Refs. 25, 26" stamped 26 in
+    /// round 3 because the walk-back covered one conjunction but not
+    /// comma items. The walk now steps back over ", <number>" repeatedly
+    /// before the conjunction step, and the label word at the head of
+    /// the list decides. Positive controls pin the distinguishing
+    /// feature: values in a comma list walk back to a non-label head
+    /// word and stamp — they are values, not references. Mutation-proven
+    /// red by deleting the comma walk-back loop (the two Refs asserts)
+    /// and by a one-token dash on its `ends_with(',')` condition.
+    #[test]
+    fn comma_separated_reference_list_numbers_are_not_support() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            26.0,
+            "Ti-6Al-4V is discussed in Refs. 25, 26 for UTS data.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            27.0,
+            "Ti-6Al-4V is discussed in Refs. 25, 26, 27 for UTS data.",
+        );
+        // Comma list ending in a conjunction: the walk-backs compose.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            27.0,
+            "Ti-6Al-4V is discussed in Refs. 25, 26 and 27 for UTS data.",
+        );
+        // The first number after the label word stays refused too.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            25.0,
+            "Ti-6Al-4V is discussed in Refs. 25, 26 for UTS data.",
+        );
+
+        // Positive controls: value lists are NOT reference lists; the
+        // head word, not the commas, is the distinguishing feature.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(970.0),
+                "The Ti-6Al-4V samples measured 950, 960 and 970 MPa."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(970.0),
+                "The Ti-6Al-4V samples measured 950, 960, 970 MPa."
+            )
+            .is_some()
+        );
+        // A mid-list value also stamps.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(960.0),
+                "The Ti-6Al-4V samples measured 950, 960, 970 MPa."
             )
             .is_some()
         );
