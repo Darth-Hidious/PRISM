@@ -350,6 +350,7 @@ const UNIT_INITIALS: &[char] = &[
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
 /// continues a grouped number ("1,140" is one number, in both directions),
+/// to a leading minus that signs it ("-950" / "\u{2212}950" are one number),
 /// or to an alphanumeric. Otherwise "95" matches inside "950", "1.5" inside
 /// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V". After the
 /// number, a letter from `UNIT_INITIALS` is allowed so glued units
@@ -358,6 +359,24 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
             return false;
+        }
+        if matches!(before, '-' | '\u{2212}') {
+            // A leading minus is part of the number: an unsigned needle
+            // must not match the digits of a signed token ("950" inside
+            // "-950" or "\u{2212}950"), or the sign-flipped claim stamps
+            // as fact — for residual stress that turns compressive into
+            // tensile, worse than a miss. The minus is a sign only when
+            // it does not join a compound: whitespace, line start or
+            // opening punctuation before it. A letter or digit before it
+            // is the hyphen of a designation ("ti-6al-4v") or a
+            // digit-joined compound, which the designation guards own.
+            let joins_compound = hay[..start - before.len_utf8()]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+            if !joins_compound {
+                return false;
+            }
         }
         if before == '.' && needle.starts_with(|c: char| c.is_ascii_digit()) {
             return false;
@@ -485,9 +504,18 @@ fn trailing_word(prefix: &str) -> String {
 }
 
 /// String forms under which a numeric value may legitimately appear in a
-/// paper: the plain rendering plus the comma-grouped integer form.
+/// paper: the plain rendering plus the comma-grouped integer form. A
+/// negative value appears under both minus glyphs, ASCII hyphen and
+/// U+2212 MINUS SIGN (the glyph typeset PDFs carry); without both, the
+/// true negative claim is dropped while its sign-flipped twin stamps.
 fn number_needles(value: f64) -> Vec<String> {
-    let mut out = vec![format!("{value}")];
+    let plain = format!("{value}");
+    let mut out = vec![plain.clone()];
+    if value < 0.0 && value.fract() != 0.0 {
+        // Negative decimals never reach the grouped branch below, so this
+        // is their only U+2212 rendering.
+        out.push(format!("\u{2212}{}", &plain[1..]));
+    }
     if value.fract() == 0.0 && value.abs() < 1e15 {
         let digits = (value as i64).abs().to_string();
         let grouped: String = digits
@@ -506,8 +534,17 @@ fn number_needles(value: f64) -> Vec<String> {
             .into_iter()
             .rev()
             .collect();
-        let sign = if value < 0.0 { "-" } else { "" };
-        out.push(format!("{sign}{grouped}"));
+        let signs: &[&str] = if value < 0.0 {
+            &["-", "\u{2212}"]
+        } else {
+            &[""]
+        };
+        for sign in signs {
+            let needle = format!("{sign}{grouped}");
+            if !out.contains(&needle) {
+                out.push(needle);
+            }
+        }
     }
     out
 }
@@ -824,6 +861,79 @@ mod tests {
         assert!(supporting_quote("CoCrFeNi", "conductivity", Some(11.0), block).is_none());
         // Positive control: 11.5 itself still stamps.
         assert!(supporting_quote("CoCrFeNi", "conductivity", Some(11.5), block).is_some());
+    }
+
+    /// The sign is the finding: for residual stress, -950 vs +950 is the
+    /// difference between compressive and tensile. Both halves of the
+    /// round-4 repro are pinned. (a) The true negative claim stamps under
+    /// U+2212 MINUS SIGN prose — killed by removing either U+2212 producer
+    /// in `number_needles` (the decimal push owns the decimal assert; the
+    /// signs loop owns the integer asserts). (b) The sign-flipped positive
+    /// claim is dropped — killed by removing the before-minus guard in
+    /// `clean_number_boundary`. The last assert pins the symmetry: a
+    /// negative claim never stamps against positive prose either.
+    #[test]
+    fn negative_value_claims_match_negative_prose_and_refuse_the_flip() {
+        let unicode_minus = "The residual stress in Ti-6Al-4V was \u{2212}950 MPa.";
+        let ascii_minus = "The residual stress in Ti-6Al-4V was -950 MPa.";
+
+        // The true negative claim stamps under both minus glyphs.
+        assert_eq!(
+            supporting_quote("Ti-6Al-4V", "residual_stress", Some(-950.0), unicode_minus)
+                .as_deref(),
+            Some(unicode_minus)
+        );
+        assert!(
+            supporting_quote("Ti-6Al-4V", "residual_stress", Some(-950.0), ascii_minus).is_some()
+        );
+        // Grouped negative integer under U+2212 (the signs loop).
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-1140.0),
+                "The residual stress in Ti-6Al-4V was \u{2212}1,140 MPa."
+            )
+            .is_some()
+        );
+        // Negative decimal under U+2212 (the decimal push).
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "seebeck_coefficient",
+                Some(-11.5),
+                "The CoCrFeNi Seebeck coefficient was \u{2212}11.5 uV/K."
+            )
+            .is_some()
+        );
+
+        // The sign-flipped claim is dropped, not stamped: the prose says
+        // compressive, +950 says tensile. Both glyphs.
+        assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", 950.0, unicode_minus);
+        assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", 950.0, ascii_minus);
+
+        // Symmetry: the negative claim against positive prose is dropped.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            "The residual stress in Ti-6Al-4V was 950 MPa.",
+        );
+
+        // The compound condition pins the hyphen/minus distinction: a
+        // hyphen that joins a digit compound is not a sign, so the
+        // pre-round-4 behaviour of "950-1100" is unchanged. Removing the
+        // joins_compound condition (making every preceding hyphen a sign)
+        // turns this red.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1100.0),
+                "The Ti-6Al-4V batches 950-1100 were tested."
+            )
+            .is_some()
+        );
     }
 
     /// F-1: a thousands comma adjacent to a digit is part of the number,
