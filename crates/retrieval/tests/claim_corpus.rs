@@ -228,13 +228,19 @@ fn corpus() -> Vec<CorpusCase> {
             "signed value after a label comma still stamps",
         ),
         // ---------------- MUST_STAMP: ranges and lists ---------------
-        case(
+        known(
             "Ti-6Al-4V powder layers of 30-50um were deposited.",
             "Ti-6Al-4V",
             "layer_thickness",
             50.0,
-            Expect::MustStamp,
-            "ASCII-dash range with glued unit: the high endpoint stamps",
+            Expect::MustDrop,
+            "KNOWN: a range endpoint is not a point value — the prose asserts \
+             30 TO 50 um, not 50. The en-dash twin of this construct drops \
+             correctly; the compound-friendly ASCII decision stamps the high \
+             endpoint anyway, so the same construct has opposite ground truth \
+             decided only by which dash the typesetter used. Ground truth \
+             picked round 9: MustDrop; the ASCII behaviour is the recorded \
+             deviation, visible here instead of certified",
         ),
         case(
             "The Ti-6Al-4V batches 950-1100 were tested.",
@@ -499,22 +505,6 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "the round-7 fix: the U+2013-minus sign flip drops",
         ),
-        case(
-            "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.",
-            "Ti-6Al-4V",
-            "residual_stress",
-            -350.0,
-            Expect::MustDrop,
-            "accepted drop: U+2013 is not a needle glyph, the true negative has no needle",
-        ),
-        case(
-            "The residual stress in Ti-6Al-4V was \u{2014}350 MPa.",
-            "Ti-6Al-4V",
-            "residual_stress",
-            -350.0,
-            Expect::MustDrop,
-            "accepted drop: U+2014 is not a needle glyph either",
-        ),
         // ---------------- MUST_DROP: tables --------------------------
         case(
             "Table 1 UTS of Ti-6Al-4V and Inconel 718\n\
@@ -587,6 +577,26 @@ fn corpus() -> Vec<CorpusCase> {
              through the subject-OR-object arm. Cross-subject attribution is \
              the largest live fabrication channel: a number from a paper about \
              a different alloy becomes a claim about yours",
+        ),
+        known(
+            "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -350.0,
+            Expect::MustStamp,
+            "KNOWN: recall loss, recorded round 9 — the prose asserts the stress \
+             IS -350 MPa, a materials engineer calls that claim supported; \
+             U+2013 is not a needle glyph yet, so the true negative has no \
+             needle and drops. What the code SHOULD do but does not yet",
+        ),
+        known(
+            "The residual stress in Ti-6Al-4V was \u{2014}350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -350.0,
+            Expect::MustStamp,
+            "KNOWN: the same recall loss for the U+2014 typesetting of the \
+             minus sign — the true negative drops for lack of a needle",
         ),
     ]
 }
