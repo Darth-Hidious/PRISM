@@ -345,8 +345,8 @@ pub fn supporting_quote_or_refusal(
         let hay = normalize_for_containment(span);
         match value {
             Some(v) => {
-                let name_near = (!subject_n.is_empty() && hay.contains(&subject_n))
-                    || (!object_n.is_empty() && hay.contains(&object_n));
+                let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
+                    || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
                 if name_near {
                     match scan_number_evidence(&hay, v, &subject_n, &object_n) {
                         NumberScan::Evidential => return Ok(span.trim().to_string()),
@@ -539,23 +539,69 @@ fn refusing_guard(
 /// "Inconel 718" have clean token boundaries around their trailing digits,
 /// so the boundary rule cannot tell the "718" of the name from a measured
 /// 718; positional containment inside the name can. An occurrence that
-/// repeats OUTSIDE the name is still evidence.
+/// repeats OUTSIDE the name is still evidence. Name matching here folds
+/// the dash class (`find_name`), exactly as the name-presence check does.
 fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
     let mut search_from = 0usize;
-    while let Some(rel) = hay[search_from..].find(name) {
-        let name_start = search_from + rel;
-        let name_end = name_start + name.len();
+    while let Some((name_start, name_end)) = find_name(hay, name, search_from) {
         if name_start <= start && end <= name_end {
             return true;
         }
         // Char-not-byte advance, as in evidential_number_occurrence:
         // names may lead with a multi-byte char ("\u{3b1}-phase").
-        search_from = name_start + name.chars().next().map_or(1, char::len_utf8);
+        search_from = name_start + hay[name_start..].chars().next().map_or(1, char::len_utf8);
     }
     false
+}
+
+/// Dash-class-aware name search: the first occurrence of `name` in
+/// `hay` at or after `from`, treating every glyph of
+/// `MINUS_CAPABLE_DASHES` as the SAME character. Returns the matched
+/// byte range — its length may differ from `name.len()`, because a
+/// 3-byte U+2013 in `hay` matches a 1-byte '-' in `name`.
+///
+/// Round 12 item 4: typesetting variants of one designation are the
+/// SAME alloy — "Ti\u{2013}6Al\u{2013}4V" and "Ti-6Al-4V" differ only in the
+/// dash the typesetter picked. Before this landed, the en-dash
+/// spelling matched the ASCII subject only through the object arm of
+/// the subject-OR-object rule: the object arm carrying a
+/// subject-matching failure. Deliberately applied to NAME matching
+/// only — the value scan still reads the raw `hay`, so U+2013 stays a
+/// non-sign glyph exactly as round 11 decided; folding the scanned
+/// text itself would turn "\u{2013}350" into "-350" and reopen the
+/// separator fabrication through the back door.
+fn find_name(hay: &str, name: &str, from: usize) -> Option<(usize, usize)> {
+    let name_chars: Vec<char> = name.chars().collect();
+    if name_chars.is_empty() || from > hay.len() {
+        return None;
+    }
+    let dash_eq = |got: char, want: char| {
+        got == want || (MINUS_CAPABLE_DASHES.contains(&got) && MINUS_CAPABLE_DASHES.contains(&want))
+    };
+    let mut start = from;
+    loop {
+        let mut pos = start;
+        let mut matched = true;
+        for &want in &name_chars {
+            match hay[pos..].chars().next() {
+                Some(got) if dash_eq(got, want) => pos += got.len_utf8(),
+                _ => {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if matched {
+            return Some((start, pos));
+        }
+        match hay[start..].chars().next() {
+            Some(c) => start += c.len_utf8(),
+            None => return None,
+        }
+    }
 }
 
 /// Letters that may begin a unit token glued directly to a number in
@@ -1780,9 +1826,13 @@ mod tests {
             .is_none()
         );
 
-        // En-dash positive control: the subject's hyphens do not match en
-        // dashes, so the fact survives ONLY through the object arm of the
-        // subject-OR-object rule. Do not flip that OR to AND.
+        // En-dash positive control: since round 12 the dash class folds
+        // in NAME matching (find_name), so the en-dash typesetting of the
+        // designation matches the ASCII subject through the SUBJECT arm
+        // itself — before round 12 it survived ONLY through the object
+        // arm of the subject-OR-object rule, the object arm carrying a
+        // subject-matching failure. Either way the fact must stamp; do
+        // not flip that OR to AND.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",

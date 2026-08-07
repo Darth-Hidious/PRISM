@@ -419,6 +419,50 @@ fn corpus() -> Vec<CorpusCase> {
              stamped only through the subject-OR-object arm, certifying \
              subject-blind attribution",
         ),
+        // ---------------- MUST_STAMP: subject dash class (round 12) ----
+        // Item 4: the dash class folds in NAME matching (find_name).
+        // Typesetting variants of one designation are the same alloy;
+        // before this the en-dash spelling matched the ASCII subject
+        // only through the object arm. The value scan is NOT folded —
+        // U+2013 stays a non-sign glyph (round 11).
+        case(
+            "The Ti\u{2013}6Al\u{2013}4V billets reached 950 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustStamp,
+            "round 12 item 4: the en-dash typesetting of Ti-6Al-4V matches \
+             the ASCII subject through the SUBJECT arm itself — the span \
+             carries no object word, so before the dash-class folding this \
+             dropped NoSpan and the fact survived only where the object \
+             word happened to sit (the lib positive control's object arm). \
+             Red if the folding reverts",
+        ),
+        case(
+            "The Ti\u{2013}6Al\u{2013}4V billets were examined.",
+            "Ti-6Al-4V",
+            "UTS",
+            6.0,
+            Expect::MustDrop,
+            "round 12 item 4: the drop half of subject dash-folding — the 6 \
+             of the en-dash-spelled designation stays refused now that the \
+             folded subject arm sees the span (the boundary clause owns the \
+             refusal); folding adds name matches only, it never makes a \
+             designation digit evidential",
+        ),
+        case(
+            "The U\u{2013}235 stock was melted.",
+            "U-235",
+            "mass_number",
+            235.0,
+            Expect::MustDrop,
+            "round 12 item 4: occurrence_inside_name folds the dash class \
+             too — 235 sits INSIDE the en-dash spelling of the subject's \
+             own name and has clean token boundaries otherwise, so only \
+             the folded inside-name check refuses it. The KNOWN U-235 row \
+             below pins the mirror shape (letter-dash-digit under a \
+             different subject)",
+        ),
         // ---------------- MUST_STAMP: table rows ---------------------
         case(
             "Table 1 UTS of Ti-6Al-4V and Inconel 718\n\
