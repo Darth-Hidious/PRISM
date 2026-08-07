@@ -306,23 +306,21 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "spaced ev still stamps after denying the glued e initial",
         ),
-        known(
+        case(
             "The Ti-6Al-4V coupons were stored at 72F.",
             "Ti-6Al-4V",
             "storage_temperature",
             72.0,
             Expect::MustStamp,
-            "recall lost untested when round 7 switched to pure derivation \
-             and dropped the f initial (Fahrenheit)",
+            "f recall restored round 8 (Fahrenheit); lost untested in round 7",
         ),
-        known(
+        case(
             "The Ti-6Al-4V powder tank holds 50l.",
             "Ti-6Al-4V",
             "tank_volume",
             50.0,
             Expect::MustStamp,
-            "recall lost untested when round 7 switched to pure derivation \
-             and dropped the l initial (litres)",
+            "l recall restored round 8 (litres); lost untested in round 7",
         ),
         // ---------------- MUST_DROP: citations -----------------------
         case(
@@ -432,22 +430,21 @@ fn corpus() -> Vec<CorpusCase> {
             "95 is a substring of 950",
         ),
         // ---------------- MUST_DROP: H2 — glued e and x --------------
-        known(
+        case(
             "The Ti-6Al-4V strain rate was 2e5 per second.",
             "Ti-6Al-4V",
             "strain_rate",
             2.0,
             Expect::MustDrop,
-            "H2: 2e5 is scientific notation, not 2 + a unit; round 7's \
-             derivation admits e via the ev token",
+            "H2 closed round 8: 2e5 is scientific notation, not 2 + a unit",
         ),
-        known(
+        case(
             "Ti-6Al-4V ran 1e6 cycles to failure.",
             "Ti-6Al-4V",
             "cycles_to_failure",
             1.0,
             Expect::MustDrop,
-            "H2: 1e6 is scientific notation; same e initial",
+            "H2 closed round 8: 1e6 is scientific notation",
         ),
         case(
             "The Ti-6Al-4V coupon was imaged at 950x magnification.",
@@ -457,14 +454,13 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "H2 pin: 950x is magnification, not 950 + a unit",
         ),
-        known(
+        case(
             "The Ti-6Al-4V tensile tests followed ASTM E8-16e1.",
             "Ti-6Al-4V",
             "elongation",
             16.0,
             Expect::MustDrop,
-            "designation suffix: denying e closes this one of the five; \
-             round 7's e initial stamps it",
+            "designation suffix closed round 8: denying e drops this one of the five",
         ),
         // ---------------- MUST_DROP: ranges --------------------------
         case(

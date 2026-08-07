@@ -500,24 +500,42 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// Letters that may begin a unit token glued directly to a number in
 /// table and PDF-extracted text where the space was lost: "950MPa",
 /// "1073K", "50um" / "50\u{b5}m", "5wt%". Deliberately an allow-list,
-/// not every letter: digit-then-letter gluing like "950x" (magnification)
-/// or "2e5" (scientific notation) is not number+unit and stays rejected.
+/// not every letter: digit-then-letter gluing like "950x"
+/// (magnification) or "2e5" (scientific notation) is not number+unit
+/// and stays rejected — denied by `DENIED_UNIT_INITIALS` below, not
+/// by the token list happening to lack the letter, so no future token
+/// can reopen either form.
+///
 /// DERIVED, not hand-listed: the first letter of every `UNIT_TOKENS`
-/// entry, plus the glyphs PDF extractors actually emit where the token
+/// entry, plus `EXTRA_UNIT_INITIALS`, minus `DENIED_UNIT_INITIALS`.
+///
+/// EXTRA: the glyphs PDF extractors actually emit where the token
 /// list spells the unit differently — U+03BC GREEK SMALL LETTER MU
 /// (extractors emit the Greek letter, not the U+00B5 MICRO SIGN the
-/// list carries, so both must open a glued unit), lowercased '\u{e5}'
-/// ("2.95\u{c5} lattice parameter"), and 'o', the mangled degree sign
-/// of "980oC". 'o' rides on the "ohm" token's initial today; it is
-/// listed anyway so the degree form survives "ohm" leaving the list.
-/// '\u{b0}' needs no entry: the degree sign is not alphanumeric, so a
-/// glued "980\u{b0}C" passes the boundary check regardless. The old
-/// hand-list carried 'd', 'f', 'l', which no unit token starts with —
-/// they are gone; the derivation keeps the list honest by construction.
-const EXTRA_UNIT_INITIALS: &[char] = &['\u{3bc}', '\u{e5}', 'o'];
+/// list carries, so both must open a glued unit) and lowercased
+/// '\u{e5}' ("2.95\u{c5} lattice parameter") — plus 'f' and 'l', the
+/// round-6 hand list's recall letters for "72F" (Fahrenheit) and
+/// "50l" (litres), which round 7's switch to pure derivation silently
+/// lost. '\u{b0}' needs no entry: the degree sign is not
+/// alphanumeric, so a glued "980\u{b0}C" passes the boundary check
+/// regardless. The 'o' of "980oC" is deliberately NOT listed: it
+/// rides on the "ohm" token's initial, and listing it twice made an
+/// entry no mutation could kill (the tenth cannot-fail finding).
+///
+/// DENIED: 'e' rides on "ev", but a digit-glued 'e' in prose is
+/// scientific notation ("2e5 per second", "1e6 cycles"), not
+/// number+unit; denying it costs nothing — no other token starts with
+/// 'e', and "5 ev" still stamps through the spaced `unit_follows`
+/// path. 'x' is denied for the magnification form ("950x"). The old
+/// hand list also carried 'd' (days, "30d"); it stays absent: its
+/// removal let "2D"/"3D projection" drop correctly, a measured win
+/// that outweighs the days form.
+const EXTRA_UNIT_INITIALS: &[char] = &['\u{3bc}', '\u{e5}', 'f', 'l'];
+const DENIED_UNIT_INITIALS: &[char] = &['e', 'x'];
 
 fn unit_initial(c: char) -> bool {
-    EXTRA_UNIT_INITIALS.contains(&c) || UNIT_TOKENS.iter().any(|t| t.starts_with(c))
+    !DENIED_UNIT_INITIALS.contains(&c)
+        && (EXTRA_UNIT_INITIALS.contains(&c) || UNIT_TOKENS.iter().any(|t| t.starts_with(c)))
 }
 
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
@@ -1574,9 +1592,14 @@ mod tests {
     /// emit. The round-6 hand-list was missing four: U+03BC GREEK MU
     /// (extractors emit the Greek letter, not U+00B5 MICRO SIGN), 'o'
     /// (the mangled degree sign of "980oC"), 'r' (though `rpm` IS a
-    /// unit token), and \u{e5} (angstrom). Each stamp assert reddens
-    /// when its glyph/initial is removed; the trailing assert pins the
-    /// allow-list half — a glued NON-unit letter must still drop.
+    /// unit token), and \u{e5} (angstrom). Round 8: 'o' left
+    /// `EXTRA_UNIT_INITIALS` — it rides on the "ohm" token's initial,
+    /// and listing it twice made an entry no mutation could kill — so
+    /// each stamp assert below reddens when the SOURCE of its initial
+    /// is removed: for 'o' that is the "ohm" token, for 'r' the
+    /// "rpm" token, for the two glyphs `EXTRA_UNIT_INITIALS`. The
+    /// trailing asserts pin the allow-list half — a glued NON-unit
+    /// letter must still drop.
     #[test]
     fn glued_units_with_pdf_glyphs_still_stamp() {
         // U+03BC GREEK SMALL LETTER MU, the form PDF extractors emit.
@@ -2445,6 +2468,94 @@ mod tests {
                 guard: RefusalGuard::Label,
                 span: "Figure 2a shows the AlSi10Mg porosity.".to_string(),
             })
+        );
+    }
+
+    /// Round 8 (H2): the derivation of glued unit initials from
+    /// `UNIT_TOKENS` admitted 'e' via the "ev" token, reopening
+    /// scientific notation — "2e5 per second" stamped 2, "1e6 cycles"
+    /// stamped 1 — while the doc comment kept promising "2e5 stays
+    /// rejected". The derivation now subtracts `DENIED_UNIT_INITIALS`,
+    /// so the promise is enforced by the code, not by the token list
+    /// happening to lack the letter. Both directions pinned: the
+    /// glued-denial drops and the spaced form of the SAME unit still
+    /// stamps. Mutations: removing 'e' from `DENIED_UNIT_INITIALS`
+    /// reddens the 2e5/1e6 asserts; removing "ev" from `UNIT_TOKENS`
+    /// reddens the spaced control.
+    #[test]
+    fn scientific_notation_and_magnification_glue_stay_rejected() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "strain_rate",
+            2.0,
+            "The Ti-6Al-4V strain rate was 2e5 per second.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "cycles_to_failure",
+            1.0,
+            "Ti-6Al-4V ran 1e6 cycles to failure.",
+        );
+        // One of the five designation-suffix fabrications round 7
+        // opened: denying 'e' closes it.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "elongation",
+            16.0,
+            "The Ti-6Al-4V tensile tests followed ASTM E8-16e1.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            "The Ti-6Al-4V coupon was imaged at 950x magnification.",
+        );
+        // Spaced control: denying the glued 'e' costs nothing — "5 ev"
+        // still stamps through the `unit_follows` path.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "band_gap",
+                Some(5.0),
+                "The Ti-6Al-4V band gap was 5 ev."
+            )
+            .is_some()
+        );
+    }
+
+    /// Round 8 (H2): round 7's switch to pure derivation silently
+    /// lost 'f' and 'l' — the round-6 hand list's recall letters for
+    /// "72F" (Fahrenheit) and "50l" (litres) — and nothing tested
+    /// them. Restored in `EXTRA_UNIT_INITIALS`, pinned here. 'd'
+    /// (days, "30d") stays absent by decision: its removal let
+    /// "2D"/"3D projection" drop correctly, and the trade is pinned
+    /// by the last assert.
+    #[test]
+    fn f_and_l_recall_initials_stamp_glued_units_again() {
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "storage_temperature",
+                Some(72.0),
+                "The Ti-6Al-4V coupons were stored at 72F."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "tank_volume",
+                Some(50.0),
+                "The Ti-6Al-4V powder tank holds 50l."
+            )
+            .is_some()
+        );
+        // The decision half: keeping 'd' absent lets 2D/3D drop.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "projection",
+            2.0,
+            "Two 2D projections of the Ti-6Al-4V microstructure were aligned.",
         );
     }
 
