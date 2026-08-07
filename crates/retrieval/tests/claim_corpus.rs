@@ -1825,10 +1825,16 @@ fn corpus() -> Vec<CorpusCase> {
             "KNOWN: transposed tables — round 11 put the SUBJECT IN THE \
              SPAN: the old prose 'UTS (MPa) | 950 | 300' never named \
              Ti-6Al-4V, so that row exercised the subject-blind OR-arm \
-             (already pinned above), not column binding — the day \
-             subject-blindness closes, that row would go green and the \
-             tripwire would strip the marker while this gap stayed wide \
-             open. A pin that dies when a DIFFERENT gap closes is not a \
+             (already pinned above), not column binding. Round 12 \
+             correction: the rewritten row rides the SUBJECT arm (the span \
+             names Ti-6Al-4V, never 'uts'), so its narrow claim holds — it \
+             survives a subject-blindness-only fix (require-subject \
+             measurement: KNOWN held) — but its STATED claim is false: the \
+             stamp of 300 is also explained by OBJECT-blindness, and a \
+             require-BOTH flip strips this marker through the missing \
+             object arm while the column-binding gap stays wide open \
+             (round-12 require-both measurement: KNOWN fixed includes this \
+             row). A pin that dies when a DIFFERENT gap closes is not a \
              pin. The row carries two columns and the engine cannot tell \
              them apart: 300 belongs to another column yet stamps as UTS — \
              row-span support is co-occurrence, not column binding",

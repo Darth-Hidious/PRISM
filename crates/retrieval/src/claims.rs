@@ -359,6 +359,30 @@ pub fn supporting_quote_or_refusal(
         let hay = normalize_for_containment(span);
         match value {
             Some(v) => {
+                // The subject-OR-object disjunction. ROUND 12 PRICE, MEASURED
+                // (decision belongs to the branch owner; do not flip without
+                // re-measuring): round 12 item 4(a) folded the dash class
+                // into name matching, so the en-dash positive control in the
+                // lib tests now rides the SUBJECT arm and the old 1-lib-assert
+                // cost of require-subject is gone. Re-measured at round-12
+                // HEAD:
+                // * require-subject (subject must be present; the object arm
+                //   alone insufficient): corpus 0 MUST_STAMP dropped, 0
+                //   MUST_DROP stamped, 1 KNOWN FIXED — the subject-blind
+                //   cross-subject row, i.e. the corpus's largest live
+                //   fabrication channel closes. But 3 LIB asserts redden, all
+                //   facts that ride ONLY the object arm: the CoCrFeNi
+                //   supporting-sentence test (subject sits in the previous
+                //   sentence), the JATS citation test's 'its UTS is 950 MPa'
+                //   (same shape), and 'Figure 3 shows a UTS of 950 MPa.'
+                //   (caption names the property, not the alloy). Honest
+                //   price: 0 corpus rows, 3 lib asserts.
+                // * require-both (this OR flipped to AND): corpus 18
+                //   MUST_STAMP dropped, 19 KNOWN 'fixed' — among them the
+                //   transposed-table row, whose marker would be stripped
+                //   through the object arm while the column-binding gap stays
+                //   wide open (the ca71cf65 defect, mirrored) — and 21 lib
+                //   asserts redden. Not a candidate.
                 let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
                     || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
                 if name_near {
