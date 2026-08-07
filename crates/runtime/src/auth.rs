@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::platform_env::PlatformVar;
 use crate::{PrismPaths, StoredCredentials};
 
 /// JSON-RPC error code used for a missing platform credential.
@@ -188,11 +189,13 @@ pub fn resolve_from_environment(
     paths: Option<&PrismPaths>,
     default_api_base: &str,
 ) -> Result<ResolvedPlatformAuth> {
-    let api_base = env::var("MARC27_API_URL").unwrap_or_else(|_| default_api_base.to_string());
-    let api_key = env::var("MARC27_API_KEY").ok();
-    let token = env::var("MARC27_TOKEN")
-        .ok()
-        .or_else(|| env::var("MARC27_API_TOKEN").ok());
+    let api_base = PlatformVar::API_URL
+        .get()
+        .unwrap_or_else(|| default_api_base.to_string());
+    let api_key = PlatformVar::API_KEY.get();
+    let token = PlatformVar::TOKEN
+        .get()
+        .or_else(|| PlatformVar::API_TOKEN.get());
     let node_token = paths
         .and_then(PrismPaths::load_node_token)
         .map(|token| token.key);

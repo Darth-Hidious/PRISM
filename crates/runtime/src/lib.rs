@@ -23,6 +23,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+
+use crate::platform_env::PlatformVar;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -404,7 +406,8 @@ pub struct PlatformEndpoints {
 impl PlatformEndpoints {
     pub fn from_env() -> Self {
         let default_root = "https://api.marc27.com".to_string();
-        let root = env::var("MARC27_PLATFORM_URL")
+        let root = PlatformVar::PLATFORM_URL
+            .get()
             .unwrap_or(default_root)
             .trim_end_matches('/')
             .to_string();
