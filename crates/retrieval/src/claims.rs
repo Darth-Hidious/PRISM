@@ -965,10 +965,12 @@ fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
     // `clean_number_boundary` redeems glued-unit recall was FALSE):
     // passing the boundary check only avoids the Boundary guard; THIS
     // guard fires afterwards and nothing redeems it. The space
-    // requirement silently costs seven glued recall forms, carried as
+    // requirement silently costs six glued recall forms, carried as
     // KNOWN failures in tests/claim_corpus.rs: sample 3mm, run 30min,
-    // sample 980°C, cross-section 10mm, samples 5mm, sample 30um,
-    // sample 5wt%. Recorded residue: a SPACED single-letter unit
+    // sample 980°C, samples 5mm, sample 30um, sample 5wt%. Round 10
+    // removed cross-section 10mm from this list: that claim is a
+    // position, not a property of the alloy — its drop is correct, not
+    // a cost. Recorded residue: a SPACED single-letter unit
     // still exempts ("Table 4 K values" stamps 4) — see the corpus
     // KNOWN cases in tests/claim_corpus.rs.
     if hay[end..].starts_with(' ') && unit_follows(hay, end) {
@@ -2306,13 +2308,17 @@ mod tests {
 
         // Stamp direction: the greedy trim must not over-walk a VALUE
         // list. Dotted values with no trailing unit walk back to their
-        // real head word, not a label, and stamp.
+        // real head word, not a label, and stamp. Round 10: the old
+        // prose here was "batches were 3.1 and 4" — batch identifiers,
+        // which certified the plural leak as required behaviour (the
+        // corpus carries it as a KNOWN fabrication now). A genuine
+        // unitless value list pins the same mechanism honestly.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
-                "batch_id",
+                "strain",
                 Some(4.0),
-                "The Ti-6Al-4V batches were 3.1 and 4."
+                "The Ti-6Al-4V strains were 3.1 and 4."
             )
             .is_some()
         );

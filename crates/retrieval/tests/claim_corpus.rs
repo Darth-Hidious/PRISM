@@ -122,13 +122,31 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "recall form pinned at 2363837a: samples 5 mm",
         ),
-        case(
+        known(
             "A cross-section 10 mm above the build plate was examined for AlSi10Mg.",
             "AlSi10Mg",
-            "height",
+            "thickness",
             10.0,
-            Expect::MustStamp,
-            "the exemption also frees the label word section",
+            Expect::MustDrop,
+            "KNOWN: 10 mm is WHERE the cross-section was cut — a position in \
+             the build, not a property of the alloy. Stamped as an AlSi10Mg \
+             property through the label-word exemption on 'section', it is a \
+             fabricated property record. Round 10 flipped this row: it \
+             certified recall for a claim that is not supported. The \
+             exemption's genuine recall job stays pinned by the spaced-unit \
+             rows (sample 3 mm, run 30 min, samples 5 mm)",
+        ),
+        case(
+            "A cross-section 10mm above the build plate was examined for AlSi10Mg.",
+            "AlSi10Mg",
+            "thickness",
+            10.0,
+            Expect::MustDrop,
+            "round 10: the glued twin of the spaced cross-section KNOWN row — \
+             a position, not a property, so ground truth is MustDrop in BOTH \
+             spellings. It drops today only because H1's space requirement \
+             keeps the label guard firing; if the spaceless exemption ever \
+             returns, this row turns red",
         ),
         // ---------------- MUST_STAMP: glued-unit family --------------
         case(
@@ -251,13 +269,19 @@ fn corpus() -> Vec<CorpusCase> {
              picked round 9: MustDrop; the ASCII behaviour is the recorded \
              deviation, visible here instead of certified",
         ),
-        case(
+        known(
             "The Ti-6Al-4V batches 950-1100 were tested.",
             "Ti-6Al-4V",
-            "batch_id",
+            "UTS",
             1100.0,
-            Expect::MustStamp,
-            "ASCII hyphen keeps compound-friendly behaviour",
+            Expect::MustDrop,
+            "KNOWN: 950-1100 is a batch IDENTIFIER, not a measurement — \
+             stamped as a property of Ti-6Al-4V it is a fabricated property \
+             record with perfect provenance, the worst shape named in the \
+             module doc. The round-9 row certified the compound-friendly \
+             ASCII behaviour as REQUIRED: that described the code, not \
+             ground truth, the same defect as the mislabel round 9 removed. \
+             Ground truth picked round 10: MustDrop, whatever the dash",
         ),
         case(
             "In Table 5, 950, 960 and 970 MPa were measured for Ti-6Al-4V.",
@@ -275,13 +299,19 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "value list after a label locator: the unit-bearing tail",
         ),
-        case(
+        known(
             "The Ti-6Al-4V batches were 3.1 and 4.",
             "Ti-6Al-4V",
-            "batch_id",
+            "UTS",
             4.0,
-            Expect::MustStamp,
-            "dotted value list walks to its real head word, not a label",
+            Expect::MustDrop,
+            "KNOWN: batch identifiers again, reached through two gaps — \
+             identifiers stamped as a property, and the plural head \
+             'batches' absent from LABEL_WORDS (singular-only by round-9 \
+             policy), so the dotted walk lands on a non-label word. The old \
+             row praised the walk's CODE behaviour ('walks to its real head \
+             word') as if that were ground truth. The walk mechanism itself \
+             stays pinned by a genuine unitless value list in the lib tests",
         ),
         case(
             "The residual stress in Ti-6Al-4V was \u{2013}350 MPa as built and \
@@ -1035,7 +1065,10 @@ fn corpus() -> Vec<CorpusCase> {
         // H1's space requirement cost (round 9): a label number with a
         // GLUED unit drops — the exemption demands the space, the
         // boundary check cannot redeem what the Label guard refuses
-        // afterwards. Seven forms, recorded so the cost is visible.
+        // afterwards. Six forms, recorded so the cost is visible; round
+        // 10 removed cross-section 10mm — a position, not a property, so
+        // its drop is correct, not a cost (the twins sit with the
+        // label/sample/run family above).
         known(
             "Each Ti-6Al-4V sample 3mm thick was ground and polished.",
             "Ti-6Al-4V",
@@ -1059,14 +1092,6 @@ fn corpus() -> Vec<CorpusCase> {
             980.0,
             Expect::MustStamp,
             "KNOWN: glued recall lost to H1's space requirement — sample 980\u{b0}C",
-        ),
-        known(
-            "A cross-section 10mm above the build plate was examined for AlSi10Mg.",
-            "AlSi10Mg",
-            "height",
-            10.0,
-            Expect::MustStamp,
-            "KNOWN: glued recall lost to H1's space requirement — cross-section 10mm",
         ),
         known(
             "The AlSi10Mg samples 5mm thick were sectioned.",
