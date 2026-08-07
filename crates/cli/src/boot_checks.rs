@@ -356,7 +356,17 @@ async fn run_boot_checks_with(
 
     // 4. Models
     {
-        let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
+        // The project scope comes from the session when there is one, and
+        // otherwise from the environment — the headless/agent path has no
+        // stored credentials at all, so reading `creds` alone meant this row
+        // NEVER appeared for it. `PlatformVar::PROJECT_ID` is what every other
+        // surface already uses for exactly this (main.rs env_project_override,
+        // agent/protocol.rs); boot_checks was the one place it was missed.
+        let env_project = PlatformVar::PROJECT_ID.get();
+        let project_id = creds
+            .and_then(|c| c.project_id.as_deref())
+            .or(env_project.as_deref())
+            .unwrap_or("");
         if !project_id.is_empty() {
             let models = credential
                 .apply(client.get(format!("{api}/projects/{project_id}/llm/models")))
@@ -500,6 +510,36 @@ pub(crate) fn clear_platform_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headless path has no stored credentials, so a Models row could
+    /// only ever appear if the project scope is read from the environment too.
+    /// Before this, `project_id` came from `creds` alone and the row was
+    /// silently absent for exactly the population the env-key work targets.
+    #[tokio::test]
+    async fn models_row_uses_the_env_project_when_there_is_no_session() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        unsafe {
+            std::env::set_var("PRISM_API_KEY", "m27_real");
+            std::env::set_var("PRISM_PROJECT_ID", "proj-env");
+        }
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
+        unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
+        clear_platform_env();
+
+        // The row exists at all. Its ok/result depend on the (unreachable)
+        // host; what this pins is that the step was REACHED, which it never
+        // was for a sessionless install.
+        assert!(
+            checks.iter().any(|c| c.name == "LLM Models"),
+            "no Models row: {:?}",
+            checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+        );
+    }
 
     /// A malformed API key must name ITS OWN defect, not blame the host.
     ///
