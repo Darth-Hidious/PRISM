@@ -12,15 +12,26 @@
 use std::time::Duration;
 
 use prism_client::PlatformError;
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
 use crate::boot;
 
-/// Env vars that carry a platform credential on the headless/agent path
-/// (no `prism login`, no `~/.prism` state). These are frozen wire
-/// identifiers — see `brand.rs` for why they are not routed through the
-/// brand definition.
-const PLATFORM_TOKEN_ENV: [&str; 3] = ["MARC27_API_KEY", "MARC27_TOKEN", "MARC27_API_TOKEN"];
+/// Settings that carry a platform credential on the headless/agent path
+/// (no `prism login`, no `~/.prism` state).
+///
+/// Each is checked under BOTH its neutral `PRISM_*` name and its historical
+/// `MARC27_*` alias, because `PlatformVar::get()` resolves both. Before this
+/// used `PlatformVar`, the list was three hardcoded `MARC27_*` strings, so an
+/// operator who set only `PRISM_API_KEY` got a CLI that authenticated
+/// perfectly on every request path but reported "not configured" at boot and
+/// never ran the marketplace tool sync — the neutral name worked everywhere
+/// except the one check that decides whether the platform exists.
+const PLATFORM_TOKEN_VARS: [PlatformVar; 3] = [
+    PlatformVar::API_KEY,
+    PlatformVar::TOKEN,
+    PlatformVar::API_TOKEN,
+];
 
 /// One boot-banner line for a rejected credential: the platform's own
 /// `error.code` plus the action that code implies.
@@ -58,9 +69,11 @@ pub fn platform_configured(creds: Option<&StoredCredentials>) -> bool {
     if creds.is_some_and(|c| !c.access_token.trim().is_empty()) {
         return true;
     }
-    PLATFORM_TOKEN_ENV
-        .iter()
-        .any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+    // `get()` already treats unset, empty and whitespace-only alike as
+    // absent, which is the same rule `blank_env_key_is_not_a_credential`
+    // pins below — so the explicit trim check the old list needed is gone,
+    // not lost.
+    PLATFORM_TOKEN_VARS.iter().any(|var| var.get().is_some())
 }
 
 /// Run the boot checks.
@@ -353,10 +366,18 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Remove every platform token env var, so a test can pin the
 /// no-credential branch regardless of the developer's shell.
+///
+/// BOTH spellings, deliberately: this is a test-isolation primitive, and
+/// clearing only the historical name would let a `PRISM_API_KEY` sitting in
+/// the developer's shell leak in and flip `platform_configured` — a flake
+/// that reproduces on one machine and nowhere else.
 #[cfg(test)]
 pub(crate) fn clear_platform_env() {
-    for key in PLATFORM_TOKEN_ENV {
-        unsafe { std::env::remove_var(key) };
+    for var in PLATFORM_TOKEN_VARS {
+        unsafe {
+            std::env::remove_var(var.preferred);
+            std::env::remove_var(var.alias);
+        }
     }
 }
 
@@ -398,15 +419,22 @@ mod tests {
     /// The headless path never runs `prism login`, so the env key alone
     /// has to count — otherwise CI/agent installs would skip the very
     /// checks they need.
+    /// Both spellings of every credential must count. The neutral name is
+    /// the one that used to be missed: `platform_configured` checked three
+    /// hardcoded `MARC27_*` strings, so a `PRISM_API_KEY`-only operator got
+    /// a CLI that authenticated on every request path while the boot screen
+    /// said "not configured" and the tool sync never ran.
     #[test]
     fn env_key_alone_means_configured() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_platform_env();
-        for key in PLATFORM_TOKEN_ENV {
-            unsafe { std::env::set_var(key, "m27_test") };
-            assert!(platform_configured(None), "{key} should count");
-            unsafe { std::env::remove_var(key) };
+        for var in PLATFORM_TOKEN_VARS {
+            for key in [var.preferred, var.alias] {
+                clear_platform_env();
+                unsafe { std::env::set_var(key, "m27_test") };
+                assert!(platform_configured(None), "{key} should count");
+            }
         }
+        clear_platform_env();
     }
 
     #[test]
