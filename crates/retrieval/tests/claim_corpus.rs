@@ -1464,16 +1464,31 @@ fn corpus() -> Vec<CorpusCase> {
              yield_strength claim stamps — and the correct 880 claim stamps \
              indistinguishably beside it",
         ),
+        case(
+            "Ti-6Al-4V | 950 | 300",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustStamp,
+            "round 11: the subject IN the span and the value of its own \
+             column — the control half of the transposed-table pair below",
+        ),
         known(
-            "UTS (MPa) | 950 | 300",
+            "Ti-6Al-4V | 950 | 300",
             "Ti-6Al-4V",
             "UTS",
             300.0,
             Expect::MustDrop,
-            "KNOWN: transposed tables — the row carries two columns and the \
-             engine cannot tell them apart. 950 (the UTS column) stamps \
-             correctly and 300 (another column) stamps as UTS too: row-span \
-             support is co-occurrence, not column binding",
+            "KNOWN: transposed tables — round 11 put the SUBJECT IN THE \
+             SPAN: the old prose 'UTS (MPa) | 950 | 300' never named \
+             Ti-6Al-4V, so that row exercised the subject-blind OR-arm \
+             (already pinned above), not column binding — the day \
+             subject-blindness closes, that row would go green and the \
+             tripwire would strip the marker while this gap stayed wide \
+             open. A pin that dies when a DIFFERENT gap closes is not a \
+             pin. The row carries two columns and the engine cannot tell \
+             them apart: 300 belongs to another column yet stamps as UTS — \
+             row-span support is co-occurrence, not column binding",
         ),
         known(
             "The Ti-6Al-4V microstructures are shown in 4a and 4b.",
