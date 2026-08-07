@@ -542,17 +542,19 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// entry, plus `EXTRA_UNIT_INITIALS`, minus `DENIED_UNIT_INITIALS`.
 ///
 /// EXTRA: the glyphs PDF extractors actually emit where the token
-/// list spells the unit differently — U+03BC GREEK SMALL LETTER MU
-/// (extractors emit the Greek letter, not the U+00B5 MICRO SIGN the
-/// list carries, so both must open a glued unit) and lowercased
+/// list spells the unit differently — lowercased
 /// '\u{e5}' ("2.95\u{c5} lattice parameter") — plus 'f' and 'l', the
 /// round-6 hand list's recall letters for "72F" (Fahrenheit) and
 /// "50l" (litres), which round 7's switch to pure derivation silently
 /// lost. '\u{b0}' needs no entry: the degree sign is not
 /// alphanumeric, so a glued "980\u{b0}C" passes the boundary check
-/// regardless. The 'o' of "980oC" is deliberately NOT listed: it
-/// rides on the "ohm" token's initial, and listing it twice made an
-/// entry no mutation could kill (the tenth cannot-fail finding).
+/// regardless. Round 10: U+03BC GREEK SMALL LETTER MU moved OUT of
+/// this list and into UNIT_TOKENS as a real "\u{3bc}m" token. The
+/// EXTRA entry opened only the GLUED boundary path (`unit_initial` is
+/// derived from both sources), while `unit_follows` reads the token
+/// list alone — so "step 30 \u{3bc}m" dropped while its U+00B5 twin
+/// stamped. Kept beside the token, the EXTRA entry would have been an
+/// entry no mutation could kill — the same defect 'o' was removed for.
 ///
 /// DENIED: 'e' rides on "ev", but a digit-glued 'e' in prose is
 /// scientific notation ("2e5 per second", "1e6 cycles"), not
@@ -570,7 +572,7 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// commit. The old hand list also carried 'd' (days, "30d"); it stays
 /// absent: its removal let "2D"/"3D projection" drop correctly, a
 /// measured win that outweighs the days form.
-const EXTRA_UNIT_INITIALS: &[char] = &['\u{3bc}', '\u{e5}', 'f', 'l'];
+const EXTRA_UNIT_INITIALS: &[char] = &['\u{e5}', 'f', 'l'];
 const DENIED_UNIT_INITIALS: &[char] = &['e'];
 
 fn unit_initial(c: char) -> bool {
@@ -838,8 +840,8 @@ const UNIT_TOKENS: &[&str] = &[
     // pressure / stress / hardness
     "pa", "kpa", "mpa", "gpa", "tpa", "bar", "mbar", "kbar", "atm", "torr", "psi", "ksi", "hv",
     "hrc", "hrb", // force, length, mass
-    "n", "kn", "mn", "gn", "m", "mm", "cm", "nm", "um", "\u{b5}m", "pm", "km", "g", "mg", "kg",
-    // time, temperature
+    "n", "kn", "mn", "gn", "m", "mm", "cm", "nm", "um", "\u{b5}m", "\u{3bc}m", "pm", "km", "g",
+    "mg", "kg", // time, temperature
     "s", "ms", "ns", "ps", "min", "h", "k", "\u{b0}c", "\u{b0}f",
     // energy, power, frequency
     "j", "kj", "mj", "gj", "ev", "kev", "mev", "gev", "tev", "w", "mw", "kw", "hz", "khz", "mhz",
@@ -1731,18 +1733,33 @@ mod tests {
     /// and listing it twice made an entry no mutation could kill — so
     /// each stamp assert below reddens when the SOURCE of its initial
     /// is removed: for 'o' that is the "ohm" token, for 'r' the
-    /// "rpm" token, for the two glyphs `EXTRA_UNIT_INITIALS`. The
+    /// "rpm" token, for \u{e5} `EXTRA_UNIT_INITIALS`. Round 10: the
+    /// U+03BC source is the "\u{3bc}m" TOKEN in `UNIT_TOKENS` — the
+    /// EXTRA entry beside it would have been the same unkillable
+    /// duplicate 'o' was removed for, and only the token opens the
+    /// SPACED path (`unit_follows` reads the token list alone). The
     /// trailing asserts pin the allow-list half — a glued NON-unit
     /// letter must still drop.
     #[test]
     fn glued_units_with_pdf_glyphs_still_stamp() {
         // U+03BC GREEK SMALL LETTER MU, the form PDF extractors emit.
+        // Deleting the "\u{3bc}m" token reddens BOTH asserts: the glued
+        // form loses its derived initial, the spaced form its unit.
         assert!(
             supporting_quote(
                 "AlSi10Mg",
                 "layer_thickness",
                 Some(30.0),
                 "AlSi10Mg was built with a 30\u{3bc}m layer thickness."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "AlSi10Mg",
+                "scan_step_size",
+                Some(30.0),
+                "The AlSi10Mg scan step 30 \u{3bc}m was imaged."
             )
             .is_some()
         );

@@ -190,6 +190,17 @@ fn corpus() -> Vec<CorpusCase> {
             "unit glyph: U+03BC GREEK MU, the form PDF extractors emit",
         ),
         case(
+            "The AlSi10Mg scan step 30 \u{3bc}m was imaged.",
+            "AlSi10Mg",
+            "scan_step_size",
+            30.0,
+            Expect::MustStamp,
+            "round 10: the SPACED U+03BC form. \u{3bc}m moved from \
+             EXTRA_UNIT_INITIALS (which opens only the glued boundary path) \
+             into UNIT_TOKENS, which unit_follows reads — before the move \
+             this dropped while its U+00B5 twin stamped",
+        ),
+        case(
             "Inconel 718 was solution treated at 980oC.",
             "Inconel 718",
             "temperature",
