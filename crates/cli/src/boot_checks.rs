@@ -86,9 +86,40 @@ pub async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
 ) -> Vec<boot::BootCheck> {
+    // Hard offline mode is a policy about the process, not about one command.
+    // `Commands::Tui` skipped the boot checks itself (main.rs), but `Setup` and
+    // `Resume` called straight through — so `PRISM_OFFLINE=1 prism setup` ran
+    // every platform check anyway. Enforcing it here covers all eight call
+    // sites at once instead of relying on each to remember.
+    //
+    // This matters more since boot checks started carrying a real credential:
+    // before, the offline bypass leaked an empty Bearer; now it would send the
+    // operator's actual key to a remote host they explicitly asked not to
+    // contact.
+    if prism_runtime::offline::enabled() {
+        return offline_checks().await;
+    }
     let configured = platform_configured(creds);
     let credential = boot_credential(creds);
     run_boot_checks_with(creds, endpoints, configured, credential).await
+}
+
+/// The check set for hard offline mode: local only, and it says why.
+async fn offline_checks() -> Vec<boot::BootCheck> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let mut checks = vec![boot::BootCheck {
+        name: "Platform".into(),
+        // Not a failure: the operator asked for this.
+        result: "offline mode — platform checks skipped".into(),
+        ok: true,
+        dots: 8,
+        delay_ms: 30,
+    }];
+    push_local_checks(&client, &mut checks).await;
+    checks
 }
 
 /// The credential the boot checks should present, in the same precedence the
@@ -427,6 +458,54 @@ pub(crate) fn clear_platform_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hard offline mode must skip every platform check, from ANY command.
+    /// `Commands::Setup` and `Commands::Resume` had no `cli.offline` guard, so
+    /// before this the boot checks ran under `PRISM_OFFLINE=1` and — once they
+    /// started carrying a real credential — would have sent it to a remote host
+    /// the operator explicitly asked not to contact.
+    #[tokio::test]
+    async fn offline_mode_skips_every_platform_check() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        // A credential IS present: offline must win over "configured".
+        unsafe {
+            std::env::set_var("PRISM_API_KEY", "m27_real");
+            std::env::set_var(prism_runtime::offline::ENV, "1");
+        }
+        // An address that would cost a full 5s timeout if it were ever dialled.
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks(None, &endpoints).await;
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+        clear_platform_env();
+
+        let platform = checks
+            .iter()
+            .find(|c| c.name == "Platform")
+            .expect("offline still reports a Platform row");
+        assert!(
+            platform.result.contains("offline mode"),
+            "must say why it skipped: {}",
+            platform.result
+        );
+        assert!(platform.ok, "offline is a choice, not a failure");
+        // None of the credentialed steps may appear.
+        for banned in [
+            "Auth",
+            "Knowledge Graph",
+            "LLM Models",
+            "Compute",
+            "Marketplace",
+        ] {
+            assert!(
+                !checks.iter().any(|c| c.name == banned),
+                "{banned} row must not exist in offline mode"
+            );
+        }
+    }
 
     /// The lying check this change exists to kill: "configured" but with no
     /// usable credential must NOT fire an unauthenticated request and then
