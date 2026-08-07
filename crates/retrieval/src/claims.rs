@@ -82,8 +82,13 @@
 //! `relative density`, `average grain size`, `grain diameter`,
 //! `compressive strength`, `fracture strength`, ... — still STAMP a
 //! negative from a positive source. More entries is NOT the fix (the
-//! const doc below disclaims "another word list"); item 5 measures
-//! head-noun matching vs an extractor-vocabulary constraint.
+//! const doc below disclaims "another word list"); round 13 item 5
+//! ADOPTED a head-noun SUFFIX rule — every `*strength`, `*hardness` and
+//! `*grain size` is non-negative and has NO signed homograph, so 16 of
+//! the 22 spellings now drop a negative (was 5), at 0 over-refusal on a
+//! 14-quantity signed control set. `density` stays EXACT: charge/current
+//! density can be negative, so `relative density` / `bulk density`
+//! still fabricate (6 spellings open). See `is_nonnegative_quantity`.
 //!
 //! ROUND 13 ITEM 2 — IS THE REVERT STILL BUYING ANYTHING? Settled by
 //! measurement; the winning reading is (a) the revert IS load-bearing.
@@ -606,7 +611,7 @@ fn refusing_guard(
     object_n: &str,
     value: f64,
 ) -> Option<RefusalGuard> {
-    if value < 0.0 && NONNEGATIVE_QUANTITIES.contains(&object_n) {
+    if value < 0.0 && is_nonnegative_quantity(object_n) {
         return Some(RefusalGuard::SignDomain);
     }
     if dash_range_endpoint(hay, start, end) {
@@ -790,6 +795,30 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
 /// guard. Every entry is pinned by a corpus row that stamps without it.
 const NONNEGATIVE_QUANTITIES: &[&str] =
     &["uts", "hardness", "density", "grain size", "yield strength"];
+
+/// Round 13 item 5: the exact-match closure was SPELLING-SCOPED — of 22
+/// common spellings only the five canonical dropped a negative; 17
+/// stamped one. Closing it with "more entries" would be another word
+/// list (the const doc above disclaims that). The fix is a HEAD-NOUN
+/// SUFFIX rule for the three quantities whose EVERY spelling is a
+/// magnitude AND has NO signed homograph: every `*strength`, every
+/// `*hardness`, every `*grain size` is non-negative — so `tensile
+/// strength`, `microhardness`, `average grain size`, `compressive
+/// strength`, `0.2% yield strength` now drop a negative too. NOT
+/// `density`: `charge density` / `current density` can be negative, so
+/// `density` stays EXACT and `relative density` / `bulk density` still
+/// fabricate (the measured price of not over-refusing the signed
+/// densities). Measured: 16/22 safe (was 5), 0 over-refusal on a
+/// 14-quantity signed control set (residual stress, Seebeck, charge
+/// density, density change, grain size difference, ...). Every suffix
+/// is pinned both directions by the lib test
+/// `sign_domain_matches_head_noun_suffix_without_over_refusal`.
+fn is_nonnegative_quantity(object_n: &str) -> bool {
+    NONNEGATIVE_QUANTITIES.contains(&object_n)
+        || object_n.ends_with("strength")
+        || object_n.ends_with("hardness")
+        || object_n.ends_with("grain size")
+}
 
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
@@ -1820,6 +1849,53 @@ mod tests {
     fn single_byte_dash_subject_matching_multibyte_hay_glyph_does_not_panic() {
         let r = supporting_quote_or_refusal("-", "UTS", Some(950.0), "ti\u{2010}6al had 950 MPa");
         assert!(r.is_ok(), "must not panic and must find the support: {r:?}");
+    }
+
+    /// Round 13 item 5: the SignDomain guard now matches by head-noun
+    /// SUFFIX (every *strength/*hardness/*grain size is non-negative),
+    /// not exact equality. Pin BOTH directions: the newly-caught
+    /// spellings now drop a negative (was stamping), and the signed
+    /// homograph traps still stamp (no over-refusal).
+    #[test]
+    fn sign_domain_matches_head_noun_suffix_without_over_refusal() {
+        // Newly caught: a negative under these stamped at exact-match
+        // and drops under the suffix rule. Reverting is_nonnegative_quantity
+        // to NONNEGATIVE_QUANTITIES.contains(...) reddens every one.
+        for nonneg_spelling in [
+            "tensile strength",
+            "ultimate tensile strength",
+            "microhardness",
+            "Vickers hardness",
+            "average grain size",
+            "compressive strength",
+            "0.2% yield strength",
+        ] {
+            let prose = format!("The Ti-6Al-4V {nonneg_spelling} was -950 MPa.");
+            let r = supporting_quote_or_refusal("Ti-6Al-4V", nonneg_spelling, Some(-950.0), &prose);
+            assert!(
+                r.is_err(),
+                "suffix rule must drop a negative under {nonneg_spelling:?}: {r:?}"
+            );
+        }
+        // Over-refusal controls: a negative under these MUST still stamp
+        // (legitimately signed). 'density' stays EXACT precisely because
+        // charge density / current density / density change can be
+        // negative; 'stress' is not 'strength'; a difference is signed.
+        for signed_spelling in [
+            "residual stress",
+            "Seebeck coefficient",
+            "charge density",
+            "current density",
+            "density change",
+            "grain size difference",
+        ] {
+            let prose = format!("The Ti-6Al-4V {signed_spelling} was -950 MPa.");
+            let r = supporting_quote_or_refusal("Ti-6Al-4V", signed_spelling, Some(-950.0), &prose);
+            assert!(
+                r.is_ok(),
+                "over-refusal: a negative under {signed_spelling:?} must still stamp: {r:?}"
+            );
+        }
     }
 
     /// F-1: a thousands comma adjacent to a digit is part of the number,
