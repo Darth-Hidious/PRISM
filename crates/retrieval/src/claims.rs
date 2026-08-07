@@ -519,7 +519,7 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
         if before.is_alphanumeric() {
             return false;
         }
-        if matches!(before, '-' | '\u{2212}') {
+        if matches!(before, '-' | '\u{2212}' | '\u{2013}') {
             // A leading minus is part of the number: an unsigned needle
             // must not match the digits of a signed token ("950" inside
             // "-950" or "\u{2212}950"), or the sign-flipped claim stamps
@@ -529,6 +529,17 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             // opening punctuation before it. A letter or digit before it
             // is the hyphen of a designation ("ti-6al-4v") or a
             // digit-joined compound, which the designation guards own.
+            //
+            // U+2013 joins this list for the MINUS half only (round 7):
+            // some PDFs typeset negative values as "\u{2013}350 MPa",
+            // and the unsigned needle matched the digits, stamping a
+            // compressive stress as tensile. A range dash always has a
+            // digit before it, a minus sign does not — so the
+            // joins-compound test separates them, and
+            // `en_dash_range_endpoint` (checked first) keeps refusing
+            // the range case as Range. U+2013 is still NOT a needle
+            // glyph: the true "\u{2013}350" claim drops (accepted; see
+            // `number_needles`), only the sign-flipped twin is killed.
             let joins_compound = hay[..start - before.len_utf8()]
                 .chars()
                 .next_back()
@@ -846,16 +857,19 @@ fn trailing_word(prefix: &str) -> String {
 /// U+2212 MINUS SIGN (the glyph typeset PDFs carry); without both, the
 /// true negative claim is dropped while its sign-flipped twin stamps.
 ///
-/// DECIDED, NOT IMPLEMENTED (round 6): U+2013 EN DASH as a minus is NOT
-/// a needle glyph. Probed: "was \u{2013}950 MPa" drops the true -950
-/// and stamps the sign-flipped +950 — the compressive-to-tensile
-/// failure the U+2212 needles exist to prevent, under a different
-/// glyph. Adding U+2013 to the minus glyphs collides head-on with the
-/// en-dash range rule in `en_dash_range_endpoint`: the same character
-/// would have to mean "sign of this number" AND "this number is a
-/// range endpoint", and the two features want the character to mean
-/// opposite things. Stays decided until a source is found that emits
-/// U+2013 as a minus rather than a range dash.
+/// DECIDED, ROUND 7 (was DECIDED-NOT-IMPLEMENTED, round 6): U+2013 EN
+/// DASH is still NOT a needle glyph — the true "\u{2013}950 MPa" claim
+/// DROPS, and that half stays accepted: adding U+2013 to the minus
+/// glyphs would make the same character mean "sign of this number" AND
+/// "range endpoint" inside `en_dash_range_endpoint`, and the two
+/// readings are not separable at the needle level. The FABRICATION half
+/// is now closed a different way: `clean_number_boundary` refuses the
+/// UNSIGNED needle when it is preceded by U+2013 with no digit before
+/// the dash — a range dash always has a digit before it, a minus sign
+/// does not. "was \u{2013}950 MPa" therefore drops both the true -950
+/// claim AND the sign-flipped +950 claim; nothing stamps compressive
+/// as tensile. Reopen only if a source is found where dropping the
+/// true en-dash-minus value costs more than the fabrication it blocks.
 fn number_needles(value: f64) -> Vec<String> {
     let plain = format!("{value}");
     let mut out = vec![plain.clone()];
@@ -1656,6 +1670,62 @@ mod tests {
                 "The Ti-6Al-4V batches 950-1100 were tested."
             )
             .is_some()
+        );
+    }
+
+    /// Round 7: the STAMP half of the U+2013-minus problem. Some PDFs
+    /// typeset negatives as "\u{2013}350 MPa". The unsigned needle
+    /// matched the digits and stamped the sign-flipped twin —
+    /// compressive recorded as tensile. The fix refuses the unsigned
+    /// needle when U+2013 precedes it with no digit before the dash:
+    /// a range dash always has a digit before it, a minus sign does
+    /// not, and `en_dash_range_endpoint` (checked first) keeps the
+    /// range case. The true negative still DROPS — U+2013 is not a
+    /// needle glyph (see `number_needles`); both halves pin that.
+    /// Mutation: removing U+2013 from the before-dash match in
+    /// `clean_number_boundary` reddens the +350 drop assert.
+    #[test]
+    fn en_dash_minus_unsigned_needle_is_refused() {
+        let minus = "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.";
+        // The fabrication half: the sign-flipped positive claim drops.
+        assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", 350.0, minus);
+        // The accepted drop half: the true negative has no needle form.
+        assert!(supporting_quote("Ti-6Al-4V", "residual_stress", Some(-350.0), minus).is_none());
+        // Grouped form too: the unsigned grouped needle is refused.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "residual_stress",
+            1140.0,
+            "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
+        );
+
+        // Stamp direction: a genuine point value in the same sentence
+        // still stamps — the refusal is dash-adjacent, not sentence-wide.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "stress",
+                Some(400.0),
+                "The residual stress in Ti-6Al-4V was \u{2013}350 MPa as built and \
+                 400 MPa after annealing."
+            )
+            .is_some()
+        );
+
+        // The range rule keeps its name: the high endpoint of
+        // "950\u{2013}1100" has a digit before the dash, so it is
+        // Range (checked first), not the new sign refusal.
+        assert_eq!(
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1100.0),
+                "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa."
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Range,
+                span: "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.".to_string(),
+            })
         );
     }
 
