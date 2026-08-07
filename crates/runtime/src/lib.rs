@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod llm_resolve;
 pub mod offline;
+pub mod platform_env;
 pub mod retry;
 
 use std::env;
