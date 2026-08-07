@@ -833,15 +833,24 @@ fn walk_comma_items(prefix: &mut String, word: &mut String) {
 /// trim to one number-run; the bound opened dotted-label fabrications
 /// and reddened nothing on revert, so it is gone.
 fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
-    // A unit after the number makes it a measurement, whatever word
-    // precedes it: a label number never carries a unit ("Table 3 mm" is
-    // not prose), a measurement always does. Checked first so it
-    // exempts the head word itself, not just the list walk: "sample
-    // 3 mm thick" and "run 30 min" are methods prose, while "Sample 5
-    // of Ti-6Al-4V" (no unit) stays a label. Round 6 cut sample/run
-    // from LABEL_WORDS instead and opened specimen-label fabrications;
-    // the exemption is the fix that pins both directions.
-    if unit_follows(hay, end) {
+    // A SPACED unit after the number makes it a measurement, whatever
+    // word precedes it: "sample 3 mm thick" and "run 30 min" are
+    // methods prose, while "Sample 5 of Ti-6Al-4V" (no unit) stays a
+    // label. Checked first so it exempts the head word itself, not
+    // just the list walk.
+    //
+    // The exemption REQUIRES the space (round 8). UNIT_TOKENS holds
+    // eleven single letters (n m g s h k j w v a t) — exactly the
+    // symbol letters of materials prose — so round 7's spaceless
+    // exemption read a glued sub-panel letter or symbol column as a
+    // unit and dropped the label guard for every label word: "Figure
+    // 2a shows..." stamped 2, "Table 4a" stamped 4. Every measured
+    // win that needs THIS exemption is spaced; glued-unit recall is
+    // redeemed by `clean_number_boundary`'s unit-initial check, not
+    // here. Recorded residue: a SPACED single-letter unit still
+    // exempts ("Table 4 K values" stamps 4) — see the corpus KNOWN
+    // cases in tests/claim_corpus.rs.
+    if hay[end..].starts_with(' ') && unit_follows(hay, end) {
         return false;
     }
     let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']).to_string();
@@ -2371,6 +2380,71 @@ mod tests {
                 "The Ti-6Al-4V run 2 h at 1073 K produced full densification."
             )
             .is_some()
+        );
+    }
+
+    /// Round 8 (H1): the unit exemption at the top of
+    /// `preceding_word_is_label` requires a SPACE before the unit.
+    /// UNIT_TOKENS holds eleven single letters (n m g s h k j w v a
+    /// t) — exactly the symbol letters of materials prose — so round
+    /// 7's spaceless exemption read a glued sub-panel letter or
+    /// symbol column as a unit and disabled the label guard for EVERY
+    /// label word: 242 label-letter combinations flipped DROP ->
+    /// STAMP, every one a fabrication ("Figure 2a shows...", "Table
+    /// 4a"). Both directions pinned: the spaced recall form stamps,
+    /// the glued panel letter drops. Mutations: deleting the
+    /// `starts_with(' ')` condition reddens the drop asserts;
+    /// deleting the exemption reddens the stamp asserts.
+    #[test]
+    fn unit_exemption_requires_a_space_before_the_unit() {
+        // Stamp direction: every win that needs the exemption is spaced.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "thickness",
+                Some(3.0),
+                "Each Ti-6Al-4V sample 3 mm thick was ground and polished."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Inconel 718",
+                "duration",
+                Some(30.0),
+                "Each Inconel 718 run 30 min at 980 \u{b0}C was quenched."
+            )
+            .is_some()
+        );
+        // Drop direction: a glued single letter is a sub-panel letter
+        // or symbol column as often as it is a unit; the Label guard
+        // must survive it.
+        assert_dropped_end_to_end(
+            "AlSi10Mg",
+            "porosity",
+            2.0,
+            "Figure 2a shows the AlSi10Mg porosity.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "microstructure",
+            3.0,
+            "Fig. 3a shows the Ti-6Al-4V microstructure.",
+        );
+        // And the refusal keeps its name: the guard is Label, not
+        // Boundary (the glued 'a' passes the boundary check as a unit
+        // initial — only the label word refuses it).
+        assert_eq!(
+            supporting_quote_or_refusal(
+                "AlSi10Mg",
+                "porosity",
+                Some(2.0),
+                "Figure 2a shows the AlSi10Mg porosity."
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: "Figure 2a shows the AlSi10Mg porosity.".to_string(),
+            })
         );
     }
 

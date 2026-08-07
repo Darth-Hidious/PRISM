@@ -358,14 +358,13 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "a Figure label number is not a measurement",
         ),
-        known(
+        case(
             "Figure 2a shows the AlSi10Mg porosity.",
             "AlSi10Mg",
             "porosity",
             2.0,
             Expect::MustDrop,
-            "H1: a GLUED sub-panel letter must not exempt the label word; \
-             round 7's spaceless exemption stamps this",
+            "H1 closed round 8: a GLUED sub-panel letter must not exempt the label word",
         ),
         case(
             "Sample 5 of Ti-6Al-4V was tested.",
