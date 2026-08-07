@@ -26,6 +26,15 @@
 //! marker must then be removed, so the record cannot go stale in
 //! either direction. KNOWN failures are documented, not hidden.
 //!
+//! LESSON (round 13 item 3): a promotion can RETIRE a tripwire as
+//! silently as a deletion. When a `known(` row is promoted to `case(`
+//! because a DIFFERENT guard now refuses it, the gap the row used to
+//! record leaves the scoreboard — nothing fires when it is fixed,
+//! nothing reddens if it regresses. The promoted row's reason may say
+//! in prose that the gap stays open, but a parenthetical is not a
+//! tripwire. When you promote a row whose guard changed, check whether
+//! the gap it recorded still has its own row.
+//!
 //! A SECOND small table covers the one class the (prose, subject,
 //! object, value) tuple cannot express: round-3 tautological
 //! containment. It lives in `validate_and_stamp` -> `quote_in_block`,
@@ -1923,6 +1932,26 @@ fn corpus() -> Vec<CorpusCase> {
              missing high endpoint of the U+2212 word-range, then closed \
              by SignDomain — one round as a KNOWN tripwire, marker \
              stripped the day the guard landed",
+        ),
+        // ROUND 13 ITEM 3 — a tripwire RETIRED by a promotion. The four
+        // word-form range rows above were promoted known( -> case( at
+        // 7b1f71ae because SignDomain now refuses them (negative UTS);
+        // the adjacency gap they recorded ('to' is not a dash, the
+        // guard never fires, both endpoints stamp as point values)
+        // came off the scoreboard. One known(MustDrop) on a SIGNED
+        // predicate repairs it: SignDomain cannot mask it, and when the
+        // guard learns 'to' it reddens. Measured at HEAD: both
+        // endpoints of this range stamp (gap live).
+        known(
+            "The Ti-6Al-4V residual stress ranged from -350 to -120 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -350.0,
+            Expect::MustDrop,
+            "KNOWN: the WORD-FORM range gap, retired by the 7b1f71ae \
+             promotion and restored here — 'to' is not a dash, the \
+             adjacency guard never fires, so the low endpoint of a \
+             signed word-range stamps as a point value",
         ),
         known(
             "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
