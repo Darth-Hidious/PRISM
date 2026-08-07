@@ -622,10 +622,6 @@ const LABEL_WORDS: &[&str] = &[
     "equations",
     "chapter",
     "chapters",
-    "sample",
-    "samples",
-    "run",
-    "runs",
     "entry",
     "entries",
     "scheme",
@@ -1571,9 +1567,10 @@ mod tests {
         );
     }
 
-    /// F-3: the label vocabulary also covers Section/Eq/Chapter/Sample/
-    /// Run/Entry/Scheme labels. Mutation-proven: removing "section" from
-    /// LABEL_WORDS turns the first assert red.
+    /// F-3: the label vocabulary also covers Section/Eq/Chapter/
+    /// Entry/Scheme labels. Mutation-proven: removing "section" from
+    /// LABEL_WORDS turns the first assert red. (Sample/Run were cut in
+    /// round 6: methods-prose nouns, not document objects.)
     #[test]
     fn section_and_kindred_label_numbers_are_not_support() {
         assert_dropped_end_to_end(
@@ -2014,6 +2011,142 @@ mod tests {
         assert_eq!(
             supporting_quote("Inconel 718", "UTS", Some(1375.0), &table.text).as_deref(),
             Some("Inconel 718 1375")
+        );
+    }
+
+    /// Round 6: `sample`/`samples`/`run`/`runs` were label words, but
+    /// they are ordinary methods-prose nouns that precede measurements —
+    /// the reviewer measured both dropping dimensional claims. Cut from
+    /// LABEL_WORDS; re-adding any one of the four reddens its assert.
+    #[test]
+    fn methods_prose_nouns_sample_and_run_do_not_label_numbers() {
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "thickness",
+                Some(3.0),
+                "Each Ti-6Al-4V sample 3 mm thick was ground and polished."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "thickness",
+                Some(3.0),
+                "The Ti-6Al-4V samples 3 mm thick were ground and polished."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "duration",
+                Some(2.0),
+                "The Ti-6Al-4V run 2 h at 1073 K produced full densification."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "duration",
+                Some(2.0),
+                "The Ti-6Al-4V runs 2 h at 1073 K produced full densification."
+            )
+            .is_some()
+        );
+        // The real temperature in the same sentence still stamps.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "temperature",
+                Some(1073.0),
+                "The Ti-6Al-4V run 2 h at 1073 K produced full densification."
+            )
+            .is_some()
+        );
+    }
+
+    /// Round 6: every label word KEPT in `LABEL_WORDS` gets a
+    /// falsifiable assert — untested denylist words are the dangerous
+    /// ones, and this list carried sixteen of them — the twelve added
+    /// words plus figures/figs/reference/references. Each assert reddens
+    /// when its word is removed from LABEL_WORDS. Pre-existing tests
+    /// cover table/tables/figure/fig/ref/refs/section/eq/eqs/scheme.
+    #[test]
+    fn every_kept_label_word_refuses_its_number() {
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            "The Ti-6Al-4V data appear in Figures 2 and 3.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            5.0,
+            "Ti-6Al-4V results are plotted in Figs. 4 and 5.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            12.0,
+            "Ti-6Al-4V data are taken from Reference 12.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            "Ti-6Al-4V data are taken from References 12 and 13.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            5.0,
+            "The Ti-6Al-4V data appear in Sections 4 and 5.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            7.0,
+            "The Ti-6Al-4V fit is given in Equation 7.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            8.0,
+            "The Ti-6Al-4V fits are given in Equations 7 and 8.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            "The Ti-6Al-4V model is given in Chapter 3.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            4.0,
+            "The Ti-6Al-4V models are given in Chapters 3 and 4.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            5.0,
+            "The Ti-6Al-4V data come from Entry 5.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            6.0,
+            "The Ti-6Al-4V data come from Entries 5 and 6.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            "The Ti-6Al-4V routes are shown in Schemes 2 and 3.",
         );
     }
 
