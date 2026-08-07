@@ -1220,6 +1220,17 @@ mod tests {
             )
             .is_some()
         );
+        // Cryogenic temperature with a degree unit — the round-6
+        // positive-control list names it explicitly.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "temperature",
+                Some(-196.0),
+                "The Ti-6Al-4V samples were tested at \u{2212}196 \u{b0}C."
+            )
+            .is_some()
+        );
 
         // The sign-flipped claim is dropped, not stamped: the prose says
         // compressive, +950 says tensile. Both glyphs.
