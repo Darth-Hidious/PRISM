@@ -867,7 +867,7 @@ const NONNEGATIVE_QUANTITIES: &[&str] =
 /// Round 14 item 3: a differential marker as a WHOLE WORD turns an
 /// otherwise-non-negative magnitude into a SIGNED delta. `change in
 /// yield strength`, `difference in hardness`, `delta grain size`,
-/// `reduction in strength`, `gradient in hardness` can all be negative
+/// `reduction in strength`, `drop in strength`, `gradient in hardness` can all be negative
 /// though the bare noun is a magnitude — so a suffix match on the noun
 /// must NOT refuse them. Matched as whole tokens (`split_whitespace`)
 /// so `change` does not fire inside `exchange`.
@@ -885,6 +885,7 @@ const SIGNED_DIFFERENTIAL_MARKERS: &[&str] = &[
     "difference",
     "delta",
     "reduction",
+    "drop",
     "loss",
     "increase",
     "deviation",
@@ -919,7 +920,7 @@ const SIGNED_STRENGTH_HOMOGRAPHS: &[&str] = &["signal strength", "field strength
 /// items 2/3 REPAIR the over-refusal direction. Two exceptions now gate
 /// the suffix rule, BOTH checked before it:
 ///   (a) A whole-word DIFFERENTIAL marker (`change`, `difference`,
-///       `delta`, `reduction`, `loss`, `increase`, `deviation`,
+///       `delta`, `reduction`, `drop`, `loss`, `increase`, `deviation`,
 ///       `variation`, `gradient`; see `SIGNED_DIFFERENTIAL_MARKERS`)
 ///       anywhere makes the quantity a signed delta — `change in yield
 ///       strength`, `difference in hardness`, `delta grain size` can be
@@ -2058,7 +2059,7 @@ mod tests {
         }
         // Over-refusal direction: a negative under a legitimately-SIGNED
         // spelling MUST stamp (is_ok). The first six are the round-13
-        // controls (kept). The next nine pin the differential markers:
+        // controls (kept). The next ten pin the differential markers:
         // removing any one marker from SIGNED_DIFFERENTIAL_MARKERS
         // reddens its row. The last four pin the signal/field
         // homographs: removing SIGNED_STRENGTH_HOMOGRAPHS (or the
@@ -2074,6 +2075,7 @@ mod tests {
             "difference in hardness",
             "delta grain size",
             "reduction in strength",
+            "drop in strength",
             "loss of strength",
             "increase in tensile strength",
             "deviation in strength",
