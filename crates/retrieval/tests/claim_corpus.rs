@@ -1255,6 +1255,25 @@ fn corpus() -> Vec<CorpusCase> {
         // word (it misreads the line-start shapes, which have no word
         // before the dash, and 'From Fig. 6, -950 MPa', which has
         // none either — one failure in each direction).
+        //
+        // ROUND 13 ITEM 1 — six of these twelve were CANNOT-FAIL.
+        // The U+2013/U+2014 rows (true-idx 122, 123, 126, 127, 130,
+        // 131) exist to pin round 11's decision that those two glyphs
+        // are NOT sign glyphs. But on UTS SignDomain refused them
+        // BEFORE any needle-set logic ran, so the exact regression
+        // they guard (re-adding U+2013/U+2014 to number_needles, M-A)
+        // left them silently green (NoSpan -> SignDomain, still drop):
+        // a tripwire the mutation it exists to guard cannot redden is
+        // not a pin. Moved onto residual_stress (a genuinely SIGNED
+        // predicate): there the needle-set decision actually decides
+        // the outcome — at HEAD no needle matches (NoSpan, drop);
+        // under M-A the re-added needle matches and it stamps
+        // (MUST_DROP stamped, red). The ASCII and U+2212 rows stay on
+        // UTS: those glyphs ARE sign glyphs, so their drop is owned by
+        // SignDomain (remove it and they stamp) — a valid, different
+        // pin. The family now splits: '-'/'\u{2212}' pin SignDomain
+        // on UTS; '\u{2013}'/'\u{2014}' pin the no-needle decision
+        // on residual_stress.
         case(
             "Ti-6Al-4V UTS -950 MPa (longitudinal)",
             "Ti-6Al-4V",
@@ -1280,23 +1299,24 @@ fn corpus() -> Vec<CorpusCase> {
              could read, the predicate's sign domain is",
         ),
         case(
-            "Ti-6Al-4V UTS \u{2013}950 MPa (longitudinal)",
+            "Ti-6Al-4V residual stress \u{2013}950 MPa (longitudinal)",
             "Ti-6Al-4V",
-            "UTS",
+            "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 11: the dash SEPARATES the label UTS from its value — \
-             the source value is +950, so -950 is a fabrication; U+2013 is \
-             no sign glyph and the claim has no needle",
+            "round 13 item 1: moved off UTS (where SignDomain masked the \
+             pin) onto residual_stress — U+2013 is no sign glyph and the \
+             claim has no needle, so it drops NoSpan; re-add U+2013 to \
+             number_needles and it stamps",
         ),
         case(
-            "Ti-6Al-4V UTS \u{2014}950 MPa (longitudinal)",
+            "Ti-6Al-4V residual stress \u{2014}950 MPa (longitudinal)",
             "Ti-6Al-4V",
-            "UTS",
+            "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the U+2014 spelling drops like its U+2013 \
-             twin — both reverted glyphs refuse the separator shape",
+            "round 13 item 1: the U+2014 twin, on residual_stress for the \
+             same reason — no sign glyph, the claim has no needle",
         ),
         case(
             "-950 MPa was recorded for Ti-6Al-4V.",
@@ -1321,21 +1341,22 @@ fn corpus() -> Vec<CorpusCase> {
         case(
             "\u{2013}950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
-            "UTS",
+            "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 11: the same separator shape at line start — locally \
-             indistinguishable from a genuine minus, so it shares the \
-             drop; the recall loss is recorded by the KNOWN rows below",
+            "round 13 item 1: moved off UTS onto residual_stress — U+2013 \
+             is no sign glyph and the claim has no needle; its recall-loss \
+             twin (the same shape read as a genuine minus) is the KNOWN \
+             row below",
         ),
         case(
             "\u{2014}950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
-            "UTS",
+            "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the U+2014 line-start separator drops like \
-             its U+2013 twin",
+            "round 13 item 1: the U+2014 line-start separator on \
+             residual_stress — no sign glyph, the claim has no needle",
         ),
         case(
             "The Ti-6Al-4V result -950 MPa- matched the target.",
@@ -1358,20 +1379,20 @@ fn corpus() -> Vec<CorpusCase> {
         case(
             "The Ti-6Al-4V result \u{2013}950 MPa\u{2013} matched the target.",
             "Ti-6Al-4V",
-            "UTS",
+            "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the U+2013 bracketed separator drops like \
-             the U+2014 original below",
+            "round 13 item 1: the U+2013 bracketed separator on \
+             residual_stress — no sign glyph, the claim has no needle",
         ),
         case(
             "The Ti-6Al-4V result \u{2014}950 MPa\u{2014} matched the target.",
             "Ti-6Al-4V",
-            "UTS",
+            "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 11: the em-dash separator twin — a tensile result \
-             bracketed by em dashes must not stamp a compressive claim",
+            "round 13 item 1: the U+2014 bracketed separator on \
+             residual_stress — no sign glyph, the claim has no needle",
         ),
         // ---------------- MUST_DROP: the sign-domain pins (round 12) ---
         // Item 1(c)'s discriminator, measured not guessed: the
