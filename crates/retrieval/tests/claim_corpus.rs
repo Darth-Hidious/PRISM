@@ -1150,9 +1150,42 @@ fn corpus() -> Vec<CorpusCase> {
         // RANGE but not from SEPARATOR — a label/value separator also
         // has no digit before the dash, and all three reviewer shapes
         // stamped a compressive value from a tensile source while
-        // dropping the correct positive. Round 11 reverted them to
-        // non-sign glyphs; these rows pin the closure so the question
-        // never reopens.
+        // dropping the correct positive. Round 11 reverted U+2013/
+        // U+2014 to non-sign glyphs. Round 12 measured the revert's
+        // limit: under '-' and U+2212 — the sign glyphs that survive —
+        // the SAME shapes still stamp a negative (all six measured
+        // stamping at HEAD), and the correct positive drops in every
+        // glyph. The engine has NO minus-vs-separator discriminator;
+        // round 11 changed which glyphs carry signed needles, not how
+        // a needle is read. Those six rows are deliberately RED case(
+        // rows: ground truth is settled (the source value is +950, so
+        // -950 is a fabrication) and a red case( is the honest signal
+        // that a DECISION is outstanding — a known( would misfile it
+        // as backlog. All four spellings of all three shapes below,
+        // one block per shape.
+        case(
+            "Ti-6Al-4V UTS -950 MPa (longitudinal)",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the ASCII spelling of the longitudinal \
+             separator shape STAMPS -950 at HEAD — RED, deliberately: the \
+             source value is +950, ground truth is settled, and the engine \
+             has no minus-vs-separator discriminator. A red case( marks the \
+             outstanding decision; a known( would misfile it as backlog",
+        ),
+        case(
+            "Ti-6Al-4V UTS \u{2212}950 MPa (longitudinal)",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the U+2212 spelling STAMPS -950 at HEAD — \
+             RED, deliberately; the glyph's typographic role as the real \
+             minus sign does not stop prose that SEPARATES with it from \
+             fabricating, and the code cannot tell the two apart",
+        ),
         case(
             "Ti-6Al-4V UTS \u{2013}950 MPa (longitudinal)",
             "Ti-6Al-4V",
@@ -1164,6 +1197,36 @@ fn corpus() -> Vec<CorpusCase> {
              no sign glyph and the claim has no needle",
         ),
         case(
+            "Ti-6Al-4V UTS \u{2014}950 MPa (longitudinal)",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the U+2014 spelling drops like its U+2013 \
+             twin — both reverted glyphs refuse the separator shape",
+        ),
+        case(
+            "-950 MPa was recorded for Ti-6Al-4V.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the ASCII line-start separator STAMPS -950 \
+             at HEAD — RED, deliberately; same outstanding decision as the \
+             longitudinal ASCII row",
+        ),
+        case(
+            "\u{2212}950 MPa was recorded for Ti-6Al-4V.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the U+2212 line-start separator STAMPS \
+             -950 at HEAD — RED, deliberately; locally indistinguishable \
+             from a genuine minus, which is exactly the decision the red \
+             rows record",
+        ),
+        case(
             "\u{2013}950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
             "UTS",
@@ -1172,6 +1235,42 @@ fn corpus() -> Vec<CorpusCase> {
             "round 11: the same separator shape at line start — locally \
              indistinguishable from a genuine minus, so it shares the \
              drop; the recall loss is recorded by the KNOWN rows below",
+        ),
+        case(
+            "\u{2014}950 MPa was recorded for Ti-6Al-4V.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the U+2014 line-start separator drops like \
+             its U+2013 twin",
+        ),
+        case(
+            "The Ti-6Al-4V result -950 MPa- matched the target.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the ASCII bracketed separator STAMPS -950 \
+             at HEAD — RED, deliberately; same outstanding decision",
+        ),
+        case(
+            "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the U+2212 bracketed separator STAMPS -950 \
+             at HEAD — RED, deliberately",
+        ),
+        case(
+            "The Ti-6Al-4V result \u{2013}950 MPa\u{2013} matched the target.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 12 item 1(b): the U+2013 bracketed separator drops like \
+             the U+2014 original below",
         ),
         case(
             "The Ti-6Al-4V result \u{2014}950 MPa\u{2014} matched the target.",
