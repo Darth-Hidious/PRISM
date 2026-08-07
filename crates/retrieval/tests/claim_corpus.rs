@@ -278,12 +278,15 @@ fn corpus() -> Vec<CorpusCase> {
             "a genuine point value beside an en-dash minus still stamps",
         ),
         case(
-            "Figure 3 shows a UTS of 950 MPa.",
+            "Figure 3 shows a Ti-6Al-4V UTS of 950 MPa.",
             "Ti-6Al-4V",
             "UTS",
             950.0,
             Expect::MustStamp,
-            "a value after a label locator in the same sentence stamps",
+            "a value after a label locator in the same sentence stamps; \
+             round 9: the subject is NAMED in the prose — the old text \
+             stamped only through the subject-OR-object arm, certifying \
+             subject-blind attribution",
         ),
         // ---------------- MUST_STAMP: table rows ---------------------
         case(
@@ -572,6 +575,18 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "KNOWN: a digit-joined standard designator with a unit-initial suffix; \
              closing it needs a standard-designator guard, not dash surgery",
+        ),
+        known(
+            "The AlSi10Mg UTS was 300 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            300.0,
+            Expect::MustDrop,
+            "KNOWN: subject-blind attribution — the span names AlSi10Mg and \
+             never Ti-6Al-4V, yet the number stamps for the claimed subject \
+             through the subject-OR-object arm. Cross-subject attribution is \
+             the largest live fabrication channel: a number from a paper about \
+             a different alloy becomes a claim about yours",
         ),
     ]
 }
