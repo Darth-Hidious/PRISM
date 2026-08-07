@@ -269,6 +269,45 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "signed value after a label comma still stamps",
         ),
+        case(
+            "The Ti-6Al-4V residual stress was -1350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1350.0,
+            Expect::MustStamp,
+            "round 11: the pdf-extract spelling of a compressive stress \
+             beyond 1000 MPa stamps",
+        ),
+        case(
+            "The Ti-6Al-4V residual stress was \u{2212}1350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1350.0,
+            Expect::MustStamp,
+            "round 11 item 2: the JATS spelling \u{2212}1350 (un-grouped, \
+             |value| >= 1000) stamps too — the sign now attaches to the \
+             PLAIN form, closing the route divergence where pdf-extract's \
+             -1350 stamped while the JATS form dropped NoSpan -> \
+             MissingQuote, misfiled as the model's fault",
+        ),
+        case(
+            "The Ti-6Al-4V residual stress was \u{2212}1,350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1350.0,
+            Expect::MustStamp,
+            "round 11 item 2: the comma-grouped \u{2212}1,350 stamps — \
+             every rendering of the same stress agrees across routes",
+        ),
+        case(
+            "The Ti-6Al-4V residual stress was \u{2212}1350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            1350.0,
+            Expect::MustDrop,
+            "round 11 item 2: the sign-flipped twin of the un-grouped \
+             \u{2212}1350 form still drops — the boundary clause owns it",
+        ),
         // ---------------- MUST_STAMP: ranges and lists ---------------
         case(
             "In Table 5, 950, 960 and 970 MPa were measured for Ti-6Al-4V.",
@@ -1078,37 +1117,74 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "dash class: U+FE63 SMALL HYPHEN-MINUS",
         ),
-        // ---------------- round 10: signed needles vs dash ranges ------
-        // U+2013/U+2014 became needle glyphs for NEGATIVE values; these
-        // rows pin the other direction of the same decision — a signed
-        // needle must not match a range endpoint or a label/citation
-        // range, and the decimal branch carries the new glyphs too.
+        // ---------------- MUST_DROP: the separator shapes (round 11) --
+        // Round 10 made U+2013/U+2014 needle glyphs for negatives on
+        // the argument "a range dash has a digit before it, a minus
+        // does not". Measured round 11: that separates minus from
+        // RANGE but not from SEPARATOR — a label/value separator also
+        // has no digit before the dash, and all three reviewer shapes
+        // stamped a compressive value from a tensile source while
+        // dropping the correct positive. Round 11 reverted them to
+        // non-sign glyphs; these rows pin the closure so the question
+        // never reopens.
         case(
-            "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.",
+            "Ti-6Al-4V UTS \u{2013}950 MPa (longitudinal)",
             "Ti-6Al-4V",
             "UTS",
-            -1100.0,
+            -950.0,
             Expect::MustDrop,
-            "round 10: the signed \u{2013}1100 needle must not match a range \
-             endpoint — the dash of 950\u{2013}1100 has a digit before it",
+            "round 11: the dash SEPARATES the label UTS from its value — \
+             the source value is +950, so -950 is a fabrication; U+2013 is \
+             no sign glyph and the claim has no needle",
         ),
         case(
-            "The Ti-6Al-4V data are listed in Refs. 25\u{2013}27.",
+            "\u{2013}950 MPa was recorded for Ti-6Al-4V.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 11: the same separator shape at line start — locally \
+             indistinguishable from a genuine minus, so it shares the \
+             drop; the recall loss is recorded by the KNOWN rows below",
+        ),
+        case(
+            "The Ti-6Al-4V result \u{2014}950 MPa\u{2014} matched the target.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 11: the em-dash separator twin — a tensile result \
+             bracketed by em dashes must not stamp a compressive claim",
+        ),
+        // ---------------- round 11: signed needles vs dash ranges ------
+        // Only '-' and U+2212 are sign glyphs — round 11 reverted
+        // round 10's U+2013/U+2014 (the separator shapes fabricated
+        // negatives; see the section above). These rows pin a signed
+        // needle against range and reference shapes under the glyphs
+        // that survive.
+        case(
+            "The Ti-6Al-4V UTS ranged from 300\u{2212}950 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round 11 rewrite of the round-10 VACUOUS row: the old \
+             \u{2013}1100 shape dropped NoSpan because the -1100 needle is \
+             never constructed un-grouped (|value| >= 1000), so the row \
+             proved nothing. The signed \u{2212}950 needle IS constructed \
+             (U+2212 stays a sign glyph) and the boundary clause refuses \
+             it — the range's left digit 300 glues before the dash",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25-27.",
             "Ti-6Al-4V",
             "UTS",
             -27.0,
             Expect::MustDrop,
-            "round 10: a signed needle must not match a reference range \
-             either",
-        ),
-        case(
-            "The CoCrFeNi Seebeck coefficient was \u{2013}11.5 uV/K.",
-            "CoCrFeNi",
-            "Seebeck coefficient",
-            -11.5,
-            Expect::MustStamp,
-            "round 10: the decimal branch carries the U+2013 glyph too — \
-             negative decimals never reach the grouped-signs path",
+            "round 11: a signed needle must not match a reference range — \
+             pinned under the ASCII hyphen now that U+2013 is no sign \
+             glyph; 25 before the dash glues and the boundary clause \
+             refuses",
         ),
         // ---------------- MUST_DROP: refused U+2212 needles ----------
         // The round-5 UTF-8 advance panic: a rejected U+2212 occurrence
@@ -1198,29 +1274,31 @@ fn corpus() -> Vec<CorpusCase> {
              the largest live fabrication channel: a number from a paper about \
              a different alloy becomes a claim about yours",
         ),
-        case(
+        known(
             "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.",
             "Ti-6Al-4V",
             "residual_stress",
             -350.0,
             Expect::MustStamp,
-            "round 10 FIXED the round-9 KNOWN: the prose asserts the stress IS \
-             -350 MPa, a materials engineer calls that supported. U+2013 and \
-             U+2014 became needle glyphs for negative values once the sign vs \
-             range readings proved separable (a range dash has a digit before \
-             it, a minus does not) — the same mechanism the ASCII hyphen used \
-             all along. Source doc claims.rs:1001 said the drop 'stays \
-             accepted'; the corpus said the code SHOULD stamp. The corpus was \
-             the ground truth; the source was the stale record",
+            "KNOWN: recall loss, round 11 REVERTED the round-10 fix — the \
+             prose asserts the stress IS -350 MPa, a materials engineer \
+             calls that supported; but U+2013 also SEPARATES a label from \
+             its value ('UTS \u{2013}950 MPa'), the two shapes are locally \
+             indistinguishable (neither has a digit before the dash), and \
+             the separator reading stamped compressive from tensile, so \
+             U+2013 is no sign glyph again and the true negative has no \
+             needle. What the code SHOULD do but does not yet",
         ),
-        case(
+        known(
             "The residual stress in Ti-6Al-4V was \u{2014}350 MPa.",
             "Ti-6Al-4V",
             "residual_stress",
             -350.0,
             Expect::MustStamp,
-            "round 10 FIXED the round-9 KNOWN: the U+2014 typesetting of the \
-             minus sign stamps its true negative too",
+            "KNOWN: the same recall loss for the U+2014 typesetting — \
+             round 11 reverted the round-10 stamp after the em-dash \
+             separator shape ('result \u{2014}950 MPa\u{2014}') stamped a \
+             compressive value from a tensile source",
         ),
         // H1's space requirement cost (round 9): a label number with a
         // GLUED unit drops — the exemption demands the space, the

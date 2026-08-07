@@ -21,13 +21,19 @@
 //! vocabulary strings are the stable machine contract ("indeterminate",
 //! "research", "screening", "reference_validated").
 //!
-//! Known provenance caveat, CLOSED round 10: ranges differ by fetch
-//! route — JATS preserves U+2013, `pdf-extract` normalises ranges to
-//! '-'. Until round 10 the engine refused the en-dash endpoints but
-//! stamped the ASCII ones (compound-friendly, by decision), so the same
-//! paper yielded different claims depending on how it was fetched. The
-//! range guard now covers every glyph of the dash class; both routes
-//! refuse both endpoints.
+//! Known provenance caveat, CLOSED round 10 + round 11: claims can
+//! differ by fetch route. (a) RANGES: JATS preserves U+2013,
+//! `pdf-extract` normalises ranges to '-'. Until round 10 the engine
+//! refused the en-dash endpoints but stamped the ASCII ones
+//! (compound-friendly, by decision), so the same paper yielded different
+//! claims depending on how it was fetched. The range guard now covers
+//! every glyph of the dash class; both routes refuse both endpoints.
+//! (b) SIGNED VALUES at |value| >= 1000: JATS typesets the minus as
+//! U+2212, `pdf-extract` emits '-'. Until round 11 the U+2212 sign
+//! attached only to the comma-grouped form, so the un-grouped
+//! "\u{2212}1350" dropped NoSpan -> MissingQuote (misfiled as the
+//! model's fault) while "-1350" stamped. The sign now attaches to the
+//! plain form too; both routes stamp.
 //!
 //! RECORDED, NOT FIXED (round 9) — the largest remaining structural
 //! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
@@ -631,11 +637,12 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             // U+2010, U+2011, U+2012, U+2015 and U+FE63. The
             // joins-compound test separates every member the same way,
             // and `dash_range_endpoint` (checked first) keeps
-            // refusing the range case as Range. Round 10: '-', U+2212,
-            // U+2013 and U+2014 are needle glyphs for NEGATIVE values
-            // (the true "\u{2013}350" claim stamps through its signed
-            // needle now); this clause kills the UNSIGNED needle's
-            // sign-flipped match for every glyph of the class.
+            // refusing the range case as Range. Round 11 reverted
+            // round 10's making U+2013/U+2014 sign glyphs — the
+            // separator shape fabricated negatives (see
+            // `number_needles`) — so the true "\u{2013}350" claim
+            // drops again; this clause still kills the UNSIGNED
+            // needle's sign-flipped match for every glyph of the class.
             let joins_compound = hay[..start - before.len_utf8()]
                 .chars()
                 .next_back()
@@ -1028,47 +1035,51 @@ fn trailing_word(prefix: &str) -> String {
 
 /// String forms under which a numeric value may legitimately appear in
 /// a paper: the plain rendering plus the comma-grouped integer form. A
-/// negative value appears under four minus glyphs: ASCII hyphen,
-/// U+2212 MINUS SIGN (the glyph typeset PDFs carry), and U+2013 EN
-/// DASH / U+2014 EM DASH (the typeset minus spellings the corpus
-/// pins); without them, the true negative claim is dropped while its
-/// sign-flipped twin stamps.
+/// negative value appears under TWO minus glyphs: ASCII hyphen and
+/// U+2212 MINUS SIGN (the glyph typeset PDFs and JATS carry); without
+/// both, the true negative claim is dropped while its sign-flipped twin
+/// stamps. The U+2212 sign attaches to the PLAIN rendering too, not just
+/// the comma-grouped one: an un-grouped "\u{2212}1350" (|value| >= 1000)
+/// otherwise has no needle and drops NoSpan while pdf-extract's "-1350"
+/// stamps — a fetch-route divergence, closed round 11.
 ///
-/// FIXED, ROUND 10 (was DECIDED-NOT-IMPLEMENTED round 6, DECIDED
-/// round 7): U+2013 and U+2014 ARE needle glyphs for negative values
-/// now. The round-7 decision kept the true "\u{2013}950 MPa" claim
-/// dropped on the ground that the same glyph also means "range
-/// endpoint" in `dash_range_endpoint` and the two readings were "not
-/// separable at the needle level". Round 10 measured them separable by
-/// the branch's own machinery: a range dash ALWAYS has a digit before
-/// it, a minus sign does not — the joins-compound test that separates
-/// the dash class inside `clean_number_boundary`, and the exact
-/// mechanism `dash_range_endpoint` relies on for the ASCII hyphen,
-/// which has been both a sign glyph and a range dash all along. The
-/// corpus KNOWN rows demanding the stamp (recorded round 9) were the
-/// ground truth; the source doc was the stale record. The fabrication
-/// half stays closed: `clean_number_boundary` still refuses the
-/// UNSIGNED needle after any non-compound dash, and every glyph's
-/// sign-flipped twin is a corpus MustDrop pin.
+/// REVERTED, ROUND 11 (was FIXED round 10, DECIDED round 7,
+/// DECIDED-NOT-IMPLEMENTED round 6): U+2013 EN DASH and U+2014 EM DASH
+/// are NOT needle glyphs. Round 10 made them sign glyphs on the argument
+/// "a range dash always has a digit before it, a minus does not". That
+/// separates a minus from a RANGE but NOT from a SEPARATOR: a
+/// label/value separator also has no digit before the dash. Measured
+/// round 11, the separator shapes stamped a negative for a positive
+/// source value — "Ti-6Al-4V UTS \u{2013}950 MPa" stamped -950 and
+/// dropped the correct +950, recording tensile as compressive, the exact
+/// fabrication this branch exists to stop. The minus and separator
+/// readings are locally indistinguishable (both word/dash/digit), so the
+/// branch's priority decides: a fabrication is worse than a miss. U+2212
+/// stays a sign glyph — unambiguously a minus, never a separator. The
+/// true negative under U+2013/U+2014 drops again (recall loss, carried
+/// as corpus KNOWN rows), the round-7/9 position restored; every
+/// separator shape and every sign-flipped twin is a corpus MustDrop pin.
 ///
-/// FIXED, ROUND 9 (was RECORDED, NOT FIXED, round 8): the U+2014
-/// twin was not alone — the sign flip stamped through U+2010,
-/// U+2011, U+2012, U+2014, U+2015 and U+FE63 as well. `clean_number_boundary`
-/// now refuses the unsigned needle after ANY glyph of the dash class
-/// (`MINUS_CAPABLE_DASHES`) that does not join a compound. The true
-/// negative under U+2010/U+2011/U+2012/U+2015/U+FE63 still drops —
-/// none of those is a needle glyph, and no real PDF measured here
-/// spells minus that way, so the gap stays doc-recorded rather than
-/// corpus-pinned; every glyph's sign-flipped twin is a MustDrop pin.
+/// FIXED, ROUND 9 (was RECORDED, NOT FIXED, round 8): the sign flip
+/// stamped through U+2010, U+2011, U+2012, U+2014, U+2015 and U+FE63 as
+/// well. `clean_number_boundary` refuses the unsigned needle after ANY
+/// glyph of the dash class (`MINUS_CAPABLE_DASHES`) that does not join a
+/// compound. The true negative under
+/// U+2010/U+2011/U+2012/U+2013/U+2014/U+2015/U+FE63 drops — none of
+/// those is a needle glyph; every glyph's sign-flipped twin is a
+/// MustDrop pin.
 fn number_needles(value: f64) -> Vec<String> {
     let plain = format!("{value}");
     let mut out = vec![plain.clone()];
-    if value < 0.0 && value.fract() != 0.0 {
-        // Negative decimals never reach the grouped branch below, so
-        // these are their only signed renderings beyond the plain form.
-        for sign in ["\u{2212}", "\u{2013}", "\u{2014}"] {
-            out.push(format!("{sign}{}", &plain[1..]));
-        }
+    if value < 0.0 {
+        // The U+2212 MINUS SIGN rendering of the PLAIN (un-grouped)
+        // form, attached for every negative — not only decimals: an
+        // integer below -1000 otherwise has only the comma-grouped
+        // "\u{2212}1,350" needle, so the un-grouped "\u{2212}1350"
+        // JATS preserves would drop NoSpan while pdf-extract's "-1350"
+        // stamps — a fetch-route divergence, closed round 11. U+2212
+        // only: U+2013/U+2014 are not sign glyphs (see the fn doc).
+        out.push(format!("\u{2212}{}", &plain[1..]));
     }
     if value.fract() == 0.0 && value.abs() < 1e15 {
         let digits = (value as i64).abs().to_string();
@@ -1089,7 +1100,7 @@ fn number_needles(value: f64) -> Vec<String> {
             .rev()
             .collect();
         let signs: &[&str] = if value < 0.0 {
-            &["-", "\u{2212}", "\u{2013}", "\u{2014}"]
+            &["-", "\u{2212}"]
         } else {
             &[""]
         };
@@ -1895,27 +1906,29 @@ mod tests {
         );
     }
 
-    /// Round 7: the STAMP half of the U+2013-minus problem. Some PDFs
-    /// typeset negatives as "\u{2013}350 MPa". The unsigned needle
+    /// Round 7, restored round 11: U+2013 is NOT a sign glyph. Some
+    /// PDFs typeset negatives as "\u{2013}350 MPa"; the unsigned needle
     /// matched the digits and stamped the sign-flipped twin —
     /// compressive recorded as tensile. The fix refuses the unsigned
-    /// needle when U+2013 precedes it with no digit before the dash:
-    /// a range dash always has a digit before it, a minus sign does
-    /// not, and `dash_range_endpoint` (checked first) keeps the
-    /// range case. Round 10: the true negative STAMPS — U+2013 and
-    /// U+2014 became needle glyphs for negative values once the two
-    /// readings proved separable (see `number_needles`); the
-    /// sign-flipped twin still drops through this clause.
-    /// Mutation: removing U+2013 from the before-dash match in
-    /// `clean_number_boundary` reddens the +350 drop assert.
+    /// needle when U+2013 precedes it with no digit before the dash.
+    /// Round 10 read the dash as a minus and stamped the signed needle,
+    /// until round 11 measured the SEPARATOR shape: "UTS \u{2013}950
+    /// MPa" has no digit before the dash either and stamped a
+    /// compressive value from a tensile source. The two readings are
+    /// locally indistinguishable, so BOTH halves now drop under
+    /// U+2013/U+2014 — a fabrication is worse than a miss (see
+    /// `number_needles`). Mutation: removing U+2013 from the
+    /// before-dash match in `clean_number_boundary` reddens the +350
+    /// drop assert.
     #[test]
-    fn en_dash_minus_unsigned_needle_is_refused() {
+    fn en_dash_is_not_a_sign_glyph() {
         let minus = "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.";
         // The fabrication half: the sign-flipped positive claim drops.
         assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", 350.0, minus);
-        // Round 10: the true negative stamps through the signed needle —
-        // the corpus KNOWN row round 9 recorded is now required behaviour.
-        assert!(supporting_quote("Ti-6Al-4V", "residual_stress", Some(-350.0), minus).is_some());
+        // Round 11: the true negative DROPS too — U+2013 has no signed
+        // needle, so its recall loss is accepted to keep the separator
+        // shape from fabricating (corpus KNOWN rows record the loss).
+        assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", -350.0, minus);
         // Grouped form: the unsigned grouped needle is still refused...
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
@@ -1923,15 +1936,12 @@ mod tests {
             1140.0,
             "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
         );
-        // ...while its signed twin stamps.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "residual_stress",
-                Some(-1140.0),
-                "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa."
-            )
-            .is_some()
+        // ...and round 11 drops its signed twin too (no U+2013 needle).
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1140.0,
+            "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
         );
 
         // Stamp direction: a genuine point value in the same sentence
