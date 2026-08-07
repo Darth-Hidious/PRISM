@@ -134,7 +134,7 @@ pub enum ClaimRejection {
     /// it, but a guard refused every occurrence: the matcher was too
     /// literal, the model did not hallucinate. Distinct from `MissingQuote`
     /// so over-refusal is measurable in the drop set. `guard` refused the
-    /// last candidate occurrence scanned; `span` is the verbatim span that
+    /// FIRST candidate occurrence scanned; `span` is the verbatim span that
     /// held it.
     NoEvidentialOccurrence {
         guard: RefusalGuard,
@@ -165,14 +165,18 @@ pub enum RefusalGuard {
 
 /// Why no supporting span was found. `NoSpan` reads as the model's fault
 /// (the block does not mention the fact at all); `Guarded` is the matcher's
-/// refusal and carries the guard that refused the last candidate occurrence.
+/// refusal and carries the guard that refused the first candidate occurrence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupportRefusal {
     /// No span held the subject or the object (both, for a non-numeric
     /// fact): there was nothing to scan.
     NoSpan,
     /// A span held the subject or object and at least one occurrence of the
-    /// value, but every occurrence was refused by a guard.
+    /// value, but every occurrence was refused by a guard. Names the guard
+    /// of the FIRST refused occurrence scanned: in a block where the value
+    /// appears more than once (most real blocks) the first is the one a
+    /// reader meets, and last-wins reporting was positional, not causal —
+    /// it over-reported `Boundary` and under-reported `Label`.
     Guarded { guard: RefusalGuard, span: String },
 }
 
@@ -264,7 +268,11 @@ pub fn supporting_quote_or_refusal(
 ) -> Result<String, SupportRefusal> {
     let subject_n = normalize_for_containment(subject);
     let object_n = normalize_for_containment(object);
-    let mut last_refusal: Option<(RefusalGuard, String)> = None;
+    // Keep the FIRST refusal, not the last: when the value occurs in
+    // several spans, the last one refused is a position in the scan
+    // order, not the cause of the drop — swapping two sentences in a
+    // block changed the reported guard under last-wins.
+    let mut first_refusal: Option<(RefusalGuard, String)> = None;
     for span in supporting_spans(block_text) {
         let hay = normalize_for_containment(span);
         match value {
@@ -275,7 +283,7 @@ pub fn supporting_quote_or_refusal(
                     match scan_number_evidence(&hay, v, &subject_n, &object_n) {
                         NumberScan::Evidential => return Ok(span.trim().to_string()),
                         NumberScan::Refused(guard) => {
-                            last_refusal = Some((guard, span.trim().to_string()));
+                            first_refusal.get_or_insert((guard, span.trim().to_string()));
                         }
                         NumberScan::Absent => {}
                     }
@@ -292,7 +300,7 @@ pub fn supporting_quote_or_refusal(
             }
         }
     }
-    match last_refusal {
+    match first_refusal {
         Some((guard, span)) => Err(SupportRefusal::Guarded { guard, span }),
         None => Err(SupportRefusal::NoSpan),
     }
@@ -373,7 +381,7 @@ enum NumberScan {
     Evidential,
     /// No needle form of the value occurs in the span at all.
     Absent,
-    /// Every occurrence was refused; holds the guard that refused the LAST
+    /// Every occurrence was refused; holds the guard that refused the FIRST
     /// candidate occurrence scanned.
     Refused(RefusalGuard),
 }
@@ -384,9 +392,13 @@ enum NumberScan {
 /// sit inside an occurrence of the subject's or object's own name (the
 /// "718" of "Inconel 718"), and must not be an en-dash range endpoint.
 /// When every occurrence is refused, the scan names the guard that refused
-/// the last one — that name is what makes an over-refusal actionable.
+/// the FIRST one — that name is what makes an over-refusal actionable, and
+/// first-wins keeps it causal instead of positional: a value glued inside
+/// another token ("AlSi10Mg") usually refuses Boundary late in the span,
+/// while the standalone occurrence the reader actually sees was refused by
+/// the real guard ("cross-section 10" -> Label).
 fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) -> NumberScan {
-    let mut last: Option<RefusalGuard> = None;
+    let mut first: Option<RefusalGuard> = None;
     for needle in number_needles(value) {
         let mut search_from = 0usize;
         while let Some(rel) = hay[search_from..].find(&needle) {
@@ -394,7 +406,9 @@ fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) 
             let end = start + needle.len();
             match refusing_guard(hay, &needle, start, end, subject_n, object_n) {
                 None => return NumberScan::Evidential,
-                Some(guard) => last = Some(guard),
+                Some(guard) => {
+                    first.get_or_insert(guard);
+                }
             }
             // Advance by the needle's first CHARACTER, not one byte: U+2212
             // needles lead with a 3-byte char, and a rejected occurrence that
@@ -406,7 +420,7 @@ fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) 
             search_from = start + needle.chars().next().map_or(1, char::len_utf8);
         }
     }
-    match last {
+    match first {
         Some(guard) => NumberScan::Refused(guard),
         None => NumberScan::Absent,
     }
@@ -2518,6 +2532,55 @@ mod tests {
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Range,
                 span: range.to_string(),
+            })
+        );
+    }
+
+    /// Round 7: the reported guard is the FIRST refusal, not the last.
+    /// Last-wins reporting was positional, not causal: any block where
+    /// the value appears more than once (most real blocks) could flip
+    /// the name when two sentences swapped, and the natural
+    /// single-sentence case reported Boundary when the real refusal was
+    /// Label. An engineer chasing "Boundary" from last-wins would go
+    /// read `clean_number_boundary` and find nothing wrong. Mutations:
+    /// switching `supporting_quote_or_refusal` back to last-wins reddens
+    /// the first assert; switching `scan_number_evidence` reddens the
+    /// in-span assert.
+    #[test]
+    fn guarded_refusals_report_the_first_refusal_not_the_last() {
+        // Cross-span: the value occurs once per span, each span refused
+        // by a different guard. First-wins makes the report follow the
+        // text, so swapping the sentences swaps the reported guard.
+        let label_first =
+            "Table 2 lists the Inconel 718 data. The Inconel 718 modulus was 2.5 GPa.";
+        assert_eq!(
+            supporting_quote_or_refusal("Inconel 718", "modulus", Some(2.0), label_first),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: "Table 2 lists the Inconel 718 data.".to_string(),
+            })
+        );
+        let boundary_first =
+            "The Inconel 718 modulus was 2.5 GPa. Table 2 lists the Inconel 718 data.";
+        assert_eq!(
+            supporting_quote_or_refusal("Inconel 718", "modulus", Some(2.0), boundary_first),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Boundary,
+                span: "The Inconel 718 modulus was 2.5 GPa.".to_string(),
+            })
+        );
+
+        // Within ONE span: the standalone occurrence a reader meets is
+        // refused by Label ("cross-section 10"); the occurrence glued
+        // inside "alsi10mg" refuses Boundary later in the scan.
+        // Last-wins reported Boundary here; the real guard is Label.
+        let one_span =
+            "A cross-section 10 layers above the build plate showed 3% AlSi10Mg porosity.";
+        assert_eq!(
+            supporting_quote_or_refusal("AlSi10Mg", "porosity", Some(10.0), one_span),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: one_span.to_string(),
             })
         );
     }
