@@ -1431,6 +1431,58 @@ fn corpus() -> Vec<CorpusCase> {
              a measurement. This row is deliberately joins_compound's only \
              pin: a green stamp-pin here would certify a fabrication",
         ),
+        // ---------------- KNOWN failures, the label-word horizon ------
+        // Measured round 10: 100 of 100 curated AM-vocabulary heads stamp
+        // on "X 3 of Ti-6Al-4V was examined." — including Layer, Track,
+        // Build, Heat and Lot, core LPBF/metallurgy specimen vocabulary,
+        // likelier in an AM paper than Inset 2. A word list CANNOT
+        // converge: every paper coins labels the list does not carry,
+        // and every word added costs glued-recall drops (the fourteen
+        // H1 rows above are the bill for nineteen words). The fix is a
+        // RULE — a label-like head is a noun immediately before a bare
+        // integer with no unit after it — not another word. Recorded,
+        // deliberately not implemented, round 10.
+        known(
+            "Layer 3 of Ti-6Al-4V was examined.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: the label-word horizon — Layer is likelier in an AM paper \
+             than Inset 2, and it stamps",
+        ),
+        known(
+            "Track 3 of Ti-6Al-4V was examined.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: the label-word horizon — Track stamps",
+        ),
+        known(
+            "Build 3 of Ti-6Al-4V was examined.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: the label-word horizon — Build stamps",
+        ),
+        known(
+            "Heat 3 of Ti-6Al-4V was examined.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: the label-word horizon — Heat stamps",
+        ),
+        known(
+            "Lot 3 of Ti-6Al-4V was examined.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: the label-word horizon — Lot stamps",
+        ),
     ]
 }
 
