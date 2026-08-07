@@ -580,13 +580,17 @@ mod tests {
             return; // no system python on this box; nothing to assert against
         };
         let row = check_venv_tools(python);
-        // Premise check, not an assertion about the product: if this box's
-        // system interpreter happens to satisfy every declared requirement,
-        // there is no "missing dependency" row to inspect and the test has
-        // nothing to say. Assert only when the premise actually holds.
-        if row.ok {
-            return;
-        }
+        // Hard assert, deliberately: the probe runs the interpreter with `-I`
+        // (venv.rs:135), so it is isolated from the working directory and from
+        // user site-packages. A system interpreter therefore cannot satisfy
+        // these requirements by accident — not even in this repo, where a bare
+        // `python3 -c "import app"` DOES succeed by picking up ./app. That
+        // difference is what made this test look environmental when it was not.
+        //
+        // An earlier version of this fix replaced this with `if row.ok { return }`,
+        // which turned a loud failure into a silent skip and executed zero
+        // assertions. It was never needed: row.ok was already false here.
+        assert!(!row.ok, "a venv without the declared set is not healthy");
         assert!(
             row.result.contains("prism-platform"),
             "must name what is missing: {}",
