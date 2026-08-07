@@ -1535,9 +1535,12 @@ fn corpus() -> Vec<CorpusCase> {
         // afterwards. Thirteen forms, recorded so the cost is visible;
         // round 10 removed cross-section 10mm — a position, not a
         // property, so its drop is correct, not a cost (the twins sit
-        // with the label/sample/run family above) — and added the eight
-        // glued losses the round-9 word list caused, one per new label
-        // word; round 11 removed batch 25kg — the mass of one powder lot
+        // with the label/sample/run family above) — and added eight of
+        // the glued losses the round-9 word list caused (nineteen new
+        // label words, eight pinned forms — the old phrasing "one per
+        // new label word" was carried forward unexamined since round
+        // 10; the claims.rs ledger has the split right); round 11
+        // removed batch 25kg — the mass of one powder lot
         // is extensive, not a property, so its drop is correct, not a
         // cost (the twin sits with the label/sample/run family above) —
         // leaving seven: coupon 3mm, specimen 5mm, panel 2mm, test
@@ -1597,7 +1600,8 @@ fn corpus() -> Vec<CorpusCase> {
             3.0,
             Expect::MustStamp,
             "KNOWN: glued recall lost to H1's space requirement — coupon 3mm, \
-             one of the eight losses the round-9 word list caused",
+             one of the eight losses the round-9 word list caused, seven of \
+             them left after round 11 removed batch 25kg",
         ),
         known(
             "Each Ti-6Al-4V specimen 5mm thick was sectioned.",
@@ -1751,6 +1755,16 @@ fn corpus() -> Vec<CorpusCase> {
              widened it to four glyphs, round 11 pinned the two",
         ),
         known(
+            "The Ti-6Al-4V UTS ranged from \u{2212}950 to \u{2212}400 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -400.0,
+            Expect::MustDrop,
+            "KNOWN: round 12 item 7 (L1) — the HIGH endpoint of the U+2212 \
+             word-range stamps too (measured); round 11 pinned only the low \
+             endpoint above, leaving coverage asymmetric",
+        ),
+        known(
             "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
             "Ti-6Al-4V",
             "UTS",
@@ -1776,6 +1790,17 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "KNOWN: the ASCII spaced-dash twin stamps — the gap is the \
              spaces, not the glyph",
+        ),
+        known(
+            "The Ti-6Al-4V UTS was 950 - 1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "KNOWN: round 12 item 7 (L1) — the HIGH endpoint of the ASCII \
+             spaced-dash range stamps too (measured); round 11 pinned only \
+             the low endpoint, while the en-dash twin has carried both \
+             endpoints since round 11",
         ),
         known(
             "The Ti-6Al-4V microstructures are shown in 4a and 4b.",
