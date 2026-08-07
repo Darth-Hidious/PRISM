@@ -25,8 +25,17 @@
 //! failures — but it DOES fail when a KNOWN case starts passing: the
 //! marker must then be removed, so the record cannot go stale in
 //! either direction. KNOWN failures are documented, not hidden.
+//!
+//! A SECOND small table covers the one class the (prose, subject,
+//! object, value) tuple cannot express: round-3 tautological
+//! containment. It lives in `validate_and_stamp` -> `quote_in_block`,
+//! which needs an `ExtractedClaim` carrying an LLM-supplied quote —
+//! claim + block -> stamped/dropped, same two scoreboard axes.
 
-use prism_retrieval::claims::supporting_quote;
+use prism_retrieval::claims::{
+    ClaimProvenance, EVIDENCE_RESEARCH, ExtractedClaim, supporting_quote, validate_and_stamp,
+};
+use prism_retrieval::fulltext::{BlockKind, Locator};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Expect {
@@ -438,6 +447,28 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "95 is a substring of 950",
         ),
+        case(
+            "The Ti-6Al-4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "round-2 regression, missed until round 9: the 6 of Ti-6Al-4V \
+             under a DIFFERENT subject — the existing cases use subject \
+             Ti-6Al-4V, so occurrence_inside_name masks the boundary dash \
+             clause; another subject in the same span exposes it",
+        ),
+        case(
+            "Inconel 718 was solution treated and aged.",
+            "Inconel 718",
+            "UTS",
+            718.0,
+            Expect::MustDrop,
+            "pins occurrence_inside_name itself: deleting that guard left \
+             the whole corpus green at round 8 — the 718 of the spaced \
+             designation has clean token boundaries and only positional \
+             containment inside the name refuses it",
+        ),
         // ---------------- MUST_DROP: H2 — glued e and x --------------
         case(
             "The Ti-6Al-4V strain rate was 2e5 per second.",
@@ -504,6 +535,39 @@ fn corpus() -> Vec<CorpusCase> {
             350.0,
             Expect::MustDrop,
             "the round-7 fix: the U+2013-minus sign flip drops",
+        ),
+        // ---------------- MUST_DROP: refused U+2212 needles ----------
+        // The round-5 UTF-8 advance panic: a rejected U+2212 occurrence
+        // must advance by the minus's 3 bytes, not one byte, or the next
+        // slice starts inside the char and the whole ingest panics. All
+        // other corpus U+2212 cases are ACCEPTED at first occurrence, so
+        // the advance line is never reached there — these needles are
+        // REFUSED, which is what exercises it.
+        case(
+            "Ti-6Al-4V at \u{2212}950x zoom had UTS.",
+            "Ti-6Al-4V",
+            "UTS",
+            -950.0,
+            Expect::MustDrop,
+            "round-5 regression, missed until round 9: the refused \u{2212}950x \
+             needle must advance by char; a byte advance panics the scan",
+        ),
+        case(
+            "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa.",
+            "Ti-6Al-4V",
+            "stress",
+            -950.0,
+            Expect::MustDrop,
+            "the range twin: a U+2212 needle refused as a range endpoint \
+             must also advance by char, not byte",
+        ),
+        case(
+            "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa.",
+            "Ti-6Al-4V",
+            "stress",
+            1100.0,
+            Expect::MustDrop,
+            "the high endpoint of a signed en-dash range is a range bound too",
         ),
         // ---------------- MUST_DROP: tables --------------------------
         case(
@@ -601,6 +665,99 @@ fn corpus() -> Vec<CorpusCase> {
     ]
 }
 
+/// Round-3 tautological containment lives in `validate_and_stamp` ->
+/// `quote_in_block`, which the main tuple cannot express: it needs an
+/// `ExtractedClaim` carrying an LLM-supplied quote.
+struct ValidationCase {
+    subject: &'static str,
+    object: &'static str,
+    value: Option<f64>,
+    unit: Option<&'static str>,
+    quote: Option<&'static str>,
+    block: &'static str,
+    expect: Expect,
+    reason: &'static str,
+}
+
+fn validation_claim(case: &ValidationCase) -> ExtractedClaim {
+    ExtractedClaim {
+        subject: case.subject.to_string(),
+        predicate: "has_value".to_string(),
+        object: case.object.to_string(),
+        value: case.value,
+        unit: case.unit.map(str::to_string),
+        conditions: Vec::new(),
+        confidence: None,
+        kind: None,
+        evidence_class: EVIDENCE_RESEARCH.to_string(),
+        provenance: ClaimProvenance {
+            document_id: "10.0000/corpus".to_string(),
+            document_url: String::new(),
+            source: "corpus".to_string(),
+            locator: Locator {
+                kind: BlockKind::Body,
+                section_path: Vec::new(),
+                label: None,
+                char_offset: 0,
+            },
+            quote: case.quote.map(str::to_string),
+        },
+    }
+}
+
+fn validation_corpus() -> Vec<ValidationCase> {
+    const BLOCK: &str = "We measured CoCrFeNi. Its thermal conductivity is 11.5 W/(m K) \
+                         at room temperature.";
+    let fact = |quote: Option<&'static str>, expect: Expect, reason: &'static str| ValidationCase {
+        subject: "CoCrFeNi",
+        object: "thermal_conductivity",
+        value: Some(11.5),
+        unit: Some("W/(m K)"),
+        quote,
+        block: BLOCK,
+        expect,
+        reason,
+    };
+    vec![
+        fact(
+            Some("thermal conductivity is 11.5 W/(m K)"),
+            Expect::MustStamp,
+            "a verbatim contained quote stamps",
+        ),
+        fact(
+            Some("  Thermal   CONDUCTIVITY is 11.5 W/(m K) "),
+            Expect::MustStamp,
+            "containment normalizes case and whitespace, nothing else",
+        ),
+        fact(
+            Some("thermal conductivity is 12.5 W/(m K)"),
+            Expect::MustDrop,
+            "a quote asserting a number the block never contains is dropped",
+        ),
+        fact(
+            None,
+            Expect::MustDrop,
+            "a claim with no quote has nothing tying it to its block",
+        ),
+        fact(
+            Some(""),
+            Expect::MustDrop,
+            "an EMPTY quote must not pass containment — the tautology guard: \
+             a containment check that accepts the empty needle accepts \
+             every claim",
+        ),
+        fact(
+            Some(
+                "We measured CoCrFeNi. Its thermal conductivity is 11.5 W/(m K) \
+                 at room temperature. The yield strength was 999 MPa.",
+            ),
+            Expect::MustDrop,
+            "containment is block-contains-quote, never the reverse: a quote \
+             that parrots the block and appends a fabricated sentence drops",
+        ),
+    ]
+}
+
 /// The two-sided scoreboard. Every future change to the matcher shows
 /// its cost on BOTH axes here: how many MUST_STAMP cases it dropped,
 /// and how many MUST_DROP cases it stamped. See the module docs for
@@ -612,29 +769,42 @@ fn claim_corpus_two_sided_scoreboard() {
     let mut known_held: Vec<String> = Vec::new();
     let mut known_fixed: Vec<String> = Vec::new();
 
-    for case in corpus() {
-        let stamped =
-            supporting_quote(case.subject, case.object, Some(case.value), case.prose).is_some();
-        let ok = match case.expect {
+    let mut record = |stamped: bool, expect: Expect, known: bool, line: String| {
+        let ok = match expect {
             Expect::MustStamp => stamped,
             Expect::MustDrop => !stamped,
         };
-        let line = format!(
-            "  {} / {} = {} in {:?}\n    reason: {}",
-            case.subject, case.object, case.value, case.prose, case.reason
-        );
         if ok {
-            if case.known {
+            if known {
                 known_fixed.push(line);
             }
-        } else if case.known {
+        } else if known {
             known_held.push(line);
         } else {
-            match case.expect {
+            match expect {
                 Expect::MustStamp => dropped_when_must_stamp.push(line),
                 Expect::MustDrop => stamped_when_must_drop.push(line),
             }
         }
+    };
+
+    for case in corpus() {
+        let stamped =
+            supporting_quote(case.subject, case.object, Some(case.value), case.prose).is_some();
+        let line = format!(
+            "  {} / {} = {} in {:?}\n    reason: {}",
+            case.subject, case.object, case.value, case.prose, case.reason
+        );
+        record(stamped, case.expect, case.known, line);
+    }
+
+    for case in validation_corpus() {
+        let stamped = validate_and_stamp(validation_claim(&case), case.block).is_ok();
+        let line = format!(
+            "  validation: {} / {} = {:?} quote {:?}\n    in {:?}\n    reason: {}",
+            case.subject, case.object, case.value, case.quote, case.block, case.reason
+        );
+        record(stamped, case.expect, false, line);
     }
 
     let failed = !stamped_when_must_drop.is_empty()
