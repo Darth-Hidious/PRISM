@@ -85,8 +85,14 @@
 //! const doc below disclaims "another word list"); round 13 item 5
 //! ADOPTED a head-noun SUFFIX rule — every `*strength`, `*hardness` and
 //! `*grain size` is non-negative and has NO signed homograph, so 16 of
-//! the 22 spellings now drop a negative (was 5), at 0 over-refusal on a
-//! 14-quantity signed control set. `density` stays EXACT: charge/current
+//! the 22 spellings now drop a negative (was 5). The round-13 record
+//! ALSO claimed `0 over-refusal` here — that is FALSE and corrected
+//! below: at HEAD 27 signed spellings (differential phrasing like
+//! `change in yield strength`, `difference in hardness`, plus the
+//! genuinely-signed homographs `signal strength` / `field strength`)
+//! return Err(Guarded{SignDomain}). See the fn doc on
+//! `is_nonnegative_quantity` for the measured over-refusal and the
+//! control-set blind spot. `density` stays EXACT: charge/current
 //! density can be negative, so `relative density` / `bulk density`
 //! still fabricate (6 spellings open). See `is_nonnegative_quantity`.
 //!
@@ -818,11 +824,32 @@ const NONNEGATIVE_QUANTITIES: &[&str] =
 /// `density`: `charge density` / `current density` can be negative, so
 /// `density` stays EXACT and `relative density` / `bulk density` still
 /// fabricate (the measured price of not over-refusing the signed
-/// densities). Measured: 16/22 safe (was 5), 0 over-refusal on a
-/// 14-quantity signed control set (residual stress, Seebeck, charge
-/// density, density change, grain size difference, ...). Every suffix
-/// is pinned both directions by the lib test
-/// `sign_domain_matches_head_noun_suffix_without_over_refusal`.
+/// densities). TWO claims in the round-13 record here are FALSE and
+/// corrected in round 14 item 1 (this commit; comment-only, no
+/// behaviour change):
+///   (1) `0 over-refusal` is FALSE. At HEAD 27 signed spellings return
+///       Err(Guarded{SignDomain}) under this suffix rule: the
+///       differential family (`change in yield strength`, `reduction
+///       in strength`, `difference in hardness`, `delta hardness`,
+///       `change in grain size`, ...) and the genuinely-signed
+///       homographs (`signal strength`, `field strength`, `magnetic
+///       field strength`). `ionic strength` / `dielectric strength` /
+///       `water hardness` ARE correctly refused (plain-noun reasoning
+///       holds); it is DIFFERENTIAL phrasing that breaks the rule.
+///   (2) `Every suffix is pinned both directions` is FALSE for the
+///       over-refusal direction. Mutating `ends_with("strength")` or
+///       `ends_with("hardness")` to `contains(...)` leaves the suite
+///       fully green (87 lib + 1 corpus); only the `grain size` arm
+///       reddens, and only because its control `grain size difference`
+///       CONTAINS the substring. The signed control set has NO entry
+///       containing `strength` or `hardness` at all, so it cannot
+///       trap over-refusal of those two arms — the control was built
+///       for the OLD exact-match failure mode, and the word order that
+///       exposes an `ends_with` rule (the signed word FIRST, e.g.
+///       `change in strength`) is absent from it. The FORWARD
+///       direction (a negative under `tensile strength` etc. drops) IS
+///       pinned. The over-refusal direction is repaired in the commits
+///       that follow (control set, then the rule, then trailing units).
 fn is_nonnegative_quantity(object_n: &str) -> bool {
     NONNEGATIVE_QUANTITIES.contains(&object_n)
         || object_n.ends_with("strength")
