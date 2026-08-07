@@ -1966,10 +1966,23 @@ mod tests {
         let minus = "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.";
         // The fabrication half: the sign-flipped positive claim drops.
         assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", 350.0, minus);
-        // Round 11: the true negative DROPS too — U+2013 has no signed
-        // needle, so its recall loss is accepted to keep the separator
-        // shape from fabricating (corpus KNOWN rows record the loss).
-        assert_dropped_end_to_end("Ti-6Al-4V", "residual_stress", -350.0, minus);
+        // MECHANISM, not ground truth (round 12 item 3). U+2013 is no
+        // sign glyph, so the true negative constructs no signed needle,
+        // the scan finds no needle form at all, and the drop surfaces as
+        // NoSpan. GROUND TRUTH for this exact tuple — the prose DOES
+        // assert -350 MPa, an engineer calls that supported, so a stamp
+        // is what SHOULD happen — belongs to the corpus KNOWN recall row
+        // (tests/claim_corpus.rs, the U+2013 \u{2013}350 entry); it is not
+        // restated here. Round 11's end-to-end drop assert contradicted
+        // that row: one owner per fact. When a separator-safe sign
+        // mechanism lands, THIS assert reddens and that KNOWN marker must
+        // be stripped in the same change — two coherent signals that the
+        // fix landed, not the old deadlock where the lib defended the
+        // drop the corpus called a loss.
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "residual_stress", Some(-350.0), minus),
+            Err(SupportRefusal::NoSpan)
+        );
         // Grouped form: the unsigned grouped needle is still refused...
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
@@ -1977,12 +1990,21 @@ mod tests {
             1140.0,
             "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
         );
-        // ...and round 11 drops its signed twin too (no U+2013 needle).
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "residual_stress",
-            -1140.0,
-            "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
+        // ...and its signed twin drops the same way (round 12 item 3:
+        // MECHANISM, not ground truth). No '-'/'\u{2212}' needle matches the
+        // U+2013 spelling of the grouped form either, so the grouped true
+        // negative also surfaces as NoSpan. Ground truth (the prose
+        // asserts \u{2013}1,140 MPa, a stamp is what SHOULD happen) belongs
+        // to the corpus KNOWN grouped-recall row this round restores; the
+        // assert pins only the current mechanism.
+        assert_eq!(
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-1140.0),
+                "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa."
+            ),
+            Err(SupportRefusal::NoSpan)
         );
 
         // Stamp direction: a genuine point value in the same sentence
