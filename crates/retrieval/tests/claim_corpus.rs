@@ -1283,6 +1283,94 @@ fn corpus() -> Vec<CorpusCase> {
         // pin. The family now splits: '-'/'\u{2212}' pin SignDomain
         // on UTS; '\u{2013}'/'\u{2014}' pin the no-needle decision
         // on residual_stress.
+        //
+        // ROUND 15 ITEM 1 — THE DANGEROUS HALF. Round 13 item 1 moved
+        // only the U+2013/U+2014 spellings onto residual_stress (the
+        // safe half: no signed needle matches, so they drop NoSpan) and
+        // left ASCII '-' / U+2212 on UTS, where SignDomain refuses them.
+        // But '-' / U+2212 are the spellings pdf-extract EMITS, and on a
+        // SIGNED predicate (residual_stress) they are real minus needles
+        // the engine STAMPS: the dash separates the label from its value
+        // ('residual stress - 950 MPa'), so under round 11's convention
+        // the source value is +950 and a -950 claim fabricates the sign.
+        // These six rows STAMP -950 at this commit and STAY RED: no
+        // minus-vs-separator discriminator exists under '-' / U+2212
+        // (round 11's measurement), and removing them from the needle
+        // set would lose ALL genuine negative recall (the Seebeck -11.5,
+        // residual -350 KNOWN rows). A row that stamps exercises NO
+        // guard — it documents a live fabrication, not a guard pin.
+        // Ground truth is WEAKER than the UTS rows beneath: a
+        // longitudinal compressive residual stress of -950 MPa is
+        // physically plausible, so unlike a negative UTS (impossible a
+        // priori) this is a fabrication of the SIGN, not a nonsense value.
+        case(
+            "Ti-6Al-4V residual stress -950 MPa (longitudinal)",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            Expect::MustDrop,
+            "round 15 item 1: the dangerous half — the ASCII '-' spelling \
+             on a SIGNED predicate STAMPS -950 (no refusal). residual_stress \
+             is signed so SignDomain does not fire, and '-' is a real minus \
+             needle that matches the source's separator dash (the dash \
+             separates 'residual stress' from '950 MPa', source value +950, \
+             so -950 fabricates the sign). Ground truth weaker than the UTS \
+             twin: a compressive residual stress of -950 MPa is plausible, so \
+             this is a sign fabrication, not an impossible value. No guard \
+             refuses it — it documents the live fabrication item 2 records",
+        ),
+        case(
+            "Ti-6Al-4V residual stress \u{2212}950 MPa (longitudinal)",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            Expect::MustDrop,
+            "round 15 item 1: the U+2212 twin of the dangerous half — STAMPS \
+             -950 (no refusal) by the same path as the ASCII spelling above; \
+             the U+2212 glyph round 11 kept AS a sign needle is exactly why \
+             this row cannot drop on a signed predicate. Ground truth as above",
+        ),
+        case(
+            "-950 MPa was recorded for Ti-6Al-4V.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            Expect::MustDrop,
+            "round 15 item 1: the ASCII line-start separator on a SIGNED \
+             predicate STAMPS -950 (no refusal) — the UTS twin of this shape \
+             drops only via SignDomain, which a signed predicate bypasses; \
+             ground truth weaker than the UTS twin (compressive residual is \
+             plausible), so this is a sign fabrication",
+        ),
+        case(
+            "\u{2212}950 MPa was recorded for Ti-6Al-4V.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            Expect::MustDrop,
+            "round 15 item 1: the U+2212 line-start separator on a SIGNED \
+             predicate STAMPS -950 (no refusal) — the same path as the ASCII \
+             twin; ground truth as above",
+        ),
+        case(
+            "The Ti-6Al-4V result -950 MPa- matched the target.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            Expect::MustDrop,
+            "round 15 item 1: the ASCII bracketed separator on a SIGNED \
+             predicate STAMPS -950 (no refusal); the UTS twin drops only via \
+             SignDomain. Ground truth as above",
+        ),
+        case(
+            "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -950.0,
+            Expect::MustDrop,
+            "round 15 item 1: the U+2212 bracketed separator on a SIGNED \
+             predicate STAMPS -950 (no refusal); ground truth as above",
+        ),
         case(
             "Ti-6Al-4V UTS -950 MPa (longitudinal)",
             "Ti-6Al-4V",
