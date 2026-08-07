@@ -920,6 +920,15 @@ fn trailing_word(prefix: &str) -> String {
 /// claim AND the sign-flipped +950 claim; nothing stamps compressive
 /// as tensile. Reopen only if a source is found where dropping the
 /// true en-dash-minus value costs more than the fabrication it blocks.
+///
+/// RECORDED, NOT FIXED (round 8): U+2014 EM DASH is the unrecorded
+/// twin of that decision. It is not a needle glyph either, but it is
+/// also NOT in the before-minus list in `clean_number_boundary`, so
+/// "was \u{2014}350 MPa" still stamps the sign-flipped +350 while the
+/// true -350 claim drops. The same range-dash/minus reasoning applies
+/// verbatim (a sentence dash before a digit joins no compound); the
+/// fix is a one-line list addition, deliberately not taken this round
+/// — the corpus carries it as a KNOWN failure.
 fn number_needles(value: f64) -> Vec<String> {
     let plain = format!("{value}");
     let mut out = vec![plain.clone()];
