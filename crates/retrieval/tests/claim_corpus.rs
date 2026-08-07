@@ -1472,6 +1472,73 @@ fn corpus() -> Vec<CorpusCase> {
              magnitude by convention so the drop is defensible, recorded \
              here as a recall price",
         ),
+        // ROUND 14 ITEM 5 — the SignDomain OPEN SET, pinned as KNOWN
+        // tripwires (they redden the suite the day a fix lands). Every
+        // member is a strictly-non-negative magnitude with NO signed
+        // homograph, none matched by any exact/suffix rule, so a
+        // negative stamps at HEAD. Representative of three families
+        // (density, magnitude, symbol); the full enumeration is in the
+        // claims.rs module doc — a sample reported as a total is how
+        // round 13's "6 of 22" became a false closure claim.
+        known(
+            "The AlSi10Mg apparent density was -4.4 g/cm3.",
+            "AlSi10Mg",
+            "apparent density",
+            -4.4,
+            Expect::MustDrop,
+            "KNOWN: round 14 item 5 open set — the density family. \
+             'apparent density' is non-negative (no signed homograph) but \
+             is not exact 'density', so SignDomain does not fire and the \
+             negative stamps; representative of relative/bulk/theoretical/\
+             packing/sintered/mass density",
+        ),
+        known(
+            "The AlSi10Mg porosity was -0.5 percent.",
+            "AlSi10Mg",
+            "porosity",
+            -0.5,
+            Expect::MustDrop,
+            "KNOWN: round 14 item 5 open set — porosity is non-negative \
+             and matched by no rule, so a negative stamps",
+        ),
+        known(
+            "The Ti-6Al-4V surface roughness was -1.2 um.",
+            "Ti-6Al-4V",
+            "surface roughness",
+            -1.2,
+            Expect::MustDrop,
+            "KNOWN: round 14 item 5 open set — roughness is non-negative, \
+             matched by no rule, so a negative stamps",
+        ),
+        known(
+            "The Ti-6Al-4V Young's modulus was -110 GPa.",
+            "Ti-6Al-4V",
+            "Young's modulus",
+            -110.0,
+            Expect::MustDrop,
+            "KNOWN: round 14 item 5 open set — Young's modulus is \
+             non-negative, matched by no rule, so a negative stamps",
+        ),
+        known(
+            "The AlSi10Mg thermal conductivity was -150 W/mK.",
+            "AlSi10Mg",
+            "thermal conductivity",
+            -150.0,
+            Expect::MustDrop,
+            "KNOWN: round 14 item 5 open set — thermal conductivity is \
+             non-negative, matched by no rule, so a negative stamps",
+        ),
+        known(
+            "The Ti-6Al-4V Rm was -950 MPa.",
+            "Ti-6Al-4V",
+            "Rm",
+            -950.0,
+            Expect::MustDrop,
+            "KNOWN: round 14 item 5 open set — 'Rm' (a tensile-strength \
+             symbol the extractor emits verbatim) is non-negative but \
+             matched by no rule, so a negative stamps; representative of \
+             Rp0.2/sigma_UTS/flow stress/ultimate tensile stress",
+        ),
         // ---------------- round 11: signed needles vs dash ranges ------
         // Only '-' and U+2212 are sign glyphs — round 11 reverted
         // round 10's U+2013/U+2014 (the separator shapes fabricated

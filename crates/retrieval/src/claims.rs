@@ -96,7 +96,34 @@
 //! phrase from the suffix rule so those 27 stamp again (see
 //! `is_nonnegative_quantity`). `density` stays EXACT: charge/current
 //! density can be negative, so `relative density` / `bulk density`
-//! still fabricate (6 spellings open). See `is_nonnegative_quantity`.
+//! still fabricate.
+//!
+//! ROUND 14 ITEM 5 — THE OPEN SET IS NOT 6, AND WAS NEVER ENUMERATED.
+//! The round-13 record's "6 of 22 spellings still fabricate" was a
+//! SAMPLE reported as a total (22 was sampled, not enumerated).
+//! Measured at HEAD the open set is unbounded and the lexical approach
+//! CANNOT enumerate it. Three families, every member a strictly-
+//! non-negative magnitude with NO signed homograph, every one stamping
+//! a -950:
+//!   * DENSITY family — `relative`, `bulk`, `apparent`, `theoretical`,
+//!     `packing`, `as-built`, `green`, `sintered`, `mass` density
+//!     (exact `density` is the only one refused);
+//!   * magnitude class — `porosity`, `surface roughness`, `layer
+//!     thickness`, `fracture toughness`, `elongation at break`,
+//!     `thermal conductivity`, `Young's modulus`, `crystallite size`,
+//!     `particle size`;
+//!   * SYMBOL/synonym forms the extractor emits verbatim — `Rm`,
+//!     `Rp0.2`, `sigma_UTS`, `UTS in MPa`, `flow stress`, `ultimate
+//!     tensile stress`, `0.2% offset yield stress`, `Vickers hardness
+//!     number`.
+//!
+//! Adding these by hand is "another word list" (disclaimed by the
+//! const doc) and would still miss the next paper's quantity; the
+//! honest conclusion is that closing this needs the extractor
+//! VOCABULARY (map every emitted object to its signed domain), which
+//! round 13 deferred. Six representative members are pinned as KNOWN
+//! tripwires in the corpus (fire when the vocabulary lands). See
+//! `is_nonnegative_quantity`.
 //!
 //! ROUND 13 ITEM 2 — IS THE REVERT STILL BUYING ANYTHING? Settled by
 //! measurement; the winning reading is (a) the revert IS load-bearing.
