@@ -871,6 +871,66 @@ fn corpus() -> Vec<CorpusCase> {
             "KNOWN: the same recall loss for the U+2014 typesetting of the \
              minus sign — the true negative drops for lack of a needle",
         ),
+        // H1's space requirement cost (round 9): a label number with a
+        // GLUED unit drops — the exemption demands the space, the
+        // boundary check cannot redeem what the Label guard refuses
+        // afterwards. Seven forms, recorded so the cost is visible.
+        known(
+            "Each Ti-6Al-4V sample 3mm thick was ground and polished.",
+            "Ti-6Al-4V",
+            "thickness",
+            3.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — sample 3mm",
+        ),
+        known(
+            "Each Inconel 718 run 30min was quenched.",
+            "Inconel 718",
+            "duration",
+            30.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — run 30min",
+        ),
+        known(
+            "The Ti-6Al-4V sample 980\u{b0}C cycle was logged.",
+            "Ti-6Al-4V",
+            "temperature",
+            980.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — sample 980\u{b0}C",
+        ),
+        known(
+            "A cross-section 10mm above the build plate was examined for AlSi10Mg.",
+            "AlSi10Mg",
+            "height",
+            10.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — cross-section 10mm",
+        ),
+        known(
+            "The AlSi10Mg samples 5mm thick were sectioned.",
+            "AlSi10Mg",
+            "thickness",
+            5.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — samples 5mm",
+        ),
+        known(
+            "Each AlSi10Mg sample 30um layer was imaged.",
+            "AlSi10Mg",
+            "layer_thickness",
+            30.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — sample 30um",
+        ),
+        known(
+            "One CoCrFeNi sample 5wt% Cr was analysed.",
+            "CoCrFeNi",
+            "content",
+            5.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — sample 5wt%",
+        ),
     ]
 }
 

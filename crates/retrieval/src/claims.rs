@@ -25,6 +25,23 @@
 //! U+2013, whose endpoints this engine refuses; `pdf-extract` normalises
 //! ranges to '-', whose endpoints stamp (compound-friendly, by decision).
 //! The same paper yields different claims depending on how it was fetched.
+//!
+//! RECORDED, NOT FIXED (round 9) — the largest remaining structural
+//! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
+//! both shapes pass every guard this branch built:
+//!
+//! * "The Ti-6Al-4V UTS was 950 MPa and the yield strength 880 MPa."
+//!   claimed as yield_strength = 950 STAMPS: the span holds the
+//!   subject, the object word and the number, and nothing asks which
+//!   property the number belongs to.
+//! * `validate_and_stamp` checks only that a unit EXISTS, never that
+//!   it matches the prose: a 950 GPa claim against "950 MPa" text
+//!   stamps with a verbatim quote.
+//!
+//! Right number, wrong property, wrong unit, perfect provenance.
+//! Closing it needs predicate/value binding in the span scan and a
+//! unit-match check in `validate_and_stamp` — deliberately not
+//! attempted this round.
 
 use serde::{Deserialize, Serialize};
 
@@ -930,11 +947,18 @@ fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
     // exemption read a glued sub-panel letter or symbol column as a
     // unit and dropped the label guard for every label word: "Figure
     // 2a shows..." stamped 2, "Table 4a" stamped 4. Every measured
-    // win that needs THIS exemption is spaced; glued-unit recall is
-    // redeemed by `clean_number_boundary`'s unit-initial check, not
-    // here. Recorded residue: a SPACED single-letter unit still
-    // exempts ("Table 4 K values" stamps 4) — see the corpus KNOWN
-    // cases in tests/claim_corpus.rs.
+    // win that needs THIS exemption is spaced.
+    //
+    // HONEST COST (round 9 — the round-8 claim that
+    // `clean_number_boundary` redeems glued-unit recall was FALSE):
+    // passing the boundary check only avoids the Boundary guard; THIS
+    // guard fires afterwards and nothing redeems it. The space
+    // requirement silently costs seven glued recall forms, carried as
+    // KNOWN failures in tests/claim_corpus.rs: sample 3mm, run 30min,
+    // sample 980°C, cross-section 10mm, samples 5mm, sample 30um,
+    // sample 5wt%. Recorded residue: a SPACED single-letter unit
+    // still exempts ("Table 4 K values" stamps 4) — see the corpus
+    // KNOWN cases in tests/claim_corpus.rs.
     if hay[end..].starts_with(' ') && unit_follows(hay, end) {
         return false;
     }
