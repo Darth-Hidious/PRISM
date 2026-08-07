@@ -1,0 +1,433 @@
+# PRISM — ownership and licence manifest
+#
+# Maps every tracked directory to an owner, a licence, a layer and its
+# permitted use. Required by the PRISM/Mirdyne IP architecture (section 5.2)
+# as the "technical evidence of legal boundaries" (section 9, step 9), and it
+# is the evidence row behind two investor-control questions (section 8):
+# "Are open-source obligations known?" and "Are any assets jointly owned
+# without rules?"
+#
+# This file RECORDS a documented position. It does not grant, assign or amend
+# any right. Where it and a signed instrument disagree, the instrument wins.
+#
+# Rule of construction: no joint ownership. Every path has exactly one owner.
+# A module that cannot be split is assigned to one owner and the other party
+# receives a documented cross-licence.
+
+version: 1
+updated: 2026-08-07
+
+owners:
+  mirdyne:
+    legal_name: Mirdyne GmbH
+    jurisdiction: Germany
+    role: Owner of the PRISM product. Licensor.
+  marc27:
+    legal_name: MARC27 Internet Private Limited
+    jurisdiction: India
+    role: >-
+      Hosted service provider. Non-exclusive and replaceable. Owns no part of
+      this repository. See NOTICE.
+  third_party:
+    legal_name: Various upstream licensors
+    role: Retain their own licences; nothing here claims ownership of them.
+
+licences:
+  mirdyne-source-available:
+    file: LICENSE-MIRDYNE
+    spdx: LicenseRef-Mirdyne-Dual
+    commercial_use: Requires a written agreement with Mirdyne.
+  mit:
+    file: LICENSE-MIT
+    spdx: MIT
+    commercial_use: Permitted.
+  apache-2.0:
+    file: LICENSE-APACHE-2.0
+    spdx: Apache-2.0
+    commercial_use: Permitted, with notice obligations.
+
+# ── Layers ───────────────────────────────────────────────────────────────
+# product-core  Local runtime, engine, interfaces, provenance, client, SDK.
+# open-tools    Python tools and plugins, deliberately MIT.
+# third-party   Vendored or derived from upstream; upstream licence governs.
+
+paths:
+  - path: crates/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: >-
+      View, audit and run for evaluation and non-commercial research.
+      Commercial use, redistribution and derivative works require a written
+      agreement.
+    notes: >-
+      All 24 crates inherit licence and authors from [workspace.package] in
+      Cargo.toml. No crate declares its own.
+
+  - path: app/tools/**
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/plugins/**
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/workflows/**
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/config/**
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/mcp_client.py
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/mcp_server.py
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/tool_server.py
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/sidecar_server.py
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: app/update.py
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant, including commercial use.
+  - path: tests/**
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant.
+
+  - path: docs/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: extensions/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: dashboard/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: macos/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: prompts/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: commands/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: data/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: script/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: scripts/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: .github/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: .prism/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+
+  # ── Repository root: build, packaging, docs, licence texts ──────────────
+  # Listed explicitly rather than by a catch-all glob, so a new root file
+  # shows up as uncovered in the coverage check instead of being silently
+  # absorbed by a wildcard.
+  - path: Cargo.toml
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+    notes: Declares licence and authors for all 24 crates.
+  - path: Cargo.lock
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: pyproject.toml
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant.
+  - path: MANIFEST.in
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant.
+  - path: app/__init__.py
+    owner: mirdyne
+    licence: mit
+    layer: open-tools
+    funding: Mirdyne internal
+    permitted_use: Full MIT grant.
+  - path: install.sh
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: install.ps1
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  # Root documentation, listed one by one on purpose. A `*.md` glob here
+  # would silently absorb every future root document, including one that
+  # should not be Mirdyne-owned -- exactly the drift this manifest exists to
+  # catch. Explicit entries make a new root file fail check_ownership.py
+  # until somebody assigns it. AGENTS-forge.md is Apache-2.0, listed below.
+  - path: README.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: PRISM.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: DESIGN.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: CHANGELOG.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: AGENTS.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: ACKNOWLEDGMENTS.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: FETCH_PLAN.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: SEARCH_TOOLS_INVENTORY.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: PRISM_TUI_VERIFY.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Redistribution requires agreement.
+  - path: WORK_LOG_2026-08-08.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Internal working notes.
+  - path: .mcp.json.notes.md
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. Internal working notes.
+  - path: .gitignore
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: .env.example
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+    notes: Example values only. Holds no live credential.
+  - path: .mcp.json
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: vertex.json
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+    notes: Configuration only. Holds no live credential.
+  - path: .cargo/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+  - path: .zcode/**
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate.
+    notes: Development session plans. Internal working notes, not product.
+
+  # ── Licence texts themselves ────────────────────────────────────────────
+  - path: LICENSE
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: The licence pointer document. Reproduce verbatim.
+  - path: LICENSE-MIRDYNE
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: The operative source-available text. Reproduce verbatim.
+  - path: NOTICE
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Attribution notice. Must accompany redistribution.
+  - path: LICENSE-MIT
+    owner: third_party
+    licence: mit
+    layer: third-party
+    permitted_use: Standard MIT text, retained verbatim.
+  - path: LICENSE-APACHE-2.0
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    permitted_use: Standard Apache-2.0 text, retained verbatim.
+
+  # ── Third-party: upstream licence governs, ours does not apply ──────────
+  - path: templates/forge-*.md
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    upstream: Forge / ForgeCode — https://github.com/tailcallhq/forgecode
+    permitted_use: Apache-2.0. Notices preserved in NOTICE.
+  - path: shell-plugin/**
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    upstream: Forge / ForgeCode — https://github.com/tailcallhq/forgecode
+    permitted_use: Apache-2.0. Notices preserved in NOTICE.
+  - path: forge.schema.json
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    upstream: Forge / ForgeCode — https://github.com/tailcallhq/forgecode
+    permitted_use: Apache-2.0. Notices preserved in NOTICE.
+  - path: .forge/commands/**
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    upstream: Forge / ForgeCode — https://github.com/tailcallhq/forgecode
+    permitted_use: Apache-2.0. Notices preserved in NOTICE.
+  - path: AGENTS-forge.md
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    upstream: Forge / ForgeCode — https://github.com/tailcallhq/forgecode
+    permitted_use: Apache-2.0. Notices preserved in NOTICE.
+  - path: LICENSES/**
+    owner: third_party
+    licence: apache-2.0
+    layer: third-party
+    upstream: OPTIMADE
+    permitted_use: Upstream licence text, retained verbatim.
+
+# ── What is deliberately NOT here ────────────────────────────────────────
+# The MARC27 hosted service layer. It lives in a separate repository under a
+# separate owner and licence, and is expressly excluded from the PRISM
+# Product IP. PRISM calls those services; that creates no ownership interest
+# in either direction. `crates/core/providers.toml` keeps the hosted platform
+# as one provider row among many, and `crates/runtime/src/platform_env.rs`
+# keeps its endpoints reachable under provider-neutral names, so the product
+# is portable off it.
+#
+# No ESA, partner-restricted or customer data is committed to this
+# repository. Project-funded foreground and partner background are governed
+# by their own contracts and are tracked outside this manifest.
