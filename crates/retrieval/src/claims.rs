@@ -125,6 +125,15 @@
 //! tripwires in the corpus (fire when the vocabulary lands). See
 //! `is_nonnegative_quantity`.
 //!
+//! ROUND 14 ITEM 6 — PRODUCTION MITIGATION: a SignDomain over-refusal is
+//! NOT invisible. cli/papers.rs pushes every rejected claim into the
+//! output `rejected[]` JSON carrying the guard name, subject, object,
+//! value and locator (its comment: "the guard name is the only
+//! observable signal of over-refusal"), so the drop is observable and
+//! attributable downstream — though it is not tripwired anywhere. That
+//! changes the cost of an over-refusal: it is a recoverable, named drop,
+//! not a silent loss.
+//!
 //! ROUND 13 ITEM 2 — IS THE REVERT STILL BUYING ANYTHING? Settled by
 //! measurement; the winning reading is (a) the revert IS load-bearing.
 //! On the round-12 corpus M-A (re-adding U+2013/U+2014 to
