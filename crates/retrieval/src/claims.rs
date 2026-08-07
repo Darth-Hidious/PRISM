@@ -428,7 +428,7 @@ fn refusing_guard(
     if inside_citation_marker(hay, start) {
         return Some(RefusalGuard::Citation);
     }
-    if preceding_word_is_label(hay, start) {
+    if preceding_word_is_label(hay, start, end) {
         return Some(RefusalGuard::Label);
     }
     if occurrence_inside_name(hay, start, end, subject_n)
@@ -623,39 +623,158 @@ const LABEL_WORDS: &[&str] = &[
 /// label when the number one step back sits a label word ("Tables 1 and 2").
 const LIST_CONTINUATIONS: &[&str] = &["and", "or", "to", "through"];
 
-/// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
-/// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
-/// not evidence for a property value. Continuations of a label list are
-/// caught by stepping back over them to the head word: ", <number>"
-/// items repeatedly ("Refs. 25, 26"), then one conjunction and its
-/// number ("Tables 1 and 2"). The head word decides: a value list
-/// ("measured 950, 960 and 970 MPa") walks back to a non-label and
-/// stamps. Known cost of the mechanism: a value opening a clause after
-/// "Table N," ("As shown in Table 2, 950 MPa was measured") is dropped
-/// — a miss, never a false stamp.
-fn preceding_word_is_label(hay: &str, start: usize) -> bool {
-    let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']);
-    let mut word = trailing_word(prefix);
-    // Step back over ", <number>" list items repeatedly: in "Refs. 25,
-    // 26" the 26 is a label because the walk lands on the label word at
-    // the head of the list. The head word is the distinguishing feature:
-    // the same walk over a value list ("measured 950, 960, 970 MPa")
-    // lands on "measured", not a label, and everything stamps.
+/// Units a list's last item can carry. The curated set is deliberately
+/// the vocabulary of measurements: reference lists never carry units, so
+/// a chain that ends in one of these is a VALUE list and the walk-back
+/// to a label word must stop. A token matches only at a token boundary,
+/// so prose words that merely start with a unit ("for", "uts") never
+/// match.
+const UNIT_TOKENS: &[&str] = &[
+    // pressure / stress / hardness
+    "pa", "kpa", "mpa", "gpa", "tpa", "bar", "mbar", "kbar", "atm", "torr", "psi", "ksi", "hv",
+    "hrc", "hrb", // force, length, mass
+    "n", "kn", "mn", "gn", "m", "mm", "cm", "nm", "um", "\u{b5}m", "pm", "km", "g", "mg", "kg",
+    // time, temperature
+    "s", "ms", "ns", "ps", "min", "h", "k", "\u{b0}c", "\u{b0}f",
+    // energy, power, frequency
+    "j", "kj", "mj", "gj", "ev", "kev", "mev", "gev", "tev", "w", "mw", "kw", "hz", "khz", "mhz",
+    "ghz", "thz", "rpm", // electrical, magnetic
+    "v", "mv", "kv", "a", "ma", "ohm", "t", // fractions
+    "%", "wt%", "at%", "vol%", "mol", "ppm", "ppb",
+];
+
+/// Does the text after `end` carry a unit for the number — one optional
+/// space, then a unit token at a token boundary ("970 mpa", "1140mpa")?
+/// `hay` is normalized: lowercase, single spaces.
+fn unit_follows(hay: &str, end: usize) -> bool {
+    let rest = hay[end..].strip_prefix(' ').unwrap_or(&hay[end..]);
+    UNIT_TOKENS.iter().any(|u| {
+        rest.strip_prefix(u)
+            .is_some_and(|tail| tail.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+    })
+}
+
+/// Byte length of the leading number in `s`, reading through
+/// thousands-grouping commas ("1,140"). A comma followed by a space is a
+/// list separator, not grouping, and ends the number.
+fn leading_number_len(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_digit()
+            || (bytes[i] == b',' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)))
+    {
+        i += 1;
+    }
+    i
+}
+
+/// Does the list chain continuing after `end` — ", <number>" items and
+/// "<and|or|to|through> <number>" steps — close with a unit? A chain that
+/// ends in a unit is a value list ("950, 960 and 970 MPa"); reference
+/// lists never carry one ("Refs. 25, 26 and 27"). A unit directly after
+/// the occurrence is a chain of length zero and counts too.
+fn chain_ends_in_unit(hay: &str, end: usize) -> bool {
+    let mut pos = end;
+    loop {
+        if unit_follows(hay, pos) {
+            return true;
+        }
+        let rest = &hay[pos..];
+        if let Some(item) = rest.strip_prefix(", ") {
+            let n = leading_number_len(item);
+            if n == 0 {
+                return false;
+            }
+            pos += ", ".len() + n;
+        } else if let Some(item) = rest.strip_prefix(' ')
+            && let Some(conj) = LIST_CONTINUATIONS
+                .iter()
+                .find(|c| item.starts_with(*c) && item.as_bytes().get(c.len()) == Some(&b' '))
+        {
+            let skip = 1 + conj.len() + 1;
+            let n = leading_number_len(&rest[skip..]);
+            if n == 0 {
+                return false;
+            }
+            pos += skip + n;
+        } else {
+            return false;
+        }
+    }
+}
+
+/// Step back over ", <number>" items one number at a time; the word at
+/// the head of the list decides.
+fn walk_comma_items(prefix: &mut String, word: &mut String) {
     while word.is_empty() && prefix.ends_with(',') {
         let before_comma = prefix[..prefix.len() - 1].trim_end_matches(' ');
         let number = trailing_word(before_comma);
         if number.is_empty() || !number.chars().all(|c: char| c.is_ascii_digit()) {
             break;
         }
-        prefix =
-            before_comma[..before_comma.len() - number.len()].trim_end_matches([' ', '.', ':']);
-        word = trailing_word(prefix);
+        *prefix = before_comma[..before_comma.len() - number.len()]
+            .trim_end_matches([' ', '.', ':'])
+            .to_string();
+        *word = trailing_word(prefix);
     }
-    if LIST_CONTINUATIONS.contains(&word.as_str()) {
-        prefix = prefix[..prefix.len() - word.len()].trim_end_matches(|c: char| {
-            c.is_ascii_digit() || matches!(c, ',' | ' ' | '.' | ':' | '-' | '\u{2013}' | '\u{2014}')
-        });
-        word = trailing_word(prefix);
+}
+
+/// Byte length of the trailing run of digits and range dashes in
+/// `prefix` ("25\u{2013}27", "26"), or 0 when it holds no digit. One
+/// conjunction step consumes exactly one such run — the old unbounded
+/// trim that ate every digit, comma and space backwards is gone.
+fn trailing_digit_run_len(prefix: &str) -> usize {
+    let mut len = 0;
+    let mut saw_digit = false;
+    for c in prefix.chars().rev() {
+        if c.is_ascii_digit() {
+            saw_digit = true;
+            len += c.len_utf8();
+        } else if matches!(c, '-' | '\u{2013}' | '\u{2014}') {
+            len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if saw_digit { len } else { 0 }
+}
+
+/// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
+/// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
+/// not evidence for a property value. Continuations of a label list are
+/// caught by stepping back over them to the head word: ", <number>"
+/// items repeatedly ("Refs. 25, 26"), then one conjunction and one
+/// number-run ("Tables 1 and 2", "Refs. 25\u{2013}27 and 28").
+///
+/// The walk runs only for REFERENCE lists: the chain continuing after
+/// the occurrence decides. It ends in a unit -> value list -> the label
+/// word before it is just the sentence's locator ("In Table 5, 950, 960
+/// and 970 MPa"), and the walk must not reach it; no unit -> reference
+/// list -> walk to the head word ("Refs. 25, 26 and 27"). The unit is
+/// the discriminator the walk never looked at; without it the walk
+/// stepped from a value back over the locator label and dropped every
+/// value in the list.
+fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
+    let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']).to_string();
+    let mut word = trailing_word(&prefix);
+    if !chain_ends_in_unit(hay, end) {
+        walk_comma_items(&mut prefix, &mut word);
+        if LIST_CONTINUATIONS.contains(&word.as_str()) {
+            prefix = prefix[..prefix.len() - word.len()]
+                .trim_end_matches(' ')
+                .to_string();
+            let run = trailing_digit_run_len(&prefix);
+            if run > 0 {
+                prefix = prefix[..prefix.len() - run]
+                    .trim_end_matches([' ', '.', ':'])
+                    .to_string();
+                word = trailing_word(&prefix);
+                walk_comma_items(&mut prefix, &mut word);
+            } else {
+                word = trailing_word(&prefix);
+            }
+        }
     }
     LABEL_WORDS.contains(&word.as_str())
 }
@@ -1699,11 +1818,19 @@ mod tests {
             "As reported in Ref. 25 Ti-6Al-4V is widely used.",
         );
         // "Eqs." joins the label family: the first number after it is a
-        // label. (The "and 8" tail is the list-form gap, recorded open.)
+        // label, and the conjunction step takes the "and 8" tail with it
+        // (the walk is bounded to one number-run per conjunction, but a
+        // reference list carries no units, so it still walks).
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
             "UTS",
             7.0,
+            "The fits are given in Eqs. 7 and 8 for Ti-6Al-4V UTS.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            8.0,
             "The fits are given in Eqs. 7 and 8 for Ti-6Al-4V UTS.",
         );
         // Positive control: a real value in the same sentence as an
@@ -1874,6 +2001,100 @@ mod tests {
         assert_eq!(
             supporting_quote("Inconel 718", "UTS", Some(1375.0), &table.text).as_deref(),
             Some("Inconel 718 1375")
+        );
+    }
+
+    /// Round 6: the walk-back used to compose comma steps with an
+    /// unbounded conjunction trim, so a VALUE after a sentence's locator
+    /// label ("In Table 5,") walked back over the label number and
+    /// dropped the whole value list — measured drops, all stamped at
+    /// base. The chain continuing after the occurrence decides: it ends
+    /// in a unit -> value list, no walk; no unit -> reference list,
+    /// walk. Mutation-proven red by removing the gate, by removing the
+    /// comma step or the conjunction step of the forward chain scan, or
+    /// by removing the head-of-chain unit check. The reference-list
+    /// asserts above (Refs. 25, 26 / and 27 / Eqs. 7 and 8) kill
+    /// mutations that over-broaden `UNIT_TOKENS` ("for" as a unit would
+    /// stamp them).
+    #[test]
+    fn value_lists_after_a_label_locator_still_stamp() {
+        // Comma + conjunction list after "Table 5,": all three values.
+        let list = "In Table 5, 950, 960 and 970 MPa were measured for Ti-6Al-4V.";
+        for v in [950.0, 960.0, 970.0] {
+            assert!(
+                supporting_quote("Ti-6Al-4V", "UTS", Some(v), list).is_some(),
+                "value {v} dropped from: {list}"
+            );
+        }
+        // Longer list: the tail value that carries the unit AND the four
+        // mid values the unbounded trim used to eat.
+        let long = "Per Table 2, 950, 960, 970, 980 and 990 MPa were recorded for Ti-6Al-4V.";
+        for v in [950.0, 960.0, 970.0, 980.0, 990.0] {
+            assert!(
+                supporting_quote("Ti-6Al-4V", "UTS", Some(v), long).is_some(),
+                "value {v} dropped from: {long}"
+            );
+        }
+        // "Fig. N," clause opener — guard interaction: the H7 period fix
+        // keeps the value in one span with "fig", and the comma walk then
+        // traversed it. Neither guard alone did this.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "As shown in Fig. 5, 950 MPa was the peak Ti-6Al-4V UTS."
+            )
+            .is_some()
+        );
+        // Comma-grouped value right after the label comma.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                "Per Table 3, 1,140 MPa was the Ti-6Al-4V peak."
+            )
+            .is_some()
+        );
+        // Signed value after the label comma.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "surface_stress",
+                Some(-950.0),
+                "From Fig. 6, \u{2212}950 MPa was the Ti-6Al-4V surface stress."
+            )
+            .is_some()
+        );
+
+        // Positive controls that must keep stamping exactly as before.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "Figure 3 shows a UTS of 950 MPa."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "alloy",
+                "strength",
+                Some(1100.0),
+                "in Table 4 the alloy reached 1100 MPa"
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "In Fig. 4, the Ti-6Al-4V UTS of 950 MPa is marked."
+            )
+            .is_some()
         );
     }
 
