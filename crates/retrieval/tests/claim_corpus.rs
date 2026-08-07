@@ -1063,6 +1063,38 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "dash class: U+FE63 SMALL HYPHEN-MINUS",
         ),
+        // ---------------- round 10: signed needles vs dash ranges ------
+        // U+2013/U+2014 became needle glyphs for NEGATIVE values; these
+        // rows pin the other direction of the same decision — a signed
+        // needle must not match a range endpoint or a label/citation
+        // range, and the decimal branch carries the new glyphs too.
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            -1100.0,
+            Expect::MustDrop,
+            "round 10: the signed \u{2013}1100 needle must not match a range \
+             endpoint — the dash of 950\u{2013}1100 has a digit before it",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{2013}27.",
+            "Ti-6Al-4V",
+            "UTS",
+            -27.0,
+            Expect::MustDrop,
+            "round 10: a signed needle must not match a reference range \
+             either",
+        ),
+        case(
+            "The CoCrFeNi Seebeck coefficient was \u{2013}11.5 uV/K.",
+            "CoCrFeNi",
+            "Seebeck coefficient",
+            -11.5,
+            Expect::MustStamp,
+            "round 10: the decimal branch carries the U+2013 glyph too — \
+             negative decimals never reach the grouped-signs path",
+        ),
         // ---------------- MUST_DROP: refused U+2212 needles ----------
         // The round-5 UTF-8 advance panic: a rejected U+2212 occurrence
         // must advance by the minus's 3 bytes, not one byte, or the next
@@ -1151,25 +1183,29 @@ fn corpus() -> Vec<CorpusCase> {
              the largest live fabrication channel: a number from a paper about \
              a different alloy becomes a claim about yours",
         ),
-        known(
+        case(
             "The residual stress in Ti-6Al-4V was \u{2013}350 MPa.",
             "Ti-6Al-4V",
             "residual_stress",
             -350.0,
             Expect::MustStamp,
-            "KNOWN: recall loss, recorded round 9 — the prose asserts the stress \
-             IS -350 MPa, a materials engineer calls that claim supported; \
-             U+2013 is not a needle glyph yet, so the true negative has no \
-             needle and drops. What the code SHOULD do but does not yet",
+            "round 10 FIXED the round-9 KNOWN: the prose asserts the stress IS \
+             -350 MPa, a materials engineer calls that supported. U+2013 and \
+             U+2014 became needle glyphs for negative values once the sign vs \
+             range readings proved separable (a range dash has a digit before \
+             it, a minus does not) — the same mechanism the ASCII hyphen used \
+             all along. Source doc claims.rs:1001 said the drop 'stays \
+             accepted'; the corpus said the code SHOULD stamp. The corpus was \
+             the ground truth; the source was the stale record",
         ),
-        known(
+        case(
             "The residual stress in Ti-6Al-4V was \u{2014}350 MPa.",
             "Ti-6Al-4V",
             "residual_stress",
             -350.0,
             Expect::MustStamp,
-            "KNOWN: the same recall loss for the U+2014 typesetting of the \
-             minus sign — the true negative drops for lack of a needle",
+            "round 10 FIXED the round-9 KNOWN: the U+2014 typesetting of the \
+             minus sign stamps its true negative too",
         ),
         // H1's space requirement cost (round 9): a label number with a
         // GLUED unit drops — the exemption demands the space, the
