@@ -21,10 +21,13 @@
 //! vocabulary strings are the stable machine contract ("indeterminate",
 //! "research", "screening", "reference_validated").
 //!
-//! Known provenance caveat: ranges differ by fetch route. JATS preserves
-//! U+2013, whose endpoints this engine refuses; `pdf-extract` normalises
-//! ranges to '-', whose endpoints stamp (compound-friendly, by decision).
-//! The same paper yields different claims depending on how it was fetched.
+//! Known provenance caveat, CLOSED round 10: ranges differ by fetch
+//! route — JATS preserves U+2013, `pdf-extract` normalises ranges to
+//! '-'. Until round 10 the engine refused the en-dash endpoints but
+//! stamped the ASCII ones (compound-friendly, by decision), so the same
+//! paper yielded different claims depending on how it was fetched. The
+//! range guard now covers every glyph of the dash class; both routes
+//! refuse both endpoints.
 //!
 //! RECORDED, NOT FIXED (round 9) — the largest remaining structural
 //! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
@@ -422,7 +425,7 @@ enum NumberScan {
 /// string form of the value must occur with clean token boundaries, must
 /// not be a citation marker or a Table/Figure/Ref label number, must not
 /// sit inside an occurrence of the subject's or object's own name (the
-/// "718" of "Inconel 718"), and must not be an en-dash range endpoint.
+/// "718" of "Inconel 718"), and must not be a dash range endpoint.
 /// When every occurrence is refused, the scan names the guard that refused
 /// the FIRST one — that name is what makes an over-refusal actionable, and
 /// first-wins keeps it causal instead of positional: a value glued inside
@@ -478,7 +481,7 @@ fn refusing_guard(
     subject_n: &str,
     object_n: &str,
 ) -> Option<RefusalGuard> {
-    if en_dash_range_endpoint(hay, start, end) {
+    if dash_range_endpoint(hay, start, end) {
         return Some(RefusalGuard::Range);
     }
     if !clean_number_boundary(hay, needle, start, end) {
@@ -598,7 +601,7 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
 /// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V". After the
 /// number, a letter from `UNIT_INITIALS` is allowed so glued units
 /// ("950MPa") still stamp. En-dash range endpoints are refused by
-/// `en_dash_range_endpoint`, not here.
+/// `dash_range_endpoint`, not here.
 fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
@@ -622,7 +625,7 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             // round 9 measured the sign flip still stamping through
             // U+2010, U+2011, U+2012, U+2015 and U+FE63. The
             // joins-compound test separates every member the same way,
-            // and `en_dash_range_endpoint` (checked first) keeps
+            // and `dash_range_endpoint` (checked first) keeps
             // refusing the U+2013 range case as Range. Only '-' and
             // U+2212 are needle glyphs: the true "\u{2013}350" claim
             // still drops (recorded recall loss; see `number_needles`
@@ -651,31 +654,25 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             }
             // A glued unit letter redeems a number, but not a digit that
             // a LETTER dash-joins into a designation (the "6" of
-            // "Ti-6Al-4V", under any glyph of the dash class). A dash
-            // preceded by a
-            // digit joins numeric runs instead, and the second number
-            // keeps its unit: "30-50um" layers and "5-10mm" grains are
-            // measurements — refusing the high endpoint while the low
-            // one stamped was the asymmetry that dropped the two
-            // most-quoted LPBF numbers. A dash leading the span (no char
-            // before it) keeps the refusal. Deletion of this clause is
-            // mutation-proven by the en-dash object-arm case in
-            // digit_dash_ranges_with_glued_units_stamp_the_high_endpoint:
+            // "Ti-6Al-4V", under any glyph of the dash class — round 10
+            // widened the old trio; U+2011 NON-BREAKING HYPHEN is the
+            // glyph a typesetter picks so Ti-6Al-4V survives
+            // line-breaking, the likeliest one in a real PDF). A dash
+            // leading the span (no char before it) keeps the refusal.
+            // Deletion of this clause is mutation-proven by the en-dash
+            // object-arm case in
+            // dash_range_endpoints_with_glued_units_are_not_point_values:
             // with it gone, the "6" of Ti\u{2013}6Al\u{2013}4V stamps.
             //
-            // RECORDED, NOT FIXED (round 7): the digit-before-dash
-            // redemption keeps ONE known fabrication — "ASTM E466-15a"
-            // stamps 15 (a digit-joined standard designator whose
-            // trailing 'a' is a unit initial; probed and confirmed at
-            // HEAD). Both reviewers confirm the clause is load-bearing —
-            // closing this shape needs a standard-designator guard, not
-            // dash surgery.
-            // Round 10: the glyph set is the whole dash class, not the
-            // hand-picked trio of rounds 6-9. U+2010/U+2011/U+2012/
-            // U+2015/U+2212/U+FE63 all stamped the "6" of a dash-spelled
-            // designation under a different subject; U+2011 NON-BREAKING
-            // HYPHEN is the glyph a typesetter picks so "Ti-6Al-4V"
-            // survives line-breaking, the likeliest one in a real PDF.
+            // Round 10: the digit-before-dash half of this clause — the
+            // "redemption" that let the second number of "30-50um" keep
+            // its unit and stamp — is owned FIRST by
+            // `dash_range_endpoint`: a digit/dash/digit run is a range
+            // whatever the glyph, and round 9's ground truth made both
+            // endpoints MustDrop. The digit condition below survives as
+            // defense-in-depth. Its old recorded residue, the "ASTM
+            // E466-15a" standard designator (round 7), is refused as a
+            // range too.
             if let Some(before) = hay[..start].chars().next_back()
                 && MINUS_CAPABLE_DASHES.contains(&before)
                 && hay[..start - before.len_utf8()]
@@ -696,22 +693,31 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     true
 }
 
-/// En-dash range endpoints: "950\u{2013}1100 MPa" asserts a range, not
-/// two point values, so a number that opens or closes a digit/en-dash/digit
-/// run is refused. U+2013 only, by decision: ASCII hyphens also join
-/// genuine compounds ("950-1100" batch designators, catalogue numbers) and
-/// the two readings are structurally indistinguishable, so the
-/// compound-friendly behaviour is kept; em-dashes are sentence dashes, not
-/// range dashes. Recorded residual gaps: spaced ranges, ASCII-typed ranges
-/// and negative ranges still stamp their endpoints.
-fn en_dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
-    if let Some(rest) = hay[end..].strip_prefix('\u{2013}')
-        && rest.starts_with(|c: char| c.is_ascii_digit())
+/// Range endpoints on a dash: "950\u{2013}1100 MPa" asserts a range,
+/// not two point values, so a number that opens or closes a
+/// digit/dash/digit run is refused. Round 10: the dash set is the whole
+/// dash class (`MINUS_CAPABLE_DASHES`), not U+2013 only. Ground truth
+/// does not depend on which glyph the typesetter or extractor emitted —
+/// "30-50um layers", "950-1100 batches" and "E1820-20b" are ranges and
+/// designators under the ASCII hyphen exactly as under the en dash, and
+/// the round-4 compound-friendly exception stamped batch identifiers as
+/// property records with perfect provenance. Round 9's ground-truth pick
+/// for the ASCII range form (MustDrop) made the exception untenable.
+/// A SIGNED value is not a range endpoint: a range dash always has a
+/// digit before it, a minus sign does not ("-950" carries whitespace or
+/// line start before the dash), so signed needles survive this guard.
+/// Recorded residual gaps: spaced ranges ("950 to 1100") still stamp
+/// their endpoints.
+fn dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
+    if let Some(after) = hay[end..].chars().next()
+        && MINUS_CAPABLE_DASHES.contains(&after)
+        && hay[end + after.len_utf8()..].starts_with(|c: char| c.is_ascii_digit())
     {
         return true;
     }
-    if let Some(prefix) = hay[..start].strip_suffix('\u{2013}')
-        && prefix.ends_with(|c: char| c.is_ascii_digit())
+    if let Some(before) = hay[..start].chars().next_back()
+        && MINUS_CAPABLE_DASHES.contains(&before)
+        && hay[..start - before.len_utf8()].ends_with(|c: char| c.is_ascii_digit())
     {
         return true;
     }
@@ -1021,7 +1027,7 @@ fn trailing_word(prefix: &str) -> String {
 /// DASH is still NOT a needle glyph — the true "\u{2013}950 MPa" claim
 /// DROPS, and that half stays accepted: adding U+2013 to the minus
 /// glyphs would make the same character mean "sign of this number" AND
-/// "range endpoint" inside `en_dash_range_endpoint`, and the two
+/// "range endpoint" inside `dash_range_endpoint`, and the two
 /// readings are not separable at the needle level. The FABRICATION half
 /// is now closed a different way: `clean_number_boundary` refuses the
 /// UNSIGNED needle when it is preceded by U+2013 with no digit before
@@ -1463,19 +1469,20 @@ mod tests {
             "The residual stress in Ti-6Al-4V was 950 MPa.",
         );
 
-        // The compound condition pins the hyphen/minus distinction: a
-        // hyphen that joins a digit compound is not a sign, so the
-        // pre-round-4 behaviour of "950-1100" is unchanged. Removing the
-        // joins_compound condition (making every preceding hyphen a sign)
-        // turns this red.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(1100.0),
-                "The Ti-6Al-4V batches 950-1100 were tested."
-            )
-            .is_some()
+        // Round 10: the old assert here pinned 1100 of "batches 950-1100"
+        // as the joins_compound killer — but it stamped a batch
+        // identifier as a measurement, and `dash_range_endpoint` now
+        // refuses the whole digit/dash/digit class. joins_compound's
+        // surviving effect is LETTER-dash-digit compounds ("U-235"),
+        // itself a fabrication channel carried as a KNOWN row in the
+        // corpus rather than a green pin. The signed-needle half of an
+        // ASCII range still drops here: the "-1100" needle starts on
+        // the hyphen, and the digit before it is alphanumeric.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            -1100.0,
+            "The Ti-6Al-4V UTS ranged from 950-1100 MPa.",
         );
     }
 
@@ -1782,13 +1789,15 @@ mod tests {
 
     /// Range endpoints are not point values: "950\u{2013}1100 MPa"
     /// asserts a range, and stamping UTS = 950 AND UTS = 1100 fabricates
-    /// two facts the sentence never states. The dash rule is U+2013-only
-    /// by decision (ASCII hyphens also join genuine compounds; em-dashes
-    /// are sentence dashes), and it refuses the adjacent OCCURRENCE, not
-    /// the number: an endpoint that recurs elsewhere as a genuine point
-    /// value still stamps. Mutation-proven per side: swapping the
-    /// after-side U+2013 for any other char reddens the 950 assert;
-    /// swapping the before-side U+2013 reddens the 1100 assert.
+    /// two facts the sentence never states. Round 10: the dash rule
+    /// covers the WHOLE dash class — the round-4 ASCII exception
+    /// stamped "950-1100" batch identifiers as measurements, fabricated
+    /// property records with perfect provenance. The rule refuses the
+    /// adjacent OCCURRENCE, not the number: an endpoint that recurs
+    /// elsewhere as a genuine point value still stamps. Mutation-proven
+    /// per side: swapping the after-side dash for a non-dash char
+    /// reddens the 950 assert; swapping the before-side dash reddens
+    /// the 1100 assert.
     #[test]
     fn en_dash_range_endpoints_are_not_point_values() {
         let range = "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.";
@@ -1835,16 +1844,23 @@ mod tests {
             .is_some()
         );
 
-        // ASCII hyphen keeps its pre-round-4 behaviour (the dash may be
-        // a genuine compound); pinned here and in the sign test.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(1100.0),
-                "The Ti-6Al-4V batches 950-1100 were tested."
-            )
-            .is_some()
+        // Round 10: the ASCII form is a range too. "950-1100" batch
+        // identifiers stamped as property records until the dash rule
+        // grew the whole dash class; both endpoints now drop, pinned
+        // here and in the sign test.
+        let batches = "The Ti-6Al-4V batches 950-1100 were tested.";
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 950.0, batches);
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1100.0, batches);
+
+        // The guard names the class: a U+2010-joined run is Range, not
+        // Boundary.
+        let hyphen_range = "The Ti-6Al-4V UTS ranged from 950\u{2010}1100 MPa.";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(1100.0), hyphen_range),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Range,
+                span: hyphen_range.to_string(),
+            })
         );
     }
 
@@ -1854,7 +1870,7 @@ mod tests {
     /// compressive recorded as tensile. The fix refuses the unsigned
     /// needle when U+2013 precedes it with no digit before the dash:
     /// a range dash always has a digit before it, a minus sign does
-    /// not, and `en_dash_range_endpoint` (checked first) keeps the
+    /// not, and `dash_range_endpoint` (checked first) keeps the
     /// range case. The true negative still DROPS — U+2013 is not a
     /// needle glyph (see `number_needles`); both halves pin that.
     /// Mutation: removing U+2013 from the before-dash match in
@@ -1912,21 +1928,23 @@ mod tests {
         let block = "Ti-6Al-4V has been studied extensively in prior work [1140].";
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1140.0, block);
 
-        // Round 10: a dash-joined citation range is refused by the
-        // Citation guard for EVERY glyph of the dash class, not just
-        // '-', U+2013 and U+2014. The walk-back reaches the bracket
-        // through each separator; the guard name pins it.
+        // Round 10: a dash-joined citation list walks back through
+        // every glyph of the dash class, not just '-', U+2013 and
+        // U+2014. The shape uses a comma-joined tail (14) that is not
+        // dash-adjacent: dash-adjacent numbers inside brackets are
+        // refused by the Range guard first, so only this shape names
+        // the Citation guard the walk produces.
         for dash in [
             '\u{2010}', '\u{2011}', '\u{2012}', '\u{2015}', '\u{2212}', '\u{fe63}',
         ] {
-            let range = format!("Ti-6Al-4V has been studied extensively [11{dash}13].");
+            let list = format!("Ti-6Al-4V has been studied extensively [11{dash}12, 14].");
             assert_eq!(
-                supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(13.0), &range),
+                supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(14.0), &list),
                 Err(SupportRefusal::Guarded {
                     guard: RefusalGuard::Citation,
-                    span: range.clone(),
+                    span: list.clone(),
                 }),
-                "dash U+{:04X} leaked the citation range",
+                "dash U+{:04X} leaked the citation walk",
                 dash as u32
             );
         }
@@ -2878,40 +2896,42 @@ mod tests {
         );
     }
 
-    /// Round 6: the dash-redemption clause in `clean_number_boundary`
-    /// refused EVERY digit with a dash before it and a unit letter after
-    /// it. That killed the high endpoint of digit-dash-digit ranges with
-    /// glued units — "30-50um" stamped 30 but dropped 50, "5-10mm"
-    /// dropped 10, same token, low endpoint lives, high one dies.
-    /// Letter-hyphenated designation digits must stay refused, and the
+    /// Round 6 read "30-50um" as a measurement because the glued unit
+    /// redeemed the high endpoint; round 9 picked the ground truth (a
+    /// range endpoint is not a point value) and round 10 enforces it —
+    /// `dash_range_endpoint` on the whole dash class owns digit/dash/
+    /// digit runs FIRST, whatever unit follows the second number. The
+    /// `clean_number_boundary` clause this test used to pin keeps its
+    /// OTHER job: LETTER-dash designation digits stay refused. The
     /// en-dash object-arm assert is the deletion killer: with the clause
     /// gone, the "6" of Ti\u{2013}6Al\u{2013}4V stamps via the object
     /// arm (the subject's ASCII hyphens mismatch the en-dash text, and
-    /// occurrence_inside_name sees nothing), so the clause survives in
-    /// narrowed form instead of being deleted. Mutations: deleting the
-    /// clause reddens the en-dash assert; swapping the digit condition
-    /// (`!c.is_ascii_digit()` -> `c.is_ascii_digit()`) reddens the harm
-    /// asserts.
+    /// occurrence_inside_name sees nothing). Mutations: deleting the
+    /// clause reddens the en-dash assert. Round 10 note: the clause's
+    /// digit-before-dash condition is defense-in-depth now — Range
+    /// refuses every digit/dash/digit occurrence before boundary runs.
     #[test]
-    fn digit_dash_ranges_with_glued_units_stamp_the_high_endpoint() {
-        // The measured harms: the high endpoint is a measurement.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "layer_thickness",
-                Some(50.0),
-                "Ti-6Al-4V powder layers of 30-50um were deposited."
-            )
-            .is_some()
+    fn dash_range_endpoints_with_glued_units_are_not_point_values() {
+        // Round 10 ground truth: the endpoints of a digit/dash/digit run
+        // are range bounds, not measurements, even when the second
+        // number carries a glued unit.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "layer_thickness",
+            50.0,
+            "Ti-6Al-4V powder layers of 30-50um were deposited.",
         );
-        assert!(
-            supporting_quote(
-                "CoCrFeNi",
-                "grain_size",
-                Some(10.0),
-                "CoCrFeNi grains of 5-10mm were observed."
-            )
-            .is_some()
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "layer_thickness",
+            30.0,
+            "Ti-6Al-4V powder layers of 30-50um were deposited.",
+        );
+        assert_dropped_end_to_end(
+            "CoCrFeNi",
+            "grain_size",
+            10.0,
+            "CoCrFeNi grains of 5-10mm were observed.",
         );
         // Letter-dash designation digits stay refused. In the en-dash
         // form ONLY this clause refuses the "6" — deletion turns it red.

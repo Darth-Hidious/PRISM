@@ -255,34 +255,6 @@ fn corpus() -> Vec<CorpusCase> {
             "signed value after a label comma still stamps",
         ),
         // ---------------- MUST_STAMP: ranges and lists ---------------
-        known(
-            "Ti-6Al-4V powder layers of 30-50um were deposited.",
-            "Ti-6Al-4V",
-            "layer_thickness",
-            50.0,
-            Expect::MustDrop,
-            "KNOWN: a range endpoint is not a point value — the prose asserts \
-             30 TO 50 um, not 50. The en-dash twin of this construct drops \
-             correctly; the compound-friendly ASCII decision stamps the high \
-             endpoint anyway, so the same construct has opposite ground truth \
-             decided only by which dash the typesetter used. Ground truth \
-             picked round 9: MustDrop; the ASCII behaviour is the recorded \
-             deviation, visible here instead of certified",
-        ),
-        known(
-            "The Ti-6Al-4V batches 950-1100 were tested.",
-            "Ti-6Al-4V",
-            "UTS",
-            1100.0,
-            Expect::MustDrop,
-            "KNOWN: 950-1100 is a batch IDENTIFIER, not a measurement — \
-             stamped as a property of Ti-6Al-4V it is a fabricated property \
-             record with perfect provenance, the worst shape named in the \
-             module doc. The round-9 row certified the compound-friendly \
-             ASCII behaviour as REQUIRED: that described the code, not \
-             ground truth, the same defect as the mislabel round 9 removed. \
-             Ground truth picked round 10: MustDrop, whatever the dash",
-        ),
         case(
             "In Table 5, 950, 960 and 970 MPa were measured for Ti-6Al-4V.",
             "Ti-6Al-4V",
@@ -391,58 +363,61 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "a bare parenthesised number is a citation",
         ),
-        // ---------------- MUST_DROP: citation dash ranges (round 10) --
+        // ---------------- MUST_DROP: citation dash walks (round 10) ---
         // The citation walk-back trimmed only '-', U+2013 and U+2014;
-        // the other six glyphs of the dash class stranded the trim on
-        // the dash, the bracket was never seen, and the second citation
-        // number stamped. One row per leaking glyph.
+        // the other six glyphs stranded the trim on the dash, the
+        // bracket was never seen, and the tail citation number stamped.
+        // The rows use a comma-joined tail (14) that is NOT
+        // dash-adjacent: dash-adjacent citation numbers are refused by
+        // the Range guard first after round 10, so only this shape
+        // pins the walk itself. One row per leaking glyph.
         case(
-            "Ti-6Al-4V has been studied extensively [11\u{2010}13].",
+            "Ti-6Al-4V has been studied extensively [11\u{2010}12, 14].",
             "Ti-6Al-4V",
             "UTS",
-            13.0,
+            14.0,
             Expect::MustDrop,
-            "citation dash class round 10: U+2010 HYPHEN range separator",
+            "citation dash class round 10: the walk reaches the bracket through a              U+2010 HYPHEN dash; 14 is not dash-adjacent, so the Range guard cannot              shadow this — the Citation walk owns it",
         ),
         case(
-            "Ti-6Al-4V has been studied extensively [11\u{2011}13].",
+            "Ti-6Al-4V has been studied extensively [11\u{2011}12, 14].",
             "Ti-6Al-4V",
             "UTS",
-            13.0,
+            14.0,
             Expect::MustDrop,
-            "citation dash class round 10: U+2011 NON-BREAKING HYPHEN range separator",
+            "citation dash class round 10: the walk reaches the bracket through a              U+2011 NON-BREAKING HYPHEN dash; 14 is not dash-adjacent, so the Range guard cannot              shadow this — the Citation walk owns it",
         ),
         case(
-            "Ti-6Al-4V has been studied extensively [11\u{2012}13].",
+            "Ti-6Al-4V has been studied extensively [11\u{2012}12, 14].",
             "Ti-6Al-4V",
             "UTS",
-            13.0,
+            14.0,
             Expect::MustDrop,
-            "citation dash class round 10: U+2012 FIGURE DASH range separator",
+            "citation dash class round 10: the walk reaches the bracket through a              U+2012 FIGURE DASH dash; 14 is not dash-adjacent, so the Range guard cannot              shadow this — the Citation walk owns it",
         ),
         case(
-            "Ti-6Al-4V has been studied extensively [11\u{2015}13].",
+            "Ti-6Al-4V has been studied extensively [11\u{2015}12, 14].",
             "Ti-6Al-4V",
             "UTS",
-            13.0,
+            14.0,
             Expect::MustDrop,
-            "citation dash class round 10: U+2015 HORIZONTAL BAR range separator",
+            "citation dash class round 10: the walk reaches the bracket through a              U+2015 HORIZONTAL BAR dash; 14 is not dash-adjacent, so the Range guard cannot              shadow this — the Citation walk owns it",
         ),
         case(
-            "Ti-6Al-4V has been studied extensively [11\u{2212}13].",
+            "Ti-6Al-4V has been studied extensively [11\u{2212}12, 14].",
             "Ti-6Al-4V",
             "UTS",
-            13.0,
+            14.0,
             Expect::MustDrop,
-            "citation dash class round 10: U+2212 MINUS SIGN range separator",
+            "citation dash class round 10: the walk reaches the bracket through a              U+2212 MINUS SIGN dash; 14 is not dash-adjacent, so the Range guard cannot              shadow this — the Citation walk owns it",
         ),
         case(
-            "Ti-6Al-4V has been studied extensively [11\u{fe63}13].",
+            "Ti-6Al-4V has been studied extensively [11\u{fe63}12, 14].",
             "Ti-6Al-4V",
             "UTS",
-            13.0,
+            14.0,
             Expect::MustDrop,
-            "citation dash class round 10: U+FE63 SMALL HYPHEN-MINUS range separator",
+            "citation dash class round 10: the walk reaches the bracket through a              U+FE63 SMALL HYPHEN-MINUS dash; 14 is not dash-adjacent, so the Range guard cannot              shadow this — the Citation walk owns it",
         ),
         // ---------------- MUST_DROP: labels --------------------------
         case(
@@ -874,6 +849,149 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "an en-dash range high endpoint is not a point value",
         ),
+        // ---------------- MUST_DROP: ranges on every dash (round 10) -
+        // Round 10 overturned the round-4 ASCII exception: a
+        // digit/dash/digit run is a range whatever the glyph. The
+        // exception stamped "950-1100" batch identifiers, "30-50um"
+        // endpoints and "E1820-20b" designators as measurements —
+        // fabricated property records with perfect provenance. The
+        // en-dash rows above pin U+2013; one row per remaining glyph
+        // pins the class at the range site, and the ASCII rows pin both
+        // endpoints of the forms round 6 misread as measurements. The
+        // KNOWN markers round 9 and round 10 carried are gone because
+        // the range guard now refuses them.
+        case(
+            "Ti-6Al-4V powder layers of 30-50um were deposited.",
+            "Ti-6Al-4V",
+            "layer_thickness",
+            50.0,
+            Expect::MustDrop,
+            "round 10 FIXED the round-9 KNOWN: the prose asserts 30 TO 50 um, \
+             not 50; round 6 read the glued unit as redemption, round 9 \
+             picked MustDrop, the range guard on the whole dash class \
+             enforces it",
+        ),
+        case(
+            "Ti-6Al-4V powder layers of 30-50um were deposited.",
+            "Ti-6Al-4V",
+            "layer_thickness",
+            30.0,
+            Expect::MustDrop,
+            "round 10: the LOW endpoint of the ASCII range — both endpoints \
+             are range bounds, whichever side carries the glued unit",
+        ),
+        case(
+            "CoCrFeNi grains of 5-10mm were observed.",
+            "CoCrFeNi",
+            "grain_size",
+            10.0,
+            Expect::MustDrop,
+            "round 10: the round-6 'measured harm' was a range endpoint too",
+        ),
+        case(
+            "CoCrFeNi grains of 5-10mm were observed.",
+            "CoCrFeNi",
+            "grain_size",
+            5.0,
+            Expect::MustDrop,
+            "round 10: the low endpoint of the grain-size range",
+        ),
+        case(
+            "The Ti-6Al-4V batches 950-1100 were tested.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "round 10 FIXED the batch-identifier fabrication: 950-1100 is a \
+             batch designator, and a batch identifier stamped as a property \
+             of Ti-6Al-4V is a fabricated property record with perfect \
+             provenance — the worst shape named in the module doc",
+        ),
+        case(
+            "The Ti-6Al-4V batches 950-1100 were tested.",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustDrop,
+            "round 10: the low endpoint of the batch range",
+        ),
+        case(
+            "The Ti-6Al-4V fracture tests followed ASTM E1820-20b.",
+            "Ti-6Al-4V",
+            "fracture_toughness",
+            20.0,
+            Expect::MustDrop,
+            "round 10 FIXED the round-8 KNOWN: E1820-20b is a standard \
+             designator; the digit-before-dash redemption stamped 20 through \
+             the trailing unit-initial 'b' until the range guard grew the \
+             whole dash class",
+        ),
+        case(
+            "The Ti-6Al-4V fatigue tests followed ASTM E466-15a.",
+            "Ti-6Al-4V",
+            "fatigue_life",
+            15.0,
+            Expect::MustDrop,
+            "round 10 FIXED the round-7 recorded residue: E466-15a is the \
+             same digit/dash/digit shape; no standard-designator guard was \
+             needed once the range guard covered the class",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2010}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+2010 HYPHEN joins the range",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2011}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+2011 NON-BREAKING HYPHEN joins the range",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2012}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+2012 FIGURE DASH joins the range",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2014}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+2014 EM DASH joins the range",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2015}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+2015 HORIZONTAL BAR joins the range",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{2212}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+2212 MINUS SIGN joins the range",
+        ),
+        case(
+            "The Ti-6Al-4V UTS ranged from 950\u{fe63}1100 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            1100.0,
+            Expect::MustDrop,
+            "range dash class round 10: U+FE63 SMALL HYPHEN-MINUS joins the range",
+        ),
         // ---------------- MUST_DROP: sign flips ----------------------
         case(
             "The residual stress in Ti-6Al-4V was \u{2212}350 MPa.",
@@ -1020,15 +1138,6 @@ fn corpus() -> Vec<CorpusCase> {
             3.0,
             Expect::MustDrop,
             "KNOWN: same residue — spaced single-letter unit exempts a label number",
-        ),
-        known(
-            "The Ti-6Al-4V fracture tests followed ASTM E1820-20b.",
-            "Ti-6Al-4V",
-            "fracture_toughness",
-            20.0,
-            Expect::MustDrop,
-            "KNOWN: a digit-joined standard designator with a unit-initial suffix; \
-             closing it needs a standard-designator guard, not dash surgery",
         ),
         known(
             "The AlSi10Mg UTS was 300 MPa.",
