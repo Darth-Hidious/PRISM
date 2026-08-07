@@ -1986,10 +1986,8 @@ impl<'a> LfmArgumentParser<'a> {
                         bail!("LFM JSON argument has mismatched delimiters");
                     }
                 }
-                b']' => {
-                    if nesting.pop() != Some(b'[') {
-                        bail!("LFM JSON argument has mismatched delimiters");
-                    }
+                b']' if nesting.pop() != Some(b'[') => {
+                    bail!("LFM JSON argument has mismatched delimiters");
                 }
                 _ => {}
             }
