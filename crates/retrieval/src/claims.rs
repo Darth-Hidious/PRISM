@@ -1801,6 +1801,27 @@ mod tests {
         );
     }
 
+    /// Round 13 item 4: the same char-not-byte advance, second bite of
+    /// this bug class. The existing test above covers a MULTI-BYTE name
+    /// glyph matching a multi-byte hay glyph (2-byte U+03B1 <-> 2-byte).
+    /// This one covers a 1-BYTE name glyph that matches a MULTI-BYTE
+    /// hay glyph: subject "-" folding onto a U+2010 HYPHEN (3 bytes) in
+    /// the hay. The OLD advance `name.chars().next()` stepped 1 byte
+    /// (the needle's first char) and landed mid-glyph inside the U+2010,
+    /// panicking "byte index 3 is not a char boundary; it is inside
+    /// '‐'". The fix advances by the HAY glyph at name_start. subject/
+    /// object are model-supplied, so this is reachable from untrusted
+    /// LLM output — a panic aborts the ingest run, not one claim. At
+    /// HEAD this was invisible: 84 lib + 197 corpus stay green with the
+    /// fix reverted, so the fix was UNPINNED. Reverting the
+    /// `occurrence_inside_name` advance to `name.chars()` reddens this
+    /// assert (panic).
+    #[test]
+    fn single_byte_dash_subject_matching_multibyte_hay_glyph_does_not_panic() {
+        let r = supporting_quote_or_refusal("-", "UTS", Some(950.0), "ti\u{2010}6al had 950 MPa");
+        assert!(r.is_ok(), "must not panic and must find the support: {r:?}");
+    }
+
     /// F-1: a thousands comma adjacent to a digit is part of the number,
     /// in both directions. "1,140" must behave byte-for-byte like "1140":
     /// searching for 140 or 1 inside it finds nothing, exactly the
