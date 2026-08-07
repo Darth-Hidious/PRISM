@@ -884,27 +884,54 @@ const SIGNED_STRENGTH_HOMOGRAPHS: &[&str] = &["signal strength", "field strength
 /// forward rows drop a negative (reverting the suffix rule reddens
 /// them), and the over-refusal rows stamp — removing any one marker, or
 /// the homograph slice, reddens its own row. No arm or marker is
-/// cannot-fail.
+/// cannot-fail. Round 14 item 4: a trailing unit is stripped FIRST, so a
+/// table-header object (`yield strength (MPa)`, `tensile strength, MPa`,
+/// `hardness (HV)`, `grain size (um)`, `density (g/cm3)`) is recognized
+/// by the exact/suffix rules. Scoped here (not in
+/// `normalize_for_containment`), so general containment matching is
+/// unaffected. The forward direction is pinned by unit-suffixed rows in
+/// the same lib test (removing the strip reddens them). Stripping has no
+/// pinnable over-refusal direction of its own: removing it only REMOVES
+/// refusal power, and signed unit-suffixed quantities are protected by
+/// the (a)/(b) exceptions above (measured — see the round-14 report).
+/// Symbol spellings the extractor emits verbatim (`Rm`, `flow stress`,
+/// `ultimate tensile stress`, ...) are NOT fixed here; they are a
+/// vocabulary problem (round 14 item 5), not a trailing-unit problem.
 fn is_nonnegative_quantity(object_n: &str) -> bool {
+    let s = strip_trailing_unit(object_n);
     // A whole-word differential marker makes the quantity a signed delta:
-    // checked FIRST so `change in yield strength` stamps, not over-refuses.
-    if object_n
-        .split_whitespace()
+    // checked before the suffix rule so `change in yield strength` stamps.
+    if s.split_whitespace()
         .any(|t| SIGNED_DIFFERENTIAL_MARKERS.contains(&t))
     {
         return false;
     }
     // signal/field strength are genuinely-signed homographs of *strength.
-    if SIGNED_STRENGTH_HOMOGRAPHS
-        .iter()
-        .any(|h| object_n.ends_with(h))
-    {
+    if SIGNED_STRENGTH_HOMOGRAPHS.iter().any(|h| s.ends_with(h)) {
         return false;
     }
-    NONNEGATIVE_QUANTITIES.contains(&object_n)
-        || object_n.ends_with("strength")
-        || object_n.ends_with("hardness")
-        || object_n.ends_with("grain size")
+    NONNEGATIVE_QUANTITIES.contains(&s)
+        || s.ends_with("strength")
+        || s.ends_with("hardness")
+        || s.ends_with("grain size")
+}
+
+/// Strip ONE trailing unit so a table-header object is recognized by the
+/// exact/suffix rules in `is_nonnegative_quantity`: a trailing
+/// parenthetical (`yield strength (MPa)`) or a trailing comma-unit
+/// (`tensile strength, MPa`). Returns the input unchanged otherwise.
+/// Scoped to the SignDomain check only — `normalize_for_containment` is
+/// untouched, so general containment matching is unaffected.
+fn strip_trailing_unit(s: &str) -> &str {
+    // trailing parenthetical: "yield strength (mpa)" -> "yield strength"
+    if let Some(open) = s.rfind(')').and_then(|close| s[..close].rfind('(')) {
+        return s[..open].trim_end();
+    }
+    // trailing comma-unit: "tensile strength, mpa" -> "tensile strength"
+    if let Some(comma) = s.rfind(',') {
+        return s[..comma].trim_end();
+    }
+    s
 }
 
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
@@ -1962,6 +1989,15 @@ mod tests {
             "0.2% yield strength",
             "ionic strength",
             "dielectric strength",
+            // Round 14 item 4: a trailing unit (the table-header form) is
+            // stripped before the suffix/exact rules. Removing
+            // strip_trailing_unit reddens every row below.
+            "yield strength (MPa)",
+            "hardness (HV)",
+            "grain size (um)",
+            "tensile strength, MPa",
+            "microhardness, HV0.5",
+            "density (g/cm3)",
         ] {
             let prose = format!("The Ti-6Al-4V {nonneg_spelling} was -950 MPa.");
             let r = supporting_quote_or_refusal("Ti-6Al-4V", nonneg_spelling, Some(-950.0), &prose);
