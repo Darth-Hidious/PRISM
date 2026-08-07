@@ -35,9 +35,11 @@
 //! list.
 //!
 //! Known provenance caveat: claims can differ by fetch route.
-//! CLOSED: (a)+(b) round 10 + round 11; (c) opened round 11, closed
-//! round 12 on the fabrication half (the recall half is carried as
-//! corpus KNOWN rows).
+//! (a)+(b) CLOSED round 10 + round 11; (c) opened round 11, recorded
+//! closed round 12 on the fabrication half — but round 13 CORRECTED
+//! that record: the closure is SPELLING-SCOPED, not predicate-scoped
+//! (see item (c) below). The recall half is carried as corpus KNOWN
+//! rows.
 //!
 //! (a) RANGES: JATS preserves U+2013,
 //! `pdf-extract` normalises ranges to '-'. Until round 10 the engine
@@ -58,10 +60,30 @@
 //! sentence fetched through the PDF route ("UTS -950 MPa") stamped a
 //! negative from a positive source — the divergence class (a)+(b)
 //! closed, reopened by the same commit that recorded closing it.
-//! Round 12 closed the fabrication half with the predicate's SIGN
-//! DOMAIN (`NONNEGATIVE_QUANTITIES` in `claims.rs`): for non-negative
+//! Round 12 NARROWED (round 13 record correction: NOT fully closed)
+//! the fabrication half with the predicate's SIGN DOMAIN
+//! (`NONNEGATIVE_QUANTITIES` in `claims.rs`): for non-negative
 //! quantities BOTH routes now drop the separator shape (JATS U+2013:
 //! no signed needle -> NoSpan; pdf-extract '-': the SignDomain guard).
+//! ROUND 13 RECORD CORRECTION — this is SPELLING-SCOPED, not
+//! predicate-scoped: `SignDomain` matches the object against the FIVE
+//! EXACT strings of `NONNEGATIVE_QUANTITIES` (slice `contains` =
+//! equality on the normalized text), and `normalize_for_containment`
+//! only lowercases / maps `_` -> space / collapses whitespace — no
+//! stemming, no head-noun, no unit strip. The extractor
+//! (`text_extract.rs`) imposes NO property vocabulary, and the
+//! codebase itself emits a missed spelling
+//! (`object: "tensile strength".into()` at cli/main.rs:13405).
+//! Measured guard-isolated round 13: of 22 common spellings only the
+//! five canonical (uts, yield strength, hardness, density, grain size)
+//! drop a negative; the other 17 — `ultimate tensile strength`,
+//! `tensile strength`, `UTS (MPa)`, `0.2% yield strength`, `yield
+//! stress`, `proof stress`, `Vickers hardness`, `microhardness`,
+//! `relative density`, `average grain size`, `grain diameter`,
+//! `compressive strength`, `fracture strength`, ... — still STAMP a
+//! negative from a positive source. More entries is NOT the fix (the
+//! const doc below disclaims "another word list"); item 5 measures
+//! head-noun matching vs an extractor-vocabulary constraint.
 //! For SIGNED quantities the routes still diverge on recall: the JATS
 //! U+2013 spelling drops while the PDF '-' spelling stamps the genuine
 //! negative — the '-' reading is the defensible one (the glyph IS the
@@ -730,10 +752,16 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
 /// from the true negatives (residual stress, Seebeck coefficient,
 /// temperature...), all of which ride genuinely SIGNED quantities.
 /// Normalized names (lowercase, underscores -> spaces), matched against
-/// the normalized object. Round 12 item 1(c): measured, not guessed —
-/// this closed the six red separator rows and the negative UTS range
-/// KNOWNs while every signed-quantity negative still stamped. The set
-/// is deliberately small and physical, not another word list: unknown
+/// the normalized object by EXACT equality (slice `contains`). ROUND 13
+/// RECORD CORRECTION: that match is SPELLING-SCOPED — these five
+/// strings only; `normalize_for_containment` does not stem or take a
+/// head-noun, so 17 of 22 common spellings measured (`tensile
+/// strength`, `relative density`, `average grain size`, ...) are NOT
+/// recognized and still stamp a negative (see module header item (c)).
+/// Round 12 item 1(c): measured, not guessed — this dropped the six
+/// separator rows and the negative UTS range KNOWNs while every
+/// signed-quantity negative still stamped. The set is deliberately
+/// small and physical, not another word list: unknown
 /// quantities default to SIGNED, the permissive direction — a negative
 /// claim against an unrecognized quantity is never dropped by this
 /// guard. Every entry is pinned by a corpus row that stamps without it.
