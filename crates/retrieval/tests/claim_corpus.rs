@@ -1619,17 +1619,96 @@ fn corpus() -> Vec<CorpusCase> {
              a measurement. This row is deliberately joins_compound's only \
              pin: a green stamp-pin here would certify a fabrication",
         ),
+        // ---------------- KNOWN failures, numeric decorations (r11) ---
+        // RECORDED, NOT FIXED, round 11. The plus-minus sign is the
+        // commonest numeric decoration in materials papers — commoner
+        // than any dash glyph — and grep for it across claims.rs and
+        // the corpus returned ZERO: the engine stamps the TOLERANCE as
+        // the value. Digit-dash-LETTER is likewise unguarded: the
+        // U-235 row covers only the mirror (letter-dash-digit) shape.
+        known(
+            "The Ti-6Al-4V UTS was 950 +/- 30 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            30.0,
+            Expect::MustDrop,
+            "KNOWN: 30 is the UNCERTAINTY, not the value — '950 +/- 30 MPa' \
+             stamps the tolerance as Ti-6Al-4V UTS = 30 MPa, an uncertainty \
+             figure promoted to a property",
+        ),
+        known(
+            "The Ti-6Al-4V UTS was 950 \u{b1} 30 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            30.0,
+            Expect::MustDrop,
+            "KNOWN: the U+00B1 PLUS-MINUS SIGN twin stamps the tolerance too \
+             — the glyph appears nowhere in claims.rs",
+        ),
+        case(
+            "The Ti-6Al-4V UTS was 950 +/- 30 MPa.",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustStamp,
+            "round 11: the value itself still stamps beside its tolerance — \
+             the control half of the two KNOWN rows above",
+        ),
+        known(
+            "The Ti-6Al-4V 3-point bend strength was measured.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: digit-dash-LETTER — '3-point' stamps 3, a method \
+             descriptor read as a measurement",
+        ),
+        known(
+            "The Ti-6Al-4V underwent 2-step ageing.",
+            "Ti-6Al-4V",
+            "ageing_steps",
+            2.0,
+            Expect::MustDrop,
+            "KNOWN: '2-step' stamps 2 — a process count, not a property of \
+             the alloy",
+        ),
+        known(
+            "The Ti-6Al-4V was cleaned in 2-propanol.",
+            "Ti-6Al-4V",
+            "cleaning",
+            2.0,
+            Expect::MustDrop,
+            "KNOWN: '2-propanol' stamps 2 — a chemical locant, not a \
+             property",
+        ),
+        known(
+            "The Ti-6Al-4V was dissolved in N-methyl-2-pyrrolidone.",
+            "Ti-6Al-4V",
+            "solvent",
+            2.0,
+            Expect::MustDrop,
+            "KNOWN: 'N-methyl-2-pyrrolidone' stamps 2 — a locant inside a \
+             solvent name",
+        ),
         // ---------------- KNOWN failures, the label-word horizon ------
         // Measured round 10: 100 of 100 curated AM-vocabulary heads stamp
         // on "X 3 of Ti-6Al-4V was examined." — including Layer, Track,
         // Build, Heat and Lot, core LPBF/metallurgy specimen vocabulary,
         // likelier in an AM paper than Inset 2. A word list CANNOT
         // converge: every paper coins labels the list does not carry,
-        // and every word added costs glued-recall drops (the fourteen
-        // H1 rows above are the bill for nineteen words). The fix is a
-        // RULE — a label-like head is a noun immediately before a bare
-        // integer with no unit after it — not another word. Recorded,
-        // deliberately not implemented, round 10.
+        // and every word added costs glued-recall drops (the thirteen
+        // H1 rows above are the bill for twenty-one words — round 8's
+        // sample/run plus round 9's nineteen; the claims.rs ledger has
+        // the split right, this comment said nineteen and fourteen,
+        // drifting from both). The fix is a RULE — a label-like head is
+        // a noun immediately before a bare integer with no unit after
+        // it — not another word. Recorded round 11: the rule's form is
+        // NOT yet shippable — it must still SURVIVE the table-row pin
+        // ("Ti-6Al-4V 950" MustStamp: the word before the bare integer
+        // there is the subject itself with no unit after, yet 950
+        // stamps) AND close the 25kg leak (batch 25kg MustDrop) before
+        // it may replace the word list. Recorded, deliberately not
+        // implemented, round 10.
         known(
             "Layer 3 of Ti-6Al-4V was examined.",
             "Ti-6Al-4V",
