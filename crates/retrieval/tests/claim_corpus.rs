@@ -1439,6 +1439,79 @@ fn corpus() -> Vec<CorpusCase> {
              separator shape ('result \u{2014}950 MPa\u{2014}') stamped a \
              compressive value from a tensile source",
         ),
+        // ---------------- KNOWN failures, round-11 revert recall (r12) -
+        // Item 6: the recall losses of the round-11 revert, restored to
+        // the scoreboard. d4b7db71's body disclosed the deletions, but
+        // a disclosure in a commit message is not a tripwire — only a
+        // row is. These shapes are the commonest negative forms in
+        // materials prose (Seebeck coefficient, grouped stresses), and
+        // their recall expectation vanished silently in the revert.
+        known(
+            "The CoCrFeNi Seebeck coefficient was \u{2013}11.5 uV/K.",
+            "CoCrFeNi",
+            "Seebeck coefficient",
+            -11.5,
+            Expect::MustStamp,
+            "KNOWN: RESTORED round 12 — d4b7db71 deleted the round-10 \
+             decimal U+2013 row and never re-added it; only the U+2212 \
+             spelling survived. The prose asserts -11.5 uV/K, the decimal \
+             branch constructs no U+2013 needle, and the true negative \
+             drops. What the code SHOULD do but does not yet",
+        ),
+        known(
+            "The CoCrFeNi Seebeck coefficient was \u{2014}11.5 uV/K.",
+            "CoCrFeNi",
+            "Seebeck coefficient",
+            -11.5,
+            Expect::MustStamp,
+            "KNOWN: the U+2014 twin of the restored decimal branch — both \
+             reverted glyphs carry the loss, pinned symmetrically the way \
+             the \u{2013}350/\u{2014}350 pair above pins its two glyphs",
+        ),
+        known(
+            "The residual stress in Ti-6Al-4V was \u{2014}1,120 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1120.0,
+            Expect::MustStamp,
+            "KNOWN: em/en grouped recall loss of the round-11 revert — no \
+             '-'/'\u{2212}' grouped needle matches the U+2014 spelling, so \
+             the true negative drops NoSpan",
+        ),
+        known(
+            "The residual stress in Ti-6Al-4V was \u{2013}1,250 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1250.0,
+            Expect::MustStamp,
+            "KNOWN: the U+2013 grouped recall loss of the round-11 revert",
+        ),
+        known(
+            "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1140.0,
+            Expect::MustStamp,
+            "KNOWN: the grouped recall loss the item-3 mechanism assert in \
+             claims.rs points at — ground truth lives HERE (the prose \
+             asserts \u{2013}1,140 MPa, a stamp is what SHOULD happen); the \
+             lib pins only the NoSpan mechanism",
+        ),
+        known(
+            "Ti-6Al-4V UTS \u{2013}950 MPa (longitudinal)",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustStamp,
+            "KNOWN: the POSITIVE half of the separator decision, and the \
+             larger loss — d4b7db71 recorded that the separator shapes \
+             stamped -950 'while DROPPING the correct +950' but pinned \
+             only the negative half. The drop is real: the boundary clause \
+             refuses the unsigned needle after EVERY glyph of the dash \
+             class (measured Guarded{Boundary} under '-', U+2212, U+2013, \
+             U+2014), so this caption/table shape is fully unreadable — \
+             neither -950 nor +950 may be taken from it",
+        ),
         // H1's space requirement cost (round 9): a label number with a
         // GLUED unit drops — the exemption demands the space, the
         // boundary check cannot redeem what the Label guard refuses
