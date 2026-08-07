@@ -167,6 +167,23 @@ fn corpus() -> Vec<CorpusCase> {
              like the glued cross-section twin; it drops today via the \
              'batch' label guard and this row turns red if that changes",
         ),
+        known(
+            "The Ti-6Al-4V batch 25 kg was melted.",
+            "Ti-6Al-4V",
+            "mass",
+            25.0,
+            Expect::MustDrop,
+            "KNOWN: round 12 item 5 — the SPACED twin of the batch 25kg \
+             flip. 1489f794 pinned only the glued form; the spaced form \
+             STAMPS at HEAD (measured) through the spaced-unit exemption — \
+             '25 kg' reads as a measurement whatever word precedes it — \
+             fabricating a lot mass as an alloy property in exactly the way \
+             the flip's own ground truth rejects: the mass of one powder lot \
+             is extensive, not a property. Mirrors the cross-section \
+             precedent that commit invoked (spaced KNOWN beside glued case) \
+             and goes green only when the exemption learns lot masses from \
+             property conditions",
+        ),
         // ---------------- MUST_STAMP: glued-unit family --------------
         case(
             "The Ti-6Al-4V UTS is 950MPa.",
