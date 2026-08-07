@@ -315,6 +315,20 @@ fn corpus() -> Vec<CorpusCase> {
              every rendering of the same stress agrees across routes",
         ),
         case(
+            "The Ti-6Al-4V residual stress was -1,350 MPa.",
+            "Ti-6Al-4V",
+            "residual_stress",
+            -1350.0,
+            Expect::MustStamp,
+            "round 12 item 2: the ASCII comma-grouped spelling stamps — it \
+             is the grouped signs array's '-' entry that builds the -1,350 \
+             needle, a routine pdf-extract shape. Round 11 pinned the \
+             U+2212 grouped twin and left this free ASCII one untested, so \
+             removing '-' from that array compiled clean, changed behaviour \
+             and stayed green — the cannot-fail item sixteen of round 11. \
+             This row is its pin: red under that mutant",
+        ),
+        case(
             "The Ti-6Al-4V residual stress was \u{2212}1350 MPa.",
             "Ti-6Al-4V",
             "residual_stress",
