@@ -125,6 +125,59 @@ pub enum ClaimRejection {
     /// The claim's quote does not occur in the block at its recorded
     /// locator. The citation is false; the claim is dropped, not downgraded.
     QuoteNotInCitedBlock,
+    /// A span held the claim's subject or object and the value occurred in
+    /// it, but a guard refused every occurrence: the matcher was too
+    /// literal, the model did not hallucinate. Distinct from `MissingQuote`
+    /// so over-refusal is measurable in the drop set. `guard` refused the
+    /// last candidate occurrence scanned; `span` is the verbatim span that
+    /// held it.
+    NoEvidentialOccurrence {
+        guard: RefusalGuard,
+        span: String,
+    },
+}
+
+/// The guard that refused a candidate occurrence of the value. Named so a
+/// drop can say WHY a supporting span yielded no evidence — the drop set is
+/// the only observable signal of how this gate behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefusalGuard {
+    /// Endpoint of an en-dash digit range ("950\u{2013}1100"): the sentence
+    /// asserts bounds, not a point value.
+    Range,
+    /// Token-boundary rule: continuation by digits/decimals/grouping, a
+    /// leading minus that signs it, or a non-unit letter glued to it.
+    Boundary,
+    /// Inside a citation marker ("[1140]", "(1140)", "{1140}").
+    Citation,
+    /// Immediately after a label word (Table/Figure/Ref/...) or a
+    /// continuation of such a list.
+    Label,
+    /// Inside an occurrence of the subject's or object's own name
+    /// (the "718" of "Inconel 718").
+    InsideName,
+}
+
+/// Why no supporting span was found. `NoSpan` reads as the model's fault
+/// (the block does not mention the fact at all); `Guarded` is the matcher's
+/// refusal and carries the guard that refused the last candidate occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SupportRefusal {
+    /// No span held the subject or the object (both, for a non-numeric
+    /// fact): there was nothing to scan.
+    NoSpan,
+    /// A span held the subject or object and at least one occurrence of the
+    /// value, but every occurrence was refused by a guard.
+    Guarded { guard: RefusalGuard, span: String },
+}
+
+impl From<SupportRefusal> for ClaimRejection {
+    fn from(refusal: SupportRefusal) -> Self {
+        match refusal {
+            SupportRefusal::NoSpan => Self::MissingQuote,
+            SupportRefusal::Guarded { guard, span } => Self::NoEvidentialOccurrence { guard, span },
+        }
+    }
 }
 
 /// Validate and stamp one claim against `block_text`, the text of the block
@@ -181,9 +234,12 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 }
 
 /// Find a verbatim span of `block_text` that supports the fact described by
-/// (`subject`, `object`, `value`). Returns `None` when the block does not
-/// contain the fact's salient evidence — such a fact cannot become a claim
-/// without fabricating provenance.
+/// (`subject`, `object`, `value`), or say WHY no span does. The distinction
+/// matters: `SupportRefusal::NoSpan` means the block does not mention the
+/// fact at all (the drop is the model's), while `SupportRefusal::Guarded`
+/// means a span held the fact but a guard refused every occurrence of the
+/// value (the drop is the matcher's) — without it, over-refusal is
+/// invisible in the output.
 ///
 /// Support criteria (all case-insensitive, within one sentence/row span):
 /// * numeric fact: the value's number appears together with the subject or
@@ -195,6 +251,49 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 ///   a citation marker `[...]` or immediately after Table/Figure/Ref is a
 ///   label, not a measurement;
 /// * non-numeric fact: both subject and object appear.
+pub fn supporting_quote_or_refusal(
+    subject: &str,
+    object: &str,
+    value: Option<f64>,
+    block_text: &str,
+) -> Result<String, SupportRefusal> {
+    let subject_n = normalize_for_containment(subject);
+    let object_n = normalize_for_containment(object);
+    let mut last_refusal: Option<(RefusalGuard, String)> = None;
+    for span in supporting_spans(block_text) {
+        let hay = normalize_for_containment(span);
+        match value {
+            Some(v) => {
+                let name_near = (!subject_n.is_empty() && hay.contains(&subject_n))
+                    || (!object_n.is_empty() && hay.contains(&object_n));
+                if name_near {
+                    match scan_number_evidence(&hay, v, &subject_n, &object_n) {
+                        NumberScan::Evidential => return Ok(span.trim().to_string()),
+                        NumberScan::Refused(guard) => {
+                            last_refusal = Some((guard, span.trim().to_string()));
+                        }
+                        NumberScan::Absent => {}
+                    }
+                }
+            }
+            None => {
+                if !subject_n.is_empty()
+                    && !object_n.is_empty()
+                    && hay.contains(&subject_n)
+                    && hay.contains(&object_n)
+                {
+                    return Ok(span.trim().to_string());
+                }
+            }
+        }
+    }
+    match last_refusal {
+        Some((guard, span)) => Err(SupportRefusal::Guarded { guard, span }),
+        None => Err(SupportRefusal::NoSpan),
+    }
+}
+
+/// `supporting_quote_or_refusal` for callers that only need the quote.
 #[must_use]
 pub fn supporting_quote(
     subject: &str,
@@ -202,28 +301,7 @@ pub fn supporting_quote(
     value: Option<f64>,
     block_text: &str,
 ) -> Option<String> {
-    let subject_n = normalize_for_containment(subject);
-    let object_n = normalize_for_containment(object);
-    for span in supporting_spans(block_text) {
-        let hay = normalize_for_containment(span);
-        let supported = match value {
-            Some(v) => {
-                number_is_evidential(&hay, v, &subject_n, &object_n)
-                    && ((!subject_n.is_empty() && hay.contains(&subject_n))
-                        || (!object_n.is_empty() && hay.contains(&object_n)))
-            }
-            None => {
-                !subject_n.is_empty()
-                    && !object_n.is_empty()
-                    && hay.contains(&subject_n)
-                    && hay.contains(&object_n)
-            }
-        };
-        if supported {
-            return Some(span.trim().to_string());
-        }
-    }
-    None
+    supporting_quote_or_refusal(subject, object, value, block_text).ok()
 }
 
 /// Split `block_text` into candidate supporting spans: sentences and table
@@ -284,41 +362,81 @@ fn period_ends_abbreviation(line: &str, dot: usize) -> bool {
     ABBREV_LABEL_WORDS.contains(&word.as_str())
 }
 
-/// Does `hay` contain the value as an evidential measurement? At least one
-/// string form of the value must occur with clean token boundaries, must
-/// not be a citation marker or a Table/Figure/Ref label number, and must
-/// not sit inside an occurrence of the subject's or object's own name
-/// (the "718" of "Inconel 718").
-fn number_is_evidential(hay: &str, value: f64, subject_n: &str, object_n: &str) -> bool {
-    number_needles(value)
-        .iter()
-        .any(|needle| evidential_number_occurrence(hay, needle, subject_n, object_n))
+/// What a scan of the value's occurrences in one span found.
+enum NumberScan {
+    /// One occurrence is evidential.
+    Evidential,
+    /// No needle form of the value occurs in the span at all.
+    Absent,
+    /// Every occurrence was refused; holds the guard that refused the LAST
+    /// candidate occurrence scanned.
+    Refused(RefusalGuard),
 }
 
-/// Scan every occurrence of `needle` in `hay` for one that is real evidence.
-fn evidential_number_occurrence(hay: &str, needle: &str, subject_n: &str, object_n: &str) -> bool {
-    let mut search_from = 0usize;
-    while let Some(rel) = hay[search_from..].find(needle) {
-        let start = search_from + rel;
-        let end = start + needle.len();
-        if clean_number_boundary(hay, needle, start, end)
-            && !inside_citation_marker(hay, start)
-            && !preceding_word_is_label(hay, start)
-            && !occurrence_inside_name(hay, start, end, subject_n)
-            && !occurrence_inside_name(hay, start, end, object_n)
-        {
-            return true;
+/// Does `hay` contain the value as an evidential measurement? At least one
+/// string form of the value must occur with clean token boundaries, must
+/// not be a citation marker or a Table/Figure/Ref label number, must not
+/// sit inside an occurrence of the subject's or object's own name (the
+/// "718" of "Inconel 718"), and must not be an en-dash range endpoint.
+/// When every occurrence is refused, the scan names the guard that refused
+/// the last one — that name is what makes an over-refusal actionable.
+fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) -> NumberScan {
+    let mut last: Option<RefusalGuard> = None;
+    for needle in number_needles(value) {
+        let mut search_from = 0usize;
+        while let Some(rel) = hay[search_from..].find(&needle) {
+            let start = search_from + rel;
+            let end = start + needle.len();
+            match refusing_guard(hay, &needle, start, end, subject_n, object_n) {
+                None => return NumberScan::Evidential,
+                Some(guard) => last = Some(guard),
+            }
+            // Advance by the needle's first CHARACTER, not one byte: U+2212
+            // needles lead with a 3-byte char, and a rejected occurrence that
+            // advanced one byte landed the next hay[search_from..] slice
+            // inside the minus (char-boundary panic, whole ingest aborted).
+            // The match guarantees the needle sits at `start`, so its first
+            // char is the char to skip; map_or(1, ..) keeps the loop
+            // terminating even for a hypothetical empty needle.
+            search_from = start + needle.chars().next().map_or(1, char::len_utf8);
         }
-        // Advance by the needle's first CHARACTER, not one byte: U+2212
-        // needles lead with a 3-byte char, and a rejected occurrence that
-        // advanced one byte landed the next hay[search_from..] slice
-        // inside the minus (char-boundary panic, whole ingest aborted).
-        // The match guarantees the needle sits at `start`, so its first
-        // char is the char to skip; map_or(1, ..) keeps the loop
-        // terminating even for a hypothetical empty needle.
-        search_from = start + needle.chars().next().map_or(1, char::len_utf8);
     }
-    false
+    match last {
+        Some(guard) => NumberScan::Refused(guard),
+        None => NumberScan::Absent,
+    }
+}
+
+/// The guard that refuses the occurrence of `needle` at [start, end), or
+/// `None` when the occurrence is evidential. Checked most-specific first so
+/// the NAMED refusal is the most informative one; the refuse/accept decision
+/// itself does not depend on the order.
+fn refusing_guard(
+    hay: &str,
+    needle: &str,
+    start: usize,
+    end: usize,
+    subject_n: &str,
+    object_n: &str,
+) -> Option<RefusalGuard> {
+    if en_dash_range_endpoint(hay, start, end) {
+        return Some(RefusalGuard::Range);
+    }
+    if !clean_number_boundary(hay, needle, start, end) {
+        return Some(RefusalGuard::Boundary);
+    }
+    if inside_citation_marker(hay, start) {
+        return Some(RefusalGuard::Citation);
+    }
+    if preceding_word_is_label(hay, start) {
+        return Some(RefusalGuard::Label);
+    }
+    if occurrence_inside_name(hay, start, end, subject_n)
+        || occurrence_inside_name(hay, start, end, object_n)
+    {
+        return Some(RefusalGuard::InsideName);
+    }
+    None
 }
 
 /// Does the occurrence at [start, end) sit inside an occurrence of the
@@ -363,9 +481,8 @@ const UNIT_INITIALS: &[char] = &[
 /// or to an alphanumeric. Otherwise "95" matches inside "950", "1.5" inside
 /// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V". After the
 /// number, a letter from `UNIT_INITIALS` is allowed so glued units
-/// ("950MPa") still stamp. A number that opens or closes an en-dash
-/// range of digits ("950\u{2013}1100") is a range endpoint, not a point
-/// value.
+/// ("950MPa") still stamp. En-dash range endpoints are refused by
+/// `en_dash_range_endpoint`, not here.
 fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
@@ -418,26 +535,29 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             return false;
         }
     }
-    // En-dash range endpoints: "950\u{2013}1100 MPa" asserts a range,
-    // not two point values, so a number that opens or closes a
-    // digit/en-dash/digit run is refused. U+2013 only, by decision:
-    // ASCII hyphens also join genuine compounds ("950-1100" batch
-    // designators, catalogue numbers) and the two readings are
-    // structurally indistinguishable, so the compound-friendly behaviour
-    // is kept; em-dashes are sentence dashes, not range dashes. Recorded
-    // residual gaps: spaced ranges, ASCII-typed ranges and negative
-    // ranges still stamp their endpoints.
+    true
+}
+
+/// En-dash range endpoints: "950\u{2013}1100 MPa" asserts a range, not
+/// two point values, so a number that opens or closes a digit/en-dash/digit
+/// run is refused. U+2013 only, by decision: ASCII hyphens also join
+/// genuine compounds ("950-1100" batch designators, catalogue numbers) and
+/// the two readings are structurally indistinguishable, so the
+/// compound-friendly behaviour is kept; em-dashes are sentence dashes, not
+/// range dashes. Recorded residual gaps: spaced ranges, ASCII-typed ranges
+/// and negative ranges still stamp their endpoints.
+fn en_dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
     if let Some(rest) = hay[end..].strip_prefix('\u{2013}')
         && rest.starts_with(|c: char| c.is_ascii_digit())
     {
-        return false;
+        return true;
     }
     if let Some(prefix) = hay[..start].strip_suffix('\u{2013}')
         && prefix.ends_with(|c: char| c.is_ascii_digit())
     {
-        return false;
+        return true;
     }
-    true
+    false
 }
 
 /// Is the occurrence inside a citation marker? Bracketed styles
@@ -1754,6 +1874,96 @@ mod tests {
         assert_eq!(
             supporting_quote("Inconel 718", "UTS", Some(1375.0), &table.text).as_deref(),
             Some("Inconel 718 1375")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Over-refusal instrumentation: a drop caused by a guard must name
+    // the guard, not read as the model's hallucination. Each assert
+    // below is a mutation target: removing the matching guard check in
+    // `refusing_guard` turns its occurrence evidential (Ok instead of
+    // Guarded), and removing the refusal recording in
+    // `supporting_quote_or_refusal` collapses every Guarded into
+    // NoSpan.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn guarded_refusals_name_the_guard_that_dropped_the_value() {
+        // Label: span holds subject + object + value; the label walk
+        // refuses the only occurrence.
+        let label = "Ti-6Al-4V properties are listed in Table 3.";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "properties", Some(3.0), label),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: label.to_string(),
+            })
+        );
+
+        // Boundary: "95" inside "950" — digit continuation.
+        let boundary = "The Ti-6Al-4V UTS is 950 MPa.";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(95.0), boundary),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Boundary,
+                span: boundary.to_string(),
+            })
+        );
+
+        // Citation: the number sits in a bracketed marker.
+        let citation = "Ti-6Al-4V has been studied extensively in prior work [1140].";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(1140.0), citation),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Citation,
+                span: citation.to_string(),
+            })
+        );
+
+        // InsideName: the "718" of the claim's own subject name.
+        let table = "Alloy UTS (MPa)\nTi-6Al-4V 950\nInconel 718 1375";
+        assert_eq!(
+            supporting_quote_or_refusal("Inconel 718", "UTS", Some(718.0), table),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::InsideName,
+                span: "Inconel 718 1375".to_string(),
+            })
+        );
+
+        // Range: en-dash digit range endpoint.
+        let range = "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(950.0), range),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Range,
+                span: range.to_string(),
+            })
+        );
+    }
+
+    /// A block that never mentions the fact's salient tokens is NoSpan,
+    /// which maps to MissingQuote — that drop IS the model's fault and
+    /// must stay indistinguishable from a hallucinated quote.
+    #[test]
+    fn no_span_refusal_stays_missing_quote() {
+        let block = "Discussion of prior work [1140] follows. No alloy data here.";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(1140.0), block),
+            Err(SupportRefusal::NoSpan)
+        );
+        assert_eq!(
+            ClaimRejection::from(SupportRefusal::NoSpan),
+            ClaimRejection::MissingQuote
+        );
+        assert_eq!(
+            ClaimRejection::from(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: "s".to_string(),
+            }),
+            ClaimRejection::NoEvidentialOccurrence {
+                guard: RefusalGuard::Label,
+                span: "s".to_string(),
+            }
         );
     }
 }

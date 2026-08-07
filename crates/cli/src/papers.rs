@@ -348,12 +348,13 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     // supports the fact. Facts with no supporting span cannot
                     // become claims — stamping them would record provenance a
                     // document never gave (extractor prompt examples included).
-                    let quote = prism_retrieval::claims::supporting_quote(
+                    let support = prism_retrieval::claims::supporting_quote_or_refusal(
                         &fact.subject,
                         &fact.object,
                         fact.value,
                         &block.text,
                     );
+                    let quote = support.as_ref().ok().cloned();
                     let claim = claim_from_fact(
                         fact,
                         &document_id,
@@ -364,6 +365,23 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     );
                     match prism_retrieval::claims::validate_and_stamp(claim, &block.text) {
                         Ok(stamped) => claims.push(stamped),
+                        Err(prism_retrieval::claims::ClaimRejection::MissingQuote) => {
+                            // A missing quote is the model's fault only when
+                            // no span held the fact at all. When a span held
+                            // it but a guard refused every occurrence of the
+                            // value, record WHICH guard: that drop is the
+                            // matcher's refusal, and the guard name is the
+                            // only observable signal of over-refusal.
+                            let reason = match support {
+                                Err(refusal) => {
+                                    prism_retrieval::claims::ClaimRejection::from(refusal)
+                                }
+                                Ok(_) => prism_retrieval::claims::ClaimRejection::MissingQuote,
+                            };
+                            rejected.push(json!({
+                                "reason": reason,
+                            }));
+                        }
                         Err(reason) => rejected.push(json!({
                             "reason": reason,
                         })),
