@@ -19,6 +19,7 @@ use prism_ingest::LlmConfig;
 use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
 use prism_runtime::auth::{self, AUTH_REQUIRED_RPC_CODE};
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use prism_workflows::{
     WorkflowExecutionOptions, WorkflowRunResult, WorkflowSpec, discover_workflows, find_workflow,
@@ -200,8 +201,8 @@ struct SelectionOutcome {
 
 #[allow(dead_code)]
 fn env_project_override() -> Option<String> {
-    std::env::var("MARC27_PROJECT_ID")
-        .ok()
+    PlatformVar::PROJECT_ID
+        .get()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -399,11 +400,27 @@ fn clear_sdk_credentials() {
     }
 }
 
+/// Publish (or clear) the signed-in account on the process environment, which
+/// every child inherits — including the Python sidecar.
+///
+/// Each platform value is written under BOTH spellings, neutral and
+/// historical. Not a transitional hedge: the shipped MIT Python tools read the
+/// historical name directly (`app/tools/platform_workflows.py`,
+/// `app/tools/mcp_services.py`), so dropping it would sign those tools out
+/// while Rust stayed authenticated. Writing only the historical name would
+/// work but leave the migration permanently unfinished. Both, same value —
+/// `PlatformVar` prefers the neutral one and they never disagree.
+///
+/// The clear path must cover both spellings for the same reason it exists: a
+/// name left behind on sign-out is a live credential surviving a logout.
 fn apply_account_env(creds: Option<&StoredCredentials>) {
     const KEYS: &[&str] = &[
-        "MARC27_TOKEN",
-        "MARC27_PLATFORM_URL",
-        "MARC27_PROJECT_ID",
+        PlatformVar::TOKEN.preferred,
+        PlatformVar::TOKEN.alias,
+        PlatformVar::PLATFORM_URL.preferred,
+        PlatformVar::PLATFORM_URL.alias,
+        PlatformVar::PROJECT_ID.preferred,
+        PlatformVar::PROJECT_ID.alias,
         "PRISM_ACCOUNT_USER_ID",
         "PRISM_ACCOUNT_DISPLAY_NAME",
         "PRISM_ACCOUNT_ORG_ID",
@@ -411,17 +428,19 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
         "PRISM_ACCOUNT_PROJECT_NAME",
     ];
 
+    /// Write one platform value under both names.
+    fn set_both(var: PlatformVar, value: &str) {
+        unsafe {
+            std::env::set_var(var.preferred, value);
+            std::env::set_var(var.alias, value);
+        }
+    }
+
     if let Some(creds) = creds {
-        unsafe {
-            std::env::set_var("MARC27_TOKEN", &creds.access_token);
-        }
-        unsafe {
-            std::env::set_var("MARC27_PLATFORM_URL", &creds.platform_url);
-        }
+        set_both(PlatformVar::TOKEN, &creds.access_token);
+        set_both(PlatformVar::PLATFORM_URL, &creds.platform_url);
         if let Some(project_id) = &creds.project_id {
-            unsafe {
-                std::env::set_var("MARC27_PROJECT_ID", project_id);
-            }
+            set_both(PlatformVar::PROJECT_ID, project_id);
         }
         if let Some(user_id) = &creds.user_id {
             unsafe {

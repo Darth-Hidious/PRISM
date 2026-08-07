@@ -36,6 +36,7 @@ use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_proto::NodeCapabilities;
 use prism_python_bridge::{ToolServer, ensure_venv};
 use prism_runtime::auth::{self, AuthSurface, PlatformAuth};
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 
 // Loopback detection lives with the local-server probe that also needs it,
@@ -2286,7 +2287,9 @@ async fn main() -> Result<()> {
             // loaded, an ANTHROPIC_API_KEY in it would otherwise shadow the
             // platform JWT and 401 every platform LLM call.
             let api_key = std::env::var("LLM_API_KEY")
-                .or_else(|_| std::env::var("MARC27_TOKEN"))
+                .ok()
+                .or_else(|| PlatformVar::TOKEN.get())
+                .ok_or(std::env::VarError::NotPresent)
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok()
@@ -2376,9 +2379,9 @@ async fn main() -> Result<()> {
                     // value onto X-API-Key and a JWT onto Bearer automatically.
                     // Provider keys are NOT platform credentials.
                     let marc27_key = std::env::var("LLM_API_KEY")
-                        .or_else(|_| std::env::var("MARC27_API_KEY"))
-                        .or_else(|_| std::env::var("MARC27_TOKEN"))
                         .ok()
+                        .or_else(|| PlatformVar::API_KEY.get())
+                        .or_else(|| PlatformVar::TOKEN.get())
                         .or_else(|| platform_token.clone());
                     (
                         marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url)?,
@@ -5029,11 +5032,11 @@ async fn handle_federation_command(
             let state = paths.load_cli_state().ok().unwrap_or_default();
             let creds = state.credentials.as_ref();
             let endpoints = PlatformEndpoints::from_env();
-            let credential_source = if std::env::var("MARC27_API_KEY")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                "MARC27_API_KEY"
+            // Report the name that actually supplied the key, not a fixed
+            // string -- an operator with both spellings set otherwise cannot
+            // tell which one the process read.
+            let credential_source = if let Some(name) = PlatformVar::API_KEY.source() {
+                name
             } else if creds.is_some() {
                 "cli-state session"
             } else {
@@ -5701,8 +5704,8 @@ fn resolve_workflow_llm_api_key_for_target(
         crate::chat_config::ChatTarget::Marc27 { .. } => non_empty(
             std::env::var("LLM_API_KEY")
                 .ok()
-                .or_else(|| std::env::var("MARC27_API_KEY").ok())
-                .or_else(|| std::env::var("MARC27_TOKEN").ok())
+                .or_else(|| PlatformVar::API_KEY.get())
+                .or_else(|| PlatformVar::TOKEN.get())
                 .or_else(|| cfg_llm.resolve_api_key())
                 .or(platform_token),
         ),
@@ -7169,8 +7172,9 @@ fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
         );
     }
 
-    let default_api_base = std::env::var("MARC27_API_URL")
-        .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
+    let default_api_base = PlatformVar::API_URL
+        .get()
+        .unwrap_or_else(|| "https://api.marc27.com/api/v1".to_string());
     let paths = PrismPaths::discover().ok();
     let resolved = auth::resolve_from_environment(paths.as_ref(), &default_api_base)?;
     Ok((resolved.api_base, resolved.credential))
@@ -10721,8 +10725,8 @@ async fn select_project(
 }
 
 fn env_project_override() -> Option<String> {
-    std::env::var("MARC27_PROJECT_ID")
-        .ok()
+    PlatformVar::PROJECT_ID
+        .get()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -10832,7 +10836,7 @@ async fn resolve_node_token(
         tracing::debug!("using durable node token (does not rotate)");
         return Ok((node_token.key, None));
     }
-    if let Ok(key) = std::env::var("MARC27_API_KEY") {
+    if let Some(key) = PlatformVar::API_KEY.get() {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Ok((key, None));
@@ -11905,7 +11909,7 @@ mod tests {
         // If MARC27_API_KEY happens to be set in the test env, the function's
         // API-key branch short-circuits and this contract isn't exercisable —
         // skip gracefully rather than racing the global env.
-        if std::env::var("MARC27_API_KEY").is_ok() {
+        if PlatformVar::API_KEY.get().is_some() {
             eprintln!(
                 "skipping resolve_node_token_fresh_creds_returns_no_rotation: \
                  MARC27_API_KEY is set in the env"

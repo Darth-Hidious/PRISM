@@ -11,6 +11,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prism_client::PlatformResponseExt;
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
 use sysinfo::System;
@@ -1981,7 +1982,7 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
     // expires. The platform's node-WS handshake validates the `?token=` param
     // as a JWT first, then as an API key, so hand the key straight through —
     // no cli-state, no refresh, no 24h re-login.
-    if let Ok(key) = std::env::var("MARC27_API_KEY") {
+    if let Some(key) = PlatformVar::API_KEY.get() {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Ok(key);
