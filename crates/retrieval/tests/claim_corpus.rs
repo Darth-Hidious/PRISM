@@ -1401,10 +1401,15 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 13 item 1: moved off UTS (where SignDomain masked the \
-             pin) onto residual_stress — U+2013 is no sign glyph and the \
-             claim has no needle, so it drops NoSpan; re-add U+2013 to \
-             number_needles and it stamps",
+            "round 15 item 5: GROUND TRUTH — the dash separates 'residual \
+             stress' from '950 MPa', so the source value is +950 and a -950 \
+             claim fabricates the sign. Weaker than the UTS twin: a \
+             longitudinal compressive residual stress of -950 MPa is \
+             plausible, so unlike a negative UTS (impossible a priori) this \
+             is a sign fabrication, not a nonsense value. MECHANISM — U+2013 \
+             is no sign glyph, so no signed needle is built; the claim \
+             refuses NoSpan, which pins the NEEDLE-SET decision (not a \
+             guard); re-add U+2013 to number_needles (M-A) and it stamps",
         ),
         case(
             "Ti-6Al-4V residual stress \u{2014}950 MPa (longitudinal)",
@@ -1412,8 +1417,12 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 13 item 1: the U+2014 twin, on residual_stress for the \
-             same reason — no sign glyph, the claim has no needle",
+            "round 15 item 5: GROUND TRUTH as the U+2013 twin above (dash \
+             separates label from value, source +950, -950 fabricates the \
+             sign; compressive residual is plausible, so weaker than UTS). \
+             MECHANISM — the U+2014 typesetting is no sign glyph either, so \
+             it refuses NoSpan (needle-set decision, not a guard); re-add \
+             U+2014 to number_needles and it stamps",
         ),
         case(
             "-950 MPa was recorded for Ti-6Al-4V.",
@@ -1441,10 +1450,13 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 13 item 1: moved off UTS onto residual_stress — U+2013 \
-             is no sign glyph and the claim has no needle; its recall-loss \
-             twin (the same shape read as a genuine minus) is the KNOWN \
-             row below",
+            "round 15 item 5: GROUND TRUTH — the leading dash separates the \
+             value from nothing (line start), source value +950, so -950 \
+             fabricates the sign; weaker than the UTS twin (compressive \
+             residual is plausible). MECHANISM — U+2013 is no sign glyph, no \
+             needle, refuses NoSpan (needle-set decision, not a guard); its \
+             recall-loss twin (the same shape read as a genuine minus) is \
+             the KNOWN row below",
         ),
         case(
             "\u{2014}950 MPa was recorded for Ti-6Al-4V.",
@@ -1452,8 +1464,10 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 13 item 1: the U+2014 line-start separator on \
-             residual_stress — no sign glyph, the claim has no needle",
+            "round 15 item 5: GROUND TRUTH as the U+2013 line-start twin \
+             (source +950, -950 fabricates the sign; weaker than UTS). \
+             MECHANISM — U+2014 is no sign glyph, no needle, refuses NoSpan \
+             (needle-set decision, not a guard)",
         ),
         case(
             "The Ti-6Al-4V result -950 MPa- matched the target.",
@@ -1479,8 +1493,11 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 13 item 1: the U+2013 bracketed separator on \
-             residual_stress — no sign glyph, the claim has no needle",
+            "round 15 item 5: GROUND TRUTH — the bracketing dashes separate \
+             'result' from '950 MPa', source +950, -950 fabricates the sign; \
+             weaker than the UTS twin (compressive residual is plausible). \
+             MECHANISM — U+2013 is no sign glyph, no needle, refuses NoSpan \
+             (needle-set decision, not a guard)",
         ),
         case(
             "The Ti-6Al-4V result \u{2014}950 MPa\u{2014} matched the target.",
@@ -1488,8 +1505,10 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 13 item 1: the U+2014 bracketed separator on \
-             residual_stress — no sign glyph, the claim has no needle",
+            "round 15 item 5: GROUND TRUTH as the U+2013 bracketed twin \
+             (source +950, -950 fabricates the sign; weaker than UTS). \
+             MECHANISM — U+2014 is no sign glyph, no needle, refuses NoSpan \
+             (needle-set decision, not a guard)",
         ),
         // ---------------- MUST_DROP: the sign-domain pins (round 12) ---
         // Item 1(c)'s discriminator, measured not guessed: the
