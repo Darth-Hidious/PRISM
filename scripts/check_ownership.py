@@ -64,9 +64,21 @@ def main() -> int:
     licences = doc.get("licences", {})
     entries = doc.get("paths", [])
 
-    tracked = subprocess.run(
-        ["git", "ls-files"], capture_output=True, text=True, check=True
+    # Tracked files PLUS untracked-but-not-ignored ones.
+    #
+    # Using bare `git ls-files` was a real bug: a new file is invisible to it
+    # until it is committed, so this check passed while OWNERSHIP.yml itself
+    # was still untracked and went red the instant it was added. `--others
+    # --exclude-standard` brings in anything git would consider new and is not
+    # covered by .gitignore, so an unowned file fails BEFORE it lands rather
+    # than after.
+    files = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.split()
+    tracked = sorted(set(files))
 
     failures: list[str] = []
 

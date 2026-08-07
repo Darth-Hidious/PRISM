@@ -197,6 +197,16 @@ paths:
   # Listed explicitly rather than by a catch-all glob, so a new root file
   # shows up as uncovered in the coverage check instead of being silently
   # absorbed by a wildcard.
+  - path: OWNERSHIP.yml
+    owner: mirdyne
+    licence: mirdyne-source-available
+    layer: product-core
+    funding: Mirdyne internal
+    permitted_use: Read and evaluate. This manifest.
+    notes: >-
+      Listed because the check reads `git ls-files`, and an untracked file is
+      invisible to it. The first draft validated green while this file was
+      still untracked and went red the moment it was committed.
   - path: Cargo.toml
     owner: mirdyne
     licence: mirdyne-source-available
