@@ -417,6 +417,17 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "a bare parenthesised number is a citation",
         ),
+        case(
+            "Ti-6Al-4V has been studied (11, 13\u{2013}15).",
+            "Ti-6Al-4V",
+            "UTS",
+            11.0,
+            Expect::MustDrop,
+            "round 11 item 14: the paren-citation FORWARD trim must walk \
+             through the en dash of 13\u{2013}15 to reach the close paren; \
+             without dash handling there the marker is never recognised \
+             and 11 stamps — this row is that cannot-fail trim's only pin",
+        ),
         // ---------------- MUST_DROP: citation dash walks (round 10) ---
         // The citation walk-back trimmed only '-', U+2013 and U+2014;
         // the other six glyphs stranded the trim on the dash, the
