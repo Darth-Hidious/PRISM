@@ -317,12 +317,16 @@ fn corpus() -> Vec<CorpusCase> {
         ),
         // ---------------- MUST_STAMP: H2 spaced controls -------------
         case(
-            "The Ti-6Al-4V band gap was 5 ev.",
+            "In Fig. 3, 5 ev was measured for the Ti-6Al-4V band gap.",
             "Ti-6Al-4V",
             "band_gap",
             5.0,
             Expect::MustStamp,
-            "spaced ev still stamps after denying the glued e initial",
+            "spaced ev still stamps after denying the glued e initial; \
+             round 9: moved under a label locator so removing \"ev\" from \
+             UNIT_TOKENS reddens this — the original prose had no label \
+             word, `unit_follows` was never consulted, and 47511ce1's \
+             stated proof was void",
         ),
         case(
             "The Ti-6Al-4V coupons were stored at 72F.",

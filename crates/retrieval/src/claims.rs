@@ -510,9 +510,13 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// "1073K", "50um" / "50\u{b5}m", "5wt%". Deliberately an allow-list,
 /// not every letter: digit-then-letter gluing like "950x"
 /// (magnification) or "2e5" (scientific notation) is not number+unit
-/// and stays rejected — denied by `DENIED_UNIT_INITIALS` below, not
-/// by the token list happening to lack the letter, so no future token
-/// can reopen either form.
+/// and stays rejected. "2e5" is denied by `DENIED_UNIT_INITIALS`
+/// below, so no future token starting with 'e' can reopen it. "950x"
+/// is refused by the allow-list itself — no token starts with 'x';
+/// round 9 removed the redundant 'x' denial as a cannot-fail entry
+/// (it refused nothing the allow-list refused already). A future
+/// token starting with 'x' would reopen the magnification form; the
+/// corpus "950x" case is the tripwire for that.
 ///
 /// DERIVED, not hand-listed: the first letter of every `UNIT_TOKENS`
 /// entry, plus `EXTRA_UNIT_INITIALS`, minus `DENIED_UNIT_INITIALS`.
@@ -533,13 +537,21 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// DENIED: 'e' rides on "ev", but a digit-glued 'e' in prose is
 /// scientific notation ("2e5 per second", "1e6 cycles"), not
 /// number+unit; denying it costs nothing — no other token starts with
-/// 'e', and "5 ev" still stamps through the spaced `unit_follows`
-/// path. 'x' is denied for the magnification form ("950x"). The old
-/// hand list also carried 'd' (days, "30d"); it stays absent: its
-/// removal let "2D"/"3D projection" drop correctly, a measured win
-/// that outweighs the days form.
+/// 'e', and "In Fig. 3, 5 ev was measured" still stamps through the
+/// spaced `unit_follows` path (the lib test and the corpus case both
+/// sit under a label locator, so deleting "ev" from UNIT_TOKENS
+/// reddens them — the original control sentence had no label word,
+/// never consulted `unit_follows`, and 47511ce1's stated proof was
+/// void).
+/// 'x' was denied in round 8 and REMOVED in round 9: no UNIT_TOKENS
+/// entry starts with 'x' and 'x' is not in `EXTRA_UNIT_INITIALS`, so
+/// the denial refused nothing the allow-list refused already — a
+/// cannot-fail entry, the same defect 'o' was deleted for in the same
+/// commit. The old hand list also carried 'd' (days, "30d"); it stays
+/// absent: its removal let "2D"/"3D projection" drop correctly, a
+/// measured win that outweighs the days form.
 const EXTRA_UNIT_INITIALS: &[char] = &['\u{3bc}', '\u{e5}', 'f', 'l'];
-const DENIED_UNIT_INITIALS: &[char] = &['e', 'x'];
+const DENIED_UNIT_INITIALS: &[char] = &['e'];
 
 fn unit_initial(c: char) -> bool {
     !DENIED_UNIT_INITIALS.contains(&c)
@@ -2527,14 +2539,17 @@ mod tests {
             950.0,
             "The Ti-6Al-4V coupon was imaged at 950x magnification.",
         );
-        // Spaced control: denying the glued 'e' costs nothing — "5 ev"
-        // still stamps through the `unit_follows` path.
+        // Spaced control: denying the glued 'e' costs nothing — spaced
+        // "5 ev" still stamps, under a label locator so the exemption's
+        // `unit_follows` actually decides the outcome: deleting "ev"
+        // from UNIT_TOKENS reddens this. Round 9: the original sentence
+        // had no label word and proved nothing.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "band_gap",
                 Some(5.0),
-                "The Ti-6Al-4V band gap was 5 ev."
+                "In Fig. 3, 5 ev was measured for the Ti-6Al-4V band gap."
             )
             .is_some()
         );
