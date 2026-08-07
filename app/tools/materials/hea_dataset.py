@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """HEA / MPEA reference dataset (E13).
 
 The work-order referenced an R2 `hea-mpea` corpus that DOES NOT EXIST (verified

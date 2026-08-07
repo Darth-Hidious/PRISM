@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Free first-class materials-informatics tools (OPTIMADE redesign S8).
 
 These close the gap to commercial materials-discovery platforms (Citrine,

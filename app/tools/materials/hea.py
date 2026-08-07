@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """High-Entropy Alloy (HEA) / Multi-Principal-Element Alloy (MPEA) design tools.
 
 SCOPE (honest): these are empirical Hume-Rothery-style SCREENING heuristics —

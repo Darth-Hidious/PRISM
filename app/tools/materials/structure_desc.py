@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Structure description + synthesizability heuristic (E12).
 
   - describe_structure: robocrystallographer → human-readable crystal-structure

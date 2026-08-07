@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """CALPHAD thermodynamic phase-stability + Scheil solidification (steel scope).
 
 Genuine CALPHAD (pycalphad Gibbs-energy minimization + the scheil package for

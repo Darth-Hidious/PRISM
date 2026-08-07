@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Free materials-informatics tools (E7-E11): the Citrine/Intellegens-equivalent stack.
 
 These rival what commercial materials-informatics platforms charge for, using

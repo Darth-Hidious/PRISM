@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Background research runs — a SECOND agent, running server-side.
 
 This is the client for the platform's `/agent-runs` orchestrator (a

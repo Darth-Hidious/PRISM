@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Phase-stability screening — convex-hull distance via Materials Project.
 
 SCOPE (honest): this looks up the Materials Project 0 K DFT convex hull

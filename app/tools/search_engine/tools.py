@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """MCP tool wrapper for the federated SearchEngine.
 
 The infrastructure (`SearchEngine`, providers, fusion, cache, circuit
