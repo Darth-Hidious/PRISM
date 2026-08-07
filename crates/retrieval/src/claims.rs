@@ -309,7 +309,14 @@ fn evidential_number_occurrence(hay: &str, needle: &str, subject_n: &str, object
         {
             return true;
         }
-        search_from = start + 1;
+        // Advance by the needle's first CHARACTER, not one byte: U+2212
+        // needles lead with a 3-byte char, and a rejected occurrence that
+        // advanced one byte landed the next hay[search_from..] slice
+        // inside the minus (char-boundary panic, whole ingest aborted).
+        // The match guarantees the needle sits at `start`, so its first
+        // char is the char to skip; map_or(1, ..) keeps the loop
+        // terminating even for a hypothetical empty needle.
+        search_from = start + needle.chars().next().map_or(1, char::len_utf8);
     }
     false
 }
@@ -331,7 +338,9 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
         if name_start <= start && end <= name_end {
             return true;
         }
-        search_from = name_start + 1;
+        // Char-not-byte advance, as in evidential_number_occurrence:
+        // names may lead with a multi-byte char ("\u{3b1}-phase").
+        search_from = name_start + name.chars().next().map_or(1, char::len_utf8);
     }
     false
 }
@@ -972,6 +981,61 @@ mod tests {
                 "UTS",
                 Some(1100.0),
                 "The Ti-6Al-4V batches 950-1100 were tested."
+            )
+            .is_some()
+        );
+    }
+
+    /// Round 5: after a REJECTED U+2212-prefixed needle, the scan must
+    /// advance by the needle's first character, not one byte. "950x" is
+    /// rejected because 'x' is deliberately not a unit initial; the old
+    /// `start + 1` advance then landed `hay[search_from..]` inside the
+    /// 3-byte U+2212 and panicked the whole ingest run on a non-char
+    /// boundary. The correct outcome is a drop: the zoom factor is not
+    /// evidence for a UTS of -950.
+    #[test]
+    fn rejected_unicode_minus_needle_advances_by_char_not_byte() {
+        assert_eq!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(-950.0),
+                "Ti-6Al-4V at \u{2212}950x zoom had UTS."
+            ),
+            None
+        );
+    }
+
+    /// Round 5: same advance bug via the range-endpoint guard — a U+2212
+    /// value that opens an en-dash range ("\u{2212}950\u{2013}1100 MPa")
+    /// is rejected as a range endpoint, and the reject-then-advance must
+    /// clear the 3-byte minus without slicing inside it.
+    #[test]
+    fn rejected_unicode_minus_range_endpoint_advances_by_char_not_byte() {
+        assert_eq!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "stress",
+                Some(-950.0),
+                "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa."
+            ),
+            None
+        );
+    }
+
+    /// Round 5 audit, same bug class: `occurrence_inside_name` also
+    /// advanced one byte after a non-containing name match. A subject name
+    /// that leads with a multi-byte char ("\u{3b1}-phase", U+03B1 GREEK
+    /// SMALL LETTER ALPHA is 2 bytes) made the next slice panic. The
+    /// occurrence is outside the name, so the value stamps.
+    #[test]
+    fn multibyte_leading_subject_name_does_not_panic_the_name_scan() {
+        assert!(
+            supporting_quote(
+                "\u{3b1}-phase",
+                "strength",
+                Some(950.0),
+                "\u{3b1}-phase strength was 950 MPa."
             )
             .is_some()
         );
