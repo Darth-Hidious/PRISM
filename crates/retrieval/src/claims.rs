@@ -740,6 +740,35 @@ const LABEL_WORDS: &[&str] = &[
     "samples",
     "run",
     "runs",
+    // Round 9: the rest of the specimen-label family, all measured
+    // stamping at HEAD — Specimen 5, Batch 12, Coupon 7, Test 3,
+    // Trial 4, Experiment 2, Condition 3, Step 2, Panel 4, Column 3,
+    // Row 2, Plot 2, Image 4, Micrograph 3, Curve 3, Inset 2,
+    // page 12, Appendix 2, and Grade 5 (a designator doubly wrong:
+    // Ti-6Al-4V IS grade 5). Every word is pinned by a corpus case;
+    // the unit exemption keeps methods prose stamping. Singular forms
+    // only — the plural leaks ("Specimens 3 and 4") stay
+    // RECORDED-NOT-FIXED until a case pins each: an unpinned list
+    // entry is a cannot-fail item.
+    "specimen",
+    "batch",
+    "coupon",
+    "test",
+    "trial",
+    "experiment",
+    "condition",
+    "step",
+    "panel",
+    "column",
+    "row",
+    "plot",
+    "image",
+    "micrograph",
+    "curve",
+    "inset",
+    "page",
+    "appendix",
+    "grade",
 ];
 
 /// Words that continue a label list: the number after one of these is a
