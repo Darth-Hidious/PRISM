@@ -152,6 +152,21 @@ fn corpus() -> Vec<CorpusCase> {
              keeps the label guard firing; if the spaceless exemption ever \
              returns, this row turns red",
         ),
+        case(
+            "The Ti-6Al-4V batch 25kg was melted.",
+            "Ti-6Al-4V",
+            "mass",
+            25.0,
+            Expect::MustDrop,
+            "round 11: 25 kg is the mass of ONE POWDER LOT — extensive, not \
+             a property of the alloy, so ground truth is MustDrop. Round 10 \
+             carried it as a KNOWN MustStamp recall loss, asking the engine \
+             to fabricate: the day H1's space requirement relaxes that row \
+             would go green, the tripwire would strip the marker, and the \
+             fabrication would be permanently certified. Flipped to MustDrop \
+             like the glued cross-section twin; it drops today via the \
+             'batch' label guard and this row turns red if that changes",
+        ),
         // ---------------- MUST_STAMP: glued-unit family --------------
         case(
             "The Ti-6Al-4V UTS is 950MPa.",
@@ -1314,13 +1329,16 @@ fn corpus() -> Vec<CorpusCase> {
         // H1's space requirement cost (round 9): a label number with a
         // GLUED unit drops — the exemption demands the space, the
         // boundary check cannot redeem what the Label guard refuses
-        // afterwards. Fourteen forms, recorded so the cost is visible;
+        // afterwards. Thirteen forms, recorded so the cost is visible;
         // round 10 removed cross-section 10mm — a position, not a
         // property, so its drop is correct, not a cost (the twins sit
         // with the label/sample/run family above) — and added the eight
         // glued losses the round-9 word list caused, one per new label
-        // word: coupon 3mm, specimen 5mm, panel 2mm, test 950MPa, scan
-        // step 50um, batch 25kg, condition 980C, trial 30min.
+        // word; round 11 removed batch 25kg — the mass of one powder lot
+        // is extensive, not a property, so its drop is correct, not a
+        // cost (the twin sits with the label/sample/run family above) —
+        // leaving seven: coupon 3mm, specimen 5mm, panel 2mm, test
+        // 950MPa, scan step 50um, condition 980C, trial 30min.
         known(
             "Each Ti-6Al-4V sample 3mm thick was ground and polished.",
             "Ti-6Al-4V",
@@ -1409,14 +1427,6 @@ fn corpus() -> Vec<CorpusCase> {
             50.0,
             Expect::MustStamp,
             "KNOWN: glued recall lost to H1's space requirement — scan step 50um",
-        ),
-        known(
-            "The Ti-6Al-4V batch 25kg was melted.",
-            "Ti-6Al-4V",
-            "mass",
-            25.0,
-            Expect::MustStamp,
-            "KNOWN: glued recall lost to H1's space requirement — batch 25kg",
         ),
         known(
             "The Ti-6Al-4V condition 980C soak was logged.",
