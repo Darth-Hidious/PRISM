@@ -354,7 +354,9 @@ const UNIT_INITIALS: &[char] = &[
 /// or to an alphanumeric. Otherwise "95" matches inside "950", "1.5" inside
 /// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V". After the
 /// number, a letter from `UNIT_INITIALS` is allowed so glued units
-/// ("950MPa") still stamp.
+/// ("950MPa") still stamp. A number that opens or closes an en-dash
+/// range of digits ("950\u{2013}1100") is a range endpoint, not a point
+/// value.
 fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
@@ -406,6 +408,25 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
         if after == ',' && hay[end + after.len_utf8()..].starts_with(|c: char| c.is_ascii_digit()) {
             return false;
         }
+    }
+    // En-dash range endpoints: "950\u{2013}1100 MPa" asserts a range,
+    // not two point values, so a number that opens or closes a
+    // digit/en-dash/digit run is refused. U+2013 only, by decision:
+    // ASCII hyphens also join genuine compounds ("950-1100" batch
+    // designators, catalogue numbers) and the two readings are
+    // structurally indistinguishable, so the compound-friendly behaviour
+    // is kept; em-dashes are sentence dashes, not range dashes. Recorded
+    // residual gaps: spaced ranges, ASCII-typed ranges and negative
+    // ranges still stamp their endpoints.
+    if let Some(rest) = hay[end..].strip_prefix('\u{2013}')
+        && rest.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return false;
+    }
+    if let Some(prefix) = hay[..start].strip_suffix('\u{2013}')
+        && prefix.ends_with(|c: char| c.is_ascii_digit())
+    {
+        return false;
     }
     true
 }
@@ -1103,6 +1124,74 @@ mod tests {
                 "UTS",
                 Some(950.0),
                 "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa."
+            )
+            .is_some()
+        );
+    }
+
+    /// Range endpoints are not point values: "950\u{2013}1100 MPa"
+    /// asserts a range, and stamping UTS = 950 AND UTS = 1100 fabricates
+    /// two facts the sentence never states. The dash rule is U+2013-only
+    /// by decision (ASCII hyphens also join genuine compounds; em-dashes
+    /// are sentence dashes), and it refuses the adjacent OCCURRENCE, not
+    /// the number: an endpoint that recurs elsewhere as a genuine point
+    /// value still stamps. Mutation-proven per side: swapping the
+    /// after-side U+2013 for any other char reddens the 950 assert;
+    /// swapping the before-side U+2013 reddens the 1100 assert.
+    #[test]
+    fn en_dash_range_endpoints_are_not_point_values() {
+        let range = "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.";
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 950.0, range);
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1100.0, range);
+
+        // Grouped endpoints are refused too.
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            1140.0,
+            "The Ti-6Al-4V UTS ranged from 1,140\u{2013}1,375 MPa.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            1375.0,
+            "The Ti-6Al-4V UTS ranged from 1,140\u{2013}1,375 MPa.",
+        );
+
+        // A different point value in the same sentence still stamps.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1150.0),
+                "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa and reached 1150 MPa \
+                 after annealing."
+            )
+            .is_some()
+        );
+
+        // An endpoint that recurs outside the range as a genuine point
+        // value still stamps: the rule refuses the range-adjacent
+        // occurrence only.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa and the annealed \
+                 sample reached 950 MPa."
+            )
+            .is_some()
+        );
+
+        // ASCII hyphen keeps its pre-round-4 behaviour (the dash may be
+        // a genuine compound); pinned here and in the sign test.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1100.0),
+                "The Ti-6Al-4V batches 950-1100 were tested."
             )
             .is_some()
         );
