@@ -598,10 +598,15 @@ fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) 
 /// `SignDomain` is checked first though it is claim-level, not
 /// occurrence-level: a negative value against a non-negative quantity is
 /// nonsense whatever the occurrence looks like, and naming it beats
-/// every positional guard's explanation. The check runs INSIDE the
-/// occurrence loop, not before it: the advance-after-refusal must still
-/// walk every needle form (the round-5 char-not-byte advance lives off
-/// that walk).
+/// every positional guard's explanation. It is checked INSIDE the
+/// occurrence loop, not hoisted claim-level before it, for one reason:
+/// attribution. A negative non-negative-quantity claim whose value does
+/// NOT occur in the block is NoSpan (the model's fault — it cited a
+/// value the block never contained), not Guarded{SignDomain} (the
+/// matcher's fault); the round-5 advance-walk rationale that used to
+/// stand here was a non-reason (the advance walks whatever the guard
+/// placement). Hoisting the check before the loop reddens
+/// `sign_domain_does_not_mask_a_non_occurring_value_as_no_span`.
 fn refusing_guard(
     hay: &str,
     needle: &str,
@@ -1896,6 +1901,27 @@ mod tests {
                 "over-refusal: a negative under {signed_spelling:?} must still stamp: {r:?}"
             );
         }
+    }
+
+    /// Round 13 item 6.2: SignDomain is checked per-occurrence (inside the
+    /// loop), not hoisted claim-level, so a non-occurring negative against
+    /// a non-negative quantity stays NoSpan (the model cited a value the
+    /// block never contained) rather than Guarded{SignDomain} (the
+    /// matcher's fault). Hoisting the check before the loop reddens this.
+    #[test]
+    fn sign_domain_does_not_mask_a_non_occurring_value_as_no_span() {
+        // The block states +950; the claim -950 never occurs in any needle
+        // form. NoSpan (model's fault), not SignDomain (matcher's fault).
+        let r = supporting_quote_or_refusal(
+            "Ti-6Al-4V",
+            "UTS",
+            Some(-950.0),
+            "The Ti-6Al-4V UTS was 950 MPa.",
+        );
+        assert!(
+            matches!(r, Err(SupportRefusal::NoSpan)),
+            "non-occurring negative must be NoSpan, not SignDomain: {r:?}"
+        );
     }
 
     /// F-1: a thousands comma adjacent to a digit is part of the number,
