@@ -21,8 +21,11 @@
 //! vocabulary strings are the stable machine contract ("indeterminate",
 //! "research", "screening", "reference_validated").
 //!
-//! Known provenance caveat, CLOSED round 10 + round 11: claims can
-//! differ by fetch route. (a) RANGES: JATS preserves U+2013,
+//! Known provenance caveat: claims can differ by fetch route.
+//! CLOSED for (a)+(b) round 10 + round 11; REOPENED as (c) round 11,
+//! recorded round 12.
+//!
+//! (a) RANGES: JATS preserves U+2013,
 //! `pdf-extract` normalises ranges to '-'. Until round 10 the engine
 //! refused the en-dash endpoints but stamped the ASCII ones
 //! (compound-friendly, by decision), so the same paper yielded different
@@ -34,6 +37,14 @@
 //! "\u{2212}1350" dropped NoSpan -> MissingQuote (misfiled as the
 //! model's fault) while "-1350" stamped. The sign now attaches to the
 //! plain form too; both routes stamp.
+//! (c) SEPARATOR SHAPES, OPENED round 11: JATS typesets the
+//! label/value separator as U+2013; `pdf-extract` emits '-'. Round
+//! 11's revert made U+2013/U+2014 non-sign glyphs, so the JATS
+//! spelling of a separator shape ("UTS \u{2013}950 MPa") drops — while
+//! the SAME sentence fetched through the PDF route ("UTS -950 MPa")
+//! stamps the negative and drops the correct positive. The divergence
+//! class (a)+(b) closed was reopened by the same commit that recorded
+//! closing it; see `number_needles`.
 //!
 //! RECORDED, NOT FIXED (round 9) — the largest remaining structural
 //! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
@@ -1065,11 +1076,30 @@ fn trailing_word(prefix: &str) -> String {
 /// dropped the correct +950, recording tensile as compressive, the exact
 /// fabrication this branch exists to stop. The minus and separator
 /// readings are locally indistinguishable (both word/dash/digit), so the
-/// branch's priority decides: a fabrication is worse than a miss. U+2212
-/// stays a sign glyph — unambiguously a minus, never a separator. The
-/// true negative under U+2013/U+2014 drops again (recall loss, carried
-/// as corpus KNOWN rows), the round-7/9 position restored; every
-/// separator shape and every sign-flipped twin is a corpus MustDrop pin.
+/// branch's priority decides: a fabrication is worse than a miss.
+///
+/// COVERAGE, corrected round 12 (the round-11 record overclaimed): the
+/// revert holds for U+2013/U+2014 ONLY. U+2212 stays a sign glyph and
+/// ASCII '-' always was one, so the SAME separator shapes stamp a
+/// negative under those two glyphs — measured at HEAD: "Ti-6Al-4V UTS
+/// -950 MPa (longitudinal)" and its U+2212 twin stamp -950, "Table 2
+/// Ti-6Al-4V - UTS -950 MPa - elongation 12 %" stamps -950, "Inconel
+/// 718 - yield strength -1100 MPa - as built" stamps -1100, each
+/// dropping the correct positive. The engine has NO minus-vs-separator
+/// discriminator under ANY glyph: round 11 changed WHICH glyphs carry
+/// signed needles, not how a needle is read — "unambiguously a minus,
+/// never a separator" described the glyph's typography, not the code.
+/// Under U+2013/U+2014 the true negative drops (recall loss, corpus
+/// KNOWN rows) and the separator shapes drop (corpus MustDrop pins);
+/// under '-' and U+2212 the separator shapes STAMP — an open
+/// fabrication channel, unpinned at this commit.
+///
+/// FETCH ROUTE, the module header's class reopened: the header records
+/// that pdf-extract emits '-' where JATS typesets U+2212, and the same
+/// holds for separator dashes (JATS U+2013 -> pdf-extract '-'). The
+/// paper whose JATS spelling ("UTS \u{2013}950 MPa") round 11 pinned
+/// MustDrop fabricates -950 when fetched through the PDF route — the
+/// divergence (a)+(b) closed, reopened by the commit that closed it.
 ///
 /// FIXED, ROUND 9 (was RECORDED, NOT FIXED, round 8): the sign flip
 /// stamped through U+2010, U+2011, U+2012, U+2014, U+2015 and U+FE63 as
