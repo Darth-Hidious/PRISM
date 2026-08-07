@@ -1301,12 +1301,17 @@ fn corpus() -> Vec<CorpusCase> {
         // the engine STAMPS: the dash separates the label from its value
         // ('residual stress - 950 MPa'), so under round 11's convention
         // the source value is +950 and a -950 claim fabricates the sign.
-        // These six rows STAMP -950 at this commit and STAY RED: no
-        // minus-vs-separator discriminator exists under '-' / U+2212
-        // (round 11's measurement), and removing them from the needle
-        // set would lose ALL genuine negative recall (the Seebeck -11.5,
-        // residual -350 KNOWN rows). A row that stamps exercises NO
-        // guard — it documents a live fabrication, not a guard pin.
+        // ROUND 16 closed FOUR of these six: the SeparatorDash guard
+        // refuses the label-inline shape (the object's own name abuts
+        // the dash) and the bracketed shape (a dash glued to the unit
+        // right after the value) on a SIGNED predicate, where SignDomain
+        // cannot help. The TWO line-start shapes stay RED as known( — a
+        // LIVE fabrication the engine cannot yet refuse: a leading dash
+        // has no preceding word (no name-abuts signal) and no trailing
+        // dash after the unit (no parenthetical signal), and it is
+        // locally indistinguishable from a genuine line-start minus
+        // ('-350 MPa was the surface stress' stamps). Refusing it would
+        // lose that true-minus recall. See the per-row reasons below.
         // Ground truth is WEAKER than the UTS rows beneath: a
         // longitudinal compressive residual stress of -950 MPa is
         // physically plausible, so unlike a negative UTS (impossible a
@@ -1317,15 +1322,15 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 15 item 1: the dangerous half — the ASCII '-' spelling \
-             on a SIGNED predicate STAMPS -950 (no refusal). residual_stress \
-             is signed so SignDomain does not fire, and '-' is a real minus \
-             needle that matches the source's separator dash (the dash \
-             separates 'residual stress' from '950 MPa', source value +950, \
-             so -950 fabricates the sign). Ground truth weaker than the UTS \
-             twin: a compressive residual stress of -950 MPa is plausible, so \
-             this is a sign fabrication, not an impossible value. No guard \
-             refuses it — it documents the live fabrication item 2 records",
+            "round 16 item 2: GROUND TRUTH — the dash separates 'residual \
+             stress' from '950 MPa', so the source value is +950 and a -950 \
+             claim fabricates the sign; a longitudinal compressive residual \
+             of -950 MPa is plausible, so this is a sign fabrication, \
+             weaker than the impossible-negative UTS twin. MECHANISM — the \
+             SeparatorDash guard (round 16) refuses it: the object's own name \
+             'residual stress' abuts the dash, the separator signal; deleting \
+             sub-condition (A) of separator_or_paren_dash_on_signed_value \
+             reddens this row",
         ),
         case(
             "Ti-6Al-4V residual stress \u{2212}950 MPa (longitudinal)",
@@ -1333,32 +1338,43 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 15 item 1: the U+2212 twin of the dangerous half — STAMPS \
-             -950 (no refusal) by the same path as the ASCII spelling above; \
-             the U+2212 glyph round 11 kept AS a sign needle is exactly why \
-             this row cannot drop on a signed predicate. Ground truth as above",
+            "round 16 item 2: GROUND TRUTH as the ASCII twin above (dash \
+             separates label from value, source +950, -950 fabricates the \
+             sign; weaker than the impossible-negative UTS twin). MECHANISM — \
+             SeparatorDash via the same object-name-abuts path (A); U+2212 is \
+             a real sign needle so the needle matches, but the guard refuses \
+             the separator shape",
         ),
-        case(
+        known(
             "-950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 15 item 1: the ASCII line-start separator on a SIGNED \
-             predicate STAMPS -950 (no refusal) — the UTS twin of this shape \
-             drops only via SignDomain, which a signed predicate bypasses; \
-             ground truth weaker than the UTS twin (compressive residual is \
-             plausible), so this is a sign fabrication",
+            "round 16 item 2: GROUND TRUTH — a leading dash at line start \
+             separates the value from nothing (no label before it), source \
+             value +950, so -950 fabricates the sign; weaker than the UTS \
+             twin (a compressive residual is plausible). MECHANISM — a LIVE \
+             fabrication the engine CANNOT yet refuse: the line-start shape \
+             has no preceding word (so the object-name-abuts signal is \
+             absent) and no trailing dash after the unit (so the \
+             parenthetical signal is absent), and it is locally \
+             indistinguishable from a genuine line-start minus ('\u{2212}350 \
+             MPa was the surface stress' stamps). Refusing it would lose that \
+             true-minus recall. Carried as known(MustDrop) — a documented \
+             fabrication, NOT an accepted drop; the tripwire fires the day a \
+             guard learns the line-start shape",
         ),
-        case(
+        known(
             "\u{2212}950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 15 item 1: the U+2212 line-start separator on a SIGNED \
-             predicate STAMPS -950 (no refusal) — the same path as the ASCII \
-             twin; ground truth as above",
+            "round 16 item 2: GROUND TRUTH as the ASCII twin above (line-start, \
+             source +950, -950 fabricates the sign; weaker than UTS). \
+             MECHANISM — a LIVE fabrication the engine cannot yet refuse; same \
+             path as the ASCII twin",
         ),
         case(
             "The Ti-6Al-4V result -950 MPa- matched the target.",
@@ -1366,9 +1382,13 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 15 item 1: the ASCII bracketed separator on a SIGNED \
-             predicate STAMPS -950 (no refusal); the UTS twin drops only via \
-             SignDomain. Ground truth as above",
+            "round 16 item 2: GROUND TRUTH — the bracketing dashes separate \
+             'result' from '950 MPa', source +950, -950 fabricates the sign; \
+             weaker than the UTS twin (compressive residual is plausible). \
+             MECHANISM — the SeparatorDash guard (round 16) refuses it: a dash \
+             glued to the unit right after the value ('MPa-') is the closing \
+             parenthetical a minus never carries; deleting sub-condition (B) \
+             reddens this row",
         ),
         case(
             "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
@@ -1376,8 +1396,10 @@ fn corpus() -> Vec<CorpusCase> {
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 15 item 1: the U+2212 bracketed separator on a SIGNED \
-             predicate STAMPS -950 (no refusal); ground truth as above",
+            "round 16 item 2: GROUND TRUTH as the ASCII twin above (bracketing \
+             dashes, source +950, -950 fabricates the sign; weaker than UTS). \
+             MECHANISM — SeparatorDash via the same trailing-paren-dash path \
+             (B)",
         ),
         case(
             "Ti-6Al-4V UTS -950 MPa (longitudinal)",

@@ -176,6 +176,22 @@
 //! minus sign), and the U+2013 drop is round 11's price (justified by
 //! item 2 above), carried as corpus KNOWN rows. See `number_needles`.
 //!
+//! ROUND 16 ITEM 1 — superseding the round-15 verdict above for FOUR of
+//! the six ASCII '-' / U+2212 residual_stress separator rows: those
+//! glyphs ARE refusable on a signed predicate after all, by reading the
+//! DASH'S ROLE rather than its glyph. `RefusalGuard::SeparatorDash`
+//! refuses (A) the label-inline shape — the object's own name abuts the
+//! dash ("residual stress -950 MPa") — and (B) the bracketed shape — a
+//! dash glued to the unit right after the value ("result -950 MPa-").
+//! Both close WITHOUT over-refusal: every true negative (Seebeck,
+//! cryo-temp, residual -350, the -1350 family, a genuine line-start
+//! minus) still stamps, because a true minus follows a verb/preposition,
+//! never the object name, and never carries a trailing parenthetical
+//! dash. The TWO line-start shapes ("-950 MPa was recorded") stay open
+//! as corpus KNOWN rows: a leading dash has neither signal and is
+//! locally indistinguishable from a genuine line-start minus. The
+//! U+2013/U+2014 half is untouched (no needle, still NoSpan).
+//!
 //! RECORDED, NOT FIXED (round 9) — the largest remaining structural
 //! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
 //! both shapes pass every guard this branch built:
