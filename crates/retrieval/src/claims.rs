@@ -86,13 +86,15 @@
 //! ADOPTED a head-noun SUFFIX rule — every `*strength`, `*hardness` and
 //! `*grain size` is non-negative and has NO signed homograph, so 16 of
 //! the 22 spellings now drop a negative (was 5). The round-13 record
-//! ALSO claimed `0 over-refusal` here — that is FALSE and corrected
-//! below: at HEAD 27 signed spellings (differential phrasing like
+//! ALSO claimed `0 over-refusal` here — that was FALSE: at the
+//! round-13 HEAD 27 signed spellings (differential phrasing like
 //! `change in yield strength`, `difference in hardness`, plus the
 //! genuinely-signed homographs `signal strength` / `field strength`)
-//! return Err(Guarded{SignDomain}). See the fn doc on
-//! `is_nonnegative_quantity` for the measured over-refusal and the
-//! control-set blind spot. `density` stays EXACT: charge/current
+//! returned Err(Guarded{SignDomain}). Round 14 item 1 corrected that
+//! record and round 14 item 3 REPAIRED it: a whole-word differential
+//! marker, or a signal/field-strength homograph, now exempts the
+//! phrase from the suffix rule so those 27 stamp again (see
+//! `is_nonnegative_quantity`). `density` stays EXACT: charge/current
 //! density can be negative, so `relative density` / `bulk density`
 //! still fabricate (6 spellings open). See `is_nonnegative_quantity`.
 //!
@@ -812,6 +814,44 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
 const NONNEGATIVE_QUANTITIES: &[&str] =
     &["uts", "hardness", "density", "grain size", "yield strength"];
 
+/// Round 14 item 3: a differential marker as a WHOLE WORD turns an
+/// otherwise-non-negative magnitude into a SIGNED delta. `change in
+/// yield strength`, `difference in hardness`, `delta grain size`,
+/// `reduction in strength`, `gradient in hardness` can all be negative
+/// though the bare noun is a magnitude — so a suffix match on the noun
+/// must NOT refuse them. Matched as whole tokens (`split_whitespace`)
+/// so `change` does not fire inside `exchange`.
+///
+/// Deliberately NOT in this list: `relative` and `anisotropy`, which
+/// denote RATIOS (non-negative), not deltas — adding them would license
+/// fabrications like `relative density = -0.5`. `relative strength` /
+/// `anisotropy in strength` therefore stay refused (measured, reported
+/// in round 14): a negative under them is nonsense. Each marker below
+/// IS pinned by its own control row in
+/// `sign_domain_matches_head_noun_suffix_without_over_refusal` —
+/// removing it from this slice reddens that row (no cannot-fail entry).
+const SIGNED_DIFFERENTIAL_MARKERS: &[&str] = &[
+    "change",
+    "difference",
+    "delta",
+    "reduction",
+    "loss",
+    "increase",
+    "deviation",
+    "variation",
+    "gradient",
+];
+
+/// Round 14 item 3: genuinely-SIGNED homographs of the `*strength`
+/// suffix. `signal strength` (dBm is routinely negative) and
+/// `*field strength` (signed vector components) are magnitudes that CAN
+/// be negative, so the suffix rule must not refuse them. Matched by
+/// `ends_with` so `magnetic field strength` / `electric field strength`
+/// are caught by the `field strength` entry. NOT here: `ionic strength`,
+/// `dielectric strength` — genuinely non-negative, kept refused (pinned
+/// by forward control rows in the same test).
+const SIGNED_STRENGTH_HOMOGRAPHS: &[&str] = &["signal strength", "field strength"];
+
 /// Round 13 item 5: the exact-match closure was SPELLING-SCOPED — of 22
 /// common spellings only the five canonical dropped a negative; 17
 /// stamped one. Closing it with "more entries" would be another word
@@ -824,33 +864,43 @@ const NONNEGATIVE_QUANTITIES: &[&str] =
 /// `density`: `charge density` / `current density` can be negative, so
 /// `density` stays EXACT and `relative density` / `bulk density` still
 /// fabricate (the measured price of not over-refusing the signed
-/// densities). TWO claims in the round-13 record here are FALSE and
-/// corrected in round 14 item 1 (this commit; comment-only, no
-/// behaviour change):
-///   (1) `0 over-refusal` is FALSE. At HEAD 27 signed spellings return
-///       Err(Guarded{SignDomain}) under this suffix rule: the
-///       differential family (`change in yield strength`, `reduction
-///       in strength`, `difference in hardness`, `delta hardness`,
-///       `change in grain size`, ...) and the genuinely-signed
-///       homographs (`signal strength`, `field strength`, `magnetic
-///       field strength`). `ionic strength` / `dielectric strength` /
-///       `water hardness` ARE correctly refused (plain-noun reasoning
-///       holds); it is DIFFERENTIAL phrasing that breaks the rule.
-///   (2) `Every suffix is pinned both directions` is FALSE for the
-///       over-refusal direction. Mutating `ends_with("strength")` or
-///       `ends_with("hardness")` to `contains(...)` leaves the suite
-///       fully green (87 lib + 1 corpus); only the `grain size` arm
-///       reddens, and only because its control `grain size difference`
-///       CONTAINS the substring. The signed control set has NO entry
-///       containing `strength` or `hardness` at all, so it cannot
-///       trap over-refusal of those two arms — the control was built
-///       for the OLD exact-match failure mode, and the word order that
-///       exposes an `ends_with` rule (the signed word FIRST, e.g.
-///       `change in strength`) is absent from it. The FORWARD
-///       direction (a negative under `tensile strength` etc. drops) IS
-///       pinned. The over-refusal direction is repaired in the commits
-///       that follow (control set, then the rule, then trailing units).
+/// densities). Round 14 item 1 corrected the round-13 record that had
+/// wrongly certified this rule's over-refusal as handled; round 14
+/// items 2/3 REPAIR the over-refusal direction. Two exceptions now gate
+/// the suffix rule, BOTH checked before it:
+///   (a) A whole-word DIFFERENTIAL marker (`change`, `difference`,
+///       `delta`, `reduction`, `loss`, `increase`, `deviation`,
+///       `variation`, `gradient`; see `SIGNED_DIFFERENTIAL_MARKERS`)
+///       anywhere makes the quantity a signed delta — `change in yield
+///       strength`, `difference in hardness`, `delta grain size` can be
+///       negative though the bare noun is a magnitude — so the suffix
+///       rule must not refuse them. `relative` / `anisotropy` are NOT
+///       markers (ratios, non-negative) — see the const doc.
+///   (b) `signal strength` and `*field strength` are genuinely-signed
+///       homographs of the suffix (see `SIGNED_STRENGTH_HOMOGRAPHS`).
+///       `ionic strength` / `dielectric strength` stay refused.
+/// BOTH directions are pinned by the lib test
+/// `sign_domain_matches_head_noun_suffix_without_over_refusal`: the
+/// forward rows drop a negative (reverting the suffix rule reddens
+/// them), and the over-refusal rows stamp — removing any one marker, or
+/// the homograph slice, reddens its own row. No arm or marker is
+/// cannot-fail.
 fn is_nonnegative_quantity(object_n: &str) -> bool {
+    // A whole-word differential marker makes the quantity a signed delta:
+    // checked FIRST so `change in yield strength` stamps, not over-refuses.
+    if object_n
+        .split_whitespace()
+        .any(|t| SIGNED_DIFFERENTIAL_MARKERS.contains(&t))
+    {
+        return false;
+    }
+    // signal/field strength are genuinely-signed homographs of *strength.
+    if SIGNED_STRENGTH_HOMOGRAPHS
+        .iter()
+        .any(|h| object_n.ends_with(h))
+    {
+        return false;
+    }
     NONNEGATIVE_QUANTITIES.contains(&object_n)
         || object_n.ends_with("strength")
         || object_n.ends_with("hardness")
@@ -1888,16 +1938,20 @@ mod tests {
         assert!(r.is_ok(), "must not panic and must find the support: {r:?}");
     }
 
-    /// Round 13 item 5: the SignDomain guard now matches by head-noun
-    /// SUFFIX (every *strength/*hardness/*grain size is non-negative),
-    /// not exact equality. Pin BOTH directions: the newly-caught
-    /// spellings now drop a negative (was stamping), and the signed
-    /// homograph traps still stamp (no over-refusal).
+    /// Round 13 item 5 + round 14 items 2/3: the SignDomain guard matches
+    /// by head-noun SUFFIX (every *strength/*hardness/*grain size is
+    /// non-negative), with round-14 exceptions for differential phrasing
+    /// and signal/field-strength homographs. Pin BOTH directions: the
+    /// forward rows drop a negative under a non-negative spelling, and the
+    /// over-refusal rows stamp under a legitimately-signed one. No arm or
+    /// marker is cannot-fail — each reddens under its own revert.
     #[test]
     fn sign_domain_matches_head_noun_suffix_without_over_refusal() {
-        // Newly caught: a negative under these stamped at exact-match
-        // and drops under the suffix rule. Reverting is_nonnegative_quantity
-        // to NONNEGATIVE_QUANTITIES.contains(...) reddens every one.
+        // Forward direction: a negative under a genuinely-non-negative
+        // spelling MUST be refused (is_err). Reverting the suffix rule to
+        // exact-match reddens every row. `ionic strength` / `dielectric
+        // strength` pin that the round-14 exceptions do NOT over-allow a
+        // genuinely-non-negative homograph.
         for nonneg_spelling in [
             "tensile strength",
             "ultimate tensile strength",
@@ -1906,6 +1960,8 @@ mod tests {
             "average grain size",
             "compressive strength",
             "0.2% yield strength",
+            "ionic strength",
+            "dielectric strength",
         ] {
             let prose = format!("The Ti-6Al-4V {nonneg_spelling} was -950 MPa.");
             let r = supporting_quote_or_refusal("Ti-6Al-4V", nonneg_spelling, Some(-950.0), &prose);
@@ -1914,10 +1970,13 @@ mod tests {
                 "suffix rule must drop a negative under {nonneg_spelling:?}: {r:?}"
             );
         }
-        // Over-refusal controls: a negative under these MUST still stamp
-        // (legitimately signed). 'density' stays EXACT precisely because
-        // charge density / current density / density change can be
-        // negative; 'stress' is not 'strength'; a difference is signed.
+        // Over-refusal direction: a negative under a legitimately-SIGNED
+        // spelling MUST stamp (is_ok). The first six are the round-13
+        // controls (kept). The next nine pin the differential markers:
+        // removing any one marker from SIGNED_DIFFERENTIAL_MARKERS
+        // reddens its row. The last four pin the signal/field
+        // homographs: removing SIGNED_STRENGTH_HOMOGRAPHS (or the
+        // field-strength entry) reddens them.
         for signed_spelling in [
             "residual stress",
             "Seebeck coefficient",
@@ -1925,6 +1984,19 @@ mod tests {
             "current density",
             "density change",
             "grain size difference",
+            "change in yield strength",
+            "difference in hardness",
+            "delta grain size",
+            "reduction in strength",
+            "loss of strength",
+            "increase in tensile strength",
+            "deviation in strength",
+            "variation in grain size",
+            "gradient in hardness",
+            "signal strength",
+            "field strength",
+            "magnetic field strength",
+            "electric field strength",
         ] {
             let prose = format!("The Ti-6Al-4V {signed_spelling} was -950 MPa.");
             let r = supporting_quote_or_refusal("Ti-6Al-4V", signed_spelling, Some(-950.0), &prose);
