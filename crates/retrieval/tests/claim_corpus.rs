@@ -30,7 +30,11 @@
 //! object, value) tuple cannot express: round-3 tautological
 //! containment. It lives in `validate_and_stamp` -> `quote_in_block`,
 //! which needs an `ExtractedClaim` carrying an LLM-supplied quote —
-//! claim + block -> stamped/dropped, same two scoreboard axes.
+//! claim + block -> stamped/dropped, same two scoreboard axes. Round
+//! 10: this table carries `known` markers under the same tripwire too —
+//! the unit-mismatch gap (the claim's unit is never checked against the
+//! block) is its first entry, expressible only here because only this
+//! tuple has a unit field.
 
 use prism_retrieval::claims::{
     ClaimProvenance, EVIDENCE_RESEARCH, ExtractedClaim, supporting_quote, validate_and_stamp,
@@ -1221,10 +1225,13 @@ fn corpus() -> Vec<CorpusCase> {
         // H1's space requirement cost (round 9): a label number with a
         // GLUED unit drops — the exemption demands the space, the
         // boundary check cannot redeem what the Label guard refuses
-        // afterwards. Six forms, recorded so the cost is visible; round
-        // 10 removed cross-section 10mm — a position, not a property, so
-        // its drop is correct, not a cost (the twins sit with the
-        // label/sample/run family above).
+        // afterwards. Fourteen forms, recorded so the cost is visible;
+        // round 10 removed cross-section 10mm — a position, not a
+        // property, so its drop is correct, not a cost (the twins sit
+        // with the label/sample/run family above) — and added the eight
+        // glued losses the round-9 word list caused, one per new label
+        // word: coupon 3mm, specimen 5mm, panel 2mm, test 950MPa, scan
+        // step 50um, batch 25kg, condition 980C, trial 30min.
         known(
             "Each Ti-6Al-4V sample 3mm thick was ground and polished.",
             "Ti-6Al-4V",
@@ -1273,6 +1280,157 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "KNOWN: glued recall lost to H1's space requirement — sample 5wt%",
         ),
+        known(
+            "Each Ti-6Al-4V coupon 3mm thick was weighed.",
+            "Ti-6Al-4V",
+            "thickness",
+            3.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — coupon 3mm, \
+             one of the eight losses the round-9 word list caused",
+        ),
+        known(
+            "Each Ti-6Al-4V specimen 5mm thick was sectioned.",
+            "Ti-6Al-4V",
+            "thickness",
+            5.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — specimen 5mm",
+        ),
+        known(
+            "The AlSi10Mg panel 2mm thick was cut.",
+            "AlSi10Mg",
+            "thickness",
+            2.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — panel 2mm",
+        ),
+        known(
+            "The Ti-6Al-4V test 950MPa peak UTS was logged.",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — test 950MPa",
+        ),
+        known(
+            "The AlSi10Mg scan step 50um was imaged.",
+            "AlSi10Mg",
+            "scan_step_size",
+            50.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — scan step 50um",
+        ),
+        known(
+            "The Ti-6Al-4V batch 25kg was melted.",
+            "Ti-6Al-4V",
+            "mass",
+            25.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — batch 25kg",
+        ),
+        known(
+            "The Ti-6Al-4V condition 980C soak was logged.",
+            "Ti-6Al-4V",
+            "temperature",
+            980.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — condition 980C",
+        ),
+        known(
+            "The Inconel 718 trial 30min ran to completion.",
+            "Inconel 718",
+            "duration",
+            30.0,
+            Expect::MustStamp,
+            "KNOWN: glued recall lost to H1's space requirement — trial 30min",
+        ),
+        // ---------------- KNOWN failures, round-10 structural gaps ----
+        // Gaps earlier rounds documented in PROSE but never pinned. A
+        // doc comment cannot tell anyone when a gap closes or widens;
+        // the KNOWN mechanism exists exactly for that and was used for
+        // fourteen other items.
+        known(
+            "The Ti-6Al-4V UTS was 950 MPa.",
+            "Ti-6Al-4V",
+            "density",
+            950.0,
+            Expect::MustDrop,
+            "KNOWN: object-blind attribution — the twin of the subject-blind \
+             KNOWN row. The span names UTS, never density, yet the number \
+             stamps for ANY claimed object because support checks the \
+             presence of subject OR object, not which property the number \
+             belongs to",
+        ),
+        known(
+            "The Ti-6Al-4V UTS was 950 MPa and the yield strength 880 MPa.",
+            "Ti-6Al-4V",
+            "yield_strength",
+            950.0,
+            Expect::MustDrop,
+            "KNOWN: predicate binding, the largest remaining structural gap \
+             in the claims.rs module doc, recorded in prose there since \
+             round 9 but never pinned: THE VALUE IS NEVER TIED TO THE \
+             PREDICATE. 950 belongs to UTS in this sentence, yet the \
+             yield_strength claim stamps — and the correct 880 claim stamps \
+             indistinguishably beside it",
+        ),
+        known(
+            "UTS (MPa) | 950 | 300",
+            "Ti-6Al-4V",
+            "UTS",
+            300.0,
+            Expect::MustDrop,
+            "KNOWN: transposed tables — the row carries two columns and the \
+             engine cannot tell them apart. 950 (the UTS column) stamps \
+             correctly and 300 (another column) stamps as UTS too: row-span \
+             support is co-occurrence, not column binding",
+        ),
+        known(
+            "The Ti-6Al-4V microstructures are shown in 4a and 4b.",
+            "Ti-6Al-4V",
+            "UTS",
+            4.0,
+            Expect::MustDrop,
+            "KNOWN: sub-panel letters without the label word in the span — \
+             'Figure' sits in an earlier sentence, the label guard never \
+             sees it, and the glued 'a' redeems 4 through unit_initial",
+        ),
+        known(
+            "Specimens 3 and 4 of Ti-6Al-4V were tested.",
+            "Ti-6Al-4V",
+            "UTS",
+            4.0,
+            Expect::MustDrop,
+            "KNOWN: the plural leak at the conjunction tail — LABEL_WORDS \
+             carries singulars only, 'specimens' is not a label word, so \
+             the walk lands on a non-label head and 4 stamps. claims.rs \
+             argues against adding the WORD unpinned; that is not an \
+             argument against pinning the gap, and a KNOWN row cannot \
+             itself be a cannot-fail item — the tripwire fires the day the \
+             plural closes",
+        ),
+        known(
+            "Specimens 3 and 4 of Ti-6Al-4V were tested.",
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            Expect::MustDrop,
+            "KNOWN: the same plural leak at the list head — 3 sits directly \
+             after 'specimens', no conjunction walk involved",
+        ),
+        known(
+            "The Ti-6Al-4V powder came from U-235 stock.",
+            "Ti-6Al-4V",
+            "UTS",
+            235.0,
+            Expect::MustDrop,
+            "KNOWN: joins_compound's surviving effect after the range guard \
+             took digit/dash/digit — LETTER-dash-digit compounds still pass \
+             the boundary and stamp. U-235 is a mass-number designator, not \
+             a measurement. This row is deliberately joins_compound's only \
+             pin: a green stamp-pin here would certify a fabrication",
+        ),
     ]
 }
 
@@ -1288,6 +1446,8 @@ struct ValidationCase {
     block: &'static str,
     expect: Expect,
     reason: &'static str,
+    /// KNOWN failure of the current code; see the module docs.
+    known: bool,
 }
 
 fn validation_claim(case: &ValidationCase) -> ExtractedClaim {
@@ -1328,6 +1488,7 @@ fn validation_corpus() -> Vec<ValidationCase> {
         block: BLOCK,
         expect,
         reason,
+        known: false,
     };
     vec![
         fact(
@@ -1366,6 +1527,20 @@ fn validation_corpus() -> Vec<ValidationCase> {
             "containment is block-contains-quote, never the reverse: a quote \
              that parrots the block and appends a fabricated sentence drops",
         ),
+        ValidationCase {
+            subject: "CoCrFeNi",
+            object: "thermal_conductivity",
+            value: Some(11.5),
+            unit: Some("QUDT:GigaPA"),
+            quote: Some("thermal conductivity is 11.5 W/(m K)"),
+            block: BLOCK,
+            expect: Expect::MustDrop,
+            reason: "KNOWN round 10: the unit is never checked — the claim says \
+                     GPa, the block says W/(m K), and containment reads only \
+                     text, so a wrong-unit claim stamps with a verbatim quote. \
+                     Ground truth: a unit the block contradicts is not support",
+            known: true,
+        },
     ]
 }
 
@@ -1415,7 +1590,7 @@ fn claim_corpus_two_sided_scoreboard() {
             "  validation: {} / {} = {:?} quote {:?}\n    in {:?}\n    reason: {}",
             case.subject, case.object, case.value, case.quote, case.block, case.reason
         );
-        record(stamped, case.expect, false, line);
+        record(stamped, case.expect, case.known, line);
     }
 
     let failed = !stamped_when_must_drop.is_empty()

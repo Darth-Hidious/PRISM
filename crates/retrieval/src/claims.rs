@@ -43,8 +43,11 @@
 //!
 //! Right number, wrong property, wrong unit, perfect provenance.
 //! Closing it needs predicate/value binding in the span scan and a
-//! unit-match check in `validate_and_stamp` — deliberately not
-//! attempted this round.
+//! unit-match check in `validate_and_stamp`. Round 10 pinned both
+//! shapes as KNOWN corpus rows — the predicate-binding case in the
+//! main table, the unit-mismatch case in the validation table, which
+//! is the only tuple with a unit field — so the record of the gap
+//! lives on the scoreboard, where it cannot go stale, instead of here.
 
 use serde::{Deserialize, Serialize};
 
@@ -802,9 +805,10 @@ const LABEL_WORDS: &[&str] = &[
     // page 12, Appendix 2, and Grade 5 (a designator doubly wrong:
     // Ti-6Al-4V IS grade 5). Every word is pinned by a corpus case;
     // the unit exemption keeps methods prose stamping. Singular forms
-    // only — the plural leaks ("Specimens 3 and 4") stay
-    // RECORDED-NOT-FIXED until a case pins each: an unpinned list
-    // entry is a cannot-fail item.
+    // only — the WORD list stays singular because an unpinned list
+    // entry is a cannot-fail item; the plural leak itself ("Specimens
+    // 3 and 4" stamps) is pinned on the scoreboard as a KNOWN gap
+    // since round 10, so the record of it can no longer go stale.
     "specimen",
     "batch",
     "coupon",
@@ -973,12 +977,15 @@ fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
     // `clean_number_boundary` redeems glued-unit recall was FALSE):
     // passing the boundary check only avoids the Boundary guard; THIS
     // guard fires afterwards and nothing redeems it. The space
-    // requirement silently costs six glued recall forms, carried as
-    // KNOWN failures in tests/claim_corpus.rs: sample 3mm, run 30min,
-    // sample 980°C, samples 5mm, sample 30um, sample 5wt%. Round 10
-    // removed cross-section 10mm from this list: that claim is a
-    // position, not a property of the alloy — its drop is correct, not
-    // a cost. Recorded residue: a SPACED single-letter unit
+    // requirement silently costs fourteen glued recall forms, carried
+    // as KNOWN failures in tests/claim_corpus.rs: sample 3mm,
+    // run 30min, sample 980°C, samples 5mm, sample 30um, sample 5wt%,
+    // and — round 10, the bill for the nineteen round-9 words —
+    // coupon 3mm, specimen 5mm, panel 2mm, test 950MPa, scan step
+    // 50um, batch 25kg, condition 980C, trial 30min. Round 10 removed
+    // cross-section 10mm from this list: that claim is a position, not
+    // a property of the alloy — its drop is correct, not a cost.
+    // Recorded residue: a SPACED single-letter unit
     // still exempts ("Table 4 K values" stamps 4) — see the corpus
     // KNOWN cases in tests/claim_corpus.rs.
     if hay[end..].starts_with(' ') && unit_follows(hay, end) {
