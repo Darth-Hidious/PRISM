@@ -734,32 +734,13 @@ fn walk_comma_items(prefix: &mut String, word: &mut String) {
     }
 }
 
-/// Byte length of the trailing run of digits and range dashes in
-/// `prefix` ("25\u{2013}27", "26"), or 0 when it holds no digit. One
-/// conjunction step consumes exactly one such run — the old unbounded
-/// trim that ate every digit, comma and space backwards is gone.
-fn trailing_digit_run_len(prefix: &str) -> usize {
-    let mut len = 0;
-    let mut saw_digit = false;
-    for c in prefix.chars().rev() {
-        if c.is_ascii_digit() {
-            saw_digit = true;
-            len += c.len_utf8();
-        } else if matches!(c, '-' | '\u{2013}' | '\u{2014}') {
-            len += c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    if saw_digit { len } else { 0 }
-}
-
 /// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
 /// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
 /// not evidence for a property value. Continuations of a label list are
 /// caught by stepping back over them to the head word: ", <number>"
-/// items repeatedly ("Refs. 25, 26"), then one conjunction and one
-/// number-run ("Tables 1 and 2", "Refs. 25\u{2013}27 and 28").
+/// items repeatedly ("Refs. 25, 26"), then one conjunction and the
+/// number-run before it ("Tables 1 and 2", "Refs. 25\u{2013}27 and 28",
+/// "Sections 3.1 and 4").
 ///
 /// The walk runs only for REFERENCE lists: the chain continuing after
 /// the occurrence decides. It ends in a unit -> value list -> the label
@@ -769,6 +750,17 @@ fn trailing_digit_run_len(prefix: &str) -> usize {
 /// the discriminator the walk never looked at; without it the walk
 /// stepped from a value back over the locator label and dropped every
 /// value in the list.
+///
+/// The conjunction step trims the number-run before the conjunction
+/// GREEDILY — digits, dots, commas, spaces and dashes — because dotted
+/// labels are ubiquitous ("Sections 3.1 and 4", "Eqs. 2.1 and 3"): a
+/// trim that stops at the '.' strands "3" as the head word and never
+/// reaches "sections". Reference lists carry no units, so the walk
+/// cannot be rescued by a unit check; a value list with a unit never
+/// walks at all (`chain_ends_in_unit`), and one without a unit lands on
+/// its real head word ("measured"), not a label. Round 6 bounded this
+/// trim to one number-run; the bound opened dotted-label fabrications
+/// and reddened nothing on revert, so it is gone.
 fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
     let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']).to_string();
     let mut word = trailing_word(&prefix);
@@ -776,18 +768,12 @@ fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
         walk_comma_items(&mut prefix, &mut word);
         if LIST_CONTINUATIONS.contains(&word.as_str()) {
             prefix = prefix[..prefix.len() - word.len()]
-                .trim_end_matches(' ')
+                .trim_end_matches(|c: char| {
+                    c.is_ascii_digit()
+                        || matches!(c, ',' | ' ' | '.' | ':' | '-' | '\u{2013}' | '\u{2014}')
+                })
                 .to_string();
-            let run = trailing_digit_run_len(&prefix);
-            if run > 0 {
-                prefix = prefix[..prefix.len() - run]
-                    .trim_end_matches([' ', '.', ':'])
-                    .to_string();
-                word = trailing_word(&prefix);
-                walk_comma_items(&mut prefix, &mut word);
-            } else {
-                word = trailing_word(&prefix);
-            }
+            word = trailing_word(&prefix);
         }
     }
     LABEL_WORDS.contains(&word.as_str())
@@ -1856,7 +1842,7 @@ mod tests {
         );
         // "Eqs." joins the label family: the first number after it is a
         // label, and the conjunction step takes the "and 8" tail with it
-        // (the walk is bounded to one number-run per conjunction, but a
+        // (the walk trims the number-run before the conjunction, and a
         // reference list carries no units, so it still walks).
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
@@ -1878,6 +1864,61 @@ mod tests {
                 "UTS",
                 Some(950.0),
                 "As shown in Fig. 2 the Ti-6Al-4V UTS is 950 MPa."
+            )
+            .is_some()
+        );
+    }
+
+    /// Round 7: dotted section/equation numbering is ubiquitous, and
+    /// reference lists can be space-separated. The round-6 bound (one
+    /// number-run per conjunction) stopped at the '.' of "3.1", stranded
+    /// "3" as the head word and never reached "sections" — the trailing
+    /// number stamped. Reverting the walk-back to the greedy trim fixes
+    /// these and reddens nothing: reference lists carry no units, value
+    /// lists with a unit never walk at all (`chain_ends_in_unit`), and
+    /// value lists without one land on their real head word. The first
+    /// three asserts each go red when the greedy trim is narrowed back
+    /// to one number-run; the fourth pins the dotted list's head number
+    /// (label-word rule) and its dotted sibling (boundary rule).
+    #[test]
+    fn dotted_and_space_separated_label_lists_are_not_support() {
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "UTS",
+            4.0,
+            "Inconel 718 data are in Sections 3.1 and 4.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            3.0,
+            "The Ti-6Al-4V fit is given in Eqs. 2.1 and 3.",
+        );
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "creep_rate",
+            27.0,
+            "Inconel 718 creep is discussed in Refs. 25 26 and 27.",
+        );
+        // The head number of a dotted list stays refused too: the "3" of
+        // "Sections 3 and 3.1" is refused by the label word itself, its
+        // dotted sibling by the boundary rule.
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "UTS",
+            3.0,
+            "Inconel 718 data are in Sections 3 and 3.1.",
+        );
+
+        // Stamp direction: the greedy trim must not over-walk a VALUE
+        // list. Dotted values with no trailing unit walk back to their
+        // real head word, not a label, and stamp.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "batch_id",
+                Some(4.0),
+                "The Ti-6Al-4V batches were 3.1 and 4."
             )
             .is_some()
         );
