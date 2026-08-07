@@ -486,12 +486,24 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// table and PDF-extracted text where the space was lost: "950MPa",
 /// "1073K", "50um" / "50\u{b5}m", "5wt%". Deliberately an allow-list,
 /// not every letter: digit-then-letter gluing like "950x" (magnification)
-/// or "2e5" (scientific notation) is not number+unit and stays rejected,
-/// so 'e' and 'x' are absent on purpose. '\u{b5}' is present because
-/// U+00B5 MICRO SIGN is alphabetic.
-const UNIT_INITIALS: &[char] = &[
-    'a', 'c', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'm', 'n', 'p', 's', 't', 'u', 'v', 'w', '\u{b5}',
-];
+/// or "2e5" (scientific notation) is not number+unit and stays rejected.
+/// DERIVED, not hand-listed: the first letter of every `UNIT_TOKENS`
+/// entry, plus the glyphs PDF extractors actually emit where the token
+/// list spells the unit differently — U+03BC GREEK SMALL LETTER MU
+/// (extractors emit the Greek letter, not the U+00B5 MICRO SIGN the
+/// list carries, so both must open a glued unit), lowercased '\u{e5}'
+/// ("2.95\u{c5} lattice parameter"), and 'o', the mangled degree sign
+/// of "980oC". 'o' rides on the "ohm" token's initial today; it is
+/// listed anyway so the degree form survives "ohm" leaving the list.
+/// '\u{b0}' needs no entry: the degree sign is not alphanumeric, so a
+/// glued "980\u{b0}C" passes the boundary check regardless. The old
+/// hand-list carried 'd', 'f', 'l', which no unit token starts with —
+/// they are gone; the derivation keeps the list honest by construction.
+const EXTRA_UNIT_INITIALS: &[char] = &['\u{3bc}', '\u{e5}', 'o'];
+
+fn unit_initial(c: char) -> bool {
+    EXTRA_UNIT_INITIALS.contains(&c) || UNIT_TOKENS.iter().any(|t| t.starts_with(c))
+}
 
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
@@ -535,7 +547,7 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     }
     if let Some(after) = hay[end..].chars().next() {
         if after.is_alphanumeric() {
-            if !UNIT_INITIALS.contains(&after) {
+            if !unit_initial(after) {
                 return false;
             }
             // A glued unit letter redeems a number, but not a digit that
@@ -1507,6 +1519,75 @@ mod tests {
                 "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa."
             )
             .is_some()
+        );
+    }
+
+    /// Round 7: `UNIT_INITIALS` is DERIVED from `UNIT_TOKENS`, so it
+    /// cannot drift from the unit vocabulary the chain/`unit_follows`
+    /// checks already trust — plus the glyphs PDF extractors actually
+    /// emit. The round-6 hand-list was missing four: U+03BC GREEK MU
+    /// (extractors emit the Greek letter, not U+00B5 MICRO SIGN), 'o'
+    /// (the mangled degree sign of "980oC"), 'r' (though `rpm` IS a
+    /// unit token), and \u{e5} (angstrom). Each stamp assert reddens
+    /// when its glyph/initial is removed; the trailing assert pins the
+    /// allow-list half — a glued NON-unit letter must still drop.
+    #[test]
+    fn glued_units_with_pdf_glyphs_still_stamp() {
+        // U+03BC GREEK SMALL LETTER MU, the form PDF extractors emit.
+        assert!(
+            supporting_quote(
+                "AlSi10Mg",
+                "layer_thickness",
+                Some(30.0),
+                "AlSi10Mg was built with a 30\u{3bc}m layer thickness."
+            )
+            .is_some()
+        );
+        // 'o' — the degree-sign mangle of "980 \u{b0}C".
+        assert!(
+            supporting_quote(
+                "Inconel 718",
+                "temperature",
+                Some(980.0),
+                "Inconel 718 was solution treated at 980oC."
+            )
+            .is_some()
+        );
+        // 'r' — rpm is a UNIT_TOKEN, so its initial must open a glued unit.
+        assert!(
+            supporting_quote(
+                "Inconel 718",
+                "rotation_speed",
+                Some(1000.0),
+                "The Inconel 718 powder was blended at 1000rpm for 30 min."
+            )
+            .is_some()
+        );
+        // \u{e5} ANGSTROM, lowercased by containment normalization.
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "lattice_parameter",
+                Some(2.95),
+                "The Ti-6Al-4V beta lattice parameter was 2.95\u{c5}."
+            )
+            .is_some()
+        );
+
+        // Drop half: the allow-list is still an allow-list. A glued
+        // letter no unit token starts with stays rejected (mutation-
+        // proven red if unit_initial is broadened to every letter).
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            "The Ti-6Al-4V coupon was imaged at 950x magnification.",
+        );
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            "The Ti-6Al-4V coupon was indexed 950z in the log.",
         );
     }
 
