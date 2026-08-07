@@ -35,8 +35,9 @@
 //! list.
 //!
 //! Known provenance caveat: claims can differ by fetch route.
-//! CLOSED for (a)+(b) round 10 + round 11; REOPENED as (c) round 11,
-//! recorded round 12.
+//! CLOSED: (a)+(b) round 10 + round 11; (c) opened round 11, closed
+//! round 12 on the fabrication half (the recall half is carried as
+//! corpus KNOWN rows).
 //!
 //! (a) RANGES: JATS preserves U+2013,
 //! `pdf-extract` normalises ranges to '-'. Until round 10 the engine
@@ -50,14 +51,22 @@
 //! "\u{2212}1350" dropped NoSpan -> MissingQuote (misfiled as the
 //! model's fault) while "-1350" stamped. The sign now attaches to the
 //! plain form too; both routes stamp.
-//! (c) SEPARATOR SHAPES, OPENED round 11: JATS typesets the
-//! label/value separator as U+2013; `pdf-extract` emits '-'. Round
-//! 11's revert made U+2013/U+2014 non-sign glyphs, so the JATS
-//! spelling of a separator shape ("UTS \u{2013}950 MPa") drops — while
-//! the SAME sentence fetched through the PDF route ("UTS -950 MPa")
-//! stamps the negative and drops the correct positive. The divergence
-//! class (a)+(b) closed was reopened by the same commit that recorded
-//! closing it; see `number_needles`.
+//! (c) SEPARATOR SHAPES, opened round 11, closed round 12 where it
+//! fabricates: JATS typesets the label/value separator as U+2013,
+//! `pdf-extract` emits '-'. Round 11's revert made the JATS spelling
+//! of a separator shape ("UTS \u{2013}950 MPa") drop while the SAME
+//! sentence fetched through the PDF route ("UTS -950 MPa") stamped a
+//! negative from a positive source — the divergence class (a)+(b)
+//! closed, reopened by the same commit that recorded closing it.
+//! Round 12 closed the fabrication half with the predicate's SIGN
+//! DOMAIN (`NONNEGATIVE_QUANTITIES` in `claims.rs`): for non-negative
+//! quantities BOTH routes now drop the separator shape (JATS U+2013:
+//! no signed needle -> NoSpan; pdf-extract '-': the SignDomain guard).
+//! For SIGNED quantities the routes still diverge on recall: the JATS
+//! U+2013 spelling drops while the PDF '-' spelling stamps the genuine
+//! negative — the '-' reading is the defensible one (the glyph IS the
+//! minus sign), and the U+2013 drop is round 11's price, carried as
+//! corpus KNOWN rows. See `number_needles`.
 //!
 //! RECORDED, NOT FIXED (round 9) — the largest remaining structural
 //! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
@@ -200,6 +209,11 @@ pub enum ClaimRejection {
 /// the only observable signal of how this gate behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefusalGuard {
+    /// A negative claim against a quantity that is non-negative by
+    /// physical definition (`NONNEGATIVE_QUANTITIES`): nonsense under
+    /// EVERY dash glyph, so it refuses what the minus-vs-separator
+    /// ambiguity cannot separate (round 12).
+    SignDomain,
     /// Endpoint of an en-dash digit range ("950\u{2013}1100"): the sentence
     /// asserts bounds, not a point value.
     Range,
@@ -480,7 +494,7 @@ fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) 
         while let Some(rel) = hay[search_from..].find(&needle) {
             let start = search_from + rel;
             let end = start + needle.len();
-            match refusing_guard(hay, &needle, start, end, subject_n, object_n) {
+            match refusing_guard(hay, &needle, start, end, subject_n, object_n, value) {
                 None => return NumberScan::Evidential,
                 Some(guard) => {
                     first.get_or_insert(guard);
@@ -506,6 +520,14 @@ fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) 
 /// `None` when the occurrence is evidential. Checked most-specific first so
 /// the NAMED refusal is the most informative one; the refuse/accept decision
 /// itself does not depend on the order.
+///
+/// `SignDomain` is checked first though it is claim-level, not
+/// occurrence-level: a negative value against a non-negative quantity is
+/// nonsense whatever the occurrence looks like, and naming it beats
+/// every positional guard's explanation. The check runs INSIDE the
+/// occurrence loop, not before it: the advance-after-refusal must still
+/// walk every needle form (the round-5 char-not-byte advance lives off
+/// that walk).
 fn refusing_guard(
     hay: &str,
     needle: &str,
@@ -513,7 +535,11 @@ fn refusing_guard(
     end: usize,
     subject_n: &str,
     object_n: &str,
+    value: f64,
 ) -> Option<RefusalGuard> {
+    if value < 0.0 && NONNEGATIVE_QUANTITIES.contains(&object_n) {
+        return Some(RefusalGuard::SignDomain);
+    }
     if dash_range_endpoint(hay, start, end) {
         return Some(RefusalGuard::Range);
     }
@@ -582,7 +608,7 @@ fn find_name(hay: &str, name: &str, from: usize) -> Option<(usize, usize)> {
         got == want || (MINUS_CAPABLE_DASHES.contains(&got) && MINUS_CAPABLE_DASHES.contains(&want))
     };
     let mut start = from;
-    loop {
+    while let Some(first) = hay[start..].chars().next() {
         let mut pos = start;
         let mut matched = true;
         for &want in &name_chars {
@@ -597,11 +623,9 @@ fn find_name(hay: &str, name: &str, from: usize) -> Option<(usize, usize)> {
         if matched {
             return Some((start, pos));
         }
-        match hay[start..].chars().next() {
-            Some(c) => start += c.len_utf8(),
-            None => return None,
-        }
+        start += first.len_utf8();
     }
+    None
 }
 
 /// Letters that may begin a unit token glued directly to a number in
@@ -673,6 +697,24 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
     '-', '\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}',
     '\u{fe63}',
 ];
+
+/// Quantities that are non-negative by physical definition: ultimate
+/// tensile strength, hardness, density, grain size and yield strength
+/// cannot be negative under any convention. A negative claim against
+/// one is therefore nonsense under EVERY dash glyph — which is what
+/// separates the separator fabrication ("UTS -950" with a +950 source)
+/// from the true negatives (residual stress, Seebeck coefficient,
+/// temperature...), all of which ride genuinely SIGNED quantities.
+/// Normalized names (lowercase, underscores -> spaces), matched against
+/// the normalized object. Round 12 item 1(c): measured, not guessed —
+/// this closed the six red separator rows and the negative UTS range
+/// KNOWNs while every signed-quantity negative still stamped. The set
+/// is deliberately small and physical, not another word list: unknown
+/// quantities default to SIGNED, the permissive direction — a negative
+/// claim against an unrecognized quantity is never dropped by this
+/// guard. Every entry is pinned by a corpus row that stamps without it.
+const NONNEGATIVE_QUANTITIES: &[&str] =
+    &["uts", "hardness", "density", "grain size", "yield strength"];
 
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
@@ -797,8 +839,12 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
 /// adjacency, so one space defeats it, and after the second dash of a
 /// double-dash comes a sign, not a digit. Round 10's reversal took the
 /// negative-range shape from two sign glyphs to four; round 11's
-/// revert restored the two ('-', U+2212) but not the drop. All pinned
-/// as KNOWN corpus rows.
+/// revert restored the two ('-', U+2212) but not the drop. Round 12:
+/// a NEGATIVE range against a NONNEGATIVE quantity now drops through
+/// the SignDomain guard before the adjacency question arises (its
+/// corpus rows graduated from KNOWN the day the guard landed); the
+/// adjacency gap itself stays open for signed quantities and positive
+/// values. All pinned as KNOWN corpus rows.
 fn dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
     if let Some(after) = hay[end..].chars().next()
         && MINUS_CAPABLE_DASHES.contains(&after)
@@ -1137,28 +1183,37 @@ fn trailing_word(prefix: &str) -> String {
 /// readings are locally indistinguishable (both word/dash/digit), so the
 /// branch's priority decides: a fabrication is worse than a miss.
 ///
-/// COVERAGE, corrected round 12 (the round-11 record overclaimed): the
-/// revert holds for U+2013/U+2014 ONLY. U+2212 stays a sign glyph and
-/// ASCII '-' always was one, so the SAME separator shapes stamp a
-/// negative under those two glyphs — measured at HEAD: "Ti-6Al-4V UTS
-/// -950 MPa (longitudinal)" and its U+2212 twin stamp -950, "Table 2
-/// Ti-6Al-4V - UTS -950 MPa - elongation 12 %" stamps -950, "Inconel
-/// 718 - yield strength -1100 MPa - as built" stamps -1100, each
-/// dropping the correct positive. The engine has NO minus-vs-separator
-/// discriminator under ANY glyph: round 11 changed WHICH glyphs carry
-/// signed needles, not how a needle is read — "unambiguously a minus,
-/// never a separator" described the glyph's typography, not the code.
+/// COVERAGE, corrected round 12 (the round-11 record overclaimed; the
+/// round-12 closure is measured, not guessed): the revert holds for
+/// U+2013/U+2014, and the predicate's SIGN DOMAIN covers what the
+/// revert could not. U+2212 stays a sign glyph and ASCII '-' always
+/// was one; round 12 item 1(b) measured the SAME separator shapes
+/// still stamping a negative under both glyphs, and item 1(c) adopted
+/// the one discriminator that separates the classes without a glyph
+/// list: UTS, hardness, density, grain size and yield strength are
+/// non-negative by physical definition, so a negative claim against
+/// one is nonsense under EVERY glyph — `RefusalGuard::SignDomain`
+/// (`NONNEGATIVE_QUANTITIES`) refuses it, the separator shapes drop
+/// for the right reason, and the true negatives survive because they
+/// ride genuinely signed quantities (residual stress, Seebeck,
+/// temperature). The round-11 sentence "unambiguously a minus, never
+/// a separator" described the glyph's typography, not the code, and
+/// is struck: for SIGNED quantities the minus-vs-separator reading of
+/// '-'/'\u{2212}' stays locally indistinguishable, and the engine keeps the
+/// MINUS reading there — the glyph IS the minus sign, so a negative
+/// that stamps is the defensible reading (its recall twin, the
+/// correct positive, still drops Boundary; corpus KNOWN row).
+/// Unknown quantities default to signed — the permissive direction.
 /// Under U+2013/U+2014 the true negative drops (recall loss, corpus
-/// KNOWN rows) and the separator shapes drop (corpus MustDrop pins);
-/// under '-' and U+2212 the separator shapes STAMP — an open
-/// fabrication channel, unpinned at this commit.
+/// KNOWN rows) and the separator shapes drop (corpus MustDrop pins).
 ///
-/// FETCH ROUTE, the module header's class reopened: the header records
-/// that pdf-extract emits '-' where JATS typesets U+2212, and the same
-/// holds for separator dashes (JATS U+2013 -> pdf-extract '-'). The
-/// paper whose JATS spelling ("UTS \u{2013}950 MPa") round 11 pinned
-/// MustDrop fabricates -950 when fetched through the PDF route — the
-/// divergence (a)+(b) closed, reopened by the commit that closed it.
+/// FETCH ROUTE, the module header's class: header item (c) carries
+/// the route view. Round 11 reopened it — the paper whose JATS
+/// spelling ("UTS \u{2013}950 MPa") round 11 pinned MustDrop fabricated
+/// -950 through the PDF route. Round 12 closed the fabrication half
+/// for non-negative quantities (both routes now drop); for signed
+/// quantities a recall divergence remains (JATS U+2013 drops, PDF '-'
+/// stamps the genuine negative), recorded as the header describes.
 ///
 /// FIXED, ROUND 9 (was RECORDED, NOT FIXED, round 8): the sign flip
 /// stamped through U+2010, U+2011, U+2012, U+2014, U+2015 and U+FE63 as
@@ -1619,15 +1674,18 @@ mod tests {
     /// `start + 1` advance then landed `hay[search_from..]` inside the
     /// 3-byte U+2212 and panicked the whole ingest run on a non-char
     /// boundary. The correct outcome is a drop: the zoom factor is not
-    /// evidence for a UTS of -950.
+    /// evidence for a stress of -950. Round 12: the object is the SIGNED
+    /// quantity 'stress', not UTS — under UTS the new SignDomain guard
+    /// would refuse first and mask the boundary/'x' rejection this test
+    /// exists to exercise.
     #[test]
     fn rejected_unicode_minus_needle_advances_by_char_not_byte() {
         assert_eq!(
             supporting_quote(
                 "Ti-6Al-4V",
-                "UTS",
+                "stress",
                 Some(-950.0),
-                "Ti-6Al-4V at \u{2212}950x zoom had UTS."
+                "Ti-6Al-4V at \u{2212}950x zoom had stress."
             ),
             None
         );
@@ -3280,6 +3338,20 @@ mod tests {
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Range,
                 span: range.to_string(),
+            })
+        );
+
+        // SignDomain: a negative claim against a quantity that is
+        // non-negative by physical definition — refused whatever the
+        // occurrence looks like (round 12 item 1c). Deleting the
+        // NONNEGATIVE_QUANTITIES check reddens this assert and lets the
+        // separator shape stamp a compressive value from a tensile source.
+        let separator = "Ti-6Al-4V UTS -950 MPa (longitudinal)";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(-950.0), separator),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::SignDomain,
+                span: separator.to_string(),
             })
         );
     }

@@ -1240,29 +1240,33 @@ fn corpus() -> Vec<CorpusCase> {
         // has no digit before the dash, and all three reviewer shapes
         // stamped a compressive value from a tensile source while
         // dropping the correct positive. Round 11 reverted U+2013/
-        // U+2014 to non-sign glyphs. Round 12 measured the revert's
-        // limit: under '-' and U+2212 — the sign glyphs that survive —
-        // the SAME shapes still stamp a negative (all six measured
-        // stamping at HEAD), and the correct positive drops in every
-        // glyph. The engine has NO minus-vs-separator discriminator;
-        // round 11 changed which glyphs carry signed needles, not how
-        // a needle is read. Those six rows are deliberately RED case(
-        // rows: ground truth is settled (the source value is +950, so
-        // -950 is a fabrication) and a red case( is the honest signal
-        // that a DECISION is outstanding — a known( would misfile it
-        // as backlog. All four spellings of all three shapes below,
-        // one block per shape.
+        // U+2014 to non-sign glyphs; round 12 item 1(b) measured the
+        // revert's limit — under '-' and U+2212 the SAME shapes still
+        // stamped, six RED rows deliberately — and item 1(c) settled
+        // the outstanding decision BY MEASUREMENT: the predicate's
+        // SIGN DOMAIN. UTS and yield strength are non-negative by
+        // physical definition, so a negative claim against them is
+        // nonsense under EVERY glyph: the SignDomain guard refuses
+        // these shapes for the right reason, without a glyph list,
+        // while the true negatives (residual stress, Seebeck,
+        // temperature) ride genuinely signed quantities and survive.
+        // All four spellings of all three shapes below, one block per
+        // shape; the candidate the measurement beat was the preceding
+        // word (it misreads the line-start shapes, which have no word
+        // before the dash, and 'From Fig. 6, -950 MPa', which has
+        // none either — one failure in each direction).
         case(
             "Ti-6Al-4V UTS -950 MPa (longitudinal)",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the ASCII spelling of the longitudinal \
-             separator shape STAMPS -950 at HEAD — RED, deliberately: the \
-             source value is +950, ground truth is settled, and the engine \
-             has no minus-vs-separator discriminator. A red case( marks the \
-             outstanding decision; a known( would misfile it as backlog",
+            "round 12: the ASCII spelling of the longitudinal separator — \
+             RED at item 1(b), green at 1(c): the SignDomain guard refuses \
+             a negative claim against UTS (non-negative by definition), so \
+             the shape drops for the right reason under the glyph round 11 \
+             could not separate. Deleting 'uts' from NONNEGATIVE_QUANTITIES \
+             reddens it",
         ),
         case(
             "Ti-6Al-4V UTS \u{2212}950 MPa (longitudinal)",
@@ -1270,10 +1274,10 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the U+2212 spelling STAMPS -950 at HEAD — \
-             RED, deliberately; the glyph's typographic role as the real \
-             minus sign does not stop prose that SEPARATES with it from \
-             fabricating, and the code cannot tell the two apart",
+            "round 12: the U+2212 spelling — RED at 1(b), green at 1(c) \
+             through the same SignDomain refusal; the glyph's typographic \
+             role as the real minus sign never was a discriminator the code \
+             could read, the predicate's sign domain is",
         ),
         case(
             "Ti-6Al-4V UTS \u{2013}950 MPa (longitudinal)",
@@ -1300,9 +1304,10 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the ASCII line-start separator STAMPS -950 \
-             at HEAD — RED, deliberately; same outstanding decision as the \
-             longitudinal ASCII row",
+            "round 12: the ASCII line-start separator — RED at 1(b), green \
+             at 1(c) via SignDomain; the preceding-word candidate could \
+             never read this shape (no word before the dash at line \
+             start), the sign domain does",
         ),
         case(
             "\u{2212}950 MPa was recorded for Ti-6Al-4V.",
@@ -1310,10 +1315,8 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the U+2212 line-start separator STAMPS \
-             -950 at HEAD — RED, deliberately; locally indistinguishable \
-             from a genuine minus, which is exactly the decision the red \
-             rows record",
+            "round 12: the U+2212 line-start separator — RED at 1(b), \
+             green at 1(c) via SignDomain",
         ),
         case(
             "\u{2013}950 MPa was recorded for Ti-6Al-4V.",
@@ -1340,8 +1343,8 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the ASCII bracketed separator STAMPS -950 \
-             at HEAD — RED, deliberately; same outstanding decision",
+            "round 12: the ASCII bracketed separator — RED at 1(b), green \
+             at 1(c) via SignDomain",
         ),
         case(
             "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
@@ -1349,8 +1352,8 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12 item 1(b): the U+2212 bracketed separator STAMPS -950 \
-             at HEAD — RED, deliberately",
+            "round 12: the U+2212 bracketed separator — RED at 1(b), green \
+             at 1(c) via SignDomain",
         ),
         case(
             "The Ti-6Al-4V result \u{2013}950 MPa\u{2013} matched the target.",
@@ -1370,6 +1373,55 @@ fn corpus() -> Vec<CorpusCase> {
             "round 11: the em-dash separator twin — a tensile result \
              bracketed by em dashes must not stamp a compressive claim",
         ),
+        // ---------------- MUST_DROP: the sign-domain pins (round 12) ---
+        // Item 1(c)'s discriminator, measured not guessed: the
+        // predicate's SIGN DOMAIN. Every entry of
+        // NONNEGATIVE_QUANTITIES is pinned by one row — delete the
+        // entry and its row stamps a nonsense negative. 'uts' is
+        // pinned by the separator shapes above, 'yield strength' by
+        // the Inconel separator row; these three pin the rest.
+        case(
+            "The Ti-6Al-4V hardness was -200 HV.",
+            "Ti-6Al-4V",
+            "hardness",
+            -200.0,
+            Expect::MustDrop,
+            "round 12 item 1(c): hardness is non-negative by definition — \
+             the row STAMPED at HEAD before the SignDomain guard landed \
+             (measured); deleting 'hardness' from NONNEGATIVE_QUANTITIES \
+             reopens it",
+        ),
+        case(
+            "The AlSi10Mg density was -4.4 g/cm3.",
+            "AlSi10Mg",
+            "density",
+            -4.4,
+            Expect::MustDrop,
+            "round 12 item 1(c): density cannot be negative — measured \
+             stamping before the guard and dropping through it; pins the \
+             'density' entry",
+        ),
+        case(
+            "The CoCrFeNi grain size was -12 um.",
+            "CoCrFeNi",
+            "grain_size",
+            -12.0,
+            Expect::MustDrop,
+            "round 12 item 1(c): grain size cannot be negative — pins the \
+             'grain size' entry of NONNEGATIVE_QUANTITIES",
+        ),
+        case(
+            "Inconel 718 - yield strength -1100 MPa - as built",
+            "Inconel 718",
+            "yield_strength",
+            -1100.0,
+            Expect::MustDrop,
+            "round 12 item 1(c): the reviewer's Inconel shape — yield \
+             strength cannot be negative, so -1100 is nonsense under every \
+             glyph; STAMPED at HEAD before the SignDomain guard landed \
+             (measured). Pins the 'yield strength' entry; without it this \
+             row is a cannot-fail constant",
+        ),
         // ---------------- round 11: signed needles vs dash ranges ------
         // Only '-' and U+2212 are sign glyphs — round 11 reverted
         // round 10's U+2013/U+2014 (the separator shapes fabricated
@@ -1386,8 +1438,10 @@ fn corpus() -> Vec<CorpusCase> {
              \u{2013}1100 shape dropped NoSpan because the -1100 needle is \
              never constructed un-grouped (|value| >= 1000), so the row \
              proved nothing. The signed \u{2212}950 needle IS constructed \
-             (U+2212 stays a sign glyph) and the boundary clause refuses \
-             it — the range's left digit 300 glues before the dash",
+             (U+2212 stays a sign glyph); round 12: the SignDomain guard \
+             refuses it FIRST now (UTS is non-negative) — before round 12 \
+             the boundary clause owned it (the range's left digit 300 \
+             glues before the dash), and still owns the positive shape",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25-27.",
@@ -1397,8 +1451,9 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "round 11: a signed needle must not match a reference range — \
              pinned under the ASCII hyphen now that U+2013 is no sign \
-             glyph; 25 before the dash glues and the boundary clause \
-             refuses",
+             glyph; round 12: SignDomain refuses it first (UTS is \
+             non-negative) — the boundary clause (25 before the dash \
+             glues) still owns the positive shape",
         ),
         // ---------------- MUST_DROP: refused U+2212 needles ----------
         // The round-5 UTF-8 advance panic: a rejected U+2212 occurrence
@@ -1408,13 +1463,17 @@ fn corpus() -> Vec<CorpusCase> {
         // the advance line is never reached there — these needles are
         // REFUSED, which is what exercises it.
         case(
-            "Ti-6Al-4V at \u{2212}950x zoom had UTS.",
+            "Ti-6Al-4V at \u{2212}950x zoom had stress.",
             "Ti-6Al-4V",
-            "UTS",
+            "stress",
             -950.0,
             Expect::MustDrop,
             "round-5 regression, missed until round 9: the refused \u{2212}950x \
-             needle must advance by char; a byte advance panics the scan",
+             needle must advance by char; a byte advance panics the scan. \
+             Round 12: the tuple moved off UTS to the signed 'stress' — \
+             under UTS the SignDomain guard now refuses first, which would \
+             leave the boundary's 'x' refusal (the point of this row) \
+             unexercised",
         ),
         case(
             "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa.",
@@ -1781,55 +1840,62 @@ fn corpus() -> Vec<CorpusCase> {
         // negative shape from 2 glyphs to 4. Round 11 restored the
         // record and pinned it. The guard sees digit/dash/digit
         // adjacency only: a space defeats it, and the second dash of a
-        // double-dash is followed by a sign, not a digit.
-        known(
+        // double-dash is followed by a sign, not a digit. Round 12:
+        // the NEGATIVE UTS ranges below now drop through the
+        // SignDomain guard (a negative UTS claim is nonsense), so
+        // their KNOWN markers came off at the tripwire's demand; the
+        // adjacency gap itself stays open — the spaced and
+        // spaced-dash POSITIVE ranges still stamp their endpoints, and
+        // a SIGNED quantity's negative range would too.
+        case(
             "The Ti-6Al-4V UTS ranged from -950--400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "KNOWN: the low endpoint of a negative dash-range stamps as a \
-             point value — after -950 comes a dash and then ANOTHER dash, \
-             not a digit, so the run is never seen; the high endpoint \
-             (-400) drops Range because its before-arm works",
+            "round 12: was the KNOWN low-endpoint leak of the negative \
+             dash-range — the SignDomain guard closed it: a negative UTS \
+             claim is nonsense whatever the range shape, so the endpoint \
+             drops without the adjacency guard ever seeing the run",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS ranged from -950 to -400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "KNOWN: the word-form negative range stamps its LOW endpoint — \
-             'to' is not a dash, the adjacency guard never fires",
+            "round 12: was the KNOWN word-form negative range LOW endpoint \
+             — closed by SignDomain, not by the adjacency guard ('to' is \
+             still not a dash; the gap stays open for signed quantities)",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS ranged from -950 to -400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -400.0,
             Expect::MustDrop,
-            "KNOWN: the word-form negative range stamps its HIGH endpoint \
-             too — both bounds of a range asserted as point values",
+            "round 12: was the KNOWN word-form negative range HIGH \
+             endpoint — closed by SignDomain",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS ranged from \u{2212}950 to \u{2212}400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "KNOWN: the U+2212 twin of the negative word-range stamps too — \
-             both surviving sign glyphs carry the gap; round 10 briefly \
-             widened it to four glyphs, round 11 pinned the two",
+            "round 12: was the KNOWN U+2212 twin of the negative \
+             word-range — closed by SignDomain",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS ranged from \u{2212}950 to \u{2212}400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -400.0,
             Expect::MustDrop,
-            "KNOWN: round 12 item 7 (L1) — the HIGH endpoint of the U+2212 \
-             word-range stamps too (measured); round 11 pinned only the low \
-             endpoint above, leaving coverage asymmetric",
+            "round 12 item 7 (L1) then round 12 item 1(c): pinned as the \
+             missing high endpoint of the U+2212 word-range, then closed \
+             by SignDomain — one round as a KNOWN tripwire, marker \
+             stripped the day the guard landed",
         ),
         known(
             "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
