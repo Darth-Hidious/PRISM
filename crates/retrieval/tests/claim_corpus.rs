@@ -1452,6 +1452,26 @@ fn corpus() -> Vec<CorpusCase> {
              (measured). Pins the 'yield strength' entry; without it this \
              row is a cannot-fail constant",
         ),
+        // ROUND 13 ITEM 6.1 — SignDomain's recall cost, made visible.
+        // The branch files every other recall price as a KNOWN row; this
+        // one had none. 'compressive yield strength' ends in 'strength'
+        // so the suffix rule (item 5) refuses a negative, and under the
+        // compressive-stress convention -250 is a value the source
+        // literally states — a defensible drop (strength is a magnitude
+        // by convention) carried as a KNOWN recall price so it shows on
+        // the scoreboard.
+        known(
+            "The Ti-6Al-4V compressive yield strength was -250 MPa.",
+            "Ti-6Al-4V",
+            "compressive yield strength",
+            -250.0,
+            Expect::MustStamp,
+            "KNOWN: SignDomain recall cost — the source states -250 under \
+             the compressive convention, but 'compressive yield strength' \
+             ends in 'strength' so the guard refuses; strength is a \
+             magnitude by convention so the drop is defensible, recorded \
+             here as a recall price",
+        ),
         // ---------------- round 11: signed needles vs dash ranges ------
         // Only '-' and U+2212 are sign glyphs — round 11 reverted
         // round 10's U+2013/U+2014 (the separator shapes fabricated

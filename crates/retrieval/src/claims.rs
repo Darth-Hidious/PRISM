@@ -798,6 +798,11 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
 /// quantities default to SIGNED, the permissive direction — a negative
 /// claim against an unrecognized quantity is never dropped by this
 /// guard. Every entry is pinned by a corpus row that stamps without it.
+/// Disabling the guard reddens 15 corpus rows at HEAD (measured round
+/// 13: 6 UTS separators, 4 quantity pins incl. 'yield strength', 5
+/// negative ranges). Round-12 commit 7b1f71ae recorded this M3 as 14 —
+/// it omitted the 'yield strength' Inconel pin from the quantity-pin
+/// count while crediting that same row to M5; the correct count is 15.
 const NONNEGATIVE_QUANTITIES: &[&str] =
     &["uts", "hardness", "density", "grain size", "yield strength"];
 
