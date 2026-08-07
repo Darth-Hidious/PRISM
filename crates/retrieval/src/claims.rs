@@ -21,6 +21,19 @@
 //! vocabulary strings are the stable machine contract ("indeterminate",
 //! "research", "screening", "reference_validated").
 //!
+//! RECORDED, NOT FIXED (round 12) — NUMERIC DECORATIONS ARE INVISIBLE:
+//! "950 ± 30 MPa" stamps the TOLERANCE as the value. The plus-minus
+//! sign appears nowhere in this file (grep-verified round 11,
+//! re-verified round 12), so the uncertainty figure passes every guard
+//! and becomes the property record under both spellings ("+/-" and
+//! U+00B1), while the value it decorates stamps as a second claim.
+//! Pinned as KNOWN corpus rows in tests/claim_corpus.rs (the
+//! numeric-decorations family); the same family carries the
+//! digit-dash-LETTER locants ("3-point", "2-step", "2-propanol",
+//! "N-methyl-2-pyrrolidone"), which are equally unguarded. Record
+//! only — fixing it needs a decoration-aware number scan, not a glyph
+//! list.
+//!
 //! Known provenance caveat: claims can differ by fetch route.
 //! CLOSED for (a)+(b) round 10 + round 11; REOPENED as (c) round 11,
 //! recorded round 12.

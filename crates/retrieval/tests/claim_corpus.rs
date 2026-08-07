@@ -126,6 +126,20 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "recall form pinned at 2363837a: samples 5 mm",
         ),
+        // RECORD, round 12 item 8: the corpus holds three verdicts on
+        // specimen-level extensive attributes — thickness MustStamp
+        // (coupon 3mm, specimen 5mm, panel 2mm in the glued KNOWN
+        // family below), cut position MustDrop (the cross-section row
+        // next), lot mass MustDrop (batch 25kg, glued case( above and
+        // spaced KNOWN below) — and until round 12 stated no criterion
+        // anywhere. Three rows had already been flipped by reviewers
+        // reading that unstated line differently, in opposite
+        // directions. The defensible line, written down so the next
+        // verdict does not depend on a reviewer's head: A SPECIMEN
+        // DIMENSION IS A CONDITION OF THE MEASUREMENT — it travels
+        // with the number, so it stamps; A LOT MASS AND A CUT POSITION
+        // ARE NOT — they say where material came from or where it was
+        // sampled, not how the measurement was made, so they drop.
         known(
             "A cross-section 10 mm above the build plate was examined for AlSi10Mg.",
             "AlSi10Mg",
@@ -1635,6 +1649,15 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "KNOWN: glued recall lost to H1's space requirement — scan step 50um",
         ),
+        // RECORD, round 12 item 8 — the two weakest rows of the
+        // extensive-attribute family, NOT changed this round:
+        // condition 980C -> temperature and trial 30min -> duration,
+        // just below. A record reading 'Ti-6Al-4V temperature = 980 C'
+        // with nothing marking it a soak set-point is not interpretable
+        // as a property; scan_step_size shows the right pattern — the
+        // object name carries the process context. Pre-existing;
+        // recorded, deliberately not re-judged — the criterion comment
+        // above the cross-section row owns the family line.
         known(
             "The Ti-6Al-4V condition 980C soak was logged.",
             "Ti-6Al-4V",
