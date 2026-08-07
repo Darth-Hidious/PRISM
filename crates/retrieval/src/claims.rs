@@ -412,6 +412,14 @@ enum NumberScan {
 /// another token ("AlSi10Mg") usually refuses Boundary late in the span,
 /// while the standalone occurrence the reader actually sees was refused by
 /// the real guard ("cross-section 10" -> Label).
+///
+/// RECORDED, NOT FIXED (round 8): "first" is first in NEEDLE-FORM
+/// order, then position — the needle forms loop outside, the positions
+/// inside. For any value with two needle forms (>= 1000 or negative),
+/// the reported guard is therefore not necessarily the occurrence a
+/// reader meets first. There is no ground truth for "the causal
+/// guard"; the honest shape is reporting ALL refusing guards as a
+/// set. Not implemented this round.
 fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) -> NumberScan {
     let mut first: Option<RefusalGuard> = None;
     for needle in number_needles(value) {
