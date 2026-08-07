@@ -607,7 +607,10 @@ fn inside_citation_marker(hay: &str, start: usize) -> bool {
     }
 }
 
-/// Words after which a number is a label, never a measurement.
+/// Words after which a number is a label, never a measurement — unless
+/// the number carries a unit, which the exemption at the top of
+/// `preceding_word_is_label` grants (a label number never has a unit
+/// after it; a measurement always does).
 const LABEL_WORDS: &[&str] = &[
     "table",
     "tables",
@@ -631,6 +634,14 @@ const LABEL_WORDS: &[&str] = &[
     "entries",
     "scheme",
     "schemes",
+    // Sample/run are methods-prose nouns too, but they double as
+    // specimen/batch labels: "Sample 5 of Ti-6Al-4V" numbers the
+    // specimen, it does not measure it. Kept here; the unit exemption
+    // keeps "sample 3 mm thick" and "run 30 min" stamping.
+    "sample",
+    "samples",
+    "run",
+    "runs",
 ];
 
 /// Words that continue a label list: the number after one of these is a
@@ -762,6 +773,17 @@ fn walk_comma_items(prefix: &mut String, word: &mut String) {
 /// trim to one number-run; the bound opened dotted-label fabrications
 /// and reddened nothing on revert, so it is gone.
 fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
+    // A unit after the number makes it a measurement, whatever word
+    // precedes it: a label number never carries a unit ("Table 3 mm" is
+    // not prose), a measurement always does. Checked first so it
+    // exempts the head word itself, not just the list walk: "sample
+    // 3 mm thick" and "run 30 min" are methods prose, while "Sample 5
+    // of Ti-6Al-4V" (no unit) stays a label. Round 6 cut sample/run
+    // from LABEL_WORDS instead and opened specimen-label fabrications;
+    // the exemption is the fix that pins both directions.
+    if unit_follows(hay, end) {
+        return false;
+    }
     let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']).to_string();
     let mut word = trailing_word(&prefix);
     if !chain_ends_in_unit(hay, end) {
@@ -1582,8 +1604,11 @@ mod tests {
 
     /// F-3: the label vocabulary also covers Section/Eq/Chapter/
     /// Entry/Scheme labels. Mutation-proven: removing "section" from
-    /// LABEL_WORDS turns the first assert red. (Sample/Run were cut in
-    /// round 6: methods-prose nouns, not document objects.)
+    /// LABEL_WORDS turns the first assert red. (Sample/Run are label
+    /// words again as of round 7 — the unit exemption in
+    /// `preceding_word_is_label` keeps methods prose stamping; their
+    /// fabrication direction is pinned in
+    /// `sample_and_run_label_numbers_are_not_support`.)
     #[test]
     fn section_and_kindred_label_numbers_are_not_support() {
         assert_dropped_end_to_end(
@@ -2082,10 +2107,16 @@ mod tests {
         );
     }
 
-    /// Round 6: `sample`/`samples`/`run`/`runs` were label words, but
-    /// they are ordinary methods-prose nouns that precede measurements —
-    /// the reviewer measured both dropping dimensional claims. Cut from
-    /// LABEL_WORDS; re-adding any one of the four reddens its assert.
+    /// Round 7: `sample`/`samples`/`run`/`runs` are back in
+    /// `LABEL_WORDS` — round 6 cut them and opened specimen-label
+    /// fabrications ("Sample 5 of Ti-6Al-4V was tested" stamped UTS =
+    /// 5). The idioms separate cleanly: a label number never has a unit
+    /// after it, a measurement always does, so the exemption at the top
+    /// of `preceding_word_is_label` pins the stamp direction and the
+    /// label words pin the drop direction. This test is the stamp half:
+    /// each assert reddens when the `unit_follows` exemption is removed
+    /// from `preceding_word_is_label` (NOT when the words leave
+    /// LABEL_WORDS — that mutation reddens the drop test instead).
     #[test]
     fn methods_prose_nouns_sample_and_run_do_not_label_numbers() {
         assert!(
@@ -2131,6 +2162,73 @@ mod tests {
                 "temperature",
                 Some(1073.0),
                 "The Ti-6Al-4V run 2 h at 1073 K produced full densification."
+            )
+            .is_some()
+        );
+    }
+
+    /// Round 7: the drop half of the sample/run restoration. With the
+    /// words back in `LABEL_WORDS`, a specimen/batch number that carries
+    /// NO unit is a label and drops — this is what round 6's cut opened:
+    /// six fabrications measured across two corpora. Each assert reddens
+    /// when its word leaves LABEL_WORDS; the stamp half lives in
+    /// `methods_prose_nouns_sample_and_run_do_not_label_numbers`. The
+    /// last two asserts are the free wins: a unit-bearing number after
+    /// "cross-section" (word "section") stamps again too.
+    #[test]
+    fn sample_and_run_label_numbers_are_not_support() {
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 5.0, "Sample 5 of Ti-6Al-4V was tested.");
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "build_failure",
+            12.0,
+            "Run 12 of the Inconel 718 build failed.",
+        );
+        // Both ends of a sample range are labels.
+        assert_dropped_end_to_end(
+            "AlSi10Mg",
+            "print_count",
+            1.0,
+            "Samples 1 to 6 of AlSi10Mg were printed.",
+        );
+        assert_dropped_end_to_end(
+            "AlSi10Mg",
+            "print_count",
+            6.0,
+            "Samples 1 to 6 of AlSi10Mg were printed.",
+        );
+        // "runs" keeps its own kill: both ends of a run range.
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "campaign",
+            7.0,
+            "Runs 7 to 12 of the Inconel 718 campaign failed.",
+        );
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "campaign",
+            12.0,
+            "Runs 7 to 12 of the Inconel 718 campaign failed.",
+        );
+
+        // Free wins from the unit exemption: measurement after
+        // "cross-section" carries a unit, so the label word "section"
+        // no longer refuses it.
+        assert!(
+            supporting_quote(
+                "AlSi10Mg",
+                "height",
+                Some(10.0),
+                "A cross-section 10 mm above the build plate was examined for AlSi10Mg."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "AlSi10Mg",
+                "height",
+                Some(10.0),
+                "Cross-sections 10 mm above the build plate were examined for AlSi10Mg."
             )
             .is_some()
         );
