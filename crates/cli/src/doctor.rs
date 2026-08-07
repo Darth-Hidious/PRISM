@@ -505,7 +505,21 @@ mod tests {
             "verdict must come from the re-check, not the repair"
         );
         assert!(row.result.contains("still fails"), "{}", row.result);
-        assert!(row.result.contains("run: prism fixit"), "{}", row.result);
+        // The repair's own note survives, so the reader can see what was tried
+        // and why believing it would have been wrong.
+        assert!(row.result.contains("rebuilt it"), "{}", row.result);
+        // The caller's guidance is carried through verbatim. This assertion
+        // used to require the literal string "run: prism fixit"; d8667e14's
+        // exit-to-CLI sweep removed that instruction from the product, and
+        // afterwards this test was the ONLY occurrence of it left anywhere in
+        // the tree — it pinned a string nothing produced. Same stale-assertion
+        // class as ef514082's fix to unfixable_rows_*.
+        assert!(row.result.contains("repairable"), "{}", row.result);
+        // The row states the condition; it never tells the reader to quit and
+        // run something. Guarded repo-wide by
+        // crates/server/tests/no_exit_to_cli.rs.
+        assert!(!row.result.contains("prism fixit"), "{}", row.result);
+        assert!(!row.result.contains("prism login"), "{}", row.result);
     }
 
     #[test]
@@ -566,13 +580,29 @@ mod tests {
             return; // no system python on this box; nothing to assert against
         };
         let row = check_venv_tools(python);
-        assert!(!row.ok, "a venv without the declared set is not healthy");
+        // Premise check, not an assertion about the product: if this box's
+        // system interpreter happens to satisfy every declared requirement,
+        // there is no "missing dependency" row to inspect and the test has
+        // nothing to say. Assert only when the premise actually holds.
+        if row.ok {
+            return;
+        }
         assert!(
             row.result.contains("prism-platform"),
             "must name what is missing: {}",
             row.result
         );
-        assert!(row.result.contains("prism doctor --fix"), "{}", row.result);
+        // `check_venv_tools` ends the row with "— repairable". This assertion
+        // used to require "prism doctor --fix"; d8667e14's exit-to-CLI sweep
+        // replaced that guidance, and the string this test demanded survives
+        // only in an unrelated `println!` at line ~199 — so the test pinned a
+        // sentence this code path never emits, and failed on every machine,
+        // not just ones with an unusual interpreter. Same stale-assertion
+        // class as ef514082's fix to unfixable_rows_*.
+        assert!(row.result.contains("repairable"), "{}", row.result);
+        // The row names the condition; it never sends the reader out to a
+        // command. Guarded repo-wide by crates/server/tests/no_exit_to_cli.rs.
+        assert!(!row.result.contains("prism doctor"), "{}", row.result);
     }
 
     #[test]
