@@ -2343,6 +2343,25 @@ mod tests {
             )
             .is_some()
         );
+        // The reviewer corpus's literal recall cases, same mechanism.
+        assert!(
+            supporting_quote(
+                "Inconel 718",
+                "duration",
+                Some(30.0),
+                "Each Inconel 718 run 30 min at 980 \u{b0}C was quenched."
+            )
+            .is_some()
+        );
+        assert!(
+            supporting_quote(
+                "AlSi10Mg",
+                "thickness",
+                Some(5.0),
+                "The AlSi10Mg samples 5 mm thick were sectioned."
+            )
+            .is_some()
+        );
         // The real temperature in the same sentence still stamps.
         assert!(
             supporting_quote(
