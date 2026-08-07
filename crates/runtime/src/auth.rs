@@ -85,6 +85,21 @@ impl PlatformAuth {
     pub fn is_api_key(&self) -> bool {
         matches!(self, Self::ApiKey(_))
     }
+
+    /// Classify a raw credential by shape: the frozen `m27_` prefix marks a
+    /// stable API key (`X-API-Key`); anything else is a rotating session
+    /// credential (`Bearer`).
+    ///
+    /// Public so callers that hold a credential but not a whole
+    /// [`ResolvedPlatformAuth`] — the boot checks, for one — get the same
+    /// answer as the resolver instead of re-deriving the prefix rule.
+    pub fn classify(value: &str) -> Self {
+        if value.starts_with("m27_") {
+            Self::ApiKey(value.to_string())
+        } else {
+            Self::Bearer(value.to_string())
+        }
+    }
 }
 
 /// Auth result returned by the seam.
@@ -272,11 +287,7 @@ fn interactive_auth_env_enabled() -> bool {
 }
 
 fn classify_token(value: &str) -> PlatformAuth {
-    if value.starts_with("m27_") {
-        PlatformAuth::ApiKey(value.to_string())
-    } else {
-        PlatformAuth::Bearer(value.to_string())
-    }
+    PlatformAuth::classify(value)
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {

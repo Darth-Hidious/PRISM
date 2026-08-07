@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use prism_client::PlatformError;
+use prism_runtime::auth::PlatformAuth;
 use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
@@ -85,7 +86,38 @@ pub async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
 ) -> Vec<boot::BootCheck> {
-    run_boot_checks_with(creds, endpoints, platform_configured(creds)).await
+    let configured = platform_configured(creds);
+    let credential = boot_credential(creds);
+    run_boot_checks_with(creds, endpoints, configured, credential).await
+}
+
+/// The credential the boot checks should present, in the same precedence the
+/// real resolver uses (`auth::resolve_platform_auth`): stored session first,
+/// then the environment.
+///
+/// Before this existed the checks derived their header from `creds` alone and
+/// sent `Bearer ` — an EMPTY bearer — whenever the only credential was an env
+/// var. `platform_configured` said "configured", step 1 fired anyway, the
+/// platform answered 401, and the row read "<host> unreachable". The host was
+/// fine; we simply never sent a credential. That is a lying check, and it hit
+/// exactly the headless/agent install this module documents as supported.
+fn boot_credential(creds: Option<&StoredCredentials>) -> Option<PlatformAuth> {
+    if let Some(token) = creds
+        .map(|c| c.access_token.trim())
+        .filter(|t| !t.is_empty())
+    {
+        return Some(PlatformAuth::Bearer(token.to_string()));
+    }
+    // An API key is a distinct wire shape (`X-API-Key`), so classify rather
+    // than assuming Bearer. `PlatformAuth::classify` is the same rule the
+    // resolver applies; it is not re-derived here.
+    if let Some(key) = PlatformVar::API_KEY.get() {
+        return Some(PlatformAuth::classify(&key));
+    }
+    PlatformVar::TOKEN
+        .get()
+        .or_else(|| PlatformVar::API_TOKEN.get())
+        .map(|value| PlatformAuth::classify(&value))
 }
 
 /// The body of [`run_boot_checks`] with the configured/not-configured
@@ -97,6 +129,7 @@ async fn run_boot_checks_with(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
     configured: bool,
+    credential: Option<PlatformAuth>,
 ) -> Vec<boot::BootCheck> {
     let mut checks = Vec::new();
     let client = reqwest::Client::builder()
@@ -118,14 +151,27 @@ async fn run_boot_checks_with(
         return checks;
     }
 
-    let token = creds.map(|c| c.access_token.as_str()).unwrap_or("");
+    // A stored session still drives the "is this a session or an env key?"
+    // distinction in the Auth row below; `credential` drives the wire header.
+    let session_token = creds.map(|c| c.access_token.trim()).unwrap_or("");
     let api = &endpoints.api_base;
 
     // 1. Platform connection — use /agent/capabilities (always 200 with auth)
-    let auth_header = format!("Bearer {token}");
-    let platform_ok = client
-        .get(format!("{api}/agent/capabilities"))
-        .header("Authorization", &auth_header)
+    let Some(credential) = credential else {
+        // Configured, but nothing to authenticate with. Say that, rather than
+        // firing an unauthenticated request and blaming the host for the 401.
+        checks.push(boot::BootCheck {
+            name: "Platform".into(),
+            result: "configured, but no usable credential — checks skipped".into(),
+            ok: false,
+            dots: 8,
+            delay_ms: 30,
+        });
+        push_local_checks(&client, &mut checks).await;
+        return checks;
+    };
+    let platform_ok = credential
+        .apply(client.get(format!("{api}/agent/capabilities")))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -147,10 +193,11 @@ async fn run_boot_checks_with(
     });
 
     // 2. Auth — distinguish actual expiry from scope/network/server errors.
-    if !token.is_empty() {
-        let user_resp = client
-            .get(format!("{api}/users/me"))
-            .header("Authorization", format!("Bearer {token}"))
+    //    Only a stored SESSION can expire, so this branch stays keyed on the
+    //    session token; an env key takes the placeholder row below.
+    if !session_token.is_empty() {
+        let user_resp = credential
+            .apply(client.get(format!("{api}/users/me")))
             .send()
             .await;
         let (auth_ok, auth_msg) = match user_resp {
@@ -203,10 +250,9 @@ async fn run_boot_checks_with(
     }
 
     // 3. Knowledge Graph
-    if !token.is_empty() {
-        let stats = client
-            .get(format!("{api}/knowledge/graph/stats"))
-            .header("Authorization", format!("Bearer {token}"))
+    {
+        let stats = credential
+            .apply(client.get(format!("{api}/knowledge/graph/stats")))
             .send()
             .await
             .ok()
@@ -236,12 +282,11 @@ async fn run_boot_checks_with(
     }
 
     // 4. Models
-    if !token.is_empty() {
+    {
         let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
         if !project_id.is_empty() {
-            let models = client
-                .get(format!("{api}/projects/{project_id}/llm/models"))
-                .header("Authorization", format!("Bearer {token}"))
+            let models = credential
+                .apply(client.get(format!("{api}/projects/{project_id}/llm/models")))
                 .send()
                 .await
                 .ok()
@@ -271,10 +316,9 @@ async fn run_boot_checks_with(
     }
 
     // 5. Compute
-    if !token.is_empty() {
-        let gpus = client
-            .get(format!("{api}/compute/gpus"))
-            .header("Authorization", format!("Bearer {token}"))
+    {
+        let gpus = credential
+            .apply(client.get(format!("{api}/compute/gpus")))
             .send()
             .await
             .ok()
@@ -296,10 +340,9 @@ async fn run_boot_checks_with(
     }
 
     // 6. Marketplace
-    if !token.is_empty() {
-        let mkt = client
-            .get(format!("{api}/marketplace/resources"))
-            .header("Authorization", format!("Bearer {token}"))
+    {
+        let mkt = credential
+            .apply(client.get(format!("{api}/marketplace/resources")))
             .send()
             .await
             .ok()
@@ -385,6 +428,66 @@ pub(crate) fn clear_platform_env() {
 mod tests {
     use super::*;
 
+    /// The lying check this change exists to kill: "configured" but with no
+    /// usable credential must NOT fire an unauthenticated request and then
+    /// report the host as unreachable. The host is fine; we had nothing to
+    /// send.
+    #[tokio::test]
+    async fn configured_without_a_credential_says_so_instead_of_blaming_the_host() {
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true, None).await;
+        let platform = checks
+            .iter()
+            .find(|c| c.name == "Platform")
+            .expect("a configured platform always reports a Platform row");
+        assert!(
+            platform.result.contains("no usable credential"),
+            "must name the real condition: {}",
+            platform.result
+        );
+        assert!(
+            !platform.result.contains("unreachable"),
+            "never blame the host for a credential we did not send: {}",
+            platform.result
+        );
+    }
+
+    /// A stored session outranks the environment, and an `m27_` key is an
+    /// API key (X-API-Key), not a Bearer token. Getting the second one wrong
+    /// sends the key on the wrong header and every platform check 401s.
+    #[test]
+    fn boot_credential_prefers_the_session_then_classifies_the_env_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+
+        // Session wins over a present env key.
+        unsafe { std::env::set_var("PRISM_API_KEY", "m27_env") };
+        assert_eq!(
+            boot_credential(Some(&creds_with("session-jwt"))),
+            Some(PlatformAuth::Bearer("session-jwt".to_string()))
+        );
+
+        // No session: the env key is classified by shape, not assumed Bearer.
+        assert_eq!(
+            boot_credential(None),
+            Some(PlatformAuth::ApiKey("m27_env".to_string()))
+        );
+
+        // A non-m27 value under the token name is a rotating credential.
+        clear_platform_env();
+        unsafe { std::env::set_var("MARC27_TOKEN", "jwt-shaped") };
+        assert_eq!(
+            boot_credential(None),
+            Some(PlatformAuth::Bearer("jwt-shaped".to_string()))
+        );
+
+        clear_platform_env();
+        assert_eq!(boot_credential(None), None);
+    }
+
     fn creds_with(token: &str) -> StoredCredentials {
         StoredCredentials {
             access_token: token.to_string(),
@@ -457,7 +560,7 @@ mod tests {
             api_base: "https://platform.invalid/api/v1".to_string(),
             node_ws: "wss://platform.invalid/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks_with(None, &endpoints, false).await;
+        let checks = run_boot_checks_with(None, &endpoints, false, None).await;
 
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["Platform", "Local Node", "Policy Engine"]);
@@ -483,7 +586,13 @@ mod tests {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks_with(None, &endpoints, true).await;
+        let checks = run_boot_checks_with(
+            None,
+            &endpoints,
+            true,
+            Some(PlatformAuth::ApiKey("m27_test".into())),
+        )
+        .await;
 
         let auth = checks
             .iter()
