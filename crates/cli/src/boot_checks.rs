@@ -122,6 +122,21 @@ async fn offline_checks() -> Vec<boot::BootCheck> {
     checks
 }
 
+/// What the boot checks have to present as a credential.
+///
+/// Three outcomes, not two: a malformed credential is NOT the same as no
+/// credential, and collapsing them is what produced the defect this type
+/// exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootCredential {
+    /// Usable. Attach it and run the checks.
+    Ready(PlatformAuth),
+    /// Supplied but unusable, with the reason stated for the reader.
+    Rejected(String),
+    /// Nothing configured.
+    Absent,
+}
+
 /// The credential the boot checks should present, in the same precedence the
 /// real resolver uses (`auth::resolve_platform_auth`): stored session first,
 /// then the environment.
@@ -132,23 +147,41 @@ async fn offline_checks() -> Vec<boot::BootCheck> {
 /// platform answered 401, and the row read "<host> unreachable". The host was
 /// fine; we simply never sent a credential. That is a lying check, and it hit
 /// exactly the headless/agent install this module documents as supported.
-fn boot_credential(creds: Option<&StoredCredentials>) -> Option<PlatformAuth> {
+///
+/// The API-key branch mirrors `resolve_platform_auth`'s REJECTION of a key
+/// without the frozen `m27_` prefix (auth.rs:165-170). An earlier version of
+/// this function called `PlatformAuth::classify` here and carried a comment
+/// claiming that was "the same rule the resolver applies". It was not: the
+/// resolver rejects, `classify` merely picks a header. A typo'd
+/// `PRISM_API_KEY=badkey` therefore went out as `Bearer badkey`, earned a 401,
+/// and the row read "<host> unreachable" — the very lying check this module
+/// had just been fixed to stop emitting, reappearing one layer down.
+fn boot_credential(creds: Option<&StoredCredentials>) -> BootCredential {
     if let Some(token) = creds
         .map(|c| c.access_token.trim())
         .filter(|t| !t.is_empty())
     {
-        return Some(PlatformAuth::Bearer(token.to_string()));
+        return BootCredential::Ready(PlatformAuth::Bearer(token.to_string()));
     }
-    // An API key is a distinct wire shape (`X-API-Key`), so classify rather
-    // than assuming Bearer. `PlatformAuth::classify` is the same rule the
-    // resolver applies; it is not re-derived here.
+    // An API key is a distinct wire shape (`X-API-Key`) AND a validated one.
     if let Some(key) = PlatformVar::API_KEY.get() {
-        return Some(PlatformAuth::classify(&key));
+        if !key.starts_with("m27_") {
+            let name = PlatformVar::API_KEY.source().unwrap_or("the API key");
+            // Names the condition; never sends the reader out to a command.
+            // Guarded repo-wide by crates/server/tests/no_exit_to_cli.rs.
+            return BootCredential::Rejected(format!(
+                "{name} is not a platform key — keys carry the m27_ prefix"
+            ));
+        }
+        return BootCredential::Ready(PlatformAuth::ApiKey(key));
     }
+    // The token vars are unvalidated by the resolver too: either shape is
+    // legitimate there, so classify rather than reject.
     PlatformVar::TOKEN
         .get()
         .or_else(|| PlatformVar::API_TOKEN.get())
-        .map(|value| PlatformAuth::classify(&value))
+        .map(|value| BootCredential::Ready(PlatformAuth::classify(&value)))
+        .unwrap_or(BootCredential::Absent)
 }
 
 /// The body of [`run_boot_checks`] with the configured/not-configured
@@ -160,7 +193,7 @@ async fn run_boot_checks_with(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
     configured: bool,
-    credential: Option<PlatformAuth>,
+    credential: BootCredential,
 ) -> Vec<boot::BootCheck> {
     let mut checks = Vec::new();
     let client = reqwest::Client::builder()
@@ -188,18 +221,27 @@ async fn run_boot_checks_with(
     let api = &endpoints.api_base;
 
     // 1. Platform connection — use /agent/capabilities (always 200 with auth)
-    let Some(credential) = credential else {
-        // Configured, but nothing to authenticate with. Say that, rather than
-        // firing an unauthenticated request and blaming the host for the 401.
-        checks.push(boot::BootCheck {
-            name: "Platform".into(),
-            result: "configured, but no usable credential — checks skipped".into(),
-            ok: false,
-            dots: 8,
-            delay_ms: 30,
-        });
-        push_local_checks(&client, &mut checks).await;
-        return checks;
+    let credential = match credential {
+        BootCredential::Ready(credential) => credential,
+        // Both remaining arms state the real condition rather than firing an
+        // unauthenticated request and blaming the host for the resulting 401.
+        // A malformed credential names ITS OWN defect: "unreachable" would
+        // send the reader to look at the network, which is not the problem.
+        other => {
+            let result = match other {
+                BootCredential::Rejected(why) => why,
+                _ => "configured, but no usable credential — checks skipped".to_string(),
+            };
+            checks.push(boot::BootCheck {
+                name: "Platform".into(),
+                result,
+                ok: false,
+                dots: 8,
+                delay_ms: 30,
+            });
+            push_local_checks(&client, &mut checks).await;
+            return checks;
+        }
     };
     let platform_ok = credential
         .apply(client.get(format!("{api}/agent/capabilities")))
@@ -459,6 +501,54 @@ pub(crate) fn clear_platform_env() {
 mod tests {
     use super::*;
 
+    /// A malformed API key must name ITS OWN defect, not blame the host.
+    ///
+    /// `resolve_platform_auth` rejects a key without the frozen `m27_` prefix
+    /// (auth.rs:165-170). Before this, `boot_credential` classified it instead
+    /// — a typo went out as `Bearer badkey`, 401'd, and the row read
+    /// "<host> unreachable", pointing the reader at the network when the
+    /// problem was the value they pasted.
+    #[tokio::test]
+    async fn a_malformed_api_key_names_itself_instead_of_blaming_the_host() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        unsafe { std::env::set_var("PRISM_API_KEY", "badkey") };
+
+        let rejected = boot_credential(None);
+        assert!(
+            matches!(rejected, BootCredential::Rejected(_)),
+            "a non-m27_ key is not usable: {rejected:?}"
+        );
+        let BootCredential::Rejected(why) = rejected else {
+            unreachable!()
+        };
+        assert!(
+            why.contains("PRISM_API_KEY"),
+            "must name the variable: {why}"
+        );
+        assert!(why.contains("m27_"), "must name the rule: {why}");
+
+        // And it must reach the boot screen as that reason, not "unreachable".
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
+        clear_platform_env();
+        let platform = checks.iter().find(|c| c.name == "Platform").unwrap();
+        assert!(platform.result.contains("m27_"), "{}", platform.result);
+        assert!(
+            !platform.result.contains("unreachable"),
+            "never blame the host for a malformed credential: {}",
+            platform.result
+        );
+        // The contradictory green Auth row must not appear either.
+        assert!(
+            !checks.iter().any(|c| c.name == "Auth"),
+            "no green Auth row beside a rejected credential"
+        );
+    }
+
     /// Hard offline mode must skip every platform check, from ANY command.
     /// `Commands::Setup` and `Commands::Resume` had no `cli.offline` guard, so
     /// before this the boot checks ran under `PRISM_OFFLINE=1` and — once they
@@ -517,7 +607,7 @@ mod tests {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks_with(None, &endpoints, true, None).await;
+        let checks = run_boot_checks_with(None, &endpoints, true, BootCredential::Absent).await;
         let platform = checks
             .iter()
             .find(|c| c.name == "Platform")
@@ -546,13 +636,13 @@ mod tests {
         unsafe { std::env::set_var("PRISM_API_KEY", "m27_env") };
         assert_eq!(
             boot_credential(Some(&creds_with("session-jwt"))),
-            Some(PlatformAuth::Bearer("session-jwt".to_string()))
+            BootCredential::Ready(PlatformAuth::Bearer("session-jwt".to_string()))
         );
 
         // No session: the env key is classified by shape, not assumed Bearer.
         assert_eq!(
             boot_credential(None),
-            Some(PlatformAuth::ApiKey("m27_env".to_string()))
+            BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string()))
         );
 
         // A non-m27 value under the token name is a rotating credential.
@@ -560,11 +650,11 @@ mod tests {
         unsafe { std::env::set_var("MARC27_TOKEN", "jwt-shaped") };
         assert_eq!(
             boot_credential(None),
-            Some(PlatformAuth::Bearer("jwt-shaped".to_string()))
+            BootCredential::Ready(PlatformAuth::Bearer("jwt-shaped".to_string()))
         );
 
         clear_platform_env();
-        assert_eq!(boot_credential(None), None);
+        assert_eq!(boot_credential(None), BootCredential::Absent);
     }
 
     fn creds_with(token: &str) -> StoredCredentials {
@@ -639,7 +729,7 @@ mod tests {
             api_base: "https://platform.invalid/api/v1".to_string(),
             node_ws: "wss://platform.invalid/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks_with(None, &endpoints, false, None).await;
+        let checks = run_boot_checks_with(None, &endpoints, false, BootCredential::Absent).await;
 
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["Platform", "Local Node", "Policy Engine"]);
@@ -669,7 +759,7 @@ mod tests {
             None,
             &endpoints,
             true,
-            Some(PlatformAuth::ApiKey("m27_test".into())),
+            BootCredential::Ready(PlatformAuth::ApiKey("m27_test".into())),
         )
         .await;
 
