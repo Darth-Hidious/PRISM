@@ -336,6 +336,24 @@ pub enum RefusalGuard {
     /// Inside an occurrence of the subject's or object's own name
     /// (the "718" of "Inconel 718").
     InsideName,
+    /// Round 16: a dash in SEPARATOR or PARENTHETICAL role on a SIGNED
+    /// predicate, where `SignDomain` cannot help (residual stress is
+    /// legitimately signed). Two locally-distinguishable shapes, both
+    /// fabrications of the SIGN against a tensile source value:
+    ///   (A) label-inline — the claimed object's own normalised name
+    ///       abuts the dash ("residual stress -950 MPa"): the dash
+    ///       separates the label from its value, so the source reads
+    ///       +950 and a -950 claim fabricates the sign.
+    ///   (B) bracketed — a dash GLUED to the unit right after the value
+    ///       ("result -950 MPa- matched"), the closing parenthetical a
+    ///       minus never carries.
+    /// Fires only for value < 0 (a signed needle); for non-negative
+    /// predicates `SignDomain` refuses first. The line-start shape
+    /// ("-950 MPa was recorded") carries NEITHER signal and is
+    /// deliberately NOT refused — it is locally indistinguishable from
+    /// a genuine line-start minus ("-350 MPa was the surface stress") —
+    /// and is carried as a KNOWN live fabrication in the corpus.
+    SeparatorDash,
 }
 
 /// Why no supporting span was found. `NoSpan` reads as the model's fault
@@ -694,6 +712,9 @@ fn refusing_guard(
     {
         return Some(RefusalGuard::InsideName);
     }
+    if separator_or_paren_dash_on_signed_value(hay, start, end, object_n, value) {
+        return Some(RefusalGuard::SeparatorDash);
+    }
     None
 }
 
@@ -718,6 +739,79 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
         search_from = name_start + hay[name_start..].chars().next().map_or(1, char::len_utf8);
     }
     false
+}
+
+/// Round 16: refuse a SIGNED needle whose dash is in SEPARATOR or
+/// PARENTHETICAL role, not sign role, on a quantity `SignDomain` cannot
+/// touch (a genuinely-signed predicate such as residual stress). Two
+/// shapes, each closed by its own sub-condition; both pin the SAME
+/// fabrication class — a compressive value stamped from a tensile
+/// source. See `RefusalGuard::SeparatorDash` for the shape catalogue.
+///
+/// Why the object NAME and not another word list: round 12 measured a
+/// generic "preceding word" rule and it failed in both directions
+/// (it could not read the line-start shape, and "From Fig. 6, -950"
+/// has no word before the dash either). The information round 12
+/// lacked is the object's OWN name, already in scope here as
+/// `object_n`. In the separator shape the name abuts the dash; in a
+/// true minus it follows a verb or preposition ("was", "at",
+/// "reached"). The name is precise where a word list was not.
+///
+/// (A) label-inline — `object_n` is the trailing token(s) of the text
+/// before the dash (one optional space between). A word boundary
+/// before it stops a suffix of a longer word matching ("distress"
+/// must not match object "stress").
+///
+/// (B) bracketed — a `UNIT_TOKENS` entry sits right after the value
+/// (one optional space), immediately followed by a
+/// `MINUS_CAPABLE_DASH` that is NOT followed by a digit. That glued
+/// dash is the closing parenthetical a minus never carries; the
+/// not-a-digit guard leaves digit/dash/digit ranges (owned by the
+/// `Range` guard, checked first) untouched.
+///
+/// DELIBERATELY not refused — the line-start shape "-950 MPa was
+/// recorded" has neither signal and is locally indistinguishable from
+/// a genuine line-start minus ("-350 MPa was the surface stress"). It
+/// is carried as a KNOWN live fabrication in the corpus.
+fn separator_or_paren_dash_on_signed_value(
+    hay: &str,
+    start: usize,
+    end: usize,
+    object_n: &str,
+    value: f64,
+) -> bool {
+    if value >= 0.0 {
+        return false;
+    }
+    // (A) the object's own name abuts the dash as complete trailing
+    // words. `strip_suffix` is an exact match; the boundary check
+    // before it stops a longer word's suffix matching.
+    if !object_n.is_empty()
+        && let Some(before_obj) = hay[..start].trim_end().strip_suffix(object_n)
+    {
+        let boundary = before_obj.is_empty()
+            || before_obj
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_alphanumeric());
+        if boundary {
+            return true;
+        }
+    }
+    // (B) a unit token right after the value, immediately followed by a
+    // dash that is not followed by a digit (so a digit/dash/digit range
+    // stays owned by the `Range` guard).
+    let rest = hay[end..].strip_prefix(' ').unwrap_or(&hay[end..]);
+    UNIT_TOKENS.iter().any(|u| match rest.strip_prefix(u) {
+        Some(tail) => match tail.chars().next() {
+            Some(d) if MINUS_CAPABLE_DASHES.contains(&d) => tail[d.len_utf8()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_digit()),
+            _ => false,
+        },
+        None => false,
+    })
 }
 
 /// Dash-class-aware name search: the first occurrence of `name` in
@@ -3743,6 +3837,80 @@ mod tests {
                 guard: RefusalGuard::SignDomain,
                 span: separator.to_string(),
             })
+        );
+    }
+
+    /// Round 16: a dash in SEPARATOR or PARENTHETICAL role on a SIGNED
+    /// predicate (residual stress) is refused — `SignDomain` cannot
+    /// help because the quantity is genuinely signed. Both shapes
+    /// (label-inline via the object name abutting the dash; bracketed
+    /// via a trailing dash glued to the unit) drop as `SeparatorDash`,
+    /// and BOTH directions are pinned: the forward rows are refused,
+    /// and the true-minus rows (a verb/preposition before the dash) still
+    /// stamp. Removing sub-condition (A) reddens the inline rows,
+    /// removing (B) reddens the bracketed rows; widening either (or
+    /// dropping the value<0 gate) reddens an over-refusal row. No
+    /// cannot-fail arm.
+    #[test]
+    fn separator_dash_refuses_signed_predicate_separator_shapes() {
+        // (A) label-inline: the object name abuts the dash. Both glyphs.
+        for prose in [
+            "Ti-6Al-4V residual stress -950 MPa (longitudinal)",
+            "Ti-6Al-4V residual stress \u{2212}950 MPa (longitudinal)",
+        ] {
+            assert_eq!(
+                supporting_quote_or_refusal("Ti-6Al-4V", "residual_stress", Some(-950.0), prose),
+                Err(SupportRefusal::Guarded {
+                    guard: RefusalGuard::SeparatorDash,
+                    span: prose.to_string(),
+                })
+            );
+        }
+        // (B) bracketed: a dash glued to the unit right after the value.
+        for prose in [
+            "The Ti-6Al-4V result -950 MPa- matched the target.",
+            "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
+        ] {
+            assert_eq!(
+                supporting_quote_or_refusal("Ti-6Al-4V", "residual_stress", Some(-950.0), prose),
+                Err(SupportRefusal::Guarded {
+                    guard: RefusalGuard::SeparatorDash,
+                    span: prose.to_string(),
+                })
+            );
+        }
+        // Over-refusal direction: a true minus MUST still stamp — the
+        // dash follows a verb/preposition (never the object name) and no
+        // dash is glued to the unit. These pin that the guard is precise.
+        assert!(
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-350.0),
+                "The residual stress in Ti-6Al-4V was \u{2212}350 MPa."
+            )
+            .is_ok()
+        );
+        assert!(
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "surface_stress",
+                Some(-950.0),
+                "From Fig. 6, \u{2212}950 MPa was the Ti-6Al-4V surface stress."
+            )
+            .is_ok()
+        );
+        // A genuine line-start minus must stamp too — the shape the
+        // corpus carries as a KNOWN fabrication: no name abuts, no
+        // trailing dash, locally indistinguishable from a separator.
+        assert!(
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-350.0),
+                "\u{2212}350 MPa was the Ti-6Al-4V surface stress (Fig. 6)."
+            )
+            .is_ok()
         );
     }
 
