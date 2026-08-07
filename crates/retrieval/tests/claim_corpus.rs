@@ -361,6 +361,59 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "a bare parenthesised number is a citation",
         ),
+        // ---------------- MUST_DROP: citation dash ranges (round 10) --
+        // The citation walk-back trimmed only '-', U+2013 and U+2014;
+        // the other six glyphs of the dash class stranded the trim on
+        // the dash, the bracket was never seen, and the second citation
+        // number stamped. One row per leaking glyph.
+        case(
+            "Ti-6Al-4V has been studied extensively [11\u{2010}13].",
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            Expect::MustDrop,
+            "citation dash class round 10: U+2010 HYPHEN range separator",
+        ),
+        case(
+            "Ti-6Al-4V has been studied extensively [11\u{2011}13].",
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            Expect::MustDrop,
+            "citation dash class round 10: U+2011 NON-BREAKING HYPHEN range separator",
+        ),
+        case(
+            "Ti-6Al-4V has been studied extensively [11\u{2012}13].",
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            Expect::MustDrop,
+            "citation dash class round 10: U+2012 FIGURE DASH range separator",
+        ),
+        case(
+            "Ti-6Al-4V has been studied extensively [11\u{2015}13].",
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            Expect::MustDrop,
+            "citation dash class round 10: U+2015 HORIZONTAL BAR range separator",
+        ),
+        case(
+            "Ti-6Al-4V has been studied extensively [11\u{2212}13].",
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            Expect::MustDrop,
+            "citation dash class round 10: U+2212 MINUS SIGN range separator",
+        ),
+        case(
+            "Ti-6Al-4V has been studied extensively [11\u{fe63}13].",
+            "Ti-6Al-4V",
+            "UTS",
+            13.0,
+            Expect::MustDrop,
+            "citation dash class round 10: U+FE63 SMALL HYPHEN-MINUS range separator",
+        ),
         // ---------------- MUST_DROP: labels --------------------------
         case(
             "Ti-6Al-4V properties are listed in Table 3.",
@@ -425,6 +478,58 @@ fn corpus() -> Vec<CorpusCase> {
             4.0,
             Expect::MustDrop,
             "dotted label lists are labels",
+        ),
+        // ---------------- MUST_DROP: label-list dash walks (round 10) -
+        // The conjunction walk-back trimmed the same hand-picked dash
+        // trio, so "Refs. 25<D>27 and 28" stranded on the dash and
+        // stamped 28 for the six other glyphs. One row per glyph.
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{2010}27 and 28.",
+            "Ti-6Al-4V",
+            "UTS",
+            28.0,
+            Expect::MustDrop,
+            "label-list dash walk round 10: U+2010 joins the reference range",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{2011}27 and 28.",
+            "Ti-6Al-4V",
+            "UTS",
+            28.0,
+            Expect::MustDrop,
+            "label-list dash walk round 10: U+2011 joins the reference range",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{2012}27 and 28.",
+            "Ti-6Al-4V",
+            "UTS",
+            28.0,
+            Expect::MustDrop,
+            "label-list dash walk round 10: U+2012 joins the reference range",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{2015}27 and 28.",
+            "Ti-6Al-4V",
+            "UTS",
+            28.0,
+            Expect::MustDrop,
+            "label-list dash walk round 10: U+2015 joins the reference range",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{2212}27 and 28.",
+            "Ti-6Al-4V",
+            "UTS",
+            28.0,
+            Expect::MustDrop,
+            "label-list dash walk round 10: U+2212 joins the reference range",
+        ),
+        case(
+            "The Ti-6Al-4V data are listed in Refs. 25\u{fe63}27 and 28.",
+            "Ti-6Al-4V",
+            "UTS",
+            28.0,
+            Expect::MustDrop,
+            "label-list dash walk round 10: U+FE63 joins the reference range",
         ),
         // ---------------- MUST_DROP: specimen-label family (round 9) -
         // LABEL_WORDS held sample/run only; the rest of the family
@@ -621,6 +726,62 @@ fn corpus() -> Vec<CorpusCase> {
              under a DIFFERENT subject — the existing cases use subject \
              Ti-6Al-4V, so occurrence_inside_name masks the boundary dash \
              clause; another subject in the same span exposes it",
+        ),
+        // ---------------- MUST_DROP: designation dash class (round 10) -
+        // The designation guard matched only '-', U+2013 and U+2014; the
+        // other six glyphs of the dash class stamped the "6" of a
+        // dash-spelled Ti-6Al-4V under a different subject. U+2011
+        // NON-BREAKING HYPHEN is the glyph a typesetter uses to keep
+        // Ti-6Al-4V on one line, the likeliest in a real PDF. One row
+        // per leaking glyph.
+        case(
+            "The Ti\u{2010}6Al\u{2010}4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "designation dash class round 10: U+2010 HYPHEN spells the designation",
+        ),
+        case(
+            "The Ti\u{2011}6Al\u{2011}4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "designation dash class round 10: U+2011 NON-BREAKING HYPHEN, the \
+             line-break-proof spelling a typesetter picks",
+        ),
+        case(
+            "The Ti\u{2012}6Al\u{2012}4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "designation dash class round 10: U+2012 FIGURE DASH spells the designation",
+        ),
+        case(
+            "The Ti\u{2015}6Al\u{2015}4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "designation dash class round 10: U+2015 HORIZONTAL BAR spells the designation",
+        ),
+        case(
+            "The Ti\u{2212}6Al\u{2212}4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "designation dash class round 10: U+2212 MINUS SIGN spells the designation",
+        ),
+        case(
+            "The Ti\u{fe63}6Al\u{fe63}4V and Inconel 718 alloys were compared.",
+            "Inconel 718",
+            "hardness",
+            6.0,
+            Expect::MustDrop,
+            "designation dash class round 10: U+FE63 SMALL HYPHEN-MINUS spells the designation",
         ),
         case(
             "Inconel 718 was solution treated and aged.",

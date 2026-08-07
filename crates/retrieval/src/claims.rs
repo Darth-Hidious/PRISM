@@ -651,7 +651,8 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             }
             // A glued unit letter redeems a number, but not a digit that
             // a LETTER dash-joins into a designation (the "6" of
-            // "Ti-6Al-4V", ASCII or en/em dash). A dash preceded by a
+            // "Ti-6Al-4V", under any glyph of the dash class). A dash
+            // preceded by a
             // digit joins numeric runs instead, and the second number
             // keeps its unit: "30-50um" layers and "5-10mm" grains are
             // measurements — refusing the high endpoint while the low
@@ -669,8 +670,14 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             // HEAD). Both reviewers confirm the clause is load-bearing —
             // closing this shape needs a standard-designator guard, not
             // dash surgery.
+            // Round 10: the glyph set is the whole dash class, not the
+            // hand-picked trio of rounds 6-9. U+2010/U+2011/U+2012/
+            // U+2015/U+2212/U+FE63 all stamped the "6" of a dash-spelled
+            // designation under a different subject; U+2011 NON-BREAKING
+            // HYPHEN is the glyph a typesetter picks so "Ti-6Al-4V"
+            // survives line-breaking, the likeliest one in a real PDF.
             if let Some(before) = hay[..start].chars().next_back()
-                && matches!(before, '-' | '\u{2013}' | '\u{2014}')
+                && MINUS_CAPABLE_DASHES.contains(&before)
                 && hay[..start - before.len_utf8()]
                     .chars()
                     .next_back()
@@ -720,9 +727,14 @@ fn en_dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
 /// any non-number text: "(950 MPa)" is a parenthesized value, not a
 /// citation, so a bracket-class rule that only looks backwards would
 /// refuse legitimate values.
+///
+/// Round 10: the range separator is the whole dash class, not the
+/// hand-picked trio. `[11\u{2010}13]` and its five other glyph twins
+/// walked back only to the dash, never saw the bracket, and stamped
+/// the second citation number as a measurement.
 fn inside_citation_marker(hay: &str, start: usize) -> bool {
     let prefix = hay[..start].trim_end_matches(|c: char| {
-        c.is_ascii_digit() || matches!(c, ',' | ' ' | '-' | '\u{2013}' | '\u{2014}')
+        c.is_ascii_digit() || matches!(c, ',' | ' ') || MINUS_CAPABLE_DASHES.contains(&c)
     });
     let Some(open) = prefix.chars().next_back() else {
         return false;
@@ -732,7 +744,7 @@ fn inside_citation_marker(hay: &str, start: usize) -> bool {
         '(' | '{' => {
             let close = if open == '(' { ')' } else { '}' };
             let after = hay[start..].trim_start_matches(|c: char| {
-                c.is_ascii_digit() || matches!(c, ',' | ' ' | '-' | '\u{2013}' | '\u{2014}')
+                c.is_ascii_digit() || matches!(c, ',' | ' ') || MINUS_CAPABLE_DASHES.contains(&c)
             });
             after.starts_with(close)
         }
@@ -967,10 +979,15 @@ fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
     if !chain_ends_in_unit(hay, end) {
         walk_comma_items(&mut prefix, &mut word);
         if LIST_CONTINUATIONS.contains(&word.as_str()) {
+            // Round 10: the dash set is the whole dash class here too —
+            // "Refs. 25\u{2010}27 and 28" used to strand its trim on the
+            // dash and stamp 28, the same partial-trio leak the
+            // citation marker had.
             prefix = prefix[..prefix.len() - word.len()]
                 .trim_end_matches(|c: char| {
                     c.is_ascii_digit()
-                        || matches!(c, ',' | ' ' | '.' | ':' | '-' | '\u{2013}' | '\u{2014}')
+                        || matches!(c, ',' | ' ' | '.' | ':')
+                        || MINUS_CAPABLE_DASHES.contains(&c)
                 })
                 .to_string();
             word = trailing_word(&prefix);
@@ -1892,6 +1909,25 @@ mod tests {
     fn citation_marker_is_not_support() {
         let block = "Ti-6Al-4V has been studied extensively in prior work [1140].";
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1140.0, block);
+
+        // Round 10: a dash-joined citation range is refused by the
+        // Citation guard for EVERY glyph of the dash class, not just
+        // '-', U+2013 and U+2014. The walk-back reaches the bracket
+        // through each separator; the guard name pins it.
+        for dash in [
+            '\u{2010}', '\u{2011}', '\u{2012}', '\u{2015}', '\u{2212}', '\u{fe63}',
+        ] {
+            let range = format!("Ti-6Al-4V has been studied extensively [11{dash}13].");
+            assert_eq!(
+                supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(13.0), &range),
+                Err(SupportRefusal::Guarded {
+                    guard: RefusalGuard::Citation,
+                    span: range.clone(),
+                }),
+                "dash U+{:04X} leaked the citation range",
+                dash as u32
+            );
+        }
     }
 
     /// Fabrication path 3 (label form): a number immediately after
@@ -2256,6 +2292,18 @@ mod tests {
             "Inconel 718 data are in Sections 3 and 3.1.",
         );
 
+        // Round 10: a dash-joined reference range walks back through
+        // every glyph of the dash class, not just '-', U+2013 and
+        // U+2014; the conjunction tail is refused by Label, guard-named.
+        let dash_range = "The Ti-6Al-4V data are listed in Refs. 25\u{2010}27 and 28.";
+        assert_eq!(
+            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(28.0), dash_range),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: dash_range.to_string(),
+            })
+        );
+
         // Stamp direction: the greedy trim must not over-walk a VALUE
         // list. Dotted values with no trailing unit walk back to their
         // real head word, not a label, and stamp.
@@ -2278,6 +2326,18 @@ mod tests {
         let block = "The Ti-6Al-4V samples were annealed and examined.";
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 6.0, block);
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 4.0, block);
+
+        // Round 10: the designation guard's glyph set is the whole dash
+        // class. U+2011 NON-BREAKING HYPHEN is the spelling a typesetter
+        // uses to keep Ti-6Al-4V on one line; under a DIFFERENT subject
+        // (so occurrence_inside_name cannot mask the boundary clause) the
+        // 6 must still drop.
+        assert_dropped_end_to_end(
+            "Inconel 718",
+            "hardness",
+            6.0,
+            "The Ti\u{2011}6Al\u{2011}4V and Inconel 718 alloys were compared.",
+        );
     }
 
     /// Fabrication path 1: a table must not act as one giant span. Rows
