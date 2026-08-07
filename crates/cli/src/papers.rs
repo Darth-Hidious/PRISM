@@ -355,6 +355,14 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         &block.text,
                     );
                     let quote = support.as_ref().ok().cloned();
+                    // Clone the drop-record fields BEFORE `fact` moves into
+                    // `claim_from_fact` and `claim` into `validate_and_stamp`:
+                    // without them the rejected entries carry only a reason,
+                    // and the over-refusal histogram cannot be built from
+                    // production output at all.
+                    let subject = fact.subject.clone();
+                    let object = fact.object.clone();
+                    let value = fact.value;
                     let claim = claim_from_fact(
                         fact,
                         &document_id,
@@ -365,26 +373,33 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     );
                     match prism_retrieval::claims::validate_and_stamp(claim, &block.text) {
                         Ok(stamped) => claims.push(stamped),
-                        Err(prism_retrieval::claims::ClaimRejection::MissingQuote) => {
-                            // A missing quote is the model's fault only when
-                            // no span held the fact at all. When a span held
-                            // it but a guard refused every occurrence of the
-                            // value, record WHICH guard: that drop is the
-                            // matcher's refusal, and the guard name is the
-                            // only observable signal of over-refusal.
-                            let reason = match support {
-                                Err(refusal) => {
-                                    prism_retrieval::claims::ClaimRejection::from(refusal)
-                                }
-                                Ok(_) => prism_retrieval::claims::ClaimRejection::MissingQuote,
+                        Err(reason) => {
+                            // A MissingQuote drop is refined by `support`: a
+                            // missing quote is the model's fault only when no
+                            // span held the fact at all (NoSpan maps back to
+                            // MissingQuote). When a span held it but a guard
+                            // refused every occurrence of the value, record
+                            // WHICH guard: that drop is the matcher's refusal,
+                            // and the guard name is the only observable signal
+                            // of over-refusal. MissingQuote implies `support`
+                            // is Err — Ok support gave the claim a quote, and
+                            // only a quote-less claim is refused as
+                            // MissingQuote — so no Ok arm exists here.
+                            let reason = match (reason, support) {
+                                (
+                                    prism_retrieval::claims::ClaimRejection::MissingQuote,
+                                    Err(refusal),
+                                ) => prism_retrieval::claims::ClaimRejection::from(refusal),
+                                (reason, _) => reason,
                             };
                             rejected.push(json!({
                                 "reason": reason,
+                                "subject": subject,
+                                "object": object,
+                                "value": value,
+                                "locator": block.locator,
                             }));
                         }
-                        Err(reason) => rejected.push(json!({
-                            "reason": reason,
-                        })),
                     }
                 }
             }

@@ -170,6 +170,16 @@ pub enum RefusalGuard {
 pub enum SupportRefusal {
     /// No span held the subject or the object (both, for a non-numeric
     /// fact): there was nothing to scan.
+    ///
+    /// RECORDED, NOT FIXED (round 7): "nothing to scan" is also what a
+    /// numeric fact reads as when NO NEEDLE FORM of the value matched
+    /// anywhere (a glyph this engine lacks, e.g. a pre-round-7
+    /// \u{3bc}m or 2.95\u{c5}). Such drops are matcher over-refusals,
+    /// but they surface as `NoSpan` -> `MissingQuote`, which this
+    /// module defines as the MODEL's fault — 3 of 12 remaining
+    /// over-refusals were misfiled as hallucinations this way. A real
+    /// fix must distinguish "no needle form matched" from "no span had
+    /// evidence".
     NoSpan,
     /// A span held the subject or object and at least one occurrence of the
     /// value, but every occurrence was refused by a guard. Names the guard
@@ -206,6 +216,11 @@ pub fn validate_and_stamp(
         return Err(ClaimRejection::EmptySubject);
     }
     if claim.value.is_some() && claim.unit.is_none() {
+        // RECORDED, NOT FIXED (round 7): this returns BEFORE the quote
+        // check, so a unitless numeric fact never reaches the
+        // supporting-span scan — its drop carries no guard and no span,
+        // and whatever the matcher would have done with the value is
+        // invisible in the drop record.
         return Err(ClaimRejection::NumericValueWithoutUnit);
     }
     for condition in &claim.conditions {
@@ -573,6 +588,14 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
             // mutation-proven by the en-dash object-arm case in
             // digit_dash_ranges_with_glued_units_stamp_the_high_endpoint:
             // with it gone, the "6" of Ti\u{2013}6Al\u{2013}4V stamps.
+            //
+            // RECORDED, NOT FIXED (round 7): the digit-before-dash
+            // redemption keeps ONE known fabrication — "ASTM E466-15a"
+            // stamps 15 (a digit-joined standard designator whose
+            // trailing 'a' is a unit initial; probed and confirmed at
+            // HEAD). Both reviewers confirm the clause is load-bearing —
+            // closing this shape needs a standard-designator guard, not
+            // dash surgery.
             if let Some(before) = hay[..start].chars().next_back()
                 && matches!(before, '-' | '\u{2013}' | '\u{2014}')
                 && hay[..start - before.len_utf8()]
