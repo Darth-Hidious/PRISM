@@ -137,25 +137,39 @@
 //! ROUND 13 ITEM 2 — IS THE REVERT STILL BUYING ANYTHING? Settled by
 //! measurement; the winning reading is (a) the revert IS load-bearing.
 //! On the round-12 corpus M-A (re-adding U+2013/U+2014 to
-//! `number_needles`) measured as a PURE WIN — 0 MUST_STAMP dropped, 0
-//! MUST_DROP stamped, 5 KNOWN recall rows recovered — but ONLY because
-//! every separator row sat on UTS, where SignDomain masked the
-//! needle-set decision (item 1's cannot-fail rows). Item 1 moved those
-//! six rows onto residual_stress (a genuinely SIGNED predicate), where
-//! SignDomain cannot touch them; re-running M-A there stamps all six
-//! (MUST_DROP stamped = 6) — the separator fabrication IS expressible
-//! for signed predicates, and the revert is what holds it. The crux
-//! the round-11/12 record left open — whether for a signed quantity the
-//! separator fabrication is INEXPRESSIBLE (because -950 is a
-//! "legitimate reading" of "\u{2013}950") — resolves cleanly: round
-//! 11's convention reads U+2013/U+2014 as SEPARATORS (not minuses), so
-//! under that convention the source value is +950 and a -950 claim is a
-//! fabrication whatever the predicate's sign domain. The two readings
-//! share one local shape (\u{2013} before a number); the engine cannot
-//! have BOTH the recall (the legitimate -350 stamp, KNOWN MustStamp)
-//! AND the safety (the separator -950 drop), so it keeps the safety.
-//! The 5 recall rows are the price, NOT free; recovering them would
-//! reopen the separator fabrication on every signed quantity.
+//! `number_needles`) measured as a win on the corpus — 0 MUST_STAMP
+//! dropped, 0 MUST_DROP stamped, 7 KNOWN recall rows recovered — but
+//! NOT a pure win: it reddens `claims::tests::en_dash_is_not_a_sign_glyph`
+//! (both `Err(NoSpan)` asserts flip to a stamp). And that corpus win
+//! was ONLY because every separator row sat on UTS, where SignDomain
+//! masked the needle-set decision (item 1's cannot-fail rows). Item 1
+//! moved those six rows onto residual_stress (a genuinely SIGNED
+//! predicate), where SignDomain cannot touch them; re-running M-A there
+//! stamps all six (MUST_DROP stamped = 6). The crux the round-11/12
+//! record left open — whether for a signed quantity the separator
+//! fabrication is INEXPRESSIBLE (because -950 is a "legitimate
+//! reading" of "\u{2013}950") — resolves cleanly: round 11's
+//! convention reads U+2013/U+2014 as SEPARATORS (not minuses), so
+//! under that convention the source value is +950 and a -950 claim is
+//! a fabrication whatever the predicate's sign domain. The two
+//! readings share one local shape (\u{2013} before a number); the
+//! engine cannot have BOTH the recall (the legitimate -350 stamp,
+//! KNOWN MustStamp) AND the safety (the separator -950 drop), so it
+//! keeps the safety. The 7 recall rows are the price, NOT free;
+//! recovering them would reopen the U+2013/U+2014 HALF of the
+//! separator fabrication on signed quantities. ROUND 15 ITEM 1
+//! narrowed this verdict: the revert holds ONLY that half — the ASCII
+//! '-' / U+2212 half is ALREADY open on every signed predicate (six
+//! RED residual_stress rows in the corpus stamp -950 from a +950
+//! source), because those glyphs are real minus needles the engine
+//! cannot refuse without losing all genuine negative recall; no revert
+//! touches them. The recall price also carries a known MISATTRIBUTION:
+//! all 7 dropped recall rows surface as `NoSpan` -> `MissingQuote`,
+//! which `SupportRefusal::NoSpan` below defines as the MODEL's fault
+//! (a hallucination) — the same misfiling round 11's (b) fix closed
+//! for U+2212 by giving the glyph a needle; the identical misfiling
+//! for U+2013/U+2014 is live (no needle, so a genuine negative reads
+//! as 'nothing to scan'). RECORDED, not refactored.
 //! For SIGNED quantities the routes still diverge on recall: the JATS
 //! U+2013 spelling drops while the PDF '-' spelling stamps the genuine
 //! negative — the '-' reading is the defensible one (the glyph IS the
