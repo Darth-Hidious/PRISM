@@ -87,6 +87,10 @@ pub enum PapersCommands {
         /// run time on long documents.
         #[arg(long, default_value_t = 0)]
         max_blocks: usize,
+        /// Also write the extracted claims into the bundled Turso store, so
+        /// they join the local knowledge graph instead of only being printed.
+        #[arg(long)]
+        store: bool,
     },
 }
 
@@ -262,6 +266,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             llm_url,
             api_key,
             max_blocks,
+            store,
         } => {
             let paper = paper_for_fulltext(&pmc, &url, &format)?;
             let engine = build_engine(vec![SourceId::Arxiv], &None, false);
@@ -283,6 +288,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 model.as_deref(),
                 api_key.as_deref(),
             )?;
+            let extractor_model = llm_cfg.model.clone();
             if llm_cfg.base_url.trim().is_empty() || llm_cfg.model.trim().is_empty() {
                 println!(
                     "{}",
@@ -355,6 +361,20 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     }
                 }
             }
+            // Persisting is opt-in. Until now `papers claims` printed EMMO
+            // claims and dropped them: the retrieval half and the graph half
+            // were both built and never joined, so PRISM could read a paper
+            // without ever knowing what was in it.
+            let stored = if store {
+                Some({
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let db_path = std::path::PathBuf::from(home).join(".prism/provenance.db");
+                    store_claims(&claims, &fulltext.source_url, &extractor_model, &db_path).await?
+                })
+            } else {
+                None
+            };
+
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -364,11 +384,149 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     "document": fulltext.source_url,
                     "blocks_extracted": blocks_extracted,
                     "max_blocks": max_blocks,
+                    "stored": stored,
                 }))?
             );
         }
     }
     Ok(())
+}
+
+/// Write extracted literature claims into the bundled Turso store.
+///
+/// `ExtractedClaim` and `MaterialFact` are structurally the same fact in two
+/// crates; the only real conversion is the unit, which is a plain `String` on
+/// the retrieval side and a validated `QudtUnit` on the storage side.
+///
+/// A claim whose unit fails QUDT validation is REJECTED and counted, never
+/// written with the unit quietly dropped: a measurement that loses its unit is
+/// a wrong number, not a slightly poorer one.
+///
+/// Evidence class is re-capped through `evidence_for_result` on the way in.
+/// `validate_and_stamp` already caps at literature, but this store call is a
+/// separate entry point and must not depend on an upstream promise.
+async fn store_claims(
+    claims: &[prism_retrieval::claims::ExtractedClaim],
+    document_url: &str,
+    model: &str,
+    db_path: &std::path::Path,
+) -> Result<serde_json::Value> {
+    use prism_provenance::{
+        EvidenceSource, LocalProvenance, MaterialFact, MeasurementCondition, ProvenanceStore,
+        QudtUnit, evidence_for_result,
+    };
+
+    if claims.is_empty() {
+        return Ok(json!({ "written": 0, "rejected": 0, "store": null }));
+    }
+
+    let store = ProvenanceStore::open(db_path).await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let prov = LocalProvenance {
+        activity_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: if model.is_empty() {
+            "prism-papers".to_string()
+        } else {
+            model.to_string()
+        },
+        agent_kind: "SoftwareAgent".into(),
+        source_entity_id: document_url.to_string(),
+        source_kind: "Document".into(),
+        tenant: "local".into(),
+        started_at: now.clone(),
+        ended_at: now,
+        locality: "local".into(),
+    };
+    store.record_activity(&prov).await?;
+
+    let mut written = 0usize;
+    let mut rejected: Vec<serde_json::Value> = Vec::new();
+
+    for claim in claims {
+        let unit = match claim.unit.as_deref() {
+            Some(raw) => match QudtUnit::new(raw) {
+                Ok(unit) => Some(unit),
+                Err(e) => {
+                    rejected.push(json!({
+                        "subject": claim.subject,
+                        "object": claim.object,
+                        "reason": format!("unit {raw:?} is not a valid QUDT identifier: {e}"),
+                    }));
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        let mut conditions = Vec::with_capacity(claim.conditions.len());
+        let mut bad_condition = None;
+        for condition in &claim.conditions {
+            let cond_unit = match condition.unit.as_deref() {
+                Some(raw) => match QudtUnit::new(raw) {
+                    Ok(unit) => Some(unit),
+                    Err(e) => {
+                        bad_condition =
+                            Some(format!("condition {:?} unit {raw:?}: {e}", condition.name));
+                        break;
+                    }
+                },
+                None => None,
+            };
+            conditions.push(MeasurementCondition {
+                name: condition.name.clone(),
+                value: match &condition.value {
+                    prism_retrieval::claims::ConditionValue::Number(n) => {
+                        prism_provenance::ConditionValue::Number(*n)
+                    }
+                    prism_retrieval::claims::ConditionValue::Text(t) => {
+                        prism_provenance::ConditionValue::Text(t.clone())
+                    }
+                },
+                unit: cond_unit,
+            });
+        }
+        if let Some(reason) = bad_condition {
+            rejected.push(json!({
+                "subject": claim.subject,
+                "object": claim.object,
+                "reason": reason,
+            }));
+            continue;
+        }
+
+        let fact = MaterialFact {
+            subject: claim.subject.clone(),
+            predicate: claim.predicate.clone(),
+            object: claim.object.clone(),
+            value: claim.value,
+            unit,
+            conditions,
+            confidence: claim.confidence,
+            evidence_class: evidence_for_result(
+                EvidenceSource::LiteratureExtraction,
+                [serde_json::from_value(json!(claim.evidence_class)).unwrap_or_default()],
+            ),
+            kind: claim.kind.clone(),
+        };
+
+        match store.write_fact(&fact, &prov).await {
+            Ok(()) => written += 1,
+            Err(e) => rejected.push(json!({
+                "subject": claim.subject,
+                "object": claim.object,
+                "reason": format!("store write failed: {e}"),
+            })),
+        }
+    }
+
+    Ok(json!({
+        "written": written,
+        "rejected": rejected.len(),
+        "rejections": rejected,
+        "store": db_path.display().to_string(),
+        "tenant": "local",
+    }))
 }
 
 /// TCP-probe an LLM base URL with a hard 3-second budget.
@@ -554,5 +712,140 @@ mod tests {
             !err.contains("offline mode"),
             "guard fired with offline unset: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use prism_retrieval::claims::{
+        ClaimProvenance, ConditionValue, ExtractedClaim, MeasurementCondition,
+    };
+
+    fn scratch_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("prism_papers_test_{}.db", uuid::Uuid::new_v4()))
+    }
+
+    fn cleanup(p: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut q = p.to_path_buf().into_os_string();
+            q.push(suffix);
+            let _ = std::fs::remove_file(q);
+        }
+    }
+
+    fn claim(object: &str, unit: Option<&str>, cond_unit: Option<&str>) -> ExtractedClaim {
+        ExtractedClaim {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_measurement".into(),
+            object: object.into(),
+            value: Some(1140.0),
+            unit: unit.map(str::to_string),
+            conditions: cond_unit
+                .map(|u| {
+                    vec![MeasurementCondition {
+                        name: "temperature".into(),
+                        value: ConditionValue::Number(298.15),
+                        unit: Some(u.to_string()),
+                    }]
+                })
+                .unwrap_or_default(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: "research".into(),
+            provenance: ClaimProvenance {
+                document_id: "10.1000/xyz".into(),
+                document_url: "https://example.org/paper".into(),
+                source: "arxiv".into(),
+                locator: prism_retrieval::Locator {
+                    kind: prism_retrieval::fulltext::BlockKind::Body,
+                    section_path: vec!["Results".into()],
+                    label: None,
+                    char_offset: 0,
+                },
+                quote: None,
+            },
+        }
+    }
+
+    /// The gap this exists to close: extracted literature claims must land in
+    /// the graph, not just be printed.
+    #[tokio::test]
+    async fn a_valid_claim_is_written_and_readable_back() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+
+        let out = store_claims(
+            &[claim("UTS", Some("QUDT:MegaPA"), Some("QUDT:K"))],
+            "https://example.org/paper",
+            "test-model",
+            &db,
+        )
+        .await
+        .expect("store");
+
+        assert_eq!(out["written"], 1, "claim was not written: {out}");
+        assert_eq!(out["rejected"], 0);
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1, "fact not readable back");
+        assert_eq!(facts[0].object, "UTS");
+        assert_eq!(
+            facts[0].evidence_class,
+            prism_provenance::EvidenceClass::Research,
+            "literature must stay ORANGE/research",
+        );
+        assert_eq!(facts[0].source, "https://example.org/paper");
+        cleanup(&db);
+    }
+
+    /// A measurement that loses its unit is a wrong number, not a slightly
+    /// poorer one. An invalid QUDT unit must reject the claim, not write it
+    /// unitless.
+    #[tokio::test]
+    async fn a_claim_with_an_invalid_unit_is_rejected_not_silently_unitless() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+
+        let out = store_claims(
+            &[claim("UTS", Some("megapascals"), None)],
+            "https://example.org/paper",
+            "test-model",
+            &db,
+        )
+        .await
+        .expect("store");
+
+        assert_eq!(out["written"], 0, "an unvalidated unit was written: {out}");
+        assert_eq!(out["rejected"], 1);
+        assert!(
+            out["rejections"][0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("QUDT"),
+            "rejection does not say why: {out}"
+        );
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert!(facts.is_empty(), "rejected claim reached the store anyway");
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn no_claims_means_no_store_file_and_no_error() {
+        let db = scratch_db();
+        let out = store_claims(&[], "https://example.org/paper", "m", &db)
+            .await
+            .expect("store");
+        assert_eq!(out["written"], 0);
+        assert!(!db.exists(), "an empty claim set created a database anyway");
     }
 }
