@@ -89,8 +89,9 @@ pub async fn run_boot_checks(
     // Hard offline mode is a policy about the process, not about one command.
     // `Commands::Tui` skipped the boot checks itself (main.rs), but `Setup` and
     // `Resume` called straight through — so `PRISM_OFFLINE=1 prism setup` ran
-    // every platform check anyway. Enforcing it here covers all eight call
-    // sites at once instead of relying on each to remember.
+    // every platform check anyway. Enforcing it here covers all NINE call
+    // sites at once (8 in main.rs + doctor.rs:172) instead of relying on each
+    // to remember.
     //
     // This matters more since boot checks started carrying a real credential:
     // before, the offline bypass leaked an empty Bearer; now it would send the
@@ -138,8 +139,20 @@ pub(crate) enum BootCredential {
 }
 
 /// The credential the boot checks should present, in the same precedence the
-/// real resolver uses (`auth::resolve_platform_auth`): stored session first,
-/// then the environment.
+/// real resolver uses (`auth::resolve_platform_auth:164-196`):
+///
+///   1. `*_API_KEY`   (validated: must carry the frozen `m27_` prefix)
+///   2. `*_TOKEN` / `*_API_TOKEN`
+///   3. the stored session
+///
+/// An earlier version of this comment said "stored session first, then the
+/// environment" and the code matched the comment rather than the resolver.
+/// Both were wrong. With an expired session AND a valid `PRISM_API_KEY`, every
+/// real command authenticated fine via the key while the boot screen used the
+/// dead session, rendered a red Auth row, and could trigger an interactive
+/// re-login (main.rs:4474-4503) for a user whose tooling was working. That is
+/// the same lying-check class this module exists to prevent, so the order is
+/// now the resolver's, not a convenient one.
 ///
 /// Before this existed the checks derived their header from `creds` alone and
 /// sent `Bearer ` — an EMPTY bearer — whenever the only credential was an env
@@ -157,12 +170,6 @@ pub(crate) enum BootCredential {
 /// and the row read "<host> unreachable" — the very lying check this module
 /// had just been fixed to stop emitting, reappearing one layer down.
 fn boot_credential(creds: Option<&StoredCredentials>) -> BootCredential {
-    if let Some(token) = creds
-        .map(|c| c.access_token.trim())
-        .filter(|t| !t.is_empty())
-    {
-        return BootCredential::Ready(PlatformAuth::Bearer(token.to_string()));
-    }
     // An API key is a distinct wire shape (`X-API-Key`) AND a validated one.
     if let Some(key) = PlatformVar::API_KEY.get() {
         if !key.starts_with("m27_") {
@@ -177,11 +184,42 @@ fn boot_credential(creds: Option<&StoredCredentials>) -> BootCredential {
     }
     // The token vars are unvalidated by the resolver too: either shape is
     // legitimate there, so classify rather than reject.
-    PlatformVar::TOKEN
+    if let Some(value) = PlatformVar::TOKEN
         .get()
         .or_else(|| PlatformVar::API_TOKEN.get())
-        .map(|value| BootCredential::Ready(PlatformAuth::classify(&value)))
+    {
+        return BootCredential::Ready(PlatformAuth::classify(&value));
+    }
+    // The stored session is LAST, matching the resolver.
+    creds
+        .map(|c| c.access_token.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| BootCredential::Ready(PlatformAuth::Bearer(t.to_string())))
         .unwrap_or(BootCredential::Absent)
+}
+
+/// The project scope the boot checks should use.
+///
+/// Env FIRST, session second — the order `resolve_active_project_id`
+/// (main.rs:7184) and `select_project_context_automatically`
+/// (agent/protocol.rs:317) both use, both of which return on the env value
+/// unconditionally.
+///
+/// My first version had this backwards while citing those two as precedent.
+/// A CI job setting `PRISM_PROJECT_ID` to override an interactive session's
+/// project would have had every command scoped to the override and this one
+/// boot row scoped to the stale session project — querying a project that may
+/// not even exist any more.
+///
+/// Extracted so the precedence is testable on its own: the row-level test
+/// cannot see it, because a sessionless install has no session project to
+/// conflict with.
+fn boot_project_id(creds: Option<&StoredCredentials>) -> Option<String> {
+    PlatformVar::PROJECT_ID.get().or_else(|| {
+        creds
+            .and_then(|c| c.project_id.as_deref())
+            .map(str::to_string)
+    })
 }
 
 /// The body of [`run_boot_checks`] with the configured/not-configured
@@ -362,11 +400,8 @@ async fn run_boot_checks_with(
         // NEVER appeared for it. `PlatformVar::PROJECT_ID` is what every other
         // surface already uses for exactly this (main.rs env_project_override,
         // agent/protocol.rs); boot_checks was the one place it was missed.
-        let env_project = PlatformVar::PROJECT_ID.get();
-        let project_id = creds
-            .and_then(|c| c.project_id.as_deref())
-            .or(env_project.as_deref())
-            .unwrap_or("");
+        let env_project = boot_project_id(creds);
+        let project_id = env_project.as_deref().unwrap_or("");
         if !project_id.is_empty() {
             let models = credential
                 .apply(client.get(format!("{api}/projects/{project_id}/llm/models")))
@@ -541,6 +576,43 @@ mod tests {
         );
     }
 
+    /// The case the row-level test structurally cannot reach: a session
+    /// project AND an env override, disagreeing. Env wins, matching
+    /// `resolve_active_project_id` and `select_project_context_automatically`.
+    #[test]
+    fn env_project_overrides_the_session_project() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
+        unsafe { std::env::remove_var("MARC27_PROJECT_ID") };
+
+        let mut with_project = creds_with("session-jwt");
+        with_project.project_id = Some("session-project".to_string());
+
+        // No override: the session project is used.
+        assert_eq!(
+            boot_project_id(Some(&with_project)).as_deref(),
+            Some("session-project")
+        );
+
+        // Override present: it wins.
+        unsafe { std::env::set_var("PRISM_PROJECT_ID", "env-project") };
+        assert_eq!(
+            boot_project_id(Some(&with_project)).as_deref(),
+            Some("env-project"),
+            "PRISM_PROJECT_ID must override the session project"
+        );
+        // And the historical spelling still works.
+        unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
+        unsafe { std::env::set_var("MARC27_PROJECT_ID", "legacy-project") };
+        assert_eq!(
+            boot_project_id(Some(&with_project)).as_deref(),
+            Some("legacy-project")
+        );
+        unsafe { std::env::remove_var("MARC27_PROJECT_ID") };
+
+        assert_eq!(boot_project_id(None), None);
+    }
+
     /// A malformed API key must name ITS OWN defect, not blame the host.
     ///
     /// `resolve_platform_auth` rejects a key without the frozen `m27_` prefix
@@ -664,25 +736,40 @@ mod tests {
         );
     }
 
-    /// A stored session outranks the environment, and an `m27_` key is an
-    /// API key (X-API-Key), not a Bearer token. Getting the second one wrong
-    /// sends the key on the wrong header and every platform check 401s.
+    /// Precedence must match `resolve_platform_auth` exactly: API key, then
+    /// token, then the stored session — NOT session-first.
+    ///
+    /// This test previously asserted the opposite and passed, because the code
+    /// it pinned had the same defect. With an expired session and a valid
+    /// `PRISM_API_KEY`, session-first made every real command succeed via the
+    /// key while the boot screen used the dead session and showed a red Auth
+    /// row. Also pins that an `m27_` value is an API key (X-API-Key), not a
+    /// Bearer token: getting that wrong 401s every check with a valid key.
     #[test]
-    fn boot_credential_prefers_the_session_then_classifies_the_env_key() {
+    fn boot_credential_matches_the_resolver_precedence() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_platform_env();
 
-        // Session wins over a present env key.
+        // The env API key OUTRANKS a stored session, as in the resolver.
         unsafe { std::env::set_var("PRISM_API_KEY", "m27_env") };
         assert_eq!(
             boot_credential(Some(&creds_with("session-jwt"))),
-            BootCredential::Ready(PlatformAuth::Bearer("session-jwt".to_string()))
+            BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string())),
+            "an env API key must win over a stored session"
         );
 
-        // No session: the env key is classified by shape, not assumed Bearer.
+        // Same with no session at all: classified by shape, not assumed Bearer.
         assert_eq!(
             boot_credential(None),
             BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string()))
+        );
+
+        // The stored session is the LAST resort, not the first.
+        clear_platform_env();
+        assert_eq!(
+            boot_credential(Some(&creds_with("session-jwt"))),
+            BootCredential::Ready(PlatformAuth::Bearer("session-jwt".to_string())),
+            "with nothing in the env, the session is used"
         );
 
         // A non-m27 value under the token name is a rotating credential.
