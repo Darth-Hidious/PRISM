@@ -476,6 +476,25 @@ async fn store_claims(
             None => None,
         };
 
+        // A `measurement` with no value is DROPPED by the store —
+        // `write_fact` returns Ok(()) having written nothing (see the
+        // `Some("measurement")` arm in prism-provenance: "a measurement
+        // without a value fails schema validation and is dropped"). Counting
+        // that as written reports facts that are not in the graph.
+        //
+        // `validate_and_stamp` does not catch it: it rejects a value with no
+        // unit, not a measurement with no value. The kind and the value come
+        // from the model independently, so nothing upstream ties them.
+        if claim.kind.as_deref() == Some("measurement") && claim.value.is_none() {
+            rejected.push(json!({
+                "subject": claim.subject,
+                "object": claim.object,
+                "reason": "kind is `measurement` but no value was extracted; the store drops \
+                           such a fact, so writing it would report a fact that is not there",
+            }));
+            continue;
+        }
+
         let mut conditions = Vec::with_capacity(claim.conditions.len());
         let mut bad_condition = None;
         for condition in &claim.conditions {
@@ -853,6 +872,37 @@ mod store_tests {
             .await
             .unwrap();
         assert!(facts.is_empty(), "rejected claim reached the store anyway");
+        cleanup(&db);
+    }
+
+    /// A `measurement` with no value is dropped by the store while returning
+    /// Ok(()), so counting it as written reports a fact that is not in the
+    /// graph. `validate_and_stamp` does not catch this — it rejects a value
+    /// with no unit, not a measurement with no value.
+    #[tokio::test]
+    async fn a_valueless_measurement_is_rejected_not_counted_as_written() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+
+        let mut c = claim("UTS", Some("QUDT:MegaPA"), None);
+        c.value = None; // kind stays "measurement"
+
+        let out = store_claims(&[c], "https://example.org/paper", "m", &db)
+            .await
+            .expect("store");
+
+        assert_eq!(
+            out["written"], 0,
+            "counted a fact the store discards: {out}"
+        );
+        assert_eq!(out["rejected"], 1);
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert!(facts.is_empty(), "the dropped fact appears in the store");
         cleanup(&db);
     }
 
