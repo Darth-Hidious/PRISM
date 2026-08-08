@@ -373,6 +373,22 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
 /// TCP-probe an LLM base URL with a hard 3-second budget.
 fn probe_endpoint(base_url: &str) -> Result<(), String> {
     use std::net::ToSocketAddrs;
+
+    // Hard offline, checked FIRST — before `to_socket_addrs`, not just before
+    // the connect. Resolution is itself a network call: a DNS query for an
+    // agent-chosen host leaves the machine even if the TCP handshake never
+    // happens.
+    //
+    // This probe is agent-reachable with no human gate. `papers` is
+    // `PermissionMode::ReadOnly, requires_approval: false` and its
+    // `FlagPolicy::Only` list includes `--llm-url`
+    // (agent/src/command_tools.rs), and `execute_cli_command` spawns the CLI
+    // with no `env_clear`, so a `PRISM_OFFLINE=1` parent is inherited and was
+    // then ignored right here. A model could name the host.
+    //
+    // `check_url` rather than `enabled()`: a local llama.cpp endpoint is the
+    // normal case and must stay probeable offline.
+    prism_runtime::offline::check_url(base_url)?;
     let without_scheme = base_url
         .split_once("://")
         .map(|(_, rest)| rest)
@@ -445,5 +461,90 @@ fn claim_from_fact(
             locator: locator.clone(),
             quote: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PRISM_OFFLINE` is process-global; serialize the tests that set it.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Restores the var on drop, so a failed assertion cannot leave it set for
+    /// the rest of the binary.
+    struct OfflineGuard(Option<String>);
+    impl Drop for OfflineGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("PRISM_OFFLINE", v),
+                    None => std::env::remove_var("PRISM_OFFLINE"),
+                }
+            }
+        }
+    }
+
+    /// The probe must refuse a remote host BEFORE resolving it. `papers` is an
+    /// agent tool with `requires_approval: false` whose flag allow-list
+    /// includes `--llm-url`, and the spawned CLI inherits `PRISM_OFFLINE`
+    /// (no `env_clear`), so a model could name the host and this was the one
+    /// step that ignored the flag.
+    #[test]
+    fn probe_refuses_a_remote_endpoint_offline() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
+
+        let err = probe_endpoint("https://llm.example.invalid/v1")
+            .expect_err("offline must refuse a remote endpoint");
+        assert!(err.contains("offline mode"), "{err}");
+        assert!(
+            err.contains("llm.example.invalid"),
+            "must name what it blocked: {err}"
+        );
+        // It must NOT have got as far as resolution — a DNS failure message
+        // would mean the lookup already left the machine.
+        assert!(
+            !err.contains("cannot resolve"),
+            "resolved before refusing: {err}"
+        );
+    }
+
+    /// A local llama.cpp endpoint stays probeable offline — `check_url`, not a
+    /// blanket refusal. Nothing listens on port 1, so reaching a CONNECT error
+    /// rather than a policy one proves the guard let it through.
+    #[test]
+    fn probe_still_allows_loopback_offline() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
+
+        let err =
+            probe_endpoint("http://127.0.0.1:1/v1").expect_err("nothing is listening on port 1");
+        assert!(
+            !err.contains("offline mode"),
+            "loopback must not be refused by policy: {err}"
+        );
+    }
+
+    /// Without this the two above would pass even if the guard refused
+    /// unconditionally.
+    #[test]
+    fn probe_guard_is_inert_when_offline_is_unset() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::remove_var("PRISM_OFFLINE") };
+
+        let err = probe_endpoint("http://127.0.0.1:1/v1").expect_err("nothing is listening");
+        assert!(
+            !err.contains("offline mode"),
+            "guard fired with offline unset: {err}"
+        );
     }
 }
