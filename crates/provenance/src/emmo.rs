@@ -420,8 +420,30 @@ pub fn assertion_id(tenant: &str, subject: &str, predicate: &str, object: &str) 
 /// arrangement of separators inside a field can imitate a field boundary.
 fn hash_field(h: &mut sha2::Sha256, bytes: &[u8]) {
     use sha2::Digest;
-    h.update(bytes.len().to_le_bytes());
+    // `u64`, not `usize`: `usize::to_le_bytes()` is 8 bytes on a 64-bit target
+    // and 4 on a 32-bit one, so a `usize` prefix would make every id
+    // architecture-dependent. Move the database between targets and the same
+    // fact hashes differently, the lookup misses, and a duplicate row is
+    // inserted with corroborations reset to 1.
+    h.update((bytes.len() as u64).to_le_bytes());
     h.update(bytes);
+}
+
+/// Hash an optional field so that ABSENT and PRESENT-BUT-EMPTY differ.
+///
+/// A bare `unwrap_or` collapses them: `None` and `Some(0.0)` both become eight
+/// zero bytes, and `None` and `Some("")` both become nothing. A measurement of
+/// exactly 0.0 is real data in materials science, and it must not share an id
+/// with a fact carrying no value at all.
+fn hash_optional_field(h: &mut sha2::Sha256, bytes: Option<&[u8]>) {
+    use sha2::Digest;
+    match bytes {
+        None => h.update([0u8]),
+        Some(b) => {
+            h.update([1u8]);
+            hash_field(h, b);
+        }
+    }
 }
 
 fn conditioned_assertion_id(
@@ -445,8 +467,9 @@ fn conditioned_assertion_id(
     hash_field(&mut h, canonical_key(subject).as_bytes());
     hash_field(&mut h, predicate.as_bytes());
     hash_field(&mut h, canonical_key(object).as_bytes());
-    hash_field(&mut h, &value.map(f64::to_bits).unwrap_or(0).to_le_bytes());
-    hash_field(&mut h, unit.unwrap_or("").as_bytes());
+    let value_bytes = value.map(|v| v.to_bits().to_le_bytes());
+    hash_optional_field(&mut h, value_bytes.as_ref().map(|b| &b[..]));
+    hash_optional_field(&mut h, unit.map(str::as_bytes));
     hash_field(&mut h, &serde_json::to_vec(&canonical_conditions)?);
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
@@ -598,7 +621,10 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 /// v1: tenant added to the assertion id.
 /// v2: id fields length-prefixed (see `hash_field`), which changes every id
 ///     again, so the re-key has to run a second time on a v1 database.
-const ASSERTION_TENANT_KEY_VERSION: i64 = 2;
+/// v3: length prefix widened to `u64` (was architecture-dependent `usize`) and
+///     optional fields tagged so absent and empty stop colliding. Both change
+///     the digest, so the re-key runs once more.
+const ASSERTION_TENANT_KEY_VERSION: i64 = 3;
 
 /// Tenant to attribute a row to when the stored value is absent.
 ///
@@ -2234,6 +2260,52 @@ mod tests {
         assert_eq!(a, b, "spelling variants must corroborate one assertion");
         assert_ne!(a, c, "direction matters");
         assert_eq!(a.len(), 64);
+    }
+
+    /// A measured 0.0 is real data and must not share an id with "no value".
+    ///
+    /// `value.map(f64::to_bits).unwrap_or(0)` collapsed them: absent and
+    /// Some(0.0) both hashed as eight zero bytes, so a fact recording a
+    /// measurement of exactly zero would corroborate — and be overwritten by —
+    /// a fact carrying no value at all.
+    #[test]
+    fn an_absent_value_does_not_hash_like_a_measured_zero() {
+        let absent =
+            conditioned_assertion_id("t", "s", "p", "o", None, Some("QUDT:K"), &[]).unwrap();
+        let zero =
+            conditioned_assertion_id("t", "s", "p", "o", Some(0.0), Some("QUDT:K"), &[]).unwrap();
+        assert_ne!(absent, zero, "no-value and a measured 0.0 share an id");
+
+        // Same hazard on the unit: absent vs present-but-empty.
+        let no_unit = conditioned_assertion_id("t", "s", "p", "o", Some(1.0), None, &[]).unwrap();
+        let empty_unit =
+            conditioned_assertion_id("t", "s", "p", "o", Some(1.0), Some(""), &[]).unwrap();
+        assert_ne!(
+            no_unit, empty_unit,
+            "absent unit and empty unit share an id"
+        );
+    }
+
+    /// Golden digest. The assertion id is a persisted key: changing how it is
+    /// computed silently re-keys every stored row, so any change to the hash
+    /// scheme must be a deliberate act that bumps
+    /// `ASSERTION_TENANT_KEY_VERSION`. This test exists to make an accidental
+    /// change loud.
+    ///
+    /// It also pins the width of the length prefix — a `usize` prefix would
+    /// produce a different digest on a 32-bit target, making ids
+    /// architecture-dependent.
+    ///
+    /// The expected value is not copied back out of a failing run: it was
+    /// computed by an independent implementation of the documented scheme and
+    /// matched byte for byte, so this pins the SPEC rather than the code.
+    #[test]
+    fn assertion_id_digest_is_pinned() {
+        assert_eq!(
+            assertion_id("local", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+            "7d980938cac1e3aa1084e04bf61a466a51d7e3f4f8b5d19d6c84cf10ff30e0b1",
+            "the assertion hash scheme changed; bump ASSERTION_TENANT_KEY_VERSION deliberately",
+        );
     }
 
     /// A separator inside a tenant name must not be able to imitate a field
