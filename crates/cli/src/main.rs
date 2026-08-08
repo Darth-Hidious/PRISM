@@ -3319,8 +3319,18 @@ async fn main() -> Result<()> {
                             println!("  \u{2713} Kafka: pub/sub active ({brokers})");
                         }
                         Err(e) => {
+                            // Name what actually stops working. `run_sync_handler`
+                            // is spawned only in the branch above and drains a
+                            // channel only the Kafka consumer feeds, and there is
+                            // no `mesh sync` subcommand — so without Kafka the
+                            // mesh discovers peers it can never pull data from.
+                            // The old wording ("Mesh will work via mDNS only")
+                            // read as a working degraded mode.
                             eprintln!("  Warning: Kafka consumer failed to start: {e}");
-                            eprintln!("  (Mesh will work via mDNS only, without Kafka pub/sub.)");
+                            eprintln!(
+                                "  Peer discovery (mDNS) still works, but NO peer data will sync: \
+                                 dataset sync is driven by Kafka messages and has no other trigger."
+                            );
                         }
                     }
 
@@ -6369,7 +6379,10 @@ async fn run_local_text_ingest_file(
         .and_then(|value| value.to_str())
         .unwrap_or("untitled");
 
-    let facts = prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+    let extraction =
+        prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+    let parse_error = extraction.parse_error.clone();
+    let facts = extraction.facts;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let db_path = PathBuf::from(home).join(".prism/provenance.db");
@@ -6407,6 +6420,15 @@ async fn run_local_text_ingest_file(
         "model": agent_id,
         "store": db_path.display().to_string(),
         "warning": warning,
+        // A partial read has to be reported here, not left to a log line: the
+        // subscriber is built with `EnvFilter::from_default_env()`, whose
+        // default directive is ERROR, so `tracing::warn!` reaches nobody
+        // unless RUST_LOG is set.
+        "truncated_bytes": extraction.dropped_bytes,
+        // Zero facts because the model returned garbage is a different outcome
+        // from zero facts because the document held none. Only this field
+        // tells them apart on the user's side.
+        "parse_error": parse_error,
     }))
 }
 
@@ -6552,6 +6574,22 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                 println!("  Text: {chars} chars extracted on-device");
                 if let Some(warning) = summary.get("warning").and_then(|value| value.as_str()) {
                     println!("  Warning: {warning}");
+                }
+                if let Some(parse_error) =
+                    summary.get("parse_error").and_then(|value| value.as_str())
+                {
+                    println!("  Warning: no facts extracted \u{2014} {parse_error}");
+                }
+                let truncated = summary
+                    .get("truncated_bytes")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                if truncated > 0 {
+                    println!(
+                        "  Warning: {truncated} bytes were NOT read. The document exceeds the \
+                         extraction budget and there is no chunking, so these facts come from \
+                         the start of it only."
+                    );
                 }
                 if summary
                     .get("schema_only")
