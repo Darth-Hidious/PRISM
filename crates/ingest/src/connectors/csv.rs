@@ -5,25 +5,51 @@ use polars::prelude::*;
 
 use crate::DataSource;
 
-/// Field separator implied by the file extension.
+/// Which delimited format a path names.
 ///
-/// `.tsv` reached this connector through two routes that both advertise it
-/// as supported — `IngestPipeline::ingest_file` maps `"csv" | "tsv"` to
-/// `ingest_csv`, and the CLI's `ingest_backend` routes `tsv` to
-/// `LocalTabular` — but the reader was built from `CsvReadOptions::default()`,
-/// whose separator is a comma. A tab-separated file therefore parsed as ONE
-/// column per row, and that single blob was what went to the LLM for entity
-/// extraction. Nothing failed loudly: the ingest reported a successful
-/// one-column schema.
-fn separator_for(path: &Path) -> u8 {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("tsv") => b'\t',
-        _ => b',',
+/// The extension is classified ONCE here. `separator_for` and
+/// `to_data_source` previously each matched on the extension themselves, so
+/// adding a format meant editing two places and a miss would give a reader
+/// one delimiter while the recorded `format` said another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delimited {
+    Csv,
+    Tsv,
+}
+
+impl Delimited {
+    /// `.tsv` reached this connector through two routes that both advertise it
+    /// as supported — `IngestPipeline::ingest_file` maps `"csv" | "tsv"` to
+    /// `ingest_csv`, and the CLI's `ingest_backend` routes `tsv` to
+    /// `LocalTabular` — but the reader was built from
+    /// `CsvReadOptions::default()`, whose separator is a comma. A
+    /// tab-separated file therefore parsed as ONE column per row, and that
+    /// single blob was what went to the LLM for entity extraction. Nothing
+    /// failed loudly: the ingest reported a successful one-column schema.
+    fn of(path: &Path) -> Self {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("tsv") => Self::Tsv,
+            _ => Self::Csv,
+        }
+    }
+
+    fn separator(self) -> u8 {
+        match self {
+            Self::Tsv => b'\t',
+            Self::Csv => b',',
+        }
+    }
+
+    fn format(self) -> &'static str {
+        match self {
+            Self::Tsv => "tsv",
+            Self::Csv => "csv",
+        }
     }
 }
 
@@ -32,8 +58,9 @@ pub struct CsvConnector;
 
 impl CsvConnector {
     fn options(path: &Path) -> CsvReadOptions {
-        CsvReadOptions::default()
-            .with_parse_options(CsvParseOptions::default().with_separator(separator_for(path)))
+        CsvReadOptions::default().with_parse_options(
+            CsvParseOptions::default().with_separator(Delimited::of(path).separator()),
+        )
     }
 
     /// Load a delimited file into a DataFrame, using the separator its
@@ -65,18 +92,9 @@ impl CsvConnector {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("Path does not exist: {}", path.display()))?;
-        let format = match path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("tsv") => "tsv",
-            _ => "csv",
-        };
         Ok(DataSource {
             path: canonical.to_string_lossy().into_owned(),
-            format: format.into(),
+            format: Delimited::of(path).format().into(),
         })
     }
 }
@@ -200,9 +218,19 @@ mod tests {
 
     #[test]
     fn separator_is_chosen_case_insensitively() {
-        assert_eq!(separator_for(Path::new("x.TSV")), b'\t');
-        assert_eq!(separator_for(Path::new("x.tsv")), b'\t');
-        assert_eq!(separator_for(Path::new("x.csv")), b',');
-        assert_eq!(separator_for(Path::new("x")), b',');
+        assert_eq!(Delimited::of(Path::new("x.TSV")).separator(), b'\t');
+        assert_eq!(Delimited::of(Path::new("x.tsv")).separator(), b'\t');
+        assert_eq!(Delimited::of(Path::new("x.csv")).separator(), b',');
+        assert_eq!(Delimited::of(Path::new("x")).separator(), b',');
+        // Separator and reported format come from ONE classification, so they
+        // cannot disagree.
+        for p in ["a.tsv", "a.TSV", "a.csv", "a"] {
+            let d = Delimited::of(Path::new(p));
+            assert_eq!(
+                d.separator() == b'\t',
+                d.format() == "tsv",
+                "{p}: separator and format disagree",
+            );
+        }
     }
 }
