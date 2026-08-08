@@ -12421,7 +12421,19 @@ mod tests {
 
     #[test]
     fn env_project_override_ignores_empty_values() {
+        // Must hold the shared guard and clear BOTH spellings.
+        //
+        // This test took no lock and cleared only the historical name. That
+        // was safe while nothing else wrote PROJECT_ID — but `cffcba9a`
+        // migrated `env_project_override` onto `PlatformVar`, so it now reads
+        // `PRISM_PROJECT_ID` too and PREFERS it. Any concurrent test setting
+        // the neutral name made this one fail with a value it never set, on a
+        // machine-dependent schedule. It flaked exactly that way.
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe {
+            std::env::remove_var("PRISM_PROJECT_ID");
             std::env::remove_var("MARC27_PROJECT_ID");
         }
         assert_eq!(env_project_override(), None);
@@ -12433,7 +12445,13 @@ mod tests {
             std::env::set_var("MARC27_PROJECT_ID", "project-123");
         }
         assert_eq!(env_project_override(), Some("project-123".to_string()));
+        // The neutral name outranks the historical one, same as everywhere.
         unsafe {
+            std::env::set_var("PRISM_PROJECT_ID", "neutral-wins");
+        }
+        assert_eq!(env_project_override(), Some("neutral-wins".to_string()));
+        unsafe {
+            std::env::remove_var("PRISM_PROJECT_ID");
             std::env::remove_var("MARC27_PROJECT_ID");
         }
     }

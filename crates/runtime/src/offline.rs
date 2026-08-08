@@ -34,17 +34,37 @@ pub fn is_loopback_url(raw_url: &str) -> bool {
     // A near-identical, correct implementation already existed one crate away
     // in `prism-cli`'s `local_llm.rs` while the weaker one guarded the policy.
     // That copy now calls this; there is one implementation.
-    match url::Url::parse(raw_url.trim()) {
-        Ok(parsed) => match parsed.host() {
-            Some(url::Host::Domain(domain)) => {
-                domain.eq_ignore_ascii_case("localhost")
-                    || domain.eq_ignore_ascii_case("localhost.localdomain")
-            }
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        },
-        Err(_) => false,
+    let trimmed = raw_url.trim();
+    // A scheme-less `127.0.0.1:8080` or `localhost:11434` is a shape the
+    // previous string-splitting version accepted, and `Url::parse` rejects
+    // outright. Callers happen to supply a scheme today (`use_command.rs:426`
+    // refuses input without one, and every shipped `providers.toml` entry has
+    // one), but a user-written `~/.prism/providers.toml` need not — and this
+    // is a general safety primitive, so it should not silently narrow. Parse
+    // the bare authority under a synthetic scheme; that cannot widen the
+    // result, since the host is still typed by `url::Host`.
+    // Retry on "no host", not merely on a parse error. `url` reads
+    // `localhost:11434` as SCHEME `localhost` with path `11434` — a SUCCESSFUL
+    // parse carrying no host — whereas `127.0.0.1:8080` fails outright because
+    // a scheme cannot start with a digit. Keying off `Err` alone therefore
+    // fixed one and silently missed the other.
+    let has_host = |u: &url::Url| u.host().is_some();
+    let parsed = match url::Url::parse(trimmed) {
+        Ok(u) if has_host(&u) => Some(u),
+        _ if trimmed.contains("://") => None,
+        _ => url::Url::parse(&format!("http://{trimmed}"))
+            .ok()
+            .filter(has_host),
+    };
+
+    match parsed.as_ref().and_then(url::Url::host) {
+        Some(url::Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.eq_ignore_ascii_case("localhost.localdomain")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -105,6 +125,33 @@ mod tests {
             "https://api.example.invalid/v1",
         ] {
             assert!(!is_loopback_url(remote), "{remote}");
+        }
+    }
+
+    /// A bare `host:port` with no scheme must still resolve, and must not
+    /// become a way in. The string-splitting version accepted these; a plain
+    /// `Url::parse` rejects them outright, which would have turned a local
+    /// endpoint into a policy REFUSAL under PRISM_OFFLINE=1 — breaking exactly
+    /// the local-llama.cpp user offline mode exists to serve.
+    #[test]
+    fn scheme_less_authorities_still_resolve_and_do_not_widen() {
+        for local in [
+            "127.0.0.1:8080",
+            "localhost:11434",
+            "127.0.0.1",
+            "localhost",
+            "[::1]:8080",
+        ] {
+            assert!(is_loopback_url(local), "{local} is on this machine");
+        }
+        // The scheme-less path must not become a bypass.
+        for hostile in [
+            "127.evil.example:8080",
+            "127.0.0.1.attacker.example",
+            "attacker.example:8080",
+            "10.0.0.4:8080",
+        ] {
+            assert!(!is_loopback_url(hostile), "{hostile} is not this machine");
         }
     }
 
