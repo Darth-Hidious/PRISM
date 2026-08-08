@@ -31,6 +31,9 @@ pub struct TextExtraction {
     /// Bytes of the supplied document that exceeded the extraction budget and
     /// were never seen. Zero means the whole document was read.
     pub dropped_bytes: usize,
+    /// Set when the model's reply could not be parsed, in which case `facts`
+    /// is empty for that reason rather than because the document held none.
+    pub parse_error: Option<String>,
 }
 
 /// Extract EMMO facts from `text` using the local LLM. The document text is
@@ -60,9 +63,11 @@ pub async fn extract_facts_from_text(
         );
     }
     let raw = llm.generate_json(&prompt).await?;
+    let (facts, parse_error) = parse_extraction(&raw);
     Ok(TextExtraction {
-        facts: parse_extraction(&raw),
+        facts,
         dropped_bytes: dropped,
+        parse_error,
     })
 }
 
@@ -109,7 +114,13 @@ Use "kind" to classify: measurement | phase | composition | processing | structu
 }
 
 /// Parse the LLM's extraction output. Tolerant of fenced JSON.
-fn parse_extraction(raw: &str) -> Vec<MaterialFact> {
+///
+/// Returns the facts and, when the response could not be parsed at all, the
+/// reason. An unparseable response yields zero facts, which is otherwise
+/// indistinguishable from a document that genuinely contained none — and the
+/// `tracing::warn!` that used to be the only signal is discarded by default
+/// (see [`TextExtraction`]).
+fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Option<String>) {
     let json_str = extract_json_block(raw);
     match serde_json::from_str::<ExtractionOutput>(json_str) {
         Ok(mut out) => {
@@ -119,11 +130,16 @@ fn parse_extraction(raw: &str) -> Vec<MaterialFact> {
                     [fact.evidence_class],
                 );
             }
-            out.facts
+            (out.facts, None)
         }
         Err(e) => {
             tracing::warn!(error = %e, "extraction output unparseable — no facts extracted");
-            Vec::new()
+            (
+                Vec::new(),
+                Some(format!(
+                    "the model's response could not be parsed as JSON: {e}"
+                )),
+            )
         }
     }
 }
@@ -159,7 +175,7 @@ mod tests {
     #[test]
     fn parse_extraction_valid_json() {
         let raw = r#"{"facts": [{"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":1140.0,"unit":"QUDT:MegaPA","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}]}"#;
-        let facts = parse_extraction(raw);
+        let (facts, _) = parse_extraction(raw);
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].subject, "Ti-6Al-4V");
         assert_eq!(facts[0].predicate, "has_measurement");
@@ -174,7 +190,7 @@ mod tests {
     #[test]
     fn parse_extraction_fenced_json() {
         let raw = "```json\n{\"facts\": [{\"subject\":\"Fe\",\"predicate\":\"has_phase\",\"object\":\"BCC\",\"kind\":\"phase\"}]}\n```";
-        let facts = parse_extraction(raw);
+        let (facts, _) = parse_extraction(raw);
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].kind.as_deref(), Some("phase"));
         // Optional fields absent in the JSON default to None.
@@ -184,14 +200,42 @@ mod tests {
 
     #[test]
     fn parse_extraction_garbage_returns_empty() {
-        assert!(parse_extraction("not json at all").is_empty());
-        assert!(parse_extraction("").is_empty());
+        assert!(parse_extraction("not json at all").0.is_empty());
+        assert!(parse_extraction("").0.is_empty());
+    }
+
+    /// Zero facts because the model misbehaved must be distinguishable from
+    /// zero facts because the document held none.
+    ///
+    /// Both look identical to a caller that only sees `facts`, and the
+    /// `tracing::warn!` covering it is discarded by default, so an ingest
+    /// against a broken model reported a clean, empty success.
+    #[test]
+    fn unparseable_output_reports_why_it_found_nothing() {
+        let (facts, err) = parse_extraction("not json at all");
+        assert!(facts.is_empty());
+        let err = err.expect("an unparseable response must say so");
+        assert!(
+            err.contains("could not be parsed"),
+            "unhelpful reason: {err}"
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_facts_is_not_reported_as_an_error() {
+        // Valid JSON, genuinely empty — silence is the correct answer here.
+        let (facts, err) = parse_extraction(r#"{"facts": []}"#);
+        assert!(facts.is_empty());
+        assert!(
+            err.is_none(),
+            "an empty but well-formed response was mislabelled a failure: {err:?}"
+        );
     }
 
     #[test]
     fn literature_extractor_cannot_claim_green() {
         let raw = r#"{"facts":[{"subject":"steel","predicate":"has_phase","object":"bcc","conditions":[],"kind":"phase","evidence_class":"reference_validated"}]}"#;
-        let facts = parse_extraction(raw);
+        let (facts, _) = parse_extraction(raw);
         assert_eq!(
             facts[0].evidence_class,
             prism_provenance::EvidenceClass::Research
@@ -212,7 +256,7 @@ mod tests {
 
         // Deterministic fake-LLM response: no provider or network is used in tests.
         let raw = r#"{"facts":[{"subject":"test ceramic","predicate":"has_measurement","object":"thermal conductivity","value":22.0,"unit":"QUDT:W-PER-M-K","conditions":[{"name":"temperature","value":1200.0,"unit":"QUDT:K"},{"name":"atmosphere","value":"air","unit":null}],"confidence":0.9,"kind":"measurement","evidence_class":"research"}]}"#;
-        let facts = parse_extraction(raw);
+        let (facts, _) = parse_extraction(raw);
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].conditions.len(), 2);
         assert_eq!(facts[0].evidence_class, EvidenceClass::Research);

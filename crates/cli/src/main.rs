@@ -6381,6 +6381,7 @@ async fn run_local_text_ingest_file(
 
     let extraction =
         prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+    let parse_error = extraction.parse_error.clone();
     let facts = extraction.facts;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -6424,6 +6425,10 @@ async fn run_local_text_ingest_file(
         // default directive is ERROR, so `tracing::warn!` reaches nobody
         // unless RUST_LOG is set.
         "truncated_bytes": extraction.dropped_bytes,
+        // Zero facts because the model returned garbage is a different outcome
+        // from zero facts because the document held none. Only this field
+        // tells them apart on the user's side.
+        "parse_error": parse_error,
     }))
 }
 
@@ -6569,6 +6574,11 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                 println!("  Text: {chars} chars extracted on-device");
                 if let Some(warning) = summary.get("warning").and_then(|value| value.as_str()) {
                     println!("  Warning: {warning}");
+                }
+                if let Some(parse_error) =
+                    summary.get("parse_error").and_then(|value| value.as_str())
+                {
+                    println!("  Warning: no facts extracted \u{2014} {parse_error}");
                 }
                 let truncated = summary
                     .get("truncated_bytes")
