@@ -76,8 +76,30 @@ pub fn status() -> Result<Option<String>> {
     }
 }
 
+/// Refuse the pip paths under hard offline mode.
+///
+/// pip reaches PyPI. This file called pip directly and reused none of
+/// python-bridge's offline hardening — `venv.rs` forces
+/// `--no-index --find-links <wheelhouse>` on every offline install path — so
+/// `prism pyiron install|update` fetched from the network under
+/// `PRISM_OFFLINE=1`.
+///
+/// Extracted rather than inlined so BOTH directions are testable: asserting the
+/// permissive half by calling `install()` with the policy off would really run
+/// `pip install` against PyPI, which a unit test must not do.
+fn pip_refusal(verb: &str) -> Result<()> {
+    if prism_runtime::offline::enabled() {
+        anyhow::bail!(
+            "offline mode: `pip install` would fetch the pyiron stack from PyPI. \
+             Run `prism pyiron {verb}` while online, or pre-stage a wheelhouse."
+        );
+    }
+    Ok(())
+}
+
 /// Install the science stack into the sidecar venv.
 pub fn install() -> Result<String> {
+    pip_refusal("install")?;
     ensure_venv()?;
     let out = Command::new(sidecar_python())
         .args(["-m", "pip", "install"])
@@ -100,6 +122,7 @@ pub fn install() -> Result<String> {
 
 /// Update the science stack inside the pinned windows.
 pub fn update() -> Result<String> {
+    pip_refusal("update")?;
     ensure_venv()?;
     let out = Command::new(sidecar_python())
         .args(["-m", "pip", "install", "--upgrade"])
@@ -112,5 +135,33 @@ pub fn update() -> Result<String> {
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         anyhow::bail!("pip upgrade failed: {err}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `prism pyiron install|update` must not reach PyPI under hard offline.
+    ///
+    /// Both directions asserted through `pip_refusal` rather than the verbs
+    /// themselves: with the policy off, `install()` really would run
+    /// `pip install pyiron_atomistics pycalphad` against PyPI. Without the
+    /// permissive half, this would pass against a function that refuses always.
+    #[test]
+    fn pip_is_refused_offline_and_only_offline() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+        for verb in ["install", "update"] {
+            let msg = format!("{:#}", pip_refusal(verb).expect_err("must refuse"));
+            assert!(msg.contains("offline mode"), "{verb}: {msg}");
+            assert!(msg.contains(verb), "message must name the verb: {msg}");
+        }
+        drop(_on);
+
+        let _off = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        assert!(pip_refusal("install").is_ok());
+        assert!(pip_refusal("update").is_ok());
     }
 }

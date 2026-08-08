@@ -154,13 +154,27 @@ pub fn sanitize_env_vars(env_vars: &BTreeMap<String, String>) -> Result<BTreeMap
 /// back to a locally present image (pre-loaded nodes, air-gapped facilities,
 /// images built on the node itself). Bail only when the image is nowhere.
 pub(crate) async fn ensure_image_available(runtime: ContainerRuntime, image: &str) -> Result<()> {
-    let pull = Command::new(runtime.binary())
-        .args(["pull", image])
-        .output()
-        .await
-        .with_context(|| format!("failed to pull image with {}", runtime.binary()))?;
+    // Hard offline never pulls — a registry fetch is egress, and with a
+    // configured `docker login` it carries registry credentials too.
+    //
+    // Nothing else is needed: the local-copy fallback below was written for
+    // exactly this case ("pre-loaded nodes, air-gapped facilities"), so offline
+    // simply skips the pull and goes straight to it. A node holding the image
+    // still runs; only the fetch is refused.
+    let offline = prism_runtime::offline::enabled();
+    let pull = if offline {
+        None
+    } else {
+        Some(
+            Command::new(runtime.binary())
+                .args(["pull", image])
+                .output()
+                .await
+                .with_context(|| format!("failed to pull image with {}", runtime.binary()))?,
+        )
+    };
 
-    if pull.status.success() {
+    if matches!(pull, Some(ref p) if p.status.success()) {
         return Ok(());
     }
 
@@ -173,11 +187,20 @@ pub(crate) async fn ensure_image_available(runtime: ContainerRuntime, image: &st
         return Ok(());
     }
 
-    let err = String::from_utf8_lossy(&pull.stderr);
-    bail!(
-        "{} pull failed and no local copy of '{image}' exists: {err}",
-        runtime.binary()
-    );
+    match pull {
+        None => bail!(
+            "offline mode: no local copy of '{image}' exists and `{} pull` is \
+             blocked. Pull it before going offline.",
+            runtime.binary()
+        ),
+        Some(pull) => {
+            let err = String::from_utf8_lossy(&pull.stderr);
+            bail!(
+                "{} pull failed and no local copy of '{image}' exists: {err}",
+                runtime.binary()
+            );
+        }
+    }
 }
 
 pub async fn execute_container_job(

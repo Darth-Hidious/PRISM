@@ -293,6 +293,17 @@ fn engine_unresponsive(runtime: ContainerRuntime, what: &str) -> anyhow::Error {
 }
 
 async fn pull_for_platform(runtime: ContainerRuntime, image: &str, platform: &str) -> Result<()> {
+    // A registry fetch is egress, and with a configured `docker login` it
+    // carries registry credentials. Unlike `ensure_image_available` there is no
+    // local-copy fallback to degrade to here — this function exists only to
+    // pull — so it refuses outright.
+    if prism_runtime::offline::enabled() {
+        bail!(
+            "offline mode: `{} pull --platform {platform} {image}` is blocked. \
+             Pull it before going offline.",
+            runtime.binary()
+        );
+    }
     // Deliberately not bounded by CONTAINER_CMD_TIMEOUT: this image is several
     // GB and a first pull legitimately runs for many minutes.
     let pull = Command::new(runtime.binary())

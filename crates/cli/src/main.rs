@@ -2653,6 +2653,23 @@ async fn main() -> Result<()> {
                     match check_ollama_model(model).await {
                         Ok(true) => println!("Model '{model}' available."),
                         Ok(false) => {
+                            // Only the PULL is refused. `check_ollama_model`
+                            // above is a loopback call and an already-cached
+                            // model still serves fine offline — so this guard
+                            // sits here, on the miss, not on the whole branch.
+                            //
+                            // It also has to sit BEFORE the spawn rather than
+                            // relying on the `offline` flag computed later in
+                            // this same function (first read ~40 lines down,
+                            // for a print): by then the pull has happened.
+                            if prism_runtime::offline::enabled() {
+                                bail!(
+                                    "offline mode: model '{model}' is not in the local \
+                                     Ollama cache and `ollama pull` would fetch it from \
+                                     the registry. Pull it before going offline, or pick \
+                                     a model already cached."
+                                );
+                            }
                             println!("Model '{model}' not found, pulling...");
                             let status = tokio::process::Command::new("ollama")
                                 .args(["pull", model])
@@ -4231,6 +4248,22 @@ async fn main() -> Result<()> {
 
             match to.as_str() {
                 "huggingface" | "hf" => {
+                    // `hf` uploads to huggingface.co using the user's cached HF
+                    // token. Egress by subprocess, so no URL-shaped guard here
+                    // covered it, and `PRISM_OFFLINE=1 prism publish --to hf`
+                    // created a public repo and pushed the artifact anyway.
+                    //
+                    // Refused, not skipped: publishing IS this command. Silently
+                    // doing nothing would report success for work never done.
+                    // (Contrast `prism report`, where filing is one optional
+                    // step of several and degrades to `--no-github`.)
+                    if prism_runtime::offline::enabled() {
+                        anyhow::bail!(
+                            "offline mode: refusing to publish to huggingface.co \
+                             — `hf` would upload {path} and send your Hugging Face \
+                             token. Unset PRISM_OFFLINE to publish."
+                        );
+                    }
                     let repo_name = repo.unwrap_or_else(|| {
                         artifact_path
                             .file_stem()
@@ -11548,7 +11581,23 @@ async fn handle_report(
         body.push_str(&format!("\n## Error Output\n\n```\n{}\n```\n", log));
     }
 
-    // 3. File GitHub issue (unless --no-github)
+    // 3. File GitHub issue (unless --no-github, or hard offline)
+    //
+    // This function already guarded its own platform POST (below), but not this
+    // subprocess — `gh` carries the user's authenticated GitHub OAuth token to
+    // api.github.com, so `PRISM_OFFLINE=1 prism report` published a bug report
+    // and a credential anyway. A guard on the sockets a function opens says
+    // nothing about the processes it spawns.
+    //
+    // Skipped rather than fatal: `--no-github` is already the supported way to
+    // run this command without filing, so offline degrades to that and the user
+    // still gets their report. Announced, never silent — a report that quietly
+    // did not file is worse than one that says so.
+    let blocked_offline = !no_github && prism_runtime::offline::enabled();
+    if blocked_offline {
+        println!("Filing GitHub issue... skipped (offline mode)");
+    }
+    let no_github = no_github || blocked_offline;
     if !no_github {
         print!("Filing GitHub issue... ");
         let gh_result = tokio::process::Command::new("gh")

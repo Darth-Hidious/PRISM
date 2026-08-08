@@ -75,9 +75,21 @@ impl ComputeBackend for LocalBackend {
 
         let mount = format!("{}:/workspace", tmp_dir.display());
 
-        let output = Command::new(&self.runtime)
+        // `--network none` does NOT make this offline-safe. It constrains the
+        // CONTAINER's namespace; the daemon still fetches an uncached image,
+        // because `docker run` defaults to `--pull missing`. So hard offline
+        // pins the policy to `never`: a cached image still runs — which is the
+        // whole point of local compute offline — and nothing is fetched.
+        // `--pull` is a flag of `docker run`, not of `docker`, so it has to sit
+        // after the subcommand — hence building the command in steps rather
+        // than one `.args([...])`.
+        let mut command = Command::new(&self.runtime);
+        command.arg("run");
+        if prism_runtime::offline::enabled() {
+            command.args(["--pull", "never"]);
+        }
+        let output = command
             .args([
-                "run",
                 "-d",
                 "--name",
                 &container_name,

@@ -4427,7 +4427,15 @@ async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContex
 }
 
 /// Run `gh … --repo <repo> --json …` and return the parsed JSON array.
+///
+/// Guarded: `gh` carries the user's authenticated GitHub OAuth token to
+/// api.github.com. Egress by subprocess, so none of the URL-shaped guards in
+/// this crate covered it, and the TUI's `/gh issues|prs|status` reached the
+/// network under `PRISM_OFFLINE=1`.
 async fn gh_json(repo: &str, sub: &[&str]) -> Result<Vec<Value>> {
+    if prism_runtime::offline::enabled() {
+        bail!("offline mode: `gh` would query api.github.com with your GitHub token");
+    }
     let mut cmd = TokioCommand::new("gh");
     cmd.args(sub).args(["--repo", repo]);
     cmd.stdout(std::process::Stdio::piped());
@@ -4453,7 +4461,18 @@ async fn gh_json(repo: &str, sub: &[&str]) -> Result<Vec<Value>> {
 }
 
 /// `gh issue create` — returns the new issue URL from stdout.
+///
+/// Guarded, and this one PUBLISHES: it opens a public issue on `repo` carrying
+/// whatever the TUI put in `body`. Under hard offline that is both an egress
+/// and a disclosure, so it refuses rather than degrading — unlike `prism
+/// report`, there is no non-filing half of this operation to fall back to.
 async fn gh_create_issue(repo: &str, title: &str, body: &str) -> Result<String> {
+    if prism_runtime::offline::enabled() {
+        bail!(
+            "offline mode: refusing to open a public issue on {repo} \
+             — `gh` would send it to api.github.com with your GitHub token"
+        );
+    }
     let out = TokioCommand::new("gh")
         .args([
             "issue", "create", "--repo", repo, "--title", title, "--body", body, "--label", "bug",
@@ -9292,6 +9311,46 @@ mod tests {
 #[cfg(test)]
 mod card_payload_tests {
     use super::*;
+
+    /// The TUI's `/gh` panel reached api.github.com under hard offline.
+    ///
+    /// `gh` carries the user's authenticated GitHub OAuth token. Egress by
+    /// subprocess, so none of this crate's URL-shaped guards covered it.
+    /// `gh_create_issue` additionally PUBLISHES — it opens a public issue —
+    /// so under offline that is a disclosure as well as an egress.
+    ///
+    /// Takes `skills::TEST_ENV_LOCK`, the prism-agent test binary's single
+    /// lock for process-global env mutation. Deliberately NOT a second lock of
+    /// its own: two locks in one binary exclude nothing, which is a bug this
+    /// repo has now hit nine times.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_gh_panel_is_refused_offline_and_only_offline() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let read = gh_json("owner/repo", &["issue", "list"]).await;
+        let msg = format!("{:#}", read.expect_err("read must be refused"));
+        assert!(msg.contains("offline mode"), "read: {msg}");
+
+        let write = gh_create_issue("owner/repo", "t", "b").await;
+        let msg = format!("{:#}", write.expect_err("write must be refused"));
+        assert!(msg.contains("offline mode"), "write: {msg}");
+        assert!(
+            msg.contains("owner/repo"),
+            "refusal should name the repo it declined to post to: {msg}"
+        );
+
+        // No permissive half here, deliberately. Proving the guard inert would
+        // mean letting `gh` actually run — and when this guard was mutated
+        // away during review, the write call really did reach api.github.com
+        // (GitHub answered "Could not resolve to a Repository"). A unit test
+        // must not send the user's OAuth token to a third party to prove a
+        // negative. The inert direction is pinned at the primitive instead, by
+        // `offline::tests::only_a_trimmed_one_enables_offline`.
+    }
 
     /// The app's Web artifact viewer could only render metadata and an honest
     /// "body not carried" notice, because the readable body was dropped here.
