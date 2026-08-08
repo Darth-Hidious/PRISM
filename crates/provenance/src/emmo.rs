@@ -396,14 +396,32 @@ fn entity_key(tenant: &str, label: &str, name: &str) -> String {
 pub fn assertion_id(tenant: &str, subject: &str, predicate: &str, object: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(tenant.as_bytes());
-    h.update(b"|");
-    h.update(canonical_key(subject).as_bytes());
-    h.update(b"|");
-    h.update(predicate.as_bytes());
-    h.update(b"|");
-    h.update(canonical_key(object).as_bytes());
+    hash_field(&mut h, tenant.as_bytes());
+    hash_field(&mut h, canonical_key(subject).as_bytes());
+    hash_field(&mut h, predicate.as_bytes());
+    hash_field(&mut h, canonical_key(object).as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Feed one field into the digest, length-prefixed.
+///
+/// A bare `|` separator is ambiguous, and `canonical_key` does not strip or
+/// escape `|` — it only collapses whitespace and lowercases. So with plain
+/// separators these two hash identically:
+///
+/// ```text
+/// tenant "acme|steel", subject "UTS"        -> acme|steel|uts|...
+/// tenant "acme",       subject "steel|UTS"  -> acme|steel|uts|...
+/// ```
+///
+/// which is one tenant reading and corroborating another tenant's assertion —
+/// exactly what putting the tenant in the key was meant to prevent. Prefixing
+/// each field with its byte length makes the encoding unambiguous, so no
+/// arrangement of separators inside a field can imitate a field boundary.
+fn hash_field(h: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+    h.update(bytes.len().to_le_bytes());
+    h.update(bytes);
 }
 
 fn conditioned_assertion_id(
@@ -423,23 +441,13 @@ fn conditioned_assertion_id(
     let mut canonical_conditions = conditions.to_vec();
     canonical_conditions.sort_by(|left, right| left.name.cmp(&right.name));
     let mut h = Sha256::new();
-    h.update(tenant.as_bytes());
-    h.update(b"|");
-    h.update(canonical_key(subject).as_bytes());
-    h.update(b"|");
-    h.update(predicate.as_bytes());
-    h.update(b"|");
-    h.update(canonical_key(object).as_bytes());
-    h.update(b"|");
-    if let Some(value) = value {
-        h.update(value.to_bits().to_le_bytes());
-    }
-    h.update(b"|");
-    if let Some(unit) = unit {
-        h.update(unit.as_bytes());
-    }
-    h.update(b"|");
-    h.update(serde_json::to_vec(&canonical_conditions)?);
+    hash_field(&mut h, tenant.as_bytes());
+    hash_field(&mut h, canonical_key(subject).as_bytes());
+    hash_field(&mut h, predicate.as_bytes());
+    hash_field(&mut h, canonical_key(object).as_bytes());
+    hash_field(&mut h, &value.map(f64::to_bits).unwrap_or(0).to_le_bytes());
+    hash_field(&mut h, unit.unwrap_or("").as_bytes());
+    hash_field(&mut h, &serde_json::to_vec(&canonical_conditions)?);
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -491,7 +499,8 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
     // Collect every re-key before issuing any write. Turso is sensitive to
     // interleaved statements on one connection, which is why the read paths
     // in this file drain their cursors before writing.
-    let mut pending: Vec<(String, String)> = Vec::new();
+    // (old_id, new_id, resolved_tenant)
+    let mut pending: Vec<(String, String, String)> = Vec::new();
     {
         let mut rows = conn
             .query(
@@ -518,8 +527,9 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
                 Value::Text(unit) if !unit.is_empty() => Some(unit),
                 _ => None,
             };
+            let tenant = legacy_tenant(&crate::get_str(&row, 7)?).to_string();
             let new_id = conditioned_assertion_id(
-                &crate::get_str(&row, 7)?, // tenant; NULL reads as ""
+                &tenant,
                 &crate::get_str(&row, 1)?,
                 &crate::get_str(&row, 2)?,
                 &crate::get_str(&row, 3)?,
@@ -527,23 +537,30 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
                 unit.as_deref(),
                 &conditions,
             )?;
-            if new_id != old_id {
-                pending.push((old_id, new_id));
-            }
+            pending.push((old_id, new_id, tenant));
         }
     }
 
     let count = pending.len();
     let mut skipped = 0usize;
-    for (old_id, new_id) in pending {
+    for (old_id, new_id, tenant) in pending {
         // `OR IGNORE` so an unexpected id collision cannot abort `open()`.
         // But a collision means the row keeps its OLD tenant-less id forever
         // and every later write forks a new row beside it, so it must not pass
         // unnoticed — `execute` returns rows-affected, and 0 is that case.
+        // `tenant` is written back as well as the id. Re-keying alone does not
+        // rescue a row whose tenant column is NULL: every read path filters
+        // `tenant = ?`, so it would stay invisible under a tenant nothing
+        // queries. For a row that already had a tenant this writes the same
+        // value back and is a no-op.
         let affected = conn
             .execute(
-                "UPDATE OR IGNORE prov_assertion SET id = ?1 WHERE id = ?2",
-                [Value::Text(new_id.clone()), Value::Text(old_id.clone())],
+                "UPDATE OR IGNORE prov_assertion SET id = ?1, tenant = ?2 WHERE id = ?3",
+                [
+                    Value::Text(new_id.clone()),
+                    Value::Text(tenant),
+                    Value::Text(old_id.clone()),
+                ],
             )
             .await?;
         if affected == 0 {
@@ -577,7 +594,23 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 
 /// Schema generation for this store. Bumped when a migration must run once and
 /// then never again; `PRAGMA user_version` is otherwise unused here.
-const ASSERTION_TENANT_KEY_VERSION: i64 = 1;
+///
+/// v1: tenant added to the assertion id.
+/// v2: id fields length-prefixed (see `hash_field`), which changes every id
+///     again, so the re-key has to run a second time on a v1 database.
+const ASSERTION_TENANT_KEY_VERSION: i64 = 2;
+
+/// Tenant to attribute a row to when the stored value is absent.
+///
+/// `prov_assertion.tenant` is NULL only on a database predating the column,
+/// which also predates the mesh tenant entirely — every row in such a store
+/// was written by local ingest. Re-keying them under `""` would move them to a
+/// tenant no read path ever queries (`recall_with_context` filters
+/// `tenant = ?`), silently orphaning exactly the history this migration exists
+/// to preserve.
+fn legacy_tenant(stored: &str) -> &str {
+    if stored.is_empty() { "local" } else { stored }
+}
 
 async fn read_user_version(conn: &turso::Connection) -> Result<i64> {
     let mut rows = conn.query("PRAGMA user_version", ()).await?;
@@ -2201,6 +2234,71 @@ mod tests {
         assert_eq!(a, b, "spelling variants must corroborate one assertion");
         assert_ne!(a, c, "direction matters");
         assert_eq!(a.len(), 64);
+    }
+
+    /// A separator inside a tenant name must not be able to imitate a field
+    /// boundary.
+    ///
+    /// `canonical_key` collapses whitespace and lowercases; it does NOT strip
+    /// or escape `|`. With a bare `|` separator these two hashed identically,
+    /// which is one tenant silently corroborating another's assertion:
+    ///   tenant "acme|steel" + subject "UTS"
+    ///   tenant "acme"       + subject "steel|UTS"
+    #[test]
+    fn a_separator_in_the_tenant_cannot_forge_a_field_boundary() {
+        assert_ne!(
+            assertion_id("acme|steel", "UTS", "has_measurement", "x"),
+            assertion_id("acme", "steel|UTS", "has_measurement", "x"),
+            "tenant/subject boundary is forgeable — one tenant can reach another's row",
+        );
+        // Same hazard on the conditioned path.
+        let left =
+            conditioned_assertion_id("acme|steel", "UTS", "p", "x", Some(1.0), None, &[]).unwrap();
+        let right =
+            conditioned_assertion_id("acme", "steel|UTS", "p", "x", Some(1.0), None, &[]).unwrap();
+        assert_ne!(
+            left, right,
+            "conditioned id has the same forgeable boundary"
+        );
+    }
+
+    /// A row predating the tenant column must not be orphaned by the re-key.
+    ///
+    /// `add_column_if_absent` gives such rows NULL, which reads as `""`.
+    /// Re-keying them under `""` would move them to a tenant no read path ever
+    /// queries, silently losing the history the migration exists to preserve.
+    #[tokio::test]
+    async fn a_row_with_no_tenant_is_recovered_as_local_not_orphaned() {
+        let db = TempDb::new();
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            drop(store);
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant)
+                   VALUES ('pre-tenant-id', 'steel', 'has_phase', 'bcc', '[]', 'research',
+                           0.7, 4, 'act', 'legacy.csv', 'legacy-agent', NULL)"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let recalled = store.recall("steel", "local", 10).await.unwrap();
+        assert_eq!(
+            recalled.len(),
+            1,
+            "the pre-tenant row was orphaned under a tenant nothing reads",
+        );
+        assert!((recalled[0].confidence - 0.7).abs() < 1e-9);
     }
 
     /// The same triple under two tenants must be two different assertions.
