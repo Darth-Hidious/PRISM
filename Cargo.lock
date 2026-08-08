@@ -5100,6 +5100,7 @@ dependencies = [
  "prism-client",
  "prism-proto",
  "prism-provenance",
+ "prism-runtime",
  "rand 0.8.5",
  "rdkafka",
  "reqwest",

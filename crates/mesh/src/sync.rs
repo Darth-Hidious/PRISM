@@ -333,6 +333,12 @@ async fn sync_dataset_from_peer(
     // The dataset name travels as plain JSON data, never spliced into a
     // query language string (Bug #45 stays fixed by construction).
     let query_url = format!("{peer_url}/api/query");
+    // Hard offline. `peer_url` is built from an address another node ANNOUNCED
+    // over the mesh, so it is attacker-influenceable by any peer with Kafka
+    // access — the destination is not ours to trust. `crates/mesh` had no
+    // dependency on prism-runtime at all, so nothing here consulted the policy.
+    // `check_url` rather than `enabled()`: a loopback peer is legitimate.
+    prism_runtime::offline::check_url(&query_url).map_err(|r| anyhow::anyhow!(r))?;
     let body = serde_json::json!({
         "query": dataset_name,
         "mode": "graph",
