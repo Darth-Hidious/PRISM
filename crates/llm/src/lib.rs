@@ -3455,6 +3455,176 @@ mod tests {
             "{\"a\":1}"
         );
     }
+
+    // ── Hard offline mode ─────────────────────────────────────────────
+    //
+    // Three separate `check_url` guards stand between a configured base URL
+    // and a socket: `health_check`, `post`, and `send_retrying`. Each gets a
+    // test here, and each asserts BOTH halves — offline refuses, not-offline
+    // reaches the transport — because a one-sided test passes just as happily
+    // against a function that refuses unconditionally.
+    //
+    // All of them take the shared lock from prism-runtime rather than
+    // declaring one here: `PRISM_OFFLINE` is process-global, `cfg(test)` does
+    // not cross crate boundaries, and two locks that do not exclude each other
+    // serialize nothing.
+
+    /// A target that is NOT loopback — so `PRISM_OFFLINE=1` must refuse it —
+    /// and that refuses a connection immediately, so the not-offline halves
+    /// cost milliseconds. A TEST-NET-3 address blackholes instead of refusing,
+    /// which is how a test in this repo once took 75 seconds.
+    const UNREACHABLE_BASE: &str = "http://0.0.0.0:1";
+
+    /// A client on the HTTP adapter. `local_backend()` short-circuits
+    /// `health_check` before the guard, so a `gguf://local` config would test
+    /// nothing at all.
+    fn unreachable_http_client() -> LlmClient {
+        assert_eq!(
+            choose_backend(UNREACHABLE_BASE),
+            BackendChoice::Http,
+            "the offline guards live on the HTTP path only"
+        );
+        LlmClient::new(LlmConfig {
+            base_url: UNREACHABLE_BASE.to_string(),
+            model: "offline-guard-probe".to_string(),
+            timeout_secs: 5,
+            ..LlmConfig::default()
+        })
+    }
+
+    // Holding the lock across the awaits is the point — it is what stops a
+    // concurrent test from flipping `PRISM_OFFLINE` mid-call. Same precedent
+    // as `client/src/api.rs` and `node/src/daemon.rs`; applies to all three.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn health_check_is_refused_by_offline_mode_and_only_by_it() {
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let client = unreachable_http_client();
+
+        // The guard restores `PRISM_OFFLINE` on drop, so an assertion panic —
+        // exactly what this test exists to produce — cannot leak the variable
+        // into every later test in the binary.
+        let blocked = {
+            let _offline = OfflineEnvGuard::set("1");
+            format!("{:#}", client.health_check().await.unwrap_err())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {UNREACHABLE_BASE}/v1/models as policy, got: {blocked}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!("{:#}", client.health_check().await.unwrap_err())
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("LLM not reachable"),
+            "with offline mode off the check must reach the transport, got: {attempted}"
+        );
+    }
+
+    /// `post` refuses a blocked URL before it builds a request.
+    ///
+    /// This guard is defence in depth, not the only thing standing there:
+    /// `post` delegates to `send_retrying`, which repeats the identical check.
+    /// Deleting either line on its own therefore leaves the other producing
+    /// the same refusal, and no test can distinguish them — the two guards are
+    /// only separable together. This test pins `post`'s observable contract;
+    /// removing BOTH guards is what fails it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_is_refused_by_offline_mode_and_only_by_it() {
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let client = unreachable_http_client();
+        let url = chat_completions_url(UNREACHABLE_BASE);
+        let body = serde_json::json!({});
+
+        let blocked = {
+            let _offline = OfflineEnvGuard::set("1");
+            format!("{:#}", client.post(&url, &body).await.unwrap_err())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {url} as policy, got: {blocked}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!("{:#}", client.post(&url, &body).await.unwrap_err())
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("LLM request to"),
+            "with offline mode off the post must reach the transport, got: {attempted}"
+        );
+    }
+
+    /// The guard sits BEFORE the retry closure on purpose, so a URL blocked by
+    /// policy is never classified transient and replayed.
+    ///
+    /// The elapsed-time assertion is what pins that placement rather than
+    /// merely the refusal: inside the closure, a refused connection to
+    /// `0.0.0.0:1` is retryable even when billable, so the failure would come
+    /// back only after the shared backoff's first 250 ms sleep.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_retrying_refuses_before_the_retry_closure() {
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let client = unreachable_http_client();
+        let url = chat_completions_url(UNREACHABLE_BASE);
+        let body = serde_json::json!({});
+
+        let (blocked, elapsed) = {
+            let _offline = OfflineEnvGuard::set("1");
+            let start = std::time::Instant::now();
+            let error = client
+                .send_retrying("test.offline", &url, &body, false)
+                .await
+                .unwrap_err();
+            (format!("{error:#}"), start.elapsed())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {url} as policy, got: {blocked}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "a blocked URL must be refused before the retry closure; one retry \
+             sleep alone is at least 250 ms, and this took {elapsed:?}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!(
+                "{:#}",
+                client
+                    .send_retrying("test.online", &url, &body, false)
+                    .await
+                    .unwrap_err()
+            )
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("LLM request to"),
+            "with offline mode off the send must reach the transport, got: {attempted}"
+        );
+    }
 }
 
 #[cfg(test)]

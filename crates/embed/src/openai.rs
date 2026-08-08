@@ -212,4 +212,59 @@ mod tests {
         assert_eq!(b.dimensions(), 0); // unknown until the first response
         assert_eq!(b.url, "https://api.example.com/v1/embeddings");
     }
+
+    /// A target that is NOT loopback — so `PRISM_OFFLINE=1` must refuse it —
+    /// and that refuses a connection immediately, so the not-offline half
+    /// costs milliseconds. A TEST-NET-3 address blackholes instead of
+    /// refusing, which is how a test in this repo once took 75 seconds.
+    const UNREACHABLE_BASE: &str = "http://0.0.0.0:1";
+
+    /// Embedding text is the one call in this crate that ships user content to
+    /// a third party, so hard offline mode must refuse it before a socket
+    /// opens.
+    ///
+    /// Both halves are asserted. Offline-only would pass just as happily
+    /// against an `embed` that refused unconditionally, and would therefore
+    /// prove nothing. The refusal is matched on its MESSAGE, not merely on
+    /// `is_err`, so a connection failure cannot masquerade as a guard hit.
+    // Holding the lock across the awaits is the point — it is what stops a
+    // concurrent test from flipping `PRISM_OFFLINE` mid-call. Same precedent
+    // as `client/src/api.rs` and `node/src/daemon.rs`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn embed_is_refused_by_offline_mode_and_only_by_it() {
+        // The shared lock in prism-runtime, deliberately not a local one:
+        // `PRISM_OFFLINE` is process-global and two locks that do not exclude
+        // each other serialize nothing.
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let backend = OpenAiCompat::new(UNREACHABLE_BASE, "offline-guard-probe", None);
+        let texts = vec!["probe".to_string()];
+
+        // Each guard restores `PRISM_OFFLINE` on drop, so an assertion panic —
+        // exactly what this test exists to produce — cannot leak the variable
+        // into every later test in the binary.
+        let blocked = {
+            let _offline = OfflineEnvGuard::set("1");
+            format!("{:#}", backend.embed(&texts).await.unwrap_err())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {UNREACHABLE_BASE} as policy, got: {blocked}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!("{:#}", backend.embed(&texts).await.unwrap_err())
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("embedding request to"),
+            "with offline mode off the call must reach the transport, got: {attempted}"
+        );
+    }
 }
