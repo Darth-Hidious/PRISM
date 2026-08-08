@@ -716,7 +716,6 @@ mod tests {
     /// usable credential must NOT fire an unauthenticated request and then
     /// report the host as unreachable. The host is fine; we had nothing to
     /// send.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn configured_without_a_credential_says_so_instead_of_blaming_the_host() {
         let endpoints = PlatformEndpoints {
@@ -853,7 +852,6 @@ mod tests {
     /// The regression guard for the phone-home: with nothing configured,
     /// the boot screen must contain only local checks — no auth line, no
     /// knowledge-graph line, nothing that implies a missing account.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn unconfigured_boot_runs_local_checks_only() {
         // A URL that would fail loudly (and slowly) if it were ever hit.
@@ -879,7 +877,6 @@ mod tests {
 
     /// The headless path has a real credential and deliberately no
     /// session — telling it to `prism login` is a lying check.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_key_path_is_not_told_to_log_in() {
         // Configured (the env key is present) but with no stored session
