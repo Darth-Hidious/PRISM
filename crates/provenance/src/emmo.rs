@@ -377,12 +377,27 @@ fn entity_key(tenant: &str, label: &str, name: &str) -> String {
     format!("{tenant}|{label}:{}", canonical_key(name))
 }
 
-/// Stable assertion id: SHA-256 of `canonical(subject)|predicate|canonical(object)`,
-/// so re-extraction corroborates one row instead of duplicating facts.
+/// Stable assertion id: SHA-256 of
+/// `tenant|canonical(subject)|predicate|canonical(object)`, so re-extraction
+/// corroborates one row instead of duplicating facts.
+///
+/// `tenant` is part of the key, and must stay that way. `prov_assertion` is
+/// keyed on this id alone, and `record_assertion_with_context` looks a row up
+/// by id with no tenant filter — so while the id omitted the tenant, two
+/// tenants asserting the same triple shared one row and each raised the
+/// other's `confidence` (noisy-OR) and `corroborations`. That is the same
+/// cross-tenant ownership problem `entity_key` already fixed for
+/// `emmo_entity`; the assertion table had not had the fix applied.
+///
+/// The tenant is hashed raw rather than through `canonical_key`: a tenant is
+/// an exact identifier, and case-folding it would merge two distinct tenants
+/// that differ only in case. `predicate` is likewise hashed raw.
 #[must_use]
-pub fn assertion_id(subject: &str, predicate: &str, object: &str) -> String {
+pub fn assertion_id(tenant: &str, subject: &str, predicate: &str, object: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
+    h.update(tenant.as_bytes());
+    h.update(b"|");
     h.update(canonical_key(subject).as_bytes());
     h.update(b"|");
     h.update(predicate.as_bytes());
@@ -392,6 +407,7 @@ pub fn assertion_id(subject: &str, predicate: &str, object: &str) -> String {
 }
 
 fn conditioned_assertion_id(
+    tenant: &str,
     subject: &str,
     predicate: &str,
     object: &str,
@@ -400,13 +416,15 @@ fn conditioned_assertion_id(
     conditions: &[MeasurementCondition],
 ) -> Result<String> {
     if value.is_none() && unit.is_none() && conditions.is_empty() {
-        return Ok(assertion_id(subject, predicate, object));
+        return Ok(assertion_id(tenant, subject, predicate, object));
     }
 
     use sha2::{Digest, Sha256};
     let mut canonical_conditions = conditions.to_vec();
     canonical_conditions.sort_by(|left, right| left.name.cmp(&right.name));
     let mut h = Sha256::new();
+    h.update(tenant.as_bytes());
+    h.update(b"|");
     h.update(canonical_key(subject).as_bytes());
     h.update(b"|");
     h.update(predicate.as_bytes());
@@ -436,6 +454,86 @@ fn corroborate_confidence(old: f64, new_evidence: f64) -> f64 {
 // ─────────────────────────────────────────────────────────────────────────
 // Schema (called from `ProvenanceStore::init_schema`)
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Move existing `prov_assertion` rows onto tenant-scoped ids.
+///
+/// Without this, adding the tenant to [`assertion_id`] would silently orphan
+/// every row already in a user's `~/.prism/provenance.db`: the next write of
+/// the same triple computes a different id, misses the old row, and inserts a
+/// duplicate whose `corroborations` restarts at 1. The row's own columns carry
+/// everything the id is derived from, so the new id is recomputable in place.
+///
+/// Idempotent: after one pass every id already equals the recomputed value, so
+/// a second run finds nothing to do. `UPDATE OR IGNORE` rather than `UPDATE` so
+/// a row whose target id somehow exists is left alone instead of aborting
+/// `open()` on a primary-key violation.
+///
+/// **What it cannot repair:** rows that already merged across tenants before
+/// the fix are a single row with one tenant recorded. That history cannot be
+/// split back apart — this assigns such a row wholly to the tenant it stores.
+async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
+    // Collect every re-key before issuing any write. Turso is sensitive to
+    // interleaved statements on one connection, which is why the read paths
+    // in this file drain their cursors before writing.
+    let mut pending: Vec<(String, String)> = Vec::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT id, subject, predicate, object, value, unit, conditions_json, tenant \
+                 FROM prov_assertion",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let old_id = crate::get_str(&row, 0)?;
+            let conditions_json = crate::get_str(&row, 6)?;
+            // A row with unreadable conditions is left exactly as it is: a
+            // best-effort re-key must never destroy a fact it cannot parse.
+            let Ok(conditions) =
+                serde_json::from_str::<Vec<MeasurementCondition>>(if conditions_json.is_empty() {
+                    "[]"
+                } else {
+                    &conditions_json
+                })
+            else {
+                continue;
+            };
+            let unit = match row.get_value(5)? {
+                Value::Text(unit) if !unit.is_empty() => Some(unit),
+                _ => None,
+            };
+            let new_id = conditioned_assertion_id(
+                &crate::get_str(&row, 7)?, // tenant; NULL reads as ""
+                &crate::get_str(&row, 1)?,
+                &crate::get_str(&row, 2)?,
+                &crate::get_str(&row, 3)?,
+                row.get_value(4).ok().and_then(|v| v.as_real().copied()),
+                unit.as_deref(),
+                &conditions,
+            )?;
+            if new_id != old_id {
+                pending.push((old_id, new_id));
+            }
+        }
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let count = pending.len();
+    for (old_id, new_id) in pending {
+        conn.execute(
+            "UPDATE OR IGNORE prov_assertion SET id = ?1 WHERE id = ?2",
+            [Value::Text(new_id), Value::Text(old_id)],
+        )
+        .await?;
+    }
+    tracing::info!(
+        count,
+        "re-keyed prov_assertion rows onto tenant-scoped assertion ids"
+    );
+    Ok(())
+}
 
 pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     conn.execute(
@@ -572,6 +670,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'indeterminate'",
     )
     .await?;
+    // Databases predating multi-tenancy have no `tenant` column at all, and
+    // the re-key below reads it.
+    crate::add_column_if_absent(conn, "prov_assertion", "tenant", "TEXT").await?;
+    rekey_assertions_by_tenant(conn).await?;
 
     // Entity vectors for local semantic search: one little-endian f32 blob
     // per emmo_entity key (same encoding as `provenance_embeddings`),
@@ -1051,8 +1153,15 @@ impl ProvenanceStore {
     ) -> Result<()> {
         self.record_activity(prov).await?;
 
-        let id =
-            conditioned_assertion_id(&a.subject, &a.predicate, &a.object, value, unit, conditions)?;
+        let id = conditioned_assertion_id(
+            &prov.tenant,
+            &a.subject,
+            &a.predicate,
+            &a.object,
+            value,
+            unit,
+            conditions,
+        )?;
         let confidence_evidence = a.confidence.unwrap_or(1.0);
         let conditions_json = serde_json::to_string(conditions)?;
 
@@ -2027,12 +2136,163 @@ mod tests {
 
     #[test]
     fn assertion_id_is_stable_and_canonical() {
-        let a = assertion_id("Ti-6Al-4V", "has_phase", "alpha-beta");
-        let b = assertion_id("  ti-6al-4v ", "has_phase", "ALPHA-BETA");
-        let c = assertion_id("alpha-beta", "has_phase", "Ti-6Al-4V");
+        let a = assertion_id("t1", "Ti-6Al-4V", "has_phase", "alpha-beta");
+        let b = assertion_id("t1", "  ti-6al-4v ", "has_phase", "ALPHA-BETA");
+        let c = assertion_id("t1", "alpha-beta", "has_phase", "Ti-6Al-4V");
         assert_eq!(a, b, "spelling variants must corroborate one assertion");
         assert_ne!(a, c, "direction matters");
         assert_eq!(a.len(), 64);
+    }
+
+    /// The same triple under two tenants must be two different assertions.
+    ///
+    /// `prov_assertion` is keyed on this id alone and the corroboration
+    /// lookup does not filter tenant, so an id that omitted the tenant let one
+    /// tenant raise another's `confidence` and `corroborations`.
+    #[test]
+    fn assertion_id_separates_tenants() {
+        let local = assertion_id("local", "Ti-6Al-4V", "has_phase", "alpha-beta");
+        let mesh = assertion_id("mesh", "Ti-6Al-4V", "has_phase", "alpha-beta");
+        assert_ne!(local, mesh, "two tenants collided on one assertion id");
+
+        // Exact, not case-folded: distinct tenants stay distinct.
+        assert_ne!(
+            assertion_id("Local", "a", "p", "b"),
+            assertion_id("local", "a", "p", "b"),
+        );
+    }
+
+    /// The end-to-end property the id change exists for: a second tenant
+    /// asserting the same triple must not corroborate the first.
+    #[tokio::test]
+    async fn a_second_tenant_cannot_corroborate_the_first() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        let assertion = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for tenant in ["local", "mesh"] {
+            let prov = LocalProvenance {
+                activity_id: format!("activity-{tenant}"),
+                agent_id: format!("agent-{tenant}"),
+                agent_kind: "SoftwareAgent".into(),
+                source_entity_id: format!("source-{tenant}"),
+                source_kind: "Dataset".into(),
+                tenant: tenant.into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                ended_at: "2026-01-01T00:00:00Z".into(),
+                locality: tenant.into(),
+            };
+            store.record_assertion(&assertion, &prov).await.unwrap();
+        }
+
+        // Each tenant sees its own assertion, at its own unmodified confidence.
+        for tenant in ["local", "mesh"] {
+            let recalled = store.recall("Ti-6Al-4V", tenant, 10).await.unwrap();
+            assert_eq!(recalled.len(), 1, "{tenant} lost or duplicated its row");
+            assert!(
+                (recalled[0].confidence - 0.8).abs() < 1e-9,
+                "{tenant} confidence was inflated to {} by the other tenant",
+                recalled[0].confidence,
+            );
+        }
+    }
+
+    /// A row written before the tenant was in the id must be re-keyed in
+    /// place, not orphaned.
+    ///
+    /// Without the migration the next write of the same triple computes a
+    /// different id, misses this row, and inserts a duplicate whose
+    /// `corroborations` restarts at 1 — the user's history silently forks.
+    #[tokio::test]
+    async fn legacy_tenantless_assertion_ids_are_rekeyed_and_still_corroborate() {
+        let db = TempDb::new();
+
+        // The pre-fix id: hashed without the tenant.
+        let legacy_id = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(canonical_key("steel").as_bytes());
+            h.update(b"|");
+            h.update(b"has_phase");
+            h.update(b"|");
+            h.update(canonical_key("bcc").as_bytes());
+            h.finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            drop(store); // schema now exists
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant)
+                   VALUES (?1, 'steel', 'has_phase', 'bcc', '[]', 'research',
+                           0.7, 3, 'act', 'legacy.csv', 'legacy-agent', 't1')"#,
+                [Value::Text(legacy_id.clone())],
+            )
+            .await
+            .unwrap();
+        }
+
+        // Re-opening runs the migration.
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // Still exactly one row, still readable, history intact.
+        let recalled = store.recall("steel", "t1", 10).await.unwrap();
+        assert_eq!(recalled.len(), 1, "the legacy row was lost or duplicated");
+        assert!((recalled[0].confidence - 0.7).abs() < 1e-9);
+
+        // And it is now reachable by the tenant-scoped id, so a further
+        // assertion corroborates it rather than forking a second row.
+        let prov = LocalProvenance {
+            activity_id: "act2".into(),
+            agent_id: "agent2".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "second.csv".into(),
+            source_kind: "Dataset".into(),
+            tenant: "t1".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: "2026-01-01T00:00:00Z".into(),
+            locality: "local".into(),
+        };
+        store
+            .record_assertion(
+                &LocalAssertion {
+                    subject: "steel".into(),
+                    predicate: "has_phase".into(),
+                    object: "bcc".into(),
+                    confidence: Some(0.5),
+                },
+                &prov,
+            )
+            .await
+            .unwrap();
+
+        let recalled = store.recall("steel", "t1", 10).await.unwrap();
+        assert_eq!(
+            recalled.len(),
+            1,
+            "the re-assertion forked a second row instead of corroborating",
+        );
+        assert!(
+            recalled[0].confidence > 0.7,
+            "corroboration did not raise confidence: {}",
+            recalled[0].confidence,
+        );
     }
 
     #[test]
