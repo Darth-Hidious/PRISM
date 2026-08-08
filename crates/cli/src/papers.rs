@@ -331,6 +331,13 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             let mut claims = Vec::new();
             let mut rejected = Vec::new();
             let mut blocks_extracted = 0usize;
+            // A block whose extraction could not be parsed yields zero claims,
+            // which is indistinguishable from a block that genuinely contained
+            // none. `TextExtraction` reports the reason precisely so that stops
+            // being invisible — but this loop was discarding it with `.facts`,
+            // leaving the literature path exactly as silent as before.
+            let mut extraction_failures: Vec<serde_json::Value> = Vec::new();
+            let mut truncated_bytes = 0usize;
             // Extract per located block so every claim inherits a locator a
             // human can follow back into the document.
             for block in &fulltext.blocks {
@@ -345,12 +352,18 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     break;
                 }
                 blocks_extracted += 1;
-                let facts =
+                let extraction =
                     prism_ingest::text_extract::extract_facts_from_text(&llm, &title, &block.text)
                         .await
-                        .with_context(|| "LLM fact extraction failed")?
-                        .facts;
-                for fact in facts {
+                        .with_context(|| "LLM fact extraction failed")?;
+                if let Some(reason) = &extraction.parse_error {
+                    extraction_failures.push(json!({
+                        "section": block.locator.section_path,
+                        "reason": reason,
+                    }));
+                }
+                truncated_bytes += extraction.dropped_bytes;
+                for fact in extraction.facts {
                     let claim =
                         claim_from_fact(fact, &document_id, &document_url, &source, &block.locator);
                     match prism_retrieval::claims::validate_and_stamp(claim) {
@@ -385,6 +398,10 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     "blocks_extracted": blocks_extracted,
                     "max_blocks": max_blocks,
                     "stored": stored,
+                    // Non-empty means some blocks produced nothing because the
+                    // model misbehaved, NOT because the paper was silent there.
+                    "extraction_failures": extraction_failures,
+                    "truncated_bytes": truncated_bytes,
                 }))?
             );
         }
