@@ -366,7 +366,25 @@ class SearchEngine:
         )
 
         # 8. Cache and persist health
-        self._cache.put(query, search_result)
+        #
+        # Cache only when a provider actually ANSWERED. `put` was
+        # unconditional, so a search in which every provider failed — which is
+        # exactly what hard offline produces — stored an empty result under a
+        # 24h TTL, keyed by `query_hash()`, which covers the query parameters
+        # and nothing about the network. A later ONLINE search of the same
+        # query then short-circuited at the cache check (step 1) and returned
+        # zero materials without contacting anyone. Reproduced end to end: a
+        # provider that raises while offline and returns a hit when online gave
+        # `materials=0, cached=True` on the online call.
+        #
+        # Worse than the circuit-breaker case fixed alongside it: 24 hours
+        # instead of a 300s cooldown, and ONE failed search instead of two.
+        #
+        # A genuinely empty answer IS cached — a provider that replied "no
+        # matches" is real knowledge. What is not cached is an answer nobody
+        # gave.
+        if any(log.status == "success" for log in query_log):
+            self._cache.put(query, search_result)
         self._health.save()
 
         # S5: restore the default deadline (the override was per-call only).
