@@ -174,6 +174,31 @@ class TestPredictStructureTool:
         # Unified `predict` replaces predict_property + predict_structure
         assert "predict" in names
         assert "list_models" in names
-        # Old names must be gone
-        assert "predict_property" not in names
+        # `predict_structure` is gone and must stay gone — that half of the
+        # Round-4 collapse still holds.
         assert "predict_structure" not in names
+
+        # `predict_property` is NOT asserted absent any more, and that is not a
+        # relaxation — the name was legitimately reused.
+        #
+        # This assertion was written 2026-07-03 (a56d8229) to pin the collapse
+        # of predict_property + predict_structure into `predict`. On 2026-07-22
+        # (80da217b) the E9 informatics batch registered a NEW and unrelated
+        # `predict_property` — matminer+sklearn with uncertainty, trained on MP
+        # via the proxy (`app/tools/materials/informatics.py:237`) — which
+        # `pareto_screen` and `hea_dataset` both consume.
+        #
+        # So the assertion has been false since 19 days after it was written.
+        # Nothing caught it because no workflow ran pytest until the
+        # `python-suite` job was added; its own comment says so.
+        #
+        # What still matters is that the E9 tool is the informatics one and not
+        # a resurrected copy of the collapsed tool, so pin its provenance
+        # rather than its absence.
+        if "predict_property" in names:
+            tool = tool_reg.get("predict_property")
+            assert tool.source_detail == "materials.informatics", (
+                "`predict_property` is registered but is not the E9 informatics "
+                f"tool (source_detail={tool.source_detail!r}) — the collapsed "
+                "pre-1.0 tool may have been resurrected"
+            )
