@@ -185,7 +185,11 @@ impl PlatformClient {
     /// helper checks it here so offline mode actually blocks network
     /// calls instead of being silently ignored (break-test defect H-3).
     fn offline_guard(&self, method: &str, path: &str) -> Result<()> {
-        if std::env::var("PRISM_OFFLINE").is_ok_and(|v| v == "1") {
+        // One rule, one home: `offline::enabled()` also trims, so a
+        // `PRISM_OFFLINE=" 1"` from a shell or CI template is honoured here
+        // exactly as it is everywhere else. This re-derived the check without
+        // the trim.
+        if prism_runtime::offline::enabled() {
             anyhow::bail!(
                 "offline mode: {method} {path} blocked by --offline \
                  (remove the flag to reach the MARC27 platform)"
