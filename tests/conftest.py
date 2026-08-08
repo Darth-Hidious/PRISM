@@ -21,6 +21,44 @@ for p in (ROOT, ROOT / "src"):
         sys.path.insert(0, sp)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolated_prism_state(tmp_path_factory):
+    """Keep the whole suite out of the developer's real ``~/.prism``.
+
+    `SearchEngine.__init__` defaults to
+    `HealthManager(persist_path=DEFAULT_HEALTH_PATH)` and
+    `SearchCache(disk_dir=DEFAULT_CACHE_DIR)`, both under the real
+    `~/.prism/cache/`. `test_fork_safety.py` runs a GENUINE materials search by
+    design — the whole point of that file is that a mock does not load the
+    framework whose atfork handler is the fault — so a plain `pytest tests/`
+    opened circuit breakers in the developer's actual provider-health file. A
+    reviewer hit exactly that here and could not restore the prior bytes.
+
+    SESSION scope, deliberately. The first version of this was folded into the
+    function-scoped `isolated_state` and did NOT work: `poisoned_process` is
+    module-scoped, and higher-scoped fixtures are set up BEFORE lower-scoped
+    ones, so the patch was not active when the real search ran. Verified by
+    md5 of the real file across a full-suite run — the other search test files
+    went clean while `test_fork_safety.py` still wrote it.
+
+    Patched as module attributes because both are read at construction time,
+    so this covers every engine built anywhere under test rather than only the
+    ones that remember to pass overrides.
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+
+    from app.tools.search_engine import engine as _search_engine
+
+    mp = MonkeyPatch()
+    cache_dir = tmp_path_factory.mktemp("prism-cache")
+    mp.setattr(_search_engine, "DEFAULT_CACHE_DIR", cache_dir)
+    mp.setattr(
+        _search_engine, "DEFAULT_HEALTH_PATH", cache_dir / "provider_health.json"
+    )
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
     """Redirect cache + state to ``tmp_path``; force FakeBackend; no HF_TOKEN."""
