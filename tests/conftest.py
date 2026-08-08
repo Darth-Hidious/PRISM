@@ -7,7 +7,9 @@ temp directory so tests are hermetic and parallel-safe.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,40 @@ for p in (ROOT, ROOT / "src"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
+
+
+# ---------------------------------------------------------------------------
+# Keep the whole suite out of the developer's real home directory.
+# ---------------------------------------------------------------------------
+#
+# Done at MODULE scope, not in a fixture, and this is the point: pytest imports
+# conftest.py before it collects anything, and nothing under `app/` is imported
+# until a fixture body or a test module runs. So this precedes every
+# `Path.home()` evaluation in the tree.
+#
+# `pytest tests/` was writing `~/.prism/cache/provider_health.json` — a reviewer
+# hit it, opened circuit breakers in the real file, and could not restore the
+# prior bytes. The first fix patched the two constants behind that one file.
+# There are THIRTY-TWO `Path.home() / ".prism"` constants under `app/`, and a
+# second was already live: `session_context.SESSION_DIR`, which
+# `tests/test_kag_tools.py` writes into a directory holding 300+ genuine session
+# files, relying on the test's own `unlink` rather than isolation.
+#
+# Patching `HOME` once covers all of them, including any added later, and
+# sidesteps the fixture-scope hazard entirely — the earlier attempt was
+# function-scoped and silently missed the module-scoped fixture that mattered.
+# Verified that `Path.home()` re-reads the environment on every call and caches
+# nothing.
+_REAL_HOME = os.environ.get("HOME")
+_TEST_HOME = Path(tempfile.mkdtemp(prefix="prism-test-home-"))
+os.environ["HOME"] = str(_TEST_HOME)
+
+
+def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
+    """Put the developer's HOME back and remove the throwaway one."""
+    if _REAL_HOME is not None:
+        os.environ["HOME"] = _REAL_HOME
+    shutil.rmtree(_TEST_HOME, ignore_errors=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
