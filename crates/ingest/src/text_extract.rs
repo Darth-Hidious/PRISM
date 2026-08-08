@@ -17,6 +17,22 @@ struct ExtractionOutput {
     facts: Vec<MaterialFact>,
 }
 
+/// What an extraction produced, and what it never read.
+///
+/// `dropped_bytes` is returned rather than only logged because a
+/// `tracing::warn!` does not reach a CLI user: `main.rs` installs
+/// `EnvFilter::from_default_env()`, whose default directive is
+/// `LevelFilter::ERROR`, so with `RUST_LOG` unset every warning in this
+/// workspace is discarded. A partial read has to travel back to the caller to
+/// be reportable at all.
+#[derive(Debug, Clone)]
+pub struct TextExtraction {
+    pub facts: Vec<MaterialFact>,
+    /// Bytes of the supplied document that exceeded the extraction budget and
+    /// were never seen. Zero means the whole document was read.
+    pub dropped_bytes: usize,
+}
+
 /// Extract EMMO facts from `text` using the local LLM. The document text is
 /// treated as untrusted DATA (extract, don't act): the prompt frames it
 /// behind security markers and the extractor gets no tools. Unparseable LLM
@@ -26,7 +42,7 @@ pub async fn extract_facts_from_text(
     llm: &LlmClient,
     title: &str,
     text: &str,
-) -> Result<Vec<MaterialFact>> {
+) -> Result<TextExtraction> {
     let (prompt, dropped) = build_extraction_prompt(title, text);
     // Say so when part of the document was never read. There is no chunking:
     // everything past the budget is simply not seen by the extractor, so a
@@ -44,7 +60,10 @@ pub async fn extract_facts_from_text(
         );
     }
     let raw = llm.generate_json(&prompt).await?;
-    Ok(parse_extraction(&raw))
+    Ok(TextExtraction {
+        facts: parse_extraction(&raw),
+        dropped_bytes: dropped,
+    })
 }
 
 /// Byte budget for the document text handed to the extractor.

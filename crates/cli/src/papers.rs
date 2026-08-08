@@ -342,7 +342,8 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 let facts =
                     prism_ingest::text_extract::extract_facts_from_text(&llm, &title, &block.text)
                         .await
-                        .with_context(|| "LLM fact extraction failed")?;
+                        .with_context(|| "LLM fact extraction failed")?
+                        .facts;
                 for fact in facts {
                     let claim =
                         claim_from_fact(fact, &document_id, &document_url, &source, &block.locator);

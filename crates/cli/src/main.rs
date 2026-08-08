@@ -6379,7 +6379,9 @@ async fn run_local_text_ingest_file(
         .and_then(|value| value.to_str())
         .unwrap_or("untitled");
 
-    let facts = prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+    let extraction =
+        prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
+    let facts = extraction.facts;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let db_path = PathBuf::from(home).join(".prism/provenance.db");
@@ -6417,6 +6419,11 @@ async fn run_local_text_ingest_file(
         "model": agent_id,
         "store": db_path.display().to_string(),
         "warning": warning,
+        // A partial read has to be reported here, not left to a log line: the
+        // subscriber is built with `EnvFilter::from_default_env()`, whose
+        // default directive is ERROR, so `tracing::warn!` reaches nobody
+        // unless RUST_LOG is set.
+        "truncated_bytes": extraction.dropped_bytes,
     }))
 }
 
@@ -6562,6 +6569,17 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                 println!("  Text: {chars} chars extracted on-device");
                 if let Some(warning) = summary.get("warning").and_then(|value| value.as_str()) {
                     println!("  Warning: {warning}");
+                }
+                let truncated = summary
+                    .get("truncated_bytes")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                if truncated > 0 {
+                    println!(
+                        "  Warning: {truncated} bytes were NOT read. The document exceeds the \
+                         extraction budget and there is no chunking, so these facts come from \
+                         the start of it only."
+                    );
                 }
                 if summary
                     .get("schema_only")
