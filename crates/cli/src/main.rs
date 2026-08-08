@@ -11048,6 +11048,19 @@ async fn handle_federated_query(
     dashboard_url: &str,
     paths: &prism_runtime::PrismPaths,
 ) -> Result<()> {
+    // Every send below is gated, and the gates are NOT allowed to be
+    // swallowed. `create_dashboard_session*` already calls `check_url`, but
+    // this function discarded its Result with `.ok()` and then built a
+    // SEPARATE, ungated `reqwest::Client::new()` request and sent it anyway.
+    // A guard that grep finds but the request never consults is worse than no
+    // guard: it reads as covered.
+    //
+    // `query_federated` is an agent tool with `requires_approval: false`
+    // (agent/src/command_tools.rs:320-326) and `dashboard_url` is in its
+    // schema, so an injected prompt could name the host and POST the user's
+    // literal query text to it with no human in the loop.
+    prism_runtime::offline::check_url(dashboard_url).map_err(|r| anyhow!(r))?;
+
     // Step 1: Get peer list from the running node
     let peers_url = format!("{dashboard_url}/api/mesh/nodes");
     let resp: serde_json::Value = reqwest::get(&peers_url)
@@ -11107,6 +11120,16 @@ async fn handle_federated_query(
         let port = peer["port"].as_u64().unwrap_or(7327);
         let name = peer["name"].as_str().unwrap_or("unknown");
         let peer_base = format!("http://{}:{}", addr, port);
+        // Second-order: these addresses come from the JSON the previous host
+        // returned, so a hostile responder can name any peer it likes. Gate
+        // each one rather than trusting step 1's check to cover them.
+        if let Err(reason) = prism_runtime::offline::check_url(&peer_base) {
+            println!(
+                "[{}] skipped — {reason}",
+                peer["name"].as_str().unwrap_or("unknown")
+            );
+            continue;
+        }
         let peer_url = format!("{peer_base}/api/query");
         let body = serde_json::json!({"query": query, "mode": "nl"});
         let peer_session =
@@ -11816,6 +11839,57 @@ mod tests {
     /// merely named. `--dashboard-url` is a free string on `mesh publish` and
     /// `query --federated`, and the agent tool schemas expose it to the model,
     /// so a prompt injection could point it anywhere.
+    /// The guard existed, ran, returned Err — and the caller `.ok()`-swallowed
+    /// it, then built a separate ungated client and sent anyway. `query_federated`
+    /// is `requires_approval: false` with `dashboard_url` in its schema, so an
+    /// injected prompt could POST the user's literal query text off-box.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn federated_query_is_refused_offline_before_any_send() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // RAII, not a trailing remove_var: `.expect_err()` below can panic,
+        // and an unwind past a manual cleanup leaves PRISM_OFFLINE set for the
+        // rest of the binary — which then fails unrelated tests like
+        // `a_signed_in_user_still_syncs_tools`, whose `should_sync_tools` gate
+        // reads it. `clear_platform_env()` does NOT clear this var.
+        struct OfflineEnvGuard(Option<String>);
+        impl Drop for OfflineEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(prism_runtime::offline::ENV, v),
+                        None => std::env::remove_var(prism_runtime::offline::ENV),
+                    }
+                }
+            }
+        }
+        let _restore = OfflineEnvGuard(std::env::var(prism_runtime::offline::ENV).ok());
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = prism_runtime::PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        // TEST-NET-3: a full connect attempt would cost seconds. Refusing by
+        // policy is immediate, so a fast failure is itself part of the proof.
+        let err = handle_federated_query("secret query text", "http://203.0.113.9:7327", &paths)
+            .await
+            .expect_err("offline must refuse a remote dashboard");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("offline mode"), "{msg}");
+        assert!(
+            !msg.contains("secret query text"),
+            "query text surfaced in the error path: {msg}"
+        );
+    }
+
     #[test]
     fn platform_token_only_goes_to_a_loopback_dashboard() {
         // Loopback, in the spellings is_loopback_url accepts.
