@@ -96,7 +96,12 @@ class ProviderQueryLog(BaseModel):
     latency_ms: float
 
     status: Literal["success", "timeout", "http_error",
-                    "parse_error", "circuit_open", "skipped"]
+                    "parse_error", "circuit_open", "skipped",
+                    # Refused by the hard-offline policy, NOT a provider fault.
+                    # Distinct from "http_error" because it says nothing about
+                    # the provider's health and must not be treated as evidence
+                    # about it — see `engine.py`'s failure branch.
+                    "offline_blocked"]
     http_status_code: int | None = None
     result_count: int = 0
 

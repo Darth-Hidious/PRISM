@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -31,6 +32,16 @@ def _sanitize_error(msg: str) -> str:
 
 
 DEFAULT_HEALTH_PATH = Path.home() / ".prism" / "cache" / "provider_health.json"
+
+
+def _offline_policy_enabled() -> bool:
+    """Hard offline mode, read per call — same contract as the Rust side.
+
+    Only a trimmed "1" enables it; everything else, including "true", reads as
+    off. Matches `prism_runtime::offline::enabled`.
+    """
+    return os.environ.get("PRISM_OFFLINE", "").strip() == "1"
+
 
 
 # S7: the OPTIMADE providers known (live-probed 2026-07) to support server-side
@@ -278,16 +289,30 @@ class SearchEngine:
         for pid, result in provider_results.items():
             provider = next(p for p in providers if p.id == pid)
             if isinstance(result, BaseException):
-                # S1: the breaker + an honest log. Each task records its OWN
-                # start (above), so latency here is per-provider, not the old
-                # cumulative search-wide `start`.
-                self._health.get(pid).record_failure()
-                status = (
-                    "timeout"
-                    if isinstance(result, asyncio.CancelledError)
-                    or isinstance(result, asyncio.TimeoutError)
-                    else "http_error"
-                )
+                # A refusal by the hard-offline policy is NOT evidence about
+                # the provider, so it must not touch the breaker.
+                #
+                # It did. `record_failure()` fired for any exception, and the
+                # offline socket guard surfaces as one. Two searches under
+                # PRISM_OFFLINE=1 hit `consecutive_failures >= 2` and opened
+                # the circuit for EVERY provider — measured: 50 open circuits
+                # before, 53 after, with `matcloud.mc3d-pbesol-v1` at exactly
+                # 2. That state persists to ~/.prism/cache/provider_health.json,
+                # so coming back online meant a 300s cooldown per provider,
+                # caused by a policy decision rather than any provider fault.
+                if _offline_policy_enabled():
+                    status = "offline_blocked"
+                else:
+                    # S1: the breaker + an honest log. Each task records its OWN
+                    # start (above), so latency here is per-provider, not the old
+                    # cumulative search-wide `start`.
+                    self._health.get(pid).record_failure()
+                    status = (
+                        "timeout"
+                        if isinstance(result, asyncio.CancelledError)
+                        or isinstance(result, asyncio.TimeoutError)
+                        else "http_error"
+                    )
                 log = ProviderQueryLog(
                     provider_id=pid,
                     provider_name=provider.name,
