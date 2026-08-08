@@ -624,6 +624,36 @@ fn binary_exists(binary: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A node with no local copy must not fetch one under hard offline.
+    ///
+    /// One-sided by necessity: the permissive half of this guard IS a registry
+    /// pull, so asserting it would put a packet on the wire (and, with a
+    /// configured `docker login`, a credential). The "policy off" direction is
+    /// pinned at the primitive by
+    /// `prism_runtime::offline::tests::only_a_trimmed_one_enables_offline`.
+    ///
+    /// Works whether or not a container runtime is installed: with no binary
+    /// the `image inspect` fallback errors, which is the same "no local copy"
+    /// branch a real absent image takes.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_absent_image_is_not_fetched_under_hard_offline() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let err = ensure_image_available(
+            ContainerRuntime::Docker,
+            "prism-test-image-that-does-not-exist:never",
+        )
+        .await
+        .expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("offline mode"),
+            "must be a POLICY refusal: {msg}"
+        );
+    }
+
     use super::*;
 
     #[test]

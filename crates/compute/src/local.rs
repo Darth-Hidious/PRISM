@@ -61,6 +61,24 @@ impl Default for LocalBackend {
     }
 }
 
+/// Extra `docker run` flags imposed by hard offline mode.
+///
+/// `--network none` on the run below does NOT make this offline-safe: it
+/// constrains the CONTAINER's namespace, while the daemon still fetches an
+/// uncached image because `docker run` defaults to `--pull missing`. Pinning
+/// the policy to `never` means a cached image still runs — the whole point of
+/// local compute offline — and nothing is fetched.
+///
+/// Extracted so both directions are testable without a container runtime and
+/// without a registry round-trip.
+fn offline_pull_policy() -> &'static [&'static str] {
+    if prism_runtime::offline::enabled() {
+        &["--pull", "never"]
+    } else {
+        &[]
+    }
+}
+
 #[async_trait]
 impl ComputeBackend for LocalBackend {
     async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
@@ -75,19 +93,12 @@ impl ComputeBackend for LocalBackend {
 
         let mount = format!("{}:/workspace", tmp_dir.display());
 
-        // `--network none` does NOT make this offline-safe. It constrains the
-        // CONTAINER's namespace; the daemon still fetches an uncached image,
-        // because `docker run` defaults to `--pull missing`. So hard offline
-        // pins the policy to `never`: a cached image still runs — which is the
-        // whole point of local compute offline — and nothing is fetched.
         // `--pull` is a flag of `docker run`, not of `docker`, so it has to sit
         // after the subcommand — hence building the command in steps rather
-        // than one `.args([...])`.
+        // than one `.args([...])`. See `offline_pull_policy` for why it matters.
         let mut command = Command::new(&self.runtime);
         command.arg("run");
-        if prism_runtime::offline::enabled() {
-            command.args(["--pull", "never"]);
-        }
+        command.args(offline_pull_policy());
         let output = command
             .args([
                 "-d",
@@ -556,6 +567,31 @@ mod tests {
         assert!(
             !msg.starts_with("no result file"),
             "must be richer than the old opaque message: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offline_pull_tests {
+    use super::*;
+
+    /// A cached image still runs offline; an uncached one is never fetched.
+    ///
+    /// Both directions, because the decision is extracted — asserting the
+    /// permissive half through `submit` would need a container runtime and
+    /// would let docker fetch.
+    #[test]
+    fn hard_offline_pins_the_pull_policy_to_never() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+        assert_eq!(offline_pull_policy(), &["--pull", "never"]);
+        drop(_on);
+
+        let _off = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        assert!(
+            offline_pull_policy().is_empty(),
+            "must add no flags when the policy is off"
         );
     }
 }

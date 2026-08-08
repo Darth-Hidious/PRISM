@@ -335,6 +335,27 @@ fn loopback_port(base_url: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    /// `pull_for_platform` exists only to pull, so it refuses outright — there
+    /// is no local-copy path to degrade to as in `ensure_image_available`.
+    ///
+    /// One-sided: the permissive half is the registry fetch itself. The
+    /// "policy off" direction is pinned at the primitive.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_platform_pull_is_refused_before_it_spawns() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let err = pull_for_platform(ContainerRuntime::Docker, "img:tag", "linux/amd64")
+            .await
+            .expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("offline mode"),
+            "must be a POLICY refusal: {msg}"
+        );
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
