@@ -472,6 +472,22 @@ fn corroborate_confidence(old: f64, new_evidence: f64) -> f64 {
 /// the fix are a single row with one tenant recorded. That history cannot be
 /// split back apart — this assigns such a row wholly to the tenant it stores.
 async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
+    // Run once per database, not once per open.
+    //
+    // `init_schema` runs from `ProvenanceStore::open`, and `open` is called on
+    // hot paths — the agent loop and hooks re-open the store rather than
+    // holding one. Without this guard the re-key would scan every assertion
+    // and SHA-256 it on every single open, which on a large graph is a real
+    // per-turn cost for work that can only ever be needed once.
+    //
+    // Downgrade hazard, stated rather than hidden: an older PRISM build knows
+    // nothing about `user_version` and would write tenant-less ids again; a
+    // newer build then sees the version already set and skips them. Recovering
+    // from that needs the version reset by hand.
+    if read_user_version(conn).await? >= ASSERTION_TENANT_KEY_VERSION {
+        return Ok(());
+    }
+
     // Collect every re-key before issuing any write. Turso is sensitive to
     // interleaved statements on one connection, which is why the read paths
     // in this file drain their cursors before writing.
@@ -517,22 +533,65 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
         }
     }
 
-    if pending.is_empty() {
-        return Ok(());
-    }
     let count = pending.len();
+    let mut skipped = 0usize;
     for (old_id, new_id) in pending {
-        conn.execute(
-            "UPDATE OR IGNORE prov_assertion SET id = ?1 WHERE id = ?2",
-            [Value::Text(new_id), Value::Text(old_id)],
-        )
-        .await?;
+        // `OR IGNORE` so an unexpected id collision cannot abort `open()`.
+        // But a collision means the row keeps its OLD tenant-less id forever
+        // and every later write forks a new row beside it, so it must not pass
+        // unnoticed — `execute` returns rows-affected, and 0 is that case.
+        let affected = conn
+            .execute(
+                "UPDATE OR IGNORE prov_assertion SET id = ?1 WHERE id = ?2",
+                [Value::Text(new_id.clone()), Value::Text(old_id.clone())],
+            )
+            .await?;
+        if affected == 0 {
+            skipped += 1;
+            tracing::warn!(
+                old_id,
+                new_id,
+                "assertion could not be re-keyed: the tenant-scoped id already exists. \
+                 This row keeps its pre-tenant id and will not corroborate future writes."
+            );
+        }
     }
-    tracing::info!(
-        count,
-        "re-keyed prov_assertion rows onto tenant-scoped assertion ids"
-    );
+    if count > 0 {
+        tracing::info!(
+            rekeyed = count - skipped,
+            skipped,
+            "re-keyed prov_assertion rows onto tenant-scoped assertion ids"
+        );
+    }
+
+    // Mark the database migrated even when nothing needed changing — a fresh
+    // store has an empty table, and returning early without stamping it would
+    // make every subsequent open repeat the scan this guard exists to avoid.
+    conn.execute(
+        &format!("PRAGMA user_version = {ASSERTION_TENANT_KEY_VERSION}"),
+        (),
+    )
+    .await?;
     Ok(())
+}
+
+/// Schema generation for this store. Bumped when a migration must run once and
+/// then never again; `PRAGMA user_version` is otherwise unused here.
+const ASSERTION_TENANT_KEY_VERSION: i64 = 1;
+
+async fn read_user_version(conn: &turso::Connection) -> Result<i64> {
+    let mut rows = conn.query("PRAGMA user_version", ()).await?;
+    let version = match rows.next().await? {
+        Some(row) => row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .unwrap_or(0),
+        None => 0,
+    };
+    // Drain before any write: Turso dislikes interleaved statements.
+    while rows.next().await?.is_some() {}
+    Ok(version)
 }
 
 pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
@@ -2246,6 +2305,11 @@ mod tests {
             )
             .await
             .unwrap();
+            // Opening the store above stamped the schema version. A database
+            // that genuinely predates the migration carries version 0, so put
+            // it back — otherwise this fixture tests the skip path, not the
+            // migration.
+            conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
         }
 
         // Re-opening runs the migration.
@@ -2292,6 +2356,83 @@ mod tests {
             recalled[0].confidence > 0.7,
             "corroboration did not raise confidence: {}",
             recalled[0].confidence,
+        );
+    }
+
+    /// A fresh store must be stamped as migrated even though its assertion
+    /// table is empty, or every later open repeats the scan for nothing.
+    #[tokio::test]
+    async fn a_fresh_store_is_stamped_migrated() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        drop(store);
+
+        let database = turso::Builder::new_local(db.path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+        assert_eq!(
+            read_user_version(&conn).await.unwrap(),
+            ASSERTION_TENANT_KEY_VERSION,
+        );
+    }
+
+    /// The re-key is a one-shot migration, not per-open work.
+    ///
+    /// `init_schema` runs on every `ProvenanceStore::open`, and `open` is
+    /// called on hot paths (the agent loop and hooks re-open rather than hold
+    /// a store). Without the version guard this would scan and SHA-256 every
+    /// assertion on every open. Pinning it by observation: a row inserted with
+    /// a pre-tenant id AFTER the database is stamped is left alone, which can
+    /// only be true if the migration did not run again.
+    #[tokio::test]
+    async fn the_rekey_does_not_run_again_once_the_database_is_stamped() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        drop(store);
+
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant)
+                   VALUES ('not-a-tenant-scoped-id', 'steel', 'has_phase', 'bcc', '[]',
+                           'research', 0.7, 1, 'act', 'x.csv', 'agent', 't1')"#,
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        ProvenanceStore::open(&db.path).await.unwrap();
+
+        let database = turso::Builder::new_local(db.path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM prov_assertion WHERE id = 'not-a-tenant-scoped-id'",
+                (),
+            )
+            .await
+            .unwrap();
+        let still_there = rows
+            .next()
+            .await
+            .unwrap()
+            .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+            .unwrap_or(0);
+        assert_eq!(
+            still_there, 1,
+            "the migration ran a second time — it is meant to be one-shot",
         );
     }
 
