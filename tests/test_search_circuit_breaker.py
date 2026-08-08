@@ -207,3 +207,46 @@ def test_hard_offline_never_penalises_provider_health(monkeypatch):
     assert health.get("p").consecutive_failures >= 2
     assert health.get("p").circuit_state == "open"
     assert result.query_log[0].status != "offline_blocked"
+
+
+def test_an_offline_refusal_hands_back_the_half_open_probe_slot(monkeypatch):
+    """Skipping the breaker must not also skip RELEASING the probe claim.
+
+    `half_open_probe_claimed` means "a probe is in flight", and it was cleared
+    only by `record_success`/`record_failure`. So the offline gate — added to
+    stop policy refusals poisoning provider health — also stopped the release,
+    and stranded the provider: once a cooldown-eligible probe landed while
+    offline, `should_query()` returned False for the rest of the PROCESS, even
+    back online, even for a provider that would now succeed, surfaced only as
+    "No providers available for this query".
+
+    That was worse than the bug the gate was added to fix, and it is the
+    default path on a machine whose circuits are already open — which the real
+    health file was: 50 of 53.
+    """
+    import asyncio
+    import time
+
+    from app.tools.search_engine.query import MaterialSearchQuery
+    from app.tools.search_engine.resilience.circuit_breaker import HealthManager
+
+    health = HealthManager(persist_path=None)
+    engine = _engine_with(health)
+
+    # Circuit open, cooldown elapsed: the next query takes the half-open probe.
+    h = health.get("p")
+    h.circuit_state = "open"
+    h.consecutive_failures = 2
+    h.last_failure = time.time() - 400  # older than the 300s cooldown
+
+    monkeypatch.setenv("PRISM_OFFLINE", "1")
+    asyncio.run(engine.search(MaterialSearchQuery(elements=["Fe"], limit=5)))
+
+    h = health.get("p")
+    assert h.half_open_probe_claimed is False, (
+        "the probe slot was never handed back — this provider is now skipped "
+        "for the life of the process, online or not"
+    )
+    # No probe ran, so nothing is known: the breaker must not have moved either.
+    assert h.consecutive_failures == 2
+    assert h.should_query() is True

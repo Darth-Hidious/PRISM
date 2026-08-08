@@ -301,6 +301,15 @@ class SearchEngine:
                 # so coming back online meant a 300s cooldown per provider,
                 # caused by a policy decision rather than any provider fault.
                 if _offline_policy_enabled():
+                    # Hand back the half-open probe slot. `record_failure` was
+                    # the only thing clearing it, so skipping the breaker also
+                    # skipped the release and stranded the provider: once a
+                    # cooldown-eligible probe landed while offline,
+                    # `should_query()` returned False for the rest of the
+                    # PROCESS — even back online, even for a provider that
+                    # would now succeed, reported only as "No providers
+                    # available". Worse than the bug the skip was added to fix.
+                    self._health.get(pid).release_probe_claim()
                     status = "offline_blocked"
                 else:
                     # S1: the breaker + an honest log. Each task records its OWN
@@ -443,7 +452,15 @@ class SearchEngine:
             return materials, log
 
         except asyncio.TimeoutError:
-            self._health.get(provider.id).record_failure()
+            # Same rule as the fan-out branch: a timeout while the offline
+            # policy is on is the policy, not the provider. This second call
+            # site was missed by the first fix, so offline still poisoned
+            # health through any provider that timed out rather than raising
+            # the socket guard's error immediately.
+            if _offline_policy_enabled():
+                self._health.get(provider.id).release_probe_claim()
+            else:
+                self._health.get(provider.id).record_failure()
             log = ProviderQueryLog(
                 provider_id=provider.id,
                 provider_name=provider.name,

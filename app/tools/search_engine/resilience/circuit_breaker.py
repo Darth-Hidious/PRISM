@@ -61,6 +61,21 @@ class ProviderHealth:
         else:
             self.avg_latency_ms = 0.9 * self.avg_latency_ms + 0.1 * latency_ms
 
+    def release_probe_claim(self) -> None:
+        """Give back the half-open probe slot without judging the provider.
+
+        `half_open_probe_claimed` means "a probe is in flight". It is cleared
+        only by `record_success`/`record_failure` — so a caller that claims the
+        probe and then declines to record anything strands the provider:
+        `should_query()` returns False for the rest of the process, even after
+        conditions improve, with no error surfaced.
+
+        That is exactly what happens when the offline policy refuses a query
+        after the circuit went half-open. No probe ran, so nothing is known —
+        the claim has to go back.
+        """
+        self.half_open_probe_claimed = False
+
     def record_failure(self) -> None:
         self.consecutive_failures += 1
         self.failure_count += 1
