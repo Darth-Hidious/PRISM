@@ -125,10 +125,8 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
                             }
                         }
                         "doi" => d.doi = normalize_doi(&value),
-                        "journal_ref" => {
-                            if !value.trim().is_empty() {
-                                d.journal_ref = Some(value.trim().to_string());
-                            }
+                        "journal_ref" if !value.trim().is_empty() => {
+                            d.journal_ref = Some(value.trim().to_string());
                         }
                         _ => {}
                     }
