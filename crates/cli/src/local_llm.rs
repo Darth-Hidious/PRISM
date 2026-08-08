@@ -317,9 +317,7 @@ fn with_port(base_url: &str, port: u16) -> Option<String> {
     Some(url.to_string().trim_end_matches('/').to_string())
 }
 
-/// True when the URL's host is loopback (`localhost`, 127.x.x.x, `::1`) —
-/// i.e. the model runs on this machine.
-/// Whether `raw` targets this machine.
+/// Whether the URL targets this machine — i.e. the model runs locally.
 ///
 /// Delegates to `prism_runtime::offline::is_loopback_url`. This module used to
 /// carry its own copy — same name, same workspace, a different implementation.
