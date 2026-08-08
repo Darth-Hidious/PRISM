@@ -751,15 +751,30 @@ async fn find_system_python() -> Result<PathBuf, PythonBridgeError> {
         }
     }
 
-    // `uv python find` is useful online, but keep the offline path strictly
-    // local: a future uv configuration must not turn this into a download.
-    // `!enabled()`, not `var().is_err()`. The old check asked "is the variable
-    // ABSENT", so `PRISM_OFFLINE=0` — an explicit opt-OUT — skipped this path
-    // as though offline were on. Now an explicit 0 behaves like unset, which
-    // is what setting it to 0 means.
+    // FIND an interpreter; never install one.
+    //
+    // `uv python find` downloads by default — `uv help python`: "By default,
+    // uv will download Python if a version cannot be found." The previous
+    // comment here said a "future uv configuration must not turn this into a
+    // download", which read as though it could not today. It could, and did.
+    // `--no-python-downloads` makes the subprocess incapable of it, so this
+    // step cannot pull an interpreter over the network whatever the env says.
+    //
+    // The request is also a POSITIONAL, not `--min-version`. That flag does not
+    // exist on uv (0.9.17: "error: unexpected argument '--min-version' found"),
+    // so this fallback has been failing on every modern uv — `status.success()`
+    // was false and the branch silently did nothing. It was dead, which is why
+    // nobody noticed it could download.
+    //
+    // The offline check stays as defence in depth, and is `!enabled()` rather
+    // than the old `var().is_err()` — that asked "is the variable ABSENT", so
+    // `PRISM_OFFLINE=0`, an explicit opt-OUT, skipped this as though offline
+    // were ON. But `is_err()` was ALSO the only thing standing between a
+    // non-`"1"` value and a downloading subprocess, which is why the flag
+    // matters more than the guard.
     if !prism_runtime::offline::enabled()
         && let Ok(output) = Command::new("uv")
-            .args(["python", "find", "--min-version", "3.11"])
+            .args(["python", "find", ">=3.11", "--no-python-downloads"])
             .output()
             .await
         && output.status.success()

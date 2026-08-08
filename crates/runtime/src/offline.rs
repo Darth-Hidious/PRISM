@@ -128,6 +128,32 @@ mod tests {
         }
     }
 
+    /// `PRISM_OFFLINE` is process-global, so serialize the tests that set it.
+    /// Same precedent as `client/src/auth.rs:238`. Recovers from poisoning so
+    /// one panicking test cannot convert every later one into a spurious
+    /// failure that masks the real cause.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Restores `PRISM_OFFLINE` on drop, so an assertion failure cannot leave
+    /// the variable set for the rest of the binary. A plain `let _restore =`
+    /// does not survive an unwind; this does.
+    struct OfflineEnvGuard(Option<String>);
+    impl Drop for OfflineEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(ENV, value),
+                    None => std::env::remove_var(ENV),
+                }
+            }
+        }
+    }
+
     /// `PRISM_OFFLINE=0` means OFF, and every caller must agree on that.
     ///
     /// The rule was re-derived in six places as `== "1"` (untrimmed), and once
@@ -136,7 +162,8 @@ mod tests {
     /// pins the semantics they got wrong.
     #[test]
     fn only_a_trimmed_one_enables_offline() {
-        let _restore = std::env::var(ENV).ok();
+        let _guard = env_lock();
+        let _restore = OfflineEnvGuard(std::env::var(ENV).ok());
         for (value, expected) in [
             ("1", true),
             (" 1", true),
@@ -153,9 +180,6 @@ mod tests {
         }
         unsafe { std::env::remove_var(ENV) };
         assert!(!enabled(), "unset is not offline");
-        if let Some(v) = _restore {
-            unsafe { std::env::set_var(ENV, v) };
-        }
     }
 
     /// A bare `host:port` with no scheme must still resolve, and must not
@@ -214,6 +238,10 @@ mod tests {
 
     #[test]
     fn offline_check_is_noop_when_disabled_and_rejects_remote_targets() {
+        // Shares the global with only_a_trimmed_one_enables_offline; without
+        // this guard the two race on PRISM_OFFLINE.
+        let _guard = env_lock();
+        let _restore = OfflineEnvGuard(std::env::var(ENV).ok());
         assert!(check_url("https://api.example.invalid").is_ok());
         // The environment-sensitive branch is covered by the process-level
         // integration test; this unit test remains deterministic for parallel
