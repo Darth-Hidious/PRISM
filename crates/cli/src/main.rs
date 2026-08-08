@@ -5192,6 +5192,36 @@ async fn handle_mesh_command(
 ) -> Result<()> {
     match command {
         MeshCommands::Discover { timeout } => {
+            // This command never discovered anything.
+            //
+            // `init_mesh` only allocates an empty peer list — the mDNS listener
+            // lives in `start_mesh`, which was never called. So the old body
+            // slept for `timeout` and then read a list nothing could ever have
+            // filled, printing "No peers found." whether or not peers existed.
+            // A false negative is worse than a missing feature: it answers the
+            // question the user asked, wrongly.
+            //
+            // Both refusal conditions are checked HERE and reported, because
+            // `start_mesh` refuses on a background task whose reason the user
+            // would never see — leaving the same silent empty result.
+            if prism_runtime::offline::enabled() {
+                println!(
+                    "Discovery not run: offline mode. mDNS is LAN multicast, \
+                     which hard offline blocks."
+                );
+                return Ok(());
+            }
+            let auth_token = resolve_agent_auth()
+                .ok()
+                .map(|(_, auth)| auth.secret().to_string());
+            if auth_token.is_none() {
+                println!(
+                    "Discovery not run: not authenticated. The mesh gates peer \
+                     interaction on platform RBAC, so discovery needs a session."
+                );
+                return Ok(());
+            }
+
             println!(
                 "Discovering PRISM nodes on local network ({}s timeout)...",
                 timeout
@@ -5203,9 +5233,29 @@ async fn handle_mesh_command(
                 kafka_brokers: None,
             };
             let handle = prism_mesh::init_mesh(config)?;
-            // mDNS discovery is async — wait for the timeout period.
+            // `MeshHandle` is Clone and its peer list is an Arc, so the clone
+            // reads the same list the mDNS task fills.
+            let probe = handle.clone();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = prism_mesh::start_mesh(
+                handle,
+                prism_mesh::MeshStartOptions {
+                    node_name: "discovery-probe".into(),
+                    publish_port: 0,
+                    // Passive: listen for peers, do not advertise this probe as
+                    // a node. `prism mesh discover` is a question, not a join.
+                    broadcast: false,
+                    capabilities: Vec::new(),
+                    discovery_interval_secs: 5,
+                    event_tx: None,
+                    auth_token,
+                },
+                cancel.clone(),
+            );
             tokio::time::sleep(Duration::from_secs(timeout)).await;
-            let peers = handle.peers();
+            let peers = probe.peers();
+            cancel.cancel();
+            task.abort();
             if peers.is_empty() {
                 println!("No peers found.");
             } else {
