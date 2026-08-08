@@ -296,8 +296,37 @@ impl IngestPipeline {
         // same Turso store so `prism query --semantic` works without Qdrant.
         // Failures are logged inside and never fail the ingest.
         store.embed_entities_best_effort(&facts, &prov.tenant).await;
+
+        // Count what the store actually received, not what the LLM proposed.
+        //
+        // `to_local_facts` maps RELATIONSHIPS, so an extracted entity that is
+        // not an endpoint of any relationship produces no fact and never
+        // reaches the store. Reporting `entity_set.entities.len()` therefore
+        // claimed nodes that were silently dropped: 50 entities with 3
+        // relationships reported "50 nodes created" while the store saw at
+        // most 6 names.
+        let written: std::collections::HashSet<&str> = facts
+            .iter()
+            .flat_map(|f| [f.subject.as_str(), f.object.as_str()])
+            .collect();
+
+        let dropped = entity_set
+            .entities
+            .iter()
+            .filter(|e| !written.contains(e.name.as_str()))
+            .count();
+        if dropped > 0 {
+            // The drop is by design; being quiet about it was not.
+            tracing::warn!(
+                dropped,
+                extracted = entity_set.entities.len(),
+                stored = written.len(),
+                "entities appearing in no relationship were not written to the graph"
+            );
+        }
+
         Ok(GraphUpdate {
-            nodes_created: entity_set.entities.len(),
+            nodes_created: written.len(),
             edges_created: facts.len(),
         })
     }
@@ -529,6 +558,85 @@ mod tests {
                 .iter()
                 .all(|f| f.evidence_class == EvidenceClass::Research),
             "LLM-extracted tabular facts must be ORANGE/research, never promoted by confidence",
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = db_path.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// `nodes_created` must count what the store received, not what the LLM
+    /// proposed. `to_local_facts` maps relationships only, so an entity in no
+    /// relationship is silently dropped — and the old count reported it as
+    /// created anyway.
+    #[tokio::test]
+    async fn write_local_graph_does_not_count_entities_it_never_wrote() {
+        use crate::{Entity, Relationship};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let db_path =
+            std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            llm: None,
+            max_sample_rows: 10,
+            mapping: None,
+            provenance_db: Some(db_path.clone()),
+        });
+
+        let entity_set = EntitySet {
+            entities: vec![
+                Entity {
+                    entity_type: "Alloy".into(),
+                    name: "Steel".into(),
+                    properties: serde_json::json!({}),
+                },
+                Entity {
+                    entity_type: "Element".into(),
+                    name: "Fe".into(),
+                    properties: serde_json::json!({}),
+                },
+                // Referenced by nothing — never reaches the store.
+                Entity {
+                    entity_type: "Element".into(),
+                    name: "Nickel".into(),
+                    properties: serde_json::json!({}),
+                },
+            ],
+            relationships: vec![Relationship {
+                from: "Steel".into(),
+                rel_type: "CONTAINS".into(),
+                to: "Fe".into(),
+                weight: Some(0.98),
+                order: None,
+            }],
+        };
+        let source = DataSource {
+            path: "/tmp/alloys.csv".into(),
+            format: "csv".into(),
+        };
+
+        let update = pipeline
+            .write_local_graph(&entity_set, &source)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            update.nodes_created, 2,
+            "counted an entity that was never written (3 extracted, only Steel and Fe stored)",
+        );
+        assert_eq!(update.edges_created, 1);
+
+        // And prove the claim: the dropped entity really is absent.
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Nickel", "local", 10).await.unwrap();
+        assert!(
+            !hits.iter().any(|n| n.name == "Nickel"),
+            "Nickel was reported as created and is in the store after all",
         );
 
         for suffix in ["", "-wal", "-shm"] {
