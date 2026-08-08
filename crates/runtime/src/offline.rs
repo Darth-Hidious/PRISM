@@ -78,6 +78,71 @@ pub fn check_url(raw_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Test-support for the process-global `PRISM_OFFLINE`.
+///
+/// **Deliberately a plain `pub mod`, not `#[cfg(test)]`.** `cfg(test)` does not
+/// cross crate boundaries, so every crate that wanted this ended up declaring
+/// its own `static LOCK` — and two locks that do not exclude each other
+/// serialize nothing. That happened SEVEN times on this branch, across
+/// prism-agent, prism-mesh, prism-cli and prism-client, three of them added by
+/// the same session that was fixing the previous one. `crates/client` failed
+/// for real: "DELETE not refused for \" 1\"" when auth.rs's tests cleared the
+/// variable mid-run of api.rs's.
+///
+/// The invariant is ONE lock per test binary, not one per workspace: cargo runs
+/// each crate's tests as its own process, so this static is instantiated once
+/// per binary and crates never contend with each other. What breaks is two
+/// locks inside a single binary — which is what a per-file `static LOCK` in a
+/// crate with several test modules produces every time. Naming one home, with
+/// the RAII guard beside it, is what stops the next file from rolling its own.
+/// The cost is a `Mutex<()>` in the shipped binary.
+pub mod test_support {
+    /// Serializes every test in this binary that mutates `PRISM_OFFLINE`.
+    pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock. Recovers from poisoning so one panicking test cannot
+    /// convert every later one into a spurious failure that masks the cause.
+    pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Restores `PRISM_OFFLINE` on drop, so an assertion failure — the very
+    /// thing these tests exist to produce — cannot leave it set for the rest
+    /// of the binary.
+    pub struct OfflineEnvGuard(Option<String>);
+
+    impl OfflineEnvGuard {
+        pub fn capture() -> Self {
+            Self(std::env::var(super::ENV).ok())
+        }
+
+        /// Capture the current value, then set a new one.
+        pub fn set(value: &str) -> Self {
+            let guard = Self::capture();
+            unsafe { std::env::set_var(super::ENV, value) };
+            guard
+        }
+
+        /// Capture the current value, then clear it.
+        pub fn clear() -> Self {
+            let guard = Self::capture();
+            unsafe { std::env::remove_var(super::ENV) };
+            guard
+        }
+    }
+
+    impl Drop for OfflineEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(super::ENV, value),
+                    None => std::env::remove_var(super::ENV),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

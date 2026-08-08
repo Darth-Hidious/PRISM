@@ -497,6 +497,75 @@ impl std::fmt::Debug for LlmKeyEntry {
 mod tests {
     use super::*;
 
+    /// The highest-blast-radius guard on the branch, and it had NO test.
+    ///
+    /// `offline_guard` backs `get`/`post`/`post_inspect`/`patch`/`delete` —
+    /// essentially every authenticated platform call from cli, agent, node,
+    /// server, tui and mesh. This branch also switched it from a hand-rolled
+    /// untrimmed `== "1"` to `offline::enabled()`; nothing proved either the
+    /// blocking or the trim.
+    ///
+    /// Base URL is `0.0.0.0:1`, chosen deliberately: `is_loopback_url` treats
+    /// it as NON-loopback (pinned in offline.rs's own tests), so the policy
+    /// must refuse it — while the OS refuses a connection to it in ~7 ms, so
+    /// the not-offline half does not spend a connect timeout per value. The
+    /// first version used TEST-NET-3 and took 75 s.
+    ///
+    /// A guard failure therefore surfaces as a TRANSPORT error, not a policy
+    /// one, and the assertions distinguish the two rather than merely checking
+    /// that an error occurred.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn every_verb_is_blocked_offline_and_the_value_is_trimmed() {
+        let _guard = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::capture();
+
+        let client = PlatformClient::new("http://0.0.0.0:1/api/v1");
+
+        for value in ["1", " 1", "1 ", "\t1\n"] {
+            unsafe { std::env::set_var("PRISM_OFFLINE", value) };
+
+            let get: Result<serde_json::Value> = client.get("/x").await;
+            let msg = format!("{:#}", get.expect_err("GET must be refused"));
+            assert!(
+                msg.contains("offline mode"),
+                "PRISM_OFFLINE={value:?}: {msg}"
+            );
+
+            let post: Result<serde_json::Value> = client.post("/x", &serde_json::json!({})).await;
+            assert!(
+                format!("{:#}", post.expect_err("POST must be refused")).contains("offline mode"),
+                "POST not refused for {value:?}"
+            );
+
+            let patch: Result<serde_json::Value> = client.patch("/x", &serde_json::json!({})).await;
+            assert!(
+                format!("{:#}", patch.expect_err("PATCH must be refused")).contains("offline mode"),
+                "PATCH not refused for {value:?}"
+            );
+
+            let delete: Result<()> = client.delete("/x").await;
+            assert!(
+                format!("{:#}", delete.expect_err("DELETE must be refused"))
+                    .contains("offline mode"),
+                "DELETE not refused for {value:?}"
+            );
+        }
+
+        // Values that are NOT offline must fall through to a real attempt —
+        // otherwise every assertion above would pass against a guard that
+        // refused unconditionally.
+        for value in ["0", "", "true", "yes"] {
+            unsafe { std::env::set_var("PRISM_OFFLINE", value) };
+            let got: Result<serde_json::Value> = client.get("/x").await;
+            let msg = format!("{:#}", got.expect_err("nothing is listening"));
+            assert!(
+                !msg.contains("offline mode"),
+                "PRISM_OFFLINE={value:?} must not enable offline: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn api_error_is_token_expired_matches_401_with_code() {
         // The exact server signal: 401 + {"error":{"code":"token_expired"}}.

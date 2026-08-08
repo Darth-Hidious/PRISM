@@ -468,10 +468,17 @@ fn claim_from_fact(
 mod tests {
     use super::*;
 
-    /// `PRISM_OFFLINE` is process-global; serialize the tests that set it.
+    /// The CRATE's lock, not a private one.
+    ///
+    /// `boot_checks::ENV_LOCK` is already shared by `boot_checks.rs` and
+    /// `main.rs`; this file declared a second `static LOCK` for the same
+    /// process-global `PRISM_OFFLINE`. Two locks that do not exclude each
+    /// other serialize nothing, and all three files compile into one test
+    /// binary that cargo runs multi-threaded. Sixth occurrence of this shape —
+    /// `d3fcdfa4` consolidated it in `crates/mesh` and missed that
+    /// `crates/cli` had the same bug.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        crate::boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner())
     }

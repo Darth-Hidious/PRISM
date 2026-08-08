@@ -2178,15 +2178,13 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn refresh_token_is_refused_offline() {
-        use std::sync::{Mutex, MutexGuard, OnceLock};
-        fn env_lock() -> MutexGuard<'static, ()> {
-            static L: OnceLock<Mutex<()>> = OnceLock::new();
-            L.get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-        }
-        let _g = env_lock();
-        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        // Shared lock + RAII, not a function-local static and a trailing
+        // `remove_var`. The `unwrap_err()` below panics in exactly the case
+        // this test exists to catch — the guard lets the refresh through and
+        // returns Ok — and an unwind past a manual cleanup leaks PRISM_OFFLINE
+        // into every later test in this binary.
+        let _g = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
 
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
@@ -2205,7 +2203,6 @@ mod tests {
             ..Default::default()
         };
         let err = refresh_token(&paths, &endpoints, &creds).await.unwrap_err();
-        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
 
         let msg = err.to_string();
         assert!(msg.contains("offline mode"), "{msg}");

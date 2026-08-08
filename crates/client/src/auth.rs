@@ -230,17 +230,6 @@ impl DeviceFlowAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// `PRISM_OFFLINE` is process-global; serialize the tests that set it.
-    /// Recovers from poisoning so one panicking test cannot convert every
-    /// later one into a spurious failure that masks the real cause.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
 
     /// A host that would take the full connect timeout if a request were
     /// actually issued. The guard must refuse before that, so these tests are
@@ -259,7 +248,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn refresh_token_is_refused_offline() {
-        let _guard = env_lock();
+        let _guard = prism_runtime::offline::test_support::env_lock();
         unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
         let client = reqwest::Client::new();
         let result = DeviceFlowAuth::refresh_token(&client, UNROUTABLE, "refresh-abc").await;
@@ -283,7 +272,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn device_flow_start_is_refused_offline() {
-        let _guard = env_lock();
+        let _guard = prism_runtime::offline::test_support::env_lock();
         unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
         let client = reqwest::Client::new();
         let result = DeviceFlowAuth::start_device_flow(&client, UNROUTABLE).await;
@@ -301,7 +290,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn device_flow_poll_is_refused_offline_without_sleeping() {
-        let _guard = env_lock();
+        let _guard = prism_runtime::offline::test_support::env_lock();
         unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
         let client = reqwest::Client::new();
         let started = std::time::Instant::now();
@@ -323,7 +312,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn the_guard_is_inert_when_offline_is_unset() {
-        let _guard = env_lock();
+        let _guard = prism_runtime::offline::test_support::env_lock();
         unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(400))

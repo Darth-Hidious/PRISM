@@ -12017,7 +12017,14 @@ mod tests {
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        // RAII, not a trailing remove_var. The `.expect_err` calls below can
+        // panic — and a panic there is EXACTLY the regression this test exists
+        // to catch (the guard lets a request through and returns Ok). An
+        // unwind past manual cleanup leaks PRISM_OFFLINE into every later test
+        // in this binary. `federated_query_is_refused_offline_before_any_send`
+        // 150 lines up carries a comment saying precisely this; this test did
+        // not follow it.
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
 
         let remote = create_dashboard_session_for_user_with_platform_token(
             "http://203.0.113.9:7327",
@@ -12039,8 +12046,6 @@ mod tests {
         .await
         .expect_err("nothing is listening on port 1");
         let local_msg = format!("{local:#}");
-
-        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
 
         assert!(
             remote_msg.contains("offline mode"),
