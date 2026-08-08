@@ -191,8 +191,14 @@ pub struct MeshStartOptions {
 /// about each other, they compile into one test binary, and cargo's runner is
 /// multi-threaded, so they serialize nothing across files. Pattern borrowed
 /// from `prism-agent`'s `skills::TEST_ENV_LOCK`.
+///
+/// **Re-exported, not declared.** Being the only lock in THIS binary is not
+/// enough: the moment a file here reaches for
+/// `prism_runtime::offline::test_support::env_lock()` instead, the two stop
+/// excluding each other. That is exactly how prism-cli broke after nine
+/// previous fixes to this same shape. Aliasing makes both spellings one mutex.
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use prism_runtime::offline::test_support::ENV_LOCK as TEST_ENV_LOCK;
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

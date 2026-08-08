@@ -318,8 +318,13 @@ fn run_with_timeout(
 
 /// `PRISM_SKILLS_DIR` is process-global; serialize every test (in any module)
 /// that mutates it so parallel runs can't read each other's temp dir.
+///
+/// **Re-exported, not declared**, so this and
+/// `prism_runtime::offline::test_support::ENV_LOCK` are one mutex. It also
+/// guards `PRISM_OFFLINE` here (`protocol.rs`'s `/gh` test takes it), and two
+/// locks for one process-global serialize nothing.
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use prism_runtime::offline::test_support::ENV_LOCK as TEST_ENV_LOCK;
 
 /// Lock the env, point [`skills_dir`] at a fresh temp dir, and return the guard
 /// (keep it alive for the whole test) plus the dir. Shared by `skills` and

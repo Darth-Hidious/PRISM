@@ -522,8 +522,22 @@ async fn push_local_checks(client: &reqwest::Client, checks: &mut Vec<boot::Boot
 /// exercise [`platform_configured`] share the SAME lock — two private locks
 /// would not serialize against each other, and both would be clearing the
 /// same three variables.
+///
+/// **Re-exported, not declared.** This name and
+/// `prism_runtime::offline::test_support::ENV_LOCK` must be the same mutex, or
+/// they serialize nothing against each other. They were two different mutexes,
+/// and it bit: `pyiron_cmd.rs` reached for the runtime one while every other
+/// prism-cli test used this one, so its `PRISM_OFFLINE=1` leaked into
+/// `a_signed_in_user_still_syncs_tools` — which calls `should_sync_tools`,
+/// which returns false under offline. A genuine failure, in the full workspace
+/// run only, from a test that passed on its own.
+///
+/// That was the TENTH occurrence of this shape on this branch, and the second I
+/// caused while fixing an earlier one. Aliasing rather than declaring is what
+/// makes the next one impossible: both spellings now resolve to one mutex, so a
+/// file cannot pick the wrong lock.
 #[cfg(test)]
-pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use prism_runtime::offline::test_support::ENV_LOCK;
 
 /// Remove every platform token env var, so a test can pin the
 /// no-credential branch regardless of the developer's shell.

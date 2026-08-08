@@ -186,11 +186,10 @@ mod tests {
     }
 
     /// PRISM_OFFLINE is process-global; serialize the tests that set it.
+    /// Delegates to the workspace lock rather than declaring a private one —
+    /// a second mutex for the same process-global excludes nothing.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        prism_runtime::offline::test_support::env_lock()
     }
 
     /// Restores the var on drop, so a failed assertion cannot leave it set for
