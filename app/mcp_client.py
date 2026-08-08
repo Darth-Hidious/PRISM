@@ -37,6 +37,14 @@ async def discover_tools_from_server(
 
     Returns list of dicts with: name, description, input_schema, server_name.
     """
+    # Self-guarded, like `call_mcp_tool`, rather than relying on its caller.
+    # Today the only caller is `discover_and_register_mcp_tools`, which is
+    # guarded — so this is defence in depth, not a live hole. But the asymmetry
+    # was the finding: a future direct import (a "test this MCP server" button)
+    # would bypass the policy with nothing to notice it.
+    if os.environ.get("PRISM_OFFLINE", "").strip() == "1":
+        return []
+
     from fastmcp import Client
 
     # FastMCP Client expects {"mcpServers": {"name": config}} format

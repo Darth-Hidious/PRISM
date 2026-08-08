@@ -83,23 +83,43 @@ def test_external_mcp_is_refused_offline_at_both_registration_and_call(monkeypat
     from app import mcp_client
     from app.tools.base import ToolRegistry
 
-    # A structurally valid stdio server that does nothing. `call_mcp_tool`
-    # builds its `Client` OUTSIDE its try block, so an invalid config raises
-    # instead of returning an error dict — an empty `{}` here would fail for
-    # that reason rather than on policy, and prove nothing.
     server = {"command": "true", "args": []}
 
+    # Offline half: returns before `fastmcp` is even imported, so nothing is
+    # spawned and nothing can block.
     monkeypatch.setenv("PRISM_OFFLINE", "1")
     assert mcp_client.discover_and_register_mcp_tools(ToolRegistry()) == []
     result = asyncio.run(mcp_client.call_mcp_tool("srv", server, "tool", {}))
     assert "offline mode" in result.get("error", ""), result
 
-    # Inert when the policy is off, or the assertions above would pass against
-    # a client that refused unconditionally. The call still fails — `true`
-    # speaks no MCP — but it must fail as TRANSPORT, never as policy.
+    # Inert half, through a STUB rather than a real client.
+    #
+    # The first version let the call proceed for real and asserted the failure
+    # was transport rather than policy. It hung: `fastmcp` spawns the stdio
+    # server and waits on an MCP handshake that `true` never performs — three
+    # of four full-file runs never returned. A hanging test is worse than a
+    # failing one, so the reachability is proved by whether control reaches the
+    # client at all, which is exactly what the guard decides.
+    import fastmcp
+
+    class _Reached(RuntimeError):
+        pass
+
+    def _stub(*_args, **_kwargs):
+        raise _Reached("client constructed")
+
+    monkeypatch.setattr(fastmcp, "Client", _stub, raising=True)
     monkeypatch.setenv("PRISM_OFFLINE", "0")
-    result = asyncio.run(mcp_client.call_mcp_tool("srv", server, "tool", {}))
-    assert "offline mode" not in result.get("error", ""), result
+    try:
+        asyncio.run(mcp_client.call_mcp_tool("srv", server, "tool", {}))
+    except _Reached:
+        pass  # control passed the guard — that is the assertion
+    else:
+        raise AssertionError(
+            "with PRISM_OFFLINE=0 the call must reach the MCP client; the guard "
+            "is refusing unconditionally, which would make the offline half above "
+            "pass for the wrong reason"
+        )
 
 
 def test_hf_jobs_backend_refuses_offline_and_only_offline(monkeypatch) -> None:
@@ -127,3 +147,50 @@ def test_hf_jobs_backend_refuses_offline_and_only_offline(monkeypatch) -> None:
         monkeypatch.setenv("PRISM_OFFLINE", not_offline)
         assert not hf_jobs._offline(), not_offline
         hf_jobs._refuse_if_offline("run a job on")
+
+
+def test_hf_jobs_poll_rechecks_offline_every_iteration(monkeypatch) -> None:
+    """The poll window runs up to ~95 minutes; checking once at entry is not enough.
+
+    This is the same defect fixed in `crates/node/src/daemon.rs` in the same
+    change set — a long-lived loop that keeps reaching out after the policy was
+    turned on — and it was reproduced here immediately, in code written to fix
+    that very class.
+
+    Drives `_poll` directly with the flag already set, so it must refuse before
+    its first `hf jobs status` spawn rather than after the whole window.
+    """
+    pytest = __import__("pytest")
+    hf_jobs = pytest.importorskip(
+        "app.tools.simulation.mace.backends.hf_jobs",
+        reason="MACE deps (ulid) live in the PRISM venv, not the bare interpreter",
+    )
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        hf_jobs.spawn, "run", lambda cmd, **kw: calls.append(cmd), raising=True
+    )
+    monkeypatch.setattr(hf_jobs.time, "sleep", lambda _s: None, raising=True)
+
+    # The loop must be bounded, or removing the guard does not FAIL this test —
+    # it HANGS it. `_poll`'s deadline is `timeout + 300s` (3900s for an unknown
+    # tool), so the first version of this test killed its mutant by timing out
+    # after five minutes. A hanging test is worse than a failing one. This clock
+    # allows exactly one iteration and then expires, so both directions finish
+    # immediately: with the guard, a RuntimeError; without it, one recorded
+    # spawn and a clean exit.
+    ticks = [0]
+
+    def _clock() -> float:
+        ticks[0] += 1
+        return 0.0 if ticks[0] <= 2 else 1e9
+
+    monkeypatch.setattr(hf_jobs.time, "time", _clock, raising=True)
+    monkeypatch.setenv("PRISM_OFFLINE", "1")
+
+    job = type("J", (), {"tool_name": "unknown_tool", "cache_key": "k"})()
+    with pytest.raises(RuntimeError) as excinfo:
+        hf_jobs.HfJobsBackend()._poll("job-123", job, None)
+
+    assert "offline mode" in str(excinfo.value)
+    assert calls == [], f"must refuse BEFORE spawning `hf`, but ran: {calls}"

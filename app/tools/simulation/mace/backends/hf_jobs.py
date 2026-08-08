@@ -226,6 +226,19 @@ class HfJobsBackend(Backend):
         steps_seen = 0
         deadline = time.time() + DEFAULT_TIMEOUTS_S.get(job.tool_name, 3600) + 300
         while time.time() < deadline:
+            # Re-checked EVERY iteration, not just once in `execute`.
+            #
+            # This window runs up to ~95 minutes for the longer tools, polling
+            # `hf jobs status` every few seconds. Checking only at entry is the
+            # exact defect fixed in `crates/node/src/daemon.rs` in this same
+            # change set — a long-lived loop that keeps reaching out after the
+            # policy was turned on — and it was reproduced here immediately.
+            if _offline():
+                raise RuntimeError(
+                    "offline mode: stopped polling Hugging Face Jobs — the job "
+                    f"{hf_job_id} is still running remotely and can be collected "
+                    "when the network policy is lifted"
+                )
             try:
                 r = spawn.run(
                     ["hf", "jobs", "status", hf_job_id],
