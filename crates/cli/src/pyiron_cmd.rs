@@ -89,9 +89,13 @@ pub fn status() -> Result<Option<String>> {
 /// `pip install` against PyPI, which a unit test must not do.
 fn pip_refusal(verb: &str) -> Result<()> {
     if prism_runtime::offline::enabled() {
+        // States the fact and the two ways out, without telling the reader to
+        // exit and run a command — `crates/server/tests/no_exit_to_cli.rs`
+        // enforces that repo-wide, and the first draft of this message
+        // ("Run `prism pyiron install` while online") violated it.
         anyhow::bail!(
-            "offline mode: `pip install` would fetch the pyiron stack from PyPI. \
-             Run `prism pyiron {verb}` while online, or pre-stage a wheelhouse."
+            "offline mode: the pyiron {verb} would fetch the science stack from \
+             PyPI. It needs either a network connection or a pre-staged wheelhouse."
         );
     }
     Ok(())

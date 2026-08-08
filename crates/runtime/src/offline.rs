@@ -9,9 +9,67 @@
 pub const ENV: &str = "PRISM_OFFLINE";
 
 /// Whether hard offline mode is enabled.
+///
+/// Exactly `1` (trimmed) enables it. `0`, empty and unset disable it. Anything
+/// else ALSO disables it — and says so on stderr, once per process.
+///
+/// That warning is the point. This is a security control that fails OPEN: a
+/// user who writes `PRISM_OFFLINE=true` believes the machine is sealed and it
+/// silently is not, with every one of the 51 guard sites waved through. The
+/// rule itself is deliberate and pinned by
+/// [`tests::only_a_trimmed_one_enables_offline`] — widening it to accept
+/// `true`/`yes`/`on` is the owner's call, not something to change quietly —
+/// so the unrecognised case is made loud instead of reinterpreted.
 #[must_use]
 pub fn enabled() -> bool {
-    std::env::var(ENV).is_ok_and(|value| value.trim() == "1")
+    let Ok(raw) = std::env::var(ENV) else {
+        return false;
+    };
+    match classify(raw.trim()) {
+        OfflineValue::On => true,
+        OfflineValue::Off => false,
+        OfflineValue::Unrecognised => {
+            warn_unrecognised(raw.trim());
+            false
+        }
+    }
+}
+
+/// How a `PRISM_OFFLINE` value reads.
+///
+/// Split out from [`enabled`] so the UNRECOGNISED case is testable. A test that
+/// only asserted the returned bool would pass against a version that dropped
+/// the warning entirely — the bool is identical either way, and silence is the
+/// failure being guarded against.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OfflineValue {
+    On,
+    Off,
+    /// Not a value this contract defines. Treated as off, and reported.
+    Unrecognised,
+}
+
+pub(crate) fn classify(trimmed: &str) -> OfflineValue {
+    match trimmed {
+        "1" => OfflineValue::On,
+        "0" | "" => OfflineValue::Off,
+        _ => OfflineValue::Unrecognised,
+    }
+}
+
+/// One warning per process, on stderr.
+///
+/// stderr, never stdout: `prism status` and the `--json` paths emit machine-read
+/// JSON on stdout, and a warning there would corrupt it. Once, because
+/// `enabled()` is called on every guarded operation.
+fn warn_unrecognised(value: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "warning: {ENV}={value:?} is not recognised — hard offline mode is OFF. \
+             Only \"1\" enables it. Set {ENV}=1 if you meant to block outbound network."
+        );
+    });
 }
 
 /// Return whether `raw_url` explicitly targets loopback.
@@ -244,6 +302,51 @@ mod tests {
         }
         unsafe { std::env::remove_var(ENV) };
         assert!(!enabled(), "unset is not offline");
+    }
+
+    /// An unrecognised value must not be silently trusted as "offline".
+    ///
+    /// `enabled()` fails OPEN by design, so the dangerous case is a user who
+    /// wrote something plausible — `true`, `yes`, `on`, a typo — and believes
+    /// the machine is sealed. The boolean stays false (that rule is pinned
+    /// above and is the owner's to widen); what this asserts is that the
+    /// process SAYS so rather than proceeding quietly.
+    ///
+    /// Asserted on the warn helper, not on captured stderr: `eprintln!` cannot
+    /// be intercepted portably, and the helper is the whole behaviour.
+    #[test]
+    fn an_unrecognised_value_warns_exactly_once_and_stays_off() {
+        let _guard = test_support::env_lock();
+        let _restore = test_support::OfflineEnvGuard::capture();
+
+        for value in ["true", "yes", "on", "TRUE", "2", "off", "no"] {
+            unsafe { std::env::set_var(ENV, value) };
+            assert!(
+                !enabled(),
+                "PRISM_OFFLINE={value:?} must not enable offline mode"
+            );
+            // The bool alone would pass against a version that dropped the
+            // warning — identical either way. Assert the CLASSIFICATION, which
+            // is what decides whether the user is told.
+            assert_eq!(
+                classify(value),
+                OfflineValue::Unrecognised,
+                "PRISM_OFFLINE={value:?} must be reported, not silently ignored"
+            );
+        }
+
+        // The recognised values must NOT warn — a warning on every `0` would
+        // train users to ignore it, which is how a fail-open control stays
+        // invisible.
+        for (value, expected) in [("1", true), ("0", false), ("", false), (" 1 ", true)] {
+            unsafe { std::env::set_var(ENV, value) };
+            assert_eq!(enabled(), expected, "PRISM_OFFLINE={value:?}");
+            assert_ne!(
+                classify(value.trim()),
+                OfflineValue::Unrecognised,
+                "PRISM_OFFLINE={value:?} is a defined value and must NOT warn"
+            );
+        }
     }
 
     /// A bare `host:port` with no scheme must still resolve, and must not
