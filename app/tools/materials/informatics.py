@@ -266,9 +266,12 @@ def _predict_property_tool() -> Tool:
                 "default": "random_forest",
                 "description": (
                     "sklearn regressor family fitted on the pulled MP rows "
-                    "(default 'random_forest'). random_forest is the path the "
-                    "reported per-prediction uncertainty comes from — it is the "
-                    "standard deviation across the fitted trees."
+                    "(default 'random_forest'). Only random_forest reports a "
+                    "per-prediction uncertainty — the standard deviation across "
+                    "its independently fitted trees. gradient_boosting returns "
+                    "predictions with uncertainty null: its trees are sequential "
+                    "residual fitters, so their spread is not an uncertainty. "
+                    "Use random_forest unless you specifically want a boosted fit."
                 ),
             },
         },
@@ -340,9 +343,26 @@ def _predict_property_tool() -> Tool:
                 continue
             x = np.array(feats).reshape(1, -1)
             pred = float(model.predict(x)[0])
-            # Uncertainty: std across trees (RandomForest) or repeat-prediction.
+            # Uncertainty: spread across the ensemble's independent fits.
+            #
+            # Gated on the ensemble KIND, not on `hasattr(estimators_)`, which
+            # both regressors have. The schema offers `gradient_boosting`, and
+            # picking it used to crash the whole call: its `estimators_` is a
+            # 2-D ndarray, so iterating yields sub-arrays and `t.predict` raises
+            # AttributeError. `Tool.execute` caught that generically, so the
+            # agent got `{"error": "AttributeError: ..."}` and ZERO predictions
+            # from a documented enum value — a total, opaque failure that reads
+            # like a PRISM bug.
+            #
+            # Flattening it would make the call succeed and the number wrong:
+            # boosting trees are sequential residual fitters, not independent
+            # estimates, so their spread is not an uncertainty. Boosting
+            # therefore returns predictions with `uncertainty: null`, which the
+            # response already models.
             unc = None
-            if hasattr(model, "estimators_"):
+            from sklearn.ensemble import RandomForestRegressor
+
+            if isinstance(model, RandomForestRegressor):
                 tree_preds = [float(t.predict(x)[0]) for t in model.estimators_]
                 unc = float(np.std(tree_preds))
             predictions.append({

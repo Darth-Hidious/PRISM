@@ -202,3 +202,42 @@ class TestPredictStructureTool:
                 f"tool (source_detail={tool.source_detail!r}) — the collapsed "
                 "pre-1.0 tool may have been resurrected"
             )
+
+
+def test_gradient_boosting_predicts_without_crashing_and_reports_no_uncertainty():
+    """`gradient_boosting` is in the tool's enum; picking it used to crash the call.
+
+    `hasattr(model, "estimators_")` is true for BOTH regressors, but
+    GradientBoostingRegressor's is a 2-D ndarray — iterating it yields
+    sub-arrays, so `t.predict(x)` raised AttributeError. `Tool.execute` caught
+    that generically, so an agent choosing a documented enum value got
+    `{"error": "AttributeError: ..."}` and zero predictions.
+
+    Flattening would have made it "work" and the number wrong: boosting trees
+    are sequential residual fitters, so their spread is not an uncertainty.
+    Predictions, `uncertainty is None`, is the honest result.
+
+    Asserted at the sklearn level the handler uses, so the test needs no MP
+    network pull.
+    """
+    import numpy as np
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+
+    X = np.random.RandomState(0).rand(24, 3)
+    y = np.random.RandomState(1).rand(24)
+    x = X[:1]
+
+    rf = RandomForestRegressor(n_estimators=4, random_state=0).fit(X, y)
+    gb = GradientBoostingRegressor(n_estimators=4, random_state=0).fit(X, y)
+
+    # The trap: the attribute exists on both, so `hasattr` cannot discriminate.
+    assert hasattr(rf, "estimators_") and hasattr(gb, "estimators_")
+
+    # The handler's rule — gate on the ensemble KIND.
+    for model, expects_uncertainty in ((rf, True), (gb, False)):
+        unc = None
+        if isinstance(model, RandomForestRegressor):
+            unc = float(np.std([float(t.predict(x)[0]) for t in model.estimators_]))
+        assert (unc is not None) is expects_uncertainty, type(model).__name__
+        # Whichever branch, a prediction is always produced.
+        assert isinstance(float(model.predict(x)[0]), float)
