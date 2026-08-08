@@ -323,6 +323,39 @@ pub struct LlmClient {
 /// `providers.toml`, `prism use local --url`, a `~/.prism/providers.toml`
 /// gateway override — already said where the API lives, and a client that
 /// edits that string can only be wrong in ways they cannot correct.
+/// A hint for a 404 on the chat-completions URL, or nothing.
+///
+/// `chat_completions_url` takes a base URL at face value and appends only
+/// `/chat/completions` — deliberately, see its doc comment: synthesising `/v1`
+/// broke every vendor not mounted there. The cost of that correctness is that
+/// a base URL missing its own `/v1` now 404s, and the raw upstream body for
+/// that is Ollama's `404 page not found`, which names nothing.
+///
+/// Ollama is the commonest local setup and serves `/v1/chat/completions`, so
+/// `--llm-url http://127.0.0.1:11434` fails and `.../v1` works. Measured
+/// against a live daemon: `/v1/chat/completions` -> 400 (reached, bad body),
+/// `/chat/completions` -> 404.
+///
+/// Only fires on 404, and only when the URL does not already carry a version
+/// segment — so it cannot mislead someone whose base is correct and whose 404
+/// is a wrong model or a dead route.
+fn base_url_hint(url: &str, status: reqwest::StatusCode) -> String {
+    if status != reqwest::StatusCode::NOT_FOUND {
+        return String::new();
+    }
+    let base = url.trim_end_matches("/chat/completions");
+    if base.contains("/v1") || base.contains("/v1beta") || base.contains("/v4") {
+        return String::new();
+    }
+    format!(
+        "\n  hint: {base} has no API version segment. Most OpenAI-compatible \
+         servers — Ollama and llama.cpp included — mount at `/v1`, so the base \
+         URL is usually `{base}/v1`. PRISM appends only `/chat/completions` and \
+         never guesses a version, because vendors mount it at `/v1beta/openai` \
+         and `/api/paas/v4` too."
+    )
+}
+
 pub fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
@@ -1472,7 +1505,12 @@ impl LlmClient {
                 let status = resp.status();
                 let http = retry::HttpStatus::from_response(&resp);
                 let text = resp.text().await.unwrap_or_default();
-                return Err(http).with_context(|| format!("LLM returned HTTP {status}: {text}"));
+                return Err(http).with_context(|| {
+                    format!(
+                        "LLM returned HTTP {status}: {text}{}",
+                        base_url_hint(url, status)
+                    )
+                });
             }
             Ok(resp)
         })
@@ -3577,6 +3615,54 @@ mod tests {
     /// merely the refusal: inside the closure, a refused connection to
     /// `0.0.0.0:1` is retryable even when billable, so the failure would come
     /// back only after the shared backoff's first 250 ms sleep.
+    /// A 404 on a version-less base URL says what is almost certainly wrong.
+    ///
+    /// `chat_completions_url` never synthesises `/v1` — correct, and the reason
+    /// is documented on it. The cost is that pointing at Ollama's bare base
+    /// (`http://127.0.0.1:11434`, the commonest local setup) 404s with the
+    /// upstream body `404 page not found`, which names nothing. Measured
+    /// against a live daemon: `/v1/chat/completions` -> 400, `/chat/completions`
+    /// -> 404.
+    ///
+    /// The hint must NOT fire when the base already carries a version, or it
+    /// would send someone with a correct URL chasing the wrong thing — their
+    /// 404 is a bad model or a dead route.
+    #[test]
+    fn a_versionless_404_hints_at_the_missing_v1_and_a_versioned_one_does_not() {
+        use reqwest::StatusCode;
+
+        let bare = base_url_hint(
+            "http://127.0.0.1:11434/chat/completions",
+            StatusCode::NOT_FOUND,
+        );
+        assert!(bare.contains("/v1"), "{bare}");
+        assert!(bare.contains("127.0.0.1:11434"), "{bare}");
+
+        // Already versioned: silent, for each shape the doc comment names.
+        for versioned in [
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "https://api.z.ai/api/paas/v4/chat/completions",
+        ] {
+            assert!(
+                base_url_hint(versioned, StatusCode::NOT_FOUND).is_empty(),
+                "must not hint for {versioned}"
+            );
+        }
+
+        // Only 404. A 401/429/500 on a version-less base is not this problem.
+        for other in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                base_url_hint("http://127.0.0.1:11434/chat/completions", other).is_empty(),
+                "must not hint for {other}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn send_retrying_refuses_before_the_retry_closure() {
