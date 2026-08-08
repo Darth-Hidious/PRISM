@@ -76,6 +76,29 @@ const GUARD_MARKERS: &[&str] = &["offline::enabled", "offline::check_url"];
 /// silent pass.
 const ALLOWED_UNGUARDED: &[(&str, &str)] = &[];
 
+/// Every file known to invoke a network tool, pinned by path.
+///
+/// The per-marker staleness check is not sufficient on its own. Most markers
+/// match two or more files, so a file can leave the scan entirely — refactor
+/// `Command::new("gh")` to `Command::new(gh_binary())`, which the docstring
+/// above admits is already the shape `docker`/`podman` and the pyiron
+/// interpreter use — while another file keeps that marker alive. Drop the
+/// guard in the same change and nothing fails.
+///
+/// Pinning the file list closes that: a file that stops matching any marker
+/// fails here and forces the question "did the spawn move, or did the marker
+/// stop seeing it?" to be answered in review rather than by silence.
+const EXPECTED_SPAWNERS: &[&str] = &[
+    "agent/src/protocol.rs",
+    "cli/src/main.rs",
+    "cli/src/pyiron_cmd.rs",
+    "compute/src/byoc.rs",
+    "compute/src/local.rs",
+    "node/src/executor.rs",
+    "node/src/runtime_service.rs",
+    "python-bridge/src/venv.rs",
+];
+
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -117,6 +140,7 @@ fn every_file_that_spawns_a_network_tool_consults_the_offline_policy() {
 
     let markers = network_tool_markers();
     let mut spawning_files = 0usize;
+    let mut matched_files: Vec<String> = Vec::new();
     let mut active_hits = vec![0usize; ACTIVE_MARKERS.len()];
     let mut violations: Vec<String> = Vec::new();
 
@@ -148,8 +172,18 @@ fn every_file_that_spawns_a_network_tool_consults_the_offline_policy() {
             continue;
         };
         spawning_files += 1;
+        matched_files.push(rel.clone());
 
-        if GUARD_MARKERS.iter().any(|g| body.contains(g)) {
+        // Comment-excluded, exactly like the spawn check above. It was
+        // `body.contains(g)` on the RAW text, so a file with a genuinely
+        // unguarded spawn plus any comment mentioning `offline::enabled` —
+        // `// TODO: call offline::enabled here` — counted as guarded and was
+        // skipped. Verified by mutation: byoc.rs with every real guard removed
+        // and one such comment left behind passed this test.
+        let guarded = body
+            .lines()
+            .any(|line| !is_comment(line) && GUARD_MARKERS.iter().any(|g| line.contains(g)));
+        if guarded {
             continue;
         }
         if ALLOWED_UNGUARDED.iter().any(|(f, _)| rel.contains(f)) {
@@ -176,9 +210,23 @@ fn every_file_that_spawns_a_network_tool_consults_the_offline_policy() {
          enforcing them: {stale:?}. Either the last use was removed (delete the \
          marker deliberately, or move it to FORWARD_MARKERS) or it drifted."
     );
+    let vanished: Vec<&str> = EXPECTED_SPAWNERS
+        .iter()
+        .filter(|expected| !matched_files.iter().any(|m| m.contains(*expected)))
+        .copied()
+        .collect();
     assert!(
-        spawning_files >= 8,
-        "only {spawning_files} files matched a network-tool marker; there were 8."
+        vanished.is_empty(),
+        "these files are known to spawn a network tool but no longer match any \
+         marker, so they silently left this test's scope: {vanished:?}. Either the \
+         spawn moved (update EXPECTED_SPAWNERS) or it is now invoked through a \
+         variable and needs a new marker."
+    );
+    assert!(
+        spawning_files >= EXPECTED_SPAWNERS.len(),
+        "only {spawning_files} files matched a network-tool marker; expected at \
+         least {}.",
+        EXPECTED_SPAWNERS.len()
     );
 
     assert!(
