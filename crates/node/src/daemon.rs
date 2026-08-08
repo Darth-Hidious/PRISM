@@ -269,6 +269,28 @@ pub async fn run_daemon(
     let mut delay_secs: u64 = 1;
 
     loop {
+        // Re-checked EVERY iteration, not just once above.
+        //
+        // `options.offline` is captured when the daemon launches. This is a
+        // long-lived process — it reconnects on every ordinary WebSocket drop,
+        // with backoff up to 300s — so a daemon started online keeps
+        // reconnecting after `PRISM_OFFLINE=1` is set in its environment, and
+        // `connect_and_run` puts the node access token in the WS URL.
+        //
+        // Every other guard in the workspace re-reads the variable per call
+        // (`PlatformClient::offline_guard`, the Python `_platform_client`), so
+        // a user who sets it on a running daemon has every reason to expect it
+        // to take effect. Parks the same way the startup check does rather than
+        // exiting, so the caller's mesh/Kafka shutdown still fires on signal.
+        if prism_runtime::offline::enabled() {
+            tracing::info!(
+                "PRISM_OFFLINE set while running — stopping platform reconnects, \
+                 local surfaces keep running"
+            );
+            let _ = tokio::signal::ctrl_c().await;
+            return Ok(());
+        }
+
         let token = load_access_token(paths, endpoints).await?;
 
         match connect_and_run(

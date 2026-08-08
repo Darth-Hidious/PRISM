@@ -64,3 +64,66 @@ def test_every_python_entry_point_installs_the_network_guard() -> None:
             f"app/{name} builds the tool registry but never installs the offline "
             "network guard — PRISM_OFFLINE=1 would not be enforced in that process"
         )
+
+
+def test_external_mcp_is_refused_offline_at_both_registration_and_call(monkeypatch) -> None:
+    """The Python MCP client had no offline check; its Rust sibling has one.
+
+    Guarded in TWO places on purpose. Discovery runs once at boot, but the
+    handlers it registers live for the whole session — gating only registration
+    would leave every already-registered server reachable after PRISM_OFFLINE=1
+    is set on a running process.
+
+    The process-wide socket patch is not cover here either: a stdio-transport
+    server spawns an arbitrary command from ~/.prism/mcp_servers.json as a CHILD
+    process, which does its own networking outside the parent's monkeypatch.
+    """
+    import asyncio
+
+    from app import mcp_client
+    from app.tools.base import ToolRegistry
+
+    # A structurally valid stdio server that does nothing. `call_mcp_tool`
+    # builds its `Client` OUTSIDE its try block, so an invalid config raises
+    # instead of returning an error dict — an empty `{}` here would fail for
+    # that reason rather than on policy, and prove nothing.
+    server = {"command": "true", "args": []}
+
+    monkeypatch.setenv("PRISM_OFFLINE", "1")
+    assert mcp_client.discover_and_register_mcp_tools(ToolRegistry()) == []
+    result = asyncio.run(mcp_client.call_mcp_tool("srv", server, "tool", {}))
+    assert "offline mode" in result.get("error", ""), result
+
+    # Inert when the policy is off, or the assertions above would pass against
+    # a client that refused unconditionally. The call still fails — `true`
+    # speaks no MCP — but it must fail as TRANSPORT, never as policy.
+    monkeypatch.setenv("PRISM_OFFLINE", "0")
+    result = asyncio.run(mcp_client.call_mcp_tool("srv", server, "tool", {}))
+    assert "offline mode" not in result.get("error", ""), result
+
+
+def test_hf_jobs_backend_refuses_offline_and_only_offline(monkeypatch) -> None:
+    """`hf jobs` reaches huggingface.co itself and is launched with --secrets HF_TOKEN.
+
+    Nothing chose this backend deliberately: `select_backend`'s "auto" heuristic
+    picks it whenever HF_TOKEN is in the environment and no project id is set.
+    """
+    pytest = __import__("pytest")
+    hf_jobs = pytest.importorskip(
+        "app.tools.simulation.mace.backends.hf_jobs",
+        reason="MACE deps (ulid) live in the PRISM venv, not the bare interpreter",
+    )
+
+    monkeypatch.setenv("PRISM_OFFLINE", "1")
+    assert hf_jobs._offline()
+    with pytest.raises(RuntimeError) as excinfo:
+        hf_jobs._refuse_if_offline("run a job on")
+    assert "offline mode" in str(excinfo.value)
+    assert "HF_TOKEN" in str(excinfo.value)
+
+    # Only "1" — same contract as the Rust side, where PRISM_OFFLINE=true reads
+    # as OFF and warns rather than silently sealing nothing.
+    for not_offline in ("0", "", "true", "yes"):
+        monkeypatch.setenv("PRISM_OFFLINE", not_offline)
+        assert not hf_jobs._offline(), not_offline
+        hf_jobs._refuse_if_offline("run a job on")
