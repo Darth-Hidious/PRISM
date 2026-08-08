@@ -34,12 +34,15 @@ def _describe_structure_tool() -> Tool:
             "Generate a human-readable description of a crystal structure "
             "(mineral name, dimensionality, structural features, coordination). "
             "The 'what is this structure in plain English?' answer. Uses "
-            "robocrystallographer (hackingmaterials.lbl.gov)."
+            "robocrystallographer (hackingmaterials.lbl.gov). Supply cif or "
+            "formula — at least one is mandatory, and only cif yields a full "
+            "description."
         ),
         "properties": {
-            "formula": {"type": "string", "description": "Formula (e.g. 'BaTiO3'). Looks up the structure from the federation if no CIF given."},
-            "cif": {"type": "string", "description": "Optional CIF text to describe directly."},
+            "formula": {"type": "string", "description": "Formula (e.g. 'BaTiO3'). Looks the material up in the OPTIMADE federation; because those hits carry no site coordinates, a formula alone yields a note asking for a CIF, not a description."},
+            "cif": {"type": "string", "description": "CIF text to describe directly. This is the only input that actually produces a robocrystallographer description."},
         },
+        "required": [],
         "additionalProperties": False,
     }
 
@@ -97,7 +100,15 @@ def _describe_structure_tool() -> Tool:
 
     return Tool(
         name="describe_structure",
-        description="Human-readable crystal-structure description (robocrystallographer).",
+        description=(
+            "Describe a crystal structure in plain English — mineral name, "
+            "dimensionality, coordination environments, structural motifs. "
+            "Returns robocrystallographer prose for a CIF you supply; given only "
+            "a formula it looks the material up in the OPTIMADE federation and, "
+            "because those hits carry no site coordinates, returns a note asking "
+            "for a CIF instead of a description. Needs the robocrystallographer "
+            "package, which has no Python 3.14 wheel."
+        ),
         input_schema=schema, func=_run, requires_approval=False,
         source="builtin", source_detail="materials.structure_desc",
     )
@@ -115,8 +126,9 @@ def _predict_synthesizability_tool() -> Tool:
             "the reasoning is auditable. Clearly labeled 'heuristic'."
         ),
         "properties": {
-            "formula": {"type": "string", "description": "Formula (e.g. 'YBa2Cu3O7')."},
+            "formula": {"type": "string", "description": "Formula to score (e.g. 'YBa2Cu3O7'). Looked up in Materials Project via the platform proxy for its hull distance; if MP has no entry the hull factor is simply absent from the returned factor list."},
         },
+        "required": ["formula"],
         "additionalProperties": False,
     }
 

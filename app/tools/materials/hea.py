@@ -496,7 +496,8 @@ _HEA_SCHEMA: dict = {
         "Hume-Rothery-style first-pass screen — NOT phase equilibria: no "
         "phase fractions, no temperature dependence, no Gibbs energies "
         "(that is what CALPHAD databases like Thermo-Calc TCHEA compute). "
-        "Pure math from open literature parameters."
+        "Pure math from open literature parameters. Supply composition or "
+        "fractions — one of the two is mandatory, and either alone is enough."
     ),
     "properties": {
         "composition": {
@@ -529,6 +530,7 @@ _HEA_SCHEMA: dict = {
             ),
         },
     },
+    "required": [],
     "additionalProperties": False,
 }
 

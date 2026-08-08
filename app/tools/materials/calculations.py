@@ -212,6 +212,7 @@ _HEA_PS_SCHEMA: dict = {
             ),
         },
     },
+    "required": ["composition"],
     "additionalProperties": False,
 }
 
@@ -317,10 +318,14 @@ def _hea_phase_stability_tool() -> Tool:
     return Tool(
         name="hea_phase_stability",
         description=(
-            "CALPHAD equilibrium phase stability (phase fractions vs temperature) "
-            "via pycalphad + the bundled open MatCalc mc_fe DILUTE-STEEL TDB. "
-            "Steel scope only — refuses compositions outside the DB's assessed "
-            "window (equimolar HEAs are out of scope; not a TCHEA substitute)."
+            "Compute CALPHAD equilibrium phase stability with pycalphad + the "
+            "bundled open MatCalc mc_fe DILUTE-STEEL TDB. Returns one row per "
+            "temperature listing the stable phases and their fractions. STEEL "
+            "SCOPE ONLY: Fe-base compositions inside the DB's assessed window; "
+            "out-of-window inputs (equimolar HEAs, non-Fe alloys, T outside "
+            "673-2000 K) are refused, never extrapolated. Despite the name this "
+            "is not an HEA database and not a Thermo-Calc TCHEA substitute — for "
+            "HEAs use hea_descriptors or phase_stability."
         ),
         input_schema=_HEA_PS_SCHEMA,
         func=_run,
@@ -367,9 +372,14 @@ _SCHEIL_SCHEMA: dict = {
         },
         "step_temperature": {
             "type": "number",
-            "description": "Temperature step for the Scheil simulation in K (default 10).",
+            "description": (
+                "Temperature decrement between Scheil steps, in K (default 10). "
+                "Smaller steps resolve the solidification path and the terminal "
+                "solidus more finely at proportionally more equilibrium solves."
+            ),
         },
     },
+    "required": ["composition"],
     "additionalProperties": False,
 }
 
@@ -446,10 +456,14 @@ def _scheil_solidification_tool() -> Tool:
     return Tool(
         name="scheil_solidification",
         description=(
-            "Gulliver-Scheil non-equilibrium solidification simulation for "
-            "STEEL compositions: solidification path, solidus/liquidus, "
-            "microsegregation. Open scheil package + pycalphad + bundled "
-            "dilute-steel TDB; refuses out-of-window compositions."
+            "Simulate Gulliver-Scheil non-equilibrium solidification of a STEEL "
+            "composition and return the solidification path: solid fraction vs "
+            "temperature, plus solidus and liquidus. Use it for as-cast "
+            "microsegregation questions where equilibrium (hea_phase_stability) "
+            "is the wrong assumption — Scheil assumes perfect liquid mixing and "
+            "no solid-state diffusion. Open scheil package + pycalphad + the "
+            "bundled dilute-steel TDB; compositions outside that database's "
+            "assessed window are refused, not extrapolated."
         ),
         input_schema=_SCHEIL_SCHEMA,
         func=_run,

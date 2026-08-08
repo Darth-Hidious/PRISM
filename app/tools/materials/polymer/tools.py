@@ -303,7 +303,17 @@ def create_polymer_tools(registry: ToolRegistry) -> None:
                             "monomer, or smiles"
                         ),
                     },
-                    "tier": {"type": "integer", "enum": [0], "default": 0},
+                    "tier": {
+                        "type": "integer",
+                        "enum": [0],
+                        "default": 0,
+                        "description": (
+                            "Evaluator fidelity tier. Only tier 0 exists (RDKit "
+                            "identity validation, Fox-Flory Tg, rotatable-bond "
+                            "fraction); any other value is rejected outright "
+                            "rather than silently downgraded."
+                        ),
+                    },
                 },
                 "required": ["candidate_identity"],
                 "additionalProperties": False,

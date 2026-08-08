@@ -42,7 +42,9 @@ _PHASE_SCHEMA: dict = {
         "no local MP_API_KEY needed. This is 0 K DFT convex-hull screening, "
         "NOT CALPHAD phase equilibria (no temperature dependence or phase "
         "fractions). Use after screening to gate candidates: on-hull or "
-        "near-hull (< 0.05 eV/atom) materials are likely synthesizable."
+        "near-hull (< 0.05 eV/atom) materials are likely synthesizable. "
+        "Supply formula or material_id — one of the two is mandatory, and "
+        "either alone is enough."
     ),
     "properties": {
         "formula": {
@@ -54,6 +56,7 @@ _PHASE_SCHEMA: dict = {
             "description": "Optional MP material_id (e.g. 'mp-19770') for a direct lookup.",
         },
     },
+    "required": [],
     "additionalProperties": False,
 }
 

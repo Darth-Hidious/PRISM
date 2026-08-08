@@ -1000,7 +1000,8 @@ _EVAL_SCHEMA: dict = {
         "phase equilibria; tier 3 = Quantum ESPRESSO pw.x. Tiers run "
         "cheap-first in order and stop escalating when a gate fails or a "
         "tier is unavailable. Every property block names the tier and "
-        "method that produced it."
+        "method that produced it. Supply composition or fractions — one of "
+        "the two is mandatory, and either alone is enough."
     ),
     "properties": {
         "composition": {
@@ -1060,6 +1061,7 @@ _EVAL_SCHEMA: dict = {
             "description": "pw.x calculation type (scf|relax|vc-relax). Default vc-relax.",
         },
     },
+    "required": [],
     "additionalProperties": False,
 }
 
@@ -1089,9 +1091,11 @@ def create_evaluation_tools(registry: ToolRegistry) -> None:
             "Evaluate a candidate material at a requested fidelity tier on "
             "the tiered ladder: 0 empirical screen (Yang/Guo-Liu), 1 MACE "
             "MLIP relaxation, 2 CALPHAD phase equilibria, 3 Quantum "
-            "ESPRESSO pw.x. Cheap-first escalation; every property carries "
-            "the tier + method provenance that produced it; unavailable "
-            "tiers report honestly with no fabricated numbers."
+            "ESPRESSO pw.x. Cheap-first escalation. Returns one result block "
+            "per tier attempted, each property carrying the tier + method "
+            "provenance that produced it; unavailable tiers say so with an "
+            "install hint and no fabricated numbers. Call evaluation_tier_"
+            "status first to see which tiers this machine can actually run."
         ),
         input_schema=_EVAL_SCHEMA,
         func=_evaluate_candidate_tool,
@@ -1112,9 +1116,11 @@ def create_evaluation_tools(registry: ToolRegistry) -> None:
     registry.register(Tool(
         name="evaluation_tier_status",
         description=(
-            "Report which evaluation tiers are available on this machine "
-            "(dependencies present? pw.x installed? covering TDB?) with "
-            "install hints for the missing ones."
+            "Check which evaluation tiers this machine can actually run "
+            "(MACE importable? pycalphad plus a covering TDB? pw.x on PATH?). "
+            "Returns one availability block per tier 0-3 with the reason and "
+            "an install hint for each missing one. Takes no arguments; call it "
+            "before asking evaluate_candidate for tier 1 or higher."
         ),
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         func=_tier_status_tool,
