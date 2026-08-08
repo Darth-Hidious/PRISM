@@ -189,6 +189,24 @@ pub fn start_mesh(
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // ── Offline gate: hard offline means do not join a network ──
+        //
+        // `enabled()`, not `check_url`: there is no URL here. mDNS announce is
+        // link-local multicast, so it never leaves the LAN — but it does
+        // broadcast this node's name, capabilities and auth-token hash to every
+        // device on it, and `discover` then pulls peers in. An operator who set
+        // PRISM_OFFLINE did not ask for "remote hosts only"; they asked not to
+        // participate in a network.
+        //
+        // This is the SECOND thing in this crate that 9926eac0's claim ("those
+        // are the only two outbound sends") missed. mDNS is multicast UDP and
+        // Kafka is a TCP client — neither appears in a `reqwest` grep, which is
+        // exactly how the claim came to be wrong.
+        if prism_runtime::offline::enabled() {
+            tracing::info!("mesh disabled: offline mode");
+            return;
+        }
+
         // ── RBAC gate: refuse to start mesh without auth ──────────
         // The mesh is a trusted network. You cannot join without
         // proving your identity via `prism login`. The auth_token
@@ -330,6 +348,64 @@ mod tests {
             authenticated: true,
             auth_hash: None,
         }
+    }
+
+    /// Hard offline must stop the mesh task before it creates an mDNS daemon.
+    ///
+    /// mDNS announce is link-local multicast — it never leaves the LAN, but it
+    /// does broadcast this node's name, capabilities and auth-token hash to
+    /// every device on it, and `discover` then pulls peers in. An operator who
+    /// set PRISM_OFFLINE asked not to participate in a network, not "remote
+    /// hosts only".
+    ///
+    /// The task returns immediately rather than looping on the discovery
+    /// interval, so a fast join is the observable.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn start_mesh_does_not_join_a_network_offline() {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        struct OfflineGuard(Option<String>);
+        impl Drop for OfflineGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(prism_runtime::offline::ENV, v),
+                        None => std::env::remove_var(prism_runtime::offline::ENV),
+                    }
+                }
+            }
+        }
+        let _restore = OfflineGuard(std::env::var(prism_runtime::offline::ENV).ok());
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let handle = init_mesh(test_config()).unwrap();
+        let opts = MeshStartOptions {
+            node_name: "offline-test".into(),
+            publish_port: 9100,
+            broadcast: true,
+            capabilities: vec!["compute".into()],
+            // An hour: if the task ever reached the discovery loop it would
+            // block well past the timeout below rather than returning.
+            discovery_interval_secs: 3600,
+            event_tx: None,
+            // Authenticated, so the RBAC gate cannot be what stops it —
+            // otherwise this test would pass for the wrong reason.
+            auth_token: Some("test-token".into()),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = start_mesh(handle, opts, cancel.clone());
+
+        // Returns on its own; no cancel needed.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        assert!(
+            joined.is_ok(),
+            "mesh task kept running offline — it joined the network"
+        );
     }
 
     #[test]

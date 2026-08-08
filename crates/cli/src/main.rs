@@ -3201,13 +3201,29 @@ async fn main() -> Result<()> {
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
                 let mesh_cancel = tokio_util::sync::CancellationToken::new();
                 // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
-                let resolved_kafka_brokers = kafka_brokers.clone().or_else(|| {
-                    if with_kafka {
-                        Some("127.0.0.1:9092".to_string())
-                    } else {
-                        None
+                // Kafka is a TCP client, started SEPARATELY from `start_mesh`
+                // (below, ~:3251), so gating the mesh task does not cover it —
+                // and it never appears in a `reqwest` grep, which is how it was
+                // missed. Resolving to None under hard offline disables the
+                // whole block at its source rather than at each use.
+                //
+                // `check_url` is not usable here: brokers are `host:port` with
+                // no scheme, and a broker list can name several. `enabled()` is
+                // the right primitive for a policy decision with no single URL.
+                let resolved_kafka_brokers = if prism_runtime::offline::enabled() {
+                    if kafka_brokers.is_some() || with_kafka {
+                        eprintln!("  ⚠ Kafka mesh transport disabled: offline mode.");
                     }
-                });
+                    None
+                } else {
+                    kafka_brokers.clone().or_else(|| {
+                        if with_kafka {
+                            Some("127.0.0.1:9092".to_string())
+                        } else {
+                            None
+                        }
+                    })
+                };
 
                 let mesh_config = prism_mesh::MeshConfig {
                     node_name: daemon_options.name.clone(),
