@@ -3319,8 +3319,18 @@ async fn main() -> Result<()> {
                             println!("  \u{2713} Kafka: pub/sub active ({brokers})");
                         }
                         Err(e) => {
+                            // Name what actually stops working. `run_sync_handler`
+                            // is spawned only in the branch above and drains a
+                            // channel only the Kafka consumer feeds, and there is
+                            // no `mesh sync` subcommand — so without Kafka the
+                            // mesh discovers peers it can never pull data from.
+                            // The old wording ("Mesh will work via mDNS only")
+                            // read as a working degraded mode.
                             eprintln!("  Warning: Kafka consumer failed to start: {e}");
-                            eprintln!("  (Mesh will work via mDNS only, without Kafka pub/sub.)");
+                            eprintln!(
+                                "  Peer discovery (mDNS) still works, but NO peer data will sync: \
+                                 dataset sync is driven by Kafka messages and has no other trigger."
+                            );
                         }
                     }
 
