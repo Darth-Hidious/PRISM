@@ -345,9 +345,13 @@ mod tests {
     /// Asserts what the child actually SEES, by having it print the variable.
     #[test]
     fn the_env_scrub_passes_offline_through_but_still_hides_secrets() {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
+        // The crate's SHARED lock, declared 26 lines above this module and
+        // already used by skills.rs, protocol.rs and meta_tools.rs. My first
+        // version declared a private one right below it — two locks that do
+        // not exclude each other serialize nothing. `test_env_guard` is the
+        // richer helper (it also points PRISM_SKILLS_DIR at a temp dir); this
+        // test needs only the mutual exclusion.
+        let _guard = super::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
