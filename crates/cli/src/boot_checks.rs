@@ -508,10 +508,36 @@ async fn push_local_checks(client: &reqwest::Client, checks: &mut Vec<boot::Boot
         delay_ms: 20,
     });
 
+    // Actually construct the engine. This row used to be a hardcoded
+    // `ok: true, "OPA/Rego loaded"` that never called anything — a check in
+    // name only, sitting in the same list, same formatting and same confidence
+    // as "Local Node", which IS a live probe.
+    //
+    // It matters more than a cosmetic row. `with_discovery` compiles the
+    // built-in `default.rego` and then every `.rego` under `~/.prism/policies/`
+    // and `.prism/policies/`, any of which can fail to parse. When it does, the
+    // agent runs with `policy_engine == None` (`agent/src/service.rs:249`), and
+    // the tool-call gate at `agent/src/protocol.rs:1059` is
+    // `if let Some(pe) = policy_engine.as_mut()` — so a MISSING engine skips
+    // the gate entirely. That is fail-open: one malformed custom policy
+    // silently disables tool-call enforcement, while this row kept reporting
+    // "loaded" forever.
+    //
+    // `prism-policy` was already in this binary's dependency graph via
+    // prism-agent, so constructing it here costs a Rego compile, not a build.
+    let (policy_result, policy_ok) = match prism_policy::PolicyEngine::with_discovery(None) {
+        Ok(pe) => (format!("OPA/Rego, {} policies", pe.policy_count()), true),
+        // Names the failure. The agent degrades to no enforcement on this path,
+        // so a silent green here is the worst possible answer.
+        Err(error) => (
+            format!("failed to load — policies NOT enforced: {error}"),
+            false,
+        ),
+    };
     checks.push(boot::BootCheck {
         name: "Policy Engine".into(),
-        result: "OPA/Rego loaded".into(),
-        ok: true,
+        result: policy_result,
+        ok: policy_ok,
         dots: 4,
         delay_ms: 15,
     });

@@ -5254,8 +5254,26 @@ async fn handle_mesh_command(
             );
             tokio::time::sleep(Duration::from_secs(timeout)).await;
             let peers = probe.peers();
+
+            // Cancel and AWAIT — never `abort()` straight after `cancel()`.
+            //
+            // `start_mesh` promises a clean shutdown: on cancellation it breaks
+            // its select loop and calls `mdns.stop()`, which unregisters the
+            // service and shuts the mDNS daemon down. `abort()` drops the task
+            // future before the cancellation branch is ever polled, so that
+            // cleanup never runs — a reviewer measured 0 graceful shutdowns in
+            // 200 trials of this exact idiom.
+            //
+            // `mdns_sd::ServiceDaemon` has no `Drop` impl and owns an OS thread
+            // holding the bound UDP socket, which exits only on an explicit
+            // shutdown command. So aborting abandons a thread and a socket. In
+            // this one-shot CLI the process exits immediately and the OS
+            // reclaims both — but the idiom leaks once per call anywhere
+            // longer-lived, and it silently made the cleanup path dead code.
+            //
+            // Bounded, so a wedged daemon cannot hang the command.
             cancel.cancel();
-            task.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
             if peers.is_empty() {
                 println!("No peers found.");
             } else {
