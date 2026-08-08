@@ -17,46 +17,35 @@ pub fn enabled() -> bool {
 /// Return whether `raw_url` explicitly targets loopback.
 #[must_use]
 pub fn is_loopback_url(raw_url: &str) -> bool {
-    let authority = raw_url
-        .trim()
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(raw_url)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or_else(|| {
-            raw_url
-                .trim()
-                .split_once("://")
-                .map(|(_, rest)| rest)
-                .unwrap_or(raw_url)
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or_default()
-        });
-    let host = authority
-        .strip_prefix('[')
-        .and_then(|value| value.split(']').next())
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority))
-        .to_ascii_lowercase();
-
-    if host == "localhost" || host == "localhost.localdomain" {
-        return true;
-    }
-
-    // Everything else must be a real IP LITERAL that is itself loopback.
+    // Parse properly rather than pattern-match the string.
     //
-    // This was `host.starts_with("127.")`, which matched any DOMAIN beginning
-    // with those characters. `http://127.evil.example/` and
-    // `http://127.0.0.1.attacker.example/` both passed as "loopback" while
-    // resolving wherever their owner points them — so an attacker-controlled
-    // name defeated both `check_url`'s offline policy and every caller that
-    // treats loopback as "safe, stays on this machine".
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    // This was hand-rolled: split on "://", then on `['/','?','#']`, then
+    // `rsplit_once('@')`, then `host.starts_with("127.")`. That last clause
+    // matched any DOMAIN beginning with those characters, so
+    // `http://127.evil.example/` — a name anyone can register and point
+    // anywhere — read as loopback and defeated both the offline policy and the
+    // platform-credential guard that trusts it.
+    //
+    // `url::Host` distinguishes Domain from Ipv4/Ipv6 by construction, so a
+    // hostname can never be mistaken for an address. It also canonicalises the
+    // legacy inet_aton forms (`127.1`, `2130706433`, `0x7f000001`), which the
+    // interim `IpAddr::from_str` fix had to treat as non-loopback.
+    //
+    // A near-identical, correct implementation already existed one crate away
+    // in `prism-cli`'s `local_llm.rs` while the weaker one guarded the policy.
+    // That copy now calls this; there is one implementation.
+    match url::Url::parse(raw_url.trim()) {
+        Ok(parsed) => match parsed.host() {
+            Some(url::Host::Domain(domain)) => {
+                domain.eq_ignore_ascii_case("localhost")
+                    || domain.eq_ignore_ascii_case("localhost.localdomain")
+            }
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        Err(_) => false,
+    }
 }
 
 /// Reject a remote URL when hard offline mode is enabled.
@@ -119,19 +108,19 @@ mod tests {
         }
     }
 
-    /// Deliberately conservative, recorded so it is a decision rather than a
-    /// surprise: Rust's `IpAddr` parser rejects the legacy abbreviated
-    /// inet_aton forms that curl and browsers accept, so `127.1` and
-    /// `0x7f000001` read as NON-loopback. That errs toward withholding a
-    /// credential and refusing a request under offline mode — the safe
-    /// direction. Widening it means hand-rolling inet_aton, which is how the
-    /// original `starts_with("127.")` shortcut got written in the first place.
+    /// The legacy inet_aton spellings ARE loopback, and are now recognised.
+    ///
+    /// This test previously asserted the opposite. That was not a policy
+    /// choice, it was a limitation of the interim `IpAddr::from_str` fix,
+    /// which rejects the abbreviated forms that curl and browsers accept —
+    /// so `127.1` read as a remote host. Parsing with `url` canonicalises
+    /// them properly, and the limitation is gone rather than papered over.
     #[test]
-    fn abbreviated_ipv4_forms_are_treated_as_non_loopback() {
+    fn abbreviated_ipv4_forms_are_recognised_as_loopback() {
         for abbreviated in ["http://127.1", "http://0x7f000001/", "http://2130706433/"] {
             assert!(
-                !is_loopback_url(abbreviated),
-                "{abbreviated} — conservative by design; see the doc comment"
+                is_loopback_url(abbreviated),
+                "{abbreviated} canonicalises to 127.0.0.1"
             );
         }
     }

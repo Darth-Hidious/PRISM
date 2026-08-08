@@ -9525,7 +9525,23 @@ async fn create_dashboard_session_for_user_with_platform_token(
     let platform_token = platform_token_for(dashboard_url, platform_token);
 
     let url = format!("{dashboard_url}/api/sessions");
-    let resp = reqwest::Client::new()
+    // Never follow a redirect on this call.
+    //
+    // `reqwest`'s default is `Policy::limited(10)`, and its cross-host
+    // scrubbing (`redirect.rs:244-247`) removes AUTHORIZATION / COOKIE /
+    // PROXY_AUTHORIZATION — HEADERS only. The platform token here is in the
+    // BODY, which that never touches, and on 307/308 the method and body are
+    // preserved and resent. Both guards above run on `dashboard_url`, the
+    // INITIAL url; a redirect target is never re-checked. So a process
+    // answering the loopback dashboard port could 307 the credential off-box.
+    //
+    // A session mint has no legitimate reason to be redirected, so refusing
+    // outright is both simpler and stricter than re-validating per hop.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build the dashboard HTTP client")?;
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({
             "user_id": user_id,
@@ -11812,6 +11828,12 @@ mod tests {
             "https://attacker.example/x",
             "http://203.0.113.9:7327",
             "http://10.0.0.4:7327",
+            // A DOMAIN that merely looks loopback. This is the exact bug shape
+            // 854a9345 fixed in offline::is_loopback_url, pinned HERE too so
+            // the guard is regression-proof at its point of use and not only
+            // by delegation.
+            "http://127.evil.example/",
+            "http://127.0.0.1.attacker.example/",
         ] {
             assert_eq!(
                 platform_token_for(off_box, Some("live-token")),
