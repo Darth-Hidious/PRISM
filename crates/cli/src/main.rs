@@ -1515,7 +1515,7 @@ fn preflight_command_auth(command: Option<&Commands>) -> Result<()> {
     if let Some(Commands::Node {
         command: NodeCommands::Up { offline, .. },
     }) = command
-        && !offline
+        && !(*offline || prism_runtime::offline::enabled())
     {
         // `node up` needs Python later, but missing auth must be reported
         // before venv provisioning can block or touch the network.
@@ -3187,7 +3187,13 @@ async fn main() -> Result<()> {
                     platform_node_id: daemon_platform_node_id,
                     rbac_db_path: daemon_rbac_db_path,
                     org_id: daemon_org_id,
-                    offline,
+                    // Merge the subcommand flag with the process-wide policy.
+                    // `--offline` on `node up` is its own arg (see NodeCommands::Up)
+                    // and was passed through raw, so `PRISM_OFFLINE=1 prism node up`
+                    // left this false: the daemon resolved a real credential and
+                    // opened `wss://…?token=<token>` (node/daemon.rs:525). Same
+                    // shape as main.rs:1640's `cli.offline || offline::enabled()`.
+                    offline: offline || prism_runtime::offline::enabled(),
                     tool_invoker: Some(tool_invoke_tx),
                     audit_emitter,
                 };

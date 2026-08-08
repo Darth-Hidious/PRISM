@@ -2010,6 +2010,20 @@ async fn refresh_token(
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
 ) -> Result<String> {
+    // Defence in depth. `run_daemon` returns at :263 before any credential is
+    // resolved when offline, so this is unreachable there — but this is a
+    // THIRD hand-rolled copy of the refresh call (the others are
+    // client/src/auth.rs and cli/src/main.rs:10790), it posts the refresh
+    // token, and it is reachable from any future caller that skips that early
+    // return. A duplicated wire call needs its own guard or the next caller
+    // inherits the hole.
+    if prism_runtime::offline::enabled() {
+        anyhow::bail!(
+            "offline mode: POST {}/auth/refresh blocked by --offline \
+             (remove the flag to reach the platform)",
+            endpoints.api_base
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -2153,6 +2167,54 @@ fn advertise_ssh_service(
 
 #[cfg(test)]
 mod tests {
+    /// `prism-node` is a shipped standalone binary whose `main()` hardcoded
+    /// `offline: false`, so `PRISM_OFFLINE=1 prism-node up` resolved a real
+    /// credential and opened `wss://…?token=<token>` (:525). The guard at
+    /// :263 was correct; nothing armed it.
+    ///
+    /// This pins the mechanism the fix relies on: the refresh call — a third
+    /// hand-rolled copy of the same wire request — refuses under offline
+    /// rather than posting the refresh token.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_token_is_refused_offline() {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+        fn env_lock() -> MutexGuard<'static, ()> {
+            static L: OnceLock<Mutex<()>> = OnceLock::new();
+            L.get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+        }
+        let _g = env_lock();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let creds = StoredCredentials {
+            refresh_token: "refresh-secret".to_string(),
+            ..Default::default()
+        };
+        let err = refresh_token(&paths, &endpoints, &creds).await.unwrap_err();
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        let msg = err.to_string();
+        assert!(msg.contains("offline mode"), "{msg}");
+        assert!(
+            !msg.contains("refresh-secret"),
+            "credential leaked into the refusal: {msg}"
+        );
+    }
+
     use super::*;
     use base64::Engine;
     use std::io::{Read, Write};
