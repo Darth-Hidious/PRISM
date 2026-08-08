@@ -21,6 +21,25 @@ pub async fn get_with_retry(
     headers: &HeaderMap,
     max_attempts: u32,
 ) -> Result<bytes::Bytes> {
+    // Hard offline, checked once before the retry loop.
+    //
+    // `crates/retrieval` had NO dependency on prism-runtime at all, so the
+    // entire `prism papers` surface — eight literature sources plus
+    // fulltext.rs's document download — ignored PRISM_OFFLINE completely. It
+    // is also an agent tool with `requires_approval: false`
+    // (agent/src/command_tools.rs), so a model could fetch from the live
+    // internet under hard offline with no human gate.
+    //
+    // This function is the crate's SOLE outbound call — verified by grepping
+    // every `client.get`/`.send()` in `crates/retrieval/src`, which returns
+    // only the one below — so one check covers the whole surface, and
+    // `fulltext.rs:241` inherits it.
+    //
+    // `check_url` rather than `enabled()`: a source could legitimately be a
+    // loopback mirror, and that is the convention for URL-bearing calls
+    // (llm, embed, workflows).
+    prism_runtime::offline::check_url(url).map_err(|reason| anyhow::anyhow!(reason))?;
+
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -83,5 +102,108 @@ mod tests {
     fn headers_carry_user_agent() {
         let h = identification_headers("prism-retrieval/1.0 (test)").unwrap();
         assert_eq!(h.get(USER_AGENT).unwrap(), "prism-retrieval/1.0 (test)");
+    }
+
+    /// `PRISM_OFFLINE=1` must stop a literature fetch before it opens a
+    /// socket. Before this, `crates/retrieval` had no dependency on
+    /// prism-runtime at all, so `prism papers` — reachable as an agent tool
+    /// with `requires_approval: false` — fetched from the live internet under
+    /// hard offline with no human gate.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn offline_refuses_a_remote_source_before_any_request() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
+
+        let limiter = RateLimiter::new(Duration::ZERO);
+        let err = get_with_retry(
+            &Client::new(),
+            &limiter,
+            "https://export.arxiv.org/api/query?x=1",
+            &HeaderMap::new(),
+            1,
+        )
+        .await
+        .expect_err("offline must refuse a remote source");
+        let msg = err.to_string();
+        assert!(msg.contains("offline mode"), "{msg}");
+        assert!(
+            msg.contains("export.arxiv.org"),
+            "must name what it blocked: {msg}"
+        );
+    }
+
+    /// A loopback mirror stays reachable — `check_url`, not a blanket refusal.
+    /// Nothing is listening on port 1, so reaching a TRANSPORT error (rather
+    /// than a policy one) is the proof the guard let it through.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn offline_still_permits_a_loopback_mirror() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
+
+        let limiter = RateLimiter::new(Duration::ZERO);
+        let err = get_with_retry(
+            &Client::new(),
+            &limiter,
+            "http://127.0.0.1:1/api/query",
+            &HeaderMap::new(),
+            1,
+        )
+        .await
+        .expect_err("nothing is listening on port 1");
+        assert!(
+            !err.to_string().contains("offline mode"),
+            "loopback must not be refused by policy: {err}"
+        );
+    }
+
+    /// Without the guard the offline tests would pass even if it refused
+    /// unconditionally.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn the_guard_is_inert_when_offline_is_unset() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::remove_var("PRISM_OFFLINE") };
+
+        let limiter = RateLimiter::new(Duration::ZERO);
+        let err = get_with_retry(
+            &Client::new(),
+            &limiter,
+            "http://127.0.0.1:1/api/query",
+            &HeaderMap::new(),
+            1,
+        )
+        .await
+        .expect_err("nothing is listening");
+        assert!(
+            !err.to_string().contains("offline mode"),
+            "guard fired with offline unset: {err}"
+        );
+    }
+
+    /// PRISM_OFFLINE is process-global; serialize the tests that set it.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Restores the var on drop, so a failed assertion cannot leave it set for
+    /// the rest of the binary.
+    struct OfflineGuard(Option<String>);
+    impl Drop for OfflineGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("PRISM_OFFLINE", v),
+                    None => std::env::remove_var("PRISM_OFFLINE"),
+                }
+            }
+        }
     }
 }

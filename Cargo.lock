@@ -5228,6 +5228,7 @@ dependencies = [
  "futures-util",
  "mockito",
  "pdf-extract",
+ "prism-runtime",
  "quick-xml",
  "reqwest",
  "serde",

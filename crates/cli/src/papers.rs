@@ -379,7 +379,7 @@ fn probe_endpoint(base_url: &str) -> Result<(), String> {
         .unwrap_or(base_url);
     let host_port = without_scheme.split('/').next().unwrap_or("");
     let host_port = match host_port.rsplit_once(':') {
-        Some((h, p)) if p.parse::<u16>().is_ok() => host_port.to_string(),
+        Some((_host, p)) if p.parse::<u16>().is_ok() => host_port.to_string(),
         _ => format!(
             "{host_port}:{port}",
             port = if base_url.starts_with("https") {

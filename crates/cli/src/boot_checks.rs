@@ -550,6 +550,7 @@ mod tests {
     /// only ever appear if the project scope is read from the environment too.
     /// Before this, `project_id` came from `creds` alone and the row was
     /// silently absent for exactly the population the env-key work targets.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn models_row_uses_the_env_project_when_there_is_no_session() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -620,6 +621,7 @@ mod tests {
     /// — a typo went out as `Bearer badkey`, 401'd, and the row read
     /// "<host> unreachable", pointing the reader at the network when the
     /// problem was the value they pasted.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_malformed_api_key_names_itself_instead_of_blaming_the_host() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -666,6 +668,7 @@ mod tests {
     /// before this the boot checks ran under `PRISM_OFFLINE=1` and — once they
     /// started carrying a real credential — would have sent it to a remote host
     /// the operator explicitly asked not to contact.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn offline_mode_skips_every_platform_check() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -713,6 +716,7 @@ mod tests {
     /// usable credential must NOT fire an unauthenticated request and then
     /// report the host as unreachable. The host is fine; we had nothing to
     /// send.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn configured_without_a_credential_says_so_instead_of_blaming_the_host() {
         let endpoints = PlatformEndpoints {
@@ -849,6 +853,7 @@ mod tests {
     /// The regression guard for the phone-home: with nothing configured,
     /// the boot screen must contain only local checks — no auth line, no
     /// knowledge-graph line, nothing that implies a missing account.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn unconfigured_boot_runs_local_checks_only() {
         // A URL that would fail loudly (and slowly) if it were ever hit.
@@ -874,6 +879,7 @@ mod tests {
 
     /// The headless path has a real credential and deliberately no
     /// session — telling it to `prism login` is a lying check.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_key_path_is_not_told_to_log_in() {
         // Configured (the env key is present) but with no stored session
