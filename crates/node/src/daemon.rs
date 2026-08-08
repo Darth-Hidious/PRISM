@@ -11,6 +11,7 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use prism_client::PlatformResponseExt;
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
 use sysinfo::System;
@@ -1981,7 +1982,7 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
     // expires. The platform's node-WS handshake validates the `?token=` param
     // as a JWT first, then as an API key, so hand the key straight through —
     // no cli-state, no refresh, no 24h re-login.
-    if let Ok(key) = std::env::var("MARC27_API_KEY") {
+    if let Some(key) = PlatformVar::API_KEY.get() {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Ok(key);
@@ -2009,6 +2010,20 @@ async fn refresh_token(
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
 ) -> Result<String> {
+    // Defence in depth. `run_daemon` returns at :263 before any credential is
+    // resolved when offline, so this is unreachable there — but this is a
+    // THIRD hand-rolled copy of the refresh call (the others are
+    // client/src/auth.rs and cli/src/main.rs:10790), it posts the refresh
+    // token, and it is reachable from any future caller that skips that early
+    // return. A duplicated wire call needs its own guard or the next caller
+    // inherits the hole.
+    if prism_runtime::offline::enabled() {
+        anyhow::bail!(
+            "offline mode: POST {}/auth/refresh blocked by --offline \
+             (remove the flag to reach the platform)",
+            endpoints.api_base
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -2152,6 +2167,51 @@ fn advertise_ssh_service(
 
 #[cfg(test)]
 mod tests {
+    /// `prism-node` is a shipped standalone binary whose `main()` hardcoded
+    /// `offline: false`, so `PRISM_OFFLINE=1 prism-node up` resolved a real
+    /// credential and opened `wss://…?token=<token>` (:525). The guard at
+    /// :263 was correct; nothing armed it.
+    ///
+    /// This pins the mechanism the fix relies on: the refresh call — a third
+    /// hand-rolled copy of the same wire request — refuses under offline
+    /// rather than posting the refresh token.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_token_is_refused_offline() {
+        // Shared lock + RAII, not a function-local static and a trailing
+        // `remove_var`. The `unwrap_err()` below panics in exactly the case
+        // this test exists to catch — the guard lets the refresh through and
+        // returns Ok — and an unwind past a manual cleanup leaks PRISM_OFFLINE
+        // into every later test in this binary.
+        let _g = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let creds = StoredCredentials {
+            refresh_token: "refresh-secret".to_string(),
+            ..Default::default()
+        };
+        let err = refresh_token(&paths, &endpoints, &creds).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("offline mode"), "{msg}");
+        assert!(
+            !msg.contains("refresh-secret"),
+            "credential leaked into the refusal: {msg}"
+        );
+    }
+
     use super::*;
     use base64::Engine;
     use std::io::{Read, Write};

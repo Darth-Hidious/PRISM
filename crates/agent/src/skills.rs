@@ -230,6 +230,21 @@ pub fn execute_with_timeout(
     if let Some(home) = std::env::var_os("HOME") {
         cmd.env("HOME", home);
     }
+    // Hard-offline POLICY, not a secret — the scrub above exists to withhold
+    // credentials, and stripping this withheld a restriction instead. A skill
+    // that shells out to `prism` or imports the Python tool layer inherited an
+    // environment where PRISM_OFFLINE simply did not exist, so those honoured
+    // guards went quiet for exactly the code the comment above calls
+    // untrusted.
+    //
+    // Passing it through does NOT sandbox arbitrary code: `python -c
+    // "import requests; requests.get(...)"` never consults it. It only stops
+    // this hardening from actively DISABLING the guards that do. Constraining
+    // a skill's own network access needs the namespace/seccomp slice the doc
+    // comment already names as future work.
+    if prism_runtime::offline::enabled() {
+        cmd.env(prism_runtime::offline::ENV, "1");
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -320,6 +335,66 @@ pub(crate) fn test_env_guard(tag: &str) -> (std::sync::MutexGuard<'static, ()>, 
 
 #[cfg(test)]
 mod tests {
+    /// The credential scrub must not strip the offline POLICY.
+    ///
+    /// `env_clear()` exists so a skill cannot read the parent's secrets. It
+    /// also removed PRISM_OFFLINE, so a skill that shells out to `prism` ran
+    /// against an environment where hard offline did not exist — the scrub
+    /// withheld a restriction rather than a credential.
+    ///
+    /// Asserts what the child actually SEES, by having it print the variable.
+    #[test]
+    fn the_env_scrub_passes_offline_through_but_still_hides_secrets() {
+        // The crate's SHARED lock, declared 26 lines above this module and
+        // already used by skills.rs, protocol.rs and meta_tools.rs. My first
+        // version declared a private one right below it — two locks that do
+        // not exclude each other serialize nothing. `test_env_guard` is the
+        // richer helper (it also points PRISM_SKILLS_DIR at a temp dir); this
+        // test needs only the mutual exclusion.
+        let _guard = super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        struct EnvGuard(&'static str, Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.1.take() {
+                        Some(v) => std::env::set_var(self.0, v),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+        let _off = EnvGuard(
+            prism_runtime::offline::ENV,
+            std::env::var(prism_runtime::offline::ENV).ok(),
+        );
+        let _secret = EnvGuard("PRISM_TEST_SECRET", std::env::var("PRISM_TEST_SECRET").ok());
+        unsafe {
+            std::env::set_var(prism_runtime::offline::ENV, "1");
+            std::env::set_var("PRISM_TEST_SECRET", "do-not-leak");
+        }
+
+        let out = execute_with_timeout(
+            "shell",
+            "echo \"offline=[$PRISM_OFFLINE] secret=[$PRISM_TEST_SECRET]\"",
+            std::time::Duration::from_secs(10),
+        )
+        .expect("shell skill runs");
+
+        assert!(
+            out.stdout.contains("offline=[1]"),
+            "offline policy must reach the child: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("secret=[]"),
+            "the scrub must still hide secrets: {:?}",
+            out.stdout
+        );
+    }
+
     use super::test_env_guard as env_guard;
     use super::*;
 

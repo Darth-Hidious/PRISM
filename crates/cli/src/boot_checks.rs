@@ -12,15 +12,27 @@
 use std::time::Duration;
 
 use prism_client::PlatformError;
+use prism_runtime::auth::PlatformAuth;
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
 use crate::boot;
 
-/// Env vars that carry a platform credential on the headless/agent path
-/// (no `prism login`, no `~/.prism` state). These are frozen wire
-/// identifiers — see `brand.rs` for why they are not routed through the
-/// brand definition.
-const PLATFORM_TOKEN_ENV: [&str; 3] = ["MARC27_API_KEY", "MARC27_TOKEN", "MARC27_API_TOKEN"];
+/// Settings that carry a platform credential on the headless/agent path
+/// (no `prism login`, no `~/.prism` state).
+///
+/// Each is checked under BOTH its neutral `PRISM_*` name and its historical
+/// `MARC27_*` alias, because `PlatformVar::get()` resolves both. Before this
+/// used `PlatformVar`, the list was three hardcoded `MARC27_*` strings, so an
+/// operator who set only `PRISM_API_KEY` got a CLI that authenticated
+/// perfectly on every request path but reported "not configured" at boot and
+/// never ran the marketplace tool sync — the neutral name worked everywhere
+/// except the one check that decides whether the platform exists.
+const PLATFORM_TOKEN_VARS: [PlatformVar; 3] = [
+    PlatformVar::API_KEY,
+    PlatformVar::TOKEN,
+    PlatformVar::API_TOKEN,
+];
 
 /// One boot-banner line for a rejected credential: the platform's own
 /// `error.code` plus the action that code implies.
@@ -58,9 +70,11 @@ pub fn platform_configured(creds: Option<&StoredCredentials>) -> bool {
     if creds.is_some_and(|c| !c.access_token.trim().is_empty()) {
         return true;
     }
-    PLATFORM_TOKEN_ENV
-        .iter()
-        .any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+    // `get()` already treats unset, empty and whitespace-only alike as
+    // absent, which is the same rule `blank_env_key_is_not_a_credential`
+    // pins below — so the explicit trim check the old list needed is gone,
+    // not lost.
+    PLATFORM_TOKEN_VARS.iter().any(|var| var.get().is_some())
 }
 
 /// Run the boot checks.
@@ -72,7 +86,140 @@ pub async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
 ) -> Vec<boot::BootCheck> {
-    run_boot_checks_with(creds, endpoints, platform_configured(creds)).await
+    // Hard offline mode is a policy about the process, not about one command.
+    // `Commands::Tui` skipped the boot checks itself (main.rs), but `Setup` and
+    // `Resume` called straight through — so `PRISM_OFFLINE=1 prism setup` ran
+    // every platform check anyway. Enforcing it here covers all NINE call
+    // sites at once (8 in main.rs + doctor.rs:172) instead of relying on each
+    // to remember.
+    //
+    // This matters more since boot checks started carrying a real credential:
+    // before, the offline bypass leaked an empty Bearer; now it would send the
+    // operator's actual key to a remote host they explicitly asked not to
+    // contact.
+    if prism_runtime::offline::enabled() {
+        return offline_checks().await;
+    }
+    let configured = platform_configured(creds);
+    let credential = boot_credential(creds);
+    run_boot_checks_with(creds, endpoints, configured, credential).await
+}
+
+/// The check set for hard offline mode: local only, and it says why.
+async fn offline_checks() -> Vec<boot::BootCheck> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let mut checks = vec![boot::BootCheck {
+        name: "Platform".into(),
+        // Not a failure: the operator asked for this.
+        result: "offline mode — platform checks skipped".into(),
+        ok: true,
+        dots: 8,
+        delay_ms: 30,
+    }];
+    push_local_checks(&client, &mut checks).await;
+    checks
+}
+
+/// What the boot checks have to present as a credential.
+///
+/// Three outcomes, not two: a malformed credential is NOT the same as no
+/// credential, and collapsing them is what produced the defect this type
+/// exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootCredential {
+    /// Usable. Attach it and run the checks.
+    Ready(PlatformAuth),
+    /// Supplied but unusable, with the reason stated for the reader.
+    Rejected(String),
+    /// Nothing configured.
+    Absent,
+}
+
+/// The credential the boot checks should present, in the same precedence the
+/// real resolver uses (`auth::resolve_platform_auth:164-196`):
+///
+///   1. `*_API_KEY`   (validated: must carry the frozen `m27_` prefix)
+///   2. `*_TOKEN` / `*_API_TOKEN`
+///   3. the stored session
+///
+/// An earlier version of this comment said "stored session first, then the
+/// environment" and the code matched the comment rather than the resolver.
+/// Both were wrong. With an expired session AND a valid `PRISM_API_KEY`, every
+/// real command authenticated fine via the key while the boot screen used the
+/// dead session, rendered a red Auth row, and could trigger an interactive
+/// re-login (main.rs:4474-4503) for a user whose tooling was working. That is
+/// the same lying-check class this module exists to prevent, so the order is
+/// now the resolver's, not a convenient one.
+///
+/// Before this existed the checks derived their header from `creds` alone and
+/// sent `Bearer ` — an EMPTY bearer — whenever the only credential was an env
+/// var. `platform_configured` said "configured", step 1 fired anyway, the
+/// platform answered 401, and the row read "<host> unreachable". The host was
+/// fine; we simply never sent a credential. That is a lying check, and it hit
+/// exactly the headless/agent install this module documents as supported.
+///
+/// The API-key branch mirrors `resolve_platform_auth`'s REJECTION of a key
+/// without the frozen `m27_` prefix (auth.rs:165-170). An earlier version of
+/// this function called `PlatformAuth::classify` here and carried a comment
+/// claiming that was "the same rule the resolver applies". It was not: the
+/// resolver rejects, `classify` merely picks a header. A typo'd
+/// `PRISM_API_KEY=badkey` therefore went out as `Bearer badkey`, earned a 401,
+/// and the row read "<host> unreachable" — the very lying check this module
+/// had just been fixed to stop emitting, reappearing one layer down.
+fn boot_credential(creds: Option<&StoredCredentials>) -> BootCredential {
+    // An API key is a distinct wire shape (`X-API-Key`) AND a validated one.
+    if let Some(key) = PlatformVar::API_KEY.get() {
+        if !key.starts_with("m27_") {
+            let name = PlatformVar::API_KEY.source().unwrap_or("the API key");
+            // Names the condition; never sends the reader out to a command.
+            // Guarded repo-wide by crates/server/tests/no_exit_to_cli.rs.
+            return BootCredential::Rejected(format!(
+                "{name} is not a platform key — keys carry the m27_ prefix"
+            ));
+        }
+        return BootCredential::Ready(PlatformAuth::ApiKey(key));
+    }
+    // The token vars are unvalidated by the resolver too: either shape is
+    // legitimate there, so classify rather than reject.
+    if let Some(value) = PlatformVar::TOKEN
+        .get()
+        .or_else(|| PlatformVar::API_TOKEN.get())
+    {
+        return BootCredential::Ready(PlatformAuth::classify(&value));
+    }
+    // The stored session is LAST, matching the resolver.
+    creds
+        .map(|c| c.access_token.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| BootCredential::Ready(PlatformAuth::Bearer(t.to_string())))
+        .unwrap_or(BootCredential::Absent)
+}
+
+/// The project scope the boot checks should use.
+///
+/// Env FIRST, session second — the order `resolve_active_project_id`
+/// (main.rs:7184) and `select_project_context_automatically`
+/// (agent/protocol.rs:317) both use, both of which return on the env value
+/// unconditionally.
+///
+/// My first version had this backwards while citing those two as precedent.
+/// A CI job setting `PRISM_PROJECT_ID` to override an interactive session's
+/// project would have had every command scoped to the override and this one
+/// boot row scoped to the stale session project — querying a project that may
+/// not even exist any more.
+///
+/// Extracted so the precedence is testable on its own: the row-level test
+/// cannot see it, because a sessionless install has no session project to
+/// conflict with.
+fn boot_project_id(creds: Option<&StoredCredentials>) -> Option<String> {
+    PlatformVar::PROJECT_ID.get().or_else(|| {
+        creds
+            .and_then(|c| c.project_id.as_deref())
+            .map(str::to_string)
+    })
 }
 
 /// The body of [`run_boot_checks`] with the configured/not-configured
@@ -84,6 +231,7 @@ async fn run_boot_checks_with(
     creds: Option<&StoredCredentials>,
     endpoints: &PlatformEndpoints,
     configured: bool,
+    credential: BootCredential,
 ) -> Vec<boot::BootCheck> {
     let mut checks = Vec::new();
     let client = reqwest::Client::builder()
@@ -105,14 +253,36 @@ async fn run_boot_checks_with(
         return checks;
     }
 
-    let token = creds.map(|c| c.access_token.as_str()).unwrap_or("");
+    // A stored session still drives the "is this a session or an env key?"
+    // distinction in the Auth row below; `credential` drives the wire header.
+    let session_token = creds.map(|c| c.access_token.trim()).unwrap_or("");
     let api = &endpoints.api_base;
 
     // 1. Platform connection — use /agent/capabilities (always 200 with auth)
-    let auth_header = format!("Bearer {token}");
-    let platform_ok = client
-        .get(format!("{api}/agent/capabilities"))
-        .header("Authorization", &auth_header)
+    let credential = match credential {
+        BootCredential::Ready(credential) => credential,
+        // Both remaining arms state the real condition rather than firing an
+        // unauthenticated request and blaming the host for the resulting 401.
+        // A malformed credential names ITS OWN defect: "unreachable" would
+        // send the reader to look at the network, which is not the problem.
+        other => {
+            let result = match other {
+                BootCredential::Rejected(why) => why,
+                _ => "configured, but no usable credential — checks skipped".to_string(),
+            };
+            checks.push(boot::BootCheck {
+                name: "Platform".into(),
+                result,
+                ok: false,
+                dots: 8,
+                delay_ms: 30,
+            });
+            push_local_checks(&client, &mut checks).await;
+            return checks;
+        }
+    };
+    let platform_ok = credential
+        .apply(client.get(format!("{api}/agent/capabilities")))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -134,10 +304,11 @@ async fn run_boot_checks_with(
     });
 
     // 2. Auth — distinguish actual expiry from scope/network/server errors.
-    if !token.is_empty() {
-        let user_resp = client
-            .get(format!("{api}/users/me"))
-            .header("Authorization", format!("Bearer {token}"))
+    //    Only a stored SESSION can expire, so this branch stays keyed on the
+    //    session token; an env key takes the placeholder row below.
+    if !session_token.is_empty() {
+        let user_resp = credential
+            .apply(client.get(format!("{api}/users/me")))
             .send()
             .await;
         let (auth_ok, auth_msg) = match user_resp {
@@ -190,10 +361,9 @@ async fn run_boot_checks_with(
     }
 
     // 3. Knowledge Graph
-    if !token.is_empty() {
-        let stats = client
-            .get(format!("{api}/knowledge/graph/stats"))
-            .header("Authorization", format!("Bearer {token}"))
+    {
+        let stats = credential
+            .apply(client.get(format!("{api}/knowledge/graph/stats")))
             .send()
             .await
             .ok()
@@ -223,12 +393,18 @@ async fn run_boot_checks_with(
     }
 
     // 4. Models
-    if !token.is_empty() {
-        let project_id = creds.and_then(|c| c.project_id.as_deref()).unwrap_or("");
+    {
+        // The project scope comes from the session when there is one, and
+        // otherwise from the environment — the headless/agent path has no
+        // stored credentials at all, so reading `creds` alone meant this row
+        // NEVER appeared for it. `PlatformVar::PROJECT_ID` is what every other
+        // surface already uses for exactly this (main.rs env_project_override,
+        // agent/protocol.rs); boot_checks was the one place it was missed.
+        let env_project = boot_project_id(creds);
+        let project_id = env_project.as_deref().unwrap_or("");
         if !project_id.is_empty() {
-            let models = client
-                .get(format!("{api}/projects/{project_id}/llm/models"))
-                .header("Authorization", format!("Bearer {token}"))
+            let models = credential
+                .apply(client.get(format!("{api}/projects/{project_id}/llm/models")))
                 .send()
                 .await
                 .ok()
@@ -258,10 +434,9 @@ async fn run_boot_checks_with(
     }
 
     // 5. Compute
-    if !token.is_empty() {
-        let gpus = client
-            .get(format!("{api}/compute/gpus"))
-            .header("Authorization", format!("Bearer {token}"))
+    {
+        let gpus = credential
+            .apply(client.get(format!("{api}/compute/gpus")))
             .send()
             .await
             .ok()
@@ -283,10 +458,9 @@ async fn run_boot_checks_with(
     }
 
     // 6. Marketplace
-    if !token.is_empty() {
-        let mkt = client
-            .get(format!("{api}/marketplace/resources"))
-            .header("Authorization", format!("Bearer {token}"))
+    {
+        let mkt = credential
+            .apply(client.get(format!("{api}/marketplace/resources")))
             .send()
             .await
             .ok()
@@ -353,16 +527,265 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Remove every platform token env var, so a test can pin the
 /// no-credential branch regardless of the developer's shell.
+///
+/// BOTH spellings, deliberately: this is a test-isolation primitive, and
+/// clearing only the historical name would let a `PRISM_API_KEY` sitting in
+/// the developer's shell leak in and flip `platform_configured` — a flake
+/// that reproduces on one machine and nowhere else.
 #[cfg(test)]
 pub(crate) fn clear_platform_env() {
-    for key in PLATFORM_TOKEN_ENV {
-        unsafe { std::env::remove_var(key) };
+    for var in PLATFORM_TOKEN_VARS {
+        unsafe {
+            std::env::remove_var(var.preferred);
+            std::env::remove_var(var.alias);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headless path has no stored credentials, so a Models row could
+    /// only ever appear if the project scope is read from the environment too.
+    /// Before this, `project_id` came from `creds` alone and the row was
+    /// silently absent for exactly the population the env-key work targets.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn models_row_uses_the_env_project_when_there_is_no_session() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        unsafe {
+            std::env::set_var("PRISM_API_KEY", "m27_real");
+            std::env::set_var("PRISM_PROJECT_ID", "proj-env");
+        }
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
+        unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
+        clear_platform_env();
+
+        // The row exists at all. Its ok/result depend on the (unreachable)
+        // host; what this pins is that the step was REACHED, which it never
+        // was for a sessionless install.
+        assert!(
+            checks.iter().any(|c| c.name == "LLM Models"),
+            "no Models row: {:?}",
+            checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The case the row-level test structurally cannot reach: a session
+    /// project AND an env override, disagreeing. Env wins, matching
+    /// `resolve_active_project_id` and `select_project_context_automatically`.
+    #[test]
+    fn env_project_overrides_the_session_project() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
+        unsafe { std::env::remove_var("MARC27_PROJECT_ID") };
+
+        let mut with_project = creds_with("session-jwt");
+        with_project.project_id = Some("session-project".to_string());
+
+        // No override: the session project is used.
+        assert_eq!(
+            boot_project_id(Some(&with_project)).as_deref(),
+            Some("session-project")
+        );
+
+        // Override present: it wins.
+        unsafe { std::env::set_var("PRISM_PROJECT_ID", "env-project") };
+        assert_eq!(
+            boot_project_id(Some(&with_project)).as_deref(),
+            Some("env-project"),
+            "PRISM_PROJECT_ID must override the session project"
+        );
+        // And the historical spelling still works.
+        unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
+        unsafe { std::env::set_var("MARC27_PROJECT_ID", "legacy-project") };
+        assert_eq!(
+            boot_project_id(Some(&with_project)).as_deref(),
+            Some("legacy-project")
+        );
+        unsafe { std::env::remove_var("MARC27_PROJECT_ID") };
+
+        assert_eq!(boot_project_id(None), None);
+    }
+
+    /// A malformed API key must name ITS OWN defect, not blame the host.
+    ///
+    /// `resolve_platform_auth` rejects a key without the frozen `m27_` prefix
+    /// (auth.rs:165-170). Before this, `boot_credential` classified it instead
+    /// — a typo went out as `Bearer badkey`, 401'd, and the row read
+    /// "<host> unreachable", pointing the reader at the network when the
+    /// problem was the value they pasted.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_malformed_api_key_names_itself_instead_of_blaming_the_host() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        unsafe { std::env::set_var("PRISM_API_KEY", "badkey") };
+
+        let rejected = boot_credential(None);
+        assert!(
+            matches!(rejected, BootCredential::Rejected(_)),
+            "a non-m27_ key is not usable: {rejected:?}"
+        );
+        let BootCredential::Rejected(why) = rejected else {
+            unreachable!()
+        };
+        assert!(
+            why.contains("PRISM_API_KEY"),
+            "must name the variable: {why}"
+        );
+        assert!(why.contains("m27_"), "must name the rule: {why}");
+
+        // And it must reach the boot screen as that reason, not "unreachable".
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
+        clear_platform_env();
+        let platform = checks.iter().find(|c| c.name == "Platform").unwrap();
+        assert!(platform.result.contains("m27_"), "{}", platform.result);
+        assert!(
+            !platform.result.contains("unreachable"),
+            "never blame the host for a malformed credential: {}",
+            platform.result
+        );
+        // The contradictory green Auth row must not appear either.
+        assert!(
+            !checks.iter().any(|c| c.name == "Auth"),
+            "no green Auth row beside a rejected credential"
+        );
+    }
+
+    /// Hard offline mode must skip every platform check, from ANY command.
+    /// `Commands::Setup` and `Commands::Resume` had no `cli.offline` guard, so
+    /// before this the boot checks ran under `PRISM_OFFLINE=1` and — once they
+    /// started carrying a real credential — would have sent it to a remote host
+    /// the operator explicitly asked not to contact.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn offline_mode_skips_every_platform_check() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        // A credential IS present: offline must win over "configured".
+        unsafe {
+            std::env::set_var("PRISM_API_KEY", "m27_real");
+            std::env::set_var(prism_runtime::offline::ENV, "1");
+        }
+        // An address that would cost a full 5s timeout if it were ever dialled.
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks(None, &endpoints).await;
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+        clear_platform_env();
+
+        let platform = checks
+            .iter()
+            .find(|c| c.name == "Platform")
+            .expect("offline still reports a Platform row");
+        assert!(
+            platform.result.contains("offline mode"),
+            "must say why it skipped: {}",
+            platform.result
+        );
+        assert!(platform.ok, "offline is a choice, not a failure");
+        // None of the credentialed steps may appear.
+        for banned in [
+            "Auth",
+            "Knowledge Graph",
+            "LLM Models",
+            "Compute",
+            "Marketplace",
+        ] {
+            assert!(
+                !checks.iter().any(|c| c.name == banned),
+                "{banned} row must not exist in offline mode"
+            );
+        }
+    }
+
+    /// The lying check this change exists to kill: "configured" but with no
+    /// usable credential must NOT fire an unauthenticated request and then
+    /// report the host as unreachable. The host is fine; we had nothing to
+    /// send.
+    #[tokio::test]
+    async fn configured_without_a_credential_says_so_instead_of_blaming_the_host() {
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+        };
+        let checks = run_boot_checks_with(None, &endpoints, true, BootCredential::Absent).await;
+        let platform = checks
+            .iter()
+            .find(|c| c.name == "Platform")
+            .expect("a configured platform always reports a Platform row");
+        assert!(
+            platform.result.contains("no usable credential"),
+            "must name the real condition: {}",
+            platform.result
+        );
+        assert!(
+            !platform.result.contains("unreachable"),
+            "never blame the host for a credential we did not send: {}",
+            platform.result
+        );
+    }
+
+    /// Precedence must match `resolve_platform_auth` exactly: API key, then
+    /// token, then the stored session — NOT session-first.
+    ///
+    /// This test previously asserted the opposite and passed, because the code
+    /// it pinned had the same defect. With an expired session and a valid
+    /// `PRISM_API_KEY`, session-first made every real command succeed via the
+    /// key while the boot screen used the dead session and showed a red Auth
+    /// row. Also pins that an `m27_` value is an API key (X-API-Key), not a
+    /// Bearer token: getting that wrong 401s every check with a valid key.
+    #[test]
+    fn boot_credential_matches_the_resolver_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+
+        // The env API key OUTRANKS a stored session, as in the resolver.
+        unsafe { std::env::set_var("PRISM_API_KEY", "m27_env") };
+        assert_eq!(
+            boot_credential(Some(&creds_with("session-jwt"))),
+            BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string())),
+            "an env API key must win over a stored session"
+        );
+
+        // Same with no session at all: classified by shape, not assumed Bearer.
+        assert_eq!(
+            boot_credential(None),
+            BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string()))
+        );
+
+        // The stored session is the LAST resort, not the first.
+        clear_platform_env();
+        assert_eq!(
+            boot_credential(Some(&creds_with("session-jwt"))),
+            BootCredential::Ready(PlatformAuth::Bearer("session-jwt".to_string())),
+            "with nothing in the env, the session is used"
+        );
+
+        // A non-m27 value under the token name is a rotating credential.
+        clear_platform_env();
+        unsafe { std::env::set_var("MARC27_TOKEN", "jwt-shaped") };
+        assert_eq!(
+            boot_credential(None),
+            BootCredential::Ready(PlatformAuth::Bearer("jwt-shaped".to_string()))
+        );
+
+        clear_platform_env();
+        assert_eq!(boot_credential(None), BootCredential::Absent);
+    }
 
     fn creds_with(token: &str) -> StoredCredentials {
         StoredCredentials {
@@ -398,15 +821,22 @@ mod tests {
     /// The headless path never runs `prism login`, so the env key alone
     /// has to count — otherwise CI/agent installs would skip the very
     /// checks they need.
+    /// Both spellings of every credential must count. The neutral name is
+    /// the one that used to be missed: `platform_configured` checked three
+    /// hardcoded `MARC27_*` strings, so a `PRISM_API_KEY`-only operator got
+    /// a CLI that authenticated on every request path while the boot screen
+    /// said "not configured" and the tool sync never ran.
     #[test]
     fn env_key_alone_means_configured() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_platform_env();
-        for key in PLATFORM_TOKEN_ENV {
-            unsafe { std::env::set_var(key, "m27_test") };
-            assert!(platform_configured(None), "{key} should count");
-            unsafe { std::env::remove_var(key) };
+        for var in PLATFORM_TOKEN_VARS {
+            for key in [var.preferred, var.alias] {
+                clear_platform_env();
+                unsafe { std::env::set_var(key, "m27_test") };
+                assert!(platform_configured(None), "{key} should count");
+            }
         }
+        clear_platform_env();
     }
 
     #[test]
@@ -429,7 +859,7 @@ mod tests {
             api_base: "https://platform.invalid/api/v1".to_string(),
             node_ws: "wss://platform.invalid/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks_with(None, &endpoints, false).await;
+        let checks = run_boot_checks_with(None, &endpoints, false, BootCredential::Absent).await;
 
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["Platform", "Local Node", "Policy Engine"]);
@@ -455,7 +885,13 @@ mod tests {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
         };
-        let checks = run_boot_checks_with(None, &endpoints, true).await;
+        let checks = run_boot_checks_with(
+            None,
+            &endpoints,
+            true,
+            BootCredential::Ready(PlatformAuth::ApiKey("m27_test".into())),
+        )
+        .await;
 
         let auth = checks
             .iter()

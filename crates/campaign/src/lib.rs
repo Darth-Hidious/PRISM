@@ -56,6 +56,7 @@ use prism_provenance::{
     ActionType, Actor, EvidenceSource, ProvenanceRecord, ProvenanceStore, evidence_for_result,
     new_record,
 };
+use prism_runtime::platform_env::PlatformVar;
 
 mod domain;
 
@@ -1978,7 +1979,9 @@ impl Campaign {
             .and_then(|llm| llm.api_key.clone())
             .or_else(|| {
                 std::env::var("LLM_API_KEY")
-                    .or_else(|_| std::env::var("MARC27_TOKEN"))
+                    .ok()
+                    .or_else(|| PlatformVar::TOKEN.get())
+                    .ok_or(std::env::VarError::NotPresent)
                     .ok()
             });
         let model = if self.state.config.llm_model.is_empty() {

@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+url.workspace = true
 anyhow.workspace = true
 # Bounded exponential backoff with jitter, so no crate has to hand-roll (and
 # get wrong) its own retry loop.

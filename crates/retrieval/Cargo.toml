@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Hard-offline policy. `get_with_retry` is this crate's only outbound call.
+prism-runtime = { path = "../runtime" }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

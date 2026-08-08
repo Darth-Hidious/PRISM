@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use prism_core::{chat_config, config as core_config, providers};
 
+use crate::platform_env::PlatformVar;
 use crate::{PlatformEndpoints, PrismPaths};
 
 /// The built-in local default, refused for cloud targets when not
@@ -131,7 +132,11 @@ pub fn resolve_llm_with(
     // ANTHROPIC_API_KEY would otherwise shadow the platform JWT and 401
     // every platform LLM call).
     let api_key = std::env::var("LLM_API_KEY")
-        .or_else(|_| std::env::var("MARC27_TOKEN"))
+        .or_else(|_| {
+            PlatformVar::TOKEN
+                .get()
+                .ok_or(std::env::VarError::NotPresent)
+        })
         .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .ok()
@@ -174,8 +179,16 @@ pub fn resolve_llm_with(
             // Explicit LLM_API_KEY → stable m27_* key → MARC27_TOKEN →
             // session JWT. Provider keys are NOT platform credentials.
             let marc27_key = std::env::var("LLM_API_KEY")
-                .or_else(|_| std::env::var("MARC27_API_KEY"))
-                .or_else(|_| std::env::var("MARC27_TOKEN"))
+                .or_else(|_| {
+                    PlatformVar::API_KEY
+                        .get()
+                        .ok_or(std::env::VarError::NotPresent)
+                })
+                .or_else(|_| {
+                    PlatformVar::TOKEN
+                        .get()
+                        .ok_or(std::env::VarError::NotPresent)
+                })
                 .ok()
                 .or_else(|| platform_token.clone());
             (
