@@ -128,6 +128,36 @@ mod tests {
         }
     }
 
+    /// `PRISM_OFFLINE=0` means OFF, and every caller must agree on that.
+    ///
+    /// The rule was re-derived in six places as `== "1"` (untrimmed), and once
+    /// in python-bridge as `var().is_err()` — "is the variable absent" — which
+    /// made an explicit `0` behave like offline. Both shapes are gone; this
+    /// pins the semantics they got wrong.
+    #[test]
+    fn only_a_trimmed_one_enables_offline() {
+        let _restore = std::env::var(ENV).ok();
+        for (value, expected) in [
+            ("1", true),
+            (" 1", true),
+            ("1 ", true),
+            ("\t1\n", true),
+            ("0", false),
+            ("", false),
+            ("true", false),
+            ("yes", false),
+            ("11", false),
+        ] {
+            unsafe { std::env::set_var(ENV, value) };
+            assert_eq!(enabled(), expected, "PRISM_OFFLINE={value:?}");
+        }
+        unsafe { std::env::remove_var(ENV) };
+        assert!(!enabled(), "unset is not offline");
+        if let Some(v) = _restore {
+            unsafe { std::env::set_var(ENV, v) };
+        }
+    }
+
     /// A bare `host:port` with no scheme must still resolve, and must not
     /// become a way in. The string-splitting version accepted these; a plain
     /// `Url::parse` rejects them outright, which would have turned a local

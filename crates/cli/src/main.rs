@@ -7171,7 +7171,14 @@ fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
 /// the single CLI auth chokepoint: it accepts API-key-only users, stored
 /// sessions, and legacy credentials, and never starts interactive auth.
 fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
-    if std::env::var("PRISM_OFFLINE").is_ok_and(|v| v == "1") {
+    // `offline::enabled()`, not a re-derived `== "1"`. This function is the
+    // gate ~25 platform commands rely on, and it trimmed nothing — so
+    // `PRISM_OFFLINE=" 1"` (a routine shell/CI artifact) was honoured by every
+    // `offline::enabled()` caller and ignored here. It was not exploitable
+    // through `prism` only because main.rs:1640 canonicalises the var first,
+    // which is an accidental safety net: `prism-node` skipped that preamble
+    // and was online under hard offline until f91917a2.
+    if prism_runtime::offline::enabled() {
         anyhow::bail!(
             "offline mode: this command needs the hosted platform \
              (remove --offline to use it)"
@@ -11685,7 +11692,7 @@ async fn fetch_model_catalog(paths: &PrismPaths) -> Vec<serde_json::Value> {
     let cache_is_fresh = cache
         .as_ref()
         .is_some_and(prism_agent::models::CatalogCache::is_fresh);
-    let offline = std::env::var("PRISM_OFFLINE").as_deref() == Ok("1");
+    let offline = prism_runtime::offline::enabled();
     if offline || cache_is_fresh {
         models.extend(cache.map(|c| c.models).unwrap_or_default());
         return models;

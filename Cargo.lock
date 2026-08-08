@@ -5207,6 +5207,7 @@ dependencies = [
 name = "prism-python-bridge"
 version = "1.0.0"
 dependencies = [
+ "prism-runtime",
  "serde",
  "serde_json",
  "tempfile",
