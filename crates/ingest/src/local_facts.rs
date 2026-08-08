@@ -186,4 +186,60 @@ mod tests {
         assert_eq!(facts[0].kind, None);
         assert_eq!(facts[0].predicate, "DERIVED_FROM");
     }
+
+    /// A `measurement` fact must always carry its value.
+    ///
+    /// This pins an invariant that spans two crates. `ProvenanceStore`'s
+    /// writer drops a `measurement` whose `value` is `None` and returns
+    /// `Ok(())` without writing anything (`prism-provenance`,
+    /// `emmo.rs` — "a measurement without a value fails schema validation and
+    /// is dropped"). `IngestPipeline::write_local_graph` derives
+    /// `nodes_created` from the mapped facts, so if this mapper ever emitted a
+    /// valueless measurement the count would silently overstate again — the
+    /// exact bug that count was fixed for.
+    ///
+    /// Nothing in the type system enforces it: `kind` is an
+    /// `Option<String>` and `value` an unrelated `Option<f64>`. Hence this
+    /// test rather than a comment.
+    #[test]
+    fn a_measurement_fact_always_carries_its_value() {
+        let set = EntitySet {
+            entities: vec![
+                entity("Alloy", "Ti-6Al-4V", serde_json::json!({})),
+                // Numeric value present -> measurement.
+                entity(
+                    "Property",
+                    "UTS",
+                    serde_json::json!({"value": 1140.0, "unit": "MPa"}),
+                ),
+                // No numeric value -> must NOT be classified as a measurement,
+                // or the writer would drop it while the pipeline counted it.
+                entity("Property", "colour", serde_json::json!({"note": "grey"})),
+            ],
+            relationships: vec![
+                rel("Ti-6Al-4V", "HAS_PROPERTY", "UTS"),
+                rel("Ti-6Al-4V", "HAS_PROPERTY", "colour"),
+            ],
+        };
+
+        let facts = to_local_facts(&set);
+
+        assert_eq!(facts.len(), 2);
+        for fact in &facts {
+            if fact.kind.as_deref() == Some("measurement") {
+                assert!(
+                    fact.value.is_some(),
+                    "{} -> {} is kind=measurement with no value; the store would \
+                     drop it and nodes_created would overstate",
+                    fact.subject,
+                    fact.object,
+                );
+            }
+        }
+        // And specifically: the valueless property degraded to a generic edge
+        // rather than a measurement.
+        let colour = facts.iter().find(|f| f.object == "colour").unwrap();
+        assert_eq!(colour.kind, None);
+        assert_eq!(colour.value, None);
+    }
 }
