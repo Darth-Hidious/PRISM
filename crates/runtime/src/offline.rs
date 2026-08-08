@@ -96,6 +96,18 @@ pub fn check_url(raw_url: &str) -> Result<(), String> {
 /// crate with several test modules produces every time. Naming one home, with
 /// the RAII guard beside it, is what stops the next file from rolling its own.
 /// The cost is a `Mutex<()>` in the shipped binary.
+///
+/// **Test-only despite being public, and not semver-stable.** Being reachable
+/// across crates is the whole point, but that also means `OfflineEnvGuard::set`
+/// can mutate a process-global that gates every outbound request in the
+/// workspace — a production call would silently take the process offline.
+/// `doc(hidden)` keeps it out of the rendered API. There is no runtime check
+/// to add here: `cfg!(test)` is false in integration-test binaries too, so it
+/// would reject legitimate callers. The guarantee is by review — every current
+/// caller sits inside a `cfg(test)` mod (client/api, client/auth, cli/main,
+/// node/daemon), and the grep that proves it is
+/// `grep -rn test_support --include=*.rs crates`.
+#[doc(hidden)]
 pub mod test_support {
     /// Serializes every test in this binary that mutates `PRISM_OFFLINE`.
     pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
