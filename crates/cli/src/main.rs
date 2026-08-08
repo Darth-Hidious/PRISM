@@ -3201,29 +3201,12 @@ async fn main() -> Result<()> {
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
                 let mesh_cancel = tokio_util::sync::CancellationToken::new();
                 // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
-                // Kafka is a TCP client, started SEPARATELY from `start_mesh`
-                // (below, ~:3251), so gating the mesh task does not cover it —
-                // and it never appears in a `reqwest` grep, which is how it was
-                // missed. Resolving to None under hard offline disables the
-                // whole block at its source rather than at each use.
-                //
-                // `check_url` is not usable here: brokers are `host:port` with
-                // no scheme, and a broker list can name several. `enabled()` is
-                // the right primitive for a policy decision with no single URL.
-                let resolved_kafka_brokers = if prism_runtime::offline::enabled() {
-                    if kafka_brokers.is_some() || with_kafka {
-                        eprintln!("  ⚠ Kafka mesh transport disabled: offline mode.");
-                    }
-                    None
-                } else {
-                    kafka_brokers.clone().or_else(|| {
-                        if with_kafka {
-                            Some("127.0.0.1:9092".to_string())
-                        } else {
-                            None
-                        }
-                    })
-                };
+                let kafka_requested = kafka_brokers.is_some() || with_kafka;
+                let resolved_kafka_brokers =
+                    resolve_kafka_brokers(kafka_brokers.as_deref(), with_kafka);
+                if kafka_requested && resolved_kafka_brokers.is_none() {
+                    eprintln!("  ⚠ Kafka mesh transport disabled: offline mode.");
+                }
 
                 let mesh_config = prism_mesh::MeshConfig {
                     node_name: daemon_options.name.clone(),
@@ -11059,6 +11042,30 @@ fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
 
 // ── prism query --federated ────────────────────────────────────────────
 
+/// Which Kafka brokers the mesh may connect to, if any.
+///
+/// Kafka is a TCP client started SEPARATELY from `start_mesh`, so gating the
+/// mesh task does not cover it — and it never appears in a `reqwest` grep,
+/// which is exactly how 9926eac0's "only two outbound sends" claim came to be
+/// wrong. Returning None under hard offline disables the whole block at its
+/// source rather than at each use.
+///
+/// `enabled()` rather than `check_url`: brokers are scheme-less `host:port`
+/// and a list can name several, so there is no single URL to check.
+///
+/// Extracted so the decision is testable. It was inline in `main()` — the
+/// higher-blast-radius half of the mesh work (`--kafka-brokers` is a free-form
+/// flag naming an arbitrary REMOTE host, where mDNS is LAN-only) and the half
+/// with no coverage. Best-covered path was not highest-risk path.
+fn resolve_kafka_brokers(explicit: Option<&str>, with_kafka: bool) -> Option<String> {
+    if prism_runtime::offline::enabled() {
+        return None;
+    }
+    explicit
+        .map(str::to_string)
+        .or_else(|| with_kafka.then(|| "127.0.0.1:9092".to_string()))
+}
+
 async fn handle_federated_query(
     query: &str,
     dashboard_url: &str,
@@ -11903,6 +11910,66 @@ mod tests {
         assert!(
             !msg.contains("secret query text"),
             "query text surfaced in the error path: {msg}"
+        );
+    }
+
+    /// The higher-blast-radius half of the mesh offline work, and the half
+    /// that had no test. `--kafka-brokers` is a free-form flag naming an
+    /// arbitrary REMOTE host; mDNS is LAN-only. The mDNS gate got a
+    /// mutation-tested test and this one got prose.
+    #[test]
+    fn kafka_brokers_resolve_to_none_under_hard_offline() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        struct OfflineEnvGuard(Option<String>);
+        impl Drop for OfflineEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(prism_runtime::offline::ENV, v),
+                        None => std::env::remove_var(prism_runtime::offline::ENV),
+                    }
+                }
+            }
+        }
+        let _restore = OfflineEnvGuard(std::env::var(prism_runtime::offline::ENV).ok());
+
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        // An explicitly named REMOTE broker is the case that matters.
+        assert_eq!(
+            resolve_kafka_brokers(Some("broker.example:9092"), false),
+            None
+        );
+        assert_eq!(
+            resolve_kafka_brokers(None, true),
+            None,
+            "--with-kafka default"
+        );
+        assert_eq!(resolve_kafka_brokers(None, false), None);
+
+        // Online: every input resolves as before. Without this the assertions
+        // above would pass even if the function returned None unconditionally.
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+        assert_eq!(
+            resolve_kafka_brokers(Some("broker.example:9092"), false).as_deref(),
+            Some("broker.example:9092")
+        );
+        assert_eq!(
+            resolve_kafka_brokers(None, true).as_deref(),
+            Some("127.0.0.1:9092"),
+            "--with-kafka still defaults to loopback"
+        );
+        assert_eq!(
+            resolve_kafka_brokers(None, false),
+            None,
+            "neither flag means no Kafka, offline or not"
+        );
+        // An explicit broker outranks the --with-kafka default.
+        assert_eq!(
+            resolve_kafka_brokers(Some("explicit:1234"), true).as_deref(),
+            Some("explicit:1234")
         );
     }
 
