@@ -205,31 +205,18 @@ mod tests {
         }
     }
 
-    /// `PRISM_OFFLINE` is process-global, so serialize the tests that set it.
-    /// Same precedent as `client/src/auth.rs:238`. Recovers from poisoning so
-    /// one panicking test cannot convert every later one into a spurious
-    /// failure that masks the real cause.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Restores `PRISM_OFFLINE` on drop, so an assertion failure cannot leave
-    /// the variable set for the rest of the binary. A plain `let _restore =`
-    /// does not survive an unwind; this does.
-    struct OfflineEnvGuard(Option<String>);
-    impl Drop for OfflineEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(value) => std::env::set_var(ENV, value),
-                    None => std::env::remove_var(ENV),
-                }
-            }
-        }
-    }
+    /// This file's own tests use `test_support` like everyone else.
+    ///
+    /// They previously declared a private `env_lock()` + `OfflineEnvGuard`
+    /// about a hundred lines below the `pub static ENV_LOCK` in
+    /// [`super::test_support`] — a NINTH copy of the duplicate-lock bug, inside
+    /// the very file whose doc comment condemns it. Latent rather than live
+    /// (nothing else in the prism-runtime test binary took the shared lock, so
+    /// nothing contended), but the next test in this binary to reach for
+    /// `test_support::env_lock()` would have silently stopped excluding these.
+    ///
+    /// Keeping one canonical lock only works if its own author uses it.
+    use super::test_support::{OfflineEnvGuard, env_lock};
 
     /// `PRISM_OFFLINE=0` means OFF, and every caller must agree on that.
     ///
@@ -240,7 +227,7 @@ mod tests {
     #[test]
     fn only_a_trimmed_one_enables_offline() {
         let _guard = env_lock();
-        let _restore = OfflineEnvGuard(std::env::var(ENV).ok());
+        let _restore = OfflineEnvGuard::capture();
         for (value, expected) in [
             ("1", true),
             (" 1", true),
@@ -318,7 +305,7 @@ mod tests {
         // Shares the global with only_a_trimmed_one_enables_offline; without
         // this guard the two race on PRISM_OFFLINE.
         let _guard = env_lock();
-        let _restore = OfflineEnvGuard(std::env::var(ENV).ok());
+        let _restore = OfflineEnvGuard::capture();
         assert!(check_url("https://api.example.invalid").is_ok());
         // The environment-sensitive branch is covered by the process-level
         // integration test; this unit test remains deterministic for parallel
