@@ -7,6 +7,13 @@
 //! cursor chain is walked from the cached bodies until the first incomplete
 //! page is reached.
 //!
+//! The no-drift replay guarantee holds only WITHIN the cache TTL. A resume
+//! older than the TTL cannot be replayed faithfully: expired pages are
+//! refetched live, and the fresh bodies may differ from what the original
+//! run saw. Every such page is counted in
+//! [`SweepOutcome::replay_refetches`] — non-zero exactly when the replay
+//! was not drift-free — instead of being silently absorbed.
+//!
 //! Nothing is ever invented: a sweep that finds nothing reports zero papers.
 
 use std::collections::{BTreeSet, HashMap};
@@ -76,6 +83,15 @@ pub struct SweepOutcome {
     pub duplicates_merged: usize,
     pub pages_fetched: usize,
     pub pages_from_cache: usize,
+    /// Checkpoint-completed pages that could NOT be served from cache on a
+    /// resume (TTL expiry or eviction) and were refetched over the network.
+    /// Non-zero means the replay was not drift-free: the live server may
+    /// have answered differently than the run the checkpoint belongs to.
+    #[serde(default)]
+    pub replay_refetches: usize,
+    /// Derived, never asserted: true only when EVERY source's accounting
+    /// says complete — no error, and either its cursor chain ended or the
+    /// server-reported total was fully consumed.
     pub finished: bool,
     pub source_status: Vec<SourceStatus>,
     pub elapsed_ms: f64,
@@ -132,7 +148,10 @@ impl RetrievalEngine {
         let mut duplicates_merged = 0usize;
         let mut pages_fetched = 0usize;
         let mut pages_from_cache = 0usize;
-        let mut finished = true;
+        let mut replay_refetches = 0usize;
+        // Per-source completeness verdicts; `finished` is DERIVED from these
+        // at the end, never asserted along the way.
+        let mut completes: Vec<bool> = Vec::new();
         let mut source_status: Vec<SourceStatus> = Vec::new();
 
         for id in &plan.sources {
@@ -145,6 +164,7 @@ impl RetrievalEngine {
                     source: id.as_str().to_string(),
                     status: "error".to_string(),
                     count: 0,
+                    available: None,
                     latency_ms: source_start.elapsed().as_secs_f64() * 1000.0,
                     cache_hit: false,
                     error: Some(format!(
@@ -152,7 +172,7 @@ impl RetrievalEngine {
                         id.as_str()
                     )),
                 });
-                finished = false;
+                completes.push(false);
                 continue;
             };
             // Politeness must not depend on the source appearing in
@@ -166,6 +186,11 @@ impl RetrievalEngine {
             let mut cursor = src.initial_cursor().to_string();
             let mut pages_this_source = 0usize;
             let mut count_this_source = 0usize;
+            // Raw records the server served across the chain this run —
+            // parser skips included — measured against `available` below.
+            let mut raw_seen_this_source = 0u64;
+            // Last server-reported total for the query, when any page said.
+            let mut available_this_source: Option<u64> = None;
             let mut error_this_source: Option<String> = None;
             let mut timed_out_this_source = false;
             let mut exhausted = false;
@@ -196,15 +221,23 @@ impl RetrievalEngine {
                             // pages_from_cache measures "no network happened",
                             // not "was marked done": a completed page whose
                             // cache entry is gone was refetched over the
-                            // network and must count as fetched.
+                            // network and must count as fetched — AND as a
+                            // replay refetch, because the fresh body may
+                            // differ from what the checkpoint's run saw. The
+                            // no-drift replay guarantee holds only within the
+                            // cache TTL; this counter is where its violation
+                            // becomes visible instead of silent.
                             if ctx.network_fetches.load(Ordering::SeqCst) == network_before {
                                 pages_from_cache += 1;
                             } else {
                                 pages_fetched += 1;
+                                replay_refetches += 1;
                             }
                             pages_this_source += 1;
-                            count_this_source += replayed.len();
-                            for paper in replayed {
+                            count_this_source += replayed.papers.len();
+                            raw_seen_this_source += replayed.raw_count as u64;
+                            available_this_source = replayed.available.or(available_this_source);
+                            for paper in replayed.papers {
                                 let key = paper.dedup_key();
                                 match seen.get(&key) {
                                     Some(idx) => {
@@ -244,6 +277,8 @@ impl RetrievalEngine {
                             // that is how resumes silently lost tail papers.
                             pages_this_source = 0;
                             count_this_source = 0;
+                            raw_seen_this_source = 0;
+                            available_this_source = None;
                             // Roll back what this source already contributed.
                             // The restart rewinds its cursor, its completed
                             // markers and its budgets; leaving its papers in
@@ -268,7 +303,6 @@ impl RetrievalEngine {
                                 self.config().per_source_timeout_secs
                             ));
                             timed_out_this_source = true;
-                            finished = false;
                             break;
                         }
                     }
@@ -291,8 +325,10 @@ impl RetrievalEngine {
                             pages_fetched += 1;
                         }
                         pages_this_source += 1;
-                        count_this_source += found.len();
-                        for paper in found {
+                        count_this_source += found.papers.len();
+                        raw_seen_this_source += found.raw_count as u64;
+                        available_this_source = found.available.or(available_this_source);
+                        for paper in found.papers {
                             let key = paper.dedup_key();
                             match seen.get(&key) {
                                 Some(idx) => {
@@ -318,7 +354,6 @@ impl RetrievalEngine {
                     }
                     Ok(Err(e)) => {
                         error_this_source = Some(format!("{e:#}"));
-                        finished = false;
                         break;
                     }
                     Err(_) => {
@@ -327,19 +362,21 @@ impl RetrievalEngine {
                             self.config().per_source_timeout_secs
                         ));
                         timed_out_this_source = true;
-                        finished = false;
                         break;
                     }
                 }
             }
 
-            // A source that stopped at its page cap without exhausting the
-            // cursor chain left pages unfetched: the sweep is not finished,
-            // and reporting finished would claim completeness it does not
-            // have. A short sweep that says so is fine.
-            if !exhausted && error_this_source.is_none() {
-                finished = false;
-            }
+            // Completeness is DERIVED from the accounting, never asserted: a
+            // source is complete when it neither failed nor timed out AND
+            // either its cursor chain genuinely ended or the server-reported
+            // total was fully consumed (the page cap landing exactly on the
+            // last raw record). A source capped mid-chain with no total to
+            // check against left pages unfetched — claiming finished there
+            // would claim completeness the accounting cannot back.
+            let complete = error_this_source.is_none()
+                && (exhausted || available_this_source.is_some_and(|a| raw_seen_this_source >= a));
+            completes.push(complete);
 
             let latency_ms = source_start.elapsed().as_secs_f64() * 1000.0;
             source_status.push(SourceStatus {
@@ -352,6 +389,7 @@ impl RetrievalEngine {
                     "ok".to_string()
                 },
                 count: count_this_source,
+                available: available_this_source,
                 latency_ms,
                 cache_hit: false,
                 error: error_this_source,
@@ -363,7 +401,8 @@ impl RetrievalEngine {
             duplicates_merged,
             pages_fetched,
             pages_from_cache,
-            finished,
+            replay_refetches,
+            finished: completes.iter().all(|c| *c),
             source_status,
             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         })
@@ -394,7 +433,16 @@ mod tests {
 
     use super::*;
     use crate::engine::EngineConfig;
+    use crate::model::SourcePage;
     use crate::sources::{FetchCtx, Source, SourceRegistry};
+
+    fn page_of(papers: Vec<Paper>) -> SourcePage {
+        SourcePage {
+            raw_count: papers.len(),
+            available: None,
+            papers,
+        }
+    }
 
     fn plan() -> SweepPlan {
         SweepPlan {
@@ -440,7 +488,7 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+        async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
             self.fetch_page(ctx, query, "0").await.map(|(p, _)| p)
         }
         async fn fetch_page(
@@ -448,15 +496,15 @@ mod tests {
             ctx: &FetchCtx,
             _query: &str,
             cursor: &str,
-        ) -> Result<(Vec<Paper>, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>)> {
             self.limiters_seen
                 .lock()
                 .expect("limiters_seen poisoned")
                 .push(ctx.limiter("arxiv"));
             if cursor == "0" {
-                Ok((vec![paper("page-one")], Some("10".to_string())))
+                Ok((page_of(vec![paper("page-one")]), Some("10".to_string())))
             } else {
-                Ok((vec![paper("page-two")], None))
+                Ok((page_of(vec![paper("page-two")]), None))
             }
         }
     }
@@ -476,18 +524,18 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<Vec<Paper>> {
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<SourcePage> {
             tokio::time::sleep(Duration::from_secs(4)).await;
-            Ok(vec![paper("too-late")])
+            Ok(page_of(vec![paper("too-late")]))
         }
         async fn fetch_page(
             &self,
             _ctx: &FetchCtx,
             _query: &str,
             _cursor: &str,
-        ) -> Result<(Vec<Paper>, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>)> {
             tokio::time::sleep(Duration::from_secs(4)).await;
-            Ok((vec![paper("too-late")], None))
+            Ok((page_of(vec![paper("too-late")]), None))
         }
     }
 

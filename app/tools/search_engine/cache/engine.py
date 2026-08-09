@@ -41,10 +41,18 @@ class SearchCache:
             return result
         return None
 
-    def put(self, query: MaterialSearchQuery, result: SearchResult) -> None:
+    def put(
+        self,
+        query: MaterialSearchQuery,
+        result: SearchResult,
+        ttl: float | None = None,
+    ) -> None:
+        """Store a result. ``ttl`` overrides the default for THIS entry —
+        the engine passes a short TTL for partial results so a one-blip
+        3-of-42 answer is not pinned for a day."""
         key = query.query_hash()
         self._query_cache[key] = CachedResult(
-            result=result, ttl=self._default_ttl,
+            result=result, ttl=ttl if ttl is not None else self._default_ttl,
         )
         for m in result.materials:
             self._material_index[m.id] = m

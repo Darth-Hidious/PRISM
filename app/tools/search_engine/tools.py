@@ -259,6 +259,14 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
                     "ok": ok,
                     "latency_ms": round(log.latency_ms, 1),
                     "result_count": log.result_count,
+                    # The provider's own total of matching records, when it
+                    # reports one: result_count < available means this row
+                    # is a slice of what exists.
+                    "available": log.available,
+                    "pages_fetched": log.pages_fetched,
+                    # Partial is a third state: a truncated success returned
+                    # less than what was asked for despite more existing.
+                    "truncated": log.truncated,
                     "http_status": log.http_status_code,
                     "error": log.error_message,
                 }
@@ -319,6 +327,11 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
         return {
             "materials": [m.model_dump(mode="json") for m in result.materials],
             "count": len(result.materials),
+            # Partial is a third state: False whenever any consulted provider
+            # failed, timed out, sat behind an open circuit, was offline-
+            # blocked, or returned truncated data. A caller citing this
+            # result as exhaustive must check it.
+            "complete": result.complete,
             "providers_queried": providers_queried,
             "providers_summary": summary,
             "warnings": result.warnings,

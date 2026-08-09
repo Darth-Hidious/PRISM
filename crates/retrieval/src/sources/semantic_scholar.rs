@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, url_encode};
-use crate::model::{FulltextFormat, Paper};
+use crate::model::{FulltextFormat, Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://api.semanticscholar.org/graph/v1";
 const FIELDS: &str = "title,authors,abstract,year,externalIds,url,openAccessPdf,venue";
@@ -14,17 +14,19 @@ const FIELDS: &str = "title,authors,abstract,year,externalIds,url,openAccessPdf,
 pub const ID: &str = "semantic_scholar";
 pub const INITIAL_CURSOR: &str = "0";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
-/// One page. Cursor is the S2 `offset`; the API caps it below 10 000.
+/// One page. Cursor is the S2 `offset`; the API caps it below 10 000. The
+/// continuation gate uses the RAW item count: a skipped record (empty
+/// title) must not end the chain.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
+) -> Result<(SourcePage, Option<String>)> {
     let offset: usize = cursor.parse().unwrap_or(0);
     let limit = ctx.limit.min(100);
     let base = ctx.base(ID, DEFAULT_BASE);
@@ -33,27 +35,32 @@ pub async fn fetch_page(
         q = url_encode(query)
     );
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
-    let papers = parse(&body)?;
+    let page = parse(&body)?;
     let next =
-        (papers.len() >= limit && offset + limit <= 9_999).then(|| (offset + limit).to_string());
-    Ok((papers, next))
+        (page.raw_count >= limit && offset + limit <= 9_999).then(|| (offset + limit).to_string());
+    Ok((page, next))
 }
 
-/// Pure parser over the S2 search response.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+/// Pure parser over the S2 search response. `available` is the response's
+/// `total`; `raw_count` is every item served, parsed or not.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let root: Value = serde_json::from_slice(body)?;
-    let mut papers = Vec::new();
-    for item in root
+    let items = root
         .get("data")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default()
-    {
-        if let Some(paper) = parse_paper(&item) {
+        .unwrap_or_default();
+    let mut papers = Vec::new();
+    for item in &items {
+        if let Some(paper) = parse_paper(item) {
             papers.push(paper);
         }
     }
-    Ok(papers)
+    Ok(SourcePage {
+        papers,
+        raw_count: items.len(),
+        available: root.get("total").and_then(|v| v.as_u64()),
+    })
 }
 
 fn parse_paper(item: &Value) -> Option<Paper> {
@@ -165,8 +172,13 @@ mod tests {
 
     #[test]
     fn parses_papers_and_normalizes_ids() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 1);
+        // The empty-title record is skipped from `papers` but still raw; the
+        // server's `total` survives.
+        assert_eq!(page.raw_count, 2);
+        assert_eq!(page.available, Some(2));
         let p = &papers[0];
         assert_eq!(p.doi.as_deref(), Some("10.8888/ml.alloy"));
         assert_eq!(

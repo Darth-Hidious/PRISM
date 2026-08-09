@@ -4,24 +4,26 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, url_encode};
-use crate::model::Paper;
+use crate::model::{Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://chemrxiv.org/engage/chemrxiv/public-api/v1";
 
 pub const ID: &str = "chemrxiv";
 pub const INITIAL_CURSOR: &str = "0";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
-/// One page. Cursor is the `skip` count.
+/// One page. Cursor is the `skip` count. The continuation gate and the skip
+/// advance both use the RAW hit count: a skipped record (blank title) must
+/// neither end the chain nor re-read the tail.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
+) -> Result<(SourcePage, Option<String>)> {
     let skip: usize = cursor.parse().unwrap_or(0);
     let limit = ctx.limit.min(100);
     let base = ctx.base(ID, DEFAULT_BASE);
@@ -30,13 +32,14 @@ pub async fn fetch_page(
         q = url_encode(query)
     );
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
-    let papers = parse(&body)?;
-    let next = (papers.len() >= limit).then(|| (skip + papers.len()).to_string());
-    Ok((papers, next))
+    let page = parse(&body)?;
+    let next = (page.raw_count >= limit).then(|| (skip + page.raw_count).to_string());
+    Ok((page, next))
 }
 
-/// Pure parser over the ChemRxiv items response.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+/// Pure parser over the ChemRxiv items response. `available` is the
+/// response's `totalCount`; `raw_count` is every hit served, parsed or not.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let root: Value = serde_json::from_slice(body)?;
     let mut papers = Vec::new();
     let hits = root
@@ -52,7 +55,11 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
             papers.push(paper);
         }
     }
-    Ok(papers)
+    Ok(SourcePage {
+        papers,
+        raw_count: hits.len(),
+        available: root.get("totalCount").and_then(|v| v.as_u64()),
+    })
 }
 
 fn parse_item(item: &Value) -> Option<Paper> {
@@ -130,6 +137,7 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"{
+      "totalCount": 41,
       "itemHits": [
         {
           "item": {
@@ -150,8 +158,13 @@ mod tests {
 
     #[test]
     fn parses_item_hits() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 1);
+        // The blank-title hit is skipped from `papers` but still counted as
+        // raw — pagination gates on raw, and the server's total is kept.
+        assert_eq!(page.raw_count, 2);
+        assert_eq!(page.available, Some(41));
         let p = &papers[0];
         assert_eq!(p.source_id, "6531abcd");
         assert_eq!(p.doi.as_deref(), Some("10.26434/chemrxiv-6531abcd"));

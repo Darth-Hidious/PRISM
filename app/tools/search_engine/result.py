@@ -117,15 +117,52 @@ class ProviderQueryLog(BaseModel):
                     # the provider's health and must not be treated as evidence
                     # about it — see `engine.py`'s failure branch.
                     "offline_blocked"]
+    # The REAL wire status when one is known: the last page's status on
+    # success (providers that report it, e.g. OPTIMADE), the failing
+    # response's status on an HTTP error. None means no HTTP status existed
+    # or the provider did not report one — never a fabricated 200.
     http_status_code: int | None = None
     result_count: int = 0
 
     error_type: str | None = None
     error_message: str | None = None
+    # The verbatim error, untruncated by the one-line sanitizer (capped only
+    # to keep logs bounded). `error_message` is for a glance; this is for
+    # diagnosis.
     error_raw: str | None = None
 
+    # How many pages the provider actually walked for this query (0 when the
+    # query failed before any page landed).
+    pages_fetched: int = 1
+    # True when the provider had more matching data but returned fewer than
+    # requested — a partial result, distinct from success, never silently
+    # folded into it.
+    truncated: bool = False
+    # The provider's own total of matching records, when it reports one
+    # (OPTIMADE meta.data_returned). `result_count < available` means this
+    # answer is a slice of what exists.
+    available: int | None = None
+
+
+class ProviderPage(BaseModel):
+    """Materials plus fetch accounting from one provider query.
+
+    A provider that pages (or that knows more than "here is a list") returns
+    this instead of a bare ``list[Material]`` so the engine can log
+    ``pages_fetched``/``truncated``/``available`` from measured values
+    instead of leaving them declared-and-unwritten. Providers returning a
+    plain list keep working; their accounting fields fall back to the
+    single-page defaults.
+    """
+
+    materials: list[Material]
     pages_fetched: int = 1
     truncated: bool = False
+    available: int | None = None
+    http_status_code: int | None = None
+    # Why the result is partial, when it is (mid-pagination failure, page
+    # safety cap). Verbatim, for the query log.
+    note: str | None = None
 
 
 class SearchResult(BaseModel):
@@ -139,7 +176,12 @@ class SearchResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     cached: bool = False
     search_time_ms: float = 0
-    cache_stats: dict | None = None
+    # PARTIAL IS A THIRD STATE: False whenever any consulted provider failed,
+    # timed out, was skipped by an open circuit, was refused by the offline
+    # policy, or returned a truncated page — the answer may be less than what
+    # the federation holds. Cached with a short TTL so one blip cannot pin a
+    # 3-of-42 result for a day.
+    complete: bool = True
     # S7: which filters were applied server-side vs client-side. OPTIMADE
     # providers can't filter on property ranges server-side, so the engine
     # post-filters locally and reports it here so the agent can cite honestly

@@ -5,56 +5,62 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, url_encode};
-use crate::model::{FulltextFormat, Paper};
+use crate::model::{FulltextFormat, Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://api.openalex.org";
 
 pub const ID: &str = "openalex";
 pub const INITIAL_CURSOR: &str = "1";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
-/// One page. Cursor is the 1-based `page` number; a full page may have a
-/// successor.
+/// One page. Cursor is the 1-based `page` number; a full page of RAW works
+/// may have a successor — a parser skip (blank display_name) must not end
+/// the chain.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
-    let page: usize = cursor.parse().unwrap_or(1);
+) -> Result<(SourcePage, Option<String>)> {
+    let page_no: usize = cursor.parse().unwrap_or(1);
     let per_page = ctx.limit.min(200);
     let base = ctx.base(ID, DEFAULT_BASE);
     let mut url = format!(
-        "{base}/works?search={q}&per-page={per_page}&page={page}",
+        "{base}/works?search={q}&per-page={per_page}&page={page_no}",
         q = url_encode(query)
     );
     if let Some(mailto) = &ctx.mailto {
         url.push_str(&format!("&mailto={}", url_encode(mailto)));
     }
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
-    let papers = parse(&body)?;
-    let next = (papers.len() >= per_page).then(|| (page + 1).to_string());
-    Ok((papers, next))
+    let page = parse(&body)?;
+    let next = (page.raw_count >= per_page).then(|| (page_no + 1).to_string());
+    Ok((page, next))
 }
 
-/// Pure parser over the OpenAlex `/works` response.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+/// Pure parser over the OpenAlex `/works` response. `available` is
+/// `meta.count`; `raw_count` is every work served, parsed or not.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let root: Value = serde_json::from_slice(body)?;
-    let mut papers = Vec::new();
-    for work in root
+    let works = root
         .get("results")
         .and_then(|r| r.as_array())
         .cloned()
-        .unwrap_or_default()
-    {
-        if let Some(paper) = parse_work(&work) {
+        .unwrap_or_default();
+    let mut papers = Vec::new();
+    for work in &works {
+        if let Some(paper) = parse_work(work) {
             papers.push(paper);
         }
     }
-    Ok(papers)
+    Ok(SourcePage {
+        papers,
+        raw_count: works.len(),
+        available: root.pointer("/meta/count").and_then(|v| v.as_u64()),
+    })
 }
 
 fn parse_work(work: &Value) -> Option<Paper> {
@@ -177,6 +183,7 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"{
+      "meta": {"count": 512, "page": 1, "per_page": 25},
       "results": [
         {
           "id": "https://openalex.org/W4312345678",
@@ -202,8 +209,13 @@ mod tests {
 
     #[test]
     fn parses_works_and_reconstructs_abstract() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 1);
+        // The blank-name work is skipped from `papers` but still raw; the
+        // server's meta.count survives.
+        assert_eq!(page.raw_count, 2);
+        assert_eq!(page.available, Some(512));
         let p = &papers[0];
         assert_eq!(p.source_id, "W4312345678");
         assert_eq!(p.doi.as_deref(), Some("10.5555/tbc.2023"));

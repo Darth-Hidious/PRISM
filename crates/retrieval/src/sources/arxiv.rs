@@ -5,25 +5,27 @@ use anyhow::Result;
 use quick_xml::events::Event;
 
 use super::{FetchCtx, normalize_doi, url_encode};
-use crate::model::{FulltextFormat, Paper};
+use crate::model::{FulltextFormat, Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "http://export.arxiv.org/api/query";
 
 pub const ID: &str = "arxiv";
 pub const INITIAL_CURSOR: &str = "0";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
-/// One page of results. Cursor is the `start` offset. A full page means
-/// there may be more; an empty/short page ends the chain.
+/// One page of results. Cursor is the `start` offset. A full page of RAW
+/// entries means there may be more; an empty/short page ends the chain. The
+/// gate and the cursor advance both use the raw entry count — a parser skip
+/// (title-less entry) must neither end the chain nor re-read the tail.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
+) -> Result<(SourcePage, Option<String>)> {
     let start: usize = cursor.parse().unwrap_or(0);
     let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
@@ -32,9 +34,9 @@ pub async fn fetch_page(
         n = ctx.limit.min(100)
     );
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
-    let papers = parse(&body)?;
-    let next = (papers.len() >= ctx.limit.min(100)).then(|| (start + papers.len()).to_string());
-    Ok((papers, next))
+    let page = parse(&body)?;
+    let next = (page.raw_count >= ctx.limit.min(100)).then(|| (start + page.raw_count).to_string());
+    Ok((page, next))
 }
 
 #[derive(Default)]
@@ -50,15 +52,22 @@ struct EntryDraft {
 }
 
 /// Parse the Atom feed. Pure function — unit-tested against fixture XML.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+///
+/// Returns every entry the feed carried in `raw_count` (parseable or not)
+/// plus the feed-level `opensearch:totalResults` as `available`.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let mut reader = quick_xml::Reader::from_reader(body);
     reader.config_mut().trim_text(true);
 
     let mut papers: Vec<Paper> = Vec::new();
+    let mut raw_count = 0usize;
+    let mut available: Option<u64> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut draft: Option<EntryDraft> = None;
     // Which entry-local element is collecting text right now.
     let mut field: Option<&'static str> = None;
+    // Feed-level opensearch:totalResults is collected outside any entry.
+    let mut in_total_results = false;
     // Text accumulates here across Text/GeneralRef events until the element
     // ends, so entity references splitting a chunk cannot tear a value.
     let mut text_buf = String::new();
@@ -71,6 +80,10 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
             }
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"entry" => draft = Some(EntryDraft::default()),
+                b"totalResults" if draft.is_none() => {
+                    in_total_results = true;
+                    text_buf.clear();
+                }
                 b"id" if draft.is_some() => field = Some("id"),
                 b"title" if draft.is_some() => field = Some("title"),
                 b"summary" if draft.is_some() => field = Some("summary"),
@@ -99,6 +112,12 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
             },
             Event::End(e) => {
                 let local = e.local_name();
+                if in_total_results && local.as_ref() == b"totalResults" {
+                    available = std::mem::take(&mut text_buf).trim().parse::<u64>().ok();
+                    in_total_results = false;
+                    buf.clear();
+                    continue;
+                }
                 let ended_field: Option<&'static str> = match local.as_ref() {
                     b"id" => Some("id"),
                     b"title" => Some("title"),
@@ -135,9 +154,11 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
                 }
                 if local.as_ref() == b"entry"
                     && let Some(d) = draft.take()
-                    && let Some(paper) = finalize(d)
                 {
-                    papers.push(paper);
+                    raw_count += 1;
+                    if let Some(paper) = finalize(d) {
+                        papers.push(paper);
+                    }
                 }
             }
             Event::Eof => break,
@@ -145,7 +166,11 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
         }
         buf.clear();
     }
-    Ok(papers)
+    Ok(SourcePage {
+        papers,
+        raw_count,
+        available,
+    })
 }
 
 fn finalize(d: EntryDraft) -> Option<Paper> {
@@ -191,7 +216,8 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>250</opensearch:totalResults>
   <entry>
     <id>http://arxiv.org/abs/2401.12345v1</id>
     <published>2024-01-22T18:00:00Z</published>
@@ -216,8 +242,15 @@ mod tests {
 
     #[test]
     fn parses_entries_with_metadata() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 2);
+        assert_eq!(page.raw_count, 2, "every raw entry counts, parsed or not");
+        assert_eq!(
+            page.available,
+            Some(250),
+            "opensearch:totalResults is the server's own total; it must not be discarded"
+        );
         let first = &papers[0];
         assert_eq!(first.source_id, "2401.12345v1");
         assert_eq!(
@@ -272,7 +305,7 @@ mod tests {
             "<arxiv:journal_ref>   </arxiv:journal_ref>",
             "<arxiv:journal_ref>\n\t</arxiv:journal_ref>",
         ] {
-            let papers = parse(feed(inner).as_bytes()).unwrap();
+            let papers = parse(feed(inner).as_bytes()).unwrap().papers;
             assert_eq!(papers.len(), 1, "fixture should yield one entry: {inner}");
             assert_eq!(
                 papers[0].journal, None,
@@ -282,14 +315,36 @@ mod tests {
 
         // The positive half, so the assertions above cannot pass against a
         // parser that simply never populates `journal`.
-        let papers =
-            parse(feed("<arxiv:journal_ref> Nature 1 </arxiv:journal_ref>").as_bytes()).unwrap();
+        let papers = parse(feed("<arxiv:journal_ref> Nature 1 </arxiv:journal_ref>").as_bytes())
+            .unwrap()
+            .papers;
         assert_eq!(papers[0].journal.as_deref(), Some("Nature 1"));
     }
 
     #[test]
     fn empty_feed_yields_nothing_not_garbage() {
-        let papers = parse(b"<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>").unwrap();
-        assert!(papers.is_empty());
+        let page = parse(b"<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>").unwrap();
+        assert!(page.papers.is_empty());
+        assert_eq!(page.raw_count, 0);
+        assert_eq!(page.available, None, "no total reported means None, not 0");
+    }
+
+    /// A skippable entry (title-less) must count toward `raw_count` — that
+    /// count is what pagination gates on, so losing it ends a chain early.
+    #[test]
+    fn a_skipped_entry_still_counts_as_raw() {
+        let feed = r#"<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.00001v1</id>
+    <title>Kept entry</title>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.00002v1</id>
+    <title>   </title>
+  </entry>
+</feed>"#;
+        let page = parse(feed.as_bytes()).unwrap();
+        assert_eq!(page.papers.len(), 1, "the blank-title entry is skipped");
+        assert_eq!(page.raw_count, 2, "but it was served, so it counts as raw");
     }
 }

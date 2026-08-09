@@ -5,24 +5,26 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, url_encode};
-use crate::model::Paper;
+use crate::model::{Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 
 pub const ID: &str = "pubmed";
 pub const INITIAL_CURSOR: &str = "0";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
-/// One page. Cursor is the esearch `retstart`.
+/// One page. Cursor is the esearch `retstart`. Continuation was already
+/// gated on the RAW esearch id count (before esummary parsing can skip a
+/// record); `available` is esearch's own `count`.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
+) -> Result<(SourcePage, Option<String>)> {
     let retstart: usize = cursor.parse().unwrap_or(0);
     let retmax = ctx.limit.min(100);
     let base = ctx.base(ID, DEFAULT_BASE);
@@ -43,8 +45,20 @@ pub async fn fetch_page(
                 .collect()
         })
         .unwrap_or_default();
+    // esearch reports its total as a JSON string (e.g. "2431").
+    let available = search_root
+        .pointer("/esearchresult/count")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok());
     if ids.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((
+            SourcePage {
+                papers: Vec::new(),
+                raw_count: 0,
+                available,
+            },
+            None,
+        ));
     }
 
     // 2. Summarize them.
@@ -55,7 +69,14 @@ pub async fn fetch_page(
     let (summary_body, _) = ctx.fetch_cached(ID, &summary_url).await?;
     let papers = parse_summary(&summary_body, &ids)?;
     let next = (ids.len() >= retmax).then(|| (retstart + ids.len()).to_string());
-    Ok((papers, next))
+    Ok((
+        SourcePage {
+            papers,
+            raw_count: ids.len(),
+            available,
+        },
+        next,
+    ))
 }
 
 /// Pure parser over the esummary response. `ids` preserves esearch order so
