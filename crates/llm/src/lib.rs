@@ -53,7 +53,9 @@ fn default_max_sample_rows() -> usize {
     10
 }
 fn default_timeout_secs() -> u64 {
-    300
+    // 0 = no read deadline. Research runs are long by nature; the operator may
+    // impose a deadline, PRISM does not impose one on them.
+    0
 }
 
 /// Tokens kept free between the estimated prompt and the context window, so a
@@ -370,13 +372,29 @@ pub fn chat_completions_url(base_url: &str) -> String {
 impl LlmClient {
     pub fn new(mut config: LlmConfig) -> Self {
         let backend = match choose_backend(&config.base_url) {
-            BackendChoice::Http => LlmBackend::Http(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(config.timeout_secs))
-                    .connect_timeout(Duration::from_secs(30))
-                    .build()
-                    .expect("failed to build HTTP client"),
-            ),
+            BackendChoice::Http => LlmBackend::Http({
+                // No read deadline unless the operator sets one.
+                //
+                // PRISM is a materials-research harness, not a web service.
+                // Extracting facts from a paper with a reasoning model takes
+                // minutes; a 12B model on consumer hardware takes minutes on a
+                // single CSV. A default deadline does not make the science
+                // faster, it just fails the run partway through and throws the
+                // work away — and it got worse the moment output stopped being
+                // capped, because a model that thinks longer is now allowed to.
+                //
+                // The CONNECT timeout stays: refusing to hang on an endpoint
+                // that is not there is different from refusing to wait for one
+                // that is working.
+                //
+                // `timeout_secs = 0` means "no deadline" and is the default.
+                let mut builder =
+                    reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
+                if config.timeout_secs > 0 {
+                    builder = builder.timeout(Duration::from_secs(config.timeout_secs));
+                }
+                builder.build().expect("failed to build HTTP client")
+            }),
             BackendChoice::LocalGguf => {
                 let local = local::LocalGguf::new(config.model.clone());
                 if let Some(context_window) = local.context_window() {

@@ -206,7 +206,10 @@ fn default_api_key_env() -> String {
     "LLM_API_KEY".into()
 }
 fn default_llm_timeout() -> u64 {
-    120
+    // 0 = no read deadline; see prism_llm::LlmClient::new. This used to be 120
+    // while crates/llm defaulted to 300 — two disagreeing deadlines, and the
+    // shorter one silently won on the ingest path.
+    0
 }
 
 fn is_platform_llm_provider(provider: &str) -> bool {
