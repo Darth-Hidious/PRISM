@@ -6422,6 +6422,8 @@ async fn run_local_text_ingest_file(
         started_at: now.clone(),
         ended_at: now,
         locality: "local".into(),
+        // Local ingest reads the source itself — the locator IS the origin.
+        origin_source_id: None,
     };
     store.record_activity(&prov).await?;
     for fact in &facts {
@@ -6935,6 +6937,8 @@ async fn record_platform_ingest_provenance(path: &Path, steps: &[(String, serde_
         // Distinguishes this from a locally-extracted document: the facts are
         // NOT in the local store, they are in the platform graph.
         locality: "platform".to_string(),
+        // The platform extracted from the document itself — not a relay.
+        origin_source_id: None,
     };
     if let Err(e) = store.record_activity(&prov).await {
         tracing::warn!(error = %e, title = %title, "platform ingest succeeded but the local provenance record failed");
@@ -14001,6 +14005,7 @@ data:\n\
             started_at: now.clone(),
             ended_at: now,
             locality: "local".into(),
+            origin_source_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
         store

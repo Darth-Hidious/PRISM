@@ -120,7 +120,9 @@ fn default_provenance_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("provenance.db"))
 }
 
-/// Query the bundled Turso store for locally-ingested ontology entities.
+/// Query the bundled Turso store for locally-ingested ontology entities,
+/// each paired with the origin locator this node can honestly report for
+/// it (`None` when no stored assertion mentions the entity).
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
 /// `None`, which the handler renders as an empty result set. `None` is
@@ -130,7 +132,7 @@ async fn local_graph_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> Option<Vec<prism_provenance::GraphNode>> {
+) -> Option<Vec<(prism_provenance::GraphNode, Option<String>)>> {
     let store = match prism_provenance::ProvenanceStore::open(db_path).await {
         Ok(store) => store,
         Err(e) => {
@@ -164,7 +166,26 @@ async fn local_graph_lookup(
         };
     }
 
-    if nodes.is_empty() { None } else { Some(nodes) }
+    if nodes.is_empty() {
+        return None;
+    }
+
+    // Attach the origin each entity can honestly be attributed to, so a
+    // mesh peer syncing these rows can key corroboration on the ORIGINAL
+    // source instead of collapsing every relay to `mesh:unattributed`.
+    // A read failure degrades to an unattributed row, never an error.
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let origin = store
+            .entity_origin(&node.name, LOCAL_ONTOLOGY_TENANT)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!("entity origin read failed: {e:#}");
+                None
+            });
+        out.push((node, origin));
+    }
+    Some(out)
 }
 
 /// Semantic entity search over the bundled Turso store, ranked by Turso's
@@ -235,19 +256,74 @@ async fn local_semantic_lookup(
 
 /// Map local Turso graph nodes into the same JSON shape the retired Neo4j
 /// path returned (`{type, name, properties}`), keeping the wire format
-/// stable for existing clients. Local nodes carry no free-form properties,
-/// so `properties` is an empty object.
-fn graph_nodes_to_results(nodes: &[prism_provenance::GraphNode]) -> Vec<serde_json::Value> {
+/// stable for existing clients. The one property a node may carry is
+/// `origin_source` — the locator of the source this node's knowledge came
+/// from — which mesh peers syncing these rows use to keep corroboration
+/// honest (`crates/mesh/src/sync.rs`). A node with no attributable origin
+/// keeps the historical empty `properties`, never an invented locator.
+fn graph_nodes_to_results(
+    nodes: &[(prism_provenance::GraphNode, Option<String>)],
+) -> Vec<serde_json::Value> {
     nodes
         .iter()
-        .map(|n| {
+        .map(|(n, origin)| {
             serde_json::json!({
                 "type": n.entity_type,
                 "name": n.name,
-                "properties": {},
+                "properties": match origin.as_deref().map(redact_filesystem_origin) {
+                    Some(origin) => serde_json::json!({ "origin_source": origin }),
+                    None => serde_json::json!({}),
+                },
             })
         })
         .collect()
+}
+
+/// Prefix marking an origin that was a local filesystem path, replaced by a
+/// digest before it left this node.
+const HASHED_FILE_ORIGIN: &str = "file-sha256:";
+
+/// Replace a filesystem-path origin with a stable digest before serving it.
+///
+/// Origins exist so a subscribing peer can tell two genuinely different
+/// sources apart. A DOI or URL is a public identifier and travels as itself.
+/// A file path is not: serving `/Users/<name>/Documents/private-report.pdf`
+/// tells every subscriber this node's directory layout, the owner's account
+/// name, and what they keep — none of which corroboration needs.
+///
+/// A digest keeps the only property that matters. The receiving side never
+/// interprets the locator; it normalises it into an opaque evidence key and
+/// compares keys for equality. So two peers that ingested the SAME path still
+/// agree (same digest, one evidence row) and two peers with different paths
+/// still differ — identical behaviour to serving the path, minus the
+/// disclosure. What is lost is only cross-peer convergence when two machines
+/// hold the same document at DIFFERENT paths, which the raw path would not
+/// have merged either. Real cross-peer convergence comes from DOI/URL origins.
+///
+/// Errs toward hashing: `file://…`, absolute paths, and Windows drive paths
+/// all qualify. Over-hashing costs a little convergence; under-hashing leaks.
+fn redact_filesystem_origin(origin: &str) -> String {
+    let trimmed = origin.trim();
+    let is_path = trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("file://")
+        || trimmed
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && trimmed[1..].starts_with(":\\");
+    if !is_path {
+        return trimmed.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{HASHED_FILE_ORIGIN}{digest}")
 }
 
 /// Map local Turso semantic hits into the same JSON shape the retired
@@ -466,19 +542,32 @@ mod tests {
     #[test]
     fn turso_results_map_to_existing_response_shapes() {
         // Graph: same {type, name, properties} shape as the Neo4j path.
-        let nodes = vec![prism_provenance::GraphNode {
+        // An attributable node carries its origin locator in `properties`
+        // (additive — older clients ignore it); one without stays `{}`.
+        let node = prism_provenance::GraphNode {
             name: "Ti-6Al-4V".into(),
             entity_type: "Matter".into(),
             label: "Matter".into(),
             tenant: "local".into(),
-        }];
+        };
+        let nodes = vec![
+            (node.clone(), Some("doi:10.1234/abc".to_string())),
+            (node, None),
+        ];
         assert_eq!(
             graph_nodes_to_results(&nodes),
-            vec![serde_json::json!({
-                "type": "Matter",
-                "name": "Ti-6Al-4V",
-                "properties": {},
-            })]
+            vec![
+                serde_json::json!({
+                    "type": "Matter",
+                    "name": "Ti-6Al-4V",
+                    "properties": { "origin_source": "doi:10.1234/abc" },
+                }),
+                serde_json::json!({
+                    "type": "Matter",
+                    "name": "Ti-6Al-4V",
+                    "properties": {},
+                }),
+            ]
         );
 
         // Semantic: same {id, score} shape as the Qdrant path.
@@ -542,6 +631,96 @@ mod tests {
         assert!(hits.is_empty());
     }
 
+    /// A filesystem origin must never leave this node in the clear.
+    ///
+    /// Serving `/Users/<name>/Documents/report.pdf` tells every subscriber the
+    /// owner's account name, directory layout, and what they keep. None of
+    /// that is needed to decide whether two sources differ.
+    #[test]
+    fn filesystem_origins_are_hashed_before_they_leave_the_node() {
+        for path in [
+            "/Users/someone/Documents/private-report.pdf",
+            "file:///Users/someone/Documents/private-report.pdf",
+            "FILE:///Users/someone/x.pdf",
+            "~/Documents/x.pdf",
+            "C:\\Users\\someone\\x.pdf",
+        ] {
+            let served = redact_filesystem_origin(path);
+            assert!(
+                served.starts_with(HASHED_FILE_ORIGIN),
+                "{path} was served unhashed as {served}",
+            );
+            assert!(
+                !served.contains("someone") && !served.contains("Documents"),
+                "{path} leaked path content: {served}",
+            );
+        }
+    }
+
+    /// The redaction must be wired into what is actually SERVED, not merely
+    /// available as a helper.
+    ///
+    /// Its sibling above tests `redact_filesystem_origin` directly, so it
+    /// passes even if `graph_nodes_to_results` stops calling it — which is the
+    /// only mistake that would leak. Found by mutation: bypassing the call at
+    /// the serving site left every unit test green.
+    #[test]
+    fn the_served_payload_never_contains_a_raw_path() {
+        let node = prism_provenance::GraphNode {
+            name: "Ti-6Al-4V".into(),
+            entity_type: "Matter".into(),
+            label: "Matter".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+        };
+        let served = graph_nodes_to_results(&[(
+            node,
+            Some("/Users/someone/Documents/private-report.pdf".into()),
+        )]);
+        let json = serde_json::to_string(&served).expect("serialisable");
+        assert!(
+            !json.contains("someone") && !json.contains("Documents"),
+            "the served payload leaked a local path: {json}",
+        );
+        assert!(
+            json.contains(HASHED_FILE_ORIGIN),
+            "the served payload dropped the origin entirely instead of hashing it: {json}",
+        );
+    }
+
+    /// Public identifiers travel as themselves — hashing them would destroy
+    /// the cross-peer convergence origins exist to enable.
+    #[test]
+    fn public_identifiers_are_served_verbatim() {
+        for id in [
+            "doi:10.1234/abc",
+            "https://example.org/paper",
+            "document:6f1e2d3c",
+            "doc:test_paper",
+        ] {
+            assert_eq!(redact_filesystem_origin(id), id);
+        }
+    }
+
+    /// The property that makes hashing SAFE rather than merely private: the
+    /// receiver never interprets a locator, it compares keys for equality. So
+    /// the digest must preserve same/different exactly as the raw path did —
+    /// two peers holding one path still corroborate once, two peers holding
+    /// different paths still count twice.
+    #[test]
+    fn hashing_preserves_whether_two_origins_are_the_same_source() {
+        let a = redact_filesystem_origin("/data/papers/alloy.pdf");
+        let same = redact_filesystem_origin("/data/papers/alloy.pdf");
+        let other = redact_filesystem_origin("/data/papers/steel.pdf");
+        assert_eq!(
+            a, same,
+            "one path must yield one key, or peers double-count"
+        );
+        assert_ne!(
+            a, other,
+            "two paths must stay distinct, or one peer's evidence is dropped",
+        );
+    }
+
     #[tokio::test]
     async fn local_graph_lookup_reads_ingested_entities() {
         let db = TempProvenanceDb::new();
@@ -561,6 +740,7 @@ mod tests {
             started_at: now.clone(),
             ended_at: now,
             locality: "local".into(),
+            origin_source_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
         store
@@ -579,17 +759,22 @@ mod tests {
             .await
             .expect("write fact");
 
-        // Exact name → neighbor traversal.
+        // Exact name → neighbor traversal, carrying the origin the entity
+        // was ingested from (what a syncing mesh peer keys corroboration on).
         let nodes = local_graph_lookup(&db.path, "Ti-6Al-4V", 10)
             .await
             .expect("ingested entity must be queryable");
-        assert!(nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+        assert!(
+            nodes
+                .iter()
+                .any(|(n, origin)| n.name == "Ti-6Al-4V" && origin.as_deref() == Some("doc:test"))
+        );
 
         // Substring → graph_search fallback.
         let nodes = local_graph_lookup(&db.path, "6Al", 10)
             .await
             .expect("substring match must be queryable");
-        assert!(nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+        assert!(nodes.iter().any(|(n, _)| n.name == "Ti-6Al-4V"));
 
         // Unknown term → clean miss (handler renders an empty result set).
         assert!(

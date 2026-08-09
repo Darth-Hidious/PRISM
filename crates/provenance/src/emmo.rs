@@ -279,6 +279,18 @@ pub struct LocalProvenance {
     pub started_at: String,
     pub ended_at: String,
     pub locality: String,
+    /// Locator of the ORIGINAL source when this write relays someone else's
+    /// knowledge (a mesh peer forwarding what it read elsewhere). `None`
+    /// means "derive the independence key from `source_entity_id` as
+    /// always" — for a relay that conservatively collapses to
+    /// `mesh:unattributed`. When set on a relay, corroboration is keyed on
+    /// the origin (namespaced `mesh:…`, see [`origin_source_key_for`]), so
+    /// two peers relaying two genuinely different origin sources count as
+    /// two pieces of evidence instead of one.
+    ///
+    /// `#[serde(default)]` keeps previously serialized forms deserializable.
+    #[serde(default)]
+    pub origin_source_id: Option<String>,
 }
 
 /// A subject/predicate/object triple to reify as a PROV-O assertion
@@ -354,7 +366,8 @@ pub struct RecalledMaterialFact {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EvidenceContribution {
     /// Canonical independence key (`doi:…` / `url:…` / `file:…` /
-    /// `document:…` / `opaque:…` / `mesh:unattributed`).
+    /// `document:…` / `opaque:…`; relays are `mesh:<origin key>` when the
+    /// peer conveyed the origin, `mesh:unattributed` when it did not).
     pub source_key: String,
     /// The locator/display string exactly as this contribution supplied it.
     pub source_entity_id: String,
@@ -513,13 +526,15 @@ fn conditioned_assertion_id(
 /// only prevents repeat-ingest and relay double counting.
 ///
 /// `relay` marks a write that carries someone ELSE's knowledge — a mesh peer
-/// is an agent/relay, not an independent source. The current wire format
-/// cannot carry the origin's own key end-to-end, so every relayed
-/// contribution collapses onto the single conservative key
-/// `mesh:unattributed`: all relays of one assertion count ONCE, never once
-/// per peer. Undercounting genuinely different unknown sources is the
-/// accepted cost; letting N peers echo one fact into N "corroborations" is
-/// exactly the defect this key exists to prevent.
+/// is an agent/relay, not an independent source. A relayed contribution
+/// whose ORIGIN is unknown collapses onto the single conservative key
+/// `mesh:unattributed`: all unattributed relays of one assertion count
+/// ONCE, never once per peer. Undercounting genuinely different unknown
+/// sources is the accepted cost; letting N peers echo one fact into N
+/// "corroborations" is exactly the defect this key exists to prevent. A
+/// relay that DOES carry its origin is keyed on that origin instead — see
+/// [`origin_source_key_for`], which is where `LocalProvenance` writes
+/// derive their key.
 fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
     if relay {
         return "mesh:unattributed".to_string();
@@ -578,8 +593,46 @@ fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
 /// the source itself. `crates/mesh/src/sync.rs` marks its writes with both
 /// `tenant = "mesh"` and `locality = "mesh"`; either alone is treated as a
 /// relay so a partially-filled provenance errs on the conservative side.
-fn is_relay(prov: &LocalProvenance) -> bool {
-    prov.locality == "mesh" || prov.tenant == "mesh"
+///
+/// Takes the two markers rather than a `LocalProvenance` so the v5 migration
+/// — which recovers `locality` from the stored activity row — classifies
+/// with the SAME rule as the live path instead of an approximation of it.
+fn is_relay(locality: &str, tenant: &str) -> bool {
+    locality == "mesh" || tenant == "mesh"
+}
+
+/// Independence key for one write, honouring an explicit origin when the
+/// provenance carries one ([`LocalProvenance::origin_source_id`]).
+///
+/// - **No explicit origin**: exactly the historical derivation from
+///   `source_entity_id` — locals normalize per [`origin_source_key`],
+///   relays collapse to `mesh:unattributed`.
+/// - **Local write with an explicit origin**: the writer read the source
+///   itself and is trusted; the key derives from the stated origin.
+/// - **Relay with an explicit origin**: the origin string is PEER-SUPPLIED
+///   input — the peer chooses it. It gets the same alias-collapsing
+///   normalization (so two peers naming one DOI two ways still count once),
+///   but the result is then namespaced under `mesh:` so an attacker-chosen
+///   origin can never equal a locally-derived key. Local derivation can
+///   never produce a `mesh:…` key either — a literal `mesh:…` locator falls
+///   through to the opaque branch and becomes `opaque:mesh:…` — so the two
+///   namespaces are disjoint by construction: a relay cannot claim `local`
+///   origin, and a local write cannot be mistaken for a relay. Even if a
+///   future bug wrote a relay under a non-mesh tenant (today `is_relay`
+///   implies tenant "mesh", whose assertion ids are tenant-separated
+///   anyway), its evidence key still could not collide with — or suppress,
+///   via the same-source dedupe — any local source's contribution.
+fn origin_source_key_for(prov: &LocalProvenance) -> String {
+    let origin = prov
+        .origin_source_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty());
+    match (origin, is_relay(&prov.locality, &prov.tenant)) {
+        (Some(origin), true) => format!("mesh:{}", origin_source_key(origin, false)),
+        (Some(origin), false) => origin_source_key(origin, false),
+        (None, relay) => origin_source_key(&prov.source_entity_id, relay),
+    }
 }
 
 /// The DOI when `source` is one, in normalized form: prefix stripped,
@@ -755,27 +808,49 @@ fn classify_busy(error: anyhow::Error) -> anyhow::Error {
 /// concurrent writer of the same rows waits here (up to `busy_timeout`)
 /// instead of both reading, both writing, and one dying on a key conflict
 /// mid-document.
-async fn begin_immediate(conn: &turso::Connection) -> Result<()> {
-    conn.execute("BEGIN IMMEDIATE", ())
-        .await
-        .map_err(|e| classify_busy(anyhow::Error::new(e)))?;
-    Ok(())
+///
+/// Returns the engine's RAII transaction guard rather than `()`, so the
+/// transaction cannot outlive the scope that opened it. If the guard is
+/// dropped without [`finish_write_txn`] — async cancellation dropping the
+/// future between two statements, or a panic unwinding through them — its
+/// `Drop` marks the connection, and the NEXT operation on this handle rolls
+/// the abandoned transaction back before doing anything else
+/// (`turso::Connection::maybe_handle_dangling_tx`, run at the top of every
+/// `query`/`execute`). Rollback is async and `Drop` is not, so an eager
+/// rollback in `Drop` is impossible; deferring it to the next operation is
+/// the engine's own resolution, and it is sufficient because NOTHING can
+/// observe the abandoned state — any read rolls back before returning rows,
+/// and any write rolls back before its own `BEGIN`. Residual, stated
+/// honestly: until some operation touches this handle (or the connection
+/// closes, which discards the transaction), the database file lock stays
+/// held and writers on OTHER handles wait out their busy timeout.
+async fn begin_immediate(conn: &turso::Connection) -> Result<turso::transaction::Transaction<'_>> {
+    turso::transaction::Transaction::new_unchecked(
+        conn,
+        turso::transaction::TransactionBehavior::Immediate,
+    )
+    .await
+    .map_err(|e| classify_busy(anyhow::Error::new(e)))
 }
 
-/// COMMIT the open transaction on success; ROLLBACK (best effort) on
-/// failure so no partial fact survives. Every error out of here is
-/// busy-classified.
-async fn finish_write_txn(conn: &turso::Connection, result: Result<()>) -> Result<()> {
+/// COMMIT the open transaction on success; ROLLBACK on failure so no
+/// partial fact survives. Every error out of here is busy-classified.
+/// If a terminal statement itself fails, the guard's drop flag still heals
+/// the connection on its next operation (see [`begin_immediate`]).
+async fn finish_write_txn(
+    txn: turso::transaction::Transaction<'_>,
+    result: Result<()>,
+) -> Result<()> {
     match result {
-        Ok(()) => match conn.execute("COMMIT", ()).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(classify_busy(anyhow::Error::new(e)).context("commit failed; rolled back"))
-            }
-        },
+        Ok(()) => txn.commit().await.map_err(|e| {
+            classify_busy(anyhow::Error::new(e)).context(
+                "commit failed; the transaction rolls back on the connection's next operation",
+            )
+        }),
         Err(e) => {
-            let _ = conn.execute("ROLLBACK", ()).await;
+            // Explicit so the failure path releases the file lock NOW; on a
+            // rollback error the deferred drop-flag path takes over.
+            let _ = txn.rollback().await;
             Err(classify_busy(e))
         }
     }
@@ -931,7 +1006,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     // the whole migration over freshly migrated rows. Everything up to and
     // including the stamp commits atomically — a crash mid-migration leaves
     // the database exactly pre-migration, never half re-keyed.
-    begin_immediate(conn).await?;
+    let txn = begin_immediate(conn).await?;
     let result = async {
         let version = read_user_version(conn).await?;
         if version >= PROV_EVIDENCE_VERSION {
@@ -966,7 +1041,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         Ok(())
     }
     .await;
-    finish_write_txn(conn, result).await
+    finish_write_txn(txn, result).await
 }
 
 /// v5 backfill: give every pre-evidence assertion its one still-identifiable
@@ -1001,17 +1076,21 @@ async fn migrate_corroborations_to_evidence(conn: &turso::Connection) -> Result<
         agent: String,
         class: EvidenceClass,
         tenant: String,
+        locality: String,
     }
 
     // Drain every row before writing (Turso pre-release mishandles
-    // interleaved statements on one connection).
+    // interleaved statements on one connection). The activity row is JOINed
+    // back in because it carries the relay marker (`locality`) the assertion
+    // row itself never stored — see the relay classification below.
     let mut pending: Vec<LegacyRow> = Vec::new();
     {
         let mut rows = conn
             .query(
-                "SELECT id, confidence, corroborations, activity_id, source, agent, \
-                        evidence_class, tenant \
-                 FROM prov_assertion",
+                "SELECT a.id, a.confidence, a.corroborations, a.activity_id, a.source, \
+                        a.agent, a.evidence_class, a.tenant, act.locality \
+                 FROM prov_assertion a \
+                 LEFT JOIN prov_activity act ON act.id = a.activity_id",
                 (),
             )
             .await?;
@@ -1040,19 +1119,33 @@ async fn migrate_corroborations_to_evidence(conn: &turso::Connection) -> Result<
                 agent: crate::get_str(&row, 5)?,
                 class: EvidenceClass::from_stored(&crate::get_str(&row, 6)?),
                 tenant: crate::get_str(&row, 7)?,
+                // NULL (no matching activity row) reads as "".
+                locality: crate::get_str(&row, 8)?,
             });
         }
     }
 
     for legacy in pending {
-        // Same derivation future writes use. The only relay marker still
-        // recoverable from a stored row is the mesh tenant itself: the live
-        // path also checks `locality`, but that was never persisted, so a
-        // legacy relay stored under a non-mesh tenant migrates to a real
-        // per-URL key while a later live relay of the same fact gets
-        // `mesh:unattributed` — a known, accepted split (it can only
-        // undercount corroboration, never inflate it).
-        let source_key = origin_source_key(&legacy.source, legacy.tenant == "mesh");
+        // Same derivation AND same relay rule as every future write: a relay
+        // is `locality == "mesh" || tenant == "mesh"` ([`is_relay`]). The
+        // locality was never persisted on the assertion row, but the
+        // assertion's activity row was, and carries it — so it is recovered
+        // from there rather than approximated by the tenant alone. Tenant-only
+        // classification split one relayed source across two keys (the
+        // migration's `url:…` vs the live path's `mesh:unattributed`), so
+        // replaying the same relay after migration counted as a second
+        // "source" and INFLATED confidence — phantom corroboration, the exact
+        // defect this table exists to prevent.
+        //
+        // A row whose activity row is missing reads an empty locality and
+        // falls back to the tenant marker alone. That is the only signal
+        // left, and it is the deliberate direction: treating "unknown" as a
+        // relay instead would collapse every such row's REAL per-source
+        // evidence onto `mesh:unattributed`, destroying genuine
+        // corroboration. (In practice the activity row exists: it is written
+        // in the same transaction as the assertion.)
+        let source_key =
+            origin_source_key(&legacy.source, is_relay(&legacy.locality, &legacy.tenant));
         let aggregate = legacy.corroborations > 1;
         let inserted = conn
             .execute(
@@ -1727,7 +1820,6 @@ impl ProvenanceStore {
         let conditions = payload.conditions().to_vec();
         validate_conditions(&conditions)?;
         let fact = payload.to_local_fact();
-        let confidence = fact.confidence.unwrap_or(0.5);
         let tenant = prov.tenant.as_str();
 
         // Mirror core: a measurement without a value fails schema validation
@@ -1750,8 +1842,33 @@ impl ProvenanceStore {
         // opaque "cannot start a transaction within a transaction", not
         // `StoreBusy` (see `ProvenanceStore::write_lock`).
         let _same_handle_guard = self.write_lock.lock().await;
-        begin_immediate(&self.conn).await?;
+        let txn = begin_immediate(&self.conn).await?;
         let result: Result<()> = async {
+            // The assertion runs FIRST, and the graph writes below reuse the
+            // aggregates it returns: `confidence` and `evidence_class` are
+            // REBOUND here from this one write's own values to the parent
+            // row's post-update state. That is what keeps the graph on the
+            // same evidence gate as the assertion — a duplicate source
+            // cannot move an edge's confidence, a re-record cannot upgrade a
+            // Measurement node's class, and a genuine corroboration lifts
+            // the edge to the combined (noisy-OR) confidence instead of the
+            // last writer's own number.
+            let (confidence, evidence_class) = self
+                .record_assertion_in_open_txn(
+                    &LocalAssertion {
+                        subject: fact.subject.clone(),
+                        predicate: fact.predicate.clone(),
+                        object: fact.object.clone(),
+                        confidence: fact.confidence,
+                    },
+                    prov,
+                    fact.value,
+                    fact.unit.as_deref(),
+                    &conditions,
+                    evidence_class,
+                )
+                .await?;
+
             match fact.kind.as_deref() {
                 Some("measurement") => {
                     // Guarded above; destructure the value the guard proved.
@@ -1947,28 +2064,27 @@ impl ProvenanceStore {
                     .await?;
                 }
             }
-
-            self.record_assertion_in_open_txn(
-                &LocalAssertion {
-                    subject: fact.subject.clone(),
-                    predicate: fact.predicate.clone(),
-                    object: fact.object.clone(),
-                    confidence: fact.confidence,
-                },
-                prov,
-                fact.value,
-                fact.unit.as_deref(),
-                &conditions,
-                evidence_class,
-            )
-            .await
+            Ok(())
         }
         .await;
-        finish_write_txn(&self.conn, result).await
+        finish_write_txn(txn, result).await
     }
 
     /// UPSERT the PROV-O agent + activity for one run (idempotent).
     pub async fn record_activity(&self, prov: &LocalProvenance) -> Result<()> {
+        // Under the shared write lock: on the one shared connection an
+        // unlocked write silently joins whatever raw transaction is
+        // currently open — and is erased by that transaction's rollback
+        // AFTER this call already returned Ok (see
+        // `ProvenanceStore::write_lock`).
+        let _same_handle_guard = self.write_lock.lock().await;
+        self.record_activity_in_open_txn(prov).await
+    }
+
+    /// The agent + activity writes. Caller must hold `write_lock` — either
+    /// bare (the two statements run autocommit) or with an open write
+    /// transaction (they join it, which is then the caller's own).
+    async fn record_activity_in_open_txn(&self, prov: &LocalProvenance) -> Result<()> {
         self.conn
             .execute(
                 r#"INSERT INTO prov_agent (id, kind) VALUES (?1, ?2)
@@ -2033,18 +2149,25 @@ impl ProvenanceStore {
         evidence_class: EvidenceClass,
     ) -> Result<()> {
         let _same_handle_guard = self.write_lock.lock().await;
-        begin_immediate(&self.conn).await?;
+        let txn = begin_immediate(&self.conn).await?;
         let result = self
             .record_assertion_in_open_txn(a, prov, value, unit, conditions, evidence_class)
-            .await;
-        finish_write_txn(&self.conn, result).await
+            .await
+            .map(|_aggregates| ());
+        finish_write_txn(txn, result).await
     }
 
     /// The assertion + evidence write sequence. Caller MUST hold an open
     /// `BEGIN IMMEDIATE` transaction ([`begin_immediate`]/
-    /// [`finish_write_txn`]) — this issues writes only, no SELECT, so there
-    /// is no read cursor to interleave with them (Turso pre-release is
+    /// [`finish_write_txn`]) — this issues writes first and exactly one
+    /// fully-drained SELECT at the end (the aggregate read-back), so no open
+    /// read cursor ever interleaves with a write (Turso pre-release is
     /// sensitive to interleaved statements on one connection).
+    ///
+    /// Returns the parent row's POST-update aggregates
+    /// `(confidence, evidence_class)` so `write_fact_as` can mirror them
+    /// into the EMMO graph in the same transaction — the graph must follow
+    /// the evidence gate and `WORST_CLASS_CASE`, never the last writer.
     ///
     /// Why not one UPSERT: a single statement on `prov_assertion` cannot
     /// tell a duplicate assertion from the same source apart from the same
@@ -2061,7 +2184,7 @@ impl ProvenanceStore {
         unit: Option<&str>,
         conditions: &[MeasurementCondition],
         evidence_class: EvidenceClass,
-    ) -> Result<()> {
+    ) -> Result<(f64, EvidenceClass)> {
         // Normalize before any write. `None` keeps the historical "asserted
         // without a stated confidence = full confidence" contract; NaN and
         // infinity are rejected rather than clamped because they are always
@@ -2084,9 +2207,9 @@ impl ProvenanceStore {
             conditions,
         )?;
         let conditions_json = serde_json::to_string(conditions)?;
-        let source_key = origin_source_key(&prov.source_entity_id, is_relay(prov));
+        let source_key = origin_source_key_for(prov);
 
-        self.record_activity(prov).await?;
+        self.record_activity_in_open_txn(prov).await?;
 
         // Create the aggregate row if this is the first sighting. DO NOTHING
         // on conflict: `activity_id`/`source`/`agent` are the FIRST-committed
@@ -2250,11 +2373,33 @@ impl ProvenanceStore {
                                MIN(0.99, 1.0 - confidence_doubt)
                            )
                        WHERE id = ?1"#,
-                    [Value::Text(id)],
+                    [Value::Text(id.clone())],
                 )
                 .await?;
         }
-        Ok(())
+
+        // Read the parent's post-update aggregates back — inside the same
+        // transaction, after every write, cursor fully drained — so the
+        // caller's graph writes carry the evidence-gated values, not this
+        // one write's own confidence and class.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT confidence, evidence_class FROM prov_assertion WHERE id = ?1",
+                [Value::Text(id)],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            anyhow::bail!("assertion row vanished inside its own transaction");
+        };
+        let aggregate_confidence = row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_real().copied())
+            .unwrap_or(0.0);
+        let aggregate_class = EvidenceClass::from_stored(&get_str(&row, 1)?);
+        while rows.next().await?.is_some() {}
+        Ok((aggregate_confidence, aggregate_class))
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2287,6 +2432,37 @@ impl ProvenanceStore {
             nodes.push(row_to_node(&row, 0)?);
         }
         Ok(nodes)
+    }
+
+    /// The origin locator this store can honestly report for one entity:
+    /// the lexicographically smallest `source` among stored assertions that
+    /// mention the entity (as subject or object) under this tenant, or
+    /// `None` when no assertion mentions it.
+    ///
+    /// An entity extracted from several sources has several true origins;
+    /// one row of the peer-sync wire format carries exactly one, so the
+    /// smallest is chosen for determinism — it is always a REAL recorded
+    /// locator, never synthesized. `prov_assertion.source` is the immutable
+    /// FIRST attribution of each assertion, so a later corroborating source
+    /// cannot displace an assertion's original attribution here.
+    pub async fn entity_origin(&self, name: &str, tenant: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"SELECT source FROM prov_assertion
+                   WHERE tenant = ?1 AND (subject = ?2 OR object = ?3)
+                   ORDER BY source LIMIT 1"#,
+                [
+                    Value::Text(tenant.to_string()),
+                    Value::Text(name.to_string()),
+                    Value::Text(name.to_string()),
+                ],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(get_str(&row, 0)?)),
+            None => Ok(None),
+        }
     }
 
     /// Edges incident to the named entity (resolved via its canonical key or
@@ -2564,6 +2740,21 @@ impl ProvenanceStore {
         tenant: &str,
         vector: &[f32],
     ) -> Result<()> {
+        // Under the shared write lock so this single-statement write cannot
+        // join (and be rolled back with) a raw transaction some other task
+        // has open on the one shared connection.
+        let _same_handle_guard = self.write_lock.lock().await;
+        self.store_entity_embedding_locked(key, tenant, vector)
+            .await
+    }
+
+    /// The vector UPSERT itself. Caller must hold `write_lock`.
+    async fn store_entity_embedding_locked(
+        &self,
+        key: &str,
+        tenant: &str,
+        vector: &[f32],
+    ) -> Result<()> {
         self.conn
             .execute(
                 r#"INSERT OR REPLACE INTO emmo_embedding
@@ -2611,6 +2802,11 @@ impl ProvenanceStore {
         }
         let vectors = backend.embed(&names).await?;
 
+        // Locked AFTER the embedding call (a model pass must never hold the
+        // store's write lock) and across the whole key-resolve/UPSERT loop,
+        // so no vector write can join another task's open raw transaction on
+        // the shared connection.
+        let _same_handle_guard = self.write_lock.lock().await;
         let mut stored = 0usize;
         for (name, vector) in names.iter().zip(&vectors) {
             // The read cursor is fully drained BEFORE the writes below
@@ -2631,7 +2827,8 @@ impl ProvenanceStore {
                 keys
             };
             for key in keys {
-                self.store_entity_embedding(&key, tenant, vector).await?;
+                self.store_entity_embedding_locked(&key, tenant, vector)
+                    .await?;
                 stored += 1;
             }
         }
@@ -2830,6 +3027,7 @@ mod tests {
             started_at: "2026-07-13T00:00:00Z".into(),
             ended_at: "2026-07-13T00:00:01Z".into(),
             locality: "local".into(),
+            origin_source_id: None,
         }
     }
 
@@ -2868,6 +3066,15 @@ mod tests {
         let mut rows = store.conn.query(sql, ()).await.unwrap();
         let row = rows.next().await.unwrap().unwrap();
         get_str(&row, 0).unwrap()
+    }
+
+    async fn query_f64(store: &ProvenanceStore, sql: &str) -> f64 {
+        let mut rows = store.conn.query(sql, ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get_value(0)
+            .ok()
+            .and_then(|v| v.as_real().copied())
+            .unwrap_or(f64::NAN)
     }
 
     #[tokio::test]
@@ -3524,6 +3731,101 @@ mod tests {
         );
     }
 
+    /// The EMMO graph must AGREE with the assertion. `upsert_edge` is
+    /// last-writer-wins on `confidence`, and the Measurement node's
+    /// `props_json` is replaced wholesale — so before the graph writes were
+    /// fed the assertion's post-update aggregates, a DUPLICATE source could
+    /// re-record Research/0.8 as ReferenceValidated/0.2 and, while the
+    /// evidence row and assertion correctly stayed Research/0.8, the edge
+    /// dropped to 0.2 and the node UPGRADED to reference_validated: same
+    /// evidence set, different graph, evidence class upgraded by a
+    /// duplicate. The graph must follow the evidence gate and
+    /// `WORST_CLASS_CASE`, never the last writer.
+    #[tokio::test]
+    async fn the_graph_edge_follows_the_evidence_gate_not_the_last_writer() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let measurement = |confidence, evidence_class| MaterialFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_measurement".into(),
+            object: "UTS".into(),
+            value: Some(1140.0),
+            unit: Some(QudtUnit::new("QUDT:MegaPA").unwrap()),
+            conditions: vec![],
+            confidence: Some(confidence),
+            kind: Some("measurement".into()),
+            evidence_class,
+        };
+
+        store
+            .write_fact(
+                &measurement(0.8, EvidenceClass::Research),
+                &prov_from("doc:paper_a", "act_1"),
+            )
+            .await
+            .unwrap();
+        // The SAME source re-recorded "better" but weaker: the assertion
+        // keeps Research/0.8, so the graph must too.
+        store
+            .write_fact(
+                &measurement(0.2, EvidenceClass::ReferenceValidated),
+                &prov_from("doc:paper_a", "act_2"),
+            )
+            .await
+            .unwrap();
+
+        for rel in ["HAS_MEASUREMENT", "OF_PROPERTY"] {
+            let confidence = query_f64(
+                &store,
+                &format!("SELECT confidence FROM emmo_edge WHERE rel_type = '{rel}'"),
+            )
+            .await;
+            assert!(
+                (confidence - 0.8).abs() < 1e-9,
+                "a duplicate source moved the {rel} edge to {confidence}"
+            );
+        }
+        let props: serde_json::Value = serde_json::from_str(
+            &query_str(
+                &store,
+                "SELECT props_json FROM emmo_entity WHERE label = 'Measurement'",
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(
+            props["evidence_class"], "research",
+            "a duplicate source upgraded the Measurement node's evidence class"
+        );
+        assert_eq!(
+            props["confidence"].as_f64(),
+            Some(0.8),
+            "a duplicate source moved the Measurement node's confidence"
+        );
+
+        // A genuinely NEW source corroborates: the graph follows the
+        // assertion's combined aggregate (noisy-OR 0.96), not the last
+        // writer's own 0.8.
+        store
+            .write_fact(
+                &measurement(0.8, EvidenceClass::Research),
+                &prov_from("doc:paper_b", "act_3"),
+            )
+            .await
+            .unwrap();
+        for rel in ["HAS_MEASUREMENT", "OF_PROPERTY"] {
+            let confidence = query_f64(
+                &store,
+                &format!("SELECT confidence FROM emmo_edge WHERE rel_type = '{rel}'"),
+            )
+            .await;
+            assert!(
+                (confidence - 0.96).abs() < 1e-9,
+                "a corroborated edge must carry the combined confidence, got {confidence} for {rel}"
+            );
+        }
+    }
+
     /// The independence key collapses the obvious aliases of one source and
     /// keeps genuinely different sources apart.
     #[test]
@@ -3824,6 +4126,287 @@ mod tests {
         );
     }
 
+    /// The capability [`LocalProvenance::origin_source_id`] exists for: two
+    /// peers relaying two genuinely DIFFERENT origin sources are two pieces
+    /// of evidence, so the mesh tenant can accumulate convergence instead
+    /// of silently dropping the second peer's contribution.
+    #[tokio::test]
+    async fn mesh_relays_of_two_different_origins_corroborate() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for (peer, activity, origin) in [
+            ("http://peer-one.example/api#ds", "act_m1", "doi:10.1234/x"),
+            ("http://peer-two.example/api#ds", "act_m2", "doi:10.1234/y"),
+        ] {
+            let mut prov = prov_from(peer, activity);
+            prov.tenant = "mesh".into();
+            prov.locality = "mesh".into();
+            prov.origin_source_id = Some(origin.into());
+            store.record_assertion(&a, &prov).await.unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2,
+            "two different relayed origins must be two evidence rows"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion_evidence WHERE \
+                 source_key IN ('mesh:doi:10.1234/x', 'mesh:doi:10.1234/y')",
+            )
+            .await,
+            2,
+            "relayed origins must be keyed inside the mesh: namespace"
+        );
+        let facts = store.recall("alpha-beta", "mesh", 10).await.unwrap();
+        assert_eq!(facts.len(), 1, "one assertion row carries both origins");
+        assert!(
+            (facts[0].confidence - 0.96).abs() < 1e-9,
+            "two independent 0.8 origins must noisy-OR to 0.96, got {}",
+            facts[0].confidence
+        );
+    }
+
+    /// Two peers relaying THE SAME origin — spelled two alias ways — are
+    /// one observation: the relayed origin goes through the same
+    /// alias-collapsing normalization as a local locator, so echoing a
+    /// source cannot mint phantom corroboration.
+    #[tokio::test]
+    async fn mesh_relays_of_one_origin_count_once() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for (peer, activity, origin) in [
+            (
+                "http://peer-one.example/api#ds",
+                "act_m1",
+                "doi:10.1234/AbC",
+            ),
+            (
+                "http://peer-two.example/api#ds",
+                "act_m2",
+                " https://doi.org/10.1234/abc ",
+            ),
+        ] {
+            let mut prov = prov_from(peer, activity);
+            prov.tenant = "mesh".into();
+            prov.locality = "mesh".into();
+            prov.origin_source_id = Some(origin.into());
+            store.record_assertion(&a, &prov).await.unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "two spellings of one origin must stay one evidence row"
+        );
+        assert_eq!(
+            query_str(&store, "SELECT source_key FROM prov_assertion_evidence").await,
+            "mesh:doi:10.1234/abc"
+        );
+        let facts = store.recall("alpha-beta", "mesh", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "one origin echoed by two peers inflated confidence to {}",
+            facts[0].confidence
+        );
+    }
+
+    /// A peer-supplied origin is attacker-chosen input. Claiming the exact
+    /// locator of a locally-ingested source must not corroborate — or even
+    /// touch — the local tenant's fact: the tenant-keyed assertion id lands
+    /// the relay on the mesh tenant's own row, and the relayed key lives in
+    /// the disjoint `mesh:` namespace, so it cannot equal (or dedupe
+    /// against) the local contribution's key either.
+    #[tokio::test]
+    async fn a_peer_supplied_origin_cannot_corroborate_a_local_fact() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        // The user ingests a paper locally.
+        let mut local = prov_from("/data/papers/x.pdf", "act_local");
+        local.tenant = "local".into();
+        store.record_assertion(&a, &local).await.unwrap();
+
+        // A peer claims ITS copy of the fact came from that very file.
+        let mut mesh = prov_from("http://peer-one.example/api#ds", "act_mesh");
+        mesh.tenant = "mesh".into();
+        mesh.locality = "mesh".into();
+        mesh.origin_source_id = Some("/data/papers/x.pdf".into());
+        store.record_assertion(&a, &mesh).await.unwrap();
+
+        // The local fact is untouched: its own confidence, its own single
+        // evidence contribution under the un-namespaced local key.
+        let facts = store.recall("alpha-beta", "local", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "a relayed claim of the local locator inflated the LOCAL fact to {}",
+            facts[0].confidence
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion_evidence \
+                 WHERE source_key = 'file:/data/papers/x.pdf'",
+            )
+            .await,
+            1,
+            "only the local ingest may own the un-namespaced key"
+        );
+        assert_eq!(
+            query_str(
+                &store,
+                "SELECT source_key FROM prov_assertion_evidence \
+                 WHERE activity_id = 'act_mesh'",
+            )
+            .await,
+            "mesh:file:/data/papers/x.pdf",
+            "the relay's claim must stay inside the mesh: namespace"
+        );
+    }
+
+    /// Key derivation honours an explicit origin, and the relayed
+    /// namespace is disjoint from every locally-derivable one.
+    #[test]
+    fn origin_source_key_for_honours_and_namespaces_the_origin() {
+        let mut prov = test_prov(); // tenant "t1", locality "local"
+        prov.source_entity_id = "/data/x.pdf".into();
+
+        // No origin: exactly the historical locator derivation.
+        assert_eq!(origin_source_key_for(&prov), "file:/data/x.pdf");
+
+        // A local writer stating the origin it read is trusted directly.
+        prov.origin_source_id = Some("doi:10.1234/AbC".into());
+        assert_eq!(origin_source_key_for(&prov), "doi:10.1234/abc");
+
+        // A relay's origin is normalized, then namespaced under mesh:.
+        prov.locality = "mesh".into();
+        assert_eq!(origin_source_key_for(&prov), "mesh:doi:10.1234/abc");
+
+        // A blank or absent origin is NO origin — conservative collapse.
+        prov.origin_source_id = Some("   ".into());
+        assert_eq!(origin_source_key_for(&prov), "mesh:unattributed");
+        prov.origin_source_id = None;
+        assert_eq!(origin_source_key_for(&prov), "mesh:unattributed");
+
+        // No local derivation can mint a mesh: key — a literal mesh:…
+        // locator lands in the opaque namespace — so a relay cannot claim
+        // local origin and a local write cannot pose as a relay's.
+        assert_eq!(
+            origin_source_key("mesh:unattributed", false),
+            "opaque:mesh:unattributed"
+        );
+        assert_eq!(
+            origin_source_key("mesh:doi:10.1234/x", false),
+            "opaque:mesh:doi:10.1234/x"
+        );
+    }
+
+    /// v5 migration: a legacy RELAY row stored under a real tenant (tenant
+    /// `t1`, activity locality `mesh`) must migrate to the SAME
+    /// `mesh:unattributed` key the live path assigns. The locality was never
+    /// stored on the assertion row, but the assertion's activity row was,
+    /// and carries it — a migration that classified relays by tenant alone
+    /// assigned `url:…` here, so replaying the same relay live created a
+    /// SECOND evidence row and inflated 0.8 to 0.96: phantom corroboration.
+    #[tokio::test]
+    async fn a_legacy_relay_under_a_real_tenant_migrates_like_the_live_path() {
+        let db = TempDb::new();
+        let id = assertion_id("t1", "Ti-6Al-4V", "has_phase", "alpha-beta");
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            drop(store); // schema now exists
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_activity
+                   (id, agent_id, source_entity_id, tenant, started_at, ended_at, locality)
+                   VALUES ('act_relay', 'peer-agent', 'https://peer.example/data', 't1',
+                           '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', 'mesh')"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant)
+                   VALUES (?1, 'Ti-6Al-4V', 'has_phase', 'alpha-beta', '[]', 'research',
+                           0.8, 1, 'act_relay', 'https://peer.example/data', 'peer-agent', 't1')"#,
+                [Value::Text(id.clone())],
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+        }
+
+        // Reopening runs the v5 backfill.
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            query_str(&store, "SELECT source_key FROM prov_assertion_evidence").await,
+            "mesh:unattributed",
+            "the migration must classify tenant-t1/locality-mesh as a relay, \
+             exactly like the live path"
+        );
+
+        // Replaying the SAME relay live must be the same source, not a
+        // second one.
+        let mut prov = prov_from("https://peer.example/data", "act_relay_live");
+        prov.locality = "mesh".into();
+        store
+            .record_assertion(
+                &LocalAssertion {
+                    subject: "Ti-6Al-4V".into(),
+                    predicate: "has_phase".into(),
+                    object: "alpha-beta".into(),
+                    confidence: Some(0.8),
+                },
+                &prov,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "the migrated relay and the live relay split into two evidence \
+             rows — one relayed source counted twice"
+        );
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "replaying one relayed source inflated confidence to {}",
+            facts[0].confidence
+        );
+    }
+
     /// Two concurrent writers, same assertion, same source: both succeed,
     /// one evidence row, confidence unchanged — no key conflict escapes and
     /// no phantom corroboration happens.
@@ -4034,6 +4617,124 @@ mod tests {
         assert_eq!(
             count(&writer, "SELECT COUNT(*) FROM prov_assertion").await,
             1
+        );
+    }
+
+    /// A write cancelled mid-transaction must leave the connection USABLE:
+    /// the next operation rolls the abandoned transaction back, so reads
+    /// never see the partial rows and the next write does not die on
+    /// "cannot start a transaction within a transaction".
+    ///
+    /// Cancellation is simulated by dropping the transaction guard exactly
+    /// where a dropped future drops it — after a write, before COMMIT. The
+    /// public path cannot be cancelled deterministically: turso's local
+    /// statements complete without yielding, so there is no await point for
+    /// a test to park a real cancellation on. Rollback is async and `Drop`
+    /// is not, so the guard defers the rollback to the connection's next
+    /// operation (see [`begin_immediate`]) — which is why the READ below is
+    /// itself part of the pin.
+    #[tokio::test]
+    async fn a_cancelled_write_rolls_back_and_the_store_stays_usable() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        {
+            let _guard = store.write_lock.lock().await;
+            let txn = begin_immediate(&store.conn).await.unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO prov_agent (id, kind) VALUES ('half-written', 'SoftwareAgent')",
+                    (),
+                )
+                .await
+                .unwrap();
+            drop(txn); // the future is dropped here — COMMIT never runs
+        }
+
+        // The next READ must not see the abandoned transaction's rows.
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_agent").await,
+            0,
+            "the cancelled write's partial rows are visible — the abandoned \
+             transaction was never rolled back"
+        );
+
+        // The next WRITE must succeed instead of surfacing the opaque
+        // nested-transaction error, and land its full fact.
+        store
+            .record_assertion(
+                &LocalAssertion {
+                    subject: "Ti-6Al-4V".into(),
+                    predicate: "has_phase".into(),
+                    object: "alpha-beta".into(),
+                    confidence: Some(0.8),
+                },
+                &prov_from("doc:after_cancel", "act_after"),
+            )
+            .await
+            .expect("the store stayed wedged inside the cancelled transaction");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_agent").await,
+            1,
+            "only the post-cancel writer's agent row may exist"
+        );
+    }
+
+    /// A `record()` racing an OPEN `write_fact` transaction on the same
+    /// handle must not silently join it. The unlocked path let B's INSERT
+    /// land inside A's transaction, so A's rollback erased a record whose
+    /// caller had already been told `Ok(())` — a silent lost write. Every
+    /// writer on the shared connection must hold the same write lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_record_racing_an_open_write_transaction_is_not_lost() {
+        let db = TempDb::new();
+        let store = std::sync::Arc::new(ProvenanceStore::open(&db.path).await.unwrap());
+
+        // A: open a write transaction exactly as `write_fact` does — lock
+        // first, then BEGIN IMMEDIATE — and keep it open while B runs.
+        let guard = store.write_lock.lock().await;
+        let txn = begin_immediate(&store.conn).await.unwrap();
+
+        // B: an unrelated ledger write through the public API.
+        let record = crate::new_record(
+            "race-session",
+            crate::ActionType::ToolCall,
+            crate::Actor::Agent,
+            Some("t"),
+            None,
+            serde_json::json!({}),
+        );
+        let writer = {
+            let store = store.clone();
+            let record = record.clone();
+            tokio::spawn(async move { store.record(&record).await })
+        };
+
+        // Give B every chance to (wrongly) run its INSERT while A's
+        // transaction is open.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // A's fact is rejected (the NaN-confidence path) — A rolls back.
+        let rejected: Result<()> = Err(anyhow::anyhow!("assertion confidence must be finite"));
+        finish_write_txn(txn, rejected)
+            .await
+            .expect_err("the rejected write must surface its error");
+        drop(guard);
+
+        writer
+            .await
+            .unwrap()
+            .expect("record() must succeed, after the transaction, not inside it");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM provenance_records").await,
+            1,
+            "record() returned Ok but the row is gone — it joined A's \
+             transaction and was destroyed by A's rollback"
         );
     }
 
@@ -4370,6 +5071,7 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".into(),
                 ended_at: "2026-01-01T00:00:00Z".into(),
                 locality: tenant.into(),
+                origin_source_id: None,
             };
             store.record_assertion(&assertion, &prov).await.unwrap();
         }
@@ -4456,6 +5158,7 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".into(),
             ended_at: "2026-01-01T00:00:00Z".into(),
             locality: "local".into(),
+            origin_source_id: None,
         };
         store
             .record_assertion(

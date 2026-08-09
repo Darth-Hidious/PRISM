@@ -9,7 +9,7 @@ use tracing;
 use crate::local_facts::to_local_facts;
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
-use crate::validation::{self, ValidationReport};
+use crate::validation::{self, Severity, ValidationReport};
 use crate::{DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, SchemaAnalysis};
 
 /// Result of a complete ingest operation.
@@ -153,7 +153,23 @@ impl IngestPipeline {
 
         // Step 3: LLM entity extraction (if configured)
         let mut errors: Vec<String> = Vec::new();
-        let entities = if let Some(ref llm_config) = self.config.llm {
+        // Error-severity validation (empty frame, duplicate columns) is a
+        // refusal to extract, not a warning to scroll past — see
+        // `extraction_refusal`. Checked only when extraction is configured:
+        // a schema-only run extracts nothing and already reports the full
+        // `validation` field.
+        let refusal = self
+            .config
+            .llm
+            .as_ref()
+            .and_then(|_| extraction_refusal(&validation));
+        if let Some(msg) = &refusal {
+            tracing::error!("{msg}");
+            errors.push(msg.clone());
+        }
+        let entities = if refusal.is_none()
+            && let Some(ref llm_config) = self.config.llm
+        {
             let constructor = LlmOntologyConstructor::new(llm_config.clone());
             let sample_rows = extract_sample_rows(&df, self.config.max_sample_rows);
 
@@ -280,6 +296,8 @@ impl IngestPipeline {
             started_at: now.clone(),
             ended_at: now,
             locality: "local".into(),
+            // Local ingest reads the source itself — the locator IS the origin.
+            origin_source_id: None,
         };
         store.record_activity(&prov).await?;
 
@@ -361,6 +379,38 @@ fn validate_before_graph_write(
         error_issues.join("; ")
     );
     (report, Some(msg))
+}
+
+/// Decide whether entity extraction may run on this input at all. Returns
+/// the refusal message for `IngestResult.errors` (→ FAILED STEPS → non-zero
+/// exit), or `None` when extraction may proceed.
+///
+/// Error-severity input validation is a refusal to extract, not a warning to
+/// log past: an empty DataFrame reaches the LLM with ZERO sample rows and the
+/// model invents entities from the header names alone — self-consistent
+/// enough to pass graph validation and land in the store at the default
+/// confidence, under a clean "Done." exit 0. Duplicate column names poison
+/// the same prompt differently: sampled values can no longer be attributed
+/// to a column. "Nothing to extract from" is NOT "nothing was found" — an
+/// extraction over real rows that honestly returns zero entities never
+/// passes through here.
+fn extraction_refusal(validation: &ValidationReport) -> Option<String> {
+    let error_issues: Vec<&str> = validation
+        .issues
+        .iter()
+        .filter(|i| i.severity == Severity::Error)
+        .map(|i| i.message.as_str())
+        .collect();
+    if error_issues.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing entity extraction: input validation found {} error-severity issue(s): {}. \
+         Extracting from this input would produce fabricated entities from column names \
+         alone — nothing was sent to the LLM and nothing was written to the graph.",
+        error_issues.len(),
+        error_issues.join("; ")
+    ))
 }
 
 /// Extract up to `max_rows` sample rows from a DataFrame as `Vec<Vec<String>>`.
@@ -835,5 +885,266 @@ mod tests {
         let json = serde_json::to_string(&failed).unwrap();
         assert!(json.contains("errors"));
         assert!(json.contains("disk full"));
+    }
+
+    // ── Refusing extraction from empty / Error-severity input ─────────
+    //
+    // The defect: a CSV with headers and ZERO data rows sailed through —
+    // the Error-severity ValidationReport only warned, extraction ran with
+    // zero sample rows, and the model invented entities from the column
+    // names, written at confidence 0.8 under "Done." exit 0.
+
+    /// Per-test scratch dir + provenance path (same temp_dir+uuid convention
+    /// as the sibling tests), removed on drop.
+    struct RefusalScratch {
+        dir: PathBuf,
+    }
+
+    impl RefusalScratch {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("prism_refusal_test_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self { dir }
+        }
+
+        fn csv(&self, body: &str) -> PathBuf {
+            let p = self.dir.join("input.csv");
+            std::fs::write(&p, body).expect("write csv fixture");
+            p
+        }
+
+        fn db_path(&self) -> PathBuf {
+            self.dir.join("provenance.db")
+        }
+    }
+
+    impl Drop for RefusalScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A pipeline whose LLM points at the given mock server.
+    fn pipeline_against(server_uri: String, db_path: PathBuf) -> IngestPipeline {
+        IngestPipeline::with_config(PipelineConfig {
+            llm: Some(crate::LlmConfig {
+                base_url: server_uri,
+                model: "test-model".into(),
+                ..crate::LlmConfig::default()
+            }),
+            max_sample_rows: 10,
+            mapping: None,
+            provenance_db: Some(db_path),
+        })
+    }
+
+    /// The refusal predicate: Error severity refuses, Warning/Info does not.
+    #[test]
+    fn extraction_refusal_fires_on_error_severity_only() {
+        use crate::validation::ValidationIssue;
+
+        // Empty frame — the real report from the real validator.
+        let empty = validation::validate(&DataFrame::empty());
+        let msg = extraction_refusal(&empty).expect("an empty frame must refuse extraction");
+        assert!(msg.contains("refusing entity extraction"), "{msg}");
+        assert!(msg.contains("DataFrame is empty"), "{msg}");
+
+        // Duplicate columns (the other Error-severity issue). polars' safe
+        // constructors and its CSV reader refuse/rename duplicate names, so
+        // the report carries the exact issue `validation::validate` emits
+        // for frames that arrive from other connectors.
+        let dup = ValidationReport {
+            issues: vec![ValidationIssue {
+                severity: Severity::Error,
+                column: Some("a".into()),
+                message: "Duplicate column name: 'a'".into(),
+            }],
+            passed: false,
+        };
+        let msg = extraction_refusal(&dup).expect("duplicate columns must refuse extraction");
+        assert!(msg.contains("Duplicate column name: 'a'"), "{msg}");
+
+        // Warnings alone must NOT refuse: >50% nulls is Warning severity.
+        let s = Series::new(
+            "mostly_null".into(),
+            &[Option::<i32>::None, None, Some(1), None],
+        );
+        let warn_only = validation::validate(&DataFrame::new(vec![s.into()]).unwrap());
+        assert!(!warn_only.issues.is_empty(), "fixture must carry a warning");
+        assert_eq!(extraction_refusal(&warn_only), None);
+    }
+
+    /// End-to-end: a header-only CSV is REFUSED — the reason lands in
+    /// `errors` (→ FAILED STEPS → non-zero exit), no prompt reaches the
+    /// model, and the graph store is untouched (never even created).
+    #[tokio::test]
+    async fn header_only_csv_refuses_extraction_and_leaves_graph_untouched() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        // A live-looking LLM endpoint that must never be consulted:
+        // `.expect(0)` fails the test if any prompt is sent.
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,uts_mpa,phase\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_csv(&csv).await.unwrap();
+
+        assert_eq!((result.row_count, result.column_count), (0, 3));
+        assert!(!result.validation.passed);
+        // The refusal is visible on the errors spine, with the reason.
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("refusing entity extraction"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(
+            result.errors[0].contains("DataFrame is empty"),
+            "{}",
+            result.errors[0]
+        );
+        // Nothing was extracted, validated, or written.
+        assert!(result.entities.is_none());
+        assert!(result.graph_validation.is_none());
+        assert!(result.graph.is_none());
+        // The graph is UNTOUCHED — not "zero facts written" but "the store
+        // was never even opened": opening is what creates the file.
+        assert!(
+            !db_path.exists(),
+            "a refused ingest opened/created the provenance store"
+        );
+        server.verify().await;
+    }
+
+    /// The guard must not over-fire: a normal CSV with data rows still
+    /// extracts and still writes the graph. (This also pins the mock wire
+    /// shape the refusal tests rely on being reachable.)
+    #[tokio::test]
+    async fn csv_with_rows_still_extracts_and_writes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let extraction = serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Ti-6Al-4V", "properties": {}},
+                {"type": "Element", "name": "Al", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Ti-6Al-4V", "rel": "CONTAINS", "to": "Al", "weight": 0.06}
+            ]
+        });
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"content": extraction.to_string()},
+                "finish_reason": "stop"
+            }]
+        });
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,al_frac\nTi-6Al-4V,0.06\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_csv(&csv).await.unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let entities = result.entities.expect("extraction must run on data rows");
+        assert_eq!(entities.entities.len(), 2);
+        let graph = result.graph.expect("graph write must run");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+        // And the fact really landed.
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Ti-6Al-4V", "local", 10).await.unwrap();
+        assert!(hits.iter().any(|n| n.name == "Ti-6Al-4V"));
+        server.verify().await;
+    }
+
+    /// "Nothing was FOUND" is not "nothing to extract FROM". Rows exist, the
+    /// model runs and honestly returns zero entities — the refusal guard
+    /// must NOT fire and the prompt must actually reach the model.
+    ///
+    /// NOTE: the run is still not clean today. The pre-existing
+    /// `validate_before_graph_write` gate treats an empty extraction as
+    /// Error severity ("No entities were extracted", graph_validation.rs
+    /// check 1) and reports it on the same errors spine, so this case
+    /// already exited non-zero BEFORE the refusal guard existed. That
+    /// behaviour is out of scope here (graph validation is fenced off) and
+    /// pinned as-is.
+    #[tokio::test]
+    async fn rows_with_zero_entities_found_is_not_a_refusal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"content": "{\"entities\": [], \"relationships\": []}"},
+                "finish_reason": "stop"
+            }]
+        });
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,uts_mpa\nUnobtainium-X,9999\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_csv(&csv).await.unwrap();
+
+        // The refusal guard did not fire…
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.contains("refusing entity extraction")),
+            "{:?}",
+            result.errors
+        );
+        // …extraction ran (wiremock verifies the request) and honestly
+        // returned zero entities…
+        let entities = result.entities.expect("extraction must run on data rows");
+        assert!(entities.entities.is_empty());
+        // …and the only error is the pre-existing graph-validation gate on
+        // the empty result, unchanged by the refusal work.
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("No entities were extracted"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(result.graph.is_none());
+        server.verify().await;
     }
 }

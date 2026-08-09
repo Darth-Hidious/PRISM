@@ -276,6 +276,7 @@ mod tests {
             started_at: "2026-08-04T00:00:00Z".into(),
             ended_at: "2026-08-04T00:00:01Z".into(),
             locality: "local".into(),
+            origin_source_id: None,
         };
         store.write_fact(&facts[0], &prov).await.unwrap();
 

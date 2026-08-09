@@ -503,6 +503,8 @@ async fn store_claims(
         started_at: now.clone(),
         ended_at: now,
         locality: "local".into(),
+        // Local extraction reads the document itself — not a relay.
+        origin_source_id: None,
     };
     store.record_activity(&prov).await?;
 
