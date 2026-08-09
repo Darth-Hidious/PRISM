@@ -1,0 +1,177 @@
+{
+  "attribution": "Contains material from the Elementary Multiperspective Material Ontology (EMMO) 1.0.3 by the EMMO authors and contributors, published by EMMC ASBL, used under CC BY 4.0.",
+  "class_mappings": [
+    {
+      "extraction_label": "Alloy",
+      "iri": "https://w3id.org/emmo#EMMO_4c1f58cd_6e2c_48fb_8098_1cbb762abb05",
+      "rationale": "EMMO 1.0.3 declares no Alloy class. MetallicMaterial is the nearest safe superclass and explicitly notes that metallic materials often form alloys; it also includes pure metals.",
+      "resolution": "broader_alias",
+      "upstream_pref_label": "MetallicMaterial"
+    },
+    {
+      "extraction_label": "Element",
+      "iri": "https://w3id.org/emmo#EMMO_4f40def1_3cd7_4067_9596_541e9a5134cf",
+      "rationale": "PRISM element nodes are element names or symbols; EMMO defines ChemicalElement as the symbol for a specific chemical element.",
+      "resolution": "alias",
+      "upstream_pref_label": "ChemicalElement"
+    },
+    {
+      "extraction_label": "Property",
+      "iri": "https://w3id.org/emmo#EMMO_b7bcff25_ffc3_474e_9ab5_01b1664bd4ba",
+      "resolution": "exact_pref_label",
+      "upstream_pref_label": "Property"
+    },
+    {
+      "extraction_label": "Process",
+      "iri": "https://w3id.org/emmo#EMMO_43e9a05d_98af_41b4_92f6_00f79a09bfce",
+      "resolution": "exact_pref_label",
+      "upstream_pref_label": "Process"
+    },
+    {
+      "extraction_label": "Phase",
+      "iri": "https://w3id.org/emmo#EMMO_668fbd5b_6f1b_405c_9c6b_d6067bd0595a",
+      "rationale": "The upstream class has skos:altLabel Phase.",
+      "resolution": "exact_alt_label",
+      "upstream_pref_label": "PhaseOfMatter"
+    },
+    {
+      "extraction_label": "Paper",
+      "iri": "https://w3id.org/emmo#EMMO_ccdc1a41_6e96_416b_92ec_efe67917434a",
+      "rationale": "EMMO 1.0.3 declares no Paper class. Document is a broader graphical-document class; no local bibo paper class is declared.",
+      "resolution": "broader_alias",
+      "upstream_pref_label": "Document"
+    },
+    {
+      "extraction_label": "Dataset",
+      "iri": "https://w3id.org/emmo#EMMO_194e367c_9783_4bf5_96d0_9ad597d48d9a",
+      "resolution": "exact_pref_label",
+      "upstream_pref_label": "Dataset"
+    },
+    {
+      "extraction_label": "Material",
+      "iri": "https://w3id.org/emmo#EMMO_4207e895_8b83_4318_996a_72cfb32acd94",
+      "resolution": "exact_pref_label",
+      "upstream_pref_label": "Material"
+    }
+  ],
+  "contributors": [
+    "https://orcid.org/0000-0003-0514-9229",
+    "https://orcid.org/0000-0001-8869-3718",
+    "https://orcid.org/0009-0008-8009-5009",
+    "https://orcid.org/0000-0003-4065-9742",
+    "https://orcid.org/0000-0001-7815-6636",
+    "https://orcid.org/0000-0002-8758-6109"
+  ],
+  "creators": [
+    "https://orcid.org/0000-0003-3805-8761",
+    "https://orcid.org/0000-0002-4181-2852",
+    "https://orcid.org/0000-0002-1560-809X"
+  ],
+  "derivation": {
+    "command": "cargo run -p prism-ontology --bin materialise-emmo -- assets/ontology/upstream/emmo-1.0.3 assets/ontology/emmo-1.0.3.materialised.ttl assets/ontology/emmo-1.0.3.provenance.json",
+    "materialised_conclusions": [
+      {
+        "basis": "<https://w3id.org/emmo#EMMO_cbcf8fe6_6da6_49e0_ab4d_00f737ea9689> owl:equivalentClass [ owl:unionOf (... <https://w3id.org/emmo#EMMO_4f40def1_3cd7_4067_9596_541e9a5134cf> ...) ]",
+        "conclusion": "<https://w3id.org/emmo#EMMO_4f40def1_3cd7_4067_9596_541e9a5134cf> rdfs:subClassOf <https://w3id.org/emmo#EMMO_cbcf8fe6_6da6_49e0_ab4d_00f737ea9689>",
+        "purpose": "Makes the CONTAINS/hasChemicalSpecies object range compatible with PRISM Element nodes without a runtime OWL 2 DL reasoner."
+      }
+    ],
+    "semantics": "Complete explicit named rdfs:subClassOf ancestry plus the documented named-member conclusion from ChemicalSpecies' owl:equivalentClass/owl:unionOf axiom. No other OWL restrictions, equivalences, unions, or property chains are inferred.",
+    "source_compatibility_repairs": [
+      {
+        "change": "Replace the erroneous predicate-list terminator after the otherunits import with a semicolon; line 23 continues the same ontology subject with dcterms:abstract.",
+        "file": "disciplines/units/units.ttl",
+        "line": 22,
+        "reason": "The pinned upstream byte is a period, making line 23 invalid Turtle; Sophia correctly rejects it. The source scratch file is not modified."
+      }
+    ],
+    "tool": "prism-ontology materialise-emmo"
+  },
+  "license": "CC-BY-4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
+  "materialised_sha256": "a23f61b52e1fd8b9b3dc222742d7072ba575f9c58ec401b9c24a17eeef947313",
+  "modifications": "PRISM selected and deterministically re-serialized the required declarations and named ancestry, and added the documented OWL-entailed ChemicalElement-to-ChemicalSpecies subclass conclusion. The upstream source files are not modified.",
+  "ontology_iri": "https://w3id.org/emmo/emmo",
+  "prefixes": {
+    "bibo": "http://purl.org/ontology/bibo/",
+    "dcterms": "http://purl.org/dc/terms/",
+    "emmo": "https://w3id.org/emmo#",
+    "foaf": "http://xmlns.com/foaf/0.1/",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "skos": "http://www.w3.org/2004/02/skos/core#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#"
+  },
+  "publisher": "https://w3id.org/emmo#EMMC_ASBL",
+  "relation_mappings": [
+    {
+      "extraction_label": "CONTAINS",
+      "iri": "https://w3id.org/emmo#EMMO_7aec67a4_fb96_47c6_80a3_8fea557b2cbb",
+      "rationale": "Direct Substance-to-ChemicalSpecies relation matching PRISM's material-to-element edge. The artifact materialises the OWL-entailed ChemicalElement rdfs:subClassOf ChemicalSpecies conclusion required for range compatibility.",
+      "upstream_pref_label": "hasChemicalSpecies"
+    },
+    {
+      "extraction_label": "HAS_PROPERTY",
+      "iri": "https://w3id.org/emmo#EMMO_e1097637_70d2_4895_973f_2396f04fa204",
+      "rationale": "Direct upstream semiotic relation from an object to a property.",
+      "upstream_pref_label": "hasProperty"
+    },
+    {
+      "extraction_label": "PROCESSED_BY",
+      "iri": "https://w3id.org/emmo#EMMO_b1c64830_45c7_499d_9a72_68f517d57823",
+      "rationale": "Upstream relation from a manufactured product to the manufacturing process used to make it. It implies the PRISM source is a manufactured product.",
+      "upstream_pref_label": "manufacturedWith"
+    },
+    {
+      "extraction_label": "PART_OF",
+      "iri": "https://w3id.org/emmo#EMMO_a8bd7094_6b40_47af_b1f4_a69d81a3afbd",
+      "rationale": "Exact direction and general mereological meaning.",
+      "upstream_pref_label": "isPartOf"
+    },
+    {
+      "extraction_label": "HAS_PHASE",
+      "iri": "https://w3id.org/emmo#EMMO_dba27ca1_33c9_4443_a912_1519ce4c39ec",
+      "rationale": "EMMO 1.0.3 declares no hasPhase property. hasConstituent is a generic physical object-to-spatial-part relation and is valid only when the phase is modeled as a constituent region.",
+      "resolution": "broader_alias",
+      "upstream_pref_label": "hasConstituent"
+    }
+  ],
+  "release": "1.0.3",
+  "release_published": "2026-01-20",
+  "retrieved": "2026-08-09",
+  "schema_version": 1,
+  "source_file_count": 58,
+  "source_input_sha256": "921e013f28655e605a922341a76ee6d14b43fc0d03d691633cfe7a6deddf71dc",
+  "source_input_sha256_algorithm": "SHA-256 over PRISM EMMO source input v1 framing of each sorted relative path and byte payload: 58 Turtle files plus LICENSE",
+  "unresolved": [
+    {
+      "extraction_label": "Author",
+      "kind": "class",
+      "rationale": "No Author class is declared locally. foaf:Person is referenced and given an RDFS parent but is not locally asserted owl:Class and does not capture the author role."
+    },
+    {
+      "extraction_label": "OBSERVED_IN",
+      "kind": "relation",
+      "rationale": "The current extraction direction and intended observation bearer are underspecified; no exact local object property is declared."
+    },
+    {
+      "extraction_label": "PUBLISHED_IN",
+      "kind": "relation",
+      "rationale": "No exact local object property or publication-venue class is declared."
+    },
+    {
+      "extraction_label": "AUTHORED_BY",
+      "kind": "relation",
+      "rationale": "dcterms:creator is used as metadata but is not locally declared owl:ObjectProperty; no local authorship object property is available."
+    },
+    {
+      "extraction_label": "CITES",
+      "kind": "relation",
+      "rationale": "Neither bibo:cites nor dcterms:references is declared or used in the local EMMO source."
+    }
+  ],
+  "upstream_tarball_sha256": "e2f4d10db76e97c2a02cc08829387f9cbfa028c9c6c05a27d4dd9023c7179e79",
+  "upstream_url": "https://github.com/emmo-repo/EMMO/archive/refs/tags/1.0.3.tar.gz",
+  "version_iri": "https://w3id.org/emmo/1.0.3/emmo"
+}

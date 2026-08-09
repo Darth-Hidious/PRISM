@@ -1,8 +1,8 @@
 //! The ontology-vocabulary surface.
 //!
-//! An ontology is a plugin implementing [`Ontology`]: a stable id, the entity
-//! and relationship types its facts are allowed to carry, the unit vocabulary
-//! those facts cite, and the domain checks that validate a fact of its shape.
+//! An ontology is a plugin implementing [`Ontology`]: a stable id, versioned
+//! class and object-property declarations with canonical IRIs, and the domain
+//! checks that validate a fact of its shape.
 //! The tabular ingest pipeline consults the ACTIVE ontology for BOTH the
 //! extraction prompt and graph validation, so the vocabulary the model is
 //! instructed with and the vocabulary the validator accepts come from one
@@ -29,10 +29,12 @@
 //! own typed-unit path (today's `MaterialFact`/text extraction is QUDT by
 //! construction).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard};
 
 use anyhow::{Result, bail};
+pub use prism_ontology::{ClassDecl, Iri, PropDecl as RelationDecl};
+use prism_ontology::{OntologyGraph, load_bundled_emmo};
 
 use crate::EntitySet;
 use crate::graph_validation::{GraphIssue, GraphSeverity};
@@ -52,23 +54,10 @@ pub const DEFAULT_ONTOLOGY_ID: &str = "emmo";
 const REFERENTIAL_INTEGRITY_RULE: &str =
     "Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".";
 
-/// The unit vocabulary an ontology's facts cite. A declaration, not an
-/// enforcement point: on the tabular path units are free-form strings, and
-/// the typed enforcement that exists (text extraction → `MaterialFact`) is
-/// QUDT-shaped by construction via `prism_provenance::QudtUnit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnitVocabulary {
-    /// Vocabulary name, e.g. `"QUDT"`.
-    pub name: &'static str,
-    /// Identifier prefix unit strings carry on the typed path, e.g.
-    /// `"QUDT:"`. `None` means free-form unit strings.
-    pub prefix: Option<&'static str>,
-}
-
 /// One ontology vocabulary. The contract the ingest pipeline depends on:
 /// the extraction prompt is built from [`Ontology::extraction_preamble`] and
 /// [`Ontology::extraction_instructions`], and graph validation accepts
-/// exactly [`Ontology::entity_types`] / [`Ontology::relationship_types`]
+/// exactly [`Ontology::classes`] / [`Ontology::relations`]
 /// plus whatever [`Ontology::validate_domain`] enforces — so instructing and
 /// validating read the SAME declaration.
 pub trait Ontology: Send + Sync {
@@ -78,18 +67,61 @@ pub trait Ontology: Send + Sync {
     /// refused.
     fn id(&self) -> &'static str;
 
-    /// Entity types extraction may emit and validation accepts.
-    fn entity_types(&self) -> &'static [&'static str];
+    /// Version IRI under which this ontology classifies extracted facts.
+    ///
+    /// Satisfies `REQ-OWL-S1-CLASSIFICATION-PROVENANCE`.
+    fn version_iri(&self) -> &Iri;
 
-    /// Relationship types extraction may emit and validation accepts.
-    fn relationship_types(&self) -> &'static [&'static str];
+    /// SHA-256 of the exact materialised ontology artifact backing this
+    /// declaration.
+    ///
+    /// Satisfies `REQ-OWL-S1-SUPPLY-CHAIN`.
+    fn artifact_sha256(&self) -> &str;
+
+    /// Class declarations extraction may emit and validation accepts. This
+    /// slice contains only explicitly mapped extraction declarations, not
+    /// ancestor-only classes retained by the ontology graph for closure.
+    ///
+    /// Satisfies `REQ-OWL-S1-CANONICAL-CLASS-IDENTITY`.
+    fn classes(&self) -> &[ClassDecl];
+
+    /// Object-property declarations extraction may emit and validation
+    /// accepts.
+    ///
+    /// Satisfies `REQ-OWL-S1-CANONICAL-RELATION-IDENTITY`.
+    fn relations(&self) -> &[RelationDecl];
+
+    /// Resolve an exact extraction label to its canonical class declaration.
+    fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
+        self.classes().iter().find(|decl| {
+            decl.extraction_labels
+                .iter()
+                .any(|candidate| candidate == label)
+        })
+    }
+
+    /// Resolve an exact extraction label to its canonical object-property
+    /// declaration.
+    fn relation_for_label(&self, label: &str) -> Option<&RelationDecl> {
+        self.relations().iter().find(|decl| {
+            decl.extraction_labels
+                .iter()
+                .any(|candidate| candidate == label)
+        })
+    }
+
+    /// Whether `sub` is equal to or transitively below `sup` in the loaded
+    /// `rdfs:subClassOf` closure. Implementations must be cycle-safe.
+    ///
+    /// Satisfies `REQ-OWL-S1-SUBSUMPTION`.
+    fn is_a(&self, sub: &Iri, sup: &Iri) -> bool;
 
     /// The node label entities of declared extraction type `entity_type`
     /// are PERSISTED under in the graph store. The label is part of the
     /// store's entity key (`{tenant}|{label}:{name}`), so this mapping is
     /// identity, not decoration — and it is the third leg of the
-    /// one-declaration contract: the prompt instructs `entity_types`, the
-    /// validator accepts `entity_types`, and the store persists
+    /// one-declaration contract: the prompt instructs extraction labels, the
+    /// validator resolves those labels to declared IRIs, and the store persists
     /// `storage_label(entity_type)`. Before this method existed the store
     /// hardcoded its own third vocabulary (every fact subject became
     /// `Matter`), so a query for the declared `Material` type matched
@@ -103,17 +135,16 @@ pub trait Ontology: Send + Sync {
     /// map several extraction synonyms onto one storage label (EMMO: `Alloy`
     /// and `Material` are both matter, so both store as `Matter` and stay
     /// one identity across runs whichever synonym the model picks) but MUST
-    /// stay total over [`Ontology::entity_types`]: registration refuses an
+    /// stay total over every extraction label in [`Ontology::classes`]:
+    /// registration refuses an
     /// ontology that instructs a type it cannot store.
-    fn storage_label(&self, entity_type: &str) -> Option<&'static str> {
-        self.entity_types()
+    fn storage_label(&self, entity_type: &str) -> Option<&str> {
+        self.class_for_label(entity_type)?
+            .extraction_labels
             .iter()
-            .copied()
-            .find(|t| *t == entity_type)
+            .find(|label| label.as_str() == entity_type)
+            .map(String::as_str)
     }
-
-    /// The unit vocabulary this ontology's facts cite.
-    fn unit_vocabulary(&self) -> UnitVocabulary;
 
     /// Opening sentence of the tabular extraction prompt.
     fn extraction_preamble(&self) -> String {
@@ -141,8 +172,18 @@ pub trait Ontology: Send + Sync {
              \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
              \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}}]\n\
              }}\n",
-            self.entity_types().join(", "),
-            self.relationship_types().join(", "),
+            self.classes()
+                .iter()
+                .flat_map(|decl| decl.extraction_labels.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.relations()
+                .iter()
+                .flat_map(|decl| decl.extraction_labels.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 
@@ -178,24 +219,37 @@ pub fn storage_tenant(base: &str, ontology_id: &str) -> String {
 // Built-in: EMMO
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Entity types of the built-in EMMO materials vocabulary (formerly
-/// `graph_validation::VALID_ENTITY_TYPES`).
-const EMMO_ENTITY_TYPES: &[&str] = &[
-    "Alloy", "Element", "Property", "Process", "Phase", "Paper", "Author", "Dataset", "Material",
-];
+/// The bundled graph is parsed and integrity-checked once, at first use. A
+/// malformed or hash-mismatched built-in artifact is a process-start failure:
+/// continuing under an unverified ontology would make every subsequent
+/// classification unauditable.
+static EMMO_GRAPH: LazyLock<OntologyGraph> = LazyLock::new(|| {
+    load_bundled_emmo().unwrap_or_else(|error| {
+        panic!("bundled EMMO 1.0.3 ontology failed integrity validation: {error}")
+    })
+});
 
-/// Relationship types of the built-in EMMO materials vocabulary (formerly
-/// `graph_validation::VALID_REL_TYPES`).
-const EMMO_REL_TYPES: &[&str] = &[
-    "CONTAINS",
-    "HAS_PROPERTY",
-    "PROCESSED_BY",
-    "OBSERVED_IN",
-    "PUBLISHED_IN",
-    "AUTHORED_BY",
-    "PART_OF",
-    "CITES",
-];
+/// Extraction-facing declarations only. The graph also retains ancestor-only
+/// classes so `is_a` can answer over the full materialised closure, but those
+/// ancestors must not silently expand the LLM vocabulary.
+static EMMO_CLASSES: LazyLock<Vec<ClassDecl>> = LazyLock::new(|| {
+    EMMO_GRAPH
+        .classes()
+        .iter()
+        .filter(|decl| !decl.extraction_labels.is_empty())
+        .cloned()
+        .collect()
+});
+
+/// Extraction-facing object properties only.
+static EMMO_RELATIONS: LazyLock<Vec<RelationDecl>> = LazyLock::new(|| {
+    EMMO_GRAPH
+        .properties()
+        .iter()
+        .filter(|decl| !decl.extraction_labels.is_empty())
+        .cloned()
+        .collect()
+});
 
 /// The built-in EMMO materials-science ontology — the vocabulary this
 /// codebase always extracted and validated with, now declared through the
@@ -209,10 +263,10 @@ const EMMO_REL_TYPES: &[&str] = &[
 /// 17 orphan errors, zero facts stored). Preserving those bytes preserved
 /// the defect; the rule is added, everything else stays verbatim.
 ///
-/// The one known harmless drift IS still preserved: the legacy prompt
-/// instructs `HAS_PHASE`, which the legacy validator list never contained
-/// (so it warns as `unknown_rel`). Fixing that would change validation
-/// reports for existing users, so it is preserved, not repaired, here.
+/// `HAS_PHASE`, which the legacy validator list omitted, is now backed by a
+/// declared object-property IRI. The prompt bytes do not need to change, but
+/// the relationship is no longer reported as foreign.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EmmoOntology;
 
 impl Ontology for EmmoOntology {
@@ -220,36 +274,54 @@ impl Ontology for EmmoOntology {
         DEFAULT_ONTOLOGY_ID
     }
 
-    fn entity_types(&self) -> &'static [&'static str] {
-        EMMO_ENTITY_TYPES
+    fn version_iri(&self) -> &Iri {
+        EMMO_GRAPH.version_iri()
     }
 
-    fn relationship_types(&self) -> &'static [&'static str] {
-        EMMO_REL_TYPES
+    fn artifact_sha256(&self) -> &str {
+        EMMO_GRAPH.sha256()
     }
 
-    fn unit_vocabulary(&self) -> UnitVocabulary {
-        UnitVocabulary {
-            name: "QUDT",
-            prefix: Some("QUDT:"),
-        }
+    fn classes(&self) -> &[ClassDecl] {
+        EMMO_CLASSES.as_slice()
+    }
+
+    fn relations(&self) -> &[RelationDecl] {
+        EMMO_RELATIONS.as_slice()
+    }
+
+    fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
+        EMMO_GRAPH.class_for_label(label)
+    }
+
+    fn relation_for_label(&self, label: &str) -> Option<&RelationDecl> {
+        EMMO_GRAPH.property_for_label(label)
+    }
+
+    fn is_a(&self, sub: &Iri, sup: &Iri) -> bool {
+        EMMO_GRAPH.is_a(sub, sup)
     }
 
     /// EMMO's storage mapping — the remap the store used to hardcode,
-    /// declared. `Alloy` and `Material` are extraction synonyms for the same
-    /// EMMO concept, so both persist as `Matter`: one identity per material
-    /// name however the model typed it that run, and the same label the
-    /// text-extraction path has always written for materials. `Process`
+    /// declared. `Alloy` and `Material` now resolve to distinct canonical
+    /// classes, but both still persist under the compatibility label `Matter`:
+    /// the entity key remains byte-identical while `class_iri` carries the
+    /// distinction. `Process`
     /// persists as `Manufacturing` for the same reason — that is the label
     /// the store's `processing` fact shape (and the text path) already
     /// gives every process step, so a standalone process entity and one
     /// reached through PROCESSED_BY converge on one node instead of two.
     /// Everything else stores under itself.
-    fn storage_label(&self, entity_type: &str) -> Option<&'static str> {
+    fn storage_label(&self, entity_type: &str) -> Option<&str> {
         match entity_type {
             "Alloy" | "Material" => Some("Matter"),
             "Process" => Some("Manufacturing"),
-            other => EMMO_ENTITY_TYPES.iter().copied().find(|t| *t == other),
+            other => self
+                .class_for_label(other)?
+                .extraction_labels
+                .iter()
+                .find(|label| label.as_str() == other)
+                .map(String::as_str),
         }
     }
 
@@ -360,9 +432,9 @@ impl Ontology for EmmoOntology {
 // Registry
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Validate an ontology's declaration and capture its id — trait methods are
-/// called ONCE, outside any lock, so adapter-supplied code never runs while
-/// the process-wide registry lock is held.
+/// Validate an ontology's declaration and capture its id. Every adapter method
+/// runs outside the registry lock, so adapter-supplied code can never execute
+/// while the process-wide registry is locked.
 fn validated_id(ontology: &dyn Ontology) -> Result<&'static str> {
     let id = ontology.id();
     if id.is_empty()
@@ -375,36 +447,99 @@ fn validated_id(ontology: &dyn Ontology) -> Result<&'static str> {
              alphanumerics plus '-'/'_' (it is composed into storage tenants)"
         );
     }
-    let entity_types = ontology.entity_types();
-    if entity_types.is_empty() {
+    if ontology.version_iri().as_str().trim().is_empty() {
+        bail!("ontology '{id}' declares an empty version IRI");
+    }
+    let sha256 = ontology.artifact_sha256();
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!(
+            "ontology '{id}' artifact SHA-256 must be exactly 64 lowercase hexadecimal characters"
+        );
+    }
+
+    let classes = ontology.classes();
+    if classes.is_empty() {
         bail!("ontology '{id}' declares no entity types — it could validate nothing");
     }
-    for (label, list) in [
-        ("entity", entity_types),
-        ("relationship", ontology.relationship_types()),
-    ] {
-        for (i, t) in list.iter().enumerate() {
-            if t.trim().is_empty() {
-                bail!("ontology '{id}' declares an empty {label} type");
+
+    let mut class_iris = HashSet::new();
+    let mut class_labels = HashSet::new();
+    for class in classes {
+        if !class_iris.insert(class.iri.as_str()) {
+            bail!("ontology '{id}' declares class IRI '{}' twice", class.iri);
+        }
+        if class.extraction_labels.is_empty() {
+            bail!(
+                "ontology '{id}' declares class IRI '{}' with no extraction label",
+                class.iri
+            );
+        }
+        for label in &class.extraction_labels {
+            if label.trim().is_empty() {
+                bail!("ontology '{id}' declares an empty entity type");
             }
-            if list[..i].contains(t) {
-                bail!("ontology '{id}' declares {label} type '{t}' twice");
+            if !class_labels.insert(label.as_str()) {
+                bail!("ontology '{id}' declares entity type '{label}' twice");
+            }
+            match ontology.class_for_label(label) {
+                Some(resolved) if resolved.iri.as_str() == class.iri.as_str() => {}
+                Some(resolved) => bail!(
+                    "ontology '{id}' resolves entity type '{label}' to '{}' instead of declared '{}'",
+                    resolved.iri,
+                    class.iri
+                ),
+                None => bail!(
+                    "ontology '{id}' declares entity type '{label}' but its resolver cannot find it"
+                ),
+            }
+            match ontology.storage_label(label) {
+                Some(storage_label) if !storage_label.trim().is_empty() => {}
+                _ => bail!(
+                    "ontology '{id}' declares entity type '{label}' but maps it to no \
+                     storage label — it would instruct the model in a type that \
+                     cannot be stored"
+                ),
             }
         }
     }
-    // Totality of the storage mapping: every type the extraction prompt may
-    // instruct MUST have a storage label, or the ontology would tell the
-    // model to emit entities that cannot be persisted — the exact
-    // instruct-vs-store drift `storage_label` exists to close. Refused HERE
-    // so an unstorable vocabulary can never become the active ontology.
-    for t in entity_types {
-        match ontology.storage_label(t) {
-            Some(l) if !l.trim().is_empty() => {}
-            _ => bail!(
-                "ontology '{id}' declares entity type '{t}' but maps it to no \
-                 storage label — it would instruct the model in a type that \
-                 cannot be stored"
-            ),
+
+    let mut relation_iris = HashSet::new();
+    let mut relation_labels = HashSet::new();
+    for relation in ontology.relations() {
+        if !relation_iris.insert(relation.iri.as_str()) {
+            bail!(
+                "ontology '{id}' declares object-property IRI '{}' twice",
+                relation.iri
+            );
+        }
+        if relation.extraction_labels.is_empty() {
+            bail!(
+                "ontology '{id}' declares object-property IRI '{}' with no extraction label",
+                relation.iri
+            );
+        }
+        for label in &relation.extraction_labels {
+            if label.trim().is_empty() {
+                bail!("ontology '{id}' declares an empty relationship type");
+            }
+            if !relation_labels.insert(label.as_str()) {
+                bail!("ontology '{id}' declares relationship type '{label}' twice");
+            }
+            match ontology.relation_for_label(label) {
+                Some(resolved) if resolved.iri.as_str() == relation.iri.as_str() => {}
+                Some(resolved) => bail!(
+                    "ontology '{id}' resolves relationship type '{label}' to '{}' instead of declared '{}'",
+                    resolved.iri,
+                    relation.iri
+                ),
+                None => bail!(
+                    "ontology '{id}' declares relationship type '{label}' but its resolver cannot find it"
+                ),
+            }
         }
     }
     Ok(id)
@@ -577,65 +712,114 @@ mod tests {
     /// A test double with a configurable declaration.
     struct Fake {
         id: &'static str,
-        entities: &'static [&'static str],
-        rels: &'static [&'static str],
+        classes: Vec<ClassDecl>,
+        relations: Vec<RelationDecl>,
+        version_iri: Iri,
+        artifact_sha256: String,
+    }
+
+    impl Fake {
+        fn new(id: &'static str, entities: &[&str], relations: &[&str]) -> Self {
+            Self {
+                id,
+                classes: entities
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| ClassDecl {
+                        iri: Iri::new(format!("https://example.test/class/{index}"))
+                            .expect("test class IRI is valid"),
+                        pref_label: Some((*label).to_string()),
+                        parents: Vec::new(),
+                        extraction_labels: vec![(*label).to_string()],
+                    })
+                    .collect(),
+                relations: relations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| RelationDecl {
+                        iri: Iri::new(format!("https://example.test/property/{index}"))
+                            .expect("test property IRI is valid"),
+                        pref_label: Some((*label).to_string()),
+                        extraction_labels: vec![(*label).to_string()],
+                    })
+                    .collect(),
+                version_iri: Iri::new("https://example.test/ontology/1".to_string())
+                    .expect("test version IRI is valid"),
+                artifact_sha256: "0".repeat(64),
+            }
+        }
     }
 
     impl Ontology for Fake {
         fn id(&self) -> &'static str {
             self.id
         }
-        fn entity_types(&self) -> &'static [&'static str] {
-            self.entities
+        fn version_iri(&self) -> &Iri {
+            &self.version_iri
         }
-        fn relationship_types(&self) -> &'static [&'static str] {
-            self.rels
+        fn artifact_sha256(&self) -> &str {
+            &self.artifact_sha256
         }
-        fn unit_vocabulary(&self) -> UnitVocabulary {
-            UnitVocabulary {
-                name: "FREE",
-                prefix: None,
-            }
+        fn classes(&self) -> &[ClassDecl] {
+            &self.classes
+        }
+        fn relations(&self) -> &[RelationDecl] {
+            &self.relations
+        }
+        fn is_a(&self, sub: &Iri, sup: &Iri) -> bool {
+            sub == sup
         }
     }
 
     fn fake(id: &'static str) -> Arc<dyn Ontology> {
-        Arc::new(Fake {
-            id,
-            entities: &["Molecule"],
-            rels: &["REACTS_WITH"],
-        })
+        Arc::new(Fake::new(id, &["Molecule"], &["REACTS_WITH"]))
     }
 
+    /// Every extraction declaration served by the built-in registry resolves
+    /// back to the exact class/property present in the integrity-checked
+    /// artifact. This is a mechanism property, not a frozen label list.
     #[test]
-    fn builtin_has_emmo_with_the_legacy_vocabulary() {
+    fn builtin_declarations_resolve_to_artifact_iris() {
         let reg = OntologyRegistry::builtin();
         let emmo = reg.get("emmo").expect("emmo is built in");
-        // The exact legacy const arrays, pinned: validation behaviour for
-        // existing users depends on these values and this order (the
-        // unknown-type message joins the list).
         assert_eq!(
-            emmo.entity_types(),
-            [
-                "Alloy", "Element", "Property", "Process", "Phase", "Paper", "Author", "Dataset",
-                "Material",
-            ]
+            emmo.version_iri().as_str(),
+            "https://w3id.org/emmo/1.0.3/emmo"
         );
-        assert_eq!(
-            emmo.relationship_types(),
-            [
-                "CONTAINS",
-                "HAS_PROPERTY",
-                "PROCESSED_BY",
-                "OBSERVED_IN",
-                "PUBLISHED_IN",
-                "AUTHORED_BY",
-                "PART_OF",
-                "CITES",
-            ]
+        assert_eq!(emmo.artifact_sha256().len(), 64);
+        assert!(!emmo.classes().is_empty());
+        for class in emmo.classes() {
+            assert!(
+                EMMO_GRAPH.class(&class.iri).is_some(),
+                "declared class '{}' is absent from the bundled graph",
+                class.iri
+            );
+            assert!(!class.extraction_labels.is_empty());
+            for label in &class.extraction_labels {
+                let resolved = emmo
+                    .class_for_label(label)
+                    .unwrap_or_else(|| panic!("declared class label '{label}' did not resolve"));
+                assert_eq!(resolved.iri.as_str(), class.iri.as_str());
+            }
+        }
+        for relation in emmo.relations() {
+            assert!(
+                EMMO_GRAPH.property(&relation.iri).is_some(),
+                "declared property '{}' is absent from the bundled graph",
+                relation.iri
+            );
+            assert!(!relation.extraction_labels.is_empty());
+            for label in &relation.extraction_labels {
+                let resolved = emmo.relation_for_label(label).unwrap_or_else(|| {
+                    panic!("declared relationship label '{label}' did not resolve")
+                });
+                assert_eq!(resolved.iri.as_str(), relation.iri.as_str());
+            }
+        }
+        assert!(
+            emmo.class_for_label("Author").is_none(),
+            "Author has no defensible class IRI in the vendored vocabularies"
         );
-        assert_eq!(emmo.unit_vocabulary().name, "QUDT");
-        assert_eq!(emmo.unit_vocabulary().prefix, Some("QUDT:"));
     }
 
     /// The loud half of the two-call contract: `register` refuses a taken
@@ -650,9 +834,11 @@ mod tests {
         assert!(msg.contains("already registered"), "{msg}");
         assert!(msg.contains("replace_ontology"), "{msg}");
         // Nothing changed: the built-in still serves "emmo".
-        assert_eq!(
-            reg.get("emmo").expect("emmo registered").entity_types()[0],
-            "Alloy"
+        assert!(
+            reg.get("emmo")
+                .expect("emmo registered")
+                .class_for_label("Alloy")
+                .is_some()
         );
         assert_eq!(reg.ids(), ["emmo"]);
     }
@@ -673,21 +859,18 @@ mod tests {
         assert!(reg.get("chem").is_none(), "a refused replace must not ADD");
 
         let displaced = reg
-            .replace(Arc::new(Fake {
-                id: "emmo",
-                entities: &["Molecule"],
-                rels: &["REACTS_WITH"],
-            }))
+            .replace(Arc::new(Fake::new("emmo", &["Molecule"], &["REACTS_WITH"])))
             .expect("a registered id must be replaceable");
-        assert_eq!(
-            displaced.entity_types()[0],
-            "Alloy",
+        assert!(
+            displaced.class_for_label("Alloy").is_some(),
             "the built-in came back"
         );
-        assert_eq!(
-            reg.get("emmo").expect("emmo registered").entity_types(),
-            ["Molecule"],
-            "get() must return the replacement",
+        assert!(
+            reg.get("emmo")
+                .expect("emmo registered")
+                .class_for_label("Molecule")
+                .is_some(),
+            "get() must return the replacement"
         );
         assert_eq!(reg.all().len(), 1, "replaced in place, not appended");
     }
@@ -712,7 +895,8 @@ mod tests {
         ];
         for &(id, entities, rels) in malformed {
             assert!(
-                reg.register(Arc::new(Fake { id, entities, rels })).is_err(),
+                reg.register(Arc::new(Fake::new(id, entities, rels)))
+                    .is_err(),
                 "declaration id={id:?} entities={entities:?} rels={rels:?} must be refused",
             );
         }
@@ -720,6 +904,62 @@ mod tests {
             reg.all().is_empty(),
             "refused registrations must leave nothing behind"
         );
+    }
+
+    /// Registration verifies that declaration aliases, resolvers, and the
+    /// supply-chain identity exposed by an adapter are one coherent contract.
+    #[test]
+    fn inconsistent_resolvers_and_artifact_identity_are_refused() {
+        let mut reg = OntologyRegistry::new();
+
+        let mut bad_sha = Fake::new("bad-sha", &["Molecule"], &["REACTS_WITH"]);
+        bad_sha.artifact_sha256 = "deadbeef".to_string();
+        let error = reg
+            .register(Arc::new(bad_sha))
+            .expect_err("a truncated artifact digest must be refused");
+        assert!(format!("{error:#}").contains("64 lowercase hexadecimal"));
+
+        let mut duplicate_iri = Fake::new("dup-iri", &["Molecule", "Reaction"], &[]);
+        duplicate_iri.classes[1].iri = duplicate_iri.classes[0].iri.clone();
+        let error = reg
+            .register(Arc::new(duplicate_iri))
+            .expect_err("one class IRI cannot be declared twice");
+        assert!(format!("{error:#}").contains("class IRI"));
+
+        struct BrokenResolver(Fake);
+        impl Ontology for BrokenResolver {
+            fn id(&self) -> &'static str {
+                self.0.id()
+            }
+            fn version_iri(&self) -> &Iri {
+                self.0.version_iri()
+            }
+            fn artifact_sha256(&self) -> &str {
+                self.0.artifact_sha256()
+            }
+            fn classes(&self) -> &[ClassDecl] {
+                self.0.classes()
+            }
+            fn relations(&self) -> &[RelationDecl] {
+                self.0.relations()
+            }
+            fn class_for_label(&self, _label: &str) -> Option<&ClassDecl> {
+                None
+            }
+            fn is_a(&self, sub: &Iri, sup: &Iri) -> bool {
+                self.0.is_a(sub, sup)
+            }
+        }
+
+        let error = reg
+            .register(Arc::new(BrokenResolver(Fake::new(
+                "broken-resolver",
+                &["Molecule"],
+                &[],
+            ))))
+            .expect_err("a declaration its own resolver cannot find must be refused");
+        assert!(format!("{error:#}").contains("resolver cannot find"));
+        assert!(reg.all().is_empty(), "every invalid adapter was refused");
     }
 
     /// Facts of the default ontology keep the bare base tenant (every
@@ -741,14 +981,26 @@ mod tests {
     /// the validator will accept.
     #[test]
     fn default_instructions_derive_from_the_declared_vocabulary() {
-        let onto = Fake {
-            id: "chem",
-            entities: &["Molecule", "Reaction"],
-            rels: &["REACTS_WITH", "CATALYZED_BY"],
-        };
+        let onto = Fake::new(
+            "chem",
+            &["Molecule", "Reaction"],
+            &["REACTS_WITH", "CATALYZED_BY"],
+        );
         let instructions = onto.extraction_instructions();
-        for t in onto.entity_types().iter().chain(onto.relationship_types()) {
-            assert!(instructions.contains(t), "missing {t}: {instructions}");
+        for label in onto
+            .classes()
+            .iter()
+            .flat_map(|decl| decl.extraction_labels.iter())
+            .chain(
+                onto.relations()
+                    .iter()
+                    .flat_map(|decl| decl.extraction_labels.iter()),
+            )
+        {
+            assert!(
+                instructions.contains(label),
+                "missing {label}: {instructions}"
+            );
         }
         assert!(instructions.contains("Return ONLY valid JSON"));
         // And the wire shape the parser expects.
@@ -767,12 +1019,8 @@ mod tests {
     /// a reworded-away rule fails too.
     #[test]
     fn every_instruction_builder_states_the_referential_integrity_rule() {
-        let default_flavour = Fake {
-            id: "chem",
-            entities: &["Molecule"],
-            rels: &["REACTS_WITH"],
-        }
-        .extraction_instructions();
+        let default_flavour =
+            Fake::new("chem", &["Molecule"], &["REACTS_WITH"]).extraction_instructions();
         let emmo = EmmoOntology.extraction_instructions();
         for (who, text) in [("trait default", default_flavour), ("emmo", emmo)] {
             assert!(
@@ -788,17 +1036,20 @@ mod tests {
     /// converges on the store's `Manufacturing` label (one identity for a
     /// step whether it arrived standalone or through PROCESSED_BY), every
     /// other declared type stores under itself, and an undeclared type maps
-    /// to NOTHING — never a guess. Note `Matter` itself is a storage label,
-    /// not an instructable extraction type.
+    /// to NOTHING — never a guess. `Author` is now deliberately undeclared:
+    /// no defensible class IRI for it exists in the vendored vocabularies.
+    /// Note `Matter` itself is a storage label, not an instructable extraction
+    /// type.
     #[test]
     fn emmo_storage_mapping_converges_synonyms_and_refuses_undeclared() {
         let emmo = EmmoOntology;
         assert_eq!(emmo.storage_label("Alloy"), Some("Matter"));
         assert_eq!(emmo.storage_label("Material"), Some("Matter"));
         assert_eq!(emmo.storage_label("Process"), Some("Manufacturing"));
-        for identity in ["Element", "Property", "Phase", "Paper", "Author", "Dataset"] {
+        for identity in ["Element", "Property", "Phase", "Paper", "Dataset"] {
             assert_eq!(emmo.storage_label(identity), Some(identity));
         }
+        assert_eq!(emmo.storage_label("Author"), None);
         assert_eq!(emmo.storage_label("Matter"), None);
         assert_eq!(emmo.storage_label("Widget"), None);
         assert_eq!(emmo.storage_label(""), None);
@@ -811,17 +1062,21 @@ mod tests {
     /// a type tomorrow inherits the guarantee, it does not redden this test.
     #[test]
     fn every_declared_type_is_storable() {
-        let fake = Fake {
-            id: "prop",
-            entities: &["Molecule", "Reaction", "Solvent"],
-            rels: &["REACTS_WITH"],
-        };
+        let fake = Fake::new(
+            "prop",
+            &["Molecule", "Reaction", "Solvent"],
+            &["REACTS_WITH"],
+        );
         for onto in [&fake as &dyn Ontology, &EmmoOntology] {
-            for t in onto.entity_types() {
-                let label = onto.storage_label(t);
+            for entity_type in onto
+                .classes()
+                .iter()
+                .flat_map(|decl| decl.extraction_labels.iter())
+            {
+                let label = onto.storage_label(entity_type);
                 assert!(
                     matches!(label, Some(l) if !l.trim().is_empty()),
-                    "ontology '{}' declares type '{t}' but maps it to {label:?} — \
+                    "ontology '{}' declares type '{entity_type}' but maps it to {label:?} — \
                      it would instruct the model in a type that cannot be stored",
                     onto.id(),
                 );
@@ -837,32 +1092,39 @@ mod tests {
     /// the active ontology whose vocabulary builds the prompt.
     #[test]
     fn registration_refuses_an_ontology_that_instructs_an_unstorable_type() {
-        struct Unstorable;
+        struct Unstorable(Fake);
         impl Ontology for Unstorable {
             fn id(&self) -> &'static str {
                 "unstorable"
             }
-            fn entity_types(&self) -> &'static [&'static str] {
-                &["Molecule", "Reaction"]
+            fn version_iri(&self) -> &Iri {
+                self.0.version_iri()
             }
-            fn relationship_types(&self) -> &'static [&'static str] {
-                &["REACTS_WITH"]
+            fn artifact_sha256(&self) -> &str {
+                self.0.artifact_sha256()
             }
-            fn unit_vocabulary(&self) -> UnitVocabulary {
-                UnitVocabulary {
-                    name: "FREE",
-                    prefix: None,
-                }
+            fn classes(&self) -> &[ClassDecl] {
+                self.0.classes()
+            }
+            fn relations(&self) -> &[RelationDecl] {
+                self.0.relations()
+            }
+            fn is_a(&self, sub: &Iri, sup: &Iri) -> bool {
+                self.0.is_a(sub, sup)
             }
             // "Reaction" is instructable but unmapped — the drift this refusal exists for.
-            fn storage_label(&self, entity_type: &str) -> Option<&'static str> {
+            fn storage_label(&self, entity_type: &str) -> Option<&str> {
                 (entity_type == "Molecule").then_some("Molecule")
             }
         }
 
         let mut reg = OntologyRegistry::new();
         let err = reg
-            .register(Arc::new(Unstorable))
+            .register(Arc::new(Unstorable(Fake::new(
+                "unstorable",
+                &["Molecule", "Reaction"],
+                &["REACTS_WITH"],
+            ))))
             .expect_err("an unstorable declared type must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("Reaction"), "{msg}");
@@ -885,5 +1147,57 @@ mod tests {
         assert!(msg.contains("zzz-not-registered"), "{msg}");
         assert!(msg.contains("registered: "), "{msg}");
         assert!(msg.contains("emmo"), "{msg}");
+    }
+
+    /// Resolve and classify through the process-wide production dispatch, not
+    /// through a graph fixture constructed by the test. This test is intended
+    /// to fail if either label resolution or the production `is_a` delegation
+    /// is mutated (`REQ-OWL-S1-PRODUCTION-DISPATCH`).
+    #[test]
+    fn active_builtin_resolves_numeric_iri_and_multiple_inheritance() {
+        let ontology = active(None).expect("the built-in ontology resolves");
+        let material = ontology
+            .class_for_label("Material")
+            .expect("Material is an extraction declaration");
+        assert_eq!(
+            material.iri.as_str(),
+            "https://w3id.org/emmo#EMMO_4207e895_8b83_4318_996a_72cfb32acd94"
+        );
+        assert!(
+            material.parents.len() >= 2,
+            "the materialised Material declaration lost its multiple inheritance: {:?}",
+            material.parents
+        );
+        for parent in &material.parents {
+            assert!(
+                ontology.is_a(&material.iri, parent),
+                "Material is no longer classified below direct parent '{parent}'"
+            );
+        }
+
+        let transitive_ancestor = EMMO_GRAPH
+            .ancestors(&material.iri)
+            .expect("Material has an ancestry entry")
+            .iter()
+            .find(|ancestor| !material.parents.contains(ancestor))
+            .expect("Material has at least one transitive ancestor");
+        assert!(
+            ontology.is_a(&material.iri, transitive_ancestor),
+            "Material is no longer classified below transitive ancestor '{transitive_ancestor}'"
+        );
+    }
+
+    /// `HAS_PHASE` is now one declared, IRI-backed object property. It was
+    /// formerly the prompt's only relationship absent from validation.
+    #[test]
+    fn active_builtin_resolves_has_phase_to_an_artifact_property() {
+        let ontology = active(None).expect("the built-in ontology resolves");
+        let relation = ontology
+            .relation_for_label("HAS_PHASE")
+            .expect("HAS_PHASE must be a declared extraction relationship");
+        assert!(
+            EMMO_GRAPH.property(&relation.iri).is_some(),
+            "HAS_PHASE resolved to a property absent from the bundled artifact"
+        );
     }
 }

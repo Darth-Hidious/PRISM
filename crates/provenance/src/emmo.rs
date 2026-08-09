@@ -16,7 +16,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use turso::Value;
 
-use crate::{ProvenanceStore, get_str};
+use crate::{ProvenanceStore, get_opt_str, get_str};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Write-side types (mirror core's `ExtractedFact` / `Provenance`)
@@ -224,6 +224,38 @@ pub struct FactNodeLabels<'a> {
     pub object: &'a str,
 }
 
+/// One ontology-classified entity at the persistence boundary.
+///
+/// `storage_label` remains the compatibility identity used by [`entity_key`];
+/// `entity_type` records what extraction declared, and `class_iri` records the
+/// canonical vocabulary identity without re-keying an existing graph.
+///
+/// @req REQ-OWL-1.4 - Persist declared type and canonical class IRI additively.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassifiedNode<'a> {
+    pub entity_type: &'a str,
+    pub storage_label: &'a str,
+    pub class_iri: &'a str,
+}
+
+/// The classified subject and object of one extracted fact.
+///
+/// @req REQ-OWL-1.4 - Carry ontology identity through the production fact dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassifiedFactNodes<'a> {
+    pub subject: ClassifiedNode<'a>,
+    pub object: ClassifiedNode<'a>,
+}
+
+/// Immutable ontology artifact identity used to classify one assertion.
+///
+/// @req REQ-OWL-1.5 - Record ontology version IRI and artifact SHA-256.
+#[derive(Debug, Clone, Copy)]
+pub struct OntologyClassification<'a> {
+    pub version_iri: &'a str,
+    pub artifact_sha256: &'a str,
+}
+
 /// Common storage view implemented by both the additive conditioned contract
 /// and the source-compatible legacy fact.
 pub trait FactPayload {
@@ -330,6 +362,10 @@ pub struct GraphNode {
     pub name: String,
     pub entity_type: String,
     pub label: String,
+    /// Canonical ontology class identity. `None` is honest legacy/unclassified
+    /// data written before the OWL layer or received without a defensible IRI.
+    #[serde(default)]
+    pub class_iri: Option<String>,
     pub tenant: String,
 }
 
@@ -421,6 +457,19 @@ pub struct EvidenceContribution {
     /// self-corroboration (old count preserved in `legacy_corroborations`).
     pub confidence_kind: String,
     pub legacy_corroborations: Option<i64>,
+}
+
+/// One auditable ontology classification event for an assertion.
+///
+/// A repeated assertion may appear here under several ontology versions; the
+/// assertion's stable digest is deliberately not affected.
+///
+/// @req REQ-OWL-1.5 - Answer which ontology artifact classified a fact.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AssertionClassification {
+    pub activity_id: String,
+    pub version_iri: String,
+    pub artifact_sha256: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1328,6 +1377,7 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
             name TEXT,
             label TEXT,
             entity_type TEXT,
+            class_iri TEXT,
             tenant TEXT,
             props_json TEXT,
             created_at TEXT
@@ -1335,6 +1385,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
         (),
     )
     .await?;
+    // Additive OWL identity for databases created before Stage 1. A legacy
+    // row remains NULL: inventing an IRI from an old display label would be
+    // less honest than recording that its canonical class is unknown.
+    crate::add_column_if_absent(conn, "emmo_entity", "class_iri", "TEXT").await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_emmo_entity_tenant ON emmo_entity(tenant)",
         (),
@@ -1554,6 +1608,50 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     )
     .await?;
 
+    // Ontology classification is a separate, additive provenance relation.
+    // It MUST stay outside `prov_assertion.id`: one stable assertion can be
+    // classified under several ontology releases without re-keying the fact.
+    // One activity may classify the same assertion only once per artifact;
+    // repeated ingests and later ontology versions therefore remain auditable.
+    conn.execute(
+        r#"CREATE TABLE IF NOT EXISTS prov_assertion_classification (
+            assertion_id TEXT NOT NULL,
+            activity_id TEXT NOT NULL,
+            ontology_version_iri TEXT NOT NULL
+                CHECK (length(trim(ontology_version_iri)) > 0),
+            artifact_sha256 TEXT NOT NULL
+                CHECK (
+                    length(artifact_sha256) = 64
+                    AND artifact_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+
+            PRIMARY KEY (
+                assertion_id,
+                activity_id,
+                ontology_version_iri,
+                artifact_sha256
+            ),
+
+            FOREIGN KEY (assertion_id)
+                REFERENCES prov_assertion(id)
+                ON UPDATE CASCADE
+                ON DELETE CASCADE,
+
+            FOREIGN KEY (activity_id)
+                REFERENCES prov_activity(id)
+                ON UPDATE CASCADE
+                ON DELETE CASCADE
+        )"#,
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prov_assertion_classification_version \
+         ON prov_assertion_classification(ontology_version_iri, artifact_sha256)",
+        (),
+    )
+    .await?;
+
     // Entity vectors for local semantic search: one little-endian f32 blob
     // per emmo_entity key (same encoding as `provenance_embeddings`),
     // written lazily by `embed_and_store_entities` — never on the
@@ -1759,6 +1857,69 @@ fn distinct_fact_names<F: FactPayload>(facts: &[F]) -> Vec<String> {
     names
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EntityWrite<'a> {
+    /// `None` means the caller has no declared extraction type. A fresh row
+    /// falls back to its storage label; an existing classified row is not
+    /// downgraded by that weaker legacy write.
+    entity_type: Option<&'a str>,
+    storage_label: &'a str,
+    class_iri: Option<&'a str>,
+}
+
+impl<'a> EntityWrite<'a> {
+    fn legacy(storage_label: &'a str) -> Self {
+        Self {
+            entity_type: None,
+            storage_label,
+            class_iri: None,
+        }
+    }
+
+    fn classified(node: ClassifiedNode<'a>) -> Self {
+        Self {
+            entity_type: Some(node.entity_type),
+            storage_label: node.storage_label,
+            class_iri: Some(node.class_iri),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FactWriteMetadata<'a> {
+    subject: Option<EntityWrite<'a>>,
+    object: Option<EntityWrite<'a>>,
+    ontology: Option<OntologyClassification<'a>>,
+}
+
+fn validate_classified_node(node: ClassifiedNode<'_>) -> Result<()> {
+    if node.entity_type.trim().is_empty() {
+        bail!("classified entity type cannot be empty");
+    }
+    if node.storage_label.trim().is_empty() {
+        bail!("classified entity storage label cannot be empty");
+    }
+    if node.class_iri.trim().is_empty() {
+        bail!("classified entity class IRI cannot be empty");
+    }
+    Ok(())
+}
+
+fn validate_ontology_classification(ontology: OntologyClassification<'_>) -> Result<()> {
+    if ontology.version_iri.trim().is_empty() {
+        bail!("ontology version IRI cannot be empty");
+    }
+    if ontology.artifact_sha256.len() != 64
+        || !ontology
+            .artifact_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        bail!("ontology artifact SHA-256 must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Write API
 // ─────────────────────────────────────────────────────────────────────────
@@ -1771,11 +1932,11 @@ impl ProvenanceStore {
     async fn upsert_entity(
         &self,
         name: &str,
-        label: &str,
+        entity: EntityWrite<'_>,
         tenant: &str,
         props_json: Option<String>,
     ) -> Result<String> {
-        let key = entity_key(tenant, label, name);
+        let key = entity_key(tenant, entity.storage_label, name);
         // `tenant` is deliberately NOT in the DO UPDATE set: the key now
         // carries it, so a conflict can only ever be the same tenant
         // re-ingesting. Reassigning it here is what let one tenant take
@@ -1783,20 +1944,28 @@ impl ProvenanceStore {
         self.conn
             .execute(
                 r#"INSERT INTO emmo_entity
-                   (key, name, label, entity_type, tenant, props_json, created_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   (key, name, label, entity_type, class_iri, tenant, props_json, created_at)
+                   VALUES (?1, ?2, ?3, COALESCE(?4, ?3), ?5, ?6, ?7, ?8)
                    ON CONFLICT(key) DO UPDATE SET
                        name = excluded.name,
                        label = excluded.label,
-                       entity_type = excluded.entity_type,
+                       entity_type = CASE
+                           WHEN ?4 IS NULL
+                               THEN COALESCE(emmo_entity.entity_type, excluded.entity_type)
+                           ELSE ?4
+                       END,
+                       class_iri = COALESCE(?5, emmo_entity.class_iri),
                        props_json = COALESCE(excluded.props_json, emmo_entity.props_json)"#,
                 [
                     Value::Text(key.clone()),
                     Value::Text(name.to_string()),
-                    Value::Text(label.to_string()),
-                    // No separate short-code taxonomy locally — the EMMO label
-                    // doubles as the entity_type the read shapes expose.
-                    Value::Text(label.to_string()),
+                    Value::Text(entity.storage_label.to_string()),
+                    entity
+                        .entity_type
+                        .map_or(Value::Null, |kind| Value::Text(kind.to_string())),
+                    entity
+                        .class_iri
+                        .map_or(Value::Null, |iri| Value::Text(iri.to_string())),
                     Value::Text(tenant.to_string()),
                     match props_json {
                         Some(p) => Value::Text(p),
@@ -1860,6 +2029,35 @@ impl ProvenanceStore {
             .await
     }
 
+    /// Write a fact using the store's established graph shape and stamp the
+    /// assertion with the ontology artifact that classified it.
+    ///
+    /// This is the classified text/paper path: its synthetic `Matter`,
+    /// `Measurement`, and related storage nodes remain byte-compatible while
+    /// the assertion gains an auditable ontology version and artifact hash.
+    /// The stamp is not an input to [`assertion_id`] or any graph identity.
+    ///
+    /// @req REQ-OWL-1.5 - Classify legacy-shaped facts transactionally.
+    pub async fn write_fact_with_classification<F: FactPayload>(
+        &self,
+        fact: &F,
+        prov: &LocalProvenance,
+        ontology: OntologyClassification<'_>,
+    ) -> Result<()> {
+        validate_ontology_classification(ontology)?;
+        self.write_fact_as(
+            fact,
+            prov,
+            fact.evidence_class(),
+            Some(FactWriteMetadata {
+                subject: None,
+                object: None,
+                ontology: Some(ontology),
+            }),
+        )
+        .await
+    }
+
     /// Store a source-compatible legacy fact with an explicit class and the
     /// subject/object node labels the caller's ACTIVE ontology declares for
     /// it. This is the tabular LLM ingest path: the old `LocalFact` shape
@@ -1885,8 +2083,51 @@ impl ProvenanceStore {
                 fact.object
             );
         }
-        self.write_fact_as(fact, prov, evidence_class, Some(labels))
-            .await
+        self.write_fact_as(
+            fact,
+            prov,
+            evidence_class,
+            Some(FactWriteMetadata {
+                subject: Some(EntityWrite::legacy(labels.subject)),
+                object: Some(EntityWrite::legacy(labels.object)),
+                ontology: None,
+            }),
+        )
+        .await
+    }
+
+    /// Store one tabular fact with its declared node types, canonical class
+    /// IRIs, and the exact ontology artifact that performed classification.
+    ///
+    /// The compatibility `storage_label` alone still feeds [`entity_key`];
+    /// neither class IRIs nor ontology metadata enter entity, edge, or
+    /// assertion identities. The assertion classification row commits in the
+    /// same transaction as the assertion and graph writes.
+    ///
+    /// @req REQ-OWL-1.4 - Persist canonical class identity without re-keying.
+    /// @req REQ-OWL-1.5 - Record version IRI and artifact SHA transactionally.
+    pub async fn write_classified_fact_with_evidence(
+        &self,
+        fact: &LocalFact,
+        prov: &LocalProvenance,
+        evidence_class: EvidenceClass,
+        nodes: ClassifiedFactNodes<'_>,
+        ontology: OntologyClassification<'_>,
+    ) -> Result<()> {
+        validate_classified_node(nodes.subject)?;
+        validate_classified_node(nodes.object)?;
+        validate_ontology_classification(ontology)?;
+        self.write_fact_as(
+            fact,
+            prov,
+            evidence_class,
+            Some(FactWriteMetadata {
+                subject: Some(EntityWrite::classified(nodes.subject)),
+                object: Some(EntityWrite::classified(nodes.object)),
+                ontology: Some(ontology),
+            }),
+        )
+        .await
     }
 
     /// Write one entity relayed from a mesh peer: the entity under its own
@@ -1914,6 +2155,67 @@ impl ProvenanceStore {
         dataset_name: &str,
         prov: &LocalProvenance,
     ) -> Result<()> {
+        self.write_synced_entity_as(
+            name,
+            EntityWrite::legacy(label),
+            props_json,
+            dataset_name,
+            prov,
+        )
+        .await
+    }
+
+    /// Relay a peer entity while keeping storage identity, declared type, and
+    /// an optional peer-supplied canonical class IRI distinct.
+    ///
+    /// `None` is required when the peer did not supply a defensible IRI; this
+    /// method never fabricates one from a display label. The `SYNCED_FROM`
+    /// assertion itself is relay provenance and receives no local ontology
+    /// classification stamp.
+    ///
+    /// @req REQ-OWL-1.4 - Preserve classified entity identity across mesh sync.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_synced_entity_with_identity(
+        &self,
+        name: &str,
+        entity_type: &str,
+        storage_label: &str,
+        class_iri: Option<&str>,
+        props_json: Option<String>,
+        dataset_name: &str,
+        prov: &LocalProvenance,
+    ) -> Result<()> {
+        if entity_type.trim().is_empty() {
+            bail!("synced entity type cannot be empty");
+        }
+        if storage_label.trim().is_empty() {
+            bail!("synced entity storage label cannot be empty");
+        }
+        if class_iri.is_some_and(|iri| iri.trim().is_empty()) {
+            bail!("synced entity class IRI cannot be empty when present");
+        }
+        self.write_synced_entity_as(
+            name,
+            EntityWrite {
+                entity_type: Some(entity_type),
+                storage_label,
+                class_iri,
+            },
+            props_json,
+            dataset_name,
+            prov,
+        )
+        .await
+    }
+
+    async fn write_synced_entity_as(
+        &self,
+        name: &str,
+        entity: EntityWrite<'_>,
+        props_json: Option<String>,
+        dataset_name: &str,
+        prov: &LocalProvenance,
+    ) -> Result<()> {
         let _same_handle_guard = self.write_lock.lock().await;
         let txn = begin_immediate(&self.conn).await?;
         let result: Result<()> = async {
@@ -1930,13 +2232,19 @@ impl ProvenanceStore {
                     None,
                     &[],
                     EvidenceClass::Indeterminate,
+                    None,
                 )
                 .await?;
             let subj_key = self
-                .upsert_entity(name, label, &prov.tenant, props_json.clone())
+                .upsert_entity(name, entity, &prov.tenant, props_json.clone())
                 .await?;
             let obj_key = self
-                .upsert_entity(dataset_name, "Dataset", &prov.tenant, None)
+                .upsert_entity(
+                    dataset_name,
+                    EntityWrite::legacy("Dataset"),
+                    &prov.tenant,
+                    None,
+                )
                 .await?;
             self.upsert_edge(
                 &subj_key,
@@ -1983,7 +2291,29 @@ impl ProvenanceStore {
         // join (and be rolled back with) a raw transaction some other task
         // has open on the one shared connection.
         let _same_handle_guard = self.write_lock.lock().await;
-        self.upsert_entity(name, label, tenant, props_json).await?;
+        self.upsert_entity(name, EntityWrite::legacy(label), tenant, props_json)
+            .await?;
+        Ok(())
+    }
+
+    /// Store one relationship-less extracted entity with its declared type and
+    /// canonical class IRI while retaining the compatibility storage key.
+    ///
+    /// @req REQ-OWL-1.4 - Persist standalone classified entities additively.
+    pub async fn write_classified_entity(
+        &self,
+        name: &str,
+        node: ClassifiedNode<'_>,
+        props_json: Option<String>,
+        tenant: &str,
+    ) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("refusing to write an entity with an empty name");
+        }
+        validate_classified_node(node)?;
+        let _same_handle_guard = self.write_lock.lock().await;
+        self.upsert_entity(name, EntityWrite::classified(node), tenant, props_json)
+            .await?;
         Ok(())
     }
 
@@ -1997,7 +2327,7 @@ impl ProvenanceStore {
         payload: &F,
         prov: &LocalProvenance,
         evidence_class: EvidenceClass,
-        labels: Option<FactNodeLabels<'_>>,
+        metadata: Option<FactWriteMetadata<'_>>,
     ) -> Result<()> {
         let conditions = payload.conditions().to_vec();
         validate_conditions(&conditions)?;
@@ -2048,15 +2378,22 @@ impl ProvenanceStore {
                     fact.unit.as_deref(),
                     &conditions,
                     evidence_class,
+                    metadata.and_then(|details| details.ontology),
                 )
                 .await?;
 
-            // One binding per node role: the caller's declared label when
-            // supplied, the legacy EMMO-shaped default otherwise. Every arm
-            // below reads these — none hardcodes a label past this point,
-            // so a supplied declaration governs the WHOLE write.
-            let subject_label = labels.map_or("Matter", |l| l.subject);
-            let object_label = |legacy: &'static str| labels.map_or(legacy, |l| l.object);
+            // One binding per node role: caller-supplied classified identity
+            // when present, the established storage shape otherwise. Every
+            // fact arm uses these bindings so identity semantics do not drift
+            // between dispatch paths.
+            let subject_entity = metadata
+                .and_then(|details| details.subject)
+                .unwrap_or_else(|| EntityWrite::legacy("Matter"));
+            let object_entity = |legacy: &'static str| {
+                metadata
+                    .and_then(|details| details.object)
+                    .unwrap_or_else(|| EntityWrite::legacy(legacy))
+            };
 
             match fact.kind.as_deref() {
                 Some("measurement") => {
@@ -2079,13 +2416,18 @@ impl ProvenanceStore {
                         "confidence": confidence,
                     });
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let meas_key = self
-                        .upsert_entity(&meas_name, "Measurement", tenant, Some(props.to_string()))
+                        .upsert_entity(
+                            &meas_name,
+                            EntityWrite::legacy("Measurement"),
+                            tenant,
+                            Some(props.to_string()),
+                        )
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_label("Property"), tenant, None)
+                        .upsert_entity(&fact.object, object_entity("Property"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2110,10 +2452,10 @@ impl ProvenanceStore {
                 }
                 Some("phase") => {
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_label("Phase"), tenant, None)
+                        .upsert_entity(&fact.object, object_entity("Phase"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2129,12 +2471,12 @@ impl ProvenanceStore {
                 Some("composition") => {
                     let props = serde_json::json!({ "canonical_formula": &fact.object });
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
                         .upsert_entity(
                             &fact.object,
-                            object_label("Composition"),
+                            object_entity("Composition"),
                             tenant,
                             Some(props.to_string()),
                         )
@@ -2158,10 +2500,10 @@ impl ProvenanceStore {
                         .value
                         .map(|f| serde_json::json!({ "fraction": f }).to_string());
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_label("Element"), tenant, None)
+                        .upsert_entity(&fact.object, object_entity("Element"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2180,10 +2522,10 @@ impl ProvenanceStore {
                         .value
                         .map(|o| serde_json::json!({ "order": o }).to_string());
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_label("Manufacturing"), tenant, None)
+                        .upsert_entity(&fact.object, object_entity("Manufacturing"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2199,12 +2541,12 @@ impl ProvenanceStore {
                 Some("structure") => {
                     let props = serde_json::json!({ "system": &fact.object });
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
                         .upsert_entity(
                             &fact.object,
-                            object_label("CrystalStructure"),
+                            object_entity("CrystalStructure"),
                             tenant,
                             Some(props.to_string()),
                         )
@@ -2222,10 +2564,10 @@ impl ProvenanceStore {
                 }
                 Some("application") => {
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_label("Application"), tenant, None)
+                        .upsert_entity(&fact.object, object_entity("Application"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2241,10 +2583,10 @@ impl ProvenanceStore {
                 // Unknown kind: keep the fact as a generic edge, don't drop it.
                 _ => {
                     let subj_key = self
-                        .upsert_entity(&fact.subject, subject_label, tenant, None)
+                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_label("Entity"), tenant, None)
+                        .upsert_entity(&fact.object, object_entity("Entity"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2345,7 +2687,7 @@ impl ProvenanceStore {
         let _same_handle_guard = self.write_lock.lock().await;
         let txn = begin_immediate(&self.conn).await?;
         let result = self
-            .record_assertion_in_open_txn(a, prov, value, unit, conditions, evidence_class)
+            .record_assertion_in_open_txn(a, prov, value, unit, conditions, evidence_class, None)
             .await
             .map(|_aggregates| ());
         finish_write_txn(txn, result).await
@@ -2378,6 +2720,7 @@ impl ProvenanceStore {
         unit: Option<&str>,
         conditions: &[MeasurementCondition],
         evidence_class: EvidenceClass,
+        ontology: Option<OntologyClassification<'_>>,
     ) -> Result<(f64, EvidenceClass)> {
         // Normalize before any write. `None` keeps the historical "asserted
         // without a stated confidence = full confidence" contract; NaN and
@@ -2438,6 +2781,32 @@ impl ProvenanceStore {
                 ],
             )
             .await?;
+
+        // The classification event is joined to the stable assertion rather
+        // than folded into its digest. This permits the same fact to be
+        // classified under several ontology releases and ensures a later
+        // graph-write error rolls the stamp back with the assertion.
+        if let Some(ontology) = ontology {
+            self.conn
+                .execute(
+                    r#"INSERT INTO prov_assertion_classification
+                       (assertion_id, activity_id, ontology_version_iri, artifact_sha256)
+                       VALUES (?1, ?2, ?3, ?4)
+                       ON CONFLICT (
+                           assertion_id,
+                           activity_id,
+                           ontology_version_iri,
+                           artifact_sha256
+                       ) DO NOTHING"#,
+                    [
+                        Value::Text(id.clone()),
+                        Value::Text(prov.activity_id.clone()),
+                        Value::Text(ontology.version_iri.to_string()),
+                        Value::Text(ontology.artifact_sha256.to_string()),
+                    ],
+                )
+                .await?;
+        }
 
         // Attempt the per-source contribution. The affected-row count IS the
         // independence decision: 1 = genuinely new origin source, 0 = this
@@ -2636,7 +3005,7 @@ impl ProvenanceStore {
             return Ok(Vec::new());
         }
         let sql = format!(
-            "SELECT name, entity_type, label, tenant FROM emmo_entity \
+            "SELECT name, entity_type, label, class_iri, tenant FROM emmo_entity \
              WHERE tenant IN ({}) AND name LIKE ?{} \
              ORDER BY LENGTH(name) LIMIT ?{}",
             tenant_placeholders(1, tenants.len()),
@@ -2724,7 +3093,7 @@ impl ProvenanceStore {
         let mut centers: Vec<(String, GraphNode)> = Vec::new();
         {
             let sql = format!(
-                "SELECT key, name, entity_type, label, tenant FROM emmo_entity \
+                "SELECT key, name, entity_type, label, class_iri, tenant FROM emmo_entity \
                  WHERE tenant IN ({}) AND name = ?{}",
                 tenant_placeholders(1, tenants.len()),
                 tenants.len() + 1,
@@ -2739,7 +3108,7 @@ impl ProvenanceStore {
         if centers.is_empty() {
             let canon = canonical_key(name);
             let sql = format!(
-                "SELECT key, name, entity_type, label, tenant FROM emmo_entity \
+                "SELECT key, name, entity_type, label, class_iri, tenant FROM emmo_entity \
                  WHERE tenant IN ({})",
                 tenant_placeholders(1, tenants.len()),
             );
@@ -2784,8 +3153,8 @@ impl ProvenanceStore {
         }
 
         const EDGE_COLS: &str = "e.rel_type, \
-             s.name, s.entity_type, s.label, s.tenant, \
-             t.name, t.entity_type, t.label, t.tenant, \
+             s.name, s.entity_type, s.label, s.class_iri, s.tenant, \
+             t.name, t.entity_type, t.label, t.class_iri, t.tenant, \
              e.tenant";
         let mut edges: Vec<GraphEdge> = Vec::new();
         let mut seen_edges: std::collections::HashSet<(String, String, String, String)> =
@@ -2841,9 +3210,9 @@ impl ProvenanceStore {
             };
             while let Some(row) = rows.next().await? {
                 let source = row_to_node(&row, 1)?;
-                let target = row_to_node(&row, 5)?;
+                let target = row_to_node(&row, 6)?;
                 let rel = get_str(&row, 0)?;
-                let edge_tenant = get_str(&row, 9)?;
+                let edge_tenant = get_str(&row, 11)?;
                 // An edge between two centers shows up in both queries.
                 // The tenant is part of the key: the same (source, rel,
                 // target) names under two tenants are two edges.
@@ -3007,6 +3376,38 @@ impl ProvenanceStore {
             });
         }
         Ok(contributions)
+    }
+
+    /// Return every ontology artifact that classified the stable assertion
+    /// identified by `assertion_id`, ordered deterministically.
+    ///
+    /// The result can contain several versions and activities for one
+    /// assertion. An empty result honestly means that the assertion predates
+    /// classification provenance or was written through an unclassified API.
+    ///
+    /// @req REQ-OWL-1.5 - Report ontology identity for a classified fact.
+    pub async fn assertion_classifications(
+        &self,
+        assertion_id: &str,
+    ) -> Result<Vec<AssertionClassification>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT activity_id, ontology_version_iri, artifact_sha256 \
+                 FROM prov_assertion_classification WHERE assertion_id = ?1 \
+                 ORDER BY ontology_version_iri, artifact_sha256, activity_id",
+                [Value::Text(assertion_id.to_string())],
+            )
+            .await?;
+        let mut classifications = Vec::new();
+        while let Some(row) = rows.next().await? {
+            classifications.push(AssertionClassification {
+                activity_id: get_str(&row, 0)?,
+                version_iri: get_str(&row, 1)?,
+                artifact_sha256: get_str(&row, 2)?,
+            });
+        }
+        Ok(classifications)
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -3440,14 +3841,15 @@ fn tenant_params(tenants: &[&str]) -> Vec<Value> {
         .collect()
 }
 
-/// Read a `GraphNode` from four consecutive columns starting at `offset`
-/// (name, entity_type, label, tenant).
+/// Read a `GraphNode` from five consecutive columns starting at `offset`
+/// (name, entity_type, label, class_iri, tenant).
 fn row_to_node(row: &turso::Row, offset: usize) -> Result<GraphNode> {
     Ok(GraphNode {
         name: get_str(row, offset)?,
         entity_type: get_str(row, offset + 1)?,
         label: get_str(row, offset + 2)?,
-        tenant: get_str(row, offset + 3)?,
+        class_iri: get_opt_str(row, offset + 3)?,
+        tenant: get_str(row, offset + 4)?,
     })
 }
 
@@ -3772,6 +4174,233 @@ mod tests {
             .await
             .expect_err("an empty node label must be refused");
         assert!(format!("{err:#}").contains("empty node label"), "{err:#}");
+    }
+
+    /// Classified writes keep all three type concepts distinct and stamp the
+    /// stable assertion without changing any existing identity formula.
+    #[tokio::test]
+    async fn classified_fact_persists_identity_and_multi_version_provenance_additively() {
+        const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let classified = fact("phase", "classified-alloy", "has_phase", "alpha-phase");
+        let nodes = ClassifiedFactNodes {
+            subject: ClassifiedNode {
+                entity_type: "Alloy",
+                storage_label: "Matter",
+                class_iri: "urn:test:class:alloy",
+            },
+            object: ClassifiedNode {
+                entity_type: "Phase",
+                storage_label: "Phase",
+                class_iri: "urn:test:class:phase",
+            },
+        };
+
+        store
+            .write_classified_fact_with_evidence(
+                &classified,
+                &prov_from("doc:classified-a", "act-classified-a"),
+                EvidenceClass::Research,
+                nodes,
+                OntologyClassification {
+                    version_iri: "urn:test:ontology:v1",
+                    artifact_sha256: SHA_A,
+                },
+            )
+            .await
+            .unwrap();
+
+        let subject = store
+            .graph_search("classified-alloy", "t1", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|node| node.name == "classified-alloy")
+            .expect("classified subject must be queryable");
+        assert_eq!(subject.label, "Matter", "storage label is compatibility");
+        assert_eq!(subject.entity_type, "Alloy", "declared type was destroyed");
+        assert_eq!(subject.class_iri.as_deref(), Some("urn:test:class:alloy"));
+
+        let subject_key = entity_key("t1", "Matter", "classified-alloy");
+        let object_key = entity_key("t1", "Phase", "alpha-phase");
+        assert_eq!(
+            query_str(
+                &store,
+                "SELECT key FROM emmo_entity WHERE name = 'classified-alloy'"
+            )
+            .await,
+            subject_key
+        );
+        assert_eq!(
+            query_str(
+                &store,
+                "SELECT id FROM emmo_edge WHERE rel_type = 'HAS_PHASE'"
+            )
+            .await,
+            format!("t1|{subject_key}|HAS_PHASE|{object_key}"),
+            "class metadata must not enter the edge id"
+        );
+
+        let stable_assertion_id =
+            assertion_id("t1", "classified-alloy", "has_phase", "alpha-phase");
+        let first = store
+            .assertion_classifications(&stable_assertion_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            vec![AssertionClassification {
+                activity_id: "act-classified-a".into(),
+                version_iri: "urn:test:ontology:v1".into(),
+                artifact_sha256: SHA_A.into(),
+            }]
+        );
+
+        // Reclassifying the same assertion under another artifact adds an
+        // audit row but does not mint another assertion, edge, or entity.
+        store
+            .write_classified_fact_with_evidence(
+                &classified,
+                &prov_from("doc:classified-b", "act-classified-b"),
+                EvidenceClass::Research,
+                nodes,
+                OntologyClassification {
+                    version_iri: "urn:test:ontology:v2",
+                    artifact_sha256: SHA_B,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM emmo_edge").await, 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM emmo_entity").await, 2);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_classification").await,
+            2
+        );
+        let versions = store
+            .assertion_classifications(&stable_assertion_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|classification| classification.version_iri)
+            .collect::<Vec<_>>();
+        assert_eq!(versions, ["urn:test:ontology:v1", "urn:test:ontology:v2"]);
+    }
+
+    /// Text and paper extraction can stamp classification provenance while
+    /// keeping the store's established synthetic node shape unchanged.
+    #[tokio::test]
+    async fn legacy_shaped_fact_can_be_classification_stamped_without_fake_node_iris() {
+        const SHA: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let legacy = fact("phase", "legacy-shaped", "has_phase", "beta-phase");
+        store
+            .write_fact_with_classification(
+                &legacy,
+                &test_prov(),
+                OntologyClassification {
+                    version_iri: "urn:test:ontology:text",
+                    artifact_sha256: SHA,
+                },
+            )
+            .await
+            .unwrap();
+
+        let subject = store
+            .graph_search("legacy-shaped", "t1", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("legacy-shaped subject must be queryable");
+        assert_eq!(subject.label, "Matter");
+        assert_eq!(subject.entity_type, "Matter");
+        assert_eq!(subject.class_iri, None, "the store must not invent an IRI");
+        let id = assertion_id("t1", "legacy-shaped", "has_phase", "beta-phase");
+        assert_eq!(store.assertion_classifications(&id).await.unwrap().len(), 1);
+
+        let err = store
+            .write_fact_with_classification(
+                &legacy,
+                &test_prov(),
+                OntologyClassification {
+                    version_iri: "urn:test:ontology:text",
+                    artifact_sha256: "NOT-A-SHA",
+                },
+            )
+            .await
+            .expect_err("an invalid artifact identity must be refused before writing");
+        assert!(err.to_string().contains("64 lowercase hexadecimal"));
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+    }
+
+    /// Opening a pre-OWL database adds only the nullable class identity;
+    /// existing rows and keys remain unchanged and honestly unclassified.
+    #[tokio::test]
+    async fn legacy_emmo_entity_schema_gains_nullable_class_iri_without_rekeying() {
+        let db = TempDb::new();
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"CREATE TABLE emmo_entity (
+                    key TEXT PRIMARY KEY,
+                    name TEXT,
+                    label TEXT,
+                    entity_type TEXT,
+                    tenant TEXT,
+                    props_json TEXT,
+                    created_at TEXT
+                )"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO emmo_entity \
+                 (key, name, label, entity_type, tenant, created_at) VALUES \
+                 ('t1|Matter:legacy-alloy', 'Legacy Alloy', 'Matter', 'Matter', 't1', 'old')",
+                (),
+            )
+            .await
+            .unwrap();
+            // The key is already v4-qualified; avoid asking unrelated old-key
+            // migrations to reinterpret this focused schema fixture.
+            conn.execute("PRAGMA user_version = 5", ()).await.unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let node = store
+            .graph_search("Legacy Alloy", "t1", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("legacy row must survive the additive migration");
+        assert_eq!(node.label, "Matter");
+        assert_eq!(node.entity_type, "Matter");
+        assert_eq!(node.class_iri, None);
+        assert_eq!(
+            query_str(
+                &store,
+                "SELECT key FROM emmo_entity WHERE name = 'Legacy Alloy'"
+            )
+            .await,
+            "t1|Matter:legacy-alloy"
+        );
     }
 
     #[tokio::test]

@@ -58,6 +58,7 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.143"
 serde_yaml = "0.9"
 serde_yml = "0.0.12"
+sophia = "0.10"
 toml = "0.8"
 toml_edit = { version = "0.25", features = ["serde"] }
 url = { version = "2.5.8", features = ["serde"] }
@@ -200,4 +201,3 @@ fastembed = { version = "5.17", default-features = false, features = ["hf-hub-ru
 # workspace builds do not compile llama.cpp.
 llama-cpp-2 = { version = "0.1.154", default-features = false }
 llama-cpp-sys-2 = { version = "0.1.154", default-features = false }
-

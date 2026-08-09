@@ -271,6 +271,9 @@ impl LlmOntologyConstructor {
                 schema.columns.len()
             );
         }
+        if let Some(mapping) = mapping {
+            mapping.validate_for(ontology)?;
+        }
         let max_rows = self.config.max_sample_rows;
         let rows = if sample_rows.len() > max_rows {
             &sample_rows[..max_rows]
@@ -666,6 +669,40 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("2 columns"), "{msg}");
+    }
+
+    /// Custom prompt rules are checked at the production extraction dispatch,
+    /// before an LLM request can carry a label with no canonical IRI.
+    #[tokio::test]
+    async fn extraction_dispatch_refuses_unresolved_mapping_labels_before_llm_call() {
+        let schema = SchemaAnalysis {
+            columns: vec!["Composition".into()],
+            detected_types: vec!["string".into()],
+        };
+        let mapping: crate::mapping::OntologyMapping = serde_yaml::from_str(
+            r#"
+entity_rules:
+  - column_pattern: "Composition"
+    entity_type: ImaginaryClass
+"#,
+        )
+        .unwrap();
+        let constructor = LlmOntologyConstructor::new(LlmConfig::default());
+
+        let error = constructor
+            .extract_entities_with_mapping(
+                &crate::ontologies::EmmoOntology,
+                &schema,
+                &[vec!["Ti-6Al-4V".into()]],
+                Some(&mapping),
+            )
+            .await
+            .expect_err("an unresolved prompt label must be refused before dispatch");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unknown entity type \"ImaginaryClass\""),
+            "{message}"
+        );
     }
 
     #[test]

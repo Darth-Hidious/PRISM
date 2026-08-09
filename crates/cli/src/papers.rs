@@ -490,6 +490,11 @@ async fn store_claims(
     }
 
     let store = ProvenanceStore::open(db_path).await?;
+    // Literature claims use the same built-in EMMO classification contract
+    // as text ingest. Resolve it through the production registry so the
+    // assertion records the exact version IRI and vendored artifact hash
+    // (REQ-OWL-S1-CLASSIFICATION-PROVENANCE).
+    let ontology = prism_ingest::ontologies::active(None)?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let prov = LocalProvenance {
@@ -600,7 +605,17 @@ async fn store_claims(
             kind: claim.kind.clone(),
         };
 
-        match store.write_fact(&fact, &prov).await {
+        match store
+            .write_fact_with_classification(
+                &fact,
+                &prov,
+                prism_provenance::OntologyClassification {
+                    version_iri: ontology.version_iri().as_str(),
+                    artifact_sha256: ontology.artifact_sha256(),
+                },
+            )
+            .await
+        {
             Ok(()) => written += 1,
             Err(e) => rejected.push(json!({
                 "subject": claim.subject,

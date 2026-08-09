@@ -36,7 +36,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::SchemaAnalysis;
@@ -85,6 +85,34 @@ impl OntologyMapping {
             path.display()
         );
         Ok(mapping)
+    }
+
+    /// Validate every prompt-producing rule against the active ontology.
+    ///
+    /// # Requirements
+    /// - **REQ-OWL-INGEST-006:** A custom mapping must not instruct the LLM
+    ///   to emit a class or relation that the active ontology cannot resolve
+    ///   to a canonical IRI.
+    pub fn validate_for(&self, ontology: &dyn crate::ontologies::Ontology) -> Result<()> {
+        for (index, rule) in self.entity_rules.iter().enumerate() {
+            if ontology.class_for_label(&rule.entity_type).is_none() {
+                bail!(
+                    "ontology mapping rule {index} declares unknown entity type {:?} for ontology '{}'",
+                    rule.entity_type,
+                    ontology.id()
+                );
+            }
+            if let Some(relation) = &rule.relationship
+                && ontology.relation_for_label(relation).is_none()
+            {
+                bail!(
+                    "ontology mapping rule {index} declares unknown relationship {:?} for ontology '{}'",
+                    relation,
+                    ontology.id()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Check if a column name should be ignored.
@@ -222,6 +250,10 @@ ignore_columns:
         assert_eq!(mapping.entity_rules.len(), 2);
         assert_eq!(mapping.aliases.len(), 2);
         assert_eq!(mapping.ignore_columns.len(), 2);
+        let ontology = crate::ontologies::active(None).expect("built-in ontology loads");
+        mapping
+            .validate_for(ontology.as_ref())
+            .expect("the production EMMO resolver accepts every instructed rule");
     }
 
     #[test]
@@ -318,5 +350,19 @@ ignore_columns:
         assert!(prompt.contains("Hardness"));
         assert!(prompt.contains("Niobium"));
         assert!(prompt.contains("id"));
+
+        let ontology = crate::ontologies::active(None).expect("built-in ontology loads");
+        let mut unknown_class = mapping.clone();
+        unknown_class.entity_rules[0].entity_type = "ImaginaryClass".into();
+        assert!(
+            unknown_class.validate_for(ontology.as_ref()).is_err(),
+            "a custom prompt rule without a canonical class IRI must be refused"
+        );
+        let mut unknown_relation = mapping;
+        unknown_relation.entity_rules[0].relationship = Some("IMAGINARY_RELATION".into());
+        assert!(
+            unknown_relation.validate_for(ontology.as_ref()).is_err(),
+            "a custom prompt rule without an object-property IRI must be refused"
+        );
     }
 }
