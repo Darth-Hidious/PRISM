@@ -92,6 +92,10 @@ pub struct NodeState {
     pub rbac_db_path: Option<PathBuf>,
     /// Path to the session SQLite database.
     pub session_db_path: Option<PathBuf>,
+    /// Path to the bundled Turso provenance store served by `/api/query`.
+    /// `None` means the production default (`~/.prism/provenance.db`);
+    /// tests running several nodes in one process give each its own store.
+    pub provenance_db_path: Option<PathBuf>,
     /// Server-issued bearer capabilities for standalone mode. Active tokens
     /// are persisted beside the server's other state so a solo session can
     /// resume after restart; each record carries its real expiry and logout
@@ -150,6 +154,7 @@ impl NodeState {
             audit_db_path: None,
             rbac_db_path: None,
             session_db_path: None,
+            provenance_db_path: None,
             offline_session_tokens: RwLock::new(OfflineSessionStore::default()),
             tool_registry: RwLock::new(prism_core::registry::ToolRegistry::new()),
             mesh: RwLock::new(prism_mesh::MeshHandle::Offline),

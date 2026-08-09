@@ -590,15 +590,17 @@ fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
 }
 
 /// True when this write relays someone else's knowledge rather than reading
-/// the source itself. `crates/mesh/src/sync.rs` marks its writes with both
-/// `tenant = "mesh"` and `locality = "mesh"`; either alone is treated as a
-/// relay so a partially-filled provenance errs on the conservative side.
+/// the source itself. `crates/mesh/src/sync.rs` marks its writes with
+/// `locality = "mesh"` and a per-peer tenant `mesh:{publisher node id}`
+/// (historically the single shared tenant `"mesh"`); any of the three alone
+/// is treated as a relay so a partially-filled provenance errs on the
+/// conservative side.
 ///
 /// Takes the two markers rather than a `LocalProvenance` so the v5 migration
 /// — which recovers `locality` from the stored activity row — classifies
 /// with the SAME rule as the live path instead of an approximation of it.
 fn is_relay(locality: &str, tenant: &str) -> bool {
-    locality == "mesh" || tenant == "mesh"
+    locality == "mesh" || tenant == "mesh" || tenant.starts_with("mesh:")
 }
 
 /// Independence key for one write, honouring an explicit origin when the
@@ -619,9 +621,10 @@ fn is_relay(locality: &str, tenant: &str) -> bool {
 ///   namespaces are disjoint by construction: a relay cannot claim `local`
 ///   origin, and a local write cannot be mistaken for a relay. Even if a
 ///   future bug wrote a relay under a non-mesh tenant (today `is_relay`
-///   implies tenant "mesh", whose assertion ids are tenant-separated
-///   anyway), its evidence key still could not collide with — or suppress,
-///   via the same-source dedupe — any local source's contribution.
+///   implies tenant "mesh" or "mesh:{node id}", whose assertion ids are
+///   tenant-separated anyway), its evidence key still could not collide
+///   with — or suppress, via the same-source dedupe — any local source's
+///   contribution.
 fn origin_source_key_for(prov: &LocalProvenance) -> String {
     let origin = prov
         .origin_source_id
@@ -1809,6 +1812,71 @@ impl ProvenanceStore {
         evidence_class: EvidenceClass,
     ) -> Result<()> {
         self.write_fact_as(fact, prov, evidence_class).await
+    }
+
+    /// Write one entity relayed from a mesh peer: the entity under its own
+    /// EMMO label with the properties the peer served, a `Dataset` node for
+    /// the dataset it arrived through, a `SYNCED_FROM` edge between them,
+    /// and the PROV-O assertion — one atomic transaction, exactly like
+    /// [`Self::write_fact`].
+    ///
+    /// This exists because `write_fact`'s generic arm hardcodes the subject
+    /// label to `Matter`, so a peer's `Phase` or `CrystalStructure` node
+    /// arrived stripped to a bare mislabeled name. The label is part of the
+    /// entity KEY (`entity_key`), so it must be right on the first write —
+    /// it cannot be patched on afterwards without minting a second node.
+    ///
+    /// `label` and `props_json` are peer-supplied: the caller (mesh sync) is
+    /// responsible for capping/validating them before they get here, the
+    /// same way it validates dataset names. The evidence class stays
+    /// `Indeterminate`, matching what the old `write_fact` path recorded for
+    /// relays: a relay conveys, it does not verify.
+    pub async fn write_synced_entity(
+        &self,
+        name: &str,
+        label: &str,
+        props_json: Option<String>,
+        dataset_name: &str,
+        prov: &LocalProvenance,
+    ) -> Result<()> {
+        let _same_handle_guard = self.write_lock.lock().await;
+        let txn = begin_immediate(&self.conn).await?;
+        let result: Result<()> = async {
+            let (confidence, _class) = self
+                .record_assertion_in_open_txn(
+                    &LocalAssertion {
+                        subject: name.to_string(),
+                        predicate: "SYNCED_FROM".into(),
+                        object: dataset_name.to_string(),
+                        confidence: None,
+                    },
+                    prov,
+                    None,
+                    None,
+                    &[],
+                    EvidenceClass::Indeterminate,
+                )
+                .await?;
+            let subj_key = self
+                .upsert_entity(name, label, &prov.tenant, props_json.clone())
+                .await?;
+            let obj_key = self
+                .upsert_entity(dataset_name, "Dataset", &prov.tenant, None)
+                .await?;
+            self.upsert_edge(
+                &subj_key,
+                &obj_key,
+                "SYNCED_FROM",
+                "SYNCED_FROM",
+                confidence,
+                &prov.tenant,
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        finish_write_txn(txn, result).await
     }
 
     async fn write_fact_as<F: FactPayload>(
@@ -4323,6 +4391,96 @@ mod tests {
             origin_source_key("mesh:doi:10.1234/x", false),
             "opaque:mesh:doi:10.1234/x"
         );
+    }
+
+    /// Mesh sync now writes each peer under its own tenant
+    /// `mesh:{publisher node id}`. Relay detection must keep holding for
+    /// those tenants ON THEIR OWN — a future writer that fills the tenant
+    /// but forgets `locality = "mesh"` must still be classified a relay,
+    /// or its peer-supplied origin would be trusted as a local one.
+    #[test]
+    fn a_per_peer_mesh_tenant_is_still_a_relay() {
+        let mut prov = test_prov(); // locality "local"
+        prov.tenant = "mesh:0f2c7e1a-aaaa-bbbb-cccc-000000000001".into();
+        prov.origin_source_id = Some("doi:10.1234/abc".into());
+        assert_eq!(
+            origin_source_key_for(&prov),
+            "mesh:doi:10.1234/abc",
+            "a mesh:{{node id}} tenant alone must classify as a relay"
+        );
+
+        // And with no conveyed origin it collapses conservatively.
+        prov.origin_source_id = None;
+        assert_eq!(origin_source_key_for(&prov), "mesh:unattributed");
+
+        // A non-mesh tenant with local locality stays a local write.
+        prov.tenant = "meshless".into();
+        prov.source_entity_id = "doc:x".into();
+        assert_eq!(origin_source_key_for(&prov), "opaque:doc:x");
+    }
+
+    /// `write_synced_entity` must store the peer's OWN label and properties
+    /// (write_fact's generic arm hardcoded `Matter`, which mislabeled every
+    /// non-Matter peer node), link it to a `Dataset` node, and record the
+    /// relay's evidence under the mesh-namespaced origin key.
+    #[tokio::test]
+    async fn write_synced_entity_keeps_label_props_and_origin() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let mut prov = test_prov();
+        prov.tenant = "mesh:node-a".into();
+        prov.locality = "mesh".into();
+        prov.origin_source_id = Some("doi:10.1234/abc".into());
+
+        store
+            .write_synced_entity(
+                "alpha phase",
+                "Phase",
+                Some(r#"{"origin_source":"doi:10.1234/abc"}"#.into()),
+                "ti-alloys",
+                &prov,
+            )
+            .await
+            .unwrap();
+
+        // The entity keeps the peer's label/type and properties.
+        let label = query_str(
+            &store,
+            "SELECT label FROM emmo_entity WHERE name = 'alpha phase' AND tenant = 'mesh:node-a'",
+        )
+        .await;
+        assert_eq!(label, "Phase", "peer label must survive the sync write");
+        let props = query_str(
+            &store,
+            "SELECT props_json FROM emmo_entity WHERE name = 'alpha phase' AND tenant = 'mesh:node-a'",
+        )
+        .await;
+        assert!(
+            props.contains("doi:10.1234/abc"),
+            "peer properties must survive the sync write: {props}"
+        );
+
+        // The dataset node + SYNCED_FROM edge exist under the same tenant.
+        let dataset_label = query_str(
+            &store,
+            "SELECT label FROM emmo_entity WHERE name = 'ti-alloys' AND tenant = 'mesh:node-a'",
+        )
+        .await;
+        assert_eq!(dataset_label, "Dataset");
+        let edges = count(
+            &store,
+            "SELECT COUNT(*) FROM emmo_edge WHERE rel_type = 'SYNCED_FROM' AND tenant = 'mesh:node-a'",
+        )
+        .await;
+        assert_eq!(edges, 1);
+
+        // The assertion's evidence is keyed on the mesh-namespaced origin.
+        let evidence = store
+            .assertion_evidence("mesh:node-a", "alpha phase", "SYNCED_FROM", "ti-alloys")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source_key, "mesh:doi:10.1234/abc");
     }
 
     /// v5 migration: a legacy RELAY row stored under a real tenant (tenant

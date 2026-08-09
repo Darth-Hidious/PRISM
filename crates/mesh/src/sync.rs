@@ -4,10 +4,13 @@
 //! This is the "data plane" of the mesh: when a remote node publishes a
 //! dataset update, the consumer receives a `DataPublish` message. This
 //! module reacts to those messages by fetching the actual graph data from
-//! the publishing node's REST API and writing it as EMMO facts into the
-//! bundled Turso provenance store under the dedicated tenant
-//! [`MESH_TENANT`], so peer-synced data never blends with locally
-//! ingested data.
+//! the publishing node's REST API (authenticating via [`PeerSessions`])
+//! and writing it as EMMO facts into the bundled Turso provenance store
+//! under the publisher's own tenant ([`mesh_tenant`]), so peer-synced data
+//! never blends with locally ingested data — or with another peer's.
+//!
+//! The same fetch is reachable without Kafka through
+//! [`sync_dataset_from_peer`], which `prism mesh sync` calls directly.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -17,37 +20,47 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::PeerNode;
+use crate::peer_session::{PeerAddress, PeerSessions};
 use crate::protocol::MeshMessage;
 use crate::subscription::SubscriptionManager;
+use crate::{PeerNode, PeerTrust};
 
-/// Tenant under which peer-synced facts land in the bundled Turso store.
-/// Kept distinct from the local-ingest tenant ("local") so synced data is
-/// attributable and separable.
-pub const MESH_TENANT: &str = "mesh";
+/// Tenant under which facts synced from one publishing peer land in the
+/// bundled Turso store. Distinct from the local-ingest tenant ("local") so
+/// synced data stays attributable, and PER PEER — under the old shared
+/// `"mesh"` tenant two peers publishing a same-named dataset produced the
+/// SAME assertion id and corroborated each other.
+///
+/// `prism-provenance` treats any `mesh:`-prefixed tenant as a relay
+/// (`is_relay`), so peer-conveyed origins keep landing in the namespaced
+/// `mesh:…` evidence keyspace.
+#[must_use]
+pub fn mesh_tenant(publisher: &Uuid) -> String {
+    format!("mesh:{publisher}")
+}
 
 /// Configuration for the sync handler.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     /// Path to the bundled Turso provenance store where peer-synced facts
-    /// are written (tenant [`MESH_TENANT`]).
+    /// are written (tenant [`mesh_tenant`]).
     pub provenance_db: PathBuf,
 }
 
 /// Processes incoming mesh messages and performs data synchronisation.
 ///
 /// Spawn this as a background task alongside the Kafka consumer.
+/// `sessions` authenticates every peer fetch — without it the peer's
+/// `auth_stack` answers 401 and nothing ever arrives.
 pub async fn run_sync_handler(
     mut rx: mpsc::Receiver<MeshMessage>,
     peers: Arc<RwLock<Vec<PeerNode>>>,
     subscriptions: Arc<RwLock<SubscriptionManager>>,
     our_node_id: Uuid,
     sync_config: Option<SyncConfig>,
+    sessions: Arc<PeerSessions>,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("failed to build HTTP client for sync");
+    let client = sync_http_client();
 
     info!("mesh sync handler started");
 
@@ -97,6 +110,10 @@ pub async fn run_sync_handler(
                     capabilities,
                     authenticated: true,
                     auth_hash: None,
+                    // A Kafka Announce is writable by anyone with broker
+                    // access: the owner's platform credential is never
+                    // shown to an address learned this way.
+                    trust: PeerTrust::Announced,
                 };
                 let mut list = peers.write().unwrap_or_else(|e| e.into_inner());
                 if list.iter().any(|p| p.node_id == node_id) {
@@ -162,17 +179,26 @@ pub async fn run_sync_handler(
                     "syncing subscribed dataset update"
                 );
 
-                // Find the peer's address
+                // Find the peer's address, carrying the trust of the
+                // channel that discovered it — a registry-vouched peer may
+                // be shown the platform credential, an announced one never.
                 let peer_addr = {
                     let list = peers.read().unwrap_or_else(|e| e.into_inner());
                     list.iter()
                         .find(|p| p.node_id == node_id)
-                        .map(|p| format!("http://{}:{}", p.address, p.port))
+                        .map(PeerAddress::of_peer)
                 };
 
                 if let Some(addr) = peer_addr {
-                    if let Err(e) =
-                        sync_dataset_from_peer(&client, &addr, &dataset_name, &sync_config).await
+                    if let Err(e) = sync_dataset_from_peer(
+                        &client,
+                        &addr,
+                        &dataset_name,
+                        node_id,
+                        &sync_config,
+                        &sessions,
+                    )
+                    .await
                     {
                         error!(
                             dataset = %dataset_name,
@@ -300,14 +326,36 @@ pub async fn run_sync_handler(
     info!("mesh sync handler stopped");
 }
 
+/// The HTTP client every sync fetch uses. Redirects are refused: the
+/// request carries a session token in a header reqwest's cross-host
+/// scrubbing does NOT strip (`X-Session-Token` is not `Authorization`), so
+/// a hostile 307 could bounce it off-box.
+#[must_use]
+pub fn sync_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client for sync")
+}
+
 /// Fetch graph data from a peer's query API and write it as EMMO facts
-/// into the bundled Turso store (tenant [`MESH_TENANT`]).
-async fn sync_dataset_from_peer(
+/// into the bundled Turso store under the publisher's tenant
+/// ([`mesh_tenant`]). Returns how many entities were written.
+///
+/// Transport-agnostic: the Kafka sync handler calls this on `DataPublish`,
+/// and `prism mesh sync <dataset> --peer <url>` calls it directly, so a
+/// pull no longer requires a Kafka broker. The [`PeerAddress`] carries how
+/// the peer's address was learned; [`PeerSessions`] refuses to show the
+/// owner's platform credential to an announced address.
+pub async fn sync_dataset_from_peer(
     client: &reqwest::Client,
-    peer_url: &str,
+    peer: &PeerAddress,
     dataset_name: &str,
+    publisher: Uuid,
     sync_config: &Option<SyncConfig>,
-) -> Result<()> {
+    sessions: &PeerSessions,
+) -> Result<usize> {
     // Reject malformed dataset names up front — defense-in-depth before
     // we hand the value to the parameterized Turso writer, which *should*
     // be safe but isn't worth trusting blindly. Marketplace and platform
@@ -332,12 +380,13 @@ async fn sync_dataset_from_peer(
     // knowledge graph and returns the same {type, name, properties} rows.
     // The dataset name travels as plain JSON data, never spliced into a
     // query language string (Bug #45 stays fixed by construction).
-    let query_url = format!("{peer_url}/api/query");
-    // Hard offline. `peer_url` is built from an address another node ANNOUNCED
-    // over the mesh, so it is attacker-influenceable by any peer with Kafka
-    // access — the destination is not ours to trust. `crates/mesh` had no
-    // dependency on prism-runtime at all, so nothing here consulted the policy.
-    // `check_url` rather than `enabled()`: a loopback peer is legitimate.
+    let query_url = format!("{}/api/query", peer.url);
+    // Hard offline. The peer address may be one another node ANNOUNCED over
+    // the mesh, so it is attacker-influenceable by any peer with Kafka
+    // access — the destination is not ours to trust. `check_url` rather
+    // than `enabled()`: a loopback peer is legitimate. (What the peer may
+    // be SHOWN is a separate decision, keyed on `peer.trust` inside
+    // `PeerSessions`.)
     prism_runtime::offline::check_url(&query_url).map_err(|r| anyhow::anyhow!(r))?;
     let body = serde_json::json!({
         "query": dataset_name,
@@ -345,7 +394,26 @@ async fn sync_dataset_from_peer(
         "limit": 1000,
     });
 
-    let resp = client.post(&query_url).json(&body).send().await?;
+    // Authenticated fetch: mint (or reuse) a session on the peer, and on a
+    // 401 — an expired cached session — re-mint exactly once and retry.
+    let mut session = sessions.session_for(peer).await?;
+    let mut resp = client
+        .post(&query_url)
+        .header("X-Session-Token", &session)
+        .json(&body)
+        .send()
+        .await?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        debug!(peer = %peer.url, "peer query 401 — re-minting session and retrying once");
+        sessions.invalidate(peer);
+        session = sessions.session_for(peer).await?;
+        resp = client
+            .post(&query_url)
+            .header("X-Session-Token", &session)
+            .json(&body)
+            .send()
+            .await?;
+    }
 
     if !resp.status().is_success() {
         anyhow::bail!(
@@ -383,84 +451,114 @@ async fn sync_dataset_from_peer(
 
     if result_count == 0 {
         debug!(dataset = %dataset_name, "no data returned from peer");
-        return Ok(());
+        return Ok(0);
     }
 
     // Write into the bundled Turso store if configured. Every value —
-    // entity names, the dataset name, properties — is bound through
-    // `write_fact`'s parameterized SQL, never spliced into a statement
-    // string, so a malicious peer cannot inject via the data it serves
-    // (the same property the old parameterized Cypher write preserved;
-    // see Bug #45).
-    if let Some(cfg) = sync_config {
-        let Some(results) = data["results"].as_array() else {
-            return Ok(());
-        };
-
-        let store = prism_provenance::ProvenanceStore::open(&cfg.provenance_db).await?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let prov = prism_provenance::LocalProvenance {
-            activity_id: Uuid::new_v4().to_string(),
-            agent_id: "prism-mesh-sync".into(),
-            agent_kind: "SoftwareAgent".into(),
-            source_entity_id: format!("{peer_url}#{dataset_name}"),
-            source_kind: "Dataset".into(),
-            tenant: MESH_TENANT.into(),
-            started_at: now.clone(),
-            ended_at: now,
-            locality: "mesh".into(),
-            // Per-row: rows that name their origin get it set below.
-            origin_source_id: None,
-        };
-        store.record_activity(&prov).await?;
-
-        // Same `LocalFact` shape as ingest's `to_local_facts`: each peer
-        // entity becomes a generic edge (kind None) linking the entity to
-        // its source dataset, so the node exists in the local graph and
-        // stays attributable to where it was synced from — the Turso
-        // counterpart of the old `SyncedEntity {name, source_dataset}`
-        // node.
-        let mut synced = 0usize;
-        for row in results {
-            let Some(name) = row.get("name").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let fact = prism_provenance::LocalFact {
-                subject: name.to_string(),
-                predicate: "SYNCED_FROM".into(),
-                object: dataset_name.to_string(),
-                value: None,
-                unit: None,
-                confidence: None,
-                kind: None,
-            };
-            // Carry the ORIGIN the peer conveyed for this row, so a fact
-            // relayed by two peers from two genuinely different sources can
-            // corroborate. A row without one stays `origin_source_id: None`
-            // and collapses onto `mesh:unattributed` — never invented.
-            let row_prov = prism_provenance::LocalProvenance {
-                origin_source_id: peer_row_origin(row),
-                ..prov.clone()
-            };
-            store.write_fact(&fact, &row_prov).await?;
-            synced += 1;
-        }
-
-        info!(
-            dataset = %dataset_name,
-            synced,
-            tenant = MESH_TENANT,
-            "dataset synced to local Turso store"
-        );
-    } else {
+    // entity names, labels, the dataset name, properties — is bound
+    // through parameterized SQL, never spliced into a statement string, so
+    // a malicious peer cannot inject via the data it serves (the same
+    // property the old parameterized Cypher write preserved; see Bug #45).
+    let Some(cfg) = sync_config else {
         info!(
             dataset = %dataset_name,
             results = result_count,
-            "dataset fetched from peer (no local provenance store configured)"
+            "dataset fetched from peer (no local provenance store configured — nothing written)"
         );
+        return Ok(0);
+    };
+    let Some(results) = data["results"].as_array() else {
+        return Ok(0);
+    };
+
+    let tenant = mesh_tenant(&publisher);
+    let store = prism_provenance::ProvenanceStore::open(&cfg.provenance_db).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let prov = prism_provenance::LocalProvenance {
+        activity_id: Uuid::new_v4().to_string(),
+        agent_id: "prism-mesh-sync".into(),
+        agent_kind: "SoftwareAgent".into(),
+        source_entity_id: format!("{}#{dataset_name}", peer.url),
+        source_kind: "Dataset".into(),
+        tenant: tenant.clone(),
+        started_at: now.clone(),
+        ended_at: now,
+        locality: "mesh".into(),
+        // Per-row: rows that name their origin get it set below.
+        origin_source_id: None,
+    };
+    store.record_activity(&prov).await?;
+
+    // Each peer row lands as a typed entity under the peer's own label
+    // with the properties it served, linked to its source dataset — the
+    // old write kept only `name`, so a peer's `Phase` arrived as a bare
+    // mislabeled node.
+    let mut synced = 0usize;
+    for row in results {
+        let Some(name) = row.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Carry the ORIGIN the peer conveyed for this row, so a fact
+        // relayed by two peers from two genuinely different sources can
+        // corroborate. A row without one stays `origin_source_id: None`
+        // and collapses onto `mesh:unattributed` — never invented.
+        let row_prov = prism_provenance::LocalProvenance {
+            origin_source_id: peer_row_origin(row),
+            ..prov.clone()
+        };
+        store
+            .write_synced_entity(
+                name,
+                peer_row_label(row),
+                peer_row_props(row),
+                dataset_name,
+                &row_prov,
+            )
+            .await?;
+        synced += 1;
     }
 
-    Ok(())
+    info!(
+        dataset = %dataset_name,
+        synced,
+        tenant = %tenant,
+        "dataset synced to local Turso store"
+    );
+
+    Ok(synced)
+}
+
+/// Peer-supplied entity labels are untrusted input. Anything that is not a
+/// plain identifier collapses to the generic `Entity` — mislabeling costs
+/// less than letting a peer mint arbitrary label strings into the store.
+const MAX_LABEL_LEN: usize = 64;
+
+fn peer_row_label(row: &serde_json::Value) -> &str {
+    match row.get("type").and_then(|v| v.as_str()).map(str::trim) {
+        Some(label)
+            if !label.is_empty()
+                && label.len() <= MAX_LABEL_LEN
+                && label.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            label
+        }
+        _ => "Entity",
+    }
+}
+
+/// Peer-supplied properties, kept only when they are a non-empty JSON
+/// object of sane size. 8 KiB per row is generous for graph-node metadata
+/// and stops a hostile peer from parking megabytes in `props_json` (the
+/// 32 MiB body cap bounds the fetch, not the per-row write).
+const MAX_PROPS_BYTES: usize = 8 * 1024;
+
+fn peer_row_props(row: &serde_json::Value) -> Option<String> {
+    let props = row.get("properties")?.as_object()?;
+    if props.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(props).ok()?;
+    (json.len() <= MAX_PROPS_BYTES).then_some(json)
 }
 
 /// A peer-supplied origin locator may be junk of any size — it is
@@ -497,6 +595,88 @@ fn peer_row_origin(row: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{OfflineEnvGuard, test_env_lock};
+    use std::io::{Read, Write};
+
+    /// Minimal loopback peer: answers `POST /api/sessions` with a session
+    /// and `POST /api/query` with the given full HTTP response. Serves
+    /// until the test binary exits.
+    fn spawn_mock_peer(query_response: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // Read until the full headers+body arrived (tiny requests;
+                // stop when the body length matches Content-Length).
+                while let Ok(n) = stream.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(header_end) = text.find("\r\n\r\n") {
+                        let content_length = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(str::trim)
+                                    .map(String::from)
+                            })
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let response = if request.starts_with("POST /api/sessions") {
+                    let body = r#"{"session_id":"sess-mock"}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    query_response.clone()
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        base
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Tempfile-backed Turso DB, removed (with SQLite journal sidecars) on drop.
+    struct TempDb {
+        path: PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("prism_mesh_sync_test_{}.db", Uuid::new_v4()));
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.path.clone().into_os_string();
+                p.push(suffix);
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
 
     /// The guard `9926eac0` described as the more consequential of the two had
     /// NO test at all — a reviewer's point that stood: best-covered path was
@@ -513,9 +693,16 @@ mod tests {
         unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
 
         let client = reqwest::Client::new();
-        let err = sync_dataset_from_peer(&client, "http://203.0.113.9:9100", "ds", &None)
-            .await
-            .expect_err("offline must refuse a remote peer");
+        let err = sync_dataset_from_peer(
+            &client,
+            &PeerAddress::operator_named("http://203.0.113.9:9100"),
+            "ds",
+            Uuid::new_v4(),
+            &None,
+            &PeerSessions::new(None),
+        )
+        .await
+        .expect_err("offline must refuse a remote peer");
         let msg = err.to_string();
         assert!(msg.contains("offline mode"), "{msg}");
         assert!(
@@ -538,12 +725,156 @@ mod tests {
             .timeout(std::time::Duration::from_millis(400))
             .build()
             .expect("client");
-        let err = sync_dataset_from_peer(&client, "http://127.0.0.1:1", "ds", &None)
-            .await
-            .expect_err("nothing is listening on port 1");
+        let err = sync_dataset_from_peer(
+            &client,
+            &PeerAddress::operator_named("http://127.0.0.1:1"),
+            "ds",
+            Uuid::new_v4(),
+            &None,
+            &PeerSessions::new(None),
+        )
+        .await
+        .expect_err("nothing is listening on port 1");
         assert!(
             !err.to_string().contains("offline mode"),
             "loopback must not be refused by policy: {err}"
+        );
+    }
+
+    /// Two peers relaying the SAME dataset name land under their own
+    /// tenants (`mesh:{publisher}`) — under the old shared `"mesh"` tenant
+    /// they produced one assertion id and corroborated each other. Each
+    /// write keeps the peer's label and its conveyed origin.
+    #[tokio::test]
+    async fn two_publishers_land_under_their_own_tenants() {
+        let peer = spawn_mock_peer(http_response(
+            "200 OK",
+            r#"{"results":[{"type":"Phase","name":"alpha phase","properties":{"origin_source":"doi:10.1234/abc"}}],"count":1,"mode":"graph"}"#,
+        ));
+        let db = TempDb::new();
+        let cfg = Some(SyncConfig {
+            provenance_db: db.path.clone(),
+        });
+        let client = sync_http_client();
+        let sessions = PeerSessions::new(None);
+        let publisher_a = Uuid::new_v4();
+        let publisher_b = Uuid::new_v4();
+
+        for publisher in [publisher_a, publisher_b] {
+            let synced = sync_dataset_from_peer(
+                &client,
+                &PeerAddress::operator_named(&peer),
+                "alpha",
+                publisher,
+                &cfg,
+                &sessions,
+            )
+            .await
+            .expect("sync must succeed against the mock peer");
+            assert_eq!(synced, 1);
+        }
+
+        // The expected tenant is the publisher-qualified STRING, written
+        // out — deriving it from `mesh_tenant()` alone would let a
+        // regression to the shared "mesh" tenant pass by matching its own
+        // output (a mutation proved exactly that).
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .unwrap();
+        for publisher in [publisher_a, publisher_b] {
+            let tenant = format!("mesh:{publisher}");
+            assert_eq!(mesh_tenant(&publisher), tenant);
+            let nodes = store
+                .graph_search("alpha phase", &tenant, 10)
+                .await
+                .unwrap();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|n| n.name == "alpha phase" && n.entity_type == "Phase"),
+                "peer entity must keep its label under {tenant}: {nodes:?}"
+            );
+            // Each tenant's assertion carries exactly ONE evidence row with
+            // the mesh-namespaced origin — the peers never corroborated
+            // each other.
+            let evidence = store
+                .assertion_evidence(&tenant, "alpha phase", "SYNCED_FROM", "alpha")
+                .await
+                .unwrap();
+            assert_eq!(evidence.len(), 1, "no cross-peer corroboration");
+            assert_eq!(evidence[0].source_key, "mesh:doi:10.1234/abc");
+        }
+        // And nothing may land under the legacy shared tenant.
+        let stray = store.graph_search("alpha phase", "mesh", 10).await.unwrap();
+        assert!(
+            stray.is_empty(),
+            "peer data landed under the shared legacy tenant: {stray:?}"
+        );
+    }
+
+    /// An authentication failure must be an error naming the status — the
+    /// old pull deserialised the 401 body into an empty result set and
+    /// reported a successful sync of nothing.
+    #[tokio::test]
+    async fn a_peer_401_surfaces_as_an_error_not_an_empty_sync() {
+        let peer = spawn_mock_peer(http_response(
+            "401 Unauthorized",
+            r#"{"error":"unauthorized"}"#,
+        ));
+        let client = sync_http_client();
+        let err = sync_dataset_from_peer(
+            &client,
+            &PeerAddress::operator_named(&peer),
+            "ds",
+            Uuid::new_v4(),
+            &None,
+            &PeerSessions::new(None),
+        )
+        .await
+        .expect_err("a 401 peer must fail the sync");
+        assert!(
+            err.to_string().contains("401"),
+            "the error must carry the status: {err}"
+        );
+    }
+
+    /// Peer-supplied labels are untrusted: only plain identifiers survive,
+    /// everything else lands as the generic `Entity`.
+    #[test]
+    fn peer_row_label_accepts_identifiers_and_rejects_junk() {
+        let row = |t: serde_json::Value| serde_json::json!({ "type": t, "name": "x" });
+        assert_eq!(peer_row_label(&row("Phase".into())), "Phase");
+        assert_eq!(peer_row_label(&row("  Matter ".into())), "Matter");
+        assert_eq!(peer_row_label(&row("".into())), "Entity");
+        assert_eq!(peer_row_label(&row("has spaces".into())), "Entity");
+        assert_eq!(peer_row_label(&row("a'; DROP--".into())), "Entity");
+        assert_eq!(peer_row_label(&row("x".repeat(65).into())), "Entity");
+        assert_eq!(peer_row_label(&row(serde_json::json!(7))), "Entity");
+        assert_eq!(peer_row_label(&serde_json::json!({"name": "x"})), "Entity");
+    }
+
+    /// Properties survive only as a bounded JSON object; junk and oversize
+    /// payloads are dropped rather than stored.
+    #[test]
+    fn peer_row_props_keeps_bounded_objects_only() {
+        let with = serde_json::json!({ "properties": { "origin_source": "doi:10.1/x", "n": 1 } });
+        let kept = peer_row_props(&with).expect("object props must be kept");
+        assert!(kept.contains("doi:10.1/x"));
+
+        assert_eq!(
+            peer_row_props(&serde_json::json!({ "properties": {} })),
+            None
+        );
+        assert_eq!(
+            peer_row_props(&serde_json::json!({ "properties": [1] })),
+            None
+        );
+        assert_eq!(peer_row_props(&serde_json::json!({ "name": "x" })), None);
+        let oversize = serde_json::json!({ "properties": { "blob": "y".repeat(MAX_PROPS_BYTES) } });
+        assert_eq!(
+            peer_row_props(&oversize),
+            None,
+            "oversize props must be dropped"
         );
     }
 

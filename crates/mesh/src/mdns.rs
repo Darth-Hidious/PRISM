@@ -173,6 +173,10 @@ fn service_info_to_peer(info: &ResolvedService) -> Option<PeerNode> {
         capabilities,
         authenticated,
         auth_hash,
+        // An mDNS TXT record is unauthenticated (the "auth" hash above is
+        // explicitly not a security mechanism): the owner's platform
+        // credential is never shown to an address learned this way.
+        trust: crate::PeerTrust::Announced,
     })
 }
 

@@ -17,6 +17,8 @@ pub mod federation;
 pub mod federation_lookup;
 pub mod kafka;
 pub mod mdns;
+pub mod peer_session;
+pub mod platform_discovery;
 pub mod protocol;
 pub mod subscription;
 pub mod sync;
@@ -52,6 +54,49 @@ pub struct MeshConfig {
 
 // ── Peer tracking ──────────────────────────────────────────────────
 
+/// How this node LEARNED a peer's address — the property that decides
+/// whether the owner's platform credential may ever be shown to it.
+///
+/// A peer address is only as trustworthy as the channel it arrived on.
+/// mDNS TXT records and Kafka `Announce` messages are unauthenticated
+/// (mDNS "auth" is the mere presence of a djb2 hash whose own comment
+/// says it is not a security mechanism; Kafka trusts anyone with broker
+/// write access), so an attacker can announce an address they control
+/// and wait for this node to connect. The session-mint flow POSTs the
+/// owner's platform token in the request body — sending that to an
+/// announced address hands the attacker the owner's MARC27 account.
+///
+/// This is a TYPE, not a convention: [`peer_session::PeerSessions`]
+/// refuses to attach the platform token for [`PeerTrust::Announced`],
+/// so "only call this with a trusted URL" can never decay into a
+/// forgotten comment. The eventual fix is cryptographic peer
+/// verification (`federation::verify_peer`), but nothing issues a
+/// platform-signed `PeerIdentity` today and no node has a
+/// `platform_pubkey.bin`, so that path 503s — until it is wired, the
+/// channel the address came from IS the trust decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerTrust {
+    /// The operator typed the address (`prism mesh sync --peer <url>`).
+    OperatorNamed,
+    /// The authenticated platform node registry vouched for the address
+    /// (`platform_discovery` — both machines registered it at `node up`).
+    PlatformRegistry,
+    /// The address arrived over an unauthenticated channel (an mDNS TXT
+    /// record or a Kafka `Announce`). The conservative default: anything
+    /// deserialized without a recorded provenance lands here.
+    #[default]
+    Announced,
+}
+
+impl PeerTrust {
+    /// Whether a peer learned this way may be shown the owner's platform
+    /// credential during session minting.
+    #[must_use]
+    pub fn may_carry_platform_token(self) -> bool {
+        matches!(self, Self::OperatorNamed | Self::PlatformRegistry)
+    }
+}
+
 /// A discovered peer node on the mesh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerNode {
@@ -69,6 +114,12 @@ pub struct PeerNode {
     /// Short hash of the peer's auth token (for logging/debugging).
     #[serde(default, skip_serializing)]
     pub auth_hash: Option<String>,
+    /// The channel this peer's address was learned from. Decides whether
+    /// the owner's platform token may be presented when minting a session
+    /// on it (see [`PeerTrust`]). Defaults to the conservative
+    /// [`PeerTrust::Announced`] on deserialization.
+    #[serde(default)]
+    pub trust: PeerTrust,
 }
 
 // ── Mesh handle ────────────────────────────────────────────────────
@@ -142,14 +193,79 @@ impl MeshHandle {
 ///
 /// Generates a fresh UUID for this node and returns an `Online` handle
 /// with an empty peer list. Discovery must be started separately.
+///
+/// A fresh UUID is only right for TRANSIENT participants (a one-shot
+/// `mesh discover` scan, tests). A node that publishes or subscribes must
+/// use [`init_mesh_with_id`] with the identity from
+/// [`load_or_create_node_id`]: subscriptions are keyed on
+/// `publisher_node`, and the Kafka `group_id` derives from this id — a
+/// fresh UUID per boot dangled every subscription and made each restart a
+/// brand-new consumer group starting at `latest`, so publishes during
+/// downtime were lost forever.
 pub fn init_mesh(config: MeshConfig) -> Result<MeshHandle> {
-    let node_id = Uuid::new_v4();
+    init_mesh_with_id(config, Uuid::new_v4())
+}
+
+/// [`init_mesh`] with an explicit (persisted) node identity.
+pub fn init_mesh_with_id(config: MeshConfig, node_id: Uuid) -> Result<MeshHandle> {
     tracing::info!(%node_id, name = %config.node_name, "Mesh node initialized");
     Ok(MeshHandle::Online {
         node_id,
         config,
         peers: Arc::new(RwLock::new(Vec::new())),
     })
+}
+
+/// File under the node state dir holding this node's mesh identity —
+/// beside `node_key` / `node_signing_key`, which already persist there.
+const MESH_NODE_ID_FILE: &str = "mesh_node_id";
+
+/// This node's durable mesh identity: read from `{state_dir}/mesh_node_id`,
+/// minted and persisted (0600) on first use. An unparsable file is
+/// replaced with a fresh identity — loudly, since subscriptions keyed on
+/// the old id will dangle — rather than refusing to start the mesh.
+pub fn load_or_create_node_id(state_dir: &std::path::Path) -> Result<Uuid> {
+    use anyhow::Context as _;
+
+    let path = state_dir.join(MESH_NODE_ID_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match Uuid::parse_str(text.trim()) {
+            Ok(id) => return Ok(id),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "mesh node id file is unreadable — minting a NEW identity; \
+                 peers' subscriptions to the old id will dangle"
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", path.display()));
+        }
+    }
+
+    let id = Uuid::new_v4();
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("failed to create {}", state_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.write_all(id.to_string().as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&path, id.to_string())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    tracing::info!(node_id = %id, path = %path.display(), "minted persistent mesh node id");
+    Ok(id)
 }
 
 /// Options for [`start_mesh`].
@@ -412,6 +528,7 @@ mod tests {
             capabilities: vec!["compute".into()],
             authenticated: true,
             auth_hash: None,
+            trust: PeerTrust::Announced,
         }
     }
 
@@ -618,6 +735,41 @@ mod tests {
         assert_eq!(parsed.address, peer.address);
         assert_eq!(parsed.port, peer.port);
         assert_eq!(parsed.capabilities, peer.capabilities);
+        assert_eq!(parsed.trust, peer.trust);
+    }
+
+    /// A peer record serialized before `trust` existed must deserialize to
+    /// the conservative `Announced` — an address whose provenance nobody
+    /// recorded is never eligible for the platform credential.
+    #[test]
+    fn a_trustless_legacy_peer_record_defaults_to_announced() {
+        let mut trusted = test_peer("legacy-peer");
+        trusted.trust = PeerTrust::PlatformRegistry;
+        let mut json = serde_json::to_value(&trusted).unwrap();
+        json.as_object_mut().unwrap().remove("trust");
+        let parsed: PeerNode = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.trust, PeerTrust::Announced);
+        assert!(!parsed.trust.may_carry_platform_token());
+    }
+
+    /// A restart must keep the node id: subscriptions are keyed on
+    /// `publisher_node` and the Kafka group id derives from it, so a fresh
+    /// id per boot silently orphaned both.
+    #[test]
+    fn node_id_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("prism_mesh_id_{}", Uuid::new_v4()));
+        let first = load_or_create_node_id(&dir).expect("mint on first boot");
+        let second = load_or_create_node_id(&dir).expect("reload on second boot");
+        assert_eq!(first, second, "the persisted id must survive a restart");
+
+        // An unparsable file self-heals to a NEW valid identity.
+        std::fs::write(dir.join("mesh_node_id"), "not-a-uuid").unwrap();
+        let healed = load_or_create_node_id(&dir).expect("self-heal on corrupt id");
+        assert_ne!(healed, first);
+        // …and the healed identity is itself durable.
+        assert_eq!(healed, load_or_create_node_id(&dir).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

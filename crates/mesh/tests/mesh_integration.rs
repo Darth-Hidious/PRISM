@@ -26,6 +26,7 @@ fn make_peer(id: Uuid, name: &str, port: u16) -> PeerNode {
         capabilities: vec!["compute".into()],
         authenticated: true,
         auth_hash: None,
+        trust: prism_mesh::PeerTrust::Announced,
     }
 }
 
@@ -44,7 +45,15 @@ async fn sync_handler_announce_adds_peer() {
     // Spawn sync handler
     let peers_clone = peers.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     // Send announce from remote node
@@ -85,7 +94,15 @@ async fn sync_handler_ignores_own_announce() {
     let (tx, rx) = mpsc::channel(16);
     let peers_clone = peers.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     // Send announce from ourselves — should be ignored
@@ -125,7 +142,15 @@ async fn sync_handler_goodbye_removes_peer() {
     let (tx, rx) = mpsc::channel(16);
     let peers_clone = peers.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     assert_eq!(peers.read().unwrap().len(), 1);
@@ -161,7 +186,15 @@ async fn sync_handler_data_subscribe_adds_subscriber() {
     let (tx, rx) = mpsc::channel(16);
     let subs_clone = subs.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers, subs_clone, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers,
+            subs_clone,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     tx.send(MeshMessage::DataSubscribe {
@@ -206,7 +239,15 @@ async fn sync_handler_data_unsubscribe_removes_subscriber() {
     let (tx, rx) = mpsc::channel(16);
     let subs_clone = subs.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers, subs_clone, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers,
+            subs_clone,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     tx.send(MeshMessage::DataUnsubscribe {
@@ -245,7 +286,15 @@ async fn sync_handler_ignores_unsubscribed_data_publish() {
     let (tx, rx) = mpsc::channel(16);
     let peers_clone = peers.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     tx.send(MeshMessage::DataPublish {
@@ -286,7 +335,15 @@ async fn sync_handler_full_lifecycle() {
     let peers_clone = peers.clone();
     let subs_clone = subs.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs_clone, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs_clone,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     // Step 1: Remote node announces
@@ -354,7 +411,15 @@ async fn sync_handler_multiple_peers() {
     let (tx, rx) = mpsc::channel(32);
     let peers_clone = peers.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     // Three nodes announce
@@ -402,7 +467,15 @@ async fn sync_handler_duplicate_announce_ignored() {
     let (tx, rx) = mpsc::channel(16);
     let peers_clone = peers.clone();
     let handle = tokio::spawn(async move {
-        prism_mesh::sync::run_sync_handler(rx, peers_clone, subs, our_id, None).await;
+        prism_mesh::sync::run_sync_handler(
+            rx,
+            peers_clone,
+            subs,
+            our_id,
+            None,
+            std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(None)),
+        )
+        .await;
     });
 
     // Send same announce twice

@@ -120,6 +120,16 @@ fn default_provenance_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("provenance.db"))
 }
 
+/// The store this node serves: an explicit override on [`NodeState`]
+/// (several nodes in one test process each need their own), else the
+/// production default above.
+fn provenance_db_path(state: &NodeState) -> PathBuf {
+    state
+        .provenance_db_path
+        .clone()
+        .unwrap_or_else(default_provenance_db_path)
+}
+
 /// Query the bundled Turso store for locally-ingested ontology entities,
 /// each paired with the origin locator this node can honestly report for
 /// it (`None` when no stored assertion mentions the entity).
@@ -348,7 +358,7 @@ async fn handle_graph_query(
     body: &QueryRequest,
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let nodes = local_graph_lookup(&default_provenance_db_path(), &body.query, body.limit)
+    let nodes = local_graph_lookup(&provenance_db_path(state), &body.query, body.limit)
         .await
         .unwrap_or_default();
     let results = graph_nodes_to_results(&nodes);
@@ -397,7 +407,7 @@ async fn handle_semantic_query(
     };
 
     let hits =
-        match local_semantic_lookup(&default_provenance_db_path(), &body.query, body.limit).await {
+        match local_semantic_lookup(&provenance_db_path(state), &body.query, body.limit).await {
             Ok(hits) => hits,
             Err(e) => {
                 let error = format!("{e:#}");
