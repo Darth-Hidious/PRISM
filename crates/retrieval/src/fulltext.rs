@@ -322,6 +322,9 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
     let mut sink: Option<Sink> = None;
     // Which element opened the current wrap: "table-wrap" or "fig".
     let mut wrap_element: Option<&'static str> = None;
+    // Inside a <xref ref-type="bibr"> whose text is being wrapped in [...]
+    // so it reads as the bracketed citation marker it is by construction.
+    let mut wrapping_bibr_xref = false;
     let mut current_label: Option<String> = None;
     let mut text = String::new();
 
@@ -339,7 +342,8 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
             Event::GeneralRef(e) => Some(crate::sources::resolve_reference(
                 &e.decode().unwrap_or_default(),
             )),
-            Event::Start(e) | Event::Empty(e) => {
+            Event::Start(e) => {
+                let mut start_chunk: Option<String> = None;
                 match e.local_name().as_ref() {
                     b"front" => depth_front += 1,
                     b"body" => depth_body += 1,
@@ -379,14 +383,47 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         sink = Some(Sink::Caption);
                         text.clear();
                     }
+                    b"tr" | b"row" if sink == Some(Sink::Wrap) => {
+                        // Preserve row structure: each row starts on its own
+                        // line so evidence spans never straddle rows. Rows
+                        // joined with spaces fuse the whole table into one
+                        // span, letting a number from one row "support" a
+                        // claim whose subject lives in another row.
+                        //
+                        // JATS permits TWO table models: XHTML (<tr>) and
+                        // OASIS/CALS (<tgroup>/<row>/<entry>); publishers use
+                        // both, so <row> is a row boundary exactly like <tr>.
+                        text.push('\n');
+                    }
                     b"p" if depth_body > 0 && sink.is_none() => {
                         sink = Some(Sink::Paragraph);
                         text.clear();
                     }
+                    // The text of a bibliographic-reference xref is a
+                    // citation marker by construction. Superscript numbering
+                    // renders it as a bare number ("studied 1140."), which
+                    // the claims guard cannot tell from a measurement; wrap
+                    // it in [...] so it reads as the bracketed citation it
+                    // is and the existing citation guard refuses it.
+                    b"xref" if sink.is_some() => {
+                        let is_bibr = e
+                            .attributes()
+                            .flatten()
+                            .any(|a| a.key.as_ref() == b"ref-type" && a.value.as_ref() == b"bibr");
+                        if is_bibr {
+                            wrapping_bibr_xref = true;
+                            start_chunk = Some("[".to_string());
+                        }
+                    }
                     _ => {}
                 }
-                None
+                start_chunk
             }
+            // A self-closing tag carries no content and never gets an End
+            // event: it must not open a sink or a depth, or the parser
+            // wedges on it and silently drops the rest of the document
+            // (e.g. a bare <table-wrap/>).
+            Event::Empty(_) => None,
             Event::End(e) => {
                 match e.local_name().as_ref() {
                     b"front" => depth_front -= 1,
@@ -436,6 +473,12 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         }
                         sink = Some(Sink::Wrap);
                     }
+                    b"xref" if wrapping_bibr_xref => {
+                        if sink.is_some() {
+                            text.push(']');
+                        }
+                        wrapping_bibr_xref = false;
+                    }
                     b"table-wrap" | b"fig"
                         if sink == Some(Sink::Wrap) || sink == Some(Sink::Caption) =>
                     {
@@ -474,7 +517,7 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                 text.pop();
                 current_label = Some(trimmed);
             } else {
-                if !text.is_empty() && !text.ends_with(' ') {
+                if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('[') {
                     text.push(' ');
                 }
                 text.push_str(&trimmed);
@@ -620,6 +663,170 @@ mod tests {
         }
         // Back-matter (references) is excluded.
         assert!(!ft.plain_text.contains("Old citation text"));
+    }
+
+    /// A self-closing <table-wrap/> must not wedge the sink: the parser
+    /// used to open the wrap state on it and never receive the End event,
+    /// silently truncating every block after it.
+    #[test]
+    fn self_closing_table_wrap_does_not_wedge_the_sink() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Wedge probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Before the wedge.</p>
+      <table-wrap/>
+      <fig/>
+      <p>After the wedge.</p>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        assert!(
+            ft.blocks.iter().any(|b| b.text == "Before the wedge."),
+            "blocks: {:?}",
+            ft.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+        assert!(
+            ft.blocks.iter().any(|b| b.text == "After the wedge."),
+            "a self-closing wrap wedged the sink; blocks: {:?}",
+            ft.blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// F2 regression (fabrication path 1): the JATS sink used to join
+    /// every chunk of a table with a space, so the whole table was ONE
+    /// evidence span: a number from one row could "support" a claim whose
+    /// subject appeared in a different row. Rows must stay separate lines
+    /// so `supporting_spans` splits the table into rows.
+    #[test]
+    fn jats_table_rows_stay_separate_lines() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Row structure probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <table-wrap>
+        <label>Table 1</label>
+        <caption><p>Mechanical properties.</p></caption>
+        <table>
+          <tr><th>Alloy</th><th>UTS (MPa)</th></tr>
+          <tr><td>Ti-6Al-4V</td><td>950</td></tr>
+          <tr><td>Inconel 718</td><td>1375</td></tr>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
+        let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
+        // Exact row structure: three separate rows, so the two alloys'
+        // numbers (950 / 1375) never share one. This equality is the
+        // assertion; a weaker `.any()` after it could never fail first.
+        assert_eq!(
+            rows,
+            vec!["Alloy UTS (MPa)", "Ti-6Al-4V 950", "Inconel 718 1375"]
+        );
+    }
+
+    /// H6: the text of a <xref ref-type="bibr"> is a citation marker by
+    /// construction; superscript numbering parses it to a bare number the
+    /// claims guard cannot tell from a measurement. The parser wraps it in
+    /// [...] so the existing bracketed-citation guard refuses it. Non-bibr
+    /// xrefs pass through untouched: the wrap must not reach beyond
+    /// bibliographic references.
+    #[test]
+    fn bibr_xref_text_is_wrapped_as_citation_marker() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Citation probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Ti-6Al-4V has been widely studied<sup><xref ref-type="bibr" rid="b1">1140</xref></sup>.</p>
+      <p>Properties are shown in <xref ref-type="fig">Fig. 2</xref>.</p>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let texts: Vec<&str> = ft.blocks.iter().map(|b| b.text.as_str()).collect();
+        assert!(
+            texts.contains(&"Ti-6Al-4V has been widely studied [1140] ."),
+            "bibr xref not wrapped as a citation marker: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"Properties are shown in Fig. 2 ."),
+            "a non-bibr xref must pass through untouched: {texts:?}"
+        );
+    }
+
+    /// H1: JATS permits TWO table models. The OASIS/CALS model uses
+    /// <tgroup>/<row>/<entry> instead of <tr>/<td>, and half the corpus
+    /// uses it. A <row> must delimit rows exactly like <tr>, or the whole
+    /// OASIS table fuses into one span and a number from one row
+    /// "supports" a claim whose subject lives in another row.
+    #[test]
+    fn oasis_table_rows_stay_separate_lines() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>OASIS row probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <table-wrap>
+        <label>Table 1</label>
+        <table>
+          <tgroup cols="2">
+            <tbody>
+              <row><entry>Ti-6Al-4V</entry><entry>950</entry></row>
+              <row><entry>Inconel 718</entry><entry>1375</entry></row>
+            </tbody>
+          </tgroup>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
+        let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
+        // Exact row structure: two separate rows, so the two alloys'
+        // numbers (950 / 1375) never share one.
+        assert_eq!(rows, vec!["Ti-6Al-4V 950", "Inconel 718 1375"]);
     }
 
     #[test]

@@ -5224,6 +5224,7 @@ name = "prism-retrieval"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "chrono",
  "dirs",

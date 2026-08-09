@@ -127,12 +127,17 @@ def _literature_search_impl(**kwargs) -> dict:
         stamp_evidence(record, EvidenceSource.LITERATURE_EXTRACTION)
         results.append(record)
 
-    # Engine status list -> legacy per-source dict.
+    # Engine status list -> legacy per-source dict. Count ok sources by the
+    # engine's state, not by the rendered string: a fully-cached zero-hit
+    # success renders "cache (0 results)" and a startswith("ok") check would
+    # report it as a failure.
     source_status = {}
+    ok_sources = 0
     for status in outcome.get("source_status", []):
         name = status.get("source", "unknown")
         state = status.get("status", "error")
         if state == "ok":
+            ok_sources += 1
             note = "cache" if status.get("cache_hit") else "ok"
             source_status[name] = f"{note} ({status.get('count', 0)} results)"
         elif state == "timeout":
@@ -149,10 +154,9 @@ def _literature_search_impl(**kwargs) -> dict:
         "engine_elapsed_ms": outcome.get("elapsed_ms"),
     }
     # Nothing was retrieved AND every source failed: that is a fault, not an
-    # empty result. Surface it; keep the results list honest (empty).
-    if not results and source_status and all(
-        not v.startswith("ok") for v in source_status.values()
-    ):
+    # empty result. Surface it; keep the results list honest (empty). An
+    # honest zero-hit success (cached or not) must never trip this.
+    if not results and source_status and ok_sources == 0:
         out["error"] = (
             "no papers retrieved because every source failed; see source_status"
         )

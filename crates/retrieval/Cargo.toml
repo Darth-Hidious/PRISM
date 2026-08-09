@@ -10,6 +10,7 @@ authors.workspace = true
 # Hard-offline policy. `get_with_retry` is this crate's only outbound call.
 prism-runtime = { path = "../runtime" }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }

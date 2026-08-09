@@ -16,10 +16,16 @@ def test_to_optimade_exclude_elements():
 
 
 def test_to_optimade_formula():
+    """`chemical_formula_reduced` is alphabetical and GCD-reduced per the spec.
+
+    A user typing "SiO2" must go on the wire as "O2Si". Sending the input
+    spelling matched almost nothing: providers store the canonical form, so
+    only one of nine responding databases had data for a query like this.
+    """
     from app.tools.search_engine.translator import QueryTranslator
     q = MaterialSearchQuery(formula="SiO2")
     f = QueryTranslator.to_optimade(q)
-    assert 'chemical_formula_reduced="SiO2"' in f
+    assert 'chemical_formula_reduced="O2Si"' in f
 
 
 def test_to_optimade_n_elements():

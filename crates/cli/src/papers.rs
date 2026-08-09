@@ -364,13 +364,62 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 }
                 truncated_bytes += extraction.dropped_bytes;
                 for fact in extraction.facts {
-                    let claim =
-                        claim_from_fact(fact, &document_id, &document_url, &source, &block.locator);
-                    match prism_retrieval::claims::validate_and_stamp(claim) {
+                    // Containment: find the verbatim span of THIS block that
+                    // supports the fact. Facts with no supporting span cannot
+                    // become claims — stamping them would record provenance a
+                    // document never gave (extractor prompt examples included).
+                    let support = prism_retrieval::claims::supporting_quote_or_refusal(
+                        &fact.subject,
+                        &fact.object,
+                        fact.value,
+                        &block.text,
+                    );
+                    let quote = support.as_ref().ok().cloned();
+                    // Clone the drop-record fields BEFORE `fact` moves into
+                    // `claim_from_fact` and `claim` into `validate_and_stamp`:
+                    // without them the rejected entries carry only a reason,
+                    // and the over-refusal histogram cannot be built from
+                    // production output at all.
+                    let subject = fact.subject.clone();
+                    let object = fact.object.clone();
+                    let value = fact.value;
+                    let claim = claim_from_fact(
+                        fact,
+                        &document_id,
+                        &document_url,
+                        &source,
+                        &block.locator,
+                        quote,
+                    );
+                    match prism_retrieval::claims::validate_and_stamp(claim, &block.text) {
                         Ok(stamped) => claims.push(stamped),
-                        Err(reason) => rejected.push(json!({
-                            "reason": reason,
-                        })),
+                        Err(reason) => {
+                            // A MissingQuote drop is refined by `support`: a
+                            // missing quote is the model's fault only when no
+                            // span held the fact at all (NoSpan maps back to
+                            // MissingQuote). When a span held it but a guard
+                            // refused every occurrence of the value, record
+                            // WHICH guard: that drop is the matcher's refusal,
+                            // and the guard name is the only observable signal
+                            // of over-refusal. MissingQuote implies `support`
+                            // is Err — Ok support gave the claim a quote, and
+                            // only a quote-less claim is refused as
+                            // MissingQuote — so no Ok arm exists here.
+                            let reason = match (reason, support) {
+                                (
+                                    prism_retrieval::claims::ClaimRejection::MissingQuote,
+                                    Err(refusal),
+                                ) => prism_retrieval::claims::ClaimRejection::from(refusal),
+                                (reason, _) => reason,
+                            };
+                            rejected.push(json!({
+                                "reason": reason,
+                                "subject": subject,
+                                "object": object,
+                                "value": value,
+                                "locator": block.locator,
+                            }));
+                        }
                     }
                 }
             }
@@ -614,13 +663,16 @@ fn probe_endpoint(base_url: &str) -> Result<(), String> {
 }
 
 /// Convert one extracted `MaterialFact` into a provenance-carrying claim.
-/// Evidence is stamped by `validate_and_stamp` (ceiling: research).
+/// `quote` is the verbatim supporting span found in the cited block (see
+/// `supporting_quote`); evidence is stamped by `validate_and_stamp`
+/// (ceiling: research).
 fn claim_from_fact(
     fact: prism_provenance::MaterialFact,
     document_id: &str,
     document_url: &str,
     source: &str,
     locator: &prism_retrieval::Locator,
+    quote: Option<String>,
 ) -> prism_retrieval::claims::ExtractedClaim {
     use prism_provenance::FactPayload;
     use prism_retrieval::claims::{ConditionValue, MeasurementCondition};
@@ -654,7 +706,7 @@ fn claim_from_fact(
             document_url: document_url.to_string(),
             source: source.to_string(),
             locator: locator.clone(),
-            quote: None,
+            quote,
         },
     }
 }
