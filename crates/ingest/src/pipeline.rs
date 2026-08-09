@@ -999,7 +999,7 @@ mod tests {
         let db_path = scratch.db_path();
         let pipeline = pipeline_against(server.uri(), db_path.clone());
 
-        let result = pipeline.ingest_csv(&csv).await.unwrap();
+        let result = pipeline.ingest_file(&csv).await.unwrap();
 
         assert_eq!((result.row_count, result.column_count), (0, 3));
         assert!(!result.validation.passed);
@@ -1067,7 +1067,7 @@ mod tests {
         let db_path = scratch.db_path();
         let pipeline = pipeline_against(server.uri(), db_path.clone());
 
-        let result = pipeline.ingest_csv(&csv).await.unwrap();
+        let result = pipeline.ingest_file(&csv).await.unwrap();
 
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         let entities = result.entities.expect("extraction must run on data rows");
@@ -1121,7 +1121,7 @@ mod tests {
         let db_path = scratch.db_path();
         let pipeline = pipeline_against(server.uri(), db_path.clone());
 
-        let result = pipeline.ingest_csv(&csv).await.unwrap();
+        let result = pipeline.ingest_file(&csv).await.unwrap();
 
         // The refusal guard did not fire…
         assert!(
