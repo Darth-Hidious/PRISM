@@ -7,11 +7,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, url_encode};
+use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::{FulltextFormat, Paper};
 
 const DEFAULT_BASE: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 
+pub const ID: &str = "preprints_europepmc";
 pub const INITIAL_CURSOR: &str = "";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -28,7 +29,7 @@ pub async fn fetch_page(
     cursor: &str,
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let mark = if cursor.is_empty() { "*" } else { cursor };
-    let base = ctx.base(SourceId::Preprints, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let scoped = format!("({query}) AND SRC:PPR");
     let url = format!(
         "{base}/search?format=json&pageSize={n}&cursorMark={m}&query={q}",
@@ -36,7 +37,7 @@ pub async fn fetch_page(
         m = url_encode(mark),
         q = url_encode(&scoped)
     );
-    let (body, _cached) = ctx.fetch_cached(SourceId::Preprints, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let root: Value = serde_json::from_slice(&body)?;
     let papers = parse_items(&root);
     let next_mark = root
@@ -142,7 +143,7 @@ fn parse_item(item: &Value) -> Option<Paper> {
         .map(str::to_string);
 
     Some(Paper {
-        source: SourceId::Preprints.as_str().to_string(),
+        source: ID.to_string(),
         source_id: europepmc_id.clone(),
         title,
         authors,

@@ -62,6 +62,31 @@ class Provider(ABC):
         """Execute search, return normalized materials."""
         ...
 
+    def describe_query(self, query: MaterialSearchQuery) -> str:
+        """Describe the query this provider INTENDS to issue for ``query``.
+
+        Recorded as ``ProviderQueryLog.query_description``. Contract: this is
+        the provider's own pre-dispatch translation of the engine query -- a
+        logical/intended query, explicitly NOT a captured wire transcript. It
+        is computed before ``search()`` runs, so it exists even for a query
+        that later fails, is cancelled, or is served without any transport.
+
+        Design choice (of the two honest options): we narrow what the field
+        CLAIMS rather than capture what ``search()`` actually sent. A wire
+        capture would force every adapter to thread transport internals back
+        out through timeouts and cancellation, and could still say nothing
+        for queries that die before send. Instead the field claims exactly
+        what it carries, and adapters must derive the description from the
+        SAME code path their ``search()`` dispatch uses (see
+        OptimadeProvider.describe_query and
+        MaterialsProjectProvider.describe_query) so intent and dispatch
+        cannot drift.
+
+        The default is the engine-level query as JSON: honest but generic.
+        Providers should override this with their native query syntax.
+        """
+        return query.model_dump_json(exclude_none=True)
+
     async def health_check(self) -> bool:
         """Ping the provider. Default: return True."""
         return True

@@ -5855,14 +5855,23 @@ enum IngestBackend {
 }
 
 fn ingest_backend(path: &Path) -> Option<IngestBackend> {
+    // Tabular formats are whatever the connector registry claims — the one
+    // place that owns the extension→connector decision. A new file
+    // connector routes here with zero edits.
+    if prism_ingest::connectors::registry().claims(path) {
+        return Some(IngestBackend::LocalTabular);
+    }
+
     let ext = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    // Text documents go to the platform's holistic ingest, not to a local
+    // file connector — this list is that backend's surface, not a shadow
+    // of the connector registry.
     match ext.as_str() {
-        "csv" | "tsv" | "parquet" | "pq" => Some(IngestBackend::LocalTabular),
         "pdf" | "json" | "jsonl" | "owl" | "cif" | "txt" | "md" => {
             Some(IngestBackend::PlatformText)
         }

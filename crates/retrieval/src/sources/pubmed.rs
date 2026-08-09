@@ -4,11 +4,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, url_encode};
+use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::Paper;
 
 const DEFAULT_BASE: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 
+pub const ID: &str = "pubmed";
 pub const INITIAL_CURSOR: &str = "0";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -24,14 +25,14 @@ pub async fn fetch_page(
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let retstart: usize = cursor.parse().unwrap_or(0);
     let retmax = ctx.limit.min(100);
-    let base = ctx.base(SourceId::Pubmed, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
 
     // 1. Find matching PMIDs for this page.
     let search_url = format!(
         "{base}/esearch.fcgi?db=pubmed&retmode=json&retmax={retmax}&retstart={retstart}&term={q}",
         q = url_encode(query)
     );
-    let (search_body, _) = ctx.fetch_cached(SourceId::Pubmed, &search_url).await?;
+    let (search_body, _) = ctx.fetch_cached(ID, &search_url).await?;
     let search_root: Value = serde_json::from_slice(&search_body)?;
     let ids: Vec<String> = search_root
         .pointer("/esearchresult/idlist")
@@ -51,7 +52,7 @@ pub async fn fetch_page(
         "{base}/esummary.fcgi?db=pubmed&retmode=json&id={}",
         url_encode(&ids.join(","))
     );
-    let (summary_body, _) = ctx.fetch_cached(SourceId::Pubmed, &summary_url).await?;
+    let (summary_body, _) = ctx.fetch_cached(ID, &summary_url).await?;
     let papers = parse_summary(&summary_body, &ids)?;
     let next = (ids.len() >= retmax).then(|| (retstart + ids.len()).to_string());
     Ok((papers, next))
@@ -126,7 +127,7 @@ fn parse_record(record: &Value, pmid: &str) -> Option<Paper> {
         .map(str::to_string);
 
     Some(Paper {
-        source: SourceId::Pubmed.as_str().to_string(),
+        source: ID.to_string(),
         source_id: pmid.to_string(),
         title,
         authors,

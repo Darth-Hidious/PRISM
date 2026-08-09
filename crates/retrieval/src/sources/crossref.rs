@@ -4,11 +4,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, strip_markup, url_encode};
+use super::{FetchCtx, normalize_doi, strip_markup, url_encode};
 use crate::model::{FulltextFormat, Paper};
 
 const DEFAULT_BASE: &str = "https://api.crossref.org";
 
+pub const ID: &str = "crossref";
 pub const INITIAL_CURSOR: &str = "0";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -25,7 +26,7 @@ pub async fn fetch_page(
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let offset: usize = cursor.parse().unwrap_or(0);
     let rows = ctx.limit.min(100);
-    let base = ctx.base(SourceId::Crossref, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let mut url = format!(
         "{base}/works?query={q}&rows={rows}&offset={offset}",
         q = url_encode(query)
@@ -33,7 +34,7 @@ pub async fn fetch_page(
     if let Some(mailto) = &ctx.mailto {
         url.push_str(&format!("&mailto={}", url_encode(mailto)));
     }
-    let (body, _cached) = ctx.fetch_cached(SourceId::Crossref, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let papers = parse(&body)?;
     let next =
         (papers.len() >= rows && offset + rows <= 10_000).then(|| (offset + rows).to_string());
@@ -129,7 +130,7 @@ fn parse_item(item: &Value) -> Option<Paper> {
         .unwrap_or_else(|| format!("https://doi.org/{doi}"));
 
     Some(Paper {
-        source: SourceId::Crossref.as_str().to_string(),
+        source: ID.to_string(),
         source_id: doi.clone(),
         title,
         authors,

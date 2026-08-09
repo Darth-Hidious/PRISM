@@ -15,11 +15,40 @@ from app.tools.search_engine.providers.registry import ProviderRegistry
 from app.tools.search_engine.query import MaterialSearchQuery
 from app.tools.search_engine.resilience.circuit_breaker import HealthManager
 from app.tools.search_engine.result import Material, ProviderQueryLog, SearchResult
-from app.tools.search_engine.translator import QueryTranslator
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path.home() / ".prism" / "cache"
+
+
+def _safe_describe(provider: Provider, query: MaterialSearchQuery) -> str:
+    """describe_query, guarded: audit formatting must never become an
+    operational failure. A provider whose description code raises -- or
+    returns a non-str (None, a coroutine from an accidentally-async
+    describe_query, ...) -- still gets queried and logged, with an explicit
+    failure marker instead of a description and a WARNING so the broken
+    adapter is visible. The non-str check matters because
+    ProviderQueryLog(query_description=...) validates str and would otherwise
+    raise AFTER a successful search, defeating the guard."""
+    try:
+        desc = provider.describe_query(query)
+    except Exception as e:
+        logger.warning(
+            "describe_query failed for provider %s: %s: %s",
+            getattr(provider, "id", "?"), type(e).__name__, e,
+        )
+        return f"<describe_query failed: {type(e).__name__}>"
+    if not isinstance(desc, str):
+        import inspect
+
+        if inspect.iscoroutine(desc):
+            desc.close()  # silence the "coroutine was never awaited" warning
+        logger.warning(
+            "describe_query for provider %s returned %s, not str",
+            getattr(provider, "id", "?"), type(desc).__name__,
+        )
+        return f"<describe_query returned {type(desc).__name__}, not str>"
+    return desc
 
 
 def _sanitize_error(msg: str) -> str:
@@ -219,7 +248,7 @@ class SearchEngine:
                     provider_id=p.id,
                     provider_name=p.name,
                     endpoint_url=self._get_endpoint_url(p),
-                    query_sent="",
+                    query_description="",
                     started_at=time.time(),
                     completed_at=time.time(),
                     latency_ms=0,
@@ -326,7 +355,11 @@ class SearchEngine:
                     provider_id=pid,
                     provider_name=provider.name,
                     endpoint_url=self._get_endpoint_url(provider),
-                    query_sent=QueryTranslator.to_optimade(query),
+                    # The provider's own intended query, not a blanket OPTIMADE
+                    # translation (which was fiction for non-OPTIMADE providers).
+                    # Guarded: a broken describe_query must not take down the
+                    # whole search from inside the failure-reporting path.
+                    query_description=_safe_describe(provider, query),
                     started_at=start,
                     completed_at=time.time(),
                     latency_ms=(time.time() - start) * 1000,
@@ -416,7 +449,11 @@ class SearchEngine:
         """Query a single provider with timeout and audit logging."""
         start = time.time()
         endpoint_url = self._get_endpoint_url(provider)
-        query_sent = QueryTranslator.to_optimade(query)
+        # Each provider reports the query IT intends to issue; the engine
+        # records that instead of assuming everyone speaks OPTIMADE. Guarded
+        # (_safe_describe): an exception in a provider's description code is
+        # an audit-formatting problem and must never fail the provider query.
+        query_description = _safe_describe(provider, query)
 
         # S2: per-provider timeout by UNION. The provider's OWN configured
         # timeout wins; the global is a separate whole-fan-out deadline (see
@@ -441,7 +478,7 @@ class SearchEngine:
                 provider_id=provider.id,
                 provider_name=provider.name,
                 endpoint_url=endpoint_url,
-                query_sent=query_sent,
+                query_description=query_description,
                 started_at=start,
                 completed_at=time.time(),
                 latency_ms=latency,
@@ -465,7 +502,7 @@ class SearchEngine:
                 provider_id=provider.id,
                 provider_name=provider.name,
                 endpoint_url=endpoint_url,
-                query_sent=query_sent,
+                query_description=query_description,
                 started_at=start,
                 completed_at=time.time(),
                 latency_ms=(time.time() - start) * 1000,

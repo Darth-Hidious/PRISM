@@ -10,7 +10,7 @@ expression: rendered
               ┌ Knowledge ───────────────────────────────────────────────────────────┐
               │ Search  [Ingest]                                                     │
               │                                                                      │
-              │  /data/papers   (.pdf .csv .json)                                    │
+              │  /data/papers   (.pdf .csv .json .tsv .parquet .pq)                  │
               │                                                                      │
               │    ../                                                               │
               │    reviews/                                                          │
