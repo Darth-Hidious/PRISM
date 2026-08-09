@@ -167,14 +167,26 @@ async fn add_column_if_absent(
 
 pub struct ProvenanceStore {
     conn: turso::Connection,
-    /// Serializes write TRANSACTIONS issued through this one handle. The
-    /// write paths take `&self` but run a raw `BEGIN IMMEDIATE` on the
-    /// single shared connection, so without this two tasks writing through
-    /// ONE store (e.g. `tokio::join!` on an `Arc<ProvenanceStore>`) race
-    /// into "cannot start a transaction within a transaction" — an opaque
-    /// error, not `StoreBusy`, and the losing fact is silently not stored.
-    /// SEPARATE handles need no help: they serialize via the database busy
-    /// wait, which is what the concurrency tests exercise.
+    /// Serializes EVERY write issued through this one handle — the raw
+    /// `BEGIN IMMEDIATE` transactions of the fact writers AND each
+    /// single-statement writer (`record`, `record_activity`,
+    /// `embed_and_store`, the entity-vector upserts). Two reasons, both on
+    /// the one shared connection:
+    ///
+    /// 1. A raw `BEGIN IMMEDIATE` cannot nest, so without the mutex a
+    ///    `tokio::join!` on one `Arc<ProvenanceStore>` races into "cannot
+    ///    start a transaction within a transaction" — an opaque error, not
+    ///    `StoreBusy`, and the losing fact is silently not stored.
+    /// 2. A single-statement writer that skips the lock silently JOINS
+    ///    whatever transaction is currently open: if that transaction rolls
+    ///    back, the bystander's row vanishes even though its caller was
+    ///    already told `Ok(())` — a silent lost write.
+    ///
+    /// Read paths deliberately do NOT take the lock: a read joins an open
+    /// transaction harmlessly (it sees the writer's uncommitted rows, same
+    /// as SQLite on one connection) and holds nothing that a rollback could
+    /// destroy. SEPARATE handles need no help either: they serialize via
+    /// the database busy wait, which is what the concurrency tests exercise.
     write_lock: tokio::sync::Mutex<()>,
 }
 
@@ -309,6 +321,11 @@ impl ProvenanceStore {
             .map(serde_json::to_string)
             .transpose()?;
 
+        // Under the shared write lock: on the one shared connection an
+        // unlocked INSERT silently joins whatever raw transaction another
+        // task has open, and that transaction's rollback erases this record
+        // AFTER the caller was told `Ok(())` (see `write_lock`).
+        let _same_handle_guard = self.write_lock.lock().await;
         self.conn
             .execute(
                 r#"INSERT INTO provenance_records
@@ -428,6 +445,9 @@ impl ProvenanceStore {
             .into_iter()
             .next()
             .context("embedding backend returned no vector")?;
+        // Locked only around the INSERT — the embedding pass above must
+        // never hold the store's write lock (see `write_lock`).
+        let _same_handle_guard = self.write_lock.lock().await;
         self.conn
             .execute(
                 r#"INSERT OR REPLACE INTO provenance_embeddings
