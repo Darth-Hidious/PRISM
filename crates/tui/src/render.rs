@@ -3253,7 +3253,7 @@ fn draw_knowledge_pane(f: &mut Frame, app: &App) {
                     Style::default().fg(t.dim),
                 ),
                 Span::styled(
-                    format!("   (.{})", crate::knowledge::INGEST_EXTENSIONS.join(" .")),
+                    format!("   (.{})", crate::knowledge::ingest_extensions().join(" .")),
                     Style::default().fg(t.muted),
                 ),
             ]));

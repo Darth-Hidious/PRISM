@@ -5,13 +5,13 @@
 //! This pane consolidates them: mode tabs `[Search | Ingest]`, where
 //! Search collects a query + scope toggles and Ingest is a real file
 //! browser (arrow navigation, Enter to descend/select, filtered to
-//! .pdf/.csv/.json) followed by optional metadata.
+//! [`ingest_extensions`]) followed by optional metadata.
 //!
 //! State + pure helpers live here (gh.rs convention); key handling is
 //! in app.rs and rendering in render.rs.
 
 use crate::form::{Form, FormField};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which mode tab is active.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,8 +28,37 @@ pub enum IngestPhase {
     Meta,
 }
 
-/// File extensions the ingest browser offers.
-pub const INGEST_EXTENSIONS: &[&str] = &["pdf", "csv", "json"];
+/// Text-document formats the TUI ingest flow accepts. These are handled by
+/// the platform's text ingest, not by a local file connector, so they are
+/// this surface's own list rather than a shadow of the connector registry.
+const TEXT_INGEST_EXTENSIONS: &[&str] = &["pdf", "json"];
+
+/// The picker offered `.pdf .csv .json` (in that order) before the
+/// connector registry became the source of truth; keep that relative order
+/// for the formats that predate it and append newly exposed ones after.
+const LEGACY_PICKER_ORDER: &[&str] = &["pdf", "csv", "json"];
+
+/// File extensions the ingest browser offers: the text-document formats,
+/// plus every extension a registered file connector claims (asked of the
+/// ingest connector registry, so a new connector appears in the picker
+/// with zero edits here). Deduplicated, [`LEGACY_PICKER_ORDER`] first.
+pub fn ingest_extensions() -> Vec<&'static str> {
+    let mut exts = TEXT_INGEST_EXTENSIONS.to_vec();
+    for ext in prism_ingest::connectors::registry().extensions() {
+        if !exts.contains(&ext) {
+            exts.push(ext);
+        }
+    }
+    // Stable sort: legacy formats keep their historic order up front, the
+    // rest keep registration order after them.
+    exts.sort_by_key(|e| {
+        LEGACY_PICKER_ORDER
+            .iter()
+            .position(|l| l == e)
+            .unwrap_or(usize::MAX)
+    });
+    exts
+}
 
 /// One row of the file browser.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,7 +87,7 @@ impl FileBrowser {
     }
 
     /// Re-read `cwd`: a `..` row (when there is a parent), then visible
-    /// directories, then files matching [`INGEST_EXTENSIONS`] — each
+    /// directories, then files matching [`ingest_extensions`] — each
     /// group alphabetical. Unreadable dirs collapse to just `..`.
     pub fn refresh(&mut self) {
         let mut dirs: Vec<FileEntry> = Vec::new();
@@ -130,16 +159,22 @@ impl FileBrowser {
     }
 }
 
+/// Whether the picker offers this file name. Connector-claimed formats are
+/// the registry's decision — `Path::extension` semantics, exactly what the
+/// pipeline dispatches on, so the picker can never offer a file the
+/// pipeline then rejects (extensionless names, dotfiles). The text-document
+/// formats are matched the same way.
 fn has_ingest_extension(name: &str) -> bool {
-    name.rsplit('.')
-        .next()
-        .map(|ext| {
-            INGEST_EXTENSIONS
-                .iter()
-                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
-        })
-        .unwrap_or(false)
-        && name.contains('.')
+    let path = Path::new(name);
+    prism_ingest::connectors::registry().claims(path)
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| {
+                TEXT_INGEST_EXTENSIONS
+                    .iter()
+                    .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+            })
 }
 
 /// The Knowledge pane state: mode tabs + per-tab state.
@@ -244,6 +279,39 @@ mod tests {
         assert!(!has_ingest_extension("notes.txt"));
         assert!(!has_ingest_extension("pdf"), "bare 'pdf' is not a match");
         assert!(!has_ingest_extension("archive.tar.gz"));
+        // `Path::extension` semantics — the pipeline's own matching rule.
+        // A file literally NAMED like a format has no extension, and a
+        // dotfile's leading dot is not an extension separator; offering
+        // either would hand the pipeline a file it must reject.
+        assert!(
+            !has_ingest_extension("parquet"),
+            "extensionless name that looks like a format",
+        );
+        assert!(!has_ingest_extension(".tsv"), "dotfile has no extension");
+    }
+
+    /// The picker previously offered `.pdf .csv .json`; the registry now
+    /// exposes more formats but must not reorder the ones users already
+    /// had — new formats append after the legacy trio.
+    #[test]
+    fn picker_preserves_legacy_order_and_appends_new_formats() {
+        assert_eq!(
+            ingest_extensions(),
+            ["pdf", "csv", "json", "tsv", "parquet", "pq"],
+        );
+    }
+
+    /// The picker must offer everything a file connector can parse — the
+    /// old constant offered csv but not tsv/parquet/pq, which the pipeline
+    /// ingested happily.
+    #[test]
+    fn picker_offers_every_connector_claimed_extension() {
+        for ext in prism_ingest::connectors::registry().extensions() {
+            assert!(
+                has_ingest_extension(&format!("data.{ext}")),
+                "connector-claimed .{ext} missing from the picker",
+            );
+        }
     }
 
     #[test]

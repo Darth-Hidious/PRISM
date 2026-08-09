@@ -102,19 +102,31 @@ impl IngestPipeline {
         Self { config }
     }
 
-    /// Ingest a file (CSV or Parquet, detected from extension) through the full pipeline.
+    /// Ingest a file through the full pipeline. Which connector parses it is
+    /// the connector registry's decision — no extension match lives here.
     pub async fn ingest_file(&self, path: &Path) -> Result<IngestResult> {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        match ext.as_str() {
-            "csv" | "tsv" => self.ingest_csv(path).await,
-            "parquet" | "pq" => self.ingest_parquet(path).await,
-            _ => bail!("Unsupported file format: '.{ext}'. Supported: csv, tsv, parquet"),
-        }
+        // Resolve the connector inside a block: the registry read guard is
+        // not `Send` and must be released before any `.await`.
+        let connector = {
+            let registry = crate::connectors::registry();
+            match registry.connector_for(path) {
+                Some(connector) => connector,
+                None => {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    bail!(
+                        "Unsupported file format: '.{ext}'. Supported: {}",
+                        registry.extensions().join(", ")
+                    );
+                }
+            }
+        };
+        let df = connector.load(path)?;
+        let source = connector.to_data_source(path)?;
+        self.run_pipeline(df, source).await
     }
 
     /// Ingest a CSV file through the full pipeline.
@@ -644,6 +656,68 @@ mod tests {
             p.push(suffix);
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// The deliverable of the connector work, proven at PRODUCTION dispatch:
+    /// a connector for a NOVEL extension, registered at runtime through
+    /// `register_connector`, is reachable through `ingest_file` itself — no
+    /// match arm, no enum variant, no `builtin()` edit, no consumer-list
+    /// edit. This test dies if the pipeline stops consulting the
+    /// process-wide registry.
+    #[tokio::test]
+    async fn registering_a_new_connector_needs_no_dispatch_edits() {
+        use crate::connectors::{Connector, register_connector};
+        use std::sync::Arc;
+
+        struct Demo;
+        impl Connector for Demo {
+            fn id(&self) -> &'static str {
+                "demo"
+            }
+            fn extensions(&self) -> &'static [&'static str] {
+                &["demo"]
+            }
+            fn load(&self, _: &Path) -> Result<DataFrame> {
+                Ok(df!("answer" => &[42i64]).expect("literal frame"))
+            }
+            fn to_data_source(&self, path: &Path) -> Result<DataSource> {
+                Ok(DataSource {
+                    path: path.display().to_string(),
+                    format: "demo".into(),
+                })
+            }
+        }
+
+        register_connector(Arc::new(Demo));
+
+        let path = std::env::temp_dir().join(format!("prism_demo_{}.demo", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"content irrelevant: Demo::load ignores it").unwrap();
+
+        // Schema-only pipeline (no LLM, no store write) through the real
+        // entry point.
+        let result = IngestPipeline::new()
+            .ingest_file(&path)
+            .await
+            .expect("the novel extension must dispatch through the registry");
+        assert_eq!(result.source.format, "demo");
+        assert_eq!((result.row_count, result.column_count), (1, 1));
+        assert_eq!(result.schema.columns, vec!["answer"]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The refusal path reads the same registry: unclaimed extensions bail
+    /// with the supported list. (Containment asserts only — the sibling
+    /// test above registers an extra connector in this same process.)
+    #[tokio::test]
+    async fn ingest_file_refuses_unclaimed_extensions_with_supported_list() {
+        let err = IngestPipeline::new()
+            .ingest_file(Path::new("/tmp/data.nope"))
+            .await
+            .expect_err("unclaimed extension must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Unsupported file format: '.nope'"), "{msg}");
+        assert!(msg.contains("csv") && msg.contains("parquet"), "{msg}");
     }
 
     #[test]

@@ -10,8 +10,10 @@
 //! ```
 //!
 //! There is no database connector: [`connectors`] contains exactly
-//! [`connectors::CsvConnector`] and [`connectors::ParquetConnector`]. This
-//! header previously claimed "databases" as a supported source.
+//! [`connectors::CsvConnector`] and [`connectors::ParquetConnector`],
+//! dispatched through [`connectors::ConnectorRegistry`] — the one place
+//! extensions are mapped to connectors. This header previously claimed
+//! "databases" as a supported source.
 //!
 //! [`OntologyConstructor`] describes the intended plug point for a future DMMS
 //! (Differentiable Manifold Materials Science) engine, but nothing consumes it

@@ -158,9 +158,26 @@ fn detect_scheduler() -> Option<String> {
 
 // --- Dataset detection ---
 
-const DATASET_EXTENSIONS: &[&str] = &[
-    "csv", "json", "jsonl", "parquet", "cif", "xyz", "hdf5", "h5",
-];
+/// Dataset formats no local file connector parses: scientific interchange
+/// formats a node can still advertise to jobs (`cif`/`xyz` structures, HDF5
+/// archives) plus the JSON family the platform text ingest handles. The
+/// tabular half of the list is NOT here — it is asked of the ingest
+/// connector registry, so a new file connector shows up in dataset
+/// discovery with zero edits.
+const NON_CONNECTOR_DATASET_EXTENSIONS: &[&str] = &["json", "jsonl", "cif", "xyz", "hdf5", "h5"];
+
+/// The recognised dataset format of `path` (the lowercased extension), or
+/// `None` when it is not a dataset. Connector-claimed formats are the
+/// ingest connector registry's decision — `Path::extension` semantics,
+/// case-insensitive, exactly what the pipeline dispatches on — and the
+/// non-connector scientific formats are matched the same way, so discovery
+/// cannot skip a file (`DATA.TSV`) the rest of the stack accepts.
+fn dataset_format(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    (prism_ingest::connectors::registry().claims(path)
+        || NON_CONNECTOR_DATASET_EXTENSIONS.contains(&ext.as_str()))
+    .then_some(ext)
+}
 
 fn detect_datasets() -> Vec<DatasetInfo> {
     let mut search_dirs = vec![];
@@ -197,9 +214,8 @@ fn scan_for_datasets(dir: &Path, out: &mut Vec<DatasetInfo>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && DATASET_EXTENSIONS.contains(&ext)
-                && let Some(info) = dataset_info_from_file(&path, ext)
+            if let Some(ext) = dataset_format(&path)
+                && let Some(info) = dataset_info_from_file(&path, &ext)
             {
                 out.push(info);
             }
@@ -208,12 +224,9 @@ fn scan_for_datasets(dir: &Path, out: &mut Vec<DatasetInfo>) {
             let has_data = std::fs::read_dir(&path)
                 .ok()
                 .map(|entries| {
-                    entries.flatten().any(|e| {
-                        e.path()
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| DATASET_EXTENSIONS.contains(&ext))
-                    })
+                    entries
+                        .flatten()
+                        .any(|e| dataset_format(&e.path()).is_some())
                 })
                 .unwrap_or(false);
 
@@ -640,6 +653,70 @@ mod tests {
         assert_eq!(datasets.len(), 2);
         assert!(datasets.iter().any(|d| d.format.as_deref() == Some("csv")));
         assert!(datasets.iter().any(|d| d.format.as_deref() == Some("json")));
+    }
+
+    /// Dataset discovery must recognise every extension a file connector
+    /// claims (previously this list drifted: `tsv` and `pq` were ingestable
+    /// but not discoverable) plus the node-specific scientific formats.
+    #[test]
+    fn dataset_format_covers_every_connector_claim() {
+        for claimed in prism_ingest::connectors::registry().extensions() {
+            let path = format!("/data/x.{claimed}");
+            assert_eq!(
+                dataset_format(Path::new(&path)).as_deref(),
+                Some(claimed),
+                "connector claim {claimed} missing",
+            );
+        }
+        for extra in NON_CONNECTOR_DATASET_EXTENSIONS {
+            let path = format!("/data/x.{extra}");
+            assert_eq!(
+                dataset_format(Path::new(&path)).as_deref(),
+                Some(*extra),
+                "non-connector format {extra} missing",
+            );
+        }
+    }
+
+    /// Uppercase extensions must be discovered: the registry (and the CLI,
+    /// pipeline, and TUI behind it) matches case-insensitively, while
+    /// discovery previously compared case-SENSITIVELY — `DATA.TSV` was
+    /// ingestable everywhere but skipped by dataset auto-discovery.
+    #[test]
+    fn discovery_accepts_uppercase_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("ALLOYS.TSV"),
+            "comp\thardness\nNbMoTaW\t542\n",
+        )
+        .unwrap();
+        std::fs::write(data_dir.join("STRUCT.CIF"), "data_niti").unwrap();
+
+        let mut datasets = Vec::new();
+        scan_for_datasets(&data_dir, &mut datasets);
+        assert!(
+            datasets.iter().any(|d| d.format.as_deref() == Some("tsv")),
+            "connector-claimed .TSV skipped by discovery",
+        );
+        assert!(
+            datasets.iter().any(|d| d.format.as_deref() == Some("cif")),
+            "non-connector .CIF skipped by discovery",
+        );
+    }
+
+    /// `Path::extension` semantics, shared with the pipeline: a file
+    /// literally named like a format has no extension, and a dotfile's
+    /// leading dot is not an extension separator.
+    #[test]
+    fn discovery_ignores_extensionless_names_that_look_like_formats() {
+        assert_eq!(dataset_format(Path::new("/data/parquet")), None);
+        assert_eq!(dataset_format(Path::new("/data/.tsv")), None);
+        assert_eq!(
+            dataset_format(Path::new("/data/x.PQ")).as_deref(),
+            Some("pq")
+        );
     }
 
     #[test]

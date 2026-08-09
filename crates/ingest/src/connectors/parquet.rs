@@ -8,6 +8,24 @@ use crate::DataSource;
 /// Parquet file connector for data ingestion.
 pub struct ParquetConnector;
 
+impl crate::connectors::Connector for ParquetConnector {
+    fn id(&self) -> &'static str {
+        "parquet"
+    }
+
+    fn extensions(&self) -> &'static [&'static str] {
+        &["parquet", "pq"]
+    }
+
+    fn load(&self, path: &Path) -> Result<DataFrame> {
+        Self::load(path)
+    }
+
+    fn to_data_source(&self, path: &Path) -> Result<DataSource> {
+        Self::to_data_source(path)
+    }
+}
+
 impl ParquetConnector {
     /// Load a Parquet file into a DataFrame.
     pub fn load(path: &Path) -> Result<DataFrame> {

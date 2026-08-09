@@ -22,6 +22,9 @@ chrono = { workspace = true }
 arboard = "3"
 prism-client = { path = "../client" }
 prism-frontend = { path = "../frontend" }
+# The knowledge-pane file picker asks the ingest connector registry which
+# tabular extensions are ingestable instead of keeping its own list.
+prism-ingest = { path = "../ingest" }
 prism-llm = { path = "../llm" }
 prism-python-bridge = { path = "../python-bridge" }
 prism-provenance = { path = "../provenance" }

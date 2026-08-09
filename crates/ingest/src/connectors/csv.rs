@@ -56,6 +56,27 @@ impl Delimited {
 /// Delimited-text connector (CSV and TSV) for data ingestion.
 pub struct CsvConnector;
 
+impl crate::connectors::Connector for CsvConnector {
+    fn id(&self) -> &'static str {
+        "csv"
+    }
+
+    /// Both delimited flavours. `.tsv` is load-bearing: [`Delimited`]
+    /// classifies the extension once, so claiming it here and parsing it
+    /// with tabs cannot drift apart.
+    fn extensions(&self) -> &'static [&'static str] {
+        &["csv", "tsv"]
+    }
+
+    fn load(&self, path: &Path) -> Result<DataFrame> {
+        Self::load(path)
+    }
+
+    fn to_data_source(&self, path: &Path) -> Result<DataSource> {
+        Self::to_data_source(path)
+    }
+}
+
 impl CsvConnector {
     fn options(path: &Path) -> CsvReadOptions {
         CsvReadOptions::default().with_parse_options(
