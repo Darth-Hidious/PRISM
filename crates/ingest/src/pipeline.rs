@@ -295,6 +295,8 @@ impl IngestPipeline {
             started_at: now.clone(),
             ended_at: now,
             locality: "local".into(),
+            // Local ingest reads the source itself — the locator IS the origin.
+            origin_source_id: None,
         };
         store.record_activity(&prov).await?;
 

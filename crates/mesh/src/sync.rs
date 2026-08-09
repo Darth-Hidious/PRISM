@@ -409,6 +409,8 @@ async fn sync_dataset_from_peer(
             started_at: now.clone(),
             ended_at: now,
             locality: "mesh".into(),
+            // Per-row: rows that name their origin get it set below.
+            origin_source_id: None,
         };
         store.record_activity(&prov).await?;
 
@@ -432,7 +434,15 @@ async fn sync_dataset_from_peer(
                 confidence: None,
                 kind: None,
             };
-            store.write_fact(&fact, &prov).await?;
+            // Carry the ORIGIN the peer conveyed for this row, so a fact
+            // relayed by two peers from two genuinely different sources can
+            // corroborate. A row without one stays `origin_source_id: None`
+            // and collapses onto `mesh:unattributed` — never invented.
+            let row_prov = prism_provenance::LocalProvenance {
+                origin_source_id: peer_row_origin(row),
+                ..prov.clone()
+            };
+            store.write_fact(&fact, &row_prov).await?;
             synced += 1;
         }
 
@@ -451,6 +461,36 @@ async fn sync_dataset_from_peer(
     }
 
     Ok(())
+}
+
+/// A peer-supplied origin locator may be junk of any size — it is
+/// attacker-influenceable input. Anything overlong is treated as
+/// unattributed rather than trusted; 512 bytes is generous for a DOI, URL,
+/// or file path (the Announce caps upstream use 256 for names/addresses).
+const MAX_ORIGIN_LEN: usize = 512;
+
+/// The origin locator one peer row conveys, if any: `properties.origin_source`
+/// as a non-empty string within [`MAX_ORIGIN_LEN`].
+///
+/// This is the ONLY thing the peer payload can say about origin today —
+/// `{type, name, properties}` rows historically shipped `properties: {}`,
+/// which cannot express one, so rows from older peers (or entities whose
+/// origin the peer does not know) return `None` and stay conservatively
+/// `mesh:unattributed`. The string is a locator (e.g. `doi:10.x/y`, a URL),
+/// NOT a pre-normalized key: `origin_source_key` normalization is not
+/// idempotent, so the receiver must be the one to derive the key.
+///
+/// The value is peer-chosen and untrusted. Constraining it further here
+/// would not add safety: `prism-provenance` namespaces every relayed origin
+/// key under `mesh:…`, so no string a peer picks can collide with a
+/// locally-derived source key or with `mesh:unattributed`.
+fn peer_row_origin(row: &serde_json::Value) -> Option<String> {
+    let origin = row
+        .get("properties")?
+        .get("origin_source")?
+        .as_str()?
+        .trim();
+    (!origin.is_empty() && origin.len() <= MAX_ORIGIN_LEN).then(|| origin.to_string())
 }
 
 #[cfg(test)]
@@ -505,5 +545,39 @@ mod tests {
             !err.to_string().contains("offline mode"),
             "loopback must not be refused by policy: {err}"
         );
+    }
+
+    /// The origin travels in `properties.origin_source`; everything the
+    /// wire cannot honestly attribute — absent, empty, non-string, overlong
+    /// — must come back `None` so the write stays `mesh:unattributed`.
+    #[test]
+    fn peer_row_origin_reads_only_a_sane_origin_string() {
+        let with = serde_json::json!({
+            "type": "Matter", "name": "Ti-6Al-4V",
+            "properties": { "origin_source": "  doi:10.1234/abc  " },
+        });
+        assert_eq!(peer_row_origin(&with).as_deref(), Some("doi:10.1234/abc"));
+
+        for (label, row) in [
+            (
+                "legacy empty properties",
+                serde_json::json!({ "type": "Matter", "name": "x", "properties": {} }),
+            ),
+            ("no properties at all", serde_json::json!({ "name": "x" })),
+            (
+                "empty string",
+                serde_json::json!({ "properties": { "origin_source": "   " } }),
+            ),
+            (
+                "non-string",
+                serde_json::json!({ "properties": { "origin_source": 7 } }),
+            ),
+            (
+                "overlong",
+                serde_json::json!({ "properties": { "origin_source": "x".repeat(513) } }),
+            ),
+        ] {
+            assert_eq!(peer_row_origin(&row), None, "{label} must be unattributed");
+        }
     }
 }

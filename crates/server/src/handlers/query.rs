@@ -120,7 +120,9 @@ fn default_provenance_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("provenance.db"))
 }
 
-/// Query the bundled Turso store for locally-ingested ontology entities.
+/// Query the bundled Turso store for locally-ingested ontology entities,
+/// each paired with the origin locator this node can honestly report for
+/// it (`None` when no stored assertion mentions the entity).
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
 /// `None`, which the handler renders as an empty result set. `None` is
@@ -130,7 +132,7 @@ async fn local_graph_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> Option<Vec<prism_provenance::GraphNode>> {
+) -> Option<Vec<(prism_provenance::GraphNode, Option<String>)>> {
     let store = match prism_provenance::ProvenanceStore::open(db_path).await {
         Ok(store) => store,
         Err(e) => {
@@ -164,7 +166,26 @@ async fn local_graph_lookup(
         };
     }
 
-    if nodes.is_empty() { None } else { Some(nodes) }
+    if nodes.is_empty() {
+        return None;
+    }
+
+    // Attach the origin each entity can honestly be attributed to, so a
+    // mesh peer syncing these rows can key corroboration on the ORIGINAL
+    // source instead of collapsing every relay to `mesh:unattributed`.
+    // A read failure degrades to an unattributed row, never an error.
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let origin = store
+            .entity_origin(&node.name, LOCAL_ONTOLOGY_TENANT)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!("entity origin read failed: {e:#}");
+                None
+            });
+        out.push((node, origin));
+    }
+    Some(out)
 }
 
 /// Semantic entity search over the bundled Turso store, ranked by Turso's
@@ -235,16 +256,24 @@ async fn local_semantic_lookup(
 
 /// Map local Turso graph nodes into the same JSON shape the retired Neo4j
 /// path returned (`{type, name, properties}`), keeping the wire format
-/// stable for existing clients. Local nodes carry no free-form properties,
-/// so `properties` is an empty object.
-fn graph_nodes_to_results(nodes: &[prism_provenance::GraphNode]) -> Vec<serde_json::Value> {
+/// stable for existing clients. The one property a node may carry is
+/// `origin_source` — the locator of the source this node's knowledge came
+/// from — which mesh peers syncing these rows use to keep corroboration
+/// honest (`crates/mesh/src/sync.rs`). A node with no attributable origin
+/// keeps the historical empty `properties`, never an invented locator.
+fn graph_nodes_to_results(
+    nodes: &[(prism_provenance::GraphNode, Option<String>)],
+) -> Vec<serde_json::Value> {
     nodes
         .iter()
-        .map(|n| {
+        .map(|(n, origin)| {
             serde_json::json!({
                 "type": n.entity_type,
                 "name": n.name,
-                "properties": {},
+                "properties": match origin {
+                    Some(origin) => serde_json::json!({ "origin_source": origin }),
+                    None => serde_json::json!({}),
+                },
             })
         })
         .collect()
@@ -466,19 +495,32 @@ mod tests {
     #[test]
     fn turso_results_map_to_existing_response_shapes() {
         // Graph: same {type, name, properties} shape as the Neo4j path.
-        let nodes = vec![prism_provenance::GraphNode {
+        // An attributable node carries its origin locator in `properties`
+        // (additive — older clients ignore it); one without stays `{}`.
+        let node = prism_provenance::GraphNode {
             name: "Ti-6Al-4V".into(),
             entity_type: "Matter".into(),
             label: "Matter".into(),
             tenant: "local".into(),
-        }];
+        };
+        let nodes = vec![
+            (node.clone(), Some("doi:10.1234/abc".to_string())),
+            (node, None),
+        ];
         assert_eq!(
             graph_nodes_to_results(&nodes),
-            vec![serde_json::json!({
-                "type": "Matter",
-                "name": "Ti-6Al-4V",
-                "properties": {},
-            })]
+            vec![
+                serde_json::json!({
+                    "type": "Matter",
+                    "name": "Ti-6Al-4V",
+                    "properties": { "origin_source": "doi:10.1234/abc" },
+                }),
+                serde_json::json!({
+                    "type": "Matter",
+                    "name": "Ti-6Al-4V",
+                    "properties": {},
+                }),
+            ]
         );
 
         // Semantic: same {id, score} shape as the Qdrant path.
@@ -561,6 +603,7 @@ mod tests {
             started_at: now.clone(),
             ended_at: now,
             locality: "local".into(),
+            origin_source_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
         store
@@ -579,17 +622,22 @@ mod tests {
             .await
             .expect("write fact");
 
-        // Exact name → neighbor traversal.
+        // Exact name → neighbor traversal, carrying the origin the entity
+        // was ingested from (what a syncing mesh peer keys corroboration on).
         let nodes = local_graph_lookup(&db.path, "Ti-6Al-4V", 10)
             .await
             .expect("ingested entity must be queryable");
-        assert!(nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+        assert!(
+            nodes
+                .iter()
+                .any(|(n, origin)| n.name == "Ti-6Al-4V" && origin.as_deref() == Some("doc:test"))
+        );
 
         // Substring → graph_search fallback.
         let nodes = local_graph_lookup(&db.path, "6Al", 10)
             .await
             .expect("substring match must be queryable");
-        assert!(nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
+        assert!(nodes.iter().any(|(n, _)| n.name == "Ti-6Al-4V"));
 
         // Unknown term → clean miss (handler renders an empty result set).
         assert!(

@@ -279,6 +279,18 @@ pub struct LocalProvenance {
     pub started_at: String,
     pub ended_at: String,
     pub locality: String,
+    /// Locator of the ORIGINAL source when this write relays someone else's
+    /// knowledge (a mesh peer forwarding what it read elsewhere). `None`
+    /// means "derive the independence key from `source_entity_id` as
+    /// always" — for a relay that conservatively collapses to
+    /// `mesh:unattributed`. When set on a relay, corroboration is keyed on
+    /// the origin (namespaced `mesh:…`, see [`origin_source_key_for`]), so
+    /// two peers relaying two genuinely different origin sources count as
+    /// two pieces of evidence instead of one.
+    ///
+    /// `#[serde(default)]` keeps previously serialized forms deserializable.
+    #[serde(default)]
+    pub origin_source_id: Option<String>,
 }
 
 /// A subject/predicate/object triple to reify as a PROV-O assertion
@@ -354,7 +366,8 @@ pub struct RecalledMaterialFact {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EvidenceContribution {
     /// Canonical independence key (`doi:…` / `url:…` / `file:…` /
-    /// `document:…` / `opaque:…` / `mesh:unattributed`).
+    /// `document:…` / `opaque:…`; relays are `mesh:<origin key>` when the
+    /// peer conveyed the origin, `mesh:unattributed` when it did not).
     pub source_key: String,
     /// The locator/display string exactly as this contribution supplied it.
     pub source_entity_id: String,
@@ -513,13 +526,15 @@ fn conditioned_assertion_id(
 /// only prevents repeat-ingest and relay double counting.
 ///
 /// `relay` marks a write that carries someone ELSE's knowledge — a mesh peer
-/// is an agent/relay, not an independent source. The current wire format
-/// cannot carry the origin's own key end-to-end, so every relayed
-/// contribution collapses onto the single conservative key
-/// `mesh:unattributed`: all relays of one assertion count ONCE, never once
-/// per peer. Undercounting genuinely different unknown sources is the
-/// accepted cost; letting N peers echo one fact into N "corroborations" is
-/// exactly the defect this key exists to prevent.
+/// is an agent/relay, not an independent source. A relayed contribution
+/// whose ORIGIN is unknown collapses onto the single conservative key
+/// `mesh:unattributed`: all unattributed relays of one assertion count
+/// ONCE, never once per peer. Undercounting genuinely different unknown
+/// sources is the accepted cost; letting N peers echo one fact into N
+/// "corroborations" is exactly the defect this key exists to prevent. A
+/// relay that DOES carry its origin is keyed on that origin instead — see
+/// [`origin_source_key_for`], which is where `LocalProvenance` writes
+/// derive their key.
 fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
     if relay {
         return "mesh:unattributed".to_string();
@@ -580,6 +595,40 @@ fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
 /// relay so a partially-filled provenance errs on the conservative side.
 fn is_relay(prov: &LocalProvenance) -> bool {
     prov.locality == "mesh" || prov.tenant == "mesh"
+}
+
+/// Independence key for one write, honouring an explicit origin when the
+/// provenance carries one ([`LocalProvenance::origin_source_id`]).
+///
+/// - **No explicit origin**: exactly the historical derivation from
+///   `source_entity_id` — locals normalize per [`origin_source_key`],
+///   relays collapse to `mesh:unattributed`.
+/// - **Local write with an explicit origin**: the writer read the source
+///   itself and is trusted; the key derives from the stated origin.
+/// - **Relay with an explicit origin**: the origin string is PEER-SUPPLIED
+///   input — the peer chooses it. It gets the same alias-collapsing
+///   normalization (so two peers naming one DOI two ways still count once),
+///   but the result is then namespaced under `mesh:` so an attacker-chosen
+///   origin can never equal a locally-derived key. Local derivation can
+///   never produce a `mesh:…` key either — a literal `mesh:…` locator falls
+///   through to the opaque branch and becomes `opaque:mesh:…` — so the two
+///   namespaces are disjoint by construction: a relay cannot claim `local`
+///   origin, and a local write cannot be mistaken for a relay. Even if a
+///   future bug wrote a relay under a non-mesh tenant (today `is_relay`
+///   implies tenant "mesh", whose assertion ids are tenant-separated
+///   anyway), its evidence key still could not collide with — or suppress,
+///   via the same-source dedupe — any local source's contribution.
+fn origin_source_key_for(prov: &LocalProvenance) -> String {
+    let origin = prov
+        .origin_source_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty());
+    match (origin, is_relay(prov)) {
+        (Some(origin), true) => format!("mesh:{}", origin_source_key(origin, false)),
+        (Some(origin), false) => origin_source_key(origin, false),
+        (None, relay) => origin_source_key(&prov.source_entity_id, relay),
+    }
 }
 
 /// The DOI when `source` is one, in normalized form: prefix stripped,
@@ -2084,7 +2133,7 @@ impl ProvenanceStore {
             conditions,
         )?;
         let conditions_json = serde_json::to_string(conditions)?;
-        let source_key = origin_source_key(&prov.source_entity_id, is_relay(prov));
+        let source_key = origin_source_key_for(prov);
 
         self.record_activity(prov).await?;
 
@@ -2287,6 +2336,37 @@ impl ProvenanceStore {
             nodes.push(row_to_node(&row, 0)?);
         }
         Ok(nodes)
+    }
+
+    /// The origin locator this store can honestly report for one entity:
+    /// the lexicographically smallest `source` among stored assertions that
+    /// mention the entity (as subject or object) under this tenant, or
+    /// `None` when no assertion mentions it.
+    ///
+    /// An entity extracted from several sources has several true origins;
+    /// one row of the peer-sync wire format carries exactly one, so the
+    /// smallest is chosen for determinism — it is always a REAL recorded
+    /// locator, never synthesized. `prov_assertion.source` is the immutable
+    /// FIRST attribution of each assertion, so a later corroborating source
+    /// cannot displace an assertion's original attribution here.
+    pub async fn entity_origin(&self, name: &str, tenant: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"SELECT source FROM prov_assertion
+                   WHERE tenant = ?1 AND (subject = ?2 OR object = ?3)
+                   ORDER BY source LIMIT 1"#,
+                [
+                    Value::Text(tenant.to_string()),
+                    Value::Text(name.to_string()),
+                    Value::Text(name.to_string()),
+                ],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(get_str(&row, 0)?)),
+            None => Ok(None),
+        }
     }
 
     /// Edges incident to the named entity (resolved via its canonical key or
@@ -2830,6 +2910,7 @@ mod tests {
             started_at: "2026-07-13T00:00:00Z".into(),
             ended_at: "2026-07-13T00:00:01Z".into(),
             locality: "local".into(),
+            origin_source_id: None,
         }
     }
 
@@ -3824,6 +3905,205 @@ mod tests {
         );
     }
 
+    /// The capability [`LocalProvenance::origin_source_id`] exists for: two
+    /// peers relaying two genuinely DIFFERENT origin sources are two pieces
+    /// of evidence, so the mesh tenant can accumulate convergence instead
+    /// of silently dropping the second peer's contribution.
+    #[tokio::test]
+    async fn mesh_relays_of_two_different_origins_corroborate() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for (peer, activity, origin) in [
+            ("http://peer-one.example/api#ds", "act_m1", "doi:10.1234/x"),
+            ("http://peer-two.example/api#ds", "act_m2", "doi:10.1234/y"),
+        ] {
+            let mut prov = prov_from(peer, activity);
+            prov.tenant = "mesh".into();
+            prov.locality = "mesh".into();
+            prov.origin_source_id = Some(origin.into());
+            store.record_assertion(&a, &prov).await.unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2,
+            "two different relayed origins must be two evidence rows"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion_evidence WHERE \
+                 source_key IN ('mesh:doi:10.1234/x', 'mesh:doi:10.1234/y')",
+            )
+            .await,
+            2,
+            "relayed origins must be keyed inside the mesh: namespace"
+        );
+        let facts = store.recall("alpha-beta", "mesh", 10).await.unwrap();
+        assert_eq!(facts.len(), 1, "one assertion row carries both origins");
+        assert!(
+            (facts[0].confidence - 0.96).abs() < 1e-9,
+            "two independent 0.8 origins must noisy-OR to 0.96, got {}",
+            facts[0].confidence
+        );
+    }
+
+    /// Two peers relaying THE SAME origin — spelled two alias ways — are
+    /// one observation: the relayed origin goes through the same
+    /// alias-collapsing normalization as a local locator, so echoing a
+    /// source cannot mint phantom corroboration.
+    #[tokio::test]
+    async fn mesh_relays_of_one_origin_count_once() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for (peer, activity, origin) in [
+            (
+                "http://peer-one.example/api#ds",
+                "act_m1",
+                "doi:10.1234/AbC",
+            ),
+            (
+                "http://peer-two.example/api#ds",
+                "act_m2",
+                " https://doi.org/10.1234/abc ",
+            ),
+        ] {
+            let mut prov = prov_from(peer, activity);
+            prov.tenant = "mesh".into();
+            prov.locality = "mesh".into();
+            prov.origin_source_id = Some(origin.into());
+            store.record_assertion(&a, &prov).await.unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "two spellings of one origin must stay one evidence row"
+        );
+        assert_eq!(
+            query_str(&store, "SELECT source_key FROM prov_assertion_evidence").await,
+            "mesh:doi:10.1234/abc"
+        );
+        let facts = store.recall("alpha-beta", "mesh", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "one origin echoed by two peers inflated confidence to {}",
+            facts[0].confidence
+        );
+    }
+
+    /// A peer-supplied origin is attacker-chosen input. Claiming the exact
+    /// locator of a locally-ingested source must not corroborate — or even
+    /// touch — the local tenant's fact: the tenant-keyed assertion id lands
+    /// the relay on the mesh tenant's own row, and the relayed key lives in
+    /// the disjoint `mesh:` namespace, so it cannot equal (or dedupe
+    /// against) the local contribution's key either.
+    #[tokio::test]
+    async fn a_peer_supplied_origin_cannot_corroborate_a_local_fact() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        // The user ingests a paper locally.
+        let mut local = prov_from("/data/papers/x.pdf", "act_local");
+        local.tenant = "local".into();
+        store.record_assertion(&a, &local).await.unwrap();
+
+        // A peer claims ITS copy of the fact came from that very file.
+        let mut mesh = prov_from("http://peer-one.example/api#ds", "act_mesh");
+        mesh.tenant = "mesh".into();
+        mesh.locality = "mesh".into();
+        mesh.origin_source_id = Some("/data/papers/x.pdf".into());
+        store.record_assertion(&a, &mesh).await.unwrap();
+
+        // The local fact is untouched: its own confidence, its own single
+        // evidence contribution under the un-namespaced local key.
+        let facts = store.recall("alpha-beta", "local", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "a relayed claim of the local locator inflated the LOCAL fact to {}",
+            facts[0].confidence
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion_evidence \
+                 WHERE source_key = 'file:/data/papers/x.pdf'",
+            )
+            .await,
+            1,
+            "only the local ingest may own the un-namespaced key"
+        );
+        assert_eq!(
+            query_str(
+                &store,
+                "SELECT source_key FROM prov_assertion_evidence \
+                 WHERE activity_id = 'act_mesh'",
+            )
+            .await,
+            "mesh:file:/data/papers/x.pdf",
+            "the relay's claim must stay inside the mesh: namespace"
+        );
+    }
+
+    /// Key derivation honours an explicit origin, and the relayed
+    /// namespace is disjoint from every locally-derivable one.
+    #[test]
+    fn origin_source_key_for_honours_and_namespaces_the_origin() {
+        let mut prov = test_prov(); // tenant "t1", locality "local"
+        prov.source_entity_id = "/data/x.pdf".into();
+
+        // No origin: exactly the historical locator derivation.
+        assert_eq!(origin_source_key_for(&prov), "file:/data/x.pdf");
+
+        // A local writer stating the origin it read is trusted directly.
+        prov.origin_source_id = Some("doi:10.1234/AbC".into());
+        assert_eq!(origin_source_key_for(&prov), "doi:10.1234/abc");
+
+        // A relay's origin is normalized, then namespaced under mesh:.
+        prov.locality = "mesh".into();
+        assert_eq!(origin_source_key_for(&prov), "mesh:doi:10.1234/abc");
+
+        // A blank or absent origin is NO origin — conservative collapse.
+        prov.origin_source_id = Some("   ".into());
+        assert_eq!(origin_source_key_for(&prov), "mesh:unattributed");
+        prov.origin_source_id = None;
+        assert_eq!(origin_source_key_for(&prov), "mesh:unattributed");
+
+        // No local derivation can mint a mesh: key — a literal mesh:…
+        // locator lands in the opaque namespace — so a relay cannot claim
+        // local origin and a local write cannot pose as a relay's.
+        assert_eq!(
+            origin_source_key("mesh:unattributed", false),
+            "opaque:mesh:unattributed"
+        );
+        assert_eq!(
+            origin_source_key("mesh:doi:10.1234/x", false),
+            "opaque:mesh:doi:10.1234/x"
+        );
+    }
+
     /// Two concurrent writers, same assertion, same source: both succeed,
     /// one evidence row, confidence unchanged — no key conflict escapes and
     /// no phantom corroboration happens.
@@ -4370,6 +4650,7 @@ mod tests {
                 started_at: "2026-01-01T00:00:00Z".into(),
                 ended_at: "2026-01-01T00:00:00Z".into(),
                 locality: tenant.into(),
+                origin_source_id: None,
             };
             store.record_assertion(&assertion, &prov).await.unwrap();
         }
@@ -4456,6 +4737,7 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".into(),
             ended_at: "2026-01-01T00:00:00Z".into(),
             locality: "local".into(),
+            origin_source_id: None,
         };
         store
             .record_assertion(
