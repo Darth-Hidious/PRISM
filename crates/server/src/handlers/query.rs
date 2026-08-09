@@ -270,13 +270,60 @@ fn graph_nodes_to_results(
             serde_json::json!({
                 "type": n.entity_type,
                 "name": n.name,
-                "properties": match origin {
+                "properties": match origin.as_deref().map(redact_filesystem_origin) {
                     Some(origin) => serde_json::json!({ "origin_source": origin }),
                     None => serde_json::json!({}),
                 },
             })
         })
         .collect()
+}
+
+/// Prefix marking an origin that was a local filesystem path, replaced by a
+/// digest before it left this node.
+const HASHED_FILE_ORIGIN: &str = "file-sha256:";
+
+/// Replace a filesystem-path origin with a stable digest before serving it.
+///
+/// Origins exist so a subscribing peer can tell two genuinely different
+/// sources apart. A DOI or URL is a public identifier and travels as itself.
+/// A file path is not: serving `/Users/<name>/Documents/private-report.pdf`
+/// tells every subscriber this node's directory layout, the owner's account
+/// name, and what they keep — none of which corroboration needs.
+///
+/// A digest keeps the only property that matters. The receiving side never
+/// interprets the locator; it normalises it into an opaque evidence key and
+/// compares keys for equality. So two peers that ingested the SAME path still
+/// agree (same digest, one evidence row) and two peers with different paths
+/// still differ — identical behaviour to serving the path, minus the
+/// disclosure. What is lost is only cross-peer convergence when two machines
+/// hold the same document at DIFFERENT paths, which the raw path would not
+/// have merged either. Real cross-peer convergence comes from DOI/URL origins.
+///
+/// Errs toward hashing: `file://…`, absolute paths, and Windows drive paths
+/// all qualify. Over-hashing costs a little convergence; under-hashing leaks.
+fn redact_filesystem_origin(origin: &str) -> String {
+    let trimmed = origin.trim();
+    let is_path = trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("file://")
+        || trimmed
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && trimmed[1..].starts_with(":\\");
+    if !is_path {
+        return trimmed.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{HASHED_FILE_ORIGIN}{digest}")
 }
 
 /// Map local Turso semantic hits into the same JSON shape the retired
@@ -582,6 +629,96 @@ mod tests {
             .await
             .expect("a never-created store is an empty index, not a broken one");
         assert!(hits.is_empty());
+    }
+
+    /// A filesystem origin must never leave this node in the clear.
+    ///
+    /// Serving `/Users/<name>/Documents/report.pdf` tells every subscriber the
+    /// owner's account name, directory layout, and what they keep. None of
+    /// that is needed to decide whether two sources differ.
+    #[test]
+    fn filesystem_origins_are_hashed_before_they_leave_the_node() {
+        for path in [
+            "/Users/someone/Documents/private-report.pdf",
+            "file:///Users/someone/Documents/private-report.pdf",
+            "FILE:///Users/someone/x.pdf",
+            "~/Documents/x.pdf",
+            "C:\\Users\\someone\\x.pdf",
+        ] {
+            let served = redact_filesystem_origin(path);
+            assert!(
+                served.starts_with(HASHED_FILE_ORIGIN),
+                "{path} was served unhashed as {served}",
+            );
+            assert!(
+                !served.contains("someone") && !served.contains("Documents"),
+                "{path} leaked path content: {served}",
+            );
+        }
+    }
+
+    /// The redaction must be wired into what is actually SERVED, not merely
+    /// available as a helper.
+    ///
+    /// Its sibling above tests `redact_filesystem_origin` directly, so it
+    /// passes even if `graph_nodes_to_results` stops calling it — which is the
+    /// only mistake that would leak. Found by mutation: bypassing the call at
+    /// the serving site left every unit test green.
+    #[test]
+    fn the_served_payload_never_contains_a_raw_path() {
+        let node = prism_provenance::GraphNode {
+            name: "Ti-6Al-4V".into(),
+            entity_type: "Matter".into(),
+            label: "Matter".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+        };
+        let served = graph_nodes_to_results(&[(
+            node,
+            Some("/Users/someone/Documents/private-report.pdf".into()),
+        )]);
+        let json = serde_json::to_string(&served).expect("serialisable");
+        assert!(
+            !json.contains("someone") && !json.contains("Documents"),
+            "the served payload leaked a local path: {json}",
+        );
+        assert!(
+            json.contains(HASHED_FILE_ORIGIN),
+            "the served payload dropped the origin entirely instead of hashing it: {json}",
+        );
+    }
+
+    /// Public identifiers travel as themselves — hashing them would destroy
+    /// the cross-peer convergence origins exist to enable.
+    #[test]
+    fn public_identifiers_are_served_verbatim() {
+        for id in [
+            "doi:10.1234/abc",
+            "https://example.org/paper",
+            "document:6f1e2d3c",
+            "doc:test_paper",
+        ] {
+            assert_eq!(redact_filesystem_origin(id), id);
+        }
+    }
+
+    /// The property that makes hashing SAFE rather than merely private: the
+    /// receiver never interprets a locator, it compares keys for equality. So
+    /// the digest must preserve same/different exactly as the raw path did —
+    /// two peers holding one path still corroborate once, two peers holding
+    /// different paths still count twice.
+    #[test]
+    fn hashing_preserves_whether_two_origins_are_the_same_source() {
+        let a = redact_filesystem_origin("/data/papers/alloy.pdf");
+        let same = redact_filesystem_origin("/data/papers/alloy.pdf");
+        let other = redact_filesystem_origin("/data/papers/steel.pdf");
+        assert_eq!(
+            a, same,
+            "one path must yield one key, or peers double-count"
+        );
+        assert_ne!(
+            a, other,
+            "two paths must stay distinct, or one peer's evidence is dropped",
+        );
     }
 
     #[tokio::test]
