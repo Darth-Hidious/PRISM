@@ -58,14 +58,14 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.143"
 serde_yaml = "0.9"
 serde_yml = "0.0.12"
+# RDF: the OWL loader parses the vendored EMMO artifact, ontology induction
+# emits and re-parses generated TTL. Dual-licensed "Apache-2.0 / CECILL-B" —
+# the Apache-2.0 leg applies. Pulls mownstr (CECILL-B) and resiter (MPL-2.0,
+# file-level copyleft); both belong on the licence inventory before a v1 tag.
 sophia = "0.10"
 toml = "0.8"
 toml_edit = { version = "0.25", features = ["serde"] }
 url = { version = "2.5.8", features = ["serde"] }
-
-# RDF (ontology-induction TTL artifacts: emit + parse). Dual-licensed
-# "Apache-2.0 / CECILL-B" — the Apache-2.0 leg applies here.
-sophia = "0.10"
 
 # Document parsing (retrieval engine: Atom/JATS XML, PDF text)
 quick-xml = "0.41"
