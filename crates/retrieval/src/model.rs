@@ -95,14 +95,36 @@ impl Paper {
     }
 }
 
+/// One fetched page with completeness accounting.
+///
+/// `raw_count` is how many records the SERVER returned on this page, before
+/// any parser skip (title-less entries, missing DOI, missing `bibjson`).
+/// Pagination termination must gate on `raw_count`, never on `papers.len()`:
+/// one skipped record on a full page otherwise ends the chain while the
+/// source is reported `ok`. `available` is the server's own total for the
+/// whole query when it reports one — `None` means the source did not say,
+/// never a guess.
+#[derive(Debug, Clone, Default)]
+pub struct SourcePage {
+    pub papers: Vec<Paper>,
+    pub raw_count: usize,
+    pub available: Option<u64>,
+}
+
 /// Honest per-source outcome. A source that failed says so; it is never
 /// silently dropped from the outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceStatus {
     pub source: String,
-    /// "ok", "cache", "timeout", "error".
+    /// "ok", "timeout", "error". ("cache" was documented here but nothing
+    /// ever produced it — cache service is reported via `cache_hit`.)
     pub status: String,
     pub count: usize,
+    /// Server-reported total matches for the query, when the source reports
+    /// one. `count < available` means the caller got LESS than what exists —
+    /// visible here instead of silently absorbed into an `ok`.
+    #[serde(default)]
+    pub available: Option<u64>,
     pub latency_ms: f64,
     pub cache_hit: bool,
     pub error: Option<String>,

@@ -8,26 +8,28 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, url_encode};
-use crate::model::{FulltextFormat, Paper};
+use crate::model::{FulltextFormat, Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 
 pub const ID: &str = "preprints_europepmc";
 pub const INITIAL_CURSOR: &str = "";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
 /// One page. Cursor is Europe PMC's `cursorMark` (empty means start with
 /// `*`); the server returns the successor mark, so the chain is replayable
-/// from cache after an interruption.
+/// from cache after an interruption. Continuation gates on the RAW result
+/// count: a page whose every record was skipped by the parser must not end
+/// the chain while the server still advances the mark.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
+) -> Result<(SourcePage, Option<String>)> {
     let mark = if cursor.is_empty() { "*" } else { cursor };
     let base = ctx.base(ID, DEFAULT_BASE);
     let scoped = format!("({query}) AND SRC:PPR");
@@ -39,34 +41,39 @@ pub async fn fetch_page(
     );
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let root: Value = serde_json::from_slice(&body)?;
-    let papers = parse_items(&root);
+    let page = page_from_root(&root);
     let next_mark = root
         .get("nextCursorMark")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .filter(|m2| !papers.is_empty() && m2 != mark);
-    Ok((papers, next_mark))
+        .filter(|m2| page.raw_count > 0 && m2 != mark);
+    Ok((page, next_mark))
 }
 
-/// Pure parser over the Europe PMC search response.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+/// Pure parser over the Europe PMC search response. `available` is the
+/// response's `hitCount`; `raw_count` is every result served, parsed or not.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let root: Value = serde_json::from_slice(body)?;
-    Ok(parse_items(&root))
+    Ok(page_from_root(&root))
 }
 
-fn parse_items(root: &Value) -> Vec<Paper> {
-    let mut papers = Vec::new();
+fn page_from_root(root: &Value) -> SourcePage {
     let results = root
         .pointer("/resultList/result")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let mut papers = Vec::new();
     for item in &results {
         if let Some(paper) = parse_item(item) {
             papers.push(paper);
         }
     }
-    papers
+    SourcePage {
+        papers,
+        raw_count: results.len(),
+        available: root.get("hitCount").and_then(|v| v.as_u64()),
+    }
 }
 
 fn parse_item(item: &Value) -> Option<Paper> {
@@ -193,8 +200,11 @@ mod tests {
 
     #[test]
     fn parses_preprint_records() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 1);
+        assert_eq!(page.raw_count, 1);
+        assert_eq!(page.available, Some(1), "hitCount must be kept");
         let p = &papers[0];
         assert_eq!(p.source_id, "PPR123456");
         assert_eq!(p.doi.as_deref(), Some("10.26434/chemrxiv-2024-abc"));

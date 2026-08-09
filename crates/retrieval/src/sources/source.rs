@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::model::Paper;
+use crate::model::SourcePage;
 
 use super::FetchCtx;
 use super::{arxiv, chemrxiv, crossref, doaj, europepmc, openalex, pubmed, semantic_scholar};
@@ -42,17 +42,21 @@ pub trait Source: Send + Sync {
     fn min_interval(&self) -> Duration;
     /// Where paging starts for this source.
     fn initial_cursor(&self) -> &'static str;
-    /// Fetch the first page for `query`. An empty `Vec` means the source had
+    /// Fetch the first page for `query`. An empty page means the source had
     /// nothing; use `Err` to report failure (they are reported differently).
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>>;
+    /// The page carries completeness accounting (`raw_count`, `available`) so
+    /// a caller can tell "got everything" from "got less than exists".
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage>;
     /// Fetch one page identified by a source-specific cursor. Returns the
-    /// papers and the successor cursor, when the source says there may be more.
+    /// page and the successor cursor, when the source says there may be more.
+    /// The successor decision must derive from the RAW record count the
+    /// server returned, never from how many records survived parsing.
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)>;
+    ) -> Result<(SourcePage, Option<String>)>;
 }
 
 /// Ordered registry of adapters. Iteration order is registration order, which
@@ -170,7 +174,7 @@ impl Source for Arxiv {
     fn initial_cursor(&self) -> &'static str {
         arxiv::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         arxiv::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -178,7 +182,7 @@ impl Source for Arxiv {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         arxiv::fetch_page(ctx, query, cursor).await
     }
 }
@@ -194,7 +198,7 @@ impl Source for Openalex {
     fn initial_cursor(&self) -> &'static str {
         openalex::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         openalex::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -202,7 +206,7 @@ impl Source for Openalex {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         openalex::fetch_page(ctx, query, cursor).await
     }
 }
@@ -218,7 +222,7 @@ impl Source for Crossref {
     fn initial_cursor(&self) -> &'static str {
         crossref::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         crossref::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -226,7 +230,7 @@ impl Source for Crossref {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         crossref::fetch_page(ctx, query, cursor).await
     }
 }
@@ -242,7 +246,7 @@ impl Source for Pubmed {
     fn initial_cursor(&self) -> &'static str {
         pubmed::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         pubmed::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -250,7 +254,7 @@ impl Source for Pubmed {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         pubmed::fetch_page(ctx, query, cursor).await
     }
 }
@@ -266,7 +270,7 @@ impl Source for SemanticScholar {
     fn initial_cursor(&self) -> &'static str {
         semantic_scholar::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         semantic_scholar::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -274,7 +278,7 @@ impl Source for SemanticScholar {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         semantic_scholar::fetch_page(ctx, query, cursor).await
     }
 }
@@ -290,7 +294,7 @@ impl Source for Preprints {
     fn initial_cursor(&self) -> &'static str {
         europepmc::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         europepmc::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -298,7 +302,7 @@ impl Source for Preprints {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         europepmc::fetch_page(ctx, query, cursor).await
     }
 }
@@ -314,7 +318,7 @@ impl Source for Chemrxiv {
     fn initial_cursor(&self) -> &'static str {
         chemrxiv::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         chemrxiv::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -322,7 +326,7 @@ impl Source for Chemrxiv {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         chemrxiv::fetch_page(ctx, query, cursor).await
     }
 }
@@ -338,7 +342,7 @@ impl Source for Doaj {
     fn initial_cursor(&self) -> &'static str {
         doaj::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
         doaj::fetch(ctx, query).await
     }
     async fn fetch_page(
@@ -346,7 +350,7 @@ impl Source for Doaj {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(Vec<Paper>, Option<String>)> {
+    ) -> Result<(SourcePage, Option<String>)> {
         doaj::fetch_page(ctx, query, cursor).await
     }
 }
@@ -507,15 +511,15 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<Vec<Paper>> {
-            Ok(Vec::new())
+        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<SourcePage> {
+            Ok(SourcePage::default())
         }
         async fn fetch_page(
             &self,
             ctx: &FetchCtx,
             query: &str,
             _: &str,
-        ) -> Result<(Vec<Paper>, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>)> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }
@@ -532,15 +536,15 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<Vec<Paper>> {
-            Ok(Vec::new())
+        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<SourcePage> {
+            Ok(SourcePage::default())
         }
         async fn fetch_page(
             &self,
             ctx: &FetchCtx,
             query: &str,
             _: &str,
-        ) -> Result<(Vec<Paper>, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>)> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }

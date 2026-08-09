@@ -14,11 +14,22 @@ from app.tools.search_engine.providers.base import Provider
 from app.tools.search_engine.providers.registry import ProviderRegistry
 from app.tools.search_engine.query import MaterialSearchQuery
 from app.tools.search_engine.resilience.circuit_breaker import HealthManager
-from app.tools.search_engine.result import Material, ProviderQueryLog, SearchResult
+from app.tools.search_engine.result import (
+    Material,
+    ProviderPage,
+    ProviderQueryLog,
+    SearchResult,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path.home() / ".prism" / "cache"
+
+# A PARTIAL result (any consulted provider failed, timed out, sat behind an
+# open circuit, was offline-blocked, or returned truncated data) is cached
+# for minutes, not the full day: one network blip must not pin a 3-of-42
+# answer under the 24h TTL.
+PARTIAL_RESULT_TTL_SECONDS = 300.0
 
 
 def _safe_describe(provider: Provider, query: MaterialSearchQuery) -> str:
@@ -215,9 +226,34 @@ class SearchEngine:
             self._global_timeout = original_timeout
             return cached
 
-        # 2. Select capable providers with healthy circuits
+        # 2. Select capable providers with healthy circuits. A provider
+        # skipped because its breaker is open is LOGGED, not silently
+        # dropped: without the entry the summary's circuit_open count was
+        # structurally always 0 and the caller could not tell "queried 12 of
+        # 12" from "queried 12 of 42".
         capable = self._registry.get_capable(query)
-        providers = [p for p in capable if self._health.get(p.id).should_query()]
+        providers: list[Provider] = []
+        breaker_logs: list[ProviderQueryLog] = []
+        for p in capable:
+            if self._health.get(p.id).should_query():
+                providers.append(p)
+                continue
+            now = time.time()
+            logger.info(
+                "provider '%s' skipped: circuit breaker open", p.id
+            )
+            breaker_logs.append(ProviderQueryLog(
+                provider_id=p.id,
+                provider_name=p.name,
+                endpoint_url=self._get_endpoint_url(p),
+                query_description=_safe_describe(p, query),
+                started_at=now,
+                completed_at=now,
+                latency_ms=0,
+                status="circuit_open",
+                pages_fetched=0,
+                error_message="circuit breaker open — provider not queried",
+            ))
 
         if not providers:
             self._global_timeout = original_timeout
@@ -225,8 +261,9 @@ class SearchEngine:
                 materials=[],
                 total_count=0,
                 query=query,
-                query_log=[],
+                query_log=breaker_logs,
                 warnings=["No providers available for this query"],
+                complete=False if breaker_logs else True,
                 search_time_ms=(time.time() - start) * 1000,
             )
 
@@ -253,6 +290,7 @@ class SearchEngine:
                     completed_at=time.time(),
                     latency_ms=0,
                     status="skipped",
+                    pages_fetched=0,
                     error_message="Early termination — enough results from fast providers",
                 )
             async with semaphore:
@@ -311,9 +349,10 @@ class SearchEngine:
 
         provider_results = dict(zip(tasks.keys(), results))
 
-        # 4. Collect results + build audit trail
+        # 4. Collect results + build audit trail. Breaker-skipped providers
+        # are part of the trail: they were candidates that went unqueried.
         all_materials: list[Material] = []
-        query_log: list[ProviderQueryLog] = []
+        query_log: list[ProviderQueryLog] = list(breaker_logs)
         # `warnings` may already carry the whole-fan-out deadline notice set above.
         for pid, result in provider_results.items():
             provider = next(p for p in providers if p.id == pid)
@@ -345,12 +384,22 @@ class SearchEngine:
                     # start (above), so latency here is per-provider, not the old
                     # cumulative search-wide `start`.
                     self._health.get(pid).record_failure()
-                    status = (
-                        "timeout"
-                        if isinstance(result, asyncio.CancelledError)
-                        or isinstance(result, asyncio.TimeoutError)
-                        else "http_error"
-                    )
+                    if isinstance(
+                        result, (asyncio.CancelledError, asyncio.TimeoutError)
+                    ):
+                        status = "timeout"
+                    elif isinstance(result, ValueError):
+                        # json.JSONDecodeError and pydantic ValidationError
+                        # are ValueErrors: the transport worked, the BODY was
+                        # unusable. That is a parse failure, not an HTTP one.
+                        status = "parse_error"
+                    else:
+                        status = "http_error"
+                # The REAL wire status when the failure carries one
+                # (httpx.HTTPStatusError has .response). The old code wrote a
+                # literal 200 on success and nothing on failure, so the field
+                # was null exactly when a real status existed.
+                failed_response = getattr(result, "response", None)
                 log = ProviderQueryLog(
                     provider_id=pid,
                     provider_name=provider.name,
@@ -364,8 +413,13 @@ class SearchEngine:
                     completed_at=time.time(),
                     latency_ms=(time.time() - start) * 1000,
                     status=status,
+                    http_status_code=getattr(failed_response, "status_code", None),
+                    pages_fetched=0,
                     error_type=type(result).__name__,
                     error_message=_sanitize_error(str(result)),
+                    # Verbatim (bounded) for diagnosis; error_message is the
+                    # sanitized one-liner.
+                    error_raw=str(result)[:2000] or None,
                 )
                 query_log.append(log)
                 warnings.append(f"Provider '{pid}' failed: {type(result).__name__}")
@@ -396,13 +450,23 @@ class SearchEngine:
         # 6. Apply limit
         fused = fused[: query.limit]
 
-        # 7. Build result
+        # 7. Build result. PARTIAL IS A THIRD STATE: the result is complete
+        # only when every consulted provider either answered in full or was
+        # deliberately skipped for sufficiency ("skipped" = early
+        # termination after enough results). Failures, timeouts, open
+        # circuits, offline refusals and truncated pages all mean the answer
+        # may be less than what the federation holds.
+        complete = all(
+            log.status in ("success", "skipped") and not log.truncated
+            for log in query_log
+        )
         search_result = SearchResult(
             materials=fused,
             total_count=len(fused),
             query=query,
             query_log=query_log,
             warnings=warnings,
+            complete=complete,
             coverage=coverage,
             search_time_ms=(time.time() - start) * 1000,
         )
@@ -424,9 +488,15 @@ class SearchEngine:
         #
         # A genuinely empty answer IS cached — a provider that replied "no
         # matches" is real knowledge. What is not cached is an answer nobody
-        # gave.
+        # gave. And a PARTIAL answer (some providers answered, some did not)
+        # is cached only briefly: pinning a 3-of-42 result for 24h because
+        # of one network blip is the same lie on a timer.
         if any(log.status == "success" for log in query_log):
-            self._cache.put(query, search_result)
+            self._cache.put(
+                query,
+                search_result,
+                ttl=None if complete else PARTIAL_RESULT_TTL_SECONDS,
+            )
         self._health.save()
 
         # S5: restore the default deadline (the override was per-call only).
@@ -467,12 +537,23 @@ class SearchEngine:
                 timeout = ep.behavior.timeout_ms / 1000
 
         try:
-            materials = await asyncio.wait_for(
+            outcome = await asyncio.wait_for(
                 provider.search(query),
                 timeout=timeout,
             )
             latency = (time.time() - start) * 1000
             self._health.get(provider.id).record_success(latency)
+
+            # Providers that account for their own completeness return a
+            # ProviderPage; a bare list keeps the single-page defaults. The
+            # HTTP status is recorded only when the provider REPORTED one —
+            # never the old fabricated literal 200.
+            if isinstance(outcome, ProviderPage):
+                materials = outcome.materials
+                page_meta = outcome
+            else:
+                materials = outcome
+                page_meta = ProviderPage(materials=materials, http_status_code=None)
 
             log = ProviderQueryLog(
                 provider_id=provider.id,
@@ -483,8 +564,12 @@ class SearchEngine:
                 completed_at=time.time(),
                 latency_ms=latency,
                 status="success",
-                http_status_code=200,
+                http_status_code=page_meta.http_status_code,
                 result_count=len(materials),
+                pages_fetched=page_meta.pages_fetched,
+                truncated=page_meta.truncated,
+                available=page_meta.available,
+                error_message=page_meta.note,
             )
             return materials, log
 
@@ -507,6 +592,7 @@ class SearchEngine:
                 completed_at=time.time(),
                 latency_ms=(time.time() - start) * 1000,
                 status="timeout",
+                pages_fetched=0,
                 error_type="TimeoutError",
                 error_message=f"Timed out after {timeout}s",
             )

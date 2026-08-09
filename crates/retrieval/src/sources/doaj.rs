@@ -5,52 +5,59 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, strip_markup, url_encode};
-use crate::model::{FulltextFormat, Paper};
+use crate::model::{FulltextFormat, Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://doaj.org/api/search/articles";
 
 pub const ID: &str = "doaj";
 pub const INITIAL_CURSOR: &str = "1";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
-/// One page. Cursor is the 1-based `page` number.
+/// One page. Cursor is the 1-based `page` number. The continuation gate uses
+/// the RAW result count: a skipped record (missing `bibjson`) must not end
+/// the chain.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
-    let page: usize = cursor.parse().unwrap_or(1);
+) -> Result<(SourcePage, Option<String>)> {
+    let page_no: usize = cursor.parse().unwrap_or(1);
     let page_size = ctx.limit.min(100);
     let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
-        "{base}/{q}?pageSize={page_size}&page={page}",
+        "{base}/{q}?pageSize={page_size}&page={page_no}",
         q = url_encode(query)
     );
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
-    let papers = parse(&body)?;
-    let next = (papers.len() >= page_size).then(|| (page + 1).to_string());
-    Ok((papers, next))
+    let page = parse(&body)?;
+    let next = (page.raw_count >= page_size).then(|| (page_no + 1).to_string());
+    Ok((page, next))
 }
 
-/// Pure parser over the DOAJ search response.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+/// Pure parser over the DOAJ search response. `available` is the response's
+/// `total`; `raw_count` is every result served, parsed or not.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let root: Value = serde_json::from_slice(body)?;
-    let mut papers = Vec::new();
-    for entry in root
+    let results = root
         .get("results")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default()
-    {
-        if let Some(paper) = parse_entry(&entry) {
+        .unwrap_or_default();
+    let mut papers = Vec::new();
+    for entry in &results {
+        if let Some(paper) = parse_entry(entry) {
             papers.push(paper);
         }
     }
-    Ok(papers)
+    Ok(SourcePage {
+        papers,
+        raw_count: results.len(),
+        available: root.get("total").and_then(|v| v.as_u64()),
+    })
 }
 
 fn parse_entry(entry: &Value) -> Option<Paper> {
@@ -180,8 +187,11 @@ mod tests {
 
     #[test]
     fn parses_doaj_records() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 1);
+        assert_eq!(page.raw_count, 1);
+        assert_eq!(page.available, Some(1), "the DOAJ total must be kept");
         let p = &papers[0];
         assert_eq!(p.doi.as_deref(), Some("10.3390/ma140000"));
         assert_eq!(p.year, Some(2021));

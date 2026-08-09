@@ -5,25 +5,27 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{FetchCtx, normalize_doi, strip_markup, url_encode};
-use crate::model::{FulltextFormat, Paper};
+use crate::model::{FulltextFormat, Paper, SourcePage};
 
 const DEFAULT_BASE: &str = "https://api.crossref.org";
 
 pub const ID: &str = "crossref";
 pub const INITIAL_CURSOR: &str = "0";
 
-pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    let (papers, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
-    Ok(papers)
+pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+    let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
+    Ok(page)
 }
 
 /// One page. Cursor is the Crossref `offset`. Crossref refuses offsets past
-/// 10 000; callers (sweeps) cap page counts accordingly.
+/// 10 000; callers (sweeps) cap page counts accordingly. The continuation
+/// gate uses the RAW item count: a skipped record (no DOI) must not end the
+/// chain.
 pub async fn fetch_page(
     ctx: &FetchCtx,
     query: &str,
     cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
+) -> Result<(SourcePage, Option<String>)> {
     let offset: usize = cursor.parse().unwrap_or(0);
     let rows = ctx.limit.min(100);
     let base = ctx.base(ID, DEFAULT_BASE);
@@ -35,14 +37,15 @@ pub async fn fetch_page(
         url.push_str(&format!("&mailto={}", url_encode(mailto)));
     }
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
-    let papers = parse(&body)?;
+    let page = parse(&body)?;
     let next =
-        (papers.len() >= rows && offset + rows <= 10_000).then(|| (offset + rows).to_string());
-    Ok((papers, next))
+        (page.raw_count >= rows && offset + rows <= 10_000).then(|| (offset + rows).to_string());
+    Ok((page, next))
 }
 
-/// Pure parser over the Crossref `/works` response.
-pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
+/// Pure parser over the Crossref `/works` response. `available` is
+/// `message.total-results`; `raw_count` is every item served, parsed or not.
+pub fn parse(body: &[u8]) -> Result<SourcePage> {
     let root: Value = serde_json::from_slice(body)?;
     let items = root
         .pointer("/message/items")
@@ -55,7 +58,13 @@ pub fn parse(body: &[u8]) -> Result<Vec<Paper>> {
             papers.push(paper);
         }
     }
-    Ok(papers)
+    Ok(SourcePage {
+        papers,
+        raw_count: items.len(),
+        available: root
+            .pointer("/message/total-results")
+            .and_then(|v| v.as_u64()),
+    })
 }
 
 fn parse_item(item: &Value) -> Option<Paper> {
@@ -153,6 +162,7 @@ mod tests {
     const FIXTURE: &str = r#"{
       "status": "ok",
       "message": {
+        "total-results": 1289,
         "items": [
           {
             "DOI": "10.1016/j.actamat.2022.118000",
@@ -177,8 +187,13 @@ mod tests {
 
     #[test]
     fn parses_items_strips_jats_and_picks_pdf_link() {
-        let papers = parse(FIXTURE.as_bytes()).unwrap();
+        let page = parse(FIXTURE.as_bytes()).unwrap();
+        let papers = &page.papers;
         assert_eq!(papers.len(), 1);
+        // The DOI-less record is skipped from `papers` but counted as raw;
+        // the server total survives instead of being discarded.
+        assert_eq!(page.raw_count, 2);
+        assert_eq!(page.available, Some(1289));
         let p = &papers[0];
         assert_eq!(p.doi.as_deref(), Some("10.1016/j.actamat.2022.118000"));
         assert_eq!(p.title, "Deformation in refractory alloys");

@@ -240,9 +240,9 @@ impl RetrievalEngine {
             let latency_ms = elapsed.as_secs_f64() * 1000.0;
             let source_id = source.id();
             match result {
-                Ok(Ok(found)) => {
-                    let count = found.len();
-                    for paper in found {
+                Ok(Ok(page)) => {
+                    let count = page.papers.len();
+                    for paper in page.papers {
                         let key = paper.dedup_key();
                         match seen.get(&key) {
                             Some(idx) => {
@@ -259,6 +259,9 @@ impl RetrievalEngine {
                         source: source_id.to_string(),
                         status: "ok".to_string(),
                         count,
+                        // The server's own total: `count < available` says
+                        // this ok is a SLICE of what exists, not all of it.
+                        available: page.available,
                         latency_ms,
                         cache_hit: ctx
                             .cache_hits
@@ -274,6 +277,7 @@ impl RetrievalEngine {
                     source: source_id.to_string(),
                     status: "error".to_string(),
                     count: 0,
+                    available: None,
                     latency_ms,
                     cache_hit: false,
                     error: Some(format!("{e:#}")),
@@ -282,6 +286,7 @@ impl RetrievalEngine {
                     source: source_id.to_string(),
                     status: "timeout".to_string(),
                     count: 0,
+                    available: None,
                     latency_ms,
                     cache_hit: false,
                     error: Some(format!(
@@ -299,6 +304,7 @@ impl RetrievalEngine {
                 source: id.clone(),
                 status: "error".to_string(),
                 count: 0,
+                available: None,
                 latency_ms: 0.0,
                 cache_hit: false,
                 error: Some(format!("no adapter registered for source '{id}'")),
@@ -322,7 +328,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::model::Paper;
+    use crate::model::{Paper, SourcePage};
     use crate::sources::{FetchCtx, Source};
 
     #[test]
@@ -571,29 +577,33 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<Vec<Paper>> {
-            Ok(vec![Paper {
-                source: "echo".to_string(),
-                source_id: "echo-1".to_string(),
-                title: "Echo".to_string(),
-                authors: Vec::new(),
-                year: None,
-                published: None,
-                doi: None,
-                external_ids: Default::default(),
-                abstract_text: None,
-                url: "urn:echo:1".to_string(),
-                fulltext_url: None,
-                fulltext_format: None,
-                journal: None,
-            }])
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<SourcePage> {
+            Ok(SourcePage {
+                papers: vec![Paper {
+                    source: "echo".to_string(),
+                    source_id: "echo-1".to_string(),
+                    title: "Echo".to_string(),
+                    authors: Vec::new(),
+                    year: None,
+                    published: None,
+                    doi: None,
+                    external_ids: Default::default(),
+                    abstract_text: None,
+                    url: "urn:echo:1".to_string(),
+                    fulltext_url: None,
+                    fulltext_format: None,
+                    journal: None,
+                }],
+                raw_count: 1,
+                available: None,
+            })
         }
         async fn fetch_page(
             &self,
             ctx: &FetchCtx,
             query: &str,
             _cursor: &str,
-        ) -> anyhow::Result<(Vec<Paper>, Option<String>)> {
+        ) -> anyhow::Result<(SourcePage, Option<String>)> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }
@@ -616,29 +626,33 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<Vec<Paper>> {
-            Ok(vec![Paper {
-                source: self.id.to_string(),
-                source_id: format!("{}-{}", self.id, self.title),
-                title: self.title.to_string(),
-                authors: Vec::new(),
-                year: None,
-                published: None,
-                doi: None,
-                external_ids: Default::default(),
-                abstract_text: None,
-                url: format!("urn:{}:{}", self.id, self.title),
-                fulltext_url: None,
-                fulltext_format: None,
-                journal: None,
-            }])
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<SourcePage> {
+            Ok(SourcePage {
+                papers: vec![Paper {
+                    source: self.id.to_string(),
+                    source_id: format!("{}-{}", self.id, self.title),
+                    title: self.title.to_string(),
+                    authors: Vec::new(),
+                    year: None,
+                    published: None,
+                    doi: None,
+                    external_ids: Default::default(),
+                    abstract_text: None,
+                    url: format!("urn:{}:{}", self.id, self.title),
+                    fulltext_url: None,
+                    fulltext_format: None,
+                    journal: None,
+                }],
+                raw_count: 1,
+                available: None,
+            })
         }
         async fn fetch_page(
             &self,
             ctx: &FetchCtx,
             query: &str,
             _cursor: &str,
-        ) -> anyhow::Result<(Vec<Paper>, Option<String>)> {
+        ) -> anyhow::Result<(SourcePage, Option<String>)> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }
@@ -655,7 +669,7 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<Vec<Paper>> {
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<SourcePage> {
             Err(anyhow::anyhow!("boom-adapter-failed"))
         }
         async fn fetch_page(
@@ -663,7 +677,7 @@ mod tests {
             ctx: &FetchCtx,
             query: &str,
             _cursor: &str,
-        ) -> anyhow::Result<(Vec<Paper>, Option<String>)> {
+        ) -> anyhow::Result<(SourcePage, Option<String>)> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }

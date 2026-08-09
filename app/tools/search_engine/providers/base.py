@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from pydantic import BaseModel
 
 from app.tools.search_engine.query import MaterialSearchQuery
-from app.tools.search_engine.result import Material
+from app.tools.search_engine.result import Material, ProviderPage
 
 
 class ProviderCapabilities(BaseModel):
@@ -58,8 +58,15 @@ class Provider(ABC):
     capabilities: ProviderCapabilities
 
     @abstractmethod
-    async def search(self, query: MaterialSearchQuery) -> list[Material]:
-        """Execute search, return normalized materials."""
+    async def search(self, query: MaterialSearchQuery) -> list[Material] | ProviderPage:
+        """Execute search, return normalized materials.
+
+        Return a :class:`ProviderPage` when the provider can account for its
+        own completeness (pages walked, truncation, the server's total) so
+        the engine logs measured values. A plain ``list[Material]`` keeps
+        working and is logged with single-page defaults and no fabricated
+        HTTP status.
+        """
         ...
 
     def describe_query(self, query: MaterialSearchQuery) -> str:

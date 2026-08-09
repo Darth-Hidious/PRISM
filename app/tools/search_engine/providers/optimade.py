@@ -14,7 +14,7 @@ from app.tools.search_engine.result import (
     Material,
     MaterialIdentity,
     PropertyValue,
-    ProviderQueryLog,
+    ProviderPage,
 )
 from app.tools.search_engine.translator import (
     QueryTranslator,
@@ -48,19 +48,34 @@ class OptimadeProvider(Provider):
         """
         return QueryTranslator.to_optimade(query)
 
-    async def search(self, query: MaterialSearchQuery) -> list[Material]:
+    # Loop protection for `links.next` chains, not a policy cap: a server
+    # cycling its next links must not spin forever. Hitting it is reported
+    # as truncation, never absorbed into success.
+    MAX_PAGES = 100
+
+    async def search(self, query: MaterialSearchQuery) -> ProviderPage:
         """Query this OPTIMADE endpoint via async httpx (not OptimadeClient).
 
         The OptimadeClient library uses synchronous HTTP which blocks the
         event loop. We use httpx directly for a clean async path with
         proper timeouts.
+
+        Follows ``links.next`` until the requested limit is satisfied or the
+        server has no more pages. A provider whose server-side page cap is
+        smaller than the requested limit (e.g. 20 rows against ``limit:
+        1000``) therefore returns everything up to the limit instead of the
+        first page dressed up as the whole answer. The returned
+        :class:`ProviderPage` carries the accounting: pages walked, the
+        server's own total (``meta.data_returned``), the real HTTP status,
+        and ``truncated=True`` whenever more matching data existed but fewer
+        than requested rows are returned.
         """
         import httpx
 
         filter_string = self.describe_query(query)
         base_url = self._endpoint.base_url
         if not base_url:
-            return []
+            return ProviderPage(materials=[], pages_fetched=0)
 
         # Build the structures URL. OPTIMADE spec requires /v1/structures.
         # Some base_urls already include /v1 (e.g. from discovery), others
@@ -70,12 +85,11 @@ class OptimadeProvider(Provider):
             url = f"{base}/structures"
         else:
             url = f"{base}/v1/structures"
+        limit = min(query.limit, self._endpoint.behavior.max_results or query.limit)
         params = {}
         if filter_string:
             params["filter"] = filter_string
-        params["page_limit"] = str(
-            min(query.limit, self._endpoint.behavior.max_results)
-        )
+        params["page_limit"] = str(limit)
 
         timeout = self._endpoint.behavior.timeout_ms / 1000
         headers = {"Accept": "application/json"}
@@ -86,54 +100,125 @@ class OptimadeProvider(Provider):
         # factory re-builds the coroutine each attempt (an awaitable is
         # one-shot). httpx.AsyncClient is per-attempt so a reset connection is
         # replaced, not reused.
-        async def _do_get() -> dict:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                headers=headers,
-                follow_redirects=True,
-            ) as client:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                return resp.json()
+        async def _get_page(page_url: str, page_params: dict | None) -> tuple[dict, int]:
+            async def _do_get() -> tuple[dict, int]:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    headers=headers,
+                    follow_redirects=True,
+                ) as client:
+                    resp = await client.get(page_url, params=page_params)
+                    resp.raise_for_status()
+                    return resp.json(), resp.status_code
 
-        try:
-            data = await with_transient_retry(_do_get, provider_id=self.id)
-        except httpx.TimeoutException:
-            logger.warning("OPTIMADE timeout for %s (%.1fs)", self.id, timeout)
-            raise
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                "OPTIMADE HTTP %d for %s: %s",
-                e.response.status_code,
-                self.id,
-                str(e)[:200],
-            )
-            raise
-        except Exception as e:
-            logger.warning("OPTIMADE query failed for %s: %s", self.id, e)
-            raise
+            try:
+                return await with_transient_retry(_do_get, provider_id=self.id)
+            except httpx.TimeoutException:
+                logger.warning("OPTIMADE timeout for %s (%.1fs)", self.id, timeout)
+                raise
+            except httpx.HTTPStatusError as e:
+                logger.warning(
+                    "OPTIMADE HTTP %d for %s: %s",
+                    e.response.status_code,
+                    self.id,
+                    str(e)[:200],
+                )
+                raise
+            except Exception as e:
+                logger.warning("OPTIMADE query failed for %s: %s", self.id, e)
+                raise
 
-        # Check for OPTIMADE error responses
-        errors = data.get("errors", [])
-        entries = data.get("data", [])
-        if errors and not entries:
-            err = errors[0]
-            if isinstance(err, dict):
-                err = err.get("detail", err.get("title", str(err)))
-            raise RuntimeError(f"Provider '{self.id}' returned error: {str(err)[:200]}")
+        materials: list[Material] = []
+        pages_fetched = 0
+        available: int | None = None
+        http_status: int | None = None
+        note: str | None = None
+        next_url: str | None = None
 
-        materials = []
-        if isinstance(entries, list):
-            for entry in entries:
-                try:
-                    m = self._parse_entry(entry)
-                    if m:
-                        materials.append(m)
-                except Exception as e:
-                    logger.debug("Failed to parse entry: %s", e)
+        while True:
+            try:
+                if next_url is None:
+                    data, http_status = await _get_page(url, params)
+                else:
+                    # links.next is a full URL per the JSON:API base of the
+                    # OPTIMADE spec; parameters are already baked into it.
+                    data, http_status = await _get_page(next_url, None)
+            except Exception as e:
+                if pages_fetched == 0:
+                    raise  # nothing fetched: the whole query failed
+                # A mid-pagination failure is a PARTIAL result, not a flavour
+                # of success: keep what landed, say why it stops here.
+                note = (
+                    f"pagination stopped after {pages_fetched} page(s): "
+                    f"{type(e).__name__}: {str(e)[:200]}"
+                )
+                logger.warning("OPTIMADE %s %s", self.id, note)
+                break
 
-        limit = min(query.limit, self._endpoint.behavior.max_results)
-        return materials[:limit]
+            pages_fetched += 1
+
+            # Check for OPTIMADE error responses
+            errors = data.get("errors", [])
+            entries = data.get("data", [])
+            if errors and not entries:
+                err = errors[0]
+                if isinstance(err, dict):
+                    err = err.get("detail", err.get("title", str(err)))
+                if pages_fetched == 1:
+                    raise RuntimeError(
+                        f"Provider '{self.id}' returned error: {str(err)[:200]}"
+                    )
+                note = (
+                    f"pagination stopped after {pages_fetched - 1} page(s): "
+                    f"provider returned error: {str(err)[:200]}"
+                )
+                break
+
+            meta_total = (data.get("meta") or {}).get("data_returned")
+            if isinstance(meta_total, int):
+                available = meta_total
+
+            if isinstance(entries, list):
+                for entry in entries:
+                    try:
+                        m = self._parse_entry(entry)
+                        if m:
+                            materials.append(m)
+                    except Exception as e:
+                        logger.debug("Failed to parse entry: %s", e)
+
+            if len(materials) >= limit:
+                break
+            raw_next = (data.get("links") or {}).get("next")
+            if isinstance(raw_next, dict):
+                raw_next = raw_next.get("href")
+            if not raw_next or not isinstance(raw_next, str):
+                break
+            if pages_fetched >= self.MAX_PAGES:
+                note = (
+                    f"pagination stopped at the {self.MAX_PAGES}-page safety "
+                    "cap with a next link still present"
+                )
+                logger.warning("OPTIMADE %s %s", self.id, note)
+                break
+            next_url = raw_next
+
+        returned = materials[:limit]
+        # Truncated means "less than what was asked for despite more
+        # existing": a mid-chain failure, the safety cap, or a server that
+        # stopped serving next links while its own total says more matched.
+        truncated = len(returned) < limit and (
+            note is not None
+            or (available is not None and available > len(returned))
+        )
+        return ProviderPage(
+            materials=returned,
+            pages_fetched=pages_fetched,
+            truncated=truncated,
+            available=available,
+            http_status_code=http_status,
+            note=note,
+        )
 
     def _parse_response(self, results: dict, filter_string: str) -> list[Material]:
         """Parse the nested OptimadeClient response into Material objects.
