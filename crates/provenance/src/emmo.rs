@@ -346,6 +346,29 @@ pub struct RecalledMaterialFact {
     pub agent: String,
 }
 
+/// One stored per-source evidence contribution for an assertion.
+///
+/// `recall` reports only the immutable FIRST attribution on the parent row;
+/// every corroborating source lives here (see
+/// [`ProvenanceStore::assertion_evidence`]).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EvidenceContribution {
+    /// Canonical independence key (`doi:…` / `url:…` / `file:…` /
+    /// `document:…` / `opaque:…` / `mesh:unattributed`).
+    pub source_key: String,
+    /// The locator/display string exactly as this contribution supplied it.
+    pub source_entity_id: String,
+    pub activity_id: String,
+    pub agent_id: String,
+    pub confidence: f64,
+    pub evidence_class: EvidenceClass,
+    /// `"source"` for a real per-source contribution; `"legacy_aggregate"`
+    /// for a pre-v5 row whose confidence may contain phantom
+    /// self-corroboration (old count preserved in `legacy_corroborations`).
+    pub confidence_kind: String,
+    pub legacy_corroborations: Option<i64>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Canonicalization + assertion identity
 // ─────────────────────────────────────────────────────────────────────────
@@ -382,7 +405,7 @@ fn entity_key(tenant: &str, label: &str, name: &str) -> String {
 /// corroborates one row instead of duplicating facts.
 ///
 /// `tenant` is part of the key, and must stay that way. `prov_assertion` is
-/// keyed on this id alone, and `record_assertion_with_context` looks a row up
+/// keyed on this id alone, and `record_assertion_with_context` corroborates
 /// by id with no tenant filter — so while the id omitted the tenant, two
 /// tenants asserting the same triple shared one row and each raised the
 /// other's `confidence` (noisy-OR) and `corroborations`. That is the same
@@ -474,12 +497,288 @@ fn conditioned_assertion_id(
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Combine independent evidence for the same fact (noisy-OR): each new
-/// sighting shrinks the remaining doubt multiplicatively. Capped below 1.0 —
-/// corroboration never yields certainty (mirrors core).
-fn corroborate_confidence(old: f64, new_evidence: f64) -> f64 {
-    let combined = 1.0 - (1.0 - old.clamp(0.0, 1.0)) * (1.0 - new_evidence.clamp(0.0, 1.0));
-    combined.min(0.99)
+// ─────────────────────────────────────────────────────────────────────────
+// Origin source identity — what counts as the SAME source
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Canonical independence key for one origin source.
+///
+/// `source_entity_id` stays what it always was — a locator/display string —
+/// but it is NOT the key corroboration independence is decided on: the same
+/// paper reached as `doi:10.x/y` and as `https://doi.org/10.x/y` is one
+/// source, and twelve ingests of one file are one observation, not twelve.
+/// This function collapses the obvious aliases. It cannot establish true
+/// epistemic independence (publisher mirrors without DOI metadata, papers
+/// copying each other's numbers, moved files under the path fallback) — it
+/// only prevents repeat-ingest and relay double counting.
+///
+/// `relay` marks a write that carries someone ELSE's knowledge — a mesh peer
+/// is an agent/relay, not an independent source. The current wire format
+/// cannot carry the origin's own key end-to-end, so every relayed
+/// contribution collapses onto the single conservative key
+/// `mesh:unattributed`: all relays of one assertion count ONCE, never once
+/// per peer. Undercounting genuinely different unknown sources is the
+/// accepted cost; letting N peers echo one fact into N "corroborations" is
+/// exactly the defect this key exists to prevent.
+fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
+    if relay {
+        return "mesh:unattributed".to_string();
+    }
+    let source = source_entity_id.trim();
+    if let Some(doi) = doi_suffix(source) {
+        return format!("doi:{doi}");
+    }
+    if strip_prefix_ignore_ascii_case(source, "http://").is_some()
+        || strip_prefix_ignore_ascii_case(source, "https://").is_some()
+    {
+        return format!("url:{}", canonical_url(source));
+    }
+    if let Some(rest) = strip_prefix_ignore_ascii_case(source, "file://") {
+        // RFC 8089: an empty authority and `localhost` both mean this
+        // machine, so `file:///x`, `file://localhost/x` and the bare path
+        // `/x` are one source. A genuine remote authority
+        // (`file://server/share/x`) keeps its own `file://host` namespace:
+        // merging it with the local path `/server/share/x` would collapse
+        // two different sources and silently drop evidence, which is worse
+        // than splitting. Local `file:` keys can never collide with it,
+        // because `//` never survives `canonical_file_path`.
+        let (authority, path) = match rest.find('/') {
+            Some(slash) => rest.split_at(slash),
+            None => (rest, ""),
+        };
+        if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+            return format!("file:{}", canonical_file_path(path));
+        }
+        return format!(
+            "file://{}{}",
+            authority.to_ascii_lowercase(),
+            canonical_file_path(path)
+        );
+    }
+    if source.starts_with('/') {
+        return format!("file:{}", canonical_file_path(source));
+    }
+    if let Some(id) = strip_prefix_ignore_ascii_case(source, "document:") {
+        // Importer-assigned document UUIDs are case-insensitive identifiers.
+        return format!("document:{}", id.trim().to_ascii_lowercase());
+    }
+    // Opaque identifiers ("doc:test_paper", bare relative filenames, …):
+    // stable per trimmed string, with the file branch's lexical `.`/`..`/
+    // `//`/trailing-slash cleanup so `data/x.pdf`, `./data/x.pdf` and
+    // `data//x.pdf` are one key. Defensive only: the live ingest path hands
+    // over `canonicalize()`d absolute paths, which take the `/` branch.
+    // Identifiers without dot/empty segments ("doc:test_paper") pass
+    // through unchanged.
+    let cleaned = canonical_file_path(source);
+    let cleaned = cleaned.strip_prefix('/').unwrap_or(&cleaned);
+    format!("opaque:{cleaned}")
+}
+
+/// True when this write relays someone else's knowledge rather than reading
+/// the source itself. `crates/mesh/src/sync.rs` marks its writes with both
+/// `tenant = "mesh"` and `locality = "mesh"`; either alone is treated as a
+/// relay so a partially-filled provenance errs on the conservative side.
+fn is_relay(prov: &LocalProvenance) -> bool {
+    prov.locality == "mesh" || prov.tenant == "mesh"
+}
+
+/// The DOI when `source` is one, in normalized form: prefix stripped,
+/// percent-decoded, trimmed, lowercased (DOIs are case-insensitive by spec).
+///
+/// Percent-decoding is applied to EVERY form, exactly ONCE. DOI suffixes
+/// containing `/` commonly travel `%2F`-encoded in the `doi:` form too, and
+/// one decode pass is precisely what the doi.org resolver applies to an
+/// incoming URL. Decoding to a fixpoint would merge distinct DOIs: a
+/// doubly-encoded `%252F` names a DOI whose suffix contains the literal
+/// characters `%2F` (DOIs may contain `%`), not the plain-slash DOI.
+fn doi_suffix(source: &str) -> Option<String> {
+    if let Some(doi) = strip_prefix_ignore_ascii_case(source, "doi:") {
+        return Some(percent_decode(doi).trim().to_lowercase());
+    }
+    for resolver in [
+        "https://doi.org/",
+        "http://doi.org/",
+        "https://dx.doi.org/",
+        "http://dx.doi.org/",
+    ] {
+        if let Some(doi) = strip_prefix_ignore_ascii_case(source, resolver) {
+            return Some(percent_decode(doi).trim().to_lowercase());
+        }
+    }
+    None
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
+}
+
+/// Decode `%XX` escapes; malformed escapes pass through literally.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes.get(i), bytes.get(i + 1), bytes.get(i + 2)) {
+            (Some(b'%'), Some(&hi), Some(&lo)) => {
+                let decode = |b: u8| char::from(b).to_digit(16).map(|digit| digit as u8);
+                if let (Some(hi), Some(lo)) = (decode(hi), decode(lo)) {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Conservative URL canonicalization: lowercase scheme and host, drop the
+/// fragment (it never reaches the server, so it cannot distinguish
+/// resources), drop the scheme's default port, normalize `.`/`..` path
+/// segments. The query string and its ORDER are preserved — aggressive query
+/// stripping merges genuinely different resources, which is the wrong
+/// direction for an independence key. For the same reason a trailing slash
+/// on a NON-root path (`/a` vs `/a/`) and a bare empty `?` stay distinct:
+/// a server may legitimately serve different content for them, and this key
+/// must only ever split too much, never merge two real sources.
+fn canonical_url(url: &str) -> String {
+    let url = url.split('#').next().unwrap_or(url);
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    let (authority, path, query) = match (rest.find('/'), rest.find('?')) {
+        (Some(slash), Some(qmark)) if qmark < slash => {
+            (&rest[..qmark], "", Some(&rest[qmark + 1..]))
+        }
+        (Some(slash), _) => match rest[slash..].split_once('?') {
+            Some((path, query)) => (&rest[..slash], path, Some(query)),
+            None => (&rest[..slash], &rest[slash..], None),
+        },
+        (None, Some(qmark)) => (&rest[..qmark], "", Some(&rest[qmark + 1..])),
+        (None, None) => (rest, "", None),
+    };
+    let mut authority = authority.to_ascii_lowercase();
+    let default_port = if scheme == "https" { ":443" } else { ":80" };
+    if let Some(bare) = authority.strip_suffix(default_port) {
+        authority = bare.to_string();
+    }
+    // An absent path and `/` are the same resource for http(s).
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        remove_dot_segments(path)
+    };
+    match query {
+        Some(query) => format!("{scheme}://{authority}{path}?{query}"),
+        None => format!("{scheme}://{authority}{path}"),
+    }
+}
+
+/// Lexical `.`/`..`/`//` normalization for an absolute path. Deliberately no
+/// filesystem access: the file may not exist where the key is derived, and a
+/// key must not depend on local disk state.
+fn canonical_file_path(path: &str) -> String {
+    let normalized = remove_dot_segments(path.trim());
+    match normalized.strip_suffix('/') {
+        Some(bare) if !bare.is_empty() => bare.to_string(),
+        _ => normalized,
+    }
+}
+
+/// RFC 3986-style dot-segment removal over `/`-separated segments. Empty
+/// segments (`//`) collapse too: for an independence key, treating `a//b`
+/// and `a/b` as one resource errs toward merging aliases, never splitting.
+fn remove_dot_segments(path: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                kept.pop();
+            }
+            segment => kept.push(segment),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&kept.join("/"));
+    if (path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..")) && out != "/" {
+        out.push('/');
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Write transactions
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Typed, retriable "the store's write lock could not be acquired" error.
+///
+/// Raised when another writer holds the lock past the connection's busy
+/// timeout. The fact was NOT committed — no partial EMMO/activity/assertion/
+/// evidence rows exist — and the caller may retry. This must never be
+/// converted into silent success or a fake duplicate: the caller has to know
+/// the fact is not in the store. Detect it with
+/// `err.downcast_ref::<StoreBusy>()` anywhere in the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreBusy;
+
+impl std::fmt::Display for StoreBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "provenance store is busy: another writer held the write lock past the busy \
+             timeout; nothing was committed — retry the write",
+        )
+    }
+}
+
+impl std::error::Error for StoreBusy {}
+
+/// Tag engine-level busy errors with [`StoreBusy`] so callers can classify
+/// without string-matching. Anything else passes through untouched.
+fn classify_busy(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<turso::Error>() {
+        Some(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => error.context(StoreBusy),
+        _ => error,
+    }
+}
+
+/// `BEGIN IMMEDIATE`, not deferred: the write lock is taken up front, so a
+/// concurrent writer of the same rows waits here (up to `busy_timeout`)
+/// instead of both reading, both writing, and one dying on a key conflict
+/// mid-document.
+async fn begin_immediate(conn: &turso::Connection) -> Result<()> {
+    conn.execute("BEGIN IMMEDIATE", ())
+        .await
+        .map_err(|e| classify_busy(anyhow::Error::new(e)))?;
+    Ok(())
+}
+
+/// COMMIT the open transaction on success; ROLLBACK (best effort) on
+/// failure so no partial fact survives. Every error out of here is
+/// busy-classified.
+async fn finish_write_txn(conn: &turso::Connection, result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => match conn.execute("COMMIT", ()).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(classify_busy(anyhow::Error::new(e)).context("commit failed; rolled back"))
+            }
+        },
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(classify_busy(e))
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -612,21 +911,184 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 /// build then sees the version already set and skips them. Recovering from that
 /// needs the version reset by hand.
 async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
+    // Cheap unlocked pre-check: almost every open is of an already-stamped
+    // database and must not pay for a write transaction.
     if read_user_version(conn).await? >= ASSERTION_TENANT_KEY_VERSION {
         return Ok(());
     }
 
-    rekey_assertions_by_tenant(conn).await?;
-    migrate_keys_to_tenant_qualified(conn).await?;
+    // One writer migrates. `BEGIN IMMEDIATE` serializes concurrent openers,
+    // and the version is RE-READ under the lock: two openers can both pass
+    // the unlocked pre-check, and without the re-read the loser would redo
+    // the whole migration over freshly migrated rows. Everything up to and
+    // including the stamp commits atomically — a crash mid-migration leaves
+    // the database exactly pre-migration, never half re-keyed.
+    begin_immediate(conn).await?;
+    let result = async {
+        if read_user_version(conn).await? >= ASSERTION_TENANT_KEY_VERSION {
+            return Ok(());
+        }
 
-    // Stamp even when nothing needed changing — a fresh store has empty tables,
-    // and returning without stamping would make every subsequent open repeat
-    // the scans this guard exists to avoid.
-    conn.execute(
-        &format!("PRAGMA user_version = {ASSERTION_TENANT_KEY_VERSION}"),
-        (),
-    )
-    .await?;
+        rekey_assertions_by_tenant(conn).await?;
+        migrate_keys_to_tenant_qualified(conn).await?;
+        migrate_corroborations_to_evidence(conn).await?;
+
+        // Stamp even when nothing needed changing — a fresh store has empty
+        // tables, and returning without stamping would make every subsequent
+        // open repeat the scans this guard exists to avoid.
+        conn.execute(
+            &format!("PRAGMA user_version = {ASSERTION_TENANT_KEY_VERSION}"),
+            (),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    finish_write_txn(conn, result).await
+}
+
+/// v5 backfill: give every pre-evidence assertion its one still-identifiable
+/// evidence contribution.
+///
+/// A pre-v5 row stores only its LATEST source, and its `corroborations`
+/// counted ingest observations, not independent sources — so the honest
+/// reconstruction is: one evidence row for the stored source, parent
+/// `corroborations` reset to 1, and the stored confidence KEPT rather than
+/// replaced (an nth root assumes equal per-observation confidence, a fixed
+/// reset fabricates evidence, zero discards valid single-source evidence).
+/// Rows whose old count exceeded one are marked `legacy_aggregate` on both
+/// the contribution (`confidence_kind`, with the old count preserved in
+/// `legacy_corroborations`) and the parent (`confidence_basis`), because the
+/// retained confidence may contain phantom self-corroboration and stays
+/// tainted when combined with future evidence. The marker is never cleared
+/// automatically — exact repair needs a user-directed re-ingest of the
+/// original corpus, which no migration can do. The stored source may also be
+/// the latest rather than the first; freezing it is honest, claiming
+/// recovered first-seen attribution would not be.
+///
+/// Caller must hold the one-shot guard and the open transaction — see
+/// [`run_key_migrations`]. Runs AFTER the id re-keys so evidence rows are
+/// born under final assertion ids.
+async fn migrate_corroborations_to_evidence(conn: &turso::Connection) -> Result<()> {
+    struct LegacyRow {
+        id: String,
+        confidence: f64,
+        corroborations: i64,
+        activity_id: String,
+        source: String,
+        agent: String,
+        class: EvidenceClass,
+        tenant: String,
+    }
+
+    // Drain every row before writing (Turso pre-release mishandles
+    // interleaved statements on one connection).
+    let mut pending: Vec<LegacyRow> = Vec::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT id, confidence, corroborations, activity_id, source, agent, \
+                        evidence_class, tenant \
+                 FROM prov_assertion",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            // NULL/unreadable confidence reads 0.0 — a claim whose belief is
+            // unknown must not be resurrected as a strong one.
+            let confidence = row
+                .get_value(1)
+                .ok()
+                .and_then(|v| v.as_real().copied())
+                .unwrap_or(0.0);
+            pending.push(LegacyRow {
+                id: crate::get_str(&row, 0)?,
+                confidence: if confidence.is_finite() {
+                    confidence.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+                corroborations: row
+                    .get_value(2)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(1),
+                activity_id: crate::get_str(&row, 3)?,
+                source: crate::get_str(&row, 4)?,
+                agent: crate::get_str(&row, 5)?,
+                class: EvidenceClass::from_stored(&crate::get_str(&row, 6)?),
+                tenant: crate::get_str(&row, 7)?,
+            });
+        }
+    }
+
+    for legacy in pending {
+        // Same derivation future writes use. The only relay marker still
+        // recoverable from a stored row is the mesh tenant itself: the live
+        // path also checks `locality`, but that was never persisted, so a
+        // legacy relay stored under a non-mesh tenant migrates to a real
+        // per-URL key while a later live relay of the same fact gets
+        // `mesh:unattributed` — a known, accepted split (it can only
+        // undercount corroboration, never inflate it).
+        let source_key = origin_source_key(&legacy.source, legacy.tenant == "mesh");
+        let aggregate = legacy.corroborations > 1;
+        let inserted = conn
+            .execute(
+                r#"INSERT INTO prov_assertion_evidence
+                   (assertion_id, source_key, source_entity_id, source_revision_id,
+                    activity_id, agent_id, confidence, evidence_class,
+                    confidence_kind, legacy_corroborations)
+                   VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9)
+                   ON CONFLICT(assertion_id, source_key) DO NOTHING"#,
+                [
+                    Value::Text(legacy.id.clone()),
+                    Value::Text(source_key),
+                    Value::Text(legacy.source),
+                    Value::Text(legacy.activity_id),
+                    Value::Text(legacy.agent),
+                    Value::Real(legacy.confidence),
+                    Value::Text(legacy.class.as_str().to_string()),
+                    Value::Text(
+                        if aggregate {
+                            "legacy_aggregate"
+                        } else {
+                            "source"
+                        }
+                        .to_string(),
+                    ),
+                    if aggregate {
+                        Value::Integer(legacy.corroborations)
+                    } else {
+                        Value::Null
+                    },
+                ],
+            )
+            .await?;
+        // `inserted == 0` means this assertion already has an evidence row
+        // for that source — it was written by the post-v5 path, so its
+        // parent aggregates are real. Normalizing it here (a re-run after a
+        // hand-rewound `user_version`) would destroy correct counts.
+        if inserted == 1 {
+            conn.execute(
+                "UPDATE prov_assertion \
+                 SET confidence = ?2, corroborations = 1, confidence_basis = ?3 \
+                 WHERE id = ?1",
+                [
+                    Value::Text(legacy.id),
+                    Value::Real(legacy.confidence),
+                    Value::Text(
+                        if aggregate {
+                            "legacy_aggregate"
+                        } else {
+                            "native"
+                        }
+                        .to_string(),
+                    ),
+                ],
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -644,7 +1106,17 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
 ///     tenanted row each time. A v3 database has already had its keys
 ///     qualified by those unguarded passes, so the migration finds nothing to
 ///     do; the bump exists to make the guard take effect at all.
-const ASSERTION_TENANT_KEY_VERSION: i64 = 4;
+/// v5: no digest change. Corroboration became per-origin-source instead of
+///     per-ingest: `prov_assertion_evidence` records one row per distinct
+///     origin source of each assertion, and the parent's `confidence` /
+///     `corroborations` become caches over those rows. Pre-v5 rows inflated
+///     both on every re-ingest of the SAME source, and only their latest
+///     source survives — so the migration collapses each row to that one
+///     still-identifiable source (`corroborations = 1`), keeps the stored
+///     confidence rather than inventing a replacement, and marks rows whose
+///     old count exceeded one as `legacy_aggregate` so phantom
+///     self-corroboration is never mistaken for independent evidence.
+const ASSERTION_TENANT_KEY_VERSION: i64 = 5;
 
 /// Tenant to attribute a row to when the stored value is absent.
 ///
@@ -753,6 +1225,14 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     )
     .await?;
 
+    // `prov_assertion` is the query-optimized AGGREGATE row: `confidence`,
+    // `corroborations`, and `evidence_class` are caches over
+    // `prov_assertion_evidence`, updated in the same transaction as the
+    // evidence rows. `activity_id`/`source`/`agent` are the FIRST-committed
+    // attribution and are never overwritten after insert.
+    // `confidence_basis` is 'native' unless the v5 migration retained a
+    // pre-evidence confidence that may contain phantom self-corroboration,
+    // in which case it is permanently 'legacy_aggregate'.
     conn.execute(
         r#"CREATE TABLE IF NOT EXISTS prov_assertion (
             id TEXT PRIMARY KEY,
@@ -764,7 +1244,15 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
             conditions_json TEXT NOT NULL DEFAULT '[]',
             evidence_class TEXT NOT NULL DEFAULT 'indeterminate',
             confidence REAL,
+            -- Order-independent sufficient statistics behind `confidence`:
+            -- the running PRODUCT of (1 - c_i) over distinct sources and the
+            -- running MAX single-source c_i. NULL on rows written before the
+            -- columns existed; the aggregate UPDATE lazily seeds them from
+            -- the stored confidence.
+            confidence_doubt REAL,
+            confidence_max REAL,
             corroborations INTEGER,
+            confidence_basis TEXT NOT NULL DEFAULT 'native',
             activity_id TEXT,
             source TEXT,
             agent TEXT,
@@ -812,6 +1300,83 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // the re-key reads it. The migrations themselves run at the end of this
     // function, once every table they touch exists.
     crate::add_column_if_absent(conn, "prov_assertion", "tenant", "TEXT").await?;
+    crate::add_column_if_absent(
+        conn,
+        "prov_assertion",
+        "confidence_basis",
+        "TEXT NOT NULL DEFAULT 'native'",
+    )
+    .await?;
+    // NULL (not a default) on legacy rows: the aggregate UPDATE seeds both
+    // from the stored confidence on the next contribution, treating the
+    // pre-existing aggregate as one pseudo-contribution — the same freeze
+    // the v5 evidence migration chose.
+    crate::add_column_if_absent(conn, "prov_assertion", "confidence_doubt", "REAL").await?;
+    crate::add_column_if_absent(conn, "prov_assertion", "confidence_max", "REAL").await?;
+
+    // One row per (assertion, distinct origin source) — the AUTHORITATIVE
+    // record corroboration is computed from. Keyed by `source_key`
+    // (see `origin_source_key`), NOT by ingestion activity: activity UUIDs
+    // identify runs, and counting runs is exactly the self-corroboration
+    // defect the v5 migration exists to fix. `source_revision_id` (e.g. a
+    // content SHA-256) is attribution metadata, deliberately OUTSIDE the
+    // primary key: a file edited in place stays the same source.
+    // Rows are never updated (except an evidence-class downgrade) or
+    // deleted through the API — subtracting a contribution from noisy-OR
+    // needs a full recompute, so mutation is prohibited rather than half
+    // supported. The FK keeps evidence attached to its assertion across the
+    // id re-key migrations (ON UPDATE CASCADE); it is enforced because
+    // `open()` sets `PRAGMA foreign_keys=ON` on every connection.
+    conn.execute(
+        r#"CREATE TABLE IF NOT EXISTS prov_assertion_evidence (
+            assertion_id TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+
+            source_entity_id TEXT NOT NULL,
+            source_revision_id TEXT,
+            activity_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+
+            confidence REAL NOT NULL
+                CHECK (confidence >= 0.0 AND confidence <= 1.0),
+            evidence_class TEXT NOT NULL
+                CHECK (evidence_class IN (
+                    'indeterminate',
+                    'research',
+                    'screening',
+                    'reference_validated'
+                )),
+
+            confidence_kind TEXT NOT NULL DEFAULT 'source'
+                CHECK (confidence_kind IN ('source', 'legacy_aggregate')),
+            legacy_corroborations INTEGER
+                CHECK (
+                    legacy_corroborations IS NULL
+                    OR legacy_corroborations >= 1
+                ),
+
+            PRIMARY KEY (assertion_id, source_key),
+
+            FOREIGN KEY (assertion_id)
+                REFERENCES prov_assertion(id)
+                ON UPDATE CASCADE
+                ON DELETE CASCADE
+        )"#,
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prov_assertion_evidence_source_key \
+         ON prov_assertion_evidence(source_key, assertion_id)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prov_assertion_evidence_activity \
+         ON prov_assertion_evidence(activity_id)",
+        (),
+    )
+    .await?;
 
     // Entity vectors for local semantic search: one little-endian f32 blob
     // per emmo_entity key (same encoding as `provenance_embeddings`),
@@ -1059,218 +1624,241 @@ impl ProvenanceStore {
         let confidence = fact.confidence.unwrap_or(0.5);
         let tenant = prov.tenant.as_str();
 
-        match fact.kind.as_deref() {
-            Some("measurement") => {
-                // Mirror core: a measurement without a value fails schema
-                // validation and is dropped (not written half-typed, not
-                // recorded as an assertion).
-                let Some(value) = fact.value else {
-                    return Ok(());
-                };
-                let unit = fact.unit.clone().unwrap_or_default();
-                let meas_name = format!(
-                    "meas_{}_{}_{value}",
-                    canonical_key(&fact.subject),
-                    canonical_key(&fact.object)
-                );
-                let props = serde_json::json!({
-                    "value": value,
-                    "unit": unit,
-                    "conditions": conditions,
-                    "evidence_class": evidence_class,
-                    "evidence_color": evidence_class.color(),
-                    "confidence": confidence,
-                });
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let meas_key = self
-                    .upsert_entity(&meas_name, "Measurement", tenant, Some(props.to_string()))
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Property", tenant, None)
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &meas_key,
-                    "HAS_MEASUREMENT",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-                self.upsert_edge(
-                    &meas_key,
-                    &obj_key,
-                    "OF_PROPERTY",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-            }
-            Some("phase") => {
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Phase", tenant, None)
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    "HAS_PHASE",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-            }
-            Some("composition") => {
-                let props = serde_json::json!({ "canonical_formula": &fact.object });
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Composition", tenant, Some(props.to_string()))
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    "HAS_COMPOSITION",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-            }
-            // Mirrors core's Element node + CONTAINS_ELEMENT edge; the
-            // composition fraction (when `value` carries it) rides on the
-            // edge props, not on the nodes.
-            Some("contains") => {
-                let props = fact
-                    .value
-                    .map(|f| serde_json::json!({ "fraction": f }).to_string());
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Element", tenant, None)
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    "CONTAINS_ELEMENT",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    props.as_deref(),
-                )
-                .await?;
-            }
-            Some("processing") => {
-                // The step order (when `value` carries it) rides on the edge.
-                let props = fact
-                    .value
-                    .map(|o| serde_json::json!({ "order": o }).to_string());
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Manufacturing", tenant, None)
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    "PROCESSED_BY",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    props.as_deref(),
-                )
-                .await?;
-            }
-            Some("structure") => {
-                let props = serde_json::json!({ "system": &fact.object });
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(
-                        &fact.object,
-                        "CrystalStructure",
-                        tenant,
-                        Some(props.to_string()),
-                    )
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    "HAS_STRUCTURE",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-            }
-            Some("application") => {
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Application", tenant, None)
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    "USED_IN",
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-            }
-            // Unknown kind: keep the fact as a generic edge, don't drop it.
-            _ => {
-                let subj_key = self
-                    .upsert_entity(&fact.subject, "Matter", tenant, None)
-                    .await?;
-                let obj_key = self
-                    .upsert_entity(&fact.object, "Entity", tenant, None)
-                    .await?;
-                self.upsert_edge(
-                    &subj_key,
-                    &obj_key,
-                    &fact.predicate,
-                    &fact.predicate,
-                    confidence,
-                    tenant,
-                    None,
-                )
-                .await?;
-            }
+        // Mirror core: a measurement without a value fails schema validation
+        // and is dropped (not written half-typed, not recorded as an
+        // assertion). Checked before the transaction so a dropped fact never
+        // takes the write lock.
+        if fact.kind.as_deref() == Some("measurement") && fact.value.is_none() {
+            return Ok(());
         }
 
-        self.record_assertion_with_context(
-            &LocalAssertion {
-                subject: fact.subject.clone(),
-                predicate: fact.predicate.clone(),
-                object: fact.object.clone(),
-                confidence: fact.confidence,
-            },
-            prov,
-            fact.value,
-            fact.unit.as_deref(),
-            &conditions,
-            evidence_class,
-        )
-        .await
+        // One fact commits atomically: EMMO entities/edges, the PROV-O
+        // activity, the assertion, its evidence contribution, and the
+        // aggregate update all land or none do. A failed fact rolls back
+        // cleanly; facts already committed from the same document stay —
+        // atomicity is per fact, not per document.
+        //
+        // The guard serializes writers sharing THIS handle: a raw
+        // `BEGIN IMMEDIATE` on the one shared connection cannot nest, and
+        // without the mutex a `tokio::join!` on one store surfaces as an
+        // opaque "cannot start a transaction within a transaction", not
+        // `StoreBusy` (see `ProvenanceStore::write_lock`).
+        let _same_handle_guard = self.write_lock.lock().await;
+        begin_immediate(&self.conn).await?;
+        let result: Result<()> = async {
+            match fact.kind.as_deref() {
+                Some("measurement") => {
+                    // Guarded above; destructure the value the guard proved.
+                    let Some(value) = fact.value else {
+                        return Ok(());
+                    };
+                    let unit = fact.unit.clone().unwrap_or_default();
+                    let meas_name = format!(
+                        "meas_{}_{}_{value}",
+                        canonical_key(&fact.subject),
+                        canonical_key(&fact.object)
+                    );
+                    let props = serde_json::json!({
+                        "value": value,
+                        "unit": unit,
+                        "conditions": conditions,
+                        "evidence_class": evidence_class,
+                        "evidence_color": evidence_class.color(),
+                        "confidence": confidence,
+                    });
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let meas_key = self
+                        .upsert_entity(&meas_name, "Measurement", tenant, Some(props.to_string()))
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Property", tenant, None)
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &meas_key,
+                        "HAS_MEASUREMENT",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                    self.upsert_edge(
+                        &meas_key,
+                        &obj_key,
+                        "OF_PROPERTY",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                }
+                Some("phase") => {
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Phase", tenant, None)
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        "HAS_PHASE",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                }
+                Some("composition") => {
+                    let props = serde_json::json!({ "canonical_formula": &fact.object });
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Composition", tenant, Some(props.to_string()))
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        "HAS_COMPOSITION",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                }
+                // Mirrors core's Element node + CONTAINS_ELEMENT edge; the
+                // composition fraction (when `value` carries it) rides on the
+                // edge props, not on the nodes.
+                Some("contains") => {
+                    let props = fact
+                        .value
+                        .map(|f| serde_json::json!({ "fraction": f }).to_string());
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Element", tenant, None)
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        "CONTAINS_ELEMENT",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        props.as_deref(),
+                    )
+                    .await?;
+                }
+                Some("processing") => {
+                    // The step order (when `value` carries it) rides on the edge.
+                    let props = fact
+                        .value
+                        .map(|o| serde_json::json!({ "order": o }).to_string());
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Manufacturing", tenant, None)
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        "PROCESSED_BY",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        props.as_deref(),
+                    )
+                    .await?;
+                }
+                Some("structure") => {
+                    let props = serde_json::json!({ "system": &fact.object });
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(
+                            &fact.object,
+                            "CrystalStructure",
+                            tenant,
+                            Some(props.to_string()),
+                        )
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        "HAS_STRUCTURE",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                }
+                Some("application") => {
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Application", tenant, None)
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        "USED_IN",
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                }
+                // Unknown kind: keep the fact as a generic edge, don't drop it.
+                _ => {
+                    let subj_key = self
+                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .await?;
+                    let obj_key = self
+                        .upsert_entity(&fact.object, "Entity", tenant, None)
+                        .await?;
+                    self.upsert_edge(
+                        &subj_key,
+                        &obj_key,
+                        &fact.predicate,
+                        &fact.predicate,
+                        confidence,
+                        tenant,
+                        None,
+                    )
+                    .await?;
+                }
+            }
+
+            self.record_assertion_in_open_txn(
+                &LocalAssertion {
+                    subject: fact.subject.clone(),
+                    predicate: fact.predicate.clone(),
+                    object: fact.object.clone(),
+                    confidence: fact.confidence,
+                },
+                prov,
+                fact.value,
+                fact.unit.as_deref(),
+                &conditions,
+                evidence_class,
+            )
+            .await
+        }
+        .await;
+        finish_write_txn(&self.conn, result).await
     }
 
     /// UPSERT the PROV-O agent + activity for one run (idempotent).
@@ -1311,15 +1899,23 @@ impl ProvenanceStore {
         Ok(())
     }
 
-    /// Reify one triple as a PROV-O assertion. First sighting inserts with
-    /// the extractor's confidence and `corroborations = 1`; every re-record
-    /// of the same triple (stable SHA-256 id over canonical forms) combines
-    /// confidence noisy-OR and increments `corroborations`.
+    /// Reify one triple as a PROV-O assertion. The first sighting creates
+    /// the assertion at the extractor's confidence with `corroborations = 1`.
+    /// A later sighting from a DIFFERENT origin source (see
+    /// [`origin_source_key`] — DOI/URL/file aliases collapse, mesh peers are
+    /// relays) adds one evidence contribution, combines confidence noisy-OR,
+    /// and increments `corroborations`. Re-recording from the SAME source
+    /// changes neither: twelve ingests of one paper are one observation, not
+    /// twelve. The evidence class can only ever get worse.
     pub async fn record_assertion(&self, a: &LocalAssertion, prov: &LocalProvenance) -> Result<()> {
         self.record_assertion_with_context(a, prov, None, None, &[], EvidenceClass::Indeterminate)
             .await
     }
 
+    /// One handle, one write transaction at a time: the mutex serializes
+    /// same-handle writers, because the raw `BEGIN IMMEDIATE` below cannot
+    /// nest on the shared connection (see `ProvenanceStore::write_lock`).
+    /// Callers on SEPARATE handles serialize via the database busy wait.
     #[allow(clippy::too_many_arguments)]
     async fn record_assertion_with_context(
         &self,
@@ -1330,8 +1926,48 @@ impl ProvenanceStore {
         conditions: &[MeasurementCondition],
         evidence_class: EvidenceClass,
     ) -> Result<()> {
-        self.record_activity(prov).await?;
+        let _same_handle_guard = self.write_lock.lock().await;
+        begin_immediate(&self.conn).await?;
+        let result = self
+            .record_assertion_in_open_txn(a, prov, value, unit, conditions, evidence_class)
+            .await;
+        finish_write_txn(&self.conn, result).await
+    }
 
+    /// The assertion + evidence write sequence. Caller MUST hold an open
+    /// `BEGIN IMMEDIATE` transaction ([`begin_immediate`]/
+    /// [`finish_write_txn`]) — this issues writes only, no SELECT, so there
+    /// is no read cursor to interleave with them (Turso pre-release is
+    /// sensitive to interleaved statements on one connection).
+    ///
+    /// Why not one UPSERT: a single statement on `prov_assertion` cannot
+    /// tell a duplicate assertion from the same source apart from the same
+    /// assertion out of a genuinely NEW source, and comparing against the
+    /// parent's single `source` column breaks at the third source. The
+    /// evidence INSERT's affected-row count is that decision, and the
+    /// surrounding transaction is what lets a second table react to it.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_assertion_in_open_txn(
+        &self,
+        a: &LocalAssertion,
+        prov: &LocalProvenance,
+        value: Option<f64>,
+        unit: Option<&str>,
+        conditions: &[MeasurementCondition],
+        evidence_class: EvidenceClass,
+    ) -> Result<()> {
+        // Normalize before any write. `None` keeps the historical "asserted
+        // without a stated confidence = full confidence" contract; NaN and
+        // infinity are rejected rather than clamped because they are always
+        // an upstream bug, and a NaN inside noisy-OR silently poisons every
+        // later combination.
+        let confidence_evidence = match a.confidence {
+            None => 1.0,
+            Some(c) if !c.is_finite() => {
+                anyhow::bail!("assertion confidence must be finite, got {c}")
+            }
+            Some(c) => c.clamp(0.0, 1.0),
+        };
         let id = conditioned_assertion_id(
             &prov.tenant,
             &a.subject,
@@ -1341,96 +1977,174 @@ impl ProvenanceStore {
             unit,
             conditions,
         )?;
-        let confidence_evidence = a.confidence.unwrap_or(1.0);
         let conditions_json = serde_json::to_string(conditions)?;
+        let source_key = origin_source_key(&prov.source_entity_id, is_relay(prov));
 
-        // Read current belief, then corroborate or insert. Confidence and
-        // evidence class are independent: noisy-OR may increase confidence,
-        // but the stored class remains the WORST class ever attached to this
-        // assertion. Agreement therefore cannot turn literature into GREEN.
-        // The cursor is fully consumed before the write (Turso pre-release is
-        // sensitive to interleaved statements on one connection).
-        let existing = {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT confidence, corroborations, evidence_class \
-                     FROM prov_assertion WHERE id = ?1",
-                    [Value::Text(id.clone())],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => {
-                    let old_conf = row
-                        .get_value(0)
-                        .ok()
-                        .and_then(|v| v.as_real().copied())
-                        .unwrap_or(0.0);
-                    let old_corr = row
-                        .get_value(1)
-                        .ok()
-                        .and_then(|v| v.as_integer().copied())
-                        .unwrap_or(1);
-                    let old_class = match row.get_value(2).ok() {
-                        Some(Value::Text(value)) => EvidenceClass::from_stored(&value),
-                        _ => EvidenceClass::Indeterminate,
-                    };
-                    while rows.next().await?.is_some() {}
-                    Some((old_conf, old_corr, old_class))
-                }
-                None => None,
-            }
-        };
-        if let Some((old_conf, old_corr, old_class)) = existing {
-            let retained_class =
-                evidence_for_result(EvidenceSource::Execution, [old_class, evidence_class]);
+        self.record_activity(prov).await?;
+
+        // Create the aggregate row if this is the first sighting. DO NOTHING
+        // on conflict: `activity_id`/`source`/`agent` are the FIRST-committed
+        // attribution and are immutable from here on — the old path let every
+        // later writer overwrite them, so a fact first seen in paper A and
+        // corroborated by paper B reported its source as B, with A gone.
+        // value/unit/conditions need no update either: they are inputs to the
+        // assertion id, so an id match implies they already agree.
+        self.conn
+            .execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, value, unit,
+                    conditions_json, evidence_class, confidence, corroborations,
+                    confidence_basis, activity_id, source, agent, tenant)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                           0.0, 0, 'native',
+                           ?9, ?10, ?11, ?12)
+                   ON CONFLICT(id) DO NOTHING"#,
+                [
+                    Value::Text(id.clone()),
+                    Value::Text(a.subject.clone()),
+                    Value::Text(a.predicate.clone()),
+                    Value::Text(a.object.clone()),
+                    value.map_or(Value::Null, Value::Real),
+                    unit.map_or(Value::Null, |unit| Value::Text(unit.to_string())),
+                    Value::Text(conditions_json),
+                    Value::Text(evidence_class.as_str().to_string()),
+                    Value::Text(prov.activity_id.clone()),
+                    Value::Text(prov.source_entity_id.clone()),
+                    Value::Text(prov.agent_id.clone()),
+                    Value::Text(prov.tenant.clone()),
+                ],
+            )
+            .await?;
+
+        // Attempt the per-source contribution. The affected-row count IS the
+        // independence decision: 1 = genuinely new origin source, 0 = this
+        // source already contributed and must not corroborate again. No
+        // SELECT-first — the count answers it atomically. On a duplicate the
+        // stored contribution's confidence and provenance stay immutable: a
+        // later extraction from the same source cannot raise or replace its
+        // numeric contribution.
+        let inserted = self
+            .conn
+            .execute(
+                r#"INSERT INTO prov_assertion_evidence
+                   (assertion_id, source_key, source_entity_id, source_revision_id,
+                    activity_id, agent_id, confidence, evidence_class,
+                    confidence_kind, legacy_corroborations)
+                   VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, 'source', NULL)
+                   ON CONFLICT(assertion_id, source_key) DO NOTHING"#,
+                [
+                    Value::Text(id.clone()),
+                    Value::Text(source_key.clone()),
+                    Value::Text(prov.source_entity_id.clone()),
+                    Value::Text(prov.activity_id.clone()),
+                    Value::Text(prov.agent_id.clone()),
+                    Value::Real(confidence_evidence),
+                    Value::Text(evidence_class.as_str().to_string()),
+                ],
+            )
+            .await?;
+
+        // The evidence class may DOWNGRADE — even from a duplicate source —
+        // and never upgrades: agreement cannot turn literature into GREEN,
+        // and a source re-read at lower rigor taints what it previously
+        // claimed. Unknown stored values normalize to 'indeterminate'.
+        const WORST_CLASS_CASE: &str = r#"CASE
+                WHEN evidence_class NOT IN (
+                    'indeterminate',
+                    'research',
+                    'screening',
+                    'reference_validated'
+                ) THEN 'indeterminate'
+                WHEN evidence_class = 'indeterminate' OR ?CLASS = 'indeterminate'
+                    THEN 'indeterminate'
+                WHEN evidence_class = 'research' OR ?CLASS = 'research'
+                    THEN 'research'
+                WHEN evidence_class = 'screening' OR ?CLASS = 'screening'
+                    THEN 'screening'
+                ELSE 'reference_validated'
+            END"#;
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE prov_assertion_evidence SET evidence_class = {} \
+                     WHERE assertion_id = ?1 AND source_key = ?2",
+                    WORST_CLASS_CASE.replace("?CLASS", "?3"),
+                ),
+                [
+                    Value::Text(id.clone()),
+                    Value::Text(source_key),
+                    Value::Text(evidence_class.as_str().to_string()),
+                ],
+            )
+            .await?;
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE prov_assertion SET evidence_class = {} WHERE id = ?1",
+                    WORST_CLASS_CASE.replace("?CLASS", "?2"),
+                ),
+                [
+                    Value::Text(id.clone()),
+                    Value::Text(evidence_class.as_str().to_string()),
+                ],
+            )
+            .await?;
+
+        // The aggregate runs ONLY when the evidence INSERT actually inserted
+        // a row. Entirely in SQL under the held write lock — no application-
+        // side old-value read, so no increment can be lost to a concurrent
+        // writer.
+        //
+        // ORDER-INDEPENDENT by construction: the stored sufficient
+        // statistics are a running PRODUCT of (1 - c_i) (`confidence_doubt`)
+        // and a running MAX c_i (`confidence_max`), both commutative, so
+        // the aggregate is a function of the evidence SET, not of arrival
+        // order. (The old form combined incrementally against the running
+        // `confidence` — MAX(old, combined) — so {1.0, 0.8} yielded 1.0 or
+        // 0.99 depending on which source committed first. Exact to the last
+        // ULP for any two sources; for three or more, product association
+        // order can differ by ~1e-16, never by a rank.)
+        //
+        // Lazy seeding: rows written before the columns existed have NULL
+        // statistics; COALESCE treats their stored confidence as ONE
+        // pseudo-contribution (doubt = 1 - c, max = c) — the same freeze the
+        // v5 evidence migration chose. A fresh aggregate row has confidence
+        // 0.0, which seeds doubt 1.0 / max 0.0, so the first contribution
+        // needs no special case.
+        if inserted == 1 {
             self.conn
                 .execute(
                     r#"UPDATE prov_assertion
-                       SET confidence = ?1, corroborations = ?2,
-                           activity_id = ?3, source = ?4, agent = ?5,
-                           value = ?6, unit = ?7, conditions_json = ?8,
-                           evidence_class = ?9
-                       WHERE id = ?10"#,
-                    [
-                        Value::Real(corroborate_confidence(old_conf, confidence_evidence)),
-                        Value::Integer(old_corr + 1),
-                        Value::Text(prov.activity_id.clone()),
-                        Value::Text(prov.source_entity_id.clone()),
-                        Value::Text(prov.agent_id.clone()),
-                        value.map_or(Value::Null, Value::Real),
-                        unit.map_or(Value::Null, |unit| Value::Text(unit.to_string())),
-                        Value::Text(conditions_json),
-                        Value::Text(retained_class.as_str().to_string()),
-                        Value::Text(id),
-                    ],
+                       SET confidence_doubt = COALESCE(
+                               confidence_doubt,
+                               1.0 - MAX(0.0, MIN(1.0, COALESCE(confidence, 0.0)))
+                           ) * (1.0 - ?2),
+                           confidence_max = MAX(
+                               COALESCE(
+                                   confidence_max,
+                                   MAX(0.0, MIN(1.0, COALESCE(confidence, 0.0)))
+                               ),
+                               ?2
+                           ),
+                           corroborations = COALESCE(corroborations, 0) + 1
+                       WHERE id = ?1"#,
+                    [Value::Text(id.clone()), Value::Real(confidence_evidence)],
                 )
                 .await?;
-        } else {
+            // Derived in a second statement so it reads the statistics just
+            // written, with no reliance on old-row visibility inside one
+            // UPDATE. MAX(strongest single source, capped noisy-OR): a lone
+            // certain source stays 1.0 — whenever it arrives — while
+            // agreement alone never reaches certainty (0.99 cap).
             self.conn
                 .execute(
-                    r#"INSERT INTO prov_assertion
-                       (id, subject, predicate, object, value, unit,
-                        conditions_json, evidence_class, confidence, corroborations,
-                        activity_id, source, agent, tenant)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                               ?11, ?12, ?13, ?14)"#,
-                    [
-                        Value::Text(id),
-                        Value::Text(a.subject.clone()),
-                        Value::Text(a.predicate.clone()),
-                        Value::Text(a.object.clone()),
-                        value.map_or(Value::Null, Value::Real),
-                        unit.map_or(Value::Null, |unit| Value::Text(unit.to_string())),
-                        Value::Text(conditions_json),
-                        Value::Text(evidence_class.as_str().to_string()),
-                        Value::Real(confidence_evidence),
-                        Value::Integer(1),
-                        Value::Text(prov.activity_id.clone()),
-                        Value::Text(prov.source_entity_id.clone()),
-                        Value::Text(prov.agent_id.clone()),
-                        Value::Text(prov.tenant.clone()),
-                    ],
+                    r#"UPDATE prov_assertion
+                       SET confidence = MAX(
+                               confidence_max,
+                               MIN(0.99, 1.0 - confidence_doubt)
+                           )
+                       WHERE id = ?1"#,
+                    [Value::Text(id)],
                 )
                 .await?;
         }
@@ -1687,6 +2401,49 @@ impl ProvenanceStore {
             });
         }
         Ok(facts)
+    }
+
+    /// Every distinct origin source contributing to one (unconditioned)
+    /// assertion, ordered by source key.
+    ///
+    /// The parent row's `source`/`agent`/`activity_id` freeze the FIRST
+    /// attribution; corroborating sources are visible only here.
+    pub async fn assertion_evidence(
+        &self,
+        tenant: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Vec<EvidenceContribution>> {
+        let id = assertion_id(tenant, subject, predicate, object);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT source_key, source_entity_id, activity_id, agent_id, \
+                        confidence, evidence_class, confidence_kind, legacy_corroborations \
+                 FROM prov_assertion_evidence WHERE assertion_id = ?1 \
+                 ORDER BY source_key",
+                [Value::Text(id)],
+            )
+            .await?;
+        let mut contributions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            contributions.push(EvidenceContribution {
+                source_key: get_str(&row, 0)?,
+                source_entity_id: get_str(&row, 1)?,
+                activity_id: get_str(&row, 2)?,
+                agent_id: get_str(&row, 3)?,
+                confidence: row
+                    .get_value(4)
+                    .ok()
+                    .and_then(|v| v.as_real().copied())
+                    .unwrap_or(0.0),
+                evidence_class: EvidenceClass::from_stored(&get_str(&row, 5)?),
+                confidence_kind: get_str(&row, 6)?,
+                legacy_corroborations: row.get_value(7).ok().and_then(|v| v.as_integer().copied()),
+            });
+        }
+        Ok(contributions)
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1970,6 +2727,16 @@ mod tests {
         }
     }
 
+    /// [`test_prov`] with its own source and activity — corroboration is
+    /// keyed on the ORIGIN SOURCE, so tests vary source and run separately.
+    fn prov_from(source: &str, activity: &str) -> LocalProvenance {
+        LocalProvenance {
+            activity_id: activity.into(),
+            source_entity_id: source.into(),
+            ..test_prov()
+        }
+    }
+
     fn fact(kind: &str, subject: &str, predicate: &str, object: &str) -> LocalFact {
         LocalFact {
             subject: subject.into(),
@@ -2235,7 +3002,8 @@ mod tests {
         store.write_fact(&f, &prov).await.unwrap();
 
         // Re-ingest never duplicates: 2 entities (Matter + Phase), 1 edge,
-        // 1 assertion (corroborated), 1 agent, 1 activity.
+        // 1 assertion (same source — merged, not corroborated), 1 agent,
+        // 1 activity.
         assert_eq!(count(&store, "SELECT COUNT(*) FROM emmo_entity").await, 2);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM emmo_edge").await, 1);
         assert_eq!(
@@ -2246,11 +3014,22 @@ mod tests {
         assert_eq!(count(&store, "SELECT COUNT(*) FROM prov_activity").await, 1);
     }
 
+    /// Re-recording the same triple from the SAME origin source is one
+    /// observation, not two.
+    ///
+    /// This test replaces `same_triple_twice_corroborates_one_assertion`,
+    /// which pinned the DEFECT as intended behavior: it asserted that two
+    /// records of one document yield `corroborations = 2` and noisy-OR
+    /// confidence 0.96 — i.e. that re-ingesting a paper (or watch mode
+    /// re-scanning it) manufactures agreement. The product's thesis is
+    /// provenance-weighted convergence; a store that cannot tell twelve
+    /// papers agreeing from one ingest repeated twelve times has no
+    /// convergence signal at all. Confidence must stay at the single
+    /// source's 0.8, and the first attribution must survive the re-record.
     #[tokio::test]
-    async fn same_triple_twice_corroborates_one_assertion() {
+    async fn same_source_twice_does_not_corroborate() {
         let db = TempDb::new();
         let store = ProvenanceStore::open(&db.path).await.unwrap();
-        let prov = test_prov();
         let a = LocalAssertion {
             subject: "Ti-6Al-4V".into(),
             predicate: "has_phase".into(),
@@ -2258,24 +3037,46 @@ mod tests {
             confidence: Some(0.8),
         };
 
-        store.record_assertion(&a, &prov).await.unwrap();
-        store.record_assertion(&a, &prov).await.unwrap();
+        // Same `source_entity_id` (and thus the same origin key), two
+        // different ingest runs by a different extractor build.
+        let first = prov_from("doc:test_paper", "act_test_1");
+        let mut second = prov_from("doc:test_paper", "act_test_2");
+        second.agent_id = "second-extractor".into();
+        store.record_assertion(&a, &first).await.unwrap();
+        store.record_assertion(&a, &second).await.unwrap();
 
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
             1
         );
         assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "a duplicate source must not add an evidence contribution"
+        );
+        assert_eq!(
             count(&store, "SELECT corroborations FROM prov_assertion").await,
-            2
+            1,
+            "the same source re-recorded must not count as corroboration"
         );
 
-        // Noisy-OR: 1 - (1-0.8)*(1-0.8) = 0.96 — combined and strictly higher.
         let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
         assert_eq!(facts.len(), 1);
-        assert!((facts[0].confidence - 0.96).abs() < 1e-9);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "same-source repetition inflated confidence to {}",
+            facts[0].confidence
+        );
+
+        // First attribution is immutable: source, activity, and agent all
+        // stay with the FIRST committed writer.
         assert_eq!(facts[0].source, "doc:test_paper");
         assert_eq!(facts[0].agent, "gemma-4-12b");
+        assert_eq!(
+            query_str(&store, "SELECT activity_id FROM prov_assertion").await,
+            "act_test_1",
+            "the re-record overwrote the first activity attribution"
+        );
 
         // recall is ordered by confidence DESC.
         let weak = LocalAssertion {
@@ -2284,7 +3085,7 @@ mod tests {
             object: "beta".into(),
             confidence: Some(0.3),
         };
-        store.record_assertion(&weak, &prov).await.unwrap();
+        store.record_assertion(&weak, &first).await.unwrap();
         let facts = store.recall("Ti-6Al-4V", "t1", 10).await.unwrap();
         assert_eq!(facts.len(), 2);
         assert!(facts[0].confidence >= facts[1].confidence);
@@ -2297,6 +3098,992 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A genuinely different origin source IS new evidence: one assertion,
+    /// two evidence contributions, noisy-OR 1-(1-0.8)² = 0.96.
+    #[tokio::test]
+    async fn a_second_source_corroborates_with_noisy_or() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        store
+            .record_assertion(&a, &prov_from("doc:paper_a", "act_a"))
+            .await
+            .unwrap();
+        store
+            .record_assertion(&a, &prov_from("doc:paper_b", "act_b"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2
+        );
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2
+        );
+
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.96).abs() < 1e-9,
+            "two independent 0.8 sources must noisy-OR to 0.96, got {}",
+            facts[0].confidence
+        );
+        // Parent attribution remains the FIRST source; B is not lost — it
+        // lives in the evidence table (see the first-attribution test).
+        assert_eq!(facts[0].source, "doc:paper_a");
+        let sources: Vec<String> = store
+            .assertion_evidence("t1", "Ti-6Al-4V", "has_phase", "alpha-beta")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|contribution| contribution.source_entity_id)
+            .collect();
+        assert_eq!(sources, vec!["doc:paper_a", "doc:paper_b"]);
+    }
+
+    /// A, B, A: the third record is a repeat of A and must not become a
+    /// third contribution.
+    #[tokio::test]
+    async fn a_b_a_does_not_count_a_twice() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for (source, activity) in [
+            ("doc:paper_a", "act_1"),
+            ("doc:paper_b", "act_2"),
+            ("doc:paper_a", "act_3"),
+        ] {
+            store
+                .record_assertion(&a, &prov_from(source, activity))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2,
+            "the repeat of source A became a third contribution"
+        );
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2
+        );
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert!(
+            (facts[0].confidence - 0.96).abs() < 1e-9,
+            "A,B,A must score exactly like A,B: {}",
+            facts[0].confidence
+        );
+    }
+
+    /// First attribution survives corroboration, and the corroborating
+    /// source is queryable from the evidence table with its own
+    /// activity/agent — nothing about B is lost by keeping A on the parent.
+    #[tokio::test]
+    async fn first_attribution_is_immutable_and_every_source_stays_queryable() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        let prov_a = prov_from("doc:paper_a", "act_a");
+        let mut prov_b = prov_from("doc:paper_b", "act_b");
+        prov_b.agent_id = "agent-b".into();
+        store.record_assertion(&a, &prov_a).await.unwrap();
+        store.record_assertion(&a, &prov_b).await.unwrap();
+
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert_eq!(facts[0].source, "doc:paper_a", "parent source must stay A");
+        assert_eq!(facts[0].agent, "gemma-4-12b", "parent agent must stay A's");
+        assert_eq!(
+            query_str(&store, "SELECT activity_id FROM prov_assertion").await,
+            "act_a",
+            "parent activity must stay A's"
+        );
+
+        let evidence = store
+            .assertion_evidence("t1", "Ti-6Al-4V", "has_phase", "alpha-beta")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 2);
+        let b = evidence
+            .iter()
+            .find(|contribution| contribution.source_entity_id == "doc:paper_b")
+            .expect("source B must be queryable from the evidence table");
+        assert_eq!(b.activity_id, "act_b");
+        assert_eq!(b.agent_id, "agent-b");
+        assert!((b.confidence - 0.8).abs() < 1e-9);
+        assert_eq!(b.confidence_kind, "source");
+        assert_eq!(b.legacy_corroborations, None);
+    }
+
+    /// The evidence class may only ever get WORSE — agreement cannot turn
+    /// literature into GREEN, and a source re-read at lower rigor taints
+    /// what it previously claimed without touching confidence or counts.
+    #[tokio::test]
+    async fn evidence_class_downgrades_and_never_upgrades() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+        // screening (A) then reference_validated (B): the parent keeps the
+        // WORST class even though B is better and B genuinely corroborates.
+        store
+            .record_assertion_with_context(
+                &a,
+                &prov_from("doc:paper_a", "act_1"),
+                None,
+                None,
+                &[],
+                EvidenceClass::Screening,
+            )
+            .await
+            .unwrap();
+        store
+            .record_assertion_with_context(
+                &a,
+                &prov_from("doc:paper_b", "act_2"),
+                None,
+                None,
+                &[],
+                EvidenceClass::ReferenceValidated,
+            )
+            .await
+            .unwrap();
+        let facts = store
+            .recall_with_context("alpha-beta", "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts[0].evidence_class, EvidenceClass::Screening);
+        assert!((facts[0].confidence - 0.96).abs() < 1e-9);
+
+        // The SAME source re-recorded as indeterminate: class downgrades on
+        // both the contribution and the parent, confidence and count do not
+        // move.
+        store
+            .record_assertion_with_context(
+                &a,
+                &prov_from("doc:paper_a", "act_3"),
+                None,
+                None,
+                &[],
+                EvidenceClass::Indeterminate,
+            )
+            .await
+            .unwrap();
+        let facts = store
+            .recall_with_context("alpha-beta", "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts[0].evidence_class, EvidenceClass::Indeterminate);
+        assert!(
+            (facts[0].confidence - 0.96).abs() < 1e-9,
+            "a duplicate-source downgrade must not change confidence: {}",
+            facts[0].confidence
+        );
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2
+        );
+
+        // A later better class never upgrades either row back.
+        store
+            .record_assertion_with_context(
+                &a,
+                &prov_from("doc:paper_a", "act_4"),
+                None,
+                None,
+                &[],
+                EvidenceClass::Screening,
+            )
+            .await
+            .unwrap();
+        let facts = store
+            .recall_with_context("alpha-beta", "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            facts[0].evidence_class,
+            EvidenceClass::Indeterminate,
+            "a later better class must not upgrade the parent"
+        );
+        let evidence = store
+            .assertion_evidence("t1", "Ti-6Al-4V", "has_phase", "alpha-beta")
+            .await
+            .unwrap();
+        let class_for = |source: &str| {
+            evidence
+                .iter()
+                .find(|contribution| contribution.source_entity_id == source)
+                .map(|contribution| contribution.evidence_class)
+        };
+        assert_eq!(
+            class_for("doc:paper_a"),
+            Some(EvidenceClass::Indeterminate),
+            "A's contribution must keep its worst class"
+        );
+        assert_eq!(
+            class_for("doc:paper_b"),
+            Some(EvidenceClass::ReferenceValidated),
+            "B's contribution must be untouched by A's downgrade"
+        );
+    }
+
+    /// Research vs screening on a DUPLICATE source: research is the WORSE
+    /// class (`rank()`: Indeterminate 0 < Research 1 < Screening 2 <
+    /// ReferenceValidated 3) and must win, while the duplicate source
+    /// changes neither confidence nor corroborations. Pins the branch order
+    /// in `WORST_CLASS_CASE`, which reads counter-intuitively (research
+    /// checked before screening) but is CORRECT: it selects the
+    /// lowest-ranked class present. Swapping those arms would wrongly keep
+    /// 'screening'.
+    #[tokio::test]
+    async fn research_downgrades_screening_on_duplicate_source() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+        for (activity, class) in [
+            ("act_1", EvidenceClass::Screening),
+            ("act_2", EvidenceClass::Research),
+        ] {
+            store
+                .record_assertion_with_context(
+                    &a,
+                    &prov_from("doc:paper_a", activity),
+                    None,
+                    None,
+                    &[],
+                    class,
+                )
+                .await
+                .unwrap();
+        }
+        let facts = store
+            .recall_with_context("alpha-beta", "t1", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            facts[0].evidence_class,
+            EvidenceClass::Research,
+            "research (rank 1) is worse than screening (rank 2) and must win"
+        );
+        assert_eq!(
+            query_str(&store, "SELECT evidence_class FROM prov_assertion_evidence").await,
+            "research",
+            "the stored contribution itself must carry the downgrade"
+        );
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            1,
+            "a duplicate source must not corroborate"
+        );
+        let plain = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert!(
+            (plain[0].confidence - 0.8).abs() < 1e-9,
+            "a duplicate source must not move confidence, got {}",
+            plain[0].confidence
+        );
+    }
+
+    /// The independence key collapses the obvious aliases of one source and
+    /// keeps genuinely different sources apart.
+    #[test]
+    fn origin_source_key_normalizes() {
+        // A relay carries someone else's knowledge: one conservative key,
+        // regardless of which peer relayed it.
+        assert_eq!(
+            origin_source_key("http://peer-one.example/api#ds", true),
+            "mesh:unattributed"
+        );
+
+        // DOI forms collapse: raw, resolver URL, percent-encoded, any case.
+        assert_eq!(
+            origin_source_key("doi:10.1234/AbC", false),
+            "doi:10.1234/abc"
+        );
+        assert_eq!(
+            origin_source_key("  https://doi.org/10.1234/AbC  ", false),
+            "doi:10.1234/abc"
+        );
+        assert_eq!(
+            origin_source_key("http://dx.doi.org/10.1234%2Fabc", false),
+            "doi:10.1234/abc"
+        );
+        assert_eq!(
+            origin_source_key("doi:10.1234%2FAbC", false),
+            "doi:10.1234/abc",
+            "the doi: form travels percent-encoded too and must decode like the resolver forms"
+        );
+        assert_eq!(
+            origin_source_key("doi:10.1234%252Fabc", false),
+            "doi:10.1234%2fabc",
+            "decoding applies exactly once: a doubly-encoded slash names a DOI containing a literal %2F, not the plain-slash DOI"
+        );
+
+        // URLs: scheme/host case, default port, fragment, and dot segments
+        // normalize away; the query string AND ITS ORDER are preserved.
+        assert_eq!(
+            origin_source_key("HTTPS://Example.com:443/a/./b/../c?q=1&r=2#frag", false),
+            "url:https://example.com/a/c?q=1&r=2"
+        );
+        assert_eq!(
+            origin_source_key("http://example.com", false),
+            origin_source_key("http://example.com/", false),
+        );
+        assert_ne!(
+            origin_source_key("https://e.com/p?a=1&b=2", false),
+            origin_source_key("https://e.com/p?b=2&a=1", false),
+            "query order is preserved — aggressive merging is the wrong direction"
+        );
+
+        // File paths: file:// URI and plain absolute path, `//` and dot
+        // segments, all one key. No filesystem access is involved.
+        assert_eq!(
+            origin_source_key("file:///data//papers/./x.pdf", false),
+            "file:/data/papers/x.pdf"
+        );
+        assert_eq!(
+            origin_source_key("/data/papers/other/../x.pdf", false),
+            "file:/data/papers/x.pdf"
+        );
+        // RFC 8089: an empty authority and `localhost` both mean this
+        // machine; the scheme is case-insensitive like every other scheme.
+        assert_eq!(
+            origin_source_key("file://localhost/data//papers/./x.pdf", false),
+            "file:/data/papers/x.pdf"
+        );
+        assert_eq!(
+            origin_source_key("FILE:///data/papers/x.pdf", false),
+            "file:/data/papers/x.pdf"
+        );
+        // A genuine remote authority is a DIFFERENT source from the local
+        // path of the same spelling — merging them would drop evidence.
+        assert_eq!(
+            origin_source_key("file://FileServer/share/x.pdf", false),
+            "file://fileserver/share/x.pdf"
+        );
+        assert_ne!(
+            origin_source_key("file://fileserver/share/x.pdf", false),
+            origin_source_key("/fileserver/share/x.pdf", false),
+            "a remote file authority must not collide with a local path"
+        );
+
+        // Opaque relative paths get the file branch's lexical cleanup
+        // (defensive: the live ingest path canonicalizes to an absolute
+        // path and reaches the `/` branch instead).
+        for alias in ["data/x.pdf", "./data/x.pdf", "data/./x.pdf", "data//x.pdf"] {
+            assert_eq!(
+                origin_source_key(alias, false),
+                "opaque:data/x.pdf",
+                "{alias:?} must collapse to the plain relative path"
+            );
+        }
+
+        // Importer-assigned document ids are case-insensitive.
+        assert_eq!(
+            origin_source_key("document:0A3F", false),
+            origin_source_key("DOCUMENT:0a3f", false),
+        );
+
+        // Anything else is opaque: stable per exact trimmed string.
+        assert_eq!(
+            origin_source_key(" doc:test_paper ", false),
+            "opaque:doc:test_paper"
+        );
+        assert_ne!(
+            origin_source_key("doc:a", false),
+            origin_source_key("doc:b", false)
+        );
+    }
+
+    /// End to end: the same paper reached by DOI and by resolver URL is ONE
+    /// source; a file re-reached through a lexical path alias is ONE source.
+    #[tokio::test]
+    async fn doi_and_file_aliases_corroborate_once() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        store
+            .record_assertion(&a, &prov_from("doi:10.1234/AbC", "act_1"))
+            .await
+            .unwrap();
+        store
+            .record_assertion(&a, &prov_from("https://doi.org/10.1234/abc", "act_2"))
+            .await
+            .unwrap();
+        store
+            .record_assertion(&a, &prov_from("doi:10.1234%2FAbC", "act_2b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "the DOI resolver URL and the percent-encoded doi: form are the same paper, not extra sources"
+        );
+
+        store
+            .record_assertion(&a, &prov_from("/data/papers/a.pdf", "act_3"))
+            .await
+            .unwrap();
+        store
+            .record_assertion(
+                &a,
+                &prov_from("file:///data/papers/../papers/a.pdf", "act_4"),
+            )
+            .await
+            .unwrap();
+        store
+            .record_assertion(
+                &a,
+                &prov_from("file://localhost/data/papers/a.pdf", "act_5"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2,
+            "the file:// and file://localhost/ aliases must merge; the file itself is a genuine second source"
+        );
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2
+        );
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert!((facts[0].confidence - 0.96).abs() < 1e-9);
+    }
+
+    /// Writers sharing ONE store handle must serialize on the internal
+    /// write mutex, not race the raw `BEGIN IMMEDIATE` into "cannot start a
+    /// transaction within a transaction" and silently lose facts
+    /// (`ProvenanceStore::write_lock`). Needs a multi-thread runtime: on a
+    /// current-thread runtime turso's statements complete without yielding,
+    /// so single-threaded interleaving cannot reproduce the race. Separate
+    /// handles are covered by the concurrent-writer tests; this pins the
+    /// same-handle case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_writers_on_one_handle_serialize() {
+        let db = TempDb::new();
+        let store = std::sync::Arc::new(ProvenanceStore::open(&db.path).await.unwrap());
+        let mut writers = tokio::task::JoinSet::new();
+        for writer in 0..4 {
+            let store = store.clone();
+            writers.spawn(async move {
+                for i in 0..8 {
+                    let a = LocalAssertion {
+                        subject: "Ti-6Al-4V".into(),
+                        predicate: "has_phase".into(),
+                        object: format!("phase_{writer}_{i}"),
+                        confidence: Some(0.8),
+                    };
+                    let prov = prov_from(
+                        &format!("doc:paper_{writer}_{i}"),
+                        &format!("act_{writer}_{i}"),
+                    );
+                    store.record_assertion(&a, &prov).await?;
+                }
+                anyhow::Ok(())
+            });
+        }
+        while let Some(joined) = writers.join_next().await {
+            joined
+                .unwrap()
+                .expect("a same-handle writer must serialize, not error");
+        }
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            32,
+            "every same-handle writer's facts must land"
+        );
+    }
+
+    /// The parent confidence is a function of the evidence SET, not of
+    /// arrival order: {1.0, 0.8} must combine identically whichever source
+    /// commits first, and the certain source keeps certainty even when it
+    /// arrives second. Asymmetric values on purpose — a symmetric pair like
+    /// {0.8, 0.8} cannot expose order dependence, which is why the
+    /// concurrency tests never saw it.
+    #[tokio::test]
+    async fn confidence_is_order_independent_across_arrival_orders() {
+        async fn combined(first: (&str, f64), second: (&str, f64)) -> f64 {
+            let db = TempDb::new();
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            for (i, (source, confidence)) in [first, second].into_iter().enumerate() {
+                let a = LocalAssertion {
+                    subject: "Ti-6Al-4V".into(),
+                    predicate: "has_phase".into(),
+                    object: "alpha-beta".into(),
+                    confidence: Some(confidence),
+                };
+                store
+                    .record_assertion(&a, &prov_from(source, &format!("act_{i}")))
+                    .await
+                    .unwrap();
+            }
+            let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+            facts[0].confidence
+        }
+
+        let certain_first = combined(("doc:certain", 1.0), ("doc:strong", 0.8)).await;
+        let certain_second = combined(("doc:strong", 0.8), ("doc:certain", 1.0)).await;
+        assert!(
+            (certain_first - certain_second).abs() < 1e-12,
+            "identical evidence must not report different confidence by \
+             arrival order: {certain_first} vs {certain_second}"
+        );
+        assert!(
+            (certain_second - 1.0).abs() < 1e-9,
+            "a certain source must keep certainty regardless of arrival \
+             position, got {certain_second}"
+        );
+    }
+
+    /// Two mesh peers relaying the same assertion are relays, not two
+    /// independent sources: everything unattributed collapses onto ONE
+    /// conservative contribution.
+    #[tokio::test]
+    async fn mesh_relays_collapse_to_one_unattributed_source() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for (peer, activity) in [
+            ("http://peer-one.example/api#dataset", "act_m1"),
+            ("http://peer-two.example/api#dataset", "act_m2"),
+        ] {
+            let mut prov = prov_from(peer, activity);
+            prov.tenant = "mesh".into();
+            prov.locality = "mesh".into();
+            store.record_assertion(&a, &prov).await.unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "two peers echoing one fact must not count as two sources"
+        );
+        assert_eq!(
+            query_str(&store, "SELECT source_key FROM prov_assertion_evidence").await,
+            "mesh:unattributed"
+        );
+        let facts = store.recall("alpha-beta", "mesh", 10).await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "relayed repetition inflated confidence to {}",
+            facts[0].confidence
+        );
+    }
+
+    /// Two concurrent writers, same assertion, same source: both succeed,
+    /// one evidence row, confidence unchanged — no key conflict escapes and
+    /// no phantom corroboration happens.
+    ///
+    /// This is the read-modify-write race the transaction exists for: the
+    /// old path had both writers SELECT nothing, both INSERT, and the loser
+    /// abort its whole document on the primary-key error.
+    #[tokio::test]
+    async fn concurrent_same_source_writers_both_succeed_with_one_contribution() {
+        let db = TempDb::new();
+        // Stamp schema + migrations once so the racers race on the write
+        // path itself, not on `open()`.
+        drop(ProvenanceStore::open(&db.path).await.unwrap());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut writers = Vec::new();
+        for activity in ["act_r1", "act_r2"] {
+            let path = db.path.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let store = ProvenanceStore::open(&path).await?;
+                    let a = LocalAssertion {
+                        subject: "Ti-6Al-4V".into(),
+                        predicate: "has_phase".into(),
+                        object: "alpha-beta".into(),
+                        confidence: Some(0.8),
+                    };
+                    let prov = prov_from("doc:test_paper", activity);
+                    barrier.wait();
+                    store.record_assertion(&a, &prov).await
+                })
+            }));
+        }
+        for writer in writers {
+            writer
+                .join()
+                .expect("writer thread panicked")
+                .expect("both concurrent same-source writers must succeed");
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            1,
+            "a concurrent duplicate of the same source became a second contribution"
+        );
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert!(
+            (facts[0].confidence - 0.8).abs() < 1e-9,
+            "the concurrent duplicate corroborated: {}",
+            facts[0].confidence
+        );
+    }
+
+    /// Two concurrent writers with genuinely different sources: both count,
+    /// atomically — two evidence rows, corroborations 2, noisy-OR 0.96, and
+    /// whichever transaction committed first owns the parent attribution.
+    #[tokio::test]
+    async fn concurrent_different_source_writers_both_count() {
+        let db = TempDb::new();
+        drop(ProvenanceStore::open(&db.path).await.unwrap());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut writers = Vec::new();
+        for (source, activity) in [("doc:paper_a", "act_a"), ("doc:paper_b", "act_b")] {
+            let path = db.path.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let store = ProvenanceStore::open(&path).await?;
+                    let a = LocalAssertion {
+                        subject: "Ti-6Al-4V".into(),
+                        predicate: "has_phase".into(),
+                        object: "alpha-beta".into(),
+                        confidence: Some(0.8),
+                    };
+                    let prov = prov_from(source, activity);
+                    barrier.wait();
+                    store.record_assertion(&a, &prov).await
+                })
+            }));
+        }
+        for writer in writers {
+            writer
+                .join()
+                .expect("writer thread panicked")
+                .expect("both concurrent different-source writers must succeed");
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2,
+            "an increment was lost — both sources must contribute"
+        );
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2
+        );
+        let facts = store.recall("alpha-beta", "t1", 10).await.unwrap();
+        assert!(
+            (facts[0].confidence - 0.96).abs() < 1e-9,
+            "both contributions must noisy-OR: {}",
+            facts[0].confidence
+        );
+        // The parent's first attribution is whichever COMMITTED first —
+        // deliberately not asserting which.
+        assert!(
+            ["doc:paper_a", "doc:paper_b"].contains(&facts[0].source.as_str()),
+            "parent attribution must be one of the racers: {}",
+            facts[0].source
+        );
+    }
+
+    /// A writer that meets a short-lived competing transaction WAITS (busy
+    /// timeout) and then succeeds — it does not fail fast and it does not
+    /// skip the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_competing_writer_waits_then_succeeds() {
+        let db = TempDb::new();
+        let holder = ProvenanceStore::open(&db.path).await.unwrap();
+        let writer = ProvenanceStore::open(&db.path).await.unwrap();
+
+        holder.conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            holder.conn.execute("COMMIT", ()).await.unwrap();
+        });
+
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+        let started = std::time::Instant::now();
+        writer
+            .record_assertion(&a, &prov_from("doc:test_paper", "act_1"))
+            .await
+            .expect("a short competing transaction must mean WAIT, not failure");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "the writer did not actually contend for the lock — the test is a no-op"
+        );
+        release.await.unwrap();
+
+        assert_eq!(
+            count(&writer, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+    }
+
+    /// A lock held PAST the busy timeout is a typed, retriable error and
+    /// leaves no partial fact — never silent success, never a fake
+    /// duplicate. (Takes ~5s: the full busy timeout must actually elapse.)
+    #[tokio::test]
+    async fn a_lock_held_past_the_timeout_is_a_typed_busy_error() {
+        let db = TempDb::new();
+        let holder = ProvenanceStore::open(&db.path).await.unwrap();
+        let writer = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        holder.conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        let err = writer
+            .record_assertion(&a, &prov_from("doc:test_paper", "act_1"))
+            .await
+            .expect_err("the lock outlives the busy timeout — success would be a lie");
+        assert!(
+            err.downcast_ref::<StoreBusy>().is_some(),
+            "busy must surface as the typed retriable StoreBusy, got: {err:#}"
+        );
+        holder.conn.execute("ROLLBACK", ()).await.unwrap();
+
+        // No partial fact: no assertion, no evidence, no activity.
+        for table in ["prov_assertion", "prov_assertion_evidence", "prov_activity"] {
+            assert_eq!(
+                count(&writer, &format!("SELECT COUNT(*) FROM {table}")).await,
+                0,
+                "a failed write left partial rows in {table}"
+            );
+        }
+
+        // Retriable means exactly that: the same call now goes through.
+        writer
+            .record_assertion(&a, &prov_from("doc:test_paper", "act_1"))
+            .await
+            .expect("the busy error must be retriable once the lock is released");
+        assert_eq!(
+            count(&writer, "SELECT COUNT(*) FROM prov_assertion").await,
+            1
+        );
+    }
+
+    /// v5 migration: a pre-evidence row with an inflated `corroborations`
+    /// collapses to its one identifiable source, KEEPS its stored (possibly
+    /// phantom) confidence, and is permanently marked `legacy_aggregate` on
+    /// both the contribution and the parent. Idempotent across reopens and
+    /// even across a forced re-run.
+    #[tokio::test]
+    async fn legacy_corroborations_collapse_to_one_marked_contribution() {
+        let db = TempDb::new();
+        let id = assertion_id("t1", "steel", "has_phase", "bcc");
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            drop(store); // schema now exists
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant)
+                   VALUES (?1, 'steel', 'has_phase', 'bcc', '[]', 'research',
+                           0.96, 2, 'act_legacy', 'legacy.csv', 'legacy-agent', 't1')"#,
+                [Value::Text(id.clone())],
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+        }
+
+        async fn assert_migrated(store: &ProvenanceStore) {
+            assert_eq!(
+                count(store, "SELECT corroborations FROM prov_assertion").await,
+                1,
+                "the phantom per-ingest count must collapse to the one known source"
+            );
+            let facts = store.recall("steel", "t1", 10).await.unwrap();
+            assert!(
+                (facts[0].confidence - 0.96).abs() < 1e-9,
+                "migration must keep the stored confidence, not invent one: {}",
+                facts[0].confidence
+            );
+            assert_eq!(
+                query_str(store, "SELECT confidence_basis FROM prov_assertion").await,
+                "legacy_aggregate"
+            );
+            let evidence = store
+                .assertion_evidence("t1", "steel", "has_phase", "bcc")
+                .await
+                .unwrap();
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(evidence[0].source_key, "opaque:legacy.csv");
+            assert_eq!(evidence[0].confidence_kind, "legacy_aggregate");
+            assert_eq!(
+                evidence[0].legacy_corroborations,
+                Some(2),
+                "the old count must stay visible on the marked contribution"
+            );
+            assert_eq!(evidence[0].evidence_class, EvidenceClass::Research);
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_migrated(&store).await;
+
+        // Reopen: stamped, nothing re-runs, nothing changes.
+        drop(store);
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_migrated(&store).await;
+
+        // A real second source still corroborates the migrated row…
+        store
+            .record_assertion(
+                &LocalAssertion {
+                    subject: "steel".into(),
+                    predicate: "has_phase".into(),
+                    object: "bcc".into(),
+                    confidence: Some(0.5),
+                },
+                &prov_from("doc:new_paper", "act_new"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2
+        );
+
+        // …and a FORCED re-run over post-v5 data must not renormalize it:
+        // the evidence rows already exist, so the backfill must leave the
+        // real aggregates alone.
+        store
+            .conn
+            .execute("PRAGMA user_version = 0", ())
+            .await
+            .unwrap();
+        drop(store);
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT corroborations FROM prov_assertion").await,
+            2,
+            "a re-run backfill destroyed real post-migration corroborations"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2
+        );
+    }
+
+    /// The same source key under two tenants stays two assertions with two
+    /// independent evidence rows — the origin key does not weaken the
+    /// tenant-in-key design.
+    #[tokio::test]
+    async fn same_source_key_under_two_tenants_stays_two_assertions() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let a = LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            confidence: Some(0.8),
+        };
+
+        for tenant in ["t1", "t2"] {
+            let mut prov = prov_from("doc:shared_paper", &format!("act_{tenant}"));
+            prov.tenant = tenant.into();
+            store.record_assertion(&a, &prov).await.unwrap();
+        }
+
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            2
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion_evidence").await,
+            2
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(DISTINCT source_key) FROM prov_assertion_evidence"
+            )
+            .await,
+            1,
+            "one shared source key, two per-tenant contributions"
+        );
+        for tenant in ["t1", "t2"] {
+            let facts = store.recall("alpha-beta", tenant, 10).await.unwrap();
+            assert_eq!(facts.len(), 1);
+            assert!(
+                (facts[0].confidence - 0.8).abs() < 1e-9,
+                "{tenant} was corroborated by the other tenant's identical source"
+            );
+        }
     }
 
     #[test]
@@ -2869,12 +4656,17 @@ mod tests {
         let at_1300 = measurement(1300.0, EvidenceClass::Research);
         store.write_fact(&at_1200, &prov).await.unwrap();
         store.write_fact(&at_1300, &prov).await.unwrap();
-        // A later execution that agrees with the 1200 K value raises
-        // confidence but must not upgrade the literature-derived class.
+        // A later execution from a DIFFERENT origin source that agrees with
+        // the 1200 K value raises confidence but must not upgrade the
+        // literature-derived class. (Agreement from the SAME source would
+        // change nothing at all — see `same_source_twice_does_not_corroborate`.)
+        let mut replication = prov.clone();
+        replication.source_entity_id = "doc:replication_run".into();
+        replication.activity_id = "act_test_2".into();
         store
             .write_fact(
                 &measurement(1200.0, EvidenceClass::ReferenceValidated),
-                &prov,
+                &replication,
             )
             .await
             .unwrap();

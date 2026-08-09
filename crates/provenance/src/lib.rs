@@ -36,10 +36,10 @@ use uuid::Uuid;
 
 pub mod emmo;
 pub use emmo::{
-    ConditionValue, EvidenceClass, EvidenceSource, FactPayload, GraphEdge, GraphNode,
-    LocalAssertion, LocalFact, LocalProvenance, MaterialFact, MeasurementCondition, QudtUnit,
-    RecalledFact, RecalledMaterialFact, TraversalResult, assertion_id, canonical_key,
-    evidence_for_result,
+    ConditionValue, EvidenceClass, EvidenceContribution, EvidenceSource, FactPayload, GraphEdge,
+    GraphNode, LocalAssertion, LocalFact, LocalProvenance, MaterialFact, MeasurementCondition,
+    QudtUnit, RecalledFact, RecalledMaterialFact, StoreBusy, TraversalResult, assertion_id,
+    canonical_key, evidence_for_result,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +167,15 @@ async fn add_column_if_absent(
 
 pub struct ProvenanceStore {
     conn: turso::Connection,
+    /// Serializes write TRANSACTIONS issued through this one handle. The
+    /// write paths take `&self` but run a raw `BEGIN IMMEDIATE` on the
+    /// single shared connection, so without this two tasks writing through
+    /// ONE store (e.g. `tokio::join!` on an `Arc<ProvenanceStore>`) race
+    /// into "cannot start a transaction within a transaction" — an opaque
+    /// error, not `StoreBusy`, and the losing fact is silently not stored.
+    /// SEPARATE handles need no help: they serialize via the database busy
+    /// wait, which is what the concurrency tests exercise.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl ProvenanceStore {
@@ -201,8 +210,22 @@ impl ProvenanceStore {
         let mut busy = conn.query("PRAGMA busy_timeout=5000", ()).await?;
         while busy.next().await?.is_some() {}
 
+        // Enforce the evidence-table foreign key (`prov_assertion_evidence`
+        // → `prov_assertion`). Like SQLite, Turso leaves foreign keys OFF
+        // unless each connection opts in, and an unenforced FK is a lie in
+        // the schema. This is the only declared FK in the store, so turning
+        // enforcement on changes nothing else. Set before `init_schema` so
+        // the migrations run under the same rules as ordinary writes
+        // (`ON UPDATE CASCADE` keeps evidence rows attached across id
+        // re-keys).
+        let mut foreign_keys = conn.query("PRAGMA foreign_keys=ON", ()).await?;
+        while foreign_keys.next().await?.is_some() {}
+
         Self::init_schema(&conn).await?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            write_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     async fn init_schema(conn: &turso::Connection) -> Result<()> {
