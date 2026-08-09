@@ -207,6 +207,23 @@ pub struct MaterialFact {
     pub evidence_class: EvidenceClass,
 }
 
+/// The node labels ONE tabular fact write persists its subject and object
+/// under. Supplied by the ingest pipeline from the ACTIVE ontology's
+/// declared storage mapping (`Ontology::storage_label`), so the labels the
+/// store persists come from the same declaration the extraction prompt and
+/// the graph validator read — the store never invents a label on this path.
+/// The label is part of the entity KEY (`entity_key`), so it is identity,
+/// not decoration.
+///
+/// The synthetic `Measurement` node a `measurement`-kind fact mints is the
+/// one label this does not govern: it is the store's own fact shape, not an
+/// extracted entity.
+#[derive(Debug, Clone, Copy)]
+pub struct FactNodeLabels<'a> {
+    pub subject: &'a str,
+    pub object: &'a str,
+}
+
 /// Common storage view implemented by both the additive conditioned contract
 /// and the source-compatible legacy fact.
 pub trait FactPayload {
@@ -1839,20 +1856,37 @@ impl ProvenanceStore {
     /// exactly like core's typed `write_*_fact` writers, then reify it as a
     /// PROV-O assertion so graph and audit trail stay consistent.
     pub async fn write_fact<F: FactPayload>(&self, fact: &F, prov: &LocalProvenance) -> Result<()> {
-        self.write_fact_as(fact, prov, fact.evidence_class()).await
+        self.write_fact_as(fact, prov, fact.evidence_class(), None)
+            .await
     }
 
-    /// Store a source-compatible legacy fact with an explicit class. This is
-    /// used by the tabular LLM ingest path, whose old `LocalFact` shape cannot
-    /// carry the new field but whose origin is known to be literature/data
-    /// extraction (ORANGE), not an ungrounded model assertion (RED).
+    /// Store a source-compatible legacy fact with an explicit class and the
+    /// subject/object node labels the caller's ACTIVE ontology declares for
+    /// it. This is the tabular LLM ingest path: the old `LocalFact` shape
+    /// cannot carry the evidence field but its origin is known to be
+    /// literature/data extraction (ORANGE), not an ungrounded model
+    /// assertion (RED) — and its node labels come from the ontology
+    /// declaration the prompt and validator already read, never from this
+    /// store's legacy hardcoded vocabulary (which labeled every subject
+    /// `Matter` no matter what the prompt instructed, splitting the stored
+    /// vocabulary from the declared one).
     pub async fn write_fact_with_evidence(
         &self,
         fact: &LocalFact,
         prov: &LocalProvenance,
         evidence_class: EvidenceClass,
+        labels: FactNodeLabels<'_>,
     ) -> Result<()> {
-        self.write_fact_as(fact, prov, evidence_class).await
+        if labels.subject.trim().is_empty() || labels.object.trim().is_empty() {
+            bail!(
+                "refusing to write fact '{}' -[{}]-> '{}' with an empty node label",
+                fact.subject,
+                fact.predicate,
+                fact.object
+            );
+        }
+        self.write_fact_as(fact, prov, evidence_class, Some(labels))
+            .await
     }
 
     /// Write one entity relayed from a mesh peer: the entity under its own
@@ -1953,11 +1987,17 @@ impl ProvenanceStore {
         Ok(())
     }
 
+    /// `labels` carries the subject/object node labels the caller's ontology
+    /// declares (tabular ingest); `None` keeps the store's legacy EMMO-shaped
+    /// labels (text extraction and every older caller, byte-for-byte
+    /// unchanged). The `Measurement` node of a `measurement` fact is the
+    /// store's own fact shape and is never caller-labeled.
     async fn write_fact_as<F: FactPayload>(
         &self,
         payload: &F,
         prov: &LocalProvenance,
         evidence_class: EvidenceClass,
+        labels: Option<FactNodeLabels<'_>>,
     ) -> Result<()> {
         let conditions = payload.conditions().to_vec();
         validate_conditions(&conditions)?;
@@ -2011,6 +2051,13 @@ impl ProvenanceStore {
                 )
                 .await?;
 
+            // One binding per node role: the caller's declared label when
+            // supplied, the legacy EMMO-shaped default otherwise. Every arm
+            // below reads these — none hardcodes a label past this point,
+            // so a supplied declaration governs the WHOLE write.
+            let subject_label = labels.map_or("Matter", |l| l.subject);
+            let object_label = |legacy: &'static str| labels.map_or(legacy, |l| l.object);
+
             match fact.kind.as_deref() {
                 Some("measurement") => {
                     // Guarded above; destructure the value the guard proved.
@@ -2032,13 +2079,13 @@ impl ProvenanceStore {
                         "confidence": confidence,
                     });
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let meas_key = self
                         .upsert_entity(&meas_name, "Measurement", tenant, Some(props.to_string()))
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Property", tenant, None)
+                        .upsert_entity(&fact.object, object_label("Property"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2063,10 +2110,10 @@ impl ProvenanceStore {
                 }
                 Some("phase") => {
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Phase", tenant, None)
+                        .upsert_entity(&fact.object, object_label("Phase"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2082,10 +2129,15 @@ impl ProvenanceStore {
                 Some("composition") => {
                     let props = serde_json::json!({ "canonical_formula": &fact.object });
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Composition", tenant, Some(props.to_string()))
+                        .upsert_entity(
+                            &fact.object,
+                            object_label("Composition"),
+                            tenant,
+                            Some(props.to_string()),
+                        )
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2106,10 +2158,10 @@ impl ProvenanceStore {
                         .value
                         .map(|f| serde_json::json!({ "fraction": f }).to_string());
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Element", tenant, None)
+                        .upsert_entity(&fact.object, object_label("Element"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2128,10 +2180,10 @@ impl ProvenanceStore {
                         .value
                         .map(|o| serde_json::json!({ "order": o }).to_string());
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Manufacturing", tenant, None)
+                        .upsert_entity(&fact.object, object_label("Manufacturing"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2147,12 +2199,12 @@ impl ProvenanceStore {
                 Some("structure") => {
                     let props = serde_json::json!({ "system": &fact.object });
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
                         .upsert_entity(
                             &fact.object,
-                            "CrystalStructure",
+                            object_label("CrystalStructure"),
                             tenant,
                             Some(props.to_string()),
                         )
@@ -2170,10 +2222,10 @@ impl ProvenanceStore {
                 }
                 Some("application") => {
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Application", tenant, None)
+                        .upsert_entity(&fact.object, object_label("Application"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2189,10 +2241,10 @@ impl ProvenanceStore {
                 // Unknown kind: keep the fact as a generic edge, don't drop it.
                 _ => {
                     let subj_key = self
-                        .upsert_entity(&fact.subject, "Matter", tenant, None)
+                        .upsert_entity(&fact.subject, subject_label, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, "Entity", tenant, None)
+                        .upsert_entity(&fact.object, object_label("Entity"), tenant, None)
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -3594,6 +3646,132 @@ mod tests {
                 .edges
                 .is_empty()
         );
+    }
+
+    /// Caller-supplied node labels govern EVERY fact arm, subject and
+    /// object alike — the tabular ingest passes the ACTIVE ontology's
+    /// declared storage labels here, so what lands in `emmo_entity.label`
+    /// (and therefore in the entity KEY) is the ontology's declaration,
+    /// never this store's legacy hardcoded vocabulary. The no-label path
+    /// (`write_fact` — text extraction and older callers) keeps that legacy
+    /// shape byte-for-byte, pinned by the second half.
+    #[tokio::test]
+    async fn caller_labels_govern_every_arm_and_the_legacy_path_is_unchanged() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        // (kind, legacy object label) — every arm write_fact_as has,
+        // including the generic fallback arm (kind: None).
+        let arms: [(Option<&str>, &str); 8] = [
+            (Some("measurement"), "Property"),
+            (Some("phase"), "Phase"),
+            (Some("composition"), "Composition"),
+            (Some("contains"), "Element"),
+            (Some("processing"), "Manufacturing"),
+            (Some("structure"), "CrystalStructure"),
+            (Some("application"), "Application"),
+            (None, "Entity"),
+        ];
+
+        let label_of = |name: &str| {
+            let sql =
+                format!("SELECT label FROM emmo_entity WHERE name = '{name}' AND tenant = 't1'");
+            let store = &store;
+            async move { query_str(store, &sql).await }
+        };
+
+        for (i, (kind, legacy_object_label)) in arms.iter().enumerate() {
+            // Labeled write: the caller's labels must land verbatim.
+            let subj = format!("lab-subj-{i}");
+            let obj = format!("lab-obj-{i}");
+            let mut f = LocalFact {
+                subject: subj.clone(),
+                predicate: format!("pred-{i}"),
+                object: obj.clone(),
+                value: None,
+                unit: None,
+                confidence: Some(0.8),
+                kind: kind.map(str::to_string),
+            };
+            if *kind == Some("measurement") {
+                f.value = Some(42.0);
+            }
+            store
+                .write_fact_with_evidence(
+                    &f,
+                    &prov,
+                    EvidenceClass::Research,
+                    FactNodeLabels {
+                        subject: "Molecule",
+                        object: "Reaction",
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                label_of(&subj).await,
+                "Molecule",
+                "arm {kind:?}: subject label must be the caller's, not hardcoded"
+            );
+            assert_eq!(
+                label_of(&obj).await,
+                "Reaction",
+                "arm {kind:?}: object label must be the caller's, not hardcoded"
+            );
+
+            // Legacy write of the same shape: the store's EMMO labels, unchanged.
+            let subj = format!("leg-subj-{i}");
+            let obj = format!("leg-obj-{i}");
+            let mut f = LocalFact {
+                subject: subj.clone(),
+                predicate: format!("legacy-pred-{i}"),
+                object: obj.clone(),
+                value: None,
+                unit: None,
+                confidence: Some(0.8),
+                kind: kind.map(str::to_string),
+            };
+            if *kind == Some("measurement") {
+                f.value = Some(42.0);
+            }
+            store.write_fact(&f, &prov).await.unwrap();
+            assert_eq!(label_of(&subj).await, "Matter", "legacy arm {kind:?}");
+            assert_eq!(
+                label_of(&obj).await,
+                *legacy_object_label,
+                "legacy arm {kind:?}"
+            );
+        }
+
+        // The synthetic Measurement node is the store's own fact shape: it
+        // stays `Measurement` on the labeled path too (it is not an
+        // extracted entity, so no ontology declares a type for it).
+        let meas = count(
+            &store,
+            "SELECT COUNT(*) FROM emmo_entity WHERE label = 'Measurement' \
+             AND tenant = 't1' AND name LIKE 'meas_lab-subj-%'",
+        )
+        .await;
+        assert_eq!(
+            meas, 1,
+            "the labeled measurement arm must mint its Measurement node"
+        );
+
+        // An empty caller label is refused loudly — never written blank.
+        let err = store
+            .write_fact_with_evidence(
+                &fact("phase", "S", "has_phase", "O"),
+                &prov,
+                EvidenceClass::Research,
+                FactNodeLabels {
+                    subject: "",
+                    object: "Phase",
+                },
+            )
+            .await
+            .expect_err("an empty node label must be refused");
+        assert!(format!("{err:#}").contains("empty node label"), "{err:#}");
     }
 
     #[tokio::test]

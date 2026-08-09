@@ -84,6 +84,34 @@ pub trait Ontology: Send + Sync {
     /// Relationship types extraction may emit and validation accepts.
     fn relationship_types(&self) -> &'static [&'static str];
 
+    /// The node label entities of declared extraction type `entity_type`
+    /// are PERSISTED under in the graph store. The label is part of the
+    /// store's entity key (`{tenant}|{label}:{name}`), so this mapping is
+    /// identity, not decoration — and it is the third leg of the
+    /// one-declaration contract: the prompt instructs `entity_types`, the
+    /// validator accepts `entity_types`, and the store persists
+    /// `storage_label(entity_type)`. Before this method existed the store
+    /// hardcoded its own third vocabulary (every fact subject became
+    /// `Matter`), so a query for the declared `Material` type matched
+    /// nothing that was ever stored.
+    ///
+    /// `None` means the type is not declared — the pipeline drops such an
+    /// entity and REPORTS the drop; it never invents or passes through a
+    /// label the declaration does not produce.
+    ///
+    /// The default stores every declared type under itself. An override may
+    /// map several extraction synonyms onto one storage label (EMMO: `Alloy`
+    /// and `Material` are both matter, so both store as `Matter` and stay
+    /// one identity across runs whichever synonym the model picks) but MUST
+    /// stay total over [`Ontology::entity_types`]: registration refuses an
+    /// ontology that instructs a type it cannot store.
+    fn storage_label(&self, entity_type: &str) -> Option<&'static str> {
+        self.entity_types()
+            .iter()
+            .copied()
+            .find(|t| *t == entity_type)
+    }
+
     /// The unit vocabulary this ontology's facts cite.
     fn unit_vocabulary(&self) -> UnitVocabulary;
 
@@ -204,6 +232,24 @@ impl Ontology for EmmoOntology {
         UnitVocabulary {
             name: "QUDT",
             prefix: Some("QUDT:"),
+        }
+    }
+
+    /// EMMO's storage mapping — the remap the store used to hardcode,
+    /// declared. `Alloy` and `Material` are extraction synonyms for the same
+    /// EMMO concept, so both persist as `Matter`: one identity per material
+    /// name however the model typed it that run, and the same label the
+    /// text-extraction path has always written for materials. `Process`
+    /// persists as `Manufacturing` for the same reason — that is the label
+    /// the store's `processing` fact shape (and the text path) already
+    /// gives every process step, so a standalone process entity and one
+    /// reached through PROCESSED_BY converge on one node instead of two.
+    /// Everything else stores under itself.
+    fn storage_label(&self, entity_type: &str) -> Option<&'static str> {
+        match entity_type {
+            "Alloy" | "Material" => Some("Matter"),
+            "Process" => Some("Manufacturing"),
+            other => EMMO_ENTITY_TYPES.iter().copied().find(|t| *t == other),
         }
     }
 
@@ -344,6 +390,21 @@ fn validated_id(ontology: &dyn Ontology) -> Result<&'static str> {
             if list[..i].contains(t) {
                 bail!("ontology '{id}' declares {label} type '{t}' twice");
             }
+        }
+    }
+    // Totality of the storage mapping: every type the extraction prompt may
+    // instruct MUST have a storage label, or the ontology would tell the
+    // model to emit entities that cannot be persisted — the exact
+    // instruct-vs-store drift `storage_label` exists to close. Refused HERE
+    // so an unstorable vocabulary can never become the active ontology.
+    for t in entity_types {
+        match ontology.storage_label(t) {
+            Some(l) if !l.trim().is_empty() => {}
+            _ => bail!(
+                "ontology '{id}' declares entity type '{t}' but maps it to no \
+                 storage label — it would instruct the model in a type that \
+                 cannot be stored"
+            ),
         }
     }
     Ok(id)
@@ -719,6 +780,94 @@ mod tests {
                 "{who} instructions no longer state the referential-integrity rule:\n{text}"
             );
         }
+    }
+
+    /// EMMO's storage mapping, pinned value by value: the two extraction
+    /// synonyms `Alloy`/`Material` converge on `Matter` (one identity per
+    /// material name whichever synonym the model picked), `Process`
+    /// converges on the store's `Manufacturing` label (one identity for a
+    /// step whether it arrived standalone or through PROCESSED_BY), every
+    /// other declared type stores under itself, and an undeclared type maps
+    /// to NOTHING — never a guess. Note `Matter` itself is a storage label,
+    /// not an instructable extraction type.
+    #[test]
+    fn emmo_storage_mapping_converges_synonyms_and_refuses_undeclared() {
+        let emmo = EmmoOntology;
+        assert_eq!(emmo.storage_label("Alloy"), Some("Matter"));
+        assert_eq!(emmo.storage_label("Material"), Some("Matter"));
+        assert_eq!(emmo.storage_label("Process"), Some("Manufacturing"));
+        for identity in ["Element", "Property", "Phase", "Paper", "Author", "Dataset"] {
+            assert_eq!(emmo.storage_label(identity), Some(identity));
+        }
+        assert_eq!(emmo.storage_label("Matter"), None);
+        assert_eq!(emmo.storage_label("Widget"), None);
+        assert_eq!(emmo.storage_label(""), None);
+    }
+
+    /// The property the whole plane guarantees, driven from the declaration
+    /// (not a frozen list): EVERY type an ontology declares — and therefore
+    /// every type its derived prompt may instruct — has a storage label, on
+    /// the trait default and on EMMO's override alike. An ontology that adds
+    /// a type tomorrow inherits the guarantee, it does not redden this test.
+    #[test]
+    fn every_declared_type_is_storable() {
+        let fake = Fake {
+            id: "prop",
+            entities: &["Molecule", "Reaction", "Solvent"],
+            rels: &["REACTS_WITH"],
+        };
+        for onto in [&fake as &dyn Ontology, &EmmoOntology] {
+            for t in onto.entity_types() {
+                let label = onto.storage_label(t);
+                assert!(
+                    matches!(label, Some(l) if !l.trim().is_empty()),
+                    "ontology '{}' declares type '{t}' but maps it to {label:?} — \
+                     it would instruct the model in a type that cannot be stored",
+                    onto.id(),
+                );
+            }
+            // And the default is identity: an undeclared type maps to nothing.
+            assert_eq!(fake.storage_label("Unicorn"), None);
+        }
+    }
+
+    /// The mechanical half of "impossible to instruct a type that cannot be
+    /// stored": an ontology whose storage mapping is NOT total over its
+    /// declared types is refused at registration, so it can never become
+    /// the active ontology whose vocabulary builds the prompt.
+    #[test]
+    fn registration_refuses_an_ontology_that_instructs_an_unstorable_type() {
+        struct Unstorable;
+        impl Ontology for Unstorable {
+            fn id(&self) -> &'static str {
+                "unstorable"
+            }
+            fn entity_types(&self) -> &'static [&'static str] {
+                &["Molecule", "Reaction"]
+            }
+            fn relationship_types(&self) -> &'static [&'static str] {
+                &["REACTS_WITH"]
+            }
+            fn unit_vocabulary(&self) -> UnitVocabulary {
+                UnitVocabulary {
+                    name: "FREE",
+                    prefix: None,
+                }
+            }
+            // "Reaction" is instructable but unmapped — the drift this refusal exists for.
+            fn storage_label(&self, entity_type: &str) -> Option<&'static str> {
+                (entity_type == "Molecule").then_some("Molecule")
+            }
+        }
+
+        let mut reg = OntologyRegistry::new();
+        let err = reg
+            .register(Arc::new(Unstorable))
+            .expect_err("an unstorable declared type must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Reaction"), "{msg}");
+        assert!(msg.contains("cannot be stored"), "{msg}");
+        assert!(reg.all().is_empty(), "a refused registration must not land");
     }
 
     /// `active` resolves the default when unconfigured, the named id when

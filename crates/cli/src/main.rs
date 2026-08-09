@@ -6814,6 +6814,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
                 );
             }
+            if let Some(report) = dropped_entities_report(result) {
+                println!("{report}");
+            }
             if let Some(report) = dropped_relationships_report(result) {
                 println!("{report}");
             }
@@ -7004,6 +7007,35 @@ fn dropped_relationships_report(result: &serde_json::Value) -> Option<String> {
     let mut out = format!(
         "  Dropped: {}{} relationship(s) referencing entities the extraction never \
          declared — NOT stored (an endpoint is never invented to patch an edge):",
+        dropped.len(),
+        extracted
+            .map(|total| format!(" of {total}"))
+            .unwrap_or_default(),
+    );
+    for reason in dropped.iter().filter_map(|value| value.as_str()) {
+        out.push_str(&format!("\n    ! {reason}"));
+    }
+    Some(out)
+}
+
+/// The unmapped-type drop report, same contract as
+/// [`dropped_relationships_report`]: entities whose declared type the
+/// active ontology maps to no storage label are dropped and REPORTED —
+/// stored under an invented label never, silently dropped never. `None`
+/// when nothing was dropped.
+fn dropped_entities_report(result: &serde_json::Value) -> Option<String> {
+    let dropped = result.get("dropped_entities")?.as_array()?;
+    if dropped.is_empty() {
+        return None;
+    }
+    let extracted = result
+        .get("entities")
+        .and_then(|value| value.get("entities"))
+        .and_then(|value| value.as_array())
+        .map(Vec::len);
+    let mut out = format!(
+        "  Dropped: {}{} entity(ies) of types the active ontology maps to no \
+         storage label — NOT stored (a label is never invented):",
         dropped.len(),
         extracted
             .map(|total| format!(" of {total}"))
@@ -12577,6 +12609,42 @@ mod tests {
             None
         );
         assert_eq!(dropped_relationships_report(&serde_json::json!({})), None);
+    }
+
+    /// Entities the pipeline dropped for having a type the active ontology
+    /// maps to no storage label must reach the user's summary the same way
+    /// — count AND per-entity reason. Same contract as dropped
+    /// relationships: a drop only visible in `--json` is silent.
+    #[test]
+    fn dropped_entities_reach_the_ingest_summary() {
+        let result = serde_json::json!({
+            "entities": {
+                "entities": [
+                    {"type": "Alloy", "name": "Bloopium", "properties": {}},
+                    {"type": "Gadget", "name": "Sprocketium", "properties": {}}
+                ],
+                "relationships": []
+            },
+            "dropped_entities": [
+                "entity 'Sprocketium': type 'Gadget' has no storage label in ontology 'emmo' \
+                 (declared: Alloy, Element, Property, Process, Phase, Paper, Author, Dataset, Material)"
+            ],
+            "graph": {"nodes_created": 1, "edges_created": 0}
+        });
+        let report =
+            dropped_entities_report(&result).expect("a non-empty drop list must produce a report");
+        assert!(report.contains("1 of 2"), "{report}");
+        assert!(report.contains("Sprocketium"), "{report}");
+        assert!(report.contains("Gadget"), "{report}");
+        assert!(report.contains("NOT stored"), "{report}");
+        assert!(report.contains("never invented"), "{report}");
+
+        // Nothing dropped (or a shape without the field) ⇒ no report line.
+        assert_eq!(
+            dropped_entities_report(&serde_json::json!({ "dropped_entities": [] })),
+            None
+        );
+        assert_eq!(dropped_entities_report(&serde_json::json!({})), None);
     }
 
     /// The mode `query --federated` sends must be one the server still

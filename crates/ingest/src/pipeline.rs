@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use polars::prelude::*;
-use prism_provenance::{EvidenceClass, LocalProvenance, ProvenanceStore};
+use prism_provenance::{EvidenceClass, FactNodeLabels, LocalProvenance, ProvenanceStore};
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -11,7 +11,8 @@ use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
 use crate::validation::{self, Severity, ValidationReport};
 use crate::{
-    DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, Relationship, SchemaAnalysis,
+    DataSource, EmbeddingBatch, Entity, EntitySet, GraphUpdate, LlmConfig, Relationship,
+    SchemaAnalysis,
 };
 
 /// Result of a complete ingest operation.
@@ -52,6 +53,17 @@ pub struct IngestResult {
     /// silent drop.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped_relationships: Vec<String>,
+    /// Entities dropped before the graph write because their declared type
+    /// has no storage label in the active ontology (`Ontology::storage_label`
+    /// returned `None`): one entry per dropped entity, naming the unmapped
+    /// type. Same contract as `dropped_relationships` — a PARTIAL result,
+    /// not a step failure (exit stays 0), because inventing a label for an
+    /// undeclared type would store a vocabulary the ontology never stated,
+    /// and failing the whole ingest would discard everything valid.
+    /// Relationships referencing a dropped entity dangle and are dropped
+    /// (and reported) with it. Callers MUST surface it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_entities: Vec<String>,
     /// Step failures. NON-EMPTY means configured pipeline steps did NOT
     /// complete — callers must surface these and exit non-zero. The old
     /// behavior (audit critical: log-and-None) made `prism ingest` print
@@ -247,6 +259,7 @@ impl IngestPipeline {
         // graph empty (2026-08-08: 17 orphan errors discarded 13 good
         // entities); inventing the missing endpoint would fabricate a type.
         let mut dropped_relationships: Vec<String> = Vec::new();
+        let mut dropped_entities: Vec<String> = Vec::new();
         let mut write_set: Option<EntitySet> = None;
         let graph_validation = entities.as_ref().map(|entity_set| {
             let (report, plan) = validate_before_graph_write(ontology.as_ref(), entity_set);
@@ -255,7 +268,19 @@ impl IngestPipeline {
                     tracing::error!(issues = report.issues.len(), "{msg}");
                     errors.push(msg);
                 }
-                GraphWritePlan::Proceed { set, dropped } => {
+                GraphWritePlan::Proceed {
+                    set,
+                    dropped,
+                    dropped_entities: dropped_ents,
+                } => {
+                    if !dropped_ents.is_empty() {
+                        tracing::warn!(
+                            dropped = dropped_ents.len(),
+                            extracted = entity_set.entities.len(),
+                            "entities of types the active ontology maps to no storage \
+                             label were dropped; the valid remainder is stored"
+                        );
+                    }
                     if !dropped.is_empty() {
                         tracing::warn!(
                             dropped = dropped.len(),
@@ -263,13 +288,14 @@ impl IngestPipeline {
                             "relationships referencing undeclared entities were dropped; \
                              the valid remainder is stored"
                         );
-                    } else if !report.issues.is_empty() {
+                    } else if dropped_ents.is_empty() && !report.issues.is_empty() {
                         tracing::warn!(
                             issues = report.issues.len(),
                             "graph validation found non-blocking issues"
                         );
                     }
                     dropped_relationships = dropped;
+                    dropped_entities = dropped_ents;
                     write_set = Some(set);
                 }
             }
@@ -288,7 +314,10 @@ impl IngestPipeline {
         let tenant =
             crate::ontologies::storage_tenant(prism_provenance::LOCAL_TENANT, ontology.id());
         let graph = if let Some(entity_set) = &write_set {
-            match self.write_local_graph(entity_set, &source, &tenant).await {
+            match self
+                .write_local_graph(ontology.as_ref(), entity_set, &source, &tenant)
+                .await
+            {
                 Ok(update) => {
                     tracing::info!(
                         nodes = update.nodes_created,
@@ -321,6 +350,7 @@ impl IngestPipeline {
             graph,
             embeddings: None,
             dropped_relationships,
+            dropped_entities,
             errors,
         })
     }
@@ -328,12 +358,51 @@ impl IngestPipeline {
     /// Write the extracted entities/relationships as typed facts (with one
     /// PROV-O activity for the run) into the bundled Turso provenance store,
     /// under the active ontology's storage tenant.
+    ///
+    /// EVERY node label written here is produced by the active ontology's
+    /// declared storage mapping (`Ontology::storage_label`) over the
+    /// entity types the extraction declared — the same declaration the
+    /// prompt and validator read. Nothing on this path invents a label or
+    /// falls back to one the declaration does not produce: an entity whose
+    /// type has no storage label is refused loudly (the write plan drops
+    /// and reports such entities before this runs, so hitting the refusal
+    /// means a caller bypassed the plan). The one store-owned exception is
+    /// the synthetic `Measurement` node a measurement fact mints — a fact
+    /// shape, not an extracted entity.
     async fn write_local_graph(
         &self,
+        ontology: &dyn crate::ontologies::Ontology,
         entity_set: &EntitySet,
         source: &DataSource,
         tenant: &str,
     ) -> Result<GraphUpdate> {
+        // Declared name → storage label, from the ONE declaration. First
+        // declaration wins on a (rare) same-name/different-type collision,
+        // matching the standalone-write dedup below.
+        let mut storage_labels: std::collections::HashMap<&str, &'static str> =
+            std::collections::HashMap::new();
+        for e in &entity_set.entities {
+            if let Some(label) = ontology.storage_label(e.entity_type.trim()) {
+                storage_labels.entry(e.name.as_str()).or_insert(label);
+            } else {
+                bail!(
+                    "entity '{}' has type '{}', which ontology '{}' maps to no \
+                     storage label — the write plan must drop and report it, \
+                     never store a label the ontology does not declare",
+                    e.name,
+                    e.entity_type,
+                    ontology.id()
+                );
+            }
+        }
+        let label_of = |name: &str| -> Result<&'static str> {
+            storage_labels.get(name).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no declared entity (and so no storage label) for fact endpoint \
+                     '{name}' — dangling relationships must be dropped before the write"
+                )
+            })
+        };
         let db_path = match &self.config.provenance_db {
             Some(p) => p.clone(),
             None => dirs::home_dir()
@@ -368,8 +437,12 @@ impl IngestPipeline {
 
         let facts = to_local_facts(entity_set);
         for fact in &facts {
+            let labels = FactNodeLabels {
+                subject: label_of(&fact.subject)?,
+                object: label_of(&fact.object)?,
+            };
             store
-                .write_fact_with_evidence(fact, &prov, EvidenceClass::Research)
+                .write_fact_with_evidence(fact, &prov, EvidenceClass::Research, labels)
                 .await?;
         }
 
@@ -384,25 +457,22 @@ impl IngestPipeline {
         // Entities in no stored relationship land as standalone typed nodes:
         // the extraction asserted they exist, and an absent relationship —
         // or one dropped by referential containment — must not erase them.
-        // Their label is the DECLARED entity type, never an invented one.
-        // (They used to be dropped with a warning; storing 0 of 13 extracted
-        // entities because the edges dangled is the failure this replaced.)
+        // Their label comes from the SAME declared storage mapping the fact
+        // writes above used, so an entity lands under one identity whether
+        // its edges survived or dangled. (They used to be dropped with a
+        // warning; then stored under the raw extraction type, which split
+        // them from their fact-written selves — `Alloy:X` standalone vs
+        // `Matter:X` as a fact subject.)
         for e in &entity_set.entities {
             if !written.insert(e.name.as_str()) {
                 continue; // already a node via some relationship (or a duplicate name)
             }
-            let label = match e.entity_type.trim() {
-                // The store's own generic label — the same one write_fact
-                // gives targets of unknown kind — never a guessed type.
-                "" => "Entity",
-                t => t,
-            };
             let props = match &e.properties {
                 serde_json::Value::Object(map) if !map.is_empty() => Some(e.properties.to_string()),
                 _ => None,
             };
             store
-                .write_extracted_entity(&e.name, label, props, &prov.tenant)
+                .write_extracted_entity(&e.name, label_of(&e.name)?, props, &prov.tenant)
                 .await?;
         }
 
@@ -428,14 +498,18 @@ impl Default for IngestPipeline {
 
 /// What pre-write graph validation decided may be written.
 enum GraphWritePlan {
-    /// Write `set` — the extracted set minus any dangling relationships.
-    /// `dropped` carries one reason per relationship dropped for
-    /// referencing a name never declared as an entity. Containment, not
-    /// repair: the missing entity is never invented, and the drop always
-    /// reaches the caller (`IngestResult::dropped_relationships`).
+    /// Write `set` — the extracted set minus entities whose declared type
+    /// the active ontology maps to no storage label, and minus any dangling
+    /// relationships (including ones dangling BECAUSE their endpoint was
+    /// dropped as unmapped). `dropped` carries one reason per dropped
+    /// relationship, `dropped_entities` one per dropped entity. Containment,
+    /// not repair: nothing is invented — not a missing endpoint, not a
+    /// storage label — and every drop reaches the caller
+    /// (`IngestResult::dropped_relationships` / `dropped_entities`).
     Proceed {
         set: EntitySet,
         dropped: Vec<String>,
+        dropped_entities: Vec<String>,
     },
     /// Error-severity issues a targeted drop cannot repair: write nothing.
     Blocked(String),
@@ -462,30 +536,69 @@ fn validate_before_graph_write(
     GraphWritePlan,
 ) {
     let report = crate::graph_validation::validate_graph(ontology, entity_set);
-    if report.passed {
+
+    // Entities whose declared type the active ontology maps to no storage
+    // label cannot be persisted without inventing a vocabulary the ontology
+    // never stated (`unknown_type` is Warning severity, so `report.passed`
+    // alone never catches this). Drop and report them; relationships that
+    // referenced them dangle and are dropped (and reported) below.
+    let (kept_entities, dropped_entities): (Vec<Entity>, Vec<String>) = {
+        let mut kept = Vec::new();
+        let mut dropped = Vec::new();
+        for e in &entity_set.entities {
+            if ontology.storage_label(e.entity_type.trim()).is_some() {
+                kept.push(e.clone());
+            } else {
+                dropped.push(format!(
+                    "entity '{}': type '{}' has no storage label in ontology '{}' \
+                     (declared: {})",
+                    e.name,
+                    e.entity_type,
+                    ontology.id(),
+                    ontology.entity_types().join(", ")
+                ));
+            }
+        }
+        (kept, dropped)
+    };
+
+    if report.passed && dropped_entities.is_empty() {
         let plan = GraphWritePlan::Proceed {
             set: entity_set.clone(),
             dropped: Vec::new(),
+            dropped_entities: Vec::new(),
         };
         return (report, plan);
     }
 
-    let (kept, dropped) = partition_dangling_relationships(entity_set);
-    if dropped.is_empty() {
-        // Nothing dangled — the errors are of a kind a drop cannot repair.
+    let reduced = EntitySet {
+        entities: kept_entities,
+        relationships: entity_set.relationships.clone(),
+    };
+    let (kept, dropped) = partition_dangling_relationships(&reduced);
+    if dropped.is_empty() && dropped_entities.is_empty() {
+        // Nothing dangled and nothing was unmapped — the errors are of a
+        // kind a drop cannot repair.
         let msg = blocking_message(&report);
         return (report, GraphWritePlan::Blocked(msg));
     }
     let set = EntitySet {
-        entities: entity_set.entities.clone(),
+        entities: reduced.entities,
         relationships: kept,
     };
-    // Fail-closed proof that the drop repaired EVERYTHING at error
+    // Fail-closed proof that the drops repaired EVERYTHING at error
     // severity: the reduced set must validate clean of errors, or the
     // write stays blocked exactly as before.
     let recheck = crate::graph_validation::validate_graph(ontology, &set);
     if recheck.passed {
-        (report, GraphWritePlan::Proceed { set, dropped })
+        (
+            report,
+            GraphWritePlan::Proceed {
+                set,
+                dropped,
+                dropped_entities,
+            },
+        )
     } else {
         (report, GraphWritePlan::Blocked(blocking_message(&recheck)))
     }
@@ -649,9 +762,18 @@ mod tests {
             validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
         assert!(!report.passed, "the report keeps recording the orphan");
         assert!(report.issues.iter().any(|i| i.category == "orphan_rel"));
-        let GraphWritePlan::Proceed { set, dropped } = plan else {
+        let GraphWritePlan::Proceed {
+            set,
+            dropped,
+            dropped_entities,
+        } = plan
+        else {
             panic!("a purely-dangling extraction must be contained, not blocked");
         };
+        assert!(
+            dropped_entities.is_empty(),
+            "every declared type is mapped — nothing to drop: {dropped_entities:?}"
+        );
         assert_eq!(set.entities.len(), 1, "every declared entity is kept");
         assert!(
             set.relationships.is_empty(),
@@ -679,11 +801,17 @@ mod tests {
         let (report, plan) =
             validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
         assert!(report.passed);
-        let GraphWritePlan::Proceed { set, dropped } = plan else {
+        let GraphWritePlan::Proceed {
+            set,
+            dropped,
+            dropped_entities,
+        } = plan
+        else {
             panic!("clean entities must proceed");
         };
         assert_eq!(set.entities.len(), 1);
         assert!(dropped.is_empty());
+        assert!(dropped_entities.is_empty());
     }
 
     #[test]
@@ -754,7 +882,12 @@ mod tests {
         };
 
         let update = pipeline
-            .write_local_graph(&entity_set, &source, "local")
+            .write_local_graph(
+                &crate::ontologies::EmmoOntology,
+                &entity_set,
+                &source,
+                "local",
+            )
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 3);
@@ -852,7 +985,12 @@ mod tests {
         };
 
         let update = pipeline
-            .write_local_graph(&entity_set, &source, "local")
+            .write_local_graph(
+                &crate::ontologies::EmmoOntology,
+                &entity_set,
+                &source,
+                "local",
+            )
             .await
             .unwrap();
 
@@ -873,6 +1011,148 @@ mod tests {
                 .any(|n| n.name == "Nickel" && n.label == "Element"),
             "the relationship-less entity is missing from the store (or mislabeled): {hits:?}",
         );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = db_path.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// THE one-vocabulary property, proven at the production write path and
+    /// driven from the declaration rather than a frozen list of today's
+    /// types: every node the tabular write stores lands under EXACTLY
+    /// `storage_label(declared type)` of the active ontology — as a fact
+    /// subject, as a fact object (every reachable arm: measurement, phase,
+    /// contains, processing, and the generic fallback), and as a standalone
+    /// containment-path node alike. Before this, the store kept a third,
+    /// hardcoded vocabulary: every fact subject became `Matter` (live
+    /// 2026-08-08: prompt said `Alloy`/`Material`, validator accepted them,
+    /// store held `Matter` — a query for `Material` matched nothing ever
+    /// stored), every generic-arm object became `Entity`, and a standalone
+    /// entity kept its raw type — so ONE name could mint TWO nodes
+    /// depending on whether its edges survived.
+    #[tokio::test]
+    async fn every_stored_label_is_the_declared_storage_label() {
+        use crate::ontologies::Ontology;
+        use crate::{Entity, Relationship};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let db_path =
+            std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            llm: None,
+            max_sample_rows: 10,
+            mapping: None,
+            provenance_db: Some(db_path.clone()),
+            ontology: None,
+        });
+
+        let entity = |etype: &str, name: &str, props: serde_json::Value| Entity {
+            entity_type: etype.into(),
+            name: name.into(),
+            properties: props,
+        };
+        let rel = |from: &str, rel_type: &str, to: &str| Relationship {
+            from: from.into(),
+            rel_type: rel_type.into(),
+            to: to.into(),
+            weight: None,
+            order: None,
+        };
+
+        let entity_set = EntitySet {
+            entities: vec![
+                // Fact subject (Alloy → Matter) across several arms.
+                entity("Alloy", "Steel", serde_json::json!({})),
+                // Fact OBJECT of contains AND fact SUBJECT of a measurement:
+                // an Element must store as Element in both roles — this is
+                // the assertion that dies if any arm hardcodes `Matter`
+                // subjects again (the old behaviour split `Fe` into an
+                // `Element` row and a `Matter` row).
+                entity("Element", "Fe", serde_json::json!({})),
+                entity(
+                    "Property",
+                    "density",
+                    serde_json::json!({"value": 7.8, "unit": "g/cm3"}),
+                ),
+                entity(
+                    "Property",
+                    "atomic mass",
+                    serde_json::json!({"value": 55.8, "unit": "u"}),
+                ),
+                entity("Phase", "BCC", serde_json::json!({})),
+                // Process → Manufacturing: the store's one label for a step,
+                // standalone or via PROCESSED_BY.
+                entity("Process", "annealing", serde_json::json!({})),
+                // Generic-arm subject and object (AUTHORED_BY has no typed
+                // arm): declared labels, never `Matter`/`Entity`.
+                entity("Paper", "Smith2020", serde_json::json!({})),
+                entity("Author", "Jane Smith", serde_json::json!({})),
+                // Standalone (containment-path) nodes: same mapping as the
+                // fact writes — Material converges on Matter.
+                entity("Dataset", "DS-1", serde_json::json!({})),
+                entity("Material", "Ti-6Al-4V", serde_json::json!({})),
+            ],
+            relationships: vec![
+                Relationship {
+                    weight: Some(0.98),
+                    ..rel("Steel", "CONTAINS", "Fe")
+                },
+                rel("Steel", "HAS_PROPERTY", "density"),
+                rel("Fe", "HAS_PROPERTY", "atomic mass"),
+                rel("Steel", "HAS_PHASE", "BCC"),
+                Relationship {
+                    order: Some(1),
+                    ..rel("Steel", "PROCESSED_BY", "annealing")
+                },
+                rel("Smith2020", "AUTHORED_BY", "Jane Smith"),
+            ],
+        };
+        let source = DataSource {
+            path: "/tmp/alloys.csv".into(),
+            format: "csv".into(),
+        };
+
+        let update = pipeline
+            .write_local_graph(
+                &crate::ontologies::EmmoOntology,
+                &entity_set,
+                &source,
+                "local",
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.nodes_created, 10);
+        assert_eq!(update.edges_created, 6);
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        for e in &entity_set.entities {
+            let expected = crate::ontologies::EmmoOntology
+                .storage_label(&e.entity_type)
+                .expect("every declared type is storable");
+            let hits = store.graph_search(&e.name, "local", 10).await.unwrap();
+            let labels: Vec<&str> = hits
+                .iter()
+                .filter(|n| n.name == e.name)
+                .map(|n| n.label.as_str())
+                .collect();
+            assert!(
+                !labels.is_empty(),
+                "'{}' ({}) was not stored at all",
+                e.name,
+                e.entity_type
+            );
+            assert!(
+                labels.iter().all(|l| *l == expected),
+                "'{}' declared {} must store under '{expected}' in EVERY role, got {labels:?}",
+                e.name,
+                e.entity_type,
+            );
+        }
 
         for suffix in ["", "-wal", "-shm"] {
             let mut p = db_path.clone().into_os_string();
@@ -1055,6 +1335,7 @@ mod tests {
             graph: None,
             embeddings: None,
             dropped_relationships: Vec::new(),
+            dropped_entities: Vec::new(),
             errors: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -1065,6 +1346,7 @@ mod tests {
         assert!(!json.contains("embeddings"));
         // No drops ⇒ no dropped_relationships key (clean stays clean)…
         assert!(!json.contains("dropped_relationships"));
+        assert!(!json.contains("dropped_entities"));
         // No errors ⇒ no errors key either (clean success stays clean)…
         assert!(!json.contains("errors"));
         // …but step failures MUST be visible in the JSON (the old shape hid
@@ -1084,6 +1366,14 @@ mod tests {
         let json = serde_json::to_string(&partial).unwrap();
         assert!(json.contains("dropped_relationships"));
         assert!(json.contains("undeclared endpoint"));
+        // Dropped entities are the same contract: visible when non-empty.
+        let partial = IngestResult {
+            dropped_entities: vec!["entity 'X': type 'Gadget' has no storage label".into()],
+            ..partial
+        };
+        let json = serde_json::to_string(&partial).unwrap();
+        assert!(json.contains("dropped_entities"));
+        assert!(json.contains("no storage label"));
     }
 
     // ── Refusing extraction from empty / Error-severity input ─────────
@@ -1483,11 +1773,13 @@ mod tests {
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .unwrap();
-        // Stored under their DECLARED types.
+        // Stored under the ontology's DECLARED storage labels — the same
+        // ones a fact write would have used (EMMO maps Alloy → Matter), so
+        // an entity keeps ONE identity whether its edges survived or not.
         let hits = store.graph_search("Klaxonite", "local", 10).await.unwrap();
         assert!(
             hits.iter()
-                .any(|n| n.name == "Klaxonite" && n.label == "Alloy"),
+                .any(|n| n.name == "Klaxonite" && n.label == "Matter"),
             "{hits:?}"
         );
         let hits = store
@@ -1506,6 +1798,89 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the undeclared endpoint was invented into the store"
+        );
+    }
+
+    /// An entity whose type the active ontology maps to no storage label is
+    /// DROPPED AND REPORTED — never stored under an invented or passed-
+    /// through label the declaration does not produce (the pre-fix
+    /// behaviour stored it verbatim: `unknown_type` is only a Warning, so
+    /// an undeclared vocabulary sailed into the store). Relationships that
+    /// referenced it dangle and are dropped (and reported) with it; the
+    /// declared remainder still lands; exit stays 0.
+    #[tokio::test]
+    async fn unmapped_entity_types_are_dropped_and_reported_never_stored() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Bloopium", "properties": {}},
+                {"type": "Gadget", "name": "Sprocketium", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Bloopium", "rel": "CONTAINS", "to": "Sprocketium", "weight": 0.5}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // A contained drop is a partial SUCCESS: no step failure, exit 0 —
+        // and the raw validation record honestly shows only warnings
+        // (unknown_type), which is exactly why `passed` alone could never
+        // gate this.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let report = result.graph_validation.expect("validation ran");
+        assert!(report.passed, "unknown_type is Warning severity");
+        assert!(report.issues.iter().any(|i| i.category == "unknown_type"));
+
+        // Both drops are REPORTED: the unmapped entity, and the
+        // relationship that dangled once it was gone.
+        assert_eq!(
+            result.dropped_entities.len(),
+            1,
+            "{:?}",
+            result.dropped_entities
+        );
+        let dropped = &result.dropped_entities[0];
+        assert!(dropped.contains("Sprocketium"), "{dropped}");
+        assert!(dropped.contains("Gadget"), "{dropped}");
+        assert!(dropped.contains("no storage label"), "{dropped}");
+        assert_eq!(
+            result.dropped_relationships.len(),
+            1,
+            "{:?}",
+            result.dropped_relationships
+        );
+        assert!(result.dropped_relationships[0].contains("Sprocketium"));
+
+        // The declared remainder was stored — under its declared storage
+        // label — and the unmapped entity reached the store under NO label.
+        let graph = result
+            .graph
+            .expect("the declared remainder must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (1, 0));
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Bloopium", "local", 10).await.unwrap();
+        assert!(
+            hits.iter()
+                .any(|n| n.name == "Bloopium" && n.label == "Matter"),
+            "{hits:?}"
+        );
+        assert!(
+            store
+                .graph_search("Sprocketium", "local", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an entity of an undeclared type reached the store"
         );
     }
 
