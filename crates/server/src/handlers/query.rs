@@ -167,6 +167,19 @@ async fn read_scope(
 /// (local + mesh tenants by default), each paired with the origin locator
 /// this node can honestly report for it (`None` when no stored assertion
 /// mentions the entity).
+/// The store this node serves: an explicit override on [`NodeState`]
+/// (several nodes in one test process each need their own), else the
+/// production default above.
+fn provenance_db_path(state: &NodeState) -> PathBuf {
+    state
+        .provenance_db_path
+        .clone()
+        .unwrap_or_else(default_provenance_db_path)
+}
+
+/// Query the bundled Turso store for locally-ingested ontology entities,
+/// each paired with the origin locator this node can honestly report for
+/// it (`None` when no stored assertion mentions the entity).
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
 /// `None`, which the handler renders as an empty result set. `None` is
@@ -409,7 +422,7 @@ async fn handle_graph_query(
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
     let nodes = local_graph_lookup(
-        &default_provenance_db_path(),
+        &provenance_db_path(state),
         &body.query,
         body.limit,
         body.tenants.as_deref(),
@@ -462,7 +475,7 @@ async fn handle_semantic_query(
     };
 
     let hits = match local_semantic_lookup(
-        &default_provenance_db_path(),
+        &provenance_db_path(state),
         &body.query,
         body.limit,
         body.tenants.as_deref(),

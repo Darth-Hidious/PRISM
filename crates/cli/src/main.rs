@@ -1132,6 +1132,16 @@ enum MeshCommands {
         #[arg(long, default_value = "http://127.0.0.1:7327")]
         dashboard_url: String,
     },
+    /// Pull a dataset from a peer node NOW — no Kafka broker required.
+    /// The peer's facts land in the local store under the peer's own
+    /// tenant (`mesh:{peer node id}`), attributable and separable.
+    Sync {
+        /// Dataset name to pull.
+        dataset_name: String,
+        /// Base URL of the peer node (e.g. http://192.168.1.20:7327).
+        #[arg(long)]
+        peer: String,
+    },
     /// Quick health check: online status, node ID, peer count.
     Health {
         /// Dashboard URL of the running node.
@@ -2882,6 +2892,17 @@ async fn main() -> Result<()> {
                 let mut daemon_platform_client: Option<PlatformClient> = None;
                 let mut daemon_platform_node_id: Option<String> = None;
                 let mut daemon_org_id: Option<String> = None;
+                // Client for platform-mediated peer discovery (kept out of
+                // DaemonOptions, which consumes daemon_platform_client).
+                let mut platform_discovery_client: Option<PlatformClient> = None;
+
+                // Durable mesh identity, persisted beside the node keys.
+                // Subscriptions are keyed on `publisher_node` and the Kafka
+                // consumer group derives from this id — a fresh UUID per
+                // boot dangled every subscription and made each restart a
+                // new consumer group starting at `latest`, losing every
+                // publish that happened during downtime.
+                let mesh_node_id_persisted = prism_mesh::load_or_create_node_id(&paths.state_dir)?;
 
                 // Resolve auth before registration. API-key-only users do
                 // not have cli-state metadata and must still be accepted.
@@ -2941,11 +2962,21 @@ async fn main() -> Result<()> {
                     // deregister'd on the dead token → all 401 → stale
                     // "online" record).
                     let mut platform = PlatformClient::new(resolved_api_base).with_token(&token);
-                    let caps = serde_json::json!({
+                    let mut caps = serde_json::json!({
                         "compute": !no_compute,
                         "storage": !no_storage,
                         "dashboard_port": dashboard_port,
+                        // Mesh reachability for platform-mediated discovery
+                        // (prism_mesh::platform_discovery reads these back
+                        // out of the registry's node profiles).
+                        "mesh_node_id": mesh_node_id_persisted.to_string(),
                     });
+                    // Advertised only when a LAN address is actually
+                    // knowable — an address is never invented.
+                    if let Some(url) = prism_mesh::platform_discovery::advertise_url(dashboard_port)
+                    {
+                        caps["mesh_advertise_url"] = serde_json::Value::String(url);
+                    }
 
                     // register_node_inspect returns a typed ApiError
                     // carrying the HTTP status + parsed `code`, so a stale
@@ -3029,6 +3060,7 @@ async fn main() -> Result<()> {
                     // client here was the bug that made the daemon's REST
                     // calls all 401 silently.
                     server_node_state.platform_client = Some(platform.clone());
+                    platform_discovery_client = Some(platform.clone());
                     daemon_platform_client = Some(platform);
                 }
 
@@ -3203,7 +3235,7 @@ async fn main() -> Result<()> {
                     platform_client: daemon_platform_client,
                     platform_node_id: daemon_platform_node_id,
                     rbac_db_path: daemon_rbac_db_path,
-                    org_id: daemon_org_id,
+                    org_id: daemon_org_id.clone(),
                     // Merge the subcommand flag with the process-wide policy.
                     // `--offline` on `node up` is its own arg (see NodeCommands::Up)
                     // and was passed through raw, so `PRISM_OFFLINE=1 prism node up`
@@ -3231,7 +3263,8 @@ async fn main() -> Result<()> {
                     discovery: vec![prism_mesh::DiscoveryMethod::Mdns],
                     kafka_brokers: resolved_kafka_brokers.clone(),
                 };
-                let mesh_handle = prism_mesh::init_mesh(mesh_config)?;
+                let mesh_handle =
+                    prism_mesh::init_mesh_with_id(mesh_config, mesh_node_id_persisted)?;
                 let mesh_node_id = mesh_handle.node_id();
                 let mesh_peers_shared = mesh_handle.peers_shared();
                 // Update server state so REST API reports mesh as online
@@ -3245,14 +3278,70 @@ async fn main() -> Result<()> {
                         capabilities: Vec::new(),
                         discovery_interval_secs: 30,
                         event_tx: Some(server_state.ws_broadcast.clone()),
-                        auth_token: mesh_auth_token,
+                        auth_token: mesh_auth_token.clone(),
                     },
                     mesh_cancel.clone(),
                 );
-                // Initialize federated query client for cross-mesh searches
-                let _ = server_state
-                    .federation
-                    .set(prism_mesh::federated_query::FederatedQuery::default());
+                // Initialize federated query client for cross-mesh
+                // searches. It carries the owner's platform token so each
+                // peer can VERIFY who is querying and mint a session —
+                // `/api/query` sits behind the peers' auth stacks, so the
+                // tokenless default could only ever collect 401s.
+                let _ = server_state.federation.set(
+                    prism_mesh::federated_query::FederatedQuery::with_platform_token(
+                        std::time::Duration::from_secs(10),
+                        mesh_auth_token.clone(),
+                    ),
+                );
+
+                // ── Platform-mediated peer discovery ──
+                // The org's node registry is an AUTHENTICATED peer
+                // directory (both machines register there at `node up`),
+                // unlike mDNS, whose "authenticated" flag keys on the mere
+                // presence of a non-cryptographic TXT hash. Registered
+                // peers that advertised a mesh identity + URL are merged
+                // into the peer list; mDNS stays the zero-config LAN path.
+                if let (Some(discovery_client), Some(peers_shared)) =
+                    (platform_discovery_client, mesh_peers_shared.clone())
+                {
+                    let org = daemon_org_id.clone();
+                    let cancel = mesh_cancel.clone();
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(300));
+                        loop {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = interval.tick() => {}
+                            }
+                            match prism_mesh::platform_discovery::discover_platform_peers(
+                                &discovery_client,
+                                org.as_deref(),
+                                mesh_node_id_persisted,
+                            )
+                            .await
+                            {
+                                Ok(discovered) => {
+                                    let mut list =
+                                        peers_shared.write().unwrap_or_else(|e| e.into_inner());
+                                    for peer in discovered {
+                                        if !list.iter().any(|p| p.node_id == peer.node_id) {
+                                            tracing::info!(
+                                                peer = %peer.name,
+                                                id = %peer.node_id,
+                                                "peer discovered via platform registry"
+                                            );
+                                            list.push(peer);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "platform peer discovery failed");
+                                }
+                            }
+                        }
+                    });
+                }
 
                 if !mesh_has_auth {
                     println!("  \u{26A0} Mesh: disabled (not authenticated)");
@@ -3288,8 +3377,9 @@ async fn main() -> Result<()> {
                             let subscriptions = server_state.subscriptions.clone();
 
                             // Peer-synced facts land in the bundled Turso
-                            // store under tenant "mesh" — always available,
-                            // no external graph service required.
+                            // store under the publisher's own tenant
+                            // ("mesh:{node id}") — always available, no
+                            // external graph service required.
                             let sync_home =
                                 std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                             let sync_config = Some(prism_mesh::sync::SyncConfig {
@@ -3304,7 +3394,15 @@ async fn main() -> Result<()> {
                                 }
                             });
 
-                            // Spawn sync handler
+                            // Spawn sync handler. It authenticates every
+                            // peer pull by minting a session with the
+                            // owner's platform token — without one the
+                            // peer's auth stack answers 401 and nothing
+                            // ever arrives.
+                            let sync_sessions =
+                                std::sync::Arc::new(prism_mesh::peer_session::PeerSessions::new(
+                                    mesh_auth_token.clone(),
+                                ));
                             tokio::spawn(async move {
                                 prism_mesh::sync::run_sync_handler(
                                     rx,
@@ -3312,6 +3410,7 @@ async fn main() -> Result<()> {
                                     subscriptions,
                                     our_node_id,
                                     sync_config,
+                                    sync_sessions,
                                 )
                                 .await;
                             });
@@ -3319,17 +3418,18 @@ async fn main() -> Result<()> {
                             println!("  \u{2713} Kafka: pub/sub active ({brokers})");
                         }
                         Err(e) => {
-                            // Name what actually stops working. `run_sync_handler`
-                            // is spawned only in the branch above and drains a
-                            // channel only the Kafka consumer feeds, and there is
-                            // no `mesh sync` subcommand — so without Kafka the
-                            // mesh discovers peers it can never pull data from.
-                            // The old wording ("Mesh will work via mDNS only")
-                            // read as a working degraded mode.
+                            // Name what actually stops working:
+                            // `run_sync_handler` is spawned only in the
+                            // branch above and drains a channel only the
+                            // Kafka consumer feeds, so without Kafka
+                            // nothing syncs AUTOMATICALLY on publish.
+                            // `prism mesh sync <dataset> --peer <url>` is
+                            // the Kafka-free manual pull.
                             eprintln!("  Warning: Kafka consumer failed to start: {e}");
                             eprintln!(
-                                "  Peer discovery (mDNS) still works, but NO peer data will sync: \
-                                 dataset sync is driven by Kafka messages and has no other trigger."
+                                "  Peer discovery (mDNS) still works, but publishes will NOT \
+                                 sync automatically. Pull on demand with \
+                                 `prism mesh sync <dataset> --peer <url>`."
                             );
                         }
                     }
@@ -5469,6 +5569,72 @@ async fn handle_mesh_command(
                 }
                 _ => println!("  (none)"),
             }
+        }
+        MeshCommands::Sync { dataset_name, peer } => {
+            let peer = peer.trim_end_matches('/').to_string();
+            // The peer URL is user-typed, but hard offline still applies —
+            // `sync_dataset_from_peer` gates it too; failing here first
+            // gives the reason before any session mint is attempted.
+            prism_runtime::offline::check_url(&peer).map_err(|r| anyhow!(r))?;
+
+            // The tenant is keyed on the PEER's node identity, which its
+            // public discovery route reports. Refusing without one beats
+            // inventing a tenant the counting layer would misattribute.
+            let nodes_url = format!("{peer}/api/mesh/nodes");
+            let status: serde_json::Value = reqwest::get(&nodes_url)
+                .await
+                .with_context(|| format!("Failed to reach peer at {nodes_url}"))?
+                .json()
+                .await
+                .with_context(|| format!("Peer at {nodes_url} did not answer with JSON"))?;
+            let publisher = status["node_id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "peer at {peer} reports no mesh node id (is its mesh online?) — \
+                         cannot attribute the synced data to a publisher"
+                    )
+                })?;
+
+            // The owner's platform token lets the peer VERIFY who is
+            // pulling. Without a login, a loopback peer still works (it
+            // mints an anonymous-local session); a remote peer will refuse.
+            let platform_token = paths
+                .load_cli_state()
+                .ok()
+                .and_then(|s| s.credentials)
+                .map(|c| c.access_token);
+            if platform_token.is_none() {
+                println!(
+                    "  ⚠ Not logged in: a remote peer will refuse this pull. \
+                     Loopback peers still answer."
+                );
+            }
+            let sessions = prism_mesh::peer_session::PeerSessions::new(platform_token);
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let sync_config = Some(prism_mesh::sync::SyncConfig {
+                provenance_db: std::path::PathBuf::from(home).join(".prism/provenance.db"),
+            });
+
+            println!("Pulling dataset '{dataset_name}' from {peer} (node {publisher})...");
+            let client = prism_mesh::sync::sync_http_client();
+            let synced = prism_mesh::sync::sync_dataset_from_peer(
+                &client,
+                // The HUMAN typed this address, which is what makes it
+                // eligible to be shown the platform credential.
+                &prism_mesh::peer_session::PeerAddress::operator_named(&peer),
+                &dataset_name,
+                publisher,
+                &sync_config,
+                &sessions,
+            )
+            .await?;
+            println!(
+                "✓ {synced} entit{} synced under tenant '{}'",
+                if synced == 1 { "y" } else { "ies" },
+                prism_mesh::sync::mesh_tenant(&publisher)
+            );
         }
         MeshCommands::Health { dashboard_url } => {
             let url = format!("{dashboard_url}/api/mesh/nodes");
@@ -11431,6 +11597,16 @@ fn resolve_kafka_brokers(explicit: Option<&str>, with_kafka: bool) -> Option<Str
         .or_else(|| with_kafka.then(|| "127.0.0.1:9092".to_string()))
 }
 
+/// The query body `query --federated` sends to every node, local and peer.
+///
+/// Mode is `"graph"`: the server's `execute_query` accepts only
+/// graph/semantic/federated and 400s anything else. This function used to
+/// send `"nl"`, a mode the server deleted with the Neo4j retirement — so
+/// every federated CLI query was a guaranteed 400 rendered as "0 result(s)".
+fn federated_query_body(query: &str) -> serde_json::Value {
+    serde_json::json!({ "query": query, "mode": "graph" })
+}
+
 async fn handle_federated_query(
     query: &str,
     dashboard_url: &str,
@@ -11469,7 +11645,7 @@ async fn handle_federated_query(
 
     // Step 2: Query local node
     let local_url = format!("{dashboard_url}/api/query");
-    let local_body = serde_json::json!({"query": query, "mode": "nl"});
+    let local_body = federated_query_body(query);
     // Protected dashboard routes need a local session token, even for the CLI
     // running on the same machine as the node.
     let local_session = create_dashboard_session(dashboard_url, paths).await.ok();
@@ -11519,7 +11695,7 @@ async fn handle_federated_query(
             continue;
         }
         let peer_url = format!("{peer_base}/api/query");
-        let body = serde_json::json!({"query": query, "mode": "nl"});
+        let body = federated_query_body(query);
         let peer_session =
             create_dashboard_session_for_user(&peer_base, "federated-cli", Some("PRISM CLI"))
                 .await
@@ -12292,6 +12468,18 @@ mod tests {
             !msg.contains("secret query text"),
             "query text surfaced in the error path: {msg}"
         );
+    }
+
+    /// The mode `query --federated` sends must be one the server still
+    /// serves: `execute_query` accepts only graph/semantic/federated and
+    /// 400s anything else. This function sent `"nl"` — a mode deleted with
+    /// the Neo4j retirement — so every federated CLI query was a
+    /// guaranteed 400 rendered as "0 result(s)".
+    #[test]
+    fn federated_query_sends_a_mode_the_server_still_accepts() {
+        let body = federated_query_body("titanium alloys");
+        assert_eq!(body["mode"], "graph", "got: {body}");
+        assert_eq!(body["query"], "titanium alloys");
     }
 
     /// The higher-blast-radius half of the mesh offline work, and the half

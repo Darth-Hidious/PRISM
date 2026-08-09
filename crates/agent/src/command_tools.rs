@@ -168,6 +168,7 @@ enum CommandToolKind {
     MeshPublish,
     MeshSubscribe,
     MeshUnsubscribe,
+    MeshSync,
     RunSubmit,
     PublishArtifact,
     ComputeGpus,
@@ -498,6 +499,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
                 "subscribe",
                 "unsubscribe",
                 "subscriptions",
+                "sync",
                 "health",
             ],
             flags: FlagPolicy::AnyBehindApproval,
@@ -566,6 +568,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &[],
         kind: CommandToolKind::MeshUnsubscribe,
         description: "Unsubscribe the local node from a previously subscribed remote dataset.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "mesh_sync",
+        root: "mesh",
+        aliases: &[],
+        kind: CommandToolKind::MeshSync,
+        description: "Pull a dataset from a peer PRISM node NOW — no Kafka broker required. Fetches the peer's matching graph entities over its authenticated query API and writes them into the local knowledge store under the peer's own tenant (mesh:{peer node id}), so peer data stays attributable and never blends with local ingest. Needs the peer's base URL (e.g. http://192.168.1.20:7327). Writes to the local store, so it is approval-gated.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -2168,6 +2179,24 @@ fn mesh_publish_schema() -> Value {
     })
 }
 
+fn mesh_sync_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "dataset_name": {
+                "type": "string",
+                "description": "Dataset name to pull from the peer."
+            },
+            "peer": {
+                "type": "string",
+                "description": "Base URL of the peer node, e.g. http://192.168.1.20:7327."
+            }
+        },
+        "required": ["dataset_name", "peer"],
+        "additionalProperties": false
+    })
+}
+
 fn mesh_subscription_schema(action: &str) -> Value {
     json!({
         "type": "object",
@@ -2300,6 +2329,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::MeshPublish => mesh_publish_schema(),
         CommandToolKind::MeshSubscribe => mesh_subscription_schema("subscribe to"),
         CommandToolKind::MeshUnsubscribe => mesh_subscription_schema("unsubscribe from"),
+        CommandToolKind::MeshSync => mesh_sync_schema(),
     }
 }
 
@@ -3977,6 +4007,15 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::MeshSync => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec![
+                "sync".to_string(),
+                required_string(input, "dataset_name")?,
+                "--peer".to_string(),
+                required_string(input, "peer")?,
+            ],
+        }),
         CommandToolKind::NotebookExec => Ok(CommandExecution::NotebookExec {
             code: required_string(input, "code")?,
             timeout: optional_usize(input, "timeout").map(|value| value as u64),
