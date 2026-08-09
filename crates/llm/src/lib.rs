@@ -680,8 +680,8 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(&messages)),
         });
+        let body = self.with_operator_output_cap(body, Self::estimate_tokens(&messages));
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
         Ok(Self::extract_content(&data))
@@ -697,8 +697,8 @@ impl LlmClient {
             // unbounded output (thousands of tokens observed) on every call —
             // real, billed credits with no cap. Send the same context-clamped
             // budget every other chat path uses.
-            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(messages)),
         });
+        let body = self.with_operator_output_cap(body, Self::estimate_tokens(messages));
         let resp = self.post(&url, &body).await?;
         let text = resp
             .text()
@@ -777,12 +777,12 @@ impl LlmClient {
 
         let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(est),
         });
+        let mut body = self.with_operator_output_cap(body, est);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
@@ -828,6 +828,33 @@ impl LlmClient {
     /// model needs more (or less) room than a hardcoded 4096. Falls back to
     /// 4096 only when the config doesn't carry a value (e.g. local llama.cpp
     /// with no catalog entry).
+    /// Attach `max_tokens` ONLY when the operator asked for a ceiling.
+    ///
+    /// PRISM sends no output limit of its own. There are millions of models
+    /// and more arriving; deciding how many tokens any of them may emit is not
+    /// PRISM's call. Output is metered and billed per token — on the platform
+    /// side that is exactly how a user is charged against prepaid credits — so
+    /// counting is the control. Truncating just breaks models that reason
+    /// before answering and saves nobody anything.
+    ///
+    /// When `max_output_tokens` is unset the key is absent from the request
+    /// and the server applies its own context-derived bound.
+    fn with_operator_output_cap(
+        &self,
+        mut body: serde_json::Value,
+        est_prompt_tokens: u64,
+    ) -> serde_json::Value {
+        if self.config.max_output_tokens.is_some()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                "max_tokens".to_string(),
+                serde_json::json!(self.effective_max_tokens(est_prompt_tokens)),
+            );
+        }
+        body
+    }
+
     fn effective_max_tokens(&self, est_prompt_tokens: u64) -> u64 {
         const FLOOR: u64 = 256;
         // PRISM does NOT cap output on the operator's behalf.
@@ -942,9 +969,9 @@ impl LlmClient {
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(prompt.len() as u64 / 4),
             "response_format": {"type": "json_object"},
         });
+        let body = self.with_operator_output_cap(body, prompt.len() as u64 / 4);
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
         Self::extract_json_content(&data["choices"][0])
@@ -1158,14 +1185,14 @@ impl LlmClient {
                     } else {
                         0
                     };
-                let mut body = serde_json::json!({
+                let body = serde_json::json!({
                     "model": self.config.model,
                     "messages": msgs,
                     // Same fix as chat_marc27_simple: this path previously sent
                     // no cap at all, so a tool-calling turn could generate an
                     // unbounded (and unbounded-billed) response.
-                    "max_tokens": self.effective_max_tokens(est),
                 });
+                let mut body = self.with_operator_output_cap(body, est);
                 // The tool surface, identical to the OpenAI path below: the
                 // caller's already-token-bounded selection, with FULL schemas.
                 if native && !tools.is_empty() {
@@ -1347,13 +1374,13 @@ impl LlmClient {
 
         let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(est),
             "stream": true,
         });
+        let mut body = self.with_operator_output_cap(body, est);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
