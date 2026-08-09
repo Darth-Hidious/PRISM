@@ -5,7 +5,27 @@ import os
 import sys
 from typing import Annotated, Optional
 
-from app.tools.base import Tool, ToolRegistry
+from app.tools._offline import install_external_network_guard
+
+# Install BEFORE the registry is built, exactly as `app/tool_server.py:24` and
+# `app/sidecar_server.py:18` do.
+#
+# This was the one entry point of the three that did not. That is invisible to
+# both a socket audit and a subprocess audit: the socket layer is correct and
+# present (`_offline` monkeypatches `socket.connect`/`connect_ex`/`getaddrinfo`
+# process-wide), and this process is spawned by an EXTERNAL MCP host — Claude
+# Desktop, forge — not by PRISM, so no `Command::new` in the Rust tree points
+# at it. The guard was simply never invoked here.
+#
+# The registry it builds is the same one the guarded entry points build, and
+# several of its tools carry credentials with no check of their own:
+# `platform_jobs(action='events')` issues a raw `requests.get` with the live
+# `X-API-Key`/Bearer to api.marc27.com, and `tools/web.py` sends
+# FIRECRAWL_API_KEY. Neither reads PRISM_OFFLINE; both relied entirely on this
+# patch being in place.
+install_external_network_guard()
+
+from app.tools.base import Tool, ToolRegistry  # noqa: E402
 
 
 def _build_registry() -> ToolRegistry:

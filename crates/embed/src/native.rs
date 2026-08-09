@@ -34,6 +34,25 @@ pub fn default_cache_dir() -> Result<PathBuf> {
         .join(".prism/models/embed"))
 }
 
+/// Is the model already in `cache_dir`?
+///
+/// `hf-hub` lays a repo out as `models--<org>--<name>` — verified empirically
+/// against this machine's cache (`models--Xenova--bge-small-en-v1.5`), not
+/// assumed from the crate docs.
+///
+/// KNOWN RESIDUAL, deliberately not papered over: this proves the repo
+/// directory exists, not that every weight file inside is complete, and it does
+/// not rule out `hf-hub` issuing a revision/etag HEAD request against a warm
+/// cache. Confirming that would require letting it talk to huggingface.co,
+/// which is exactly what this guard exists to prevent, so it is recorded rather
+/// than claimed. The cold-cache case — the ~90 MB download that carries the
+/// token — is closed either way.
+fn model_is_cached(cache_dir: &std::path::Path, model_code: &str) -> bool {
+    cache_dir
+        .join(format!("models--{}", model_code.replace('/', "--")))
+        .is_dir()
+}
+
 impl NativeOnnx {
     /// Build with the default cache dir. Blocking; returns `Err` when the
     /// model is absent and cannot be downloaded (offline, no disk).
@@ -52,6 +71,34 @@ impl NativeOnnx {
         let (dim, model_code) = TextEmbedding::get_model_info(&MODEL)
             .map(|info| (info.dim, info.model_code.clone()))
             .unwrap_or((FALLBACK_DIM, "bge-small-en-v1.5".to_string()));
+
+        // Hard offline: never let `fastembed` fetch the weights.
+        //
+        // This bypassed the policy structurally, not by omission. `fastembed`
+        // does not use any client PRISM constructs — on a cache miss it calls
+        // `hf-hub`, which opens its OWN connection to huggingface.co and
+        // unconditionally attaches `~/.cache/huggingface/token` as a Bearer if
+        // that file exists. So neither a `reqwest` audit nor a subprocess audit
+        // could see it, and `hf-hub` honours no `HF_HUB_OFFLINE` escape (checked
+        // its source — the variable does not appear).
+        //
+        // Reached from background work too, not just interactive paths:
+        // `agent_loop.rs:1279` and `hooks.rs:558` embed inside `tokio::spawn`,
+        // after the turn that triggered them has already returned.
+        //
+        // A WARM cache still works, which is the module's stated contract ("no
+        // network after the first model download") and the whole point of local
+        // embedding offline. Only the download is refused.
+        if prism_runtime::offline::enabled() && !model_is_cached(&cache_dir, &model_code) {
+            anyhow::bail!(
+                "offline mode: the native embedding model is not cached at {} \
+                 and downloading it would fetch ~90 MB from huggingface.co \
+                 (sending your HF token if you have one). Run once online, or \
+                 use an endpoint-based embedding backend.",
+                cache_dir.display()
+            );
+        }
+
         let model = TextEmbedding::try_new(
             TextInitOptions::new(MODEL)
                 .with_cache_dir(cache_dir)
@@ -91,5 +138,51 @@ impl EmbedBackend for NativeOnnx {
 
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cold cache must not become a 90 MB download under hard offline.
+    ///
+    /// Only the COLD path is driven end-to-end: it returns before
+    /// `TextEmbedding::try_new`, so nothing can reach the network. The warm
+    /// path is asserted through `model_is_cached` instead — calling
+    /// `with_cache_dir` on a directory that merely LOOKS warm would hand
+    /// control to `fastembed`, which is what we are trying not to do in a test.
+    #[test]
+    fn a_cold_cache_is_not_downloaded_offline_and_a_warm_one_is_recognised() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `match`, not `expect_err`: `NativeOnnx` holds a `TextEmbedding` and
+        // does not implement `Debug`, which `expect_err` requires of the Ok
+        // type.
+        let err = match NativeOnnx::with_cache_dir(dir.path().to_path_buf()) {
+            Ok(_) => panic!("a cold cache must be refused offline"),
+            Err(err) => err,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("offline mode"),
+            "must be a POLICY refusal: {msg}"
+        );
+        assert!(
+            msg.contains("huggingface.co"),
+            "the refusal should name where it declined to go: {msg}"
+        );
+
+        // The cache check itself, both directions — this is what decides
+        // whether a warm cache still works offline.
+        assert!(!model_is_cached(dir.path(), "Xenova/bge-small-en-v1.5"));
+        std::fs::create_dir_all(dir.path().join("models--Xenova--bge-small-en-v1.5"))
+            .expect("mkdir");
+        assert!(
+            model_is_cached(dir.path(), "Xenova/bge-small-en-v1.5"),
+            "a warm cache must be recognised, or offline would break local embedding"
+        );
     }
 }

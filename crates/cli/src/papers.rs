@@ -87,6 +87,10 @@ pub enum PapersCommands {
         /// run time on long documents.
         #[arg(long, default_value_t = 0)]
         max_blocks: usize,
+        /// Also write the extracted claims into the bundled Turso store, so
+        /// they join the local knowledge graph instead of only being printed.
+        #[arg(long)]
+        store: bool,
     },
 }
 
@@ -262,6 +266,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             llm_url,
             api_key,
             max_blocks,
+            store,
         } => {
             let paper = paper_for_fulltext(&pmc, &url, &format)?;
             let engine = build_engine(vec![SourceId::Arxiv], &None, false);
@@ -283,6 +288,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 model.as_deref(),
                 api_key.as_deref(),
             )?;
+            let extractor_model = llm_cfg.model.clone();
             if llm_cfg.base_url.trim().is_empty() || llm_cfg.model.trim().is_empty() {
                 println!(
                     "{}",
@@ -325,6 +331,13 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             let mut claims = Vec::new();
             let mut rejected = Vec::new();
             let mut blocks_extracted = 0usize;
+            // A block whose extraction could not be parsed yields zero claims,
+            // which is indistinguishable from a block that genuinely contained
+            // none. `TextExtraction` reports the reason precisely so that stops
+            // being invisible — but this loop was discarding it with `.facts`,
+            // leaving the literature path exactly as silent as before.
+            let mut extraction_failures: Vec<serde_json::Value> = Vec::new();
+            let mut truncated_bytes = 0usize;
             // Extract per located block so every claim inherits a locator a
             // human can follow back into the document.
             for block in &fulltext.blocks {
@@ -339,11 +352,18 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     break;
                 }
                 blocks_extracted += 1;
-                let facts =
+                let extraction =
                     prism_ingest::text_extract::extract_facts_from_text(&llm, &title, &block.text)
                         .await
                         .with_context(|| "LLM fact extraction failed")?;
-                for fact in facts {
+                if let Some(reason) = &extraction.parse_error {
+                    extraction_failures.push(json!({
+                        "section": block.locator.section_path,
+                        "reason": reason,
+                    }));
+                }
+                truncated_bytes += extraction.dropped_bytes;
+                for fact in extraction.facts {
                     // Containment: find the verbatim span of THIS block that
                     // supports the fact. Facts with no supporting span cannot
                     // become claims — stamping them would record provenance a
@@ -403,6 +423,20 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     }
                 }
             }
+            // Persisting is opt-in. Until now `papers claims` printed EMMO
+            // claims and dropped them: the retrieval half and the graph half
+            // were both built and never joined, so PRISM could read a paper
+            // without ever knowing what was in it.
+            let stored = if store {
+                Some({
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                    let db_path = std::path::PathBuf::from(home).join(".prism/provenance.db");
+                    store_claims(&claims, &fulltext.source_url, &extractor_model, &db_path).await?
+                })
+            } else {
+                None
+            };
+
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -412,6 +446,11 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     "document": fulltext.source_url,
                     "blocks_extracted": blocks_extracted,
                     "max_blocks": max_blocks,
+                    "stored": stored,
+                    // Non-empty means some blocks produced nothing because the
+                    // model misbehaved, NOT because the paper was silent there.
+                    "extraction_failures": extraction_failures,
+                    "truncated_bytes": truncated_bytes,
                 }))?
             );
         }
@@ -419,16 +458,188 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
     Ok(())
 }
 
+/// Write extracted literature claims into the bundled Turso store.
+///
+/// `ExtractedClaim` and `MaterialFact` are structurally the same fact in two
+/// crates; the only real conversion is the unit, which is a plain `String` on
+/// the retrieval side and a validated `QudtUnit` on the storage side.
+///
+/// A claim whose unit fails QUDT validation is REJECTED and counted, never
+/// written with the unit quietly dropped: a measurement that loses its unit is
+/// a wrong number, not a slightly poorer one.
+///
+/// Evidence class is re-capped through `evidence_for_result` on the way in.
+/// `validate_and_stamp` already caps at literature, but this store call is a
+/// separate entry point and must not depend on an upstream promise.
+async fn store_claims(
+    claims: &[prism_retrieval::claims::ExtractedClaim],
+    document_url: &str,
+    model: &str,
+    db_path: &std::path::Path,
+) -> Result<serde_json::Value> {
+    use prism_provenance::{
+        EvidenceSource, LocalProvenance, MaterialFact, MeasurementCondition, ProvenanceStore,
+        QudtUnit, evidence_for_result,
+    };
+
+    if claims.is_empty() {
+        return Ok(json!({ "written": 0, "rejected": 0, "store": null }));
+    }
+
+    let store = ProvenanceStore::open(db_path).await?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let prov = LocalProvenance {
+        activity_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: if model.is_empty() {
+            "prism-papers".to_string()
+        } else {
+            model.to_string()
+        },
+        agent_kind: "SoftwareAgent".into(),
+        source_entity_id: document_url.to_string(),
+        source_kind: "Document".into(),
+        tenant: "local".into(),
+        started_at: now.clone(),
+        ended_at: now,
+        locality: "local".into(),
+    };
+    store.record_activity(&prov).await?;
+
+    let mut written = 0usize;
+    let mut rejected: Vec<serde_json::Value> = Vec::new();
+
+    for claim in claims {
+        let unit = match claim.unit.as_deref() {
+            Some(raw) => match QudtUnit::new(raw) {
+                Ok(unit) => Some(unit),
+                Err(e) => {
+                    rejected.push(json!({
+                        "subject": claim.subject,
+                        "object": claim.object,
+                        "reason": format!("unit {raw:?} is not a valid QUDT identifier: {e}"),
+                    }));
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        // A `measurement` with no value is DROPPED by the store —
+        // `write_fact` returns Ok(()) having written nothing (see the
+        // `Some("measurement")` arm in prism-provenance: "a measurement
+        // without a value fails schema validation and is dropped"). Counting
+        // that as written reports facts that are not in the graph.
+        //
+        // `validate_and_stamp` does not catch it: it rejects a value with no
+        // unit, not a measurement with no value. The kind and the value come
+        // from the model independently, so nothing upstream ties them.
+        if claim.kind.as_deref() == Some("measurement") && claim.value.is_none() {
+            rejected.push(json!({
+                "subject": claim.subject,
+                "object": claim.object,
+                "reason": "kind is `measurement` but no value was extracted; the store drops \
+                           such a fact, so writing it would report a fact that is not there",
+            }));
+            continue;
+        }
+
+        let mut conditions = Vec::with_capacity(claim.conditions.len());
+        let mut bad_condition = None;
+        for condition in &claim.conditions {
+            let cond_unit = match condition.unit.as_deref() {
+                Some(raw) => match QudtUnit::new(raw) {
+                    Ok(unit) => Some(unit),
+                    Err(e) => {
+                        bad_condition =
+                            Some(format!("condition {:?} unit {raw:?}: {e}", condition.name));
+                        break;
+                    }
+                },
+                None => None,
+            };
+            conditions.push(MeasurementCondition {
+                name: condition.name.clone(),
+                value: match &condition.value {
+                    prism_retrieval::claims::ConditionValue::Number(n) => {
+                        prism_provenance::ConditionValue::Number(*n)
+                    }
+                    prism_retrieval::claims::ConditionValue::Text(t) => {
+                        prism_provenance::ConditionValue::Text(t.clone())
+                    }
+                },
+                unit: cond_unit,
+            });
+        }
+        if let Some(reason) = bad_condition {
+            rejected.push(json!({
+                "subject": claim.subject,
+                "object": claim.object,
+                "reason": reason,
+            }));
+            continue;
+        }
+
+        let fact = MaterialFact {
+            subject: claim.subject.clone(),
+            predicate: claim.predicate.clone(),
+            object: claim.object.clone(),
+            value: claim.value,
+            unit,
+            conditions,
+            confidence: claim.confidence,
+            evidence_class: evidence_for_result(
+                EvidenceSource::LiteratureExtraction,
+                [serde_json::from_value(json!(claim.evidence_class)).unwrap_or_default()],
+            ),
+            kind: claim.kind.clone(),
+        };
+
+        match store.write_fact(&fact, &prov).await {
+            Ok(()) => written += 1,
+            Err(e) => rejected.push(json!({
+                "subject": claim.subject,
+                "object": claim.object,
+                "reason": format!("store write failed: {e}"),
+            })),
+        }
+    }
+
+    Ok(json!({
+        "written": written,
+        "rejected": rejected.len(),
+        "rejections": rejected,
+        "store": db_path.display().to_string(),
+        "tenant": "local",
+    }))
+}
+
 /// TCP-probe an LLM base URL with a hard 3-second budget.
 fn probe_endpoint(base_url: &str) -> Result<(), String> {
     use std::net::ToSocketAddrs;
+
+    // Hard offline, checked FIRST — before `to_socket_addrs`, not just before
+    // the connect. Resolution is itself a network call: a DNS query for an
+    // agent-chosen host leaves the machine even if the TCP handshake never
+    // happens.
+    //
+    // This probe is agent-reachable with no human gate. `papers` is
+    // `PermissionMode::ReadOnly, requires_approval: false` and its
+    // `FlagPolicy::Only` list includes `--llm-url`
+    // (agent/src/command_tools.rs), and `execute_cli_command` spawns the CLI
+    // with no `env_clear`, so a `PRISM_OFFLINE=1` parent is inherited and was
+    // then ignored right here. A model could name the host.
+    //
+    // `check_url` rather than `enabled()`: a local llama.cpp endpoint is the
+    // normal case and must stay probeable offline.
+    prism_runtime::offline::check_url(base_url)?;
     let without_scheme = base_url
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(base_url);
     let host_port = without_scheme.split('/').next().unwrap_or("");
     let host_port = match host_port.rsplit_once(':') {
-        Some((h, p)) if p.parse::<u16>().is_ok() => host_port.to_string(),
+        Some((_host, p)) if p.parse::<u16>().is_ok() => host_port.to_string(),
         _ => format!(
             "{host_port}:{port}",
             port = if base_url.starts_with("https") {
@@ -497,5 +708,263 @@ fn claim_from_fact(
             locator: locator.clone(),
             quote,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CRATE's lock, not a private one.
+    ///
+    /// `boot_checks::ENV_LOCK` is already shared by `boot_checks.rs` and
+    /// `main.rs`; this file declared a second `static LOCK` for the same
+    /// process-global `PRISM_OFFLINE`. Two locks that do not exclude each
+    /// other serialize nothing, and all three files compile into one test
+    /// binary that cargo runs multi-threaded. Sixth occurrence of this shape —
+    /// `d3fcdfa4` consolidated it in `crates/mesh` and missed that
+    /// `crates/cli` had the same bug.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Restores the var on drop, so a failed assertion cannot leave it set for
+    /// the rest of the binary.
+    struct OfflineGuard(Option<String>);
+    impl Drop for OfflineGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("PRISM_OFFLINE", v),
+                    None => std::env::remove_var("PRISM_OFFLINE"),
+                }
+            }
+        }
+    }
+
+    /// The probe must refuse a remote host BEFORE resolving it. `papers` is an
+    /// agent tool with `requires_approval: false` whose flag allow-list
+    /// includes `--llm-url`, and the spawned CLI inherits `PRISM_OFFLINE`
+    /// (no `env_clear`), so a model could name the host and this was the one
+    /// step that ignored the flag.
+    #[test]
+    fn probe_refuses_a_remote_endpoint_offline() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
+
+        let err = probe_endpoint("https://llm.example.invalid/v1")
+            .expect_err("offline must refuse a remote endpoint");
+        assert!(err.contains("offline mode"), "{err}");
+        assert!(
+            err.contains("llm.example.invalid"),
+            "must name what it blocked: {err}"
+        );
+        // It must NOT have got as far as resolution — a DNS failure message
+        // would mean the lookup already left the machine.
+        assert!(
+            !err.contains("cannot resolve"),
+            "resolved before refusing: {err}"
+        );
+    }
+
+    /// A local llama.cpp endpoint stays probeable offline — `check_url`, not a
+    /// blanket refusal. Nothing listens on port 1, so reaching a CONNECT error
+    /// rather than a policy one proves the guard let it through.
+    #[test]
+    fn probe_still_allows_loopback_offline() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
+
+        let err =
+            probe_endpoint("http://127.0.0.1:1/v1").expect_err("nothing is listening on port 1");
+        assert!(
+            !err.contains("offline mode"),
+            "loopback must not be refused by policy: {err}"
+        );
+    }
+
+    /// Without this the two above would pass even if the guard refused
+    /// unconditionally.
+    #[test]
+    fn probe_guard_is_inert_when_offline_is_unset() {
+        let _guard = env_lock();
+        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
+        unsafe { std::env::remove_var("PRISM_OFFLINE") };
+
+        let err = probe_endpoint("http://127.0.0.1:1/v1").expect_err("nothing is listening");
+        assert!(
+            !err.contains("offline mode"),
+            "guard fired with offline unset: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use prism_retrieval::claims::{
+        ClaimProvenance, ConditionValue, ExtractedClaim, MeasurementCondition,
+    };
+
+    fn scratch_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("prism_papers_test_{}.db", uuid::Uuid::new_v4()))
+    }
+
+    fn cleanup(p: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut q = p.to_path_buf().into_os_string();
+            q.push(suffix);
+            let _ = std::fs::remove_file(q);
+        }
+    }
+
+    fn claim(object: &str, unit: Option<&str>, cond_unit: Option<&str>) -> ExtractedClaim {
+        ExtractedClaim {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_measurement".into(),
+            object: object.into(),
+            value: Some(1140.0),
+            unit: unit.map(str::to_string),
+            conditions: cond_unit
+                .map(|u| {
+                    vec![MeasurementCondition {
+                        name: "temperature".into(),
+                        value: ConditionValue::Number(298.15),
+                        unit: Some(u.to_string()),
+                    }]
+                })
+                .unwrap_or_default(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: "research".into(),
+            provenance: ClaimProvenance {
+                document_id: "10.1000/xyz".into(),
+                document_url: "https://example.org/paper".into(),
+                source: "arxiv".into(),
+                locator: prism_retrieval::Locator {
+                    kind: prism_retrieval::fulltext::BlockKind::Body,
+                    section_path: vec!["Results".into()],
+                    label: None,
+                    char_offset: 0,
+                },
+                quote: None,
+            },
+        }
+    }
+
+    /// The gap this exists to close: extracted literature claims must land in
+    /// the graph, not just be printed.
+    #[tokio::test]
+    async fn a_valid_claim_is_written_and_readable_back() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+
+        let out = store_claims(
+            &[claim("UTS", Some("QUDT:MegaPA"), Some("QUDT:K"))],
+            "https://example.org/paper",
+            "test-model",
+            &db,
+        )
+        .await
+        .expect("store");
+
+        assert_eq!(out["written"], 1, "claim was not written: {out}");
+        assert_eq!(out["rejected"], 0);
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1, "fact not readable back");
+        assert_eq!(facts[0].object, "UTS");
+        assert_eq!(
+            facts[0].evidence_class,
+            prism_provenance::EvidenceClass::Research,
+            "literature must stay ORANGE/research",
+        );
+        assert_eq!(facts[0].source, "https://example.org/paper");
+        cleanup(&db);
+    }
+
+    /// A measurement that loses its unit is a wrong number, not a slightly
+    /// poorer one. An invalid QUDT unit must reject the claim, not write it
+    /// unitless.
+    #[tokio::test]
+    async fn a_claim_with_an_invalid_unit_is_rejected_not_silently_unitless() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+
+        let out = store_claims(
+            &[claim("UTS", Some("megapascals"), None)],
+            "https://example.org/paper",
+            "test-model",
+            &db,
+        )
+        .await
+        .expect("store");
+
+        assert_eq!(out["written"], 0, "an unvalidated unit was written: {out}");
+        assert_eq!(out["rejected"], 1);
+        assert!(
+            out["rejections"][0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("QUDT"),
+            "rejection does not say why: {out}"
+        );
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert!(facts.is_empty(), "rejected claim reached the store anyway");
+        cleanup(&db);
+    }
+
+    /// A `measurement` with no value is dropped by the store while returning
+    /// Ok(()), so counting it as written reports a fact that is not in the
+    /// graph. `validate_and_stamp` does not catch this — it rejects a value
+    /// with no unit, not a measurement with no value.
+    #[tokio::test]
+    async fn a_valueless_measurement_is_rejected_not_counted_as_written() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+
+        let mut c = claim("UTS", Some("QUDT:MegaPA"), None);
+        c.value = None; // kind stays "measurement"
+
+        let out = store_claims(&[c], "https://example.org/paper", "m", &db)
+            .await
+            .expect("store");
+
+        assert_eq!(
+            out["written"], 0,
+            "counted a fact the store discards: {out}"
+        );
+        assert_eq!(out["rejected"], 1);
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert!(facts.is_empty(), "the dropped fact appears in the store");
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn no_claims_means_no_store_file_and_no_error() {
+        let db = scratch_db();
+        let out = store_claims(&[], "https://example.org/paper", "m", &db)
+            .await
+            .expect("store");
+        assert_eq!(out["written"], 0);
+        assert!(!db.exists(), "an empty claim set created a database anyway");
     }
 }

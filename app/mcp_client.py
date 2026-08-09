@@ -1,6 +1,7 @@
 """MCP client: connect to external MCP servers and import their tools."""
 import asyncio
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,14 @@ async def discover_tools_from_server(
 
     Returns list of dicts with: name, description, input_schema, server_name.
     """
+    # Self-guarded, like `call_mcp_tool`, rather than relying on its caller.
+    # Today the only caller is `discover_and_register_mcp_tools`, which is
+    # guarded — so this is defence in depth, not a live hole. But the asymmetry
+    # was the finding: a future direct import (a "test this MCP server" button)
+    # would bypass the policy with nothing to notice it.
+    if os.environ.get("PRISM_OFFLINE", "").strip() == "1":
+        return []
+
     from fastmcp import Client
 
     # FastMCP Client expects {"mcpServers": {"name": config}} format
@@ -67,6 +76,13 @@ async def call_mcp_tool(
     arguments: dict,
 ) -> dict:
     """Call a tool on an external MCP server."""
+    # Guarded separately from discovery, not just alongside it. Discovery runs
+    # once at boot; these handlers live for the whole session. A registry built
+    # while online keeps working after PRISM_OFFLINE=1 is set, so gating only
+    # registration would leave every already-registered server reachable.
+    if os.environ.get("PRISM_OFFLINE", "").strip() == "1":
+        return {"error": "offline mode: external MCP servers are unreachable"}
+
     from fastmcp import Client
 
     mcp_config = {"mcpServers": {server_name: server_config}}
@@ -89,6 +105,18 @@ def discover_and_register_mcp_tools(
 
     Returns list of registered tool names.
     """
+    # Hard offline: no external MCP servers. Mirrors the Rust client exactly —
+    # `crates/agent/src/mcp.rs:177` returns an empty client under the same
+    # condition — and this one had no check at all.
+    #
+    # The process-wide socket guard is not sufficient cover here: a stdio
+    # transport spawns an arbitrary `command`/`args` from
+    # `~/.prism/mcp_servers.json` as a CHILD process, which does its own
+    # networking outside the parent's monkeypatch. The config's own documented
+    # example carries an `env` block, so a credential can ride along.
+    if os.environ.get("PRISM_OFFLINE", "").strip() == "1":
+        return []
+
     if config is None:
         config = load_mcp_config()
     if not config.servers:

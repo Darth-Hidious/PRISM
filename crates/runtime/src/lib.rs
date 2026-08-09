@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod llm_resolve;
 pub mod offline;
+pub mod platform_env;
 pub mod retry;
 
 use std::env;
@@ -22,6 +23,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+
+use crate::platform_env::PlatformVar;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -403,7 +406,8 @@ pub struct PlatformEndpoints {
 impl PlatformEndpoints {
     pub fn from_env() -> Self {
         let default_root = "https://api.marc27.com".to_string();
-        let root = env::var("MARC27_PLATFORM_URL")
+        let root = PlatformVar::PLATFORM_URL
+            .get()
             .unwrap_or(default_root)
             .trim_end_matches('/')
             .to_string();
@@ -433,21 +437,86 @@ mod tests {
     // every env-touching test through this guard.
     static ENV_GUARD: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn derives_api_and_ws_endpoints_from_platform_url() {
-        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    /// Clear both spellings so a test starts from a known environment.
+    fn clear_platform_url() {
         unsafe {
-            env::set_var("MARC27_PLATFORM_URL", "https://api.marc27.com/");
-        }
-        let endpoints = PlatformEndpoints::from_env();
-        assert_eq!(endpoints.api_base, "https://api.marc27.com/api/v1");
-        assert_eq!(
-            endpoints.node_ws,
-            "wss://api.marc27.com/api/v1/nodes/connect"
-        );
-        unsafe {
+            env::remove_var("PRISM_PLATFORM_URL");
             env::remove_var("MARC27_PLATFORM_URL");
         }
+    }
+
+    /// The historical `MARC27_*` name must keep working forever: every shipped
+    /// client, deployed node and CI secret sets it.
+    ///
+    /// The URL here deliberately does NOT match the built-in default. An
+    /// earlier version of this test used `https://api.marc27.com/`, which is
+    /// byte-identical to `default_root` once the trailing slash is trimmed —
+    /// so it passed whether the alias resolved or the lookup returned `None`
+    /// and fell through to the default. It could not fail for the reason it
+    /// was named after. A non-default host makes the two outcomes distinct.
+    #[test]
+    fn historical_platform_url_alias_still_resolves() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("MARC27_PLATFORM_URL", "https://legacy.example.test/");
+        }
+        let endpoints = PlatformEndpoints::from_env();
+        assert_eq!(endpoints.api_base, "https://legacy.example.test/api/v1");
+        assert_eq!(
+            endpoints.node_ws,
+            "wss://legacy.example.test/api/v1/nodes/connect"
+        );
+        clear_platform_url();
+    }
+
+    /// The provider-neutral name works at a real call site, not just in the
+    /// resolver's own unit tests. This is what makes "PRISM can be pointed at
+    /// another provider" a demonstrated property rather than a claim.
+    #[test]
+    fn neutral_platform_url_is_honoured() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("PRISM_PLATFORM_URL", "https://self-hosted.example.test/");
+        }
+        let endpoints = PlatformEndpoints::from_env();
+        assert_eq!(
+            endpoints.api_base,
+            "https://self-hosted.example.test/api/v1"
+        );
+        assert_eq!(
+            endpoints.node_ws,
+            "wss://self-hosted.example.test/api/v1/nodes/connect"
+        );
+        clear_platform_url();
+    }
+
+    /// Precedence, proven where it matters: an operator adding the neutral
+    /// name to a host that already carries the historical one gets the neutral
+    /// one. Both values are non-default, so neither can be produced by a
+    /// fallback.
+    #[test]
+    fn neutral_platform_url_wins_over_the_alias() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("PRISM_PLATFORM_URL", "https://new.example.test/");
+            env::set_var("MARC27_PLATFORM_URL", "https://old.example.test/");
+        }
+        let endpoints = PlatformEndpoints::from_env();
+        assert_eq!(endpoints.api_base, "https://new.example.test/api/v1");
+        clear_platform_url();
+    }
+
+    /// With neither name set, the built-in default still applies. Pins the
+    /// fallback the three tests above deliberately avoid touching.
+    #[test]
+    fn unset_platform_url_falls_back_to_the_builtin_default() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        let endpoints = PlatformEndpoints::from_env();
+        assert_eq!(endpoints.api_base, "https://api.marc27.com/api/v1");
     }
 
     // The regression guard for the "re-login every ~24h" dance: a refresh must

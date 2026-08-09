@@ -7,7 +7,9 @@ temp directory so tests are hermetic and parallel-safe.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,78 @@ for p in (ROOT, ROOT / "src"):
     sp = str(p)
     if sp not in sys.path:
         sys.path.insert(0, sp)
+
+
+# ---------------------------------------------------------------------------
+# Keep the whole suite out of the developer's real home directory.
+# ---------------------------------------------------------------------------
+#
+# Done at MODULE scope, not in a fixture, and this is the point: pytest imports
+# conftest.py before it collects anything, and nothing under `app/` is imported
+# until a fixture body or a test module runs. So this precedes every
+# `Path.home()` evaluation in the tree.
+#
+# `pytest tests/` was writing `~/.prism/cache/provider_health.json` — a reviewer
+# hit it, opened circuit breakers in the real file, and could not restore the
+# prior bytes. The first fix patched the two constants behind that one file.
+# There are THIRTY-TWO `Path.home() / ".prism"` constants under `app/`, and a
+# second was already live: `session_context.SESSION_DIR`, which
+# `tests/test_kag_tools.py` writes into a directory holding 300+ genuine session
+# files, relying on the test's own `unlink` rather than isolation.
+#
+# Patching `HOME` once covers all of them, including any added later, and
+# sidesteps the fixture-scope hazard entirely — the earlier attempt was
+# function-scoped and silently missed the module-scoped fixture that mattered.
+# Verified that `Path.home()` re-reads the environment on every call and caches
+# nothing.
+_REAL_HOME = os.environ.get("HOME")
+_TEST_HOME = Path(tempfile.mkdtemp(prefix="prism-test-home-"))
+os.environ["HOME"] = str(_TEST_HOME)
+
+
+def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
+    """Put the developer's HOME back and remove the throwaway one."""
+    if _REAL_HOME is not None:
+        os.environ["HOME"] = _REAL_HOME
+    shutil.rmtree(_TEST_HOME, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_prism_state(tmp_path_factory):
+    """Keep the whole suite out of the developer's real ``~/.prism``.
+
+    `SearchEngine.__init__` defaults to
+    `HealthManager(persist_path=DEFAULT_HEALTH_PATH)` and
+    `SearchCache(disk_dir=DEFAULT_CACHE_DIR)`, both under the real
+    `~/.prism/cache/`. `test_fork_safety.py` runs a GENUINE materials search by
+    design — the whole point of that file is that a mock does not load the
+    framework whose atfork handler is the fault — so a plain `pytest tests/`
+    opened circuit breakers in the developer's actual provider-health file. A
+    reviewer hit exactly that here and could not restore the prior bytes.
+
+    SESSION scope, deliberately. The first version of this was folded into the
+    function-scoped `isolated_state` and did NOT work: `poisoned_process` is
+    module-scoped, and higher-scoped fixtures are set up BEFORE lower-scoped
+    ones, so the patch was not active when the real search ran. Verified by
+    md5 of the real file across a full-suite run — the other search test files
+    went clean while `test_fork_safety.py` still wrote it.
+
+    Patched as module attributes because both are read at construction time,
+    so this covers every engine built anywhere under test rather than only the
+    ones that remember to pass overrides.
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+
+    from app.tools.search_engine import engine as _search_engine
+
+    mp = MonkeyPatch()
+    cache_dir = tmp_path_factory.mktemp("prism-cache")
+    mp.setattr(_search_engine, "DEFAULT_CACHE_DIR", cache_dir)
+    mp.setattr(
+        _search_engine, "DEFAULT_HEALTH_PATH", cache_dir / "provider_health.json"
+    )
+    yield
+    mp.undo()
 
 
 @pytest.fixture(autouse=True)

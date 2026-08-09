@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """MCP tool wrapper for the federated SearchEngine.
 
 The infrastructure (`SearchEngine`, providers, fusion, cache, circuit
@@ -237,7 +237,17 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
         # providers actually failed. Now we surface the full per-provider log
         # plus a one-glance summary + the engine's warnings array.
         providers_queried = []
-        summary = {"succeeded": 0, "failed": 0, "skipped": 0, "circuit_open": 0}
+        # `offline_blocked` is counted apart from `failed`. It fell into the
+        # `else` and was reported as a provider failure — the one rolled-up
+        # number a calling agent reads, contradicting the whole point of
+        # distinguishing a policy refusal from provider health.
+        summary = {
+            "succeeded": 0,
+            "failed": 0,
+            "skipped": 0,
+            "circuit_open": 0,
+            "offline_blocked": 0,
+        }
         for log in result.query_log:
             ok = log.status == "success"
             providers_queried.append(
@@ -257,6 +267,8 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
                 summary["succeeded"] += 1
             elif log.status == "skipped":
                 summary["skipped"] += 1
+            elif log.status == "offline_blocked":
+                summary["offline_blocked"] += 1
             elif log.status == "circuit_open":
                 summary["circuit_open"] += 1
             else:

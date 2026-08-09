@@ -78,6 +78,29 @@ impl Marc27Backend {
     fn url(&self, path: &str) -> String {
         format!("{}{}{}", self.api_base, "/compute", path)
     }
+
+    /// The same URL, refused under hard offline mode.
+    ///
+    /// **Every outbound call in this crate must go through here.** `crates/compute`
+    /// had no `prism-runtime` dependency at all, so it could not consult the
+    /// offline policy even in principle — and `Marc27Auth::apply` attaches the
+    /// `X-API-Key` / `Authorization: Bearer` header unconditionally. So
+    /// `PRISM_OFFLINE=1 prism run --backend marc27 …` put a live platform
+    /// credential on the wire. Nothing upstream caught it either:
+    /// `preflight_command_auth` only gates `node up`, and `handle_run` had zero
+    /// offline references.
+    ///
+    /// This is the identical shape `crates/retrieval` was fixed for — see the
+    /// comment at `retrieval/src/http.rs:30`, which describes a crate that
+    /// "ignored PRISM_OFFLINE completely" for exactly this reason.
+    ///
+    /// `check_url`, not `enabled()`: a self-hosted broker on loopback stays
+    /// usable offline, matching every other guard in the workspace.
+    fn guarded_url(&self, path: &str) -> Result<String> {
+        let url = self.url(path);
+        prism_runtime::offline::check_url(&url).map_err(anyhow::Error::msg)?;
+        Ok(url)
+    }
 }
 
 /// Normalise an API base to end with exactly one `/api/v1`. Accepts a bare host
@@ -137,7 +160,7 @@ impl ComputeBackend for Marc27Backend {
 
         let resp = self
             .auth
-            .apply(self.client.post(self.url("/submit")))
+            .apply(self.client.post(self.guarded_url("/submit")?))
             .json(&body)
             .send()
             .await
@@ -153,7 +176,7 @@ impl ComputeBackend for Marc27Backend {
     async fn status(&self, job_id: Uuid) -> Result<JobStatus> {
         let resp = self
             .auth
-            .apply(self.client.get(self.url(&format!("/{job_id}"))))
+            .apply(self.client.get(self.guarded_url(&format!("/{job_id}"))?))
             .send()
             .await
             .context("failed to query job status")?
@@ -169,7 +192,7 @@ impl ComputeBackend for Marc27Backend {
         // there is no separate `/results` path.
         let resp = self
             .auth
-            .apply(self.client.get(self.url(&format!("/{job_id}"))))
+            .apply(self.client.get(self.guarded_url(&format!("/{job_id}"))?))
             .send()
             .await
             .context("failed to fetch job results")?
@@ -182,7 +205,10 @@ impl ComputeBackend for Marc27Backend {
 
     async fn cancel(&self, job_id: Uuid) -> Result<()> {
         self.auth
-            .apply(self.client.post(self.url(&format!("/{job_id}/cancel"))))
+            .apply(
+                self.client
+                    .post(self.guarded_url(&format!("/{job_id}/cancel"))?),
+            )
             .send()
             .await
             .context("failed to cancel job")?
@@ -199,6 +225,83 @@ mod tests {
     use super::*;
 
     const DEFAULT_API_BASE: &str = "https://api.marc27.com/api/v1";
+
+    /// Every verb refuses under hard offline, and the credential never ships.
+    ///
+    /// This crate had NO `prism-runtime` dependency, so it could not consult
+    /// the offline policy even in principle, while `Marc27Auth::apply` attaches
+    /// `X-API-Key`/`Bearer` unconditionally. `PRISM_OFFLINE=1 prism run
+    /// --backend marc27` therefore put a live platform credential on the wire.
+    ///
+    /// All four verbs are asserted, not just `submit`: each builds its own URL,
+    /// so a guard added to one says nothing about the others.
+    ///
+    /// The refusal must also not quote the credential — a guard that refuses
+    /// but prints the key in the error has moved the leak, not closed it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn no_verb_reaches_the_platform_offline_and_the_key_never_appears() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        const SECRET: &str = "m27_super_secret_key";
+        let backend = Marc27Backend::new(DEFAULT_API_BASE, Marc27Auth::ApiKey(SECRET.into()));
+        let plan = ExperimentPlan {
+            name: "n".into(),
+            image: "img".into(),
+            inputs: serde_json::json!({}),
+        };
+
+        let refusals = [
+            format!("{:#}", backend.submit(&plan).await.unwrap_err()),
+            format!("{:#}", backend.status(Uuid::nil()).await.unwrap_err()),
+            format!("{:#}", backend.results(Uuid::nil()).await.unwrap_err()),
+            format!("{:#}", backend.cancel(Uuid::nil()).await.unwrap_err()),
+        ];
+        for msg in &refusals {
+            assert!(
+                msg.contains("offline mode"),
+                "must be a POLICY refusal: {msg}"
+            );
+            assert!(
+                !msg.contains(SECRET),
+                "credential leaked into the error: {msg}"
+            );
+        }
+    }
+
+    /// The other half: a loopback broker stays usable offline, and a non-offline
+    /// process is not blocked. Without this, every assertion above would pass
+    /// against a backend that refused unconditionally.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn loopback_survives_offline_and_the_guard_is_inert_when_unset() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+
+        // Nothing listens on port 1, so reaching a real connect proves the
+        // policy stepped aside — the error is transport, not policy.
+        let backend = Marc27Backend::new("http://127.0.0.1:1", Marc27Auth::ApiKey("k".into()));
+
+        let _offline = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+        let msg = format!("{:#}", backend.status(Uuid::nil()).await.unwrap_err());
+        assert!(
+            !msg.contains("offline mode"),
+            "loopback must stay reachable under offline: {msg}"
+        );
+        drop(_offline);
+
+        // `0.0.0.0:1`, NOT the real api.marc27.com — a unit test must never
+        // put a packet on the public internet. It is non-loopback (so the
+        // guard would refuse it if the policy were on) and the OS refuses a
+        // connection to it in ~7ms, so the inertness check costs nothing.
+        let _off = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let remote = Marc27Backend::new("http://0.0.0.0:1", Marc27Auth::ApiKey("k".into()));
+        let msg = format!("{:#}", remote.status(Uuid::nil()).await.unwrap_err());
+        assert!(
+            !msg.contains("offline mode"),
+            "guard must be inert when PRISM_OFFLINE is unset: {msg}"
+        );
+    }
 
     #[test]
     fn url_targets_real_compute_endpoints() {

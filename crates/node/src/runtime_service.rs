@@ -293,6 +293,17 @@ fn engine_unresponsive(runtime: ContainerRuntime, what: &str) -> anyhow::Error {
 }
 
 async fn pull_for_platform(runtime: ContainerRuntime, image: &str, platform: &str) -> Result<()> {
+    // A registry fetch is egress, and with a configured `docker login` it
+    // carries registry credentials. Unlike `ensure_image_available` there is no
+    // local-copy fallback to degrade to here — this function exists only to
+    // pull — so it refuses outright.
+    if prism_runtime::offline::enabled() {
+        bail!(
+            "offline mode: `{} pull --platform {platform} {image}` is blocked. \
+             Pull it before going offline.",
+            runtime.binary()
+        );
+    }
     // Deliberately not bounded by CONTAINER_CMD_TIMEOUT: this image is several
     // GB and a first pull legitimately runs for many minutes.
     let pull = Command::new(runtime.binary())
@@ -324,6 +335,27 @@ fn loopback_port(base_url: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    /// `pull_for_platform` exists only to pull, so it refuses outright — there
+    /// is no local-copy path to degrade to as in `ensure_image_available`.
+    ///
+    /// One-sided: the permissive half is the registry fetch itself. The
+    /// "policy off" direction is pinned at the primitive.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_platform_pull_is_refused_before_it_spawns() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let err = pull_for_platform(ContainerRuntime::Docker, "img:tag", "linux/amd64")
+            .await
+            .expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("offline mode"),
+            "must be a POLICY refusal: {msg}"
+        );
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;

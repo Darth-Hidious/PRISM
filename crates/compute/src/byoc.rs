@@ -162,6 +162,49 @@ impl ByocBackend {
         self.slurm_job_ids.read().await.get(&job_id).copied()
     }
 
+    /// Refuse under hard offline mode, BEFORE any process is spawned.
+    ///
+    /// Egress here is a subprocess, not a socket this crate opens, so no
+    /// URL-shaped guard covers it: `ssh_cmd` runs `ssh -i <key_path> …`, which
+    /// authenticates to the remote host with **the user's SSH private key**,
+    /// and the kubectl paths talk to whatever cluster the context names. The
+    /// crate had no `prism-runtime` dependency at all until the sibling fix to
+    /// `marc27.rs`, so none of this could consult the policy even in principle.
+    ///
+    /// Called at the top of all four `ComputeBackend` methods rather than at
+    /// the eleven `ssh_cmd`/`slurm_ssh`/`kubectl` sites: those sit inside match
+    /// arms and grow, and a guard you must remember to repeat is one that will
+    /// eventually be missed.
+    ///
+    /// `Ssh`/`Slurm` carry a host, so they get `check_url` and a loopback
+    /// target stays usable — a local SSH daemon or a login node on this machine
+    /// is legitimate offline. `Kubernetes` carries a CONTEXT NAME, not an
+    /// address: `minikube` and `prod-eks` are indistinguishable here without
+    /// reading kubeconfig. That is unresolvable from this data, so it fails
+    /// CLOSED — under `PRISM_OFFLINE=1` every kubectl target is refused,
+    /// including a local cluster. Refusing a local kind cluster is a nuisance;
+    /// shipping a kubeconfig credential to a remote API server is not.
+    fn check_offline(&self) -> Result<()> {
+        match &self.target {
+            ByocTarget::Ssh { host, .. } => {
+                prism_runtime::offline::check_url(host).map_err(anyhow::Error::msg)
+            }
+            ByocTarget::Slurm { head_node, .. } => {
+                prism_runtime::offline::check_url(head_node).map_err(anyhow::Error::msg)
+            }
+            ByocTarget::Kubernetes { context, .. } => {
+                if prism_runtime::offline::enabled() {
+                    bail!(
+                        "offline mode: outbound network blocked for kubectl context {context:?} \
+                         — a context name does not say whether the cluster is local, so hard \
+                         offline refuses all of them"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Build an SSH command prefix for the target host.
     fn ssh_cmd(host: &str, user: &str, key_path: &str, port: u16) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("ssh");
@@ -194,6 +237,7 @@ impl ByocBackend {
 #[async_trait]
 impl ComputeBackend for ByocBackend {
     async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
+        self.check_offline()?;
         match &self.target {
             ByocTarget::Ssh {
                 host,
@@ -333,6 +377,7 @@ impl ComputeBackend for ByocBackend {
     }
 
     async fn status(&self, job_id: Uuid) -> Result<JobStatus> {
+        self.check_offline()?;
         match &self.target {
             ByocTarget::Ssh {
                 host,
@@ -421,6 +466,7 @@ impl ComputeBackend for ByocBackend {
     }
 
     async fn results(&self, job_id: Uuid) -> Result<serde_json::Value> {
+        self.check_offline()?;
         match &self.target {
             ByocTarget::Ssh {
                 host,
@@ -508,6 +554,7 @@ impl ComputeBackend for ByocBackend {
     }
 
     async fn cancel(&self, job_id: Uuid) -> Result<()> {
+        self.check_offline()?;
         match &self.target {
             ByocTarget::Ssh {
                 host,
@@ -1044,6 +1091,126 @@ fn is_valid_docker_image(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ssh_to(host: &str) -> ByocTarget {
+        ByocTarget::Ssh {
+            host: host.into(),
+            user: "u".into(),
+            key_path: "/home/u/.ssh/id_ed25519".into(),
+            port: 22,
+        }
+    }
+
+    /// All four verbs refuse a remote target offline, and none spawns `ssh`.
+    ///
+    /// This is the wiring test: `check_offline` being correct proves nothing
+    /// unless every entry point calls it, and each of the four builds its own
+    /// command inside its own match arm.
+    ///
+    /// Safe to drive through the real methods precisely BECAUSE the refusal
+    /// happens before the spawn — if the guard regressed, this test would try
+    /// to SSH to example.invalid rather than quietly passing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn no_verb_spawns_ssh_offline_and_the_key_path_never_leaks() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let backend = ByocBackend::new(ssh_to("gpu.example.invalid"));
+        let plan = ExperimentPlan {
+            name: "n".into(),
+            image: "img".into(),
+            inputs: serde_json::json!({}),
+        };
+
+        let refusals = [
+            format!("{:#}", backend.submit(&plan).await.unwrap_err()),
+            format!("{:#}", backend.status(Uuid::nil()).await.unwrap_err()),
+            format!("{:#}", backend.results(Uuid::nil()).await.unwrap_err()),
+            format!("{:#}", backend.cancel(Uuid::nil()).await.unwrap_err()),
+        ];
+        for msg in &refusals {
+            assert!(
+                msg.contains("offline mode"),
+                "must be a POLICY refusal: {msg}"
+            );
+            assert!(
+                !msg.contains("id_ed25519"),
+                "ssh key path leaked into the refusal: {msg}"
+            );
+        }
+    }
+
+    /// The decision itself, including every permissive case.
+    ///
+    /// Driven through `check_offline` rather than the four verbs on purpose: a
+    /// target the guard ALLOWS goes on to spawn a real `ssh`/`kubectl`, which a
+    /// unit test must not do. Same "assert the decision, not the effect" shape
+    /// as `mesh_start_refusal` and `platform_token_for`.
+    #[test]
+    fn loopback_survives_offline_but_a_kubectl_context_cannot_be_trusted() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        // A host on this machine is legitimate offline.
+        for local in ["localhost", "127.0.0.1", "[::1]"] {
+            assert!(
+                ByocBackend::new(ssh_to(local)).check_offline().is_ok(),
+                "loopback ssh target must stay usable offline: {local}"
+            );
+        }
+        assert!(
+            ByocBackend::new(ssh_to("gpu.example.invalid"))
+                .check_offline()
+                .is_err(),
+            "a remote ssh host must be refused"
+        );
+
+        // A hostname that merely LOOKS like loopback is not loopback — the
+        // exact bypass fixed in offline.rs (`starts_with(\"127.\")`).
+        assert!(
+            ByocBackend::new(ssh_to("127.evil.example"))
+                .check_offline()
+                .is_err(),
+            "a domain that looks loopback must not be treated as loopback"
+        );
+
+        // Slurm carries a host too, so it gets the same treatment.
+        let slurm = |node: &str| ByocTarget::Slurm {
+            head_node: node.into(),
+            user: "u".into(),
+            partition: "p".into(),
+            config: Box::default(),
+        };
+        assert!(ByocBackend::new(slurm("localhost")).check_offline().is_ok());
+        assert!(
+            ByocBackend::new(slurm("hpc.example.invalid"))
+                .check_offline()
+                .is_err()
+        );
+
+        // Kubernetes fails CLOSED: a context name is not an address, so even a
+        // local-sounding one is refused while offline.
+        let k8s = ByocTarget::Kubernetes {
+            context: "minikube".into(),
+            namespace: "default".into(),
+        };
+        assert!(
+            ByocBackend::new(k8s.clone()).check_offline().is_err(),
+            "kubectl must fail closed offline — a context name proves nothing"
+        );
+
+        // And the whole guard is inert when the policy is off, or every
+        // assertion above would pass against a backend that refuses always.
+        drop(_restore);
+        let _off = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        assert!(ByocBackend::new(k8s).check_offline().is_ok());
+        assert!(
+            ByocBackend::new(ssh_to("gpu.example.invalid"))
+                .check_offline()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn default_byoc_is_ssh() {

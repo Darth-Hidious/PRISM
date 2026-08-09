@@ -3,7 +3,7 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
-· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files Objects
                                                                    │
                                                                    │  (no activity yet)
                                                                    │
@@ -23,7 +23,7 @@ expression: rendered
                │    Goal status             Check a discovery campaign's p… palette │
                │    List goals              Discovery campaigns on this no… palette │
                │    Node status             Local daemon + platform regist… palette │
-               │  … 53 more — ↓ to scroll or type to filter                         │
+               │  … 54 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
 ┌ Prompt ─────────────────────────────────────────────────────────┐│

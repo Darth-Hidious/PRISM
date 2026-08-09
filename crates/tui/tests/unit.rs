@@ -14,7 +14,7 @@
 
 use serde_json::json;
 
-use prism_tui::app::{App, Focus, LineKind, Role, WorkspaceTab};
+use prism_tui::app::{App, Focus, LineKind, ObjectStatus, Role, WorkspaceTab};
 use prism_tui::backend::BackendHandle;
 use prism_tui::msg::{AgentMsg, parse_notification};
 
@@ -2620,5 +2620,436 @@ async fn all_scenarios_events_parse_without_unknown() {
             !found_unknown,
             "scenario {scenario_name} produced Unknown events"
         );
+    }
+}
+
+// ── Objects tab ───────────────────────────────────────────────────────
+
+#[test]
+fn object_update_running_keeps_running_status_in_the_model() {
+    // MODEL-level only — this file has no render harness, so it cannot check
+    // anything about rendering and used to be named as if it did. The render
+    // invariant lives in tests/render_snapshots.rs
+    // (`a_running_object_never_renders_as_done`), which is where
+    // `render_app_to_string` is.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: Some(5000),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 1);
+    let obj = &app.objects[0];
+    assert_eq!(obj.status, ObjectStatus::Running);
+    assert_eq!(obj.progress, Some((5000, 10000)));
+    assert!(
+        obj.detail.is_none(),
+        "running object must not have a result detail"
+    );
+
+    // Simulate an update with NO progress — must still be running.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    let obj = &app.objects[0];
+    assert_eq!(obj.status, ObjectStatus::Running);
+    assert!(
+        obj.progress.is_none(),
+        "no progress reported yet — must stay None, not invented"
+    );
+}
+
+/// Notifications are not ordered. A `running` tick emitted just before the
+/// job finished can arrive after `completed` (retry, replay, the 50-step
+/// progress callback racing the finish). Before the guard, the upsert
+/// overwrote unconditionally and a finished simulation went back to
+/// "running" — the user would then wait for a result he already had.
+/// Mutation: delete the `if !existing.status.is_terminal()` guard in
+/// `app.rs` and this fails on the status assertion.
+#[test]
+fn object_terminal_status_is_never_resurrected_by_a_late_running() {
+    let mut app = test_app();
+    for status in ["running", "completed"] {
+        app.apply_agent_msg(AgentMsg::ObjectUpdate {
+            id: "sim-9".into(),
+            kind: "simulation".into(),
+            label: "MD NPT 300K".into(),
+            status: status.into(),
+            progress_current: Some(10000),
+            progress_total: Some(10000),
+            detail: None,
+        });
+    }
+    assert_eq!(app.objects[0].status, ObjectStatus::Completed);
+
+    // The straggler.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-9".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: Some(9950),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    assert_eq!(
+        app.objects[0].status,
+        ObjectStatus::Completed,
+        "a late `running` must not resurrect a finished object"
+    );
+    assert_eq!(
+        app.objects[0].progress,
+        Some((10000, 10000)),
+        "the stale progress must not overwrite the final one either"
+    );
+}
+
+/// An unrecognised status string used to fall through to `Running`, so a
+/// `cancelled` or `queued` object rendered as actively running — a state the
+/// backend never reported. Mutation: change the `_` arm back to
+/// `Self::Running` and this fails.
+#[test]
+fn object_unrecognised_status_is_not_reported_as_running() {
+    let mut app = test_app();
+    for (i, status) in ["cancelled", "queued", "skipped"].iter().enumerate() {
+        app.apply_agent_msg(AgentMsg::ObjectUpdate {
+            id: format!("obj-{i}"),
+            kind: "simulation".into(),
+            label: format!("job {i}"),
+            status: (*status).into(),
+            progress_current: None,
+            progress_total: None,
+            detail: None,
+        });
+    }
+    for obj in &app.objects {
+        assert_eq!(
+            obj.status,
+            ObjectStatus::Unknown,
+            "`{}` is not a status this build knows — claiming it is Running \
+             invents state the backend never reported",
+            obj.label
+        );
+    }
+}
+
+/// `parse_notification` defaulted an absent `status` to the literal "running"
+/// and an absent `id` to "". Both fabricate: the first claims a state the
+/// backend never reported, the second makes every anonymous update collapse
+/// onto ONE row, so unrelated simulations overwrite each other in front of
+/// the user. Mutations: restore `.unwrap_or("running")` in msg.rs, or delete
+/// the empty-id guard in app.rs — each fails this.
+#[test]
+fn object_update_without_id_or_status_is_not_invented() {
+    let mut app = test_app();
+
+    // No id at all — unaddressable, must be dropped rather than merged.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "".into(),
+        kind: "simulation".into(),
+        label: "anonymous A".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "   ".into(),
+        kind: "simulation".into(),
+        label: "anonymous B".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    assert!(
+        app.objects.is_empty(),
+        "an update with no id is unaddressable: nothing can target it again, so it \
+         becomes a row that never updates — and two updates sharing the SAME empty \
+         id silently overwrite each other. Leaked: {:?}",
+        app.objects.iter().map(|o| &o.label).collect::<Vec<_>>()
+    );
+
+    // Absent status (empty after parse_notification's default) is Unknown,
+    // NOT Running.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-x".into(),
+        kind: "simulation".into(),
+        label: "no status reported".into(),
+        status: "".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    assert_eq!(
+        app.objects[0].status,
+        ObjectStatus::Unknown,
+        "the backend reported no status — claiming Running invents it"
+    );
+}
+
+/// The PARSE-side default, which the test above does not reach — it builds an
+/// AgentMsg directly. I mutation-checked that: restoring
+/// `.unwrap_or("running")` in msg.rs left it green. A notification that omits
+/// `status` must not become Running on the way in.
+#[test]
+fn parsed_object_update_without_status_does_not_become_running() {
+    let msg = json!({
+        "method": "ui.object.update",
+        "params": { "id": "sim-p", "kind": "simulation", "label": "MD 300K" }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ObjectUpdate { status, .. } => {
+            assert_ne!(
+                status, "running",
+                "the notification carried no status — defaulting to `running` \
+                 reports a state the backend never sent"
+            );
+            assert_eq!(
+                ObjectStatus::from_str_loose(&status),
+                ObjectStatus::Unknown,
+                "an absent status must land on Unknown, got {status:?}"
+            );
+        }
+        other => panic!("expected ObjectUpdate, got {other:?}"),
+    }
+}
+
+/// PRISM is not a metals tool. A ceramic, composite, MOF or electrolyte used
+/// to collapse into `ObjectKind::Result` — the UI told the user a ceramic was
+/// a "Result", a label the backend never sent. Same class of lie as the status
+/// defect in 746ec620, and the same mistake the ml_train design warns about:
+/// class is DATA, not an enum arm.
+///
+/// Mutation: restore `_ => Self::Result` in `from_str_loose` and this fails.
+#[test]
+fn an_unknown_material_class_keeps_its_own_name() {
+    for kind in ["ceramic", "composite", "MOF", "electrolyte", "thin_film"] {
+        let parsed = prism_tui::app::ObjectKind::from_str_loose(kind);
+        assert_eq!(
+            parsed.as_str(),
+            kind,
+            "`{kind}` must render as itself, not be relabelled"
+        );
+        assert_ne!(
+            parsed,
+            prism_tui::app::ObjectKind::Result,
+            "`{kind}` collapsed into Result — that invents a label"
+        );
+    }
+    // The known kinds still resolve, and an empty kind is honestly a Result
+    // rather than an object named "".
+    assert_eq!(
+        prism_tui::app::ObjectKind::from_str_loose("polymer"),
+        prism_tui::app::ObjectKind::Polymer
+    );
+    assert_eq!(
+        prism_tui::app::ObjectKind::from_str_loose("  "),
+        prism_tui::app::ObjectKind::Result
+    );
+}
+
+/// Opening `ObjectKind` to `Other(String)` put BACKEND-SUPPLIED text on the
+/// path to the terminal for the first time — every variant used to be a
+/// `&'static str`. `label` and `detail` have always gone through
+/// `sanitize_for_render`; `kind` had never needed to, so it did not. That is
+/// an ANSI-injection vector into the sidebar, the exact class
+/// `snapshot_ansi_injection_sanitized` exists for.
+///
+/// Mutation: drop the `sanitize_for_render` around `kind` in `apply_agent_msg`
+/// and this fails.
+#[test]
+fn an_unknown_kind_cannot_carry_terminal_control_sequences() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-esc".into(),
+        kind: "cera\u{1b}[31mmic\u{7}".into(),
+        label: "evil".into(),
+        status: "running".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    let rendered = app.objects[0].kind.as_str().to_string();
+    for (name, ch) in [("ESC", '\u{1b}'), ("BEL", '\u{7}')] {
+        assert!(
+            !rendered.contains(ch),
+            "{name} survived into the rendered kind: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn object_update_failed_shows_error() {
+    // A failed simulation must NOT silently vanish or read as done.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-2".into(),
+        kind: "simulation".into(),
+        label: "MD NVT 500K".into(),
+        status: "running".into(),
+        progress_current: Some(2341),
+        progress_total: Some(5000),
+        detail: None,
+    });
+    // Now it fails.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-2".into(),
+        kind: "simulation".into(),
+        label: "MD NVT 500K".into(),
+        status: "failed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("divergence at step 2341".into()),
+    });
+    assert_eq!(app.objects.len(), 1);
+    let obj = &app.objects[0];
+    assert_eq!(obj.status, ObjectStatus::Failed);
+    assert_eq!(
+        obj.detail.as_deref(),
+        Some("divergence at step 2341"),
+        "failed sim must show its error"
+    );
+}
+
+#[test]
+fn object_tag_toggle_and_send_message_prefix() {
+    // Tagging must put the object into the outgoing message, using
+    // the same prefix mechanism as the standing goal.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "alloy-1".into(),
+        kind: "alloy".into(),
+        label: "CrMnFeCoNi".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("best HEA candidate".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "struct-1".into(),
+        kind: "structure".into(),
+        label: "W-BCC".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 2);
+
+    // Switch to Objects tab and tag the first one.
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.workspace_selected = 0;
+    app.focus = Focus::Workspace;
+    app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert!(app.objects[0].tagged, "t must tag the selected object");
+    assert!(!app.objects[1].tagged, "other objects stay untagged");
+
+    // Untag it.
+    app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE));
+    assert!(!app.objects[0].tagged, "second t must untag");
+
+    // Tag both and verify the outgoing message prefix.
+    app.objects[0].tagged = true;
+    app.objects[1].tagged = true;
+    // The send_message path writes to the backend (cat subprocess).
+    // We verify indirectly: tagged objects should produce a non-empty
+    // context block in the payload logic. Let's call send_message
+    // and check it doesn't panic (the cat backend absorbs the write).
+    app.focus = Focus::Input;
+    app.input.insert_str("analyze this");
+    // Should not panic even with tagged objects.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    // The message was sent — is_waiting flips true.
+    assert!(
+        app.is_waiting,
+        "send_message must set is_waiting after sending"
+    );
+}
+
+#[test]
+fn object_upsert_updates_in_place() {
+    // Same id must update in place, not create a duplicate.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD run".into(),
+        status: "running".into(),
+        progress_current: Some(100),
+        progress_total: Some(1000),
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 1);
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-1".into(),
+        kind: "simulation".into(),
+        label: "MD run".into(),
+        status: "running".into(),
+        progress_current: Some(500),
+        progress_total: Some(1000),
+        detail: None,
+    });
+    assert_eq!(app.objects.len(), 1, "upsert must not duplicate");
+    assert_eq!(app.objects[0].progress, Some((500, 1000)));
+}
+
+#[test]
+fn objects_tab_empty_state_does_not_look_broken() {
+    // Empty tab must say so plainly.
+    let mut app = test_app();
+    assert!(app.objects.is_empty());
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.focus = Focus::Workspace;
+    // Enter on empty tab should toast, not open detail modal.
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.view.open, "empty objects tab must not open a modal");
+    assert!(!app.toasts.is_empty(), "user must get feedback via a toast");
+}
+
+#[test]
+fn parse_object_update_notification() {
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.object.update",
+        "params": {
+            "id": "obj-1",
+            "kind": "polymer",
+            "label": "PEG-4000",
+            "status": "running",
+            "progress_current": 50,
+            "progress_total": 200,
+        },
+    });
+    let parsed = parse_notification(&msg);
+    match parsed {
+        AgentMsg::ObjectUpdate {
+            id,
+            kind,
+            label,
+            status,
+            progress_current,
+            progress_total,
+            detail,
+        } => {
+            assert_eq!(id, "obj-1");
+            assert_eq!(kind, "polymer");
+            assert_eq!(label, "PEG-4000");
+            assert_eq!(status, "running");
+            assert_eq!(progress_current, Some(50));
+            assert_eq!(progress_total, Some(200));
+            assert!(detail.is_none());
+        }
+        other => panic!("expected ObjectUpdate, got {other:?}"),
     }
 }

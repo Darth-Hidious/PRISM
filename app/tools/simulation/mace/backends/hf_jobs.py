@@ -56,6 +56,28 @@ DEFAULT_TIMEOUTS_S = {
 }
 
 
+def _offline() -> bool:
+    """Hard offline mode, read per call — the same contract the Rust side uses."""
+    return os.environ.get("PRISM_OFFLINE", "").strip() == "1"
+
+
+def _refuse_if_offline(what: str) -> None:
+    """Refuse an outward `hf jobs` call under hard offline mode.
+
+    This backend shells out to the Hugging Face CLI, which reaches
+    huggingface.co on its own — so the process-wide socket guard in
+    `app/tools/_offline.py` does not cover it, and the launch passes
+    `--secrets HF_TOKEN` explicitly. It had no check at all, and
+    `select_backend`'s "auto" heuristic picks it whenever HF_TOKEN is present
+    and no project id is set, so nobody has to choose it deliberately.
+    """
+    if _offline():
+        raise RuntimeError(
+            f"offline mode: refusing to {what} Hugging Face Jobs — "
+            "`hf jobs` would reach huggingface.co and send HF_TOKEN"
+        )
+
+
 class HfJobsBackend(Backend):
     name = "hf_jobs"
 
@@ -70,6 +92,10 @@ class HfJobsBackend(Backend):
         # job_id is the cache_key (since we register active jobs under it)
         hf_id = self._active.get(job_id)
         if not hf_id:
+            return
+        if _offline():
+            # Nothing to reach; drop the handle rather than shelling out.
+            self._active.pop(job_id, None)
             return
         try:
             spawn.run(
@@ -86,6 +112,7 @@ class HfJobsBackend(Backend):
 
     # ------------------------------------------------------------------
     def execute(self, job: BackendJob, progress: ProgressCb | None = None) -> dict[str, Any]:
+        _refuse_if_offline("run a job on")
         if job.tool_name not in PAYLOAD_MODULES:
             raise ValueError(f"HfJobsBackend does not implement {job.tool_name!r}")
         token = get_hf_token()  # ensures token exists; never logged
@@ -199,6 +226,19 @@ class HfJobsBackend(Backend):
         steps_seen = 0
         deadline = time.time() + DEFAULT_TIMEOUTS_S.get(job.tool_name, 3600) + 300
         while time.time() < deadline:
+            # Re-checked EVERY iteration, not just once in `execute`.
+            #
+            # This window runs up to ~95 minutes for the longer tools, polling
+            # `hf jobs status` every few seconds. Checking only at entry is the
+            # exact defect fixed in `crates/node/src/daemon.rs` in this same
+            # change set — a long-lived loop that keeps reaching out after the
+            # policy was turned on — and it was reproduced here immediately.
+            if _offline():
+                raise RuntimeError(
+                    "offline mode: stopped polling Hugging Face Jobs — the job "
+                    f"{hf_job_id} is still running remotely and can be collected "
+                    "when the network policy is lifted"
+                )
             try:
                 r = spawn.run(
                     ["hf", "jobs", "status", hf_job_id],

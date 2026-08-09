@@ -317,19 +317,18 @@ fn with_port(base_url: &str, port: u16) -> Option<String> {
     Some(url.to_string().trim_end_matches('/').to_string())
 }
 
-/// True when the URL's host is loopback (`localhost`, 127.x.x.x, `::1`) —
-/// i.e. the model runs on this machine.
-pub fn is_loopback_url(raw: &str) -> bool {
-    match url::Url::parse(raw) {
-        Ok(parsed) => match parsed.host() {
-            Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
-        },
-        Err(_) => false,
-    }
-}
+/// Whether the URL targets this machine — i.e. the model runs locally.
+///
+/// Delegates to `prism_runtime::offline::is_loopback_url`. This module used to
+/// carry its own copy — same name, same workspace, a different implementation.
+/// Its version was the CORRECT one (typed `url::Host` matching), while the
+/// runtime's hand-rolled string check treated any domain starting `127.` as
+/// loopback. The weaker one guarded the offline policy and, briefly, release
+/// of the platform credential.
+///
+/// Two same-named functions that disagree is the bug shape, independent of
+/// which one is right on any given day. There is now one.
+pub use prism_runtime::offline::is_loopback_url;
 
 // ── The bundled ONNX embedder ───────────────────────────────────────
 

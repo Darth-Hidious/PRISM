@@ -3830,4 +3830,95 @@ steps:
         );
         assert_eq!(result.steps[0].data["approve"], false);
     }
+
+    /// Hard offline mode must refuse an HTTP step's URL before the request is
+    /// built. Workflow YAML is arbitrary — marketplace installs and
+    /// LLM-generated specs included — so this is the boundary between "the
+    /// user turned the network off" and a spec that ignores them.
+    ///
+    /// Both halves are asserted, and both use the same URL. Every target that
+    /// refuses a connection fast enough for a test is loopback, private, or
+    /// unspecified, so the SSRF guard immediately after this one rejects all
+    /// of them: "not offline" is therefore proven by the refusal changing
+    /// OWNER — SSRF rather than offline — not by a socket opening. That still
+    /// fails a `run_http_step` that refused unconditionally, which is the
+    /// point of asserting the second half at all.
+    // Holding the lock across the awaits is the point — it is what stops a
+    // concurrent test from flipping `PRISM_OFFLINE` mid-call. Same precedent
+    // as `client/src/api.rs` and `node/src/daemon.rs`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn http_step_is_refused_by_offline_mode_and_only_by_it() {
+        // The shared lock in prism-runtime, deliberately not a local one:
+        // `PRISM_OFFLINE` is process-global and two locks that do not exclude
+        // each other serialize nothing.
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        fn http_step(url: &str) -> WorkflowStep {
+            WorkflowStep {
+                id: "probe".to_string(),
+                action: "http".to_string(),
+                config: BTreeMap::from([("url".to_string(), serde_json::json!(url))]),
+            }
+        }
+
+        let _lock = env_lock();
+        let client = reqwest::Client::new();
+        // Not loopback, so policy must refuse it; refuses a connection
+        // immediately, so nothing here can hang.
+        let remote = http_step("http://0.0.0.0:1/v1/models");
+
+        // The guard restores `PRISM_OFFLINE` on drop, so an assertion panic —
+        // exactly what this test exists to produce — cannot leak the variable
+        // into every later test in the binary.
+        let blocked = {
+            let _offline = OfflineEnvGuard::set("1");
+            let mut context = BTreeMap::new();
+            let error = run_http_step(&remote, &mut context, false, &client)
+                .await
+                .unwrap_err();
+            format!("{error:#}")
+        };
+        assert!(
+            blocked.contains("rejected by offline mode"),
+            "PRISM_OFFLINE=1 must refuse a remote workflow URL as policy, got: {blocked}"
+        );
+
+        // Still offline, but loopback: the policy consults the URL rather than
+        // refusing everything, so this must fall through to the SSRF guard.
+        let loopback = {
+            let _offline = OfflineEnvGuard::set("1");
+            let mut context = BTreeMap::new();
+            let error = run_http_step(
+                &http_step("http://127.0.0.1:1/"),
+                &mut context,
+                false,
+                &client,
+            )
+            .await
+            .unwrap_err();
+            format!("{error:#}")
+        };
+        assert!(
+            !loopback.contains("offline mode"),
+            "offline mode preserves explicit loopback endpoints, got: {loopback}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            let mut context = BTreeMap::new();
+            let error = run_http_step(&remote, &mut context, false, &client)
+                .await
+                .unwrap_err();
+            format!("{error:#}")
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("rejected by SSRF guard"),
+            "with offline mode off the step must reach the next guard, got: {attempted}"
+        );
+    }
 }

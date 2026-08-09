@@ -4,7 +4,9 @@
 //! `app.theme()`), never hardcoded — so the whole UI recolors uniformly
 //! when the theme changes.
 
-use crate::app::{App, Focus, LineKind, Modal, Role, WorkspaceTab, evidence_token, first_line};
+use crate::app::{
+    App, Focus, LineKind, Modal, ObjectStatus, Role, WorkspaceTab, evidence_token, first_line,
+};
 use crate::command;
 use crate::gh;
 use crate::keymap;
@@ -590,7 +592,7 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         " Workspace",
         Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
     )));
-    lines.push(workspace_tabs_line(app, t));
+    lines.push(workspace_tabs_line(app, t, w));
     if let Some(stats) = workspace_stats_line(app, t) {
         lines.push(stats);
     }
@@ -606,6 +608,7 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         WorkspaceTab::Tools => build_tools_lines(app, t, &mut lines, w),
         WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, w),
         WorkspaceTab::Files => build_files_lines(app, t, &mut lines, w),
+        WorkspaceTab::Objects => build_objects_lines(app, t, &mut lines, w),
     }
 
     let para = Paragraph::new(lines)
@@ -614,12 +617,30 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, inner);
 }
 
-fn workspace_tabs_line(app: &App, t: Theme) -> Line<'static> {
-    let tabs = [
+fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> Line<'static> {
+    // Four full labels are 31 columns. The sidebar is narrower than that on a
+    // small terminal, and the paragraph wraps — "Objects" dropped onto its own
+    // line, ate a row of the panel and shoved every entry down (caught at
+    // 40x12). Abbreviate instead of wrapping: a cramped strip is legible, a
+    // wrapped one silently costs a row of content.
+    const FULL: [(WorkspaceTab, &str); 4] = [
         (WorkspaceTab::Activity, "Activity"),
         (WorkspaceTab::Tools, "Tools"),
         (WorkspaceTab::Files, "Files"),
+        (WorkspaceTab::Objects, "Objects"),
     ];
+    const SHORT: [(WorkspaceTab, &str); 4] = [
+        (WorkspaceTab::Activity, "Act"),
+        (WorkspaceTab::Tools, "Too"),
+        (WorkspaceTab::Files, "Fil"),
+        (WorkspaceTab::Objects, "Obj"),
+    ];
+    // Rendered width: a leading space, a space between each, and the active
+    // label gains two brackets.
+    let width_of = |set: &[(WorkspaceTab, &str); 4]| -> usize {
+        1 + set.iter().map(|(_, l)| l.len()).sum::<usize>() + (set.len() - 1) + 2
+    };
+    let tabs = if width_of(&FULL) <= w { FULL } else { SHORT };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (tab, label)) in tabs.iter().enumerate() {
         if i > 0 {
@@ -902,6 +923,92 @@ fn build_files_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
     }
 }
 
+fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usize) {
+    if app.objects.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no objects yet)",
+            Style::default().fg(t.muted),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Objects appear when the agent creates",
+            Style::default().fg(t.dim),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  structures, alloys, or simulations.",
+            Style::default().fg(t.dim),
+        )));
+        return;
+    }
+    let sel = app
+        .workspace_selected
+        .min(app.objects.len().saturating_sub(1));
+    for (i, obj) in app.objects.iter().enumerate() {
+        let focused = app.focus == Focus::Workspace && i == sel;
+        let prefix = if focused { "▸ " } else { "  " };
+        let glyph = obj.kind.glyph();
+        let (status_str, status_color) = match obj.status {
+            ObjectStatus::Running => {
+                if let Some((cur, tot)) = obj.progress {
+                    if tot > 0 {
+                        let pct = (cur as f64 / tot as f64 * 100.0) as u64;
+                        (format!("{pct}%"), t.warn)
+                    } else {
+                        ("running".to_string(), t.warn)
+                    }
+                } else {
+                    ("running".to_string(), t.warn)
+                }
+            }
+            ObjectStatus::Completed => ("done".to_string(), t.ok),
+            ObjectStatus::Failed => ("FAILED".to_string(), t.err),
+            // Warn colour, not ok: we do not know this is fine.
+            ObjectStatus::Unknown => ("?".to_string(), t.warn),
+        };
+        let tag_marker = if obj.tagged { " ★" } else { "" };
+        let label_budget = w.saturating_sub(12).max(3);
+        let label = clip(&obj.label, label_budget);
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
+            Span::styled(format!("{glyph} "), Style::default().fg(t.dim)),
+            Span::styled(
+                // `{:<6}` PADS to six but never truncates. Every variant used
+                // to be a short static string so that was fine; `Other` now
+                // carries an arbitrary backend name, and a long one would run
+                // over the label and shove the tag marker off the row — the
+                // same overflow class as the tab strip in 88b96329. Clip first.
+                format!("{:<6} ", clip(obj.kind.as_str(), 10)),
+                Style::default().fg(t.muted),
+            ),
+            Span::styled(label, Style::default().fg(t.text)),
+            Span::styled(tag_marker.to_string(), Style::default().fg(t.warn)),
+            Span::raw(" "),
+            Span::styled(status_str, Style::default().fg(status_color)),
+        ]));
+        // Inline expanded detail for the focused row.
+        if focused && app.workspace_expanded {
+            if let Some((cur, tot)) = obj.progress {
+                lines.push(Line::from(Span::styled(
+                    format!("  progress: {cur}/{tot}"),
+                    Style::default().fg(t.dim),
+                )));
+            }
+            if let Some(detail) = &obj.detail {
+                let detail_line = clip(detail, w.saturating_sub(4));
+                lines.push(Line::from(Span::styled(
+                    format!("  {detail_line}"),
+                    Style::default().fg(t.dim),
+                )));
+            }
+            if obj.tagged {
+                lines.push(Line::from(Span::styled(
+                    "  ★ tagged for agent",
+                    Style::default().fg(t.warn),
+                )));
+            }
+        }
+    }
+}
+
 // ── Modals (help / cost) ──────────────────────────────────────────
 
 fn draw_modal(f: &mut Frame, modal: Modal, app: &App) {
@@ -958,10 +1065,11 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
         kv_row(t, "o", "open a link from the transcript (chat focus)"),
         Line::raw(""),
         section(t, "Workspace sidebar"),
-        kv_row(t, "← / →", "switch Activity / Tools / Files"),
+        kv_row(t, "← / →", "switch Activity / Tools / Files / Objects"),
         kv_row(t, "↑ / ↓", "move selection"),
         kv_row(t, "Enter", "open details for the selected item"),
         kv_row(t, "Space", "expand selected item inline"),
+        kv_row(t, "t", "tag/untag object for agent (Objects tab)"),
         Line::raw(""),
         section(t, "Approvals & display"),
         kv_row(t, "y / a / n", "allow / allow-all / deny a tool"),

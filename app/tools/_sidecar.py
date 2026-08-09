@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Science sidecar — a second venv for deps the main Python can't install.
 
 The main PRISM venv rides the system Python (3.14 today); the scientific

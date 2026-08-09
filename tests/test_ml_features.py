@@ -174,6 +174,70 @@ class TestPredictStructureTool:
         # Unified `predict` replaces predict_property + predict_structure
         assert "predict" in names
         assert "list_models" in names
-        # Old names must be gone
-        assert "predict_property" not in names
+        # `predict_structure` is gone and must stay gone — that half of the
+        # Round-4 collapse still holds.
         assert "predict_structure" not in names
+
+        # `predict_property` is NOT asserted absent any more, and that is not a
+        # relaxation — the name was legitimately reused.
+        #
+        # This assertion was written 2026-07-03 (a56d8229) to pin the collapse
+        # of predict_property + predict_structure into `predict`. On 2026-07-22
+        # (80da217b) the E9 informatics batch registered a NEW and unrelated
+        # `predict_property` — matminer+sklearn with uncertainty, trained on MP
+        # via the proxy (`app/tools/materials/informatics.py:237`) — which
+        # `pareto_screen` and `hea_dataset` both consume.
+        #
+        # So the assertion has been false since 19 days after it was written.
+        # Nothing caught it because no workflow ran pytest until the
+        # `python-suite` job was added; its own comment says so.
+        #
+        # What still matters is that the E9 tool is the informatics one and not
+        # a resurrected copy of the collapsed tool, so pin its provenance
+        # rather than its absence.
+        if "predict_property" in names:
+            tool = tool_reg.get("predict_property")
+            assert tool.source_detail == "materials.informatics", (
+                "`predict_property` is registered but is not the E9 informatics "
+                f"tool (source_detail={tool.source_detail!r}) — the collapsed "
+                "pre-1.0 tool may have been resurrected"
+            )
+
+
+def test_gradient_boosting_predicts_without_crashing_and_reports_no_uncertainty():
+    """`gradient_boosting` is in the tool's enum; picking it used to crash the call.
+
+    `hasattr(model, "estimators_")` is true for BOTH regressors, but
+    GradientBoostingRegressor's is a 2-D ndarray — iterating it yields
+    sub-arrays, so `t.predict(x)` raised AttributeError. `Tool.execute` caught
+    that generically, so an agent choosing a documented enum value got
+    `{"error": "AttributeError: ..."}` and zero predictions.
+
+    Flattening would have made it "work" and the number wrong: boosting trees
+    are sequential residual fitters, so their spread is not an uncertainty.
+    Predictions, `uncertainty is None`, is the honest result.
+
+    Asserted at the sklearn level the handler uses, so the test needs no MP
+    network pull.
+    """
+    import numpy as np
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+
+    X = np.random.RandomState(0).rand(24, 3)
+    y = np.random.RandomState(1).rand(24)
+    x = X[:1]
+
+    rf = RandomForestRegressor(n_estimators=4, random_state=0).fit(X, y)
+    gb = GradientBoostingRegressor(n_estimators=4, random_state=0).fit(X, y)
+
+    # The trap: the attribute exists on both, so `hasattr` cannot discriminate.
+    assert hasattr(rf, "estimators_") and hasattr(gb, "estimators_")
+
+    # The handler's rule — gate on the ensemble KIND.
+    for model, expects_uncertainty in ((rf, True), (gb, False)):
+        unc = None
+        if isinstance(model, RandomForestRegressor):
+            unc = float(np.std([float(t.predict(x)[0]) for t in model.estimators_]))
+        assert (unc is not None) is expects_uncertainty, type(model).__name__
+        # Whichever branch, a prediction is always produced.
+        assert isinstance(float(model.predict(x)[0]), float)

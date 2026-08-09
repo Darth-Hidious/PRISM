@@ -323,6 +323,39 @@ pub struct LlmClient {
 /// `providers.toml`, `prism use local --url`, a `~/.prism/providers.toml`
 /// gateway override — already said where the API lives, and a client that
 /// edits that string can only be wrong in ways they cannot correct.
+/// A hint for a 404 on the chat-completions URL, or nothing.
+///
+/// `chat_completions_url` takes a base URL at face value and appends only
+/// `/chat/completions` — deliberately, see its doc comment: synthesising `/v1`
+/// broke every vendor not mounted there. The cost of that correctness is that
+/// a base URL missing its own `/v1` now 404s, and the raw upstream body for
+/// that is Ollama's `404 page not found`, which names nothing.
+///
+/// Ollama is the commonest local setup and serves `/v1/chat/completions`, so
+/// `--llm-url http://127.0.0.1:11434` fails and `.../v1` works. Measured
+/// against a live daemon: `/v1/chat/completions` -> 400 (reached, bad body),
+/// `/chat/completions` -> 404.
+///
+/// Only fires on 404, and only when the URL does not already carry a version
+/// segment — so it cannot mislead someone whose base is correct and whose 404
+/// is a wrong model or a dead route.
+fn base_url_hint(url: &str, status: reqwest::StatusCode) -> String {
+    if status != reqwest::StatusCode::NOT_FOUND {
+        return String::new();
+    }
+    let base = url.trim_end_matches("/chat/completions");
+    if base.contains("/v1") || base.contains("/v1beta") || base.contains("/v4") {
+        return String::new();
+    }
+    format!(
+        "\n  hint: {base} has no API version segment. Most OpenAI-compatible \
+         servers — Ollama and llama.cpp included — mount at `/v1`, so the base \
+         URL is usually `{base}/v1`. PRISM appends only `/chat/completions` and \
+         never guesses a version, because vendors mount it at `/v1beta/openai` \
+         and `/api/paas/v4` too."
+    )
+}
+
 pub fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
@@ -1472,7 +1505,12 @@ impl LlmClient {
                 let status = resp.status();
                 let http = retry::HttpStatus::from_response(&resp);
                 let text = resp.text().await.unwrap_or_default();
-                return Err(http).with_context(|| format!("LLM returned HTTP {status}: {text}"));
+                return Err(http).with_context(|| {
+                    format!(
+                        "LLM returned HTTP {status}: {text}{}",
+                        base_url_hint(url, status)
+                    )
+                });
             }
             Ok(resp)
         })
@@ -1981,13 +2019,20 @@ impl<'a> LfmArgumentParser<'a> {
             match byte {
                 b'"' => in_string = true,
                 b'{' | b'[' => nesting.push(byte),
-                b'}' => {
-                    if nesting.pop() != Some(b'{') {
+                // Both closers run the identical rule, so they share an arm.
+                // NOT written as a match guard (`b'}' if nesting.pop() != …`)
+                // even though clippy suggests it: `pop()` mutates, and a guard
+                // that fails would fall through to `_ => {}` having already
+                // consumed the stack entry. Same result today, a trap later.
+                //
+                // The merged-away branch version WAS that guard form, for
+                // `b']'` specifically. Resolved toward this one deliberately:
+                // the comment above is the reason it exists.
+                b'}' | b']' => {
+                    let opener = if byte == b'}' { b'{' } else { b'[' };
+                    if nesting.pop() != Some(opener) {
                         bail!("LFM JSON argument has mismatched delimiters");
                     }
-                }
-                b']' if nesting.pop() != Some(b'[') => {
-                    bail!("LFM JSON argument has mismatched delimiters");
                 }
                 _ => {}
             }
@@ -2778,6 +2823,29 @@ mod tests {
         assert_eq!(arguments["limit"], 2);
     }
 
+    /// The close-delimiter arm had NO test — `grep "mismatched delimiters"`
+    /// matched only the `bail!`. Two closers were merged into one arm to clear
+    /// a clippy gate, so this pins what the merge must preserve: each closer
+    /// derives the opener IT closes.
+    ///
+    /// Only the accept case is asserted, and that is deliberate. I wrote the
+    /// obvious reject case first (`x=[1, 2}`) and mutation-checked it: with the
+    /// kind-check replaced by `pop().is_none()` the test still PASSED, because
+    /// any crossed-delimiter input is also invalid JSON and `serde_json` rejects
+    /// it one line later. That assertion could not fail, so it is not here.
+    /// The kind-check is defence in depth, not independently observable through
+    /// this API. The accept case IS observable: swapping the opener derivation
+    /// to `if byte == b'}' { b'[' } else { b'{' }` fails this test.
+    #[test]
+    fn lfm_argument_parser_accepts_correctly_nested_delimiters() {
+        let (_, arguments) = parse_native_tool_call(
+            "<|tool_call_start|>[f(x=[1, 2], y={\"k\": 3})]<|tool_call_end|>",
+        )
+        .expect("correctly nested delimiters must still parse");
+        assert_eq!(arguments["x"][1], 2);
+        assert_eq!(arguments["y"]["k"], 3);
+    }
+
     #[test]
     fn local_tool_response_maps_a_strict_final_answer() {
         let response = LlmClient::local_chat_response(
@@ -3427,6 +3495,224 @@ mod tests {
         assert_eq!(
             LlmClient::strip_json_fences("```json\n{\"a\":1}"),
             "{\"a\":1}"
+        );
+    }
+
+    // ── Hard offline mode ─────────────────────────────────────────────
+    //
+    // Three separate `check_url` guards stand between a configured base URL
+    // and a socket: `health_check`, `post`, and `send_retrying`. Each gets a
+    // test here, and each asserts BOTH halves — offline refuses, not-offline
+    // reaches the transport — because a one-sided test passes just as happily
+    // against a function that refuses unconditionally.
+    //
+    // All of them take the shared lock from prism-runtime rather than
+    // declaring one here: `PRISM_OFFLINE` is process-global, `cfg(test)` does
+    // not cross crate boundaries, and two locks that do not exclude each other
+    // serialize nothing.
+
+    /// A target that is NOT loopback — so `PRISM_OFFLINE=1` must refuse it —
+    /// and that refuses a connection immediately, so the not-offline halves
+    /// cost milliseconds. A TEST-NET-3 address blackholes instead of refusing,
+    /// which is how a test in this repo once took 75 seconds.
+    const UNREACHABLE_BASE: &str = "http://0.0.0.0:1";
+
+    /// A client on the HTTP adapter. `local_backend()` short-circuits
+    /// `health_check` before the guard, so a `gguf://local` config would test
+    /// nothing at all.
+    fn unreachable_http_client() -> LlmClient {
+        assert_eq!(
+            choose_backend(UNREACHABLE_BASE),
+            BackendChoice::Http,
+            "the offline guards live on the HTTP path only"
+        );
+        LlmClient::new(LlmConfig {
+            base_url: UNREACHABLE_BASE.to_string(),
+            model: "offline-guard-probe".to_string(),
+            timeout_secs: 5,
+            ..LlmConfig::default()
+        })
+    }
+
+    // Holding the lock across the awaits is the point — it is what stops a
+    // concurrent test from flipping `PRISM_OFFLINE` mid-call. Same precedent
+    // as `client/src/api.rs` and `node/src/daemon.rs`; applies to all three.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn health_check_is_refused_by_offline_mode_and_only_by_it() {
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let client = unreachable_http_client();
+
+        // The guard restores `PRISM_OFFLINE` on drop, so an assertion panic —
+        // exactly what this test exists to produce — cannot leak the variable
+        // into every later test in the binary.
+        let blocked = {
+            let _offline = OfflineEnvGuard::set("1");
+            format!("{:#}", client.health_check().await.unwrap_err())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {UNREACHABLE_BASE}/v1/models as policy, got: {blocked}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!("{:#}", client.health_check().await.unwrap_err())
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("LLM not reachable"),
+            "with offline mode off the check must reach the transport, got: {attempted}"
+        );
+    }
+
+    /// `post` refuses a blocked URL before it builds a request.
+    ///
+    /// This guard is defence in depth, not the only thing standing there:
+    /// `post` delegates to `send_retrying`, which repeats the identical check.
+    /// Deleting either line on its own therefore leaves the other producing
+    /// the same refusal, and no test can distinguish them — the two guards are
+    /// only separable together. This test pins `post`'s observable contract;
+    /// removing BOTH guards is what fails it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn post_is_refused_by_offline_mode_and_only_by_it() {
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let client = unreachable_http_client();
+        let url = chat_completions_url(UNREACHABLE_BASE);
+        let body = serde_json::json!({});
+
+        let blocked = {
+            let _offline = OfflineEnvGuard::set("1");
+            format!("{:#}", client.post(&url, &body).await.unwrap_err())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {url} as policy, got: {blocked}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!("{:#}", client.post(&url, &body).await.unwrap_err())
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("LLM request to"),
+            "with offline mode off the post must reach the transport, got: {attempted}"
+        );
+    }
+
+    /// The guard sits BEFORE the retry closure on purpose, so a URL blocked by
+    /// policy is never classified transient and replayed.
+    ///
+    /// The elapsed-time assertion is what pins that placement rather than
+    /// merely the refusal: inside the closure, a refused connection to
+    /// `0.0.0.0:1` is retryable even when billable, so the failure would come
+    /// back only after the shared backoff's first 250 ms sleep.
+    /// A 404 on a version-less base URL says what is almost certainly wrong.
+    ///
+    /// `chat_completions_url` never synthesises `/v1` — correct, and the reason
+    /// is documented on it. The cost is that pointing at Ollama's bare base
+    /// (`http://127.0.0.1:11434`, the commonest local setup) 404s with the
+    /// upstream body `404 page not found`, which names nothing. Measured
+    /// against a live daemon: `/v1/chat/completions` -> 400, `/chat/completions`
+    /// -> 404.
+    ///
+    /// The hint must NOT fire when the base already carries a version, or it
+    /// would send someone with a correct URL chasing the wrong thing — their
+    /// 404 is a bad model or a dead route.
+    #[test]
+    fn a_versionless_404_hints_at_the_missing_v1_and_a_versioned_one_does_not() {
+        use reqwest::StatusCode;
+
+        let bare = base_url_hint(
+            "http://127.0.0.1:11434/chat/completions",
+            StatusCode::NOT_FOUND,
+        );
+        assert!(bare.contains("/v1"), "{bare}");
+        assert!(bare.contains("127.0.0.1:11434"), "{bare}");
+
+        // Already versioned: silent, for each shape the doc comment names.
+        for versioned in [
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            "https://api.z.ai/api/paas/v4/chat/completions",
+        ] {
+            assert!(
+                base_url_hint(versioned, StatusCode::NOT_FOUND).is_empty(),
+                "must not hint for {versioned}"
+            );
+        }
+
+        // Only 404. A 401/429/500 on a version-less base is not this problem.
+        for other in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(
+                base_url_hint("http://127.0.0.1:11434/chat/completions", other).is_empty(),
+                "must not hint for {other}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_retrying_refuses_before_the_retry_closure() {
+        use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
+
+        let _lock = env_lock();
+        let client = unreachable_http_client();
+        let url = chat_completions_url(UNREACHABLE_BASE);
+        let body = serde_json::json!({});
+
+        let (blocked, elapsed) = {
+            let _offline = OfflineEnvGuard::set("1");
+            let start = std::time::Instant::now();
+            let error = client
+                .send_retrying("test.offline", &url, &body, false)
+                .await
+                .unwrap_err();
+            (format!("{error:#}"), start.elapsed())
+        };
+        assert!(
+            blocked.contains("offline mode"),
+            "PRISM_OFFLINE=1 must refuse {url} as policy, got: {blocked}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "a blocked URL must be refused before the retry closure; one retry \
+             sleep alone is at least 250 ms, and this took {elapsed:?}"
+        );
+
+        let attempted = {
+            let _online = OfflineEnvGuard::clear();
+            format!(
+                "{:#}",
+                client
+                    .send_retrying("test.online", &url, &body, false)
+                    .await
+                    .unwrap_err()
+            )
+        };
+        assert!(
+            !attempted.contains("offline mode"),
+            "offline mode must not refuse with PRISM_OFFLINE unset, got: {attempted}"
+        );
+        assert!(
+            attempted.contains("LLM request to"),
+            "with offline mode off the send must reach the transport, got: {attempted}"
         );
     }
 }

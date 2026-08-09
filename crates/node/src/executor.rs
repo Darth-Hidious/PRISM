@@ -154,13 +154,27 @@ pub fn sanitize_env_vars(env_vars: &BTreeMap<String, String>) -> Result<BTreeMap
 /// back to a locally present image (pre-loaded nodes, air-gapped facilities,
 /// images built on the node itself). Bail only when the image is nowhere.
 pub(crate) async fn ensure_image_available(runtime: ContainerRuntime, image: &str) -> Result<()> {
-    let pull = Command::new(runtime.binary())
-        .args(["pull", image])
-        .output()
-        .await
-        .with_context(|| format!("failed to pull image with {}", runtime.binary()))?;
+    // Hard offline never pulls — a registry fetch is egress, and with a
+    // configured `docker login` it carries registry credentials too.
+    //
+    // Nothing else is needed: the local-copy fallback below was written for
+    // exactly this case ("pre-loaded nodes, air-gapped facilities"), so offline
+    // simply skips the pull and goes straight to it. A node holding the image
+    // still runs; only the fetch is refused.
+    let offline = prism_runtime::offline::enabled();
+    let pull = if offline {
+        None
+    } else {
+        Some(
+            Command::new(runtime.binary())
+                .args(["pull", image])
+                .output()
+                .await
+                .with_context(|| format!("failed to pull image with {}", runtime.binary()))?,
+        )
+    };
 
-    if pull.status.success() {
+    if matches!(pull, Some(ref p) if p.status.success()) {
         return Ok(());
     }
 
@@ -173,11 +187,20 @@ pub(crate) async fn ensure_image_available(runtime: ContainerRuntime, image: &st
         return Ok(());
     }
 
-    let err = String::from_utf8_lossy(&pull.stderr);
-    bail!(
-        "{} pull failed and no local copy of '{image}' exists: {err}",
-        runtime.binary()
-    );
+    match pull {
+        None => bail!(
+            "offline mode: no local copy of '{image}' exists and `{} pull` is \
+             blocked. Pull it before going offline.",
+            runtime.binary()
+        ),
+        Some(pull) => {
+            let err = String::from_utf8_lossy(&pull.stderr);
+            bail!(
+                "{} pull failed and no local copy of '{image}' exists: {err}",
+                runtime.binary()
+            );
+        }
+    }
 }
 
 pub async fn execute_container_job(
@@ -601,6 +624,36 @@ fn binary_exists(binary: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A node with no local copy must not fetch one under hard offline.
+    ///
+    /// One-sided by necessity: the permissive half of this guard IS a registry
+    /// pull, so asserting it would put a packet on the wire (and, with a
+    /// configured `docker login`, a credential). The "policy off" direction is
+    /// pinned at the primitive by
+    /// `prism_runtime::offline::tests::only_a_trimmed_one_enables_offline`.
+    ///
+    /// Works whether or not a container runtime is installed: with no binary
+    /// the `image inspect` fallback errors, which is the same "no local copy"
+    /// branch a real absent image takes.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_absent_image_is_not_fetched_under_hard_offline() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let err = ensure_image_available(
+            ContainerRuntime::Docker,
+            "prism-test-image-that-does-not-exist:never",
+        )
+        .await
+        .expect_err("must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("offline mode"),
+            "must be a POLICY refusal: {msg}"
+        );
+    }
+
     use super::*;
 
     #[test]

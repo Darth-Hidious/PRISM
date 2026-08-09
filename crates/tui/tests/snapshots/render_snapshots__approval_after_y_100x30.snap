@@ -1,10 +1,9 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 674
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
-· PRISM ready — 99 tools available                                 │ [Activity] Tools Files
+· PRISM ready — 99 tools available                                 │ [Activity] Tools Files Objects
                                                                    │ 1 tools · 1 ✓
 ❯ You                                                              │
 ▌ run compute                                                      │  1. prompt "run compute" •

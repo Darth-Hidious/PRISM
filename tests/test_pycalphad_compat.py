@@ -63,19 +63,29 @@ def test_functional_equilibrium_solves_after_shim(tmp_path):
     assert gibbs < 0.0
 
 
-def test_calphad_bridge_equilibrium_reaches_a_real_solve(tmp_path, monkeypatch):
+def test_calphad_bridge_equilibrium_reaches_a_real_solve(tmp_path):
     """Guards the wiring, not just the shim: the bridge must apply it itself."""
     from app.tools.simulation import calphad_bridge as bridge_module
 
     store = tmp_path / "databases"
     store.mkdir()
     (store / "alzr_probe.tdb").write_text(_alzr_tdb(tmp_path).read_text())
-    monkeypatch.setattr(
-        bridge_module.DatabaseStore, "base_dir", store, raising=False
-    )
 
-    bridge = bridge_module.CalphadBridge()
-    bridge.databases.base_dir = store
+    # Pass the directory in, rather than patching `base_dir`.
+    #
+    # `base_dir` is a read-only property and every internal method reads
+    # `self._base_dir`, which `__init__` had already set from the real
+    # `Path.home()`. So both of the previous lines here —
+    # `monkeypatch.setattr(DatabaseStore, "base_dir", store)` and
+    # `bridge.databases.base_dir = store` — were NO-OPS: this test has always
+    # read the developer's real `~/.prism/databases`, and passed only because a
+    # leftover `alzr_probe.tdb` happened to be sitting there from an earlier
+    # run. On a clean machine, including CI, it fails.
+    #
+    # Surfaced by redirecting HOME for the suite: with a fresh home there is no
+    # leftover file, and the fake isolation stopped being invisible.
+    bridge = bridge_module.CalphadBridge(base_dir=store)
+    assert bridge.databases.base_dir == store, "isolation is a no-op again"
 
     result = bridge.calculate_equilibrium(
         database_name="alzr_probe",

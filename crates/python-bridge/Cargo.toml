@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The one offline-policy rule, rather than a fourth copy of `== "1"`.
+prism-runtime = { path = "../runtime" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -74,6 +74,123 @@ pub enum WorkspaceTab {
     Activity,
     Tools,
     Files,
+    Objects,
+}
+
+/// Domain-object kind.
+///
+/// The named variants are the kinds this build draws a distinct GLYPH for.
+/// They are NOT the set of materials PRISM supports — that set is open, and a
+/// closed enum here would be the same mistake the ml_train design calls out
+/// for model classes: "class is DATA, not an enum arm… turns every new family
+/// into a code change — backwards for a materials platform".
+///
+/// PRISM is not a metals tool. Ceramics, composites, MOFs, electrolytes, small
+/// molecules and whatever comes next arrive as `Other`, carrying their own
+/// name, and render as themselves. They used to collapse into `Result`, which
+/// told the user a ceramic was a "Result" — inventing a label the backend
+/// never sent, the same class of lie as the status defect fixed in 746ec620.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectKind {
+    Structure,
+    Alloy,
+    Polymer,
+    Simulation,
+    Result,
+    /// A kind this build has no glyph for — carried VERBATIM, never guessed.
+    Other(String),
+}
+
+impl ObjectKind {
+    /// Parse from a backend string. An unrecognised kind keeps its own name.
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "structure" | "crystal" => Self::Structure,
+            "alloy" | "hea" => Self::Alloy,
+            "polymer" => Self::Polymer,
+            "simulation" | "sim" | "md" => Self::Simulation,
+            "result" => Self::Result,
+            other if other.trim().is_empty() => Self::Result,
+            _ => Self::Other(s.trim().to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Structure => "Structure",
+            Self::Alloy => "Alloy",
+            Self::Polymer => "Polymer",
+            Self::Simulation => "Simulation",
+            Self::Result => "Result",
+            Self::Other(name) => name,
+        }
+    }
+
+    /// Short glyph for the sidebar row.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            Self::Structure => "◇",
+            Self::Alloy => "⬡",
+            Self::Polymer => "⌇",
+            Self::Simulation => "▶",
+            Self::Result => "◆",
+            // Deliberately neutral: a glyph borrowed from another kind would
+            // imply we know what this is.
+            Self::Other(_) => "·",
+        }
+    }
+}
+
+/// Status of a domain object in the Objects tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStatus {
+    Running,
+    Completed,
+    Failed,
+    /// A status string this build does not recognise — `cancelled`, `queued`,
+    /// something a newer backend sends. Deliberately NOT folded into
+    /// `Running`: a cancelled simulation displayed as actively running is a
+    /// fabricated state, and the whole point of this tab is that the user can
+    /// trust what he is pointing at.
+    Unknown,
+}
+
+impl ObjectStatus {
+    /// Terminal states are final. A late or replayed `running` for an object
+    /// that already finished must not resurrect it.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+impl ObjectStatus {
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "running" | "in_progress" | "active" => Self::Running,
+            "completed" | "done" | "success" | "finished" => Self::Completed,
+            "failed" | "error" | "errored" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// One row of the Workspace *Objects* tab — a domain object the user
+/// can see, point at, and tag for the agent.
+#[derive(Debug, Clone)]
+pub struct WorkspaceObject {
+    /// Backend-assigned unique id (upsert key).
+    pub id: String,
+    pub kind: ObjectKind,
+    pub label: String,
+    pub status: ObjectStatus,
+    /// Live progress as (current_step, total_steps). `None` means the
+    /// backend hasn't reported progress yet — render as "running" with
+    /// no percentage (honesty constraint).
+    pub progress: Option<(u64, u64)>,
+    /// Tagged for the agent — prefixed into the next message.
+    pub tagged: bool,
+    /// Result summary (completed) or error message (failed).
+    pub detail: Option<String>,
 }
 
 /// A transient full-overlay modal, dismissed by any key.
@@ -502,10 +619,13 @@ pub struct App {
     /// Set at startup and on each turn boundary to trigger a cheap balance
     /// refresh in the event loop (never on every keystroke).
     pub needs_credits_refresh: bool,
-    // Workspace sidebar — the right-hand panel (Activity / Tools / Files)
+    // Workspace sidebar — the right-hand panel (Activity / Tools / Files / Objects)
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
     pub workspace_expanded: bool,
+    /// Domain objects (structures, alloys, simulations, …) shown in the
+    /// Objects tab. Upserted by `id` from `ui.object.update` notifications.
+    pub objects: Vec<WorkspaceObject>,
     /// Max chat scroll offset, recomputed by the renderer each frame
     /// (content height − viewport). Lets key handlers clamp/anchor scrolling
     /// without knowing the terminal size.
@@ -606,6 +726,7 @@ impl App {
             workspace_tab: WorkspaceTab::Activity,
             workspace_selected: 0,
             workspace_expanded: false,
+            objects: Vec::new(),
             view_max_scroll: std::cell::Cell::new(0),
             modal: None,
             goal: None,
@@ -1022,7 +1143,8 @@ impl App {
 
     /// Navigate the Workspace sidebar: ←/→ switch tab, ↑/↓ move selection,
     /// Enter opens a detail modal for the selected item, Space expands it
-    /// inline, i/Esc jump back to input.
+    /// inline, `t` tags/untags an object (Objects tab), i/Esc jump back
+    /// to input.
     fn handle_workspace_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => self.workspace_prev_tab(),
@@ -1039,9 +1161,27 @@ impl App {
             KeyCode::Char(' ') => {
                 self.workspace_expanded = !self.workspace_expanded;
             }
+            KeyCode::Char('t') => self.toggle_object_tag(),
             KeyCode::Char('?') => self.open_which_key(),
             KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Input,
             _ => {}
+        }
+    }
+
+    /// Toggle the tag on the currently selected object in the Objects tab.
+    /// Tagged objects are prefixed into the next message sent to the agent.
+    fn toggle_object_tag(&mut self) {
+        if self.workspace_tab != WorkspaceTab::Objects || self.objects.is_empty() {
+            return;
+        }
+        let sel = self.workspace_selected.min(self.objects.len() - 1);
+        self.objects[sel].tagged = !self.objects[sel].tagged;
+        let label = self.objects[sel].label.clone();
+        let tagged = self.objects[sel].tagged;
+        if tagged {
+            self.toast(format!("tagged: {label}"), ToastKind::Ok);
+        } else {
+            self.toast(format!("untagged: {label}"), ToastKind::Info);
         }
     }
 
@@ -1119,6 +1259,7 @@ impl App {
     ///     the per-tool config file at ~/.prism/tools.d/<tool>.toml.
     ///   - Files:    the file's content (text files, capped at 200 KB).
     ///   - Activity: the underlying event of that row as pretty JSON.
+    ///   - Objects:  the object's parameters and result summary.
     pub fn open_workspace_detail(&mut self) {
         match self.workspace_tab {
             WorkspaceTab::Tools => {
@@ -1160,6 +1301,32 @@ impl App {
                     .unwrap_or_else(|_| "(unrenderable event)".to_string());
                 self.open_detail_view(format!("Activity — {}. {}", sel + 1, entry.kind), body);
             }
+            WorkspaceTab::Objects => {
+                if self.objects.is_empty() {
+                    self.toast("no objects yet", ToastKind::Info);
+                    return;
+                }
+                let sel = self.workspace_selected.min(self.objects.len() - 1);
+                let obj = &self.objects[sel];
+                let mut body = format!(
+                    "Kind:     {}\nLabel:    {}\nStatus:   {:?}\nID:       {}\n",
+                    obj.kind.as_str(),
+                    obj.label,
+                    obj.status,
+                    obj.id,
+                );
+                if let Some((cur, tot)) = obj.progress {
+                    body.push_str(&format!("Progress: {cur}/{tot}\n"));
+                }
+                if obj.tagged {
+                    body.push_str("Tagged:   yes (sent to agent)\n");
+                }
+                if let Some(detail) = &obj.detail {
+                    body.push_str(&format!("\n---\n{detail}\n"));
+                }
+                let title = format!("{} — {}", obj.kind.as_str(), obj.label);
+                self.open_detail_view(title, body);
+            }
         }
     }
 
@@ -1177,7 +1344,8 @@ impl App {
         self.workspace_tab = match self.workspace_tab {
             WorkspaceTab::Activity => WorkspaceTab::Tools,
             WorkspaceTab::Tools => WorkspaceTab::Files,
-            WorkspaceTab::Files => WorkspaceTab::Activity,
+            WorkspaceTab::Files => WorkspaceTab::Objects,
+            WorkspaceTab::Objects => WorkspaceTab::Activity,
         };
         self.workspace_selected = 0;
         self.workspace_expanded = false;
@@ -1186,9 +1354,10 @@ impl App {
 
     fn workspace_prev_tab(&mut self) {
         self.workspace_tab = match self.workspace_tab {
-            WorkspaceTab::Activity => WorkspaceTab::Files,
+            WorkspaceTab::Activity => WorkspaceTab::Objects,
             WorkspaceTab::Tools => WorkspaceTab::Activity,
             WorkspaceTab::Files => WorkspaceTab::Tools,
+            WorkspaceTab::Objects => WorkspaceTab::Files,
         };
         self.workspace_selected = 0;
         self.workspace_expanded = false;
@@ -3159,6 +3328,12 @@ impl App {
                 self.workspace_expanded = false;
                 self.focus = Focus::Workspace;
             }
+            "workspace.objects" => {
+                self.workspace_tab = WorkspaceTab::Objects;
+                self.workspace_selected = 0;
+                self.workspace_expanded = false;
+                self.focus = Focus::Workspace;
+            }
             other if other.starts_with("slash.") => {
                 // Run any backend slash command, e.g. "slash.tools" → "/tools".
                 // No chat echo — the returned `ui.view` panel is the feedback.
@@ -3226,10 +3401,31 @@ impl App {
             // Inject the standing goal so it actually steers the agent. The
             // chat shows the user's clean text; the backend receives it with
             // the goal prefixed as context on every turn (survives compaction).
-            let payload = match &self.goal {
-                Some(goal) => format!("[Standing goal: {goal}]\n\n{trimmed}"),
-                None => trimmed.to_string(),
-            };
+            let mut payload = trimmed.to_string();
+            if let Some(goal) = &self.goal {
+                payload = format!("[Standing goal: {goal}]\n\n{payload}");
+            }
+            // Inject tagged objects so the LLM can see what the user pointed at.
+            let tagged: Vec<&WorkspaceObject> = self.objects.iter().filter(|o| o.tagged).collect();
+            if !tagged.is_empty() {
+                let mut ctx = String::from("[Tagged objects]\n");
+                for obj in &tagged {
+                    ctx.push_str(&format!(
+                        "- {} {} ({:?})",
+                        obj.kind.as_str(),
+                        obj.label,
+                        obj.status,
+                    ));
+                    if let Some((cur, tot)) = obj.progress {
+                        ctx.push_str(&format!(" [{cur}/{tot}]"));
+                    }
+                    if let Some(detail) = &obj.detail {
+                        ctx.push_str(&format!(": {detail}"));
+                    }
+                    ctx.push('\n');
+                }
+                payload = format!("{ctx}\n{payload}");
+            }
             let _ = self.backend.send_message(&payload);
         }
         self.is_waiting = true;
@@ -3676,6 +3872,65 @@ impl App {
                         "[{origin} notebook In[{}]] {body}",
                         parsed.execution_count
                     ));
+                }
+            }
+            AgentMsg::ObjectUpdate {
+                id,
+                kind,
+                label,
+                status,
+                progress_current,
+                progress_total,
+                detail,
+            } => {
+                // The id IS the identity — the upsert below matches on it. A
+                // notification with no id defaults to "" and every such update
+                // collapses onto ONE row, so two unrelated simulations would
+                // overwrite each other's status and progress in front of the
+                // user. An unaddressable update is dropped, not guessed at.
+                if id.trim().is_empty() {
+                    return;
+                }
+                // Sanitize BEFORE parsing. `kind` is backend-supplied and now
+                // reaches the terminal verbatim through `ObjectKind::Other`
+                // (5a3e3a46). While every variant was a &'static str this was
+                // safe; it is not any more. `label` and `detail` below have
+                // always been sanitized — kind had simply never needed it.
+                let obj_kind = ObjectKind::from_str_loose(&sanitize_for_render(&kind));
+                let obj_status = ObjectStatus::from_str_loose(&status);
+                let progress = match (progress_current, progress_total) {
+                    (Some(c), Some(t)) => Some((c, t)),
+                    _ => None,
+                };
+                let label = sanitize_for_render(&label);
+                let detail = detail.map(|d| sanitize_for_render(&d));
+                // Upsert by id.
+                if let Some(existing) = self.objects.iter_mut().find(|o| o.id == id) {
+                    existing.kind = obj_kind;
+                    existing.label = label;
+                    // Terminal is final. Notifications are not ordered — a
+                    // `running` emitted before completion can arrive after it
+                    // (retry, replay, a slow 50-step progress tick racing the
+                    // finish). Letting that overwrite would show a finished
+                    // simulation as running again, and the user would wait on
+                    // a result he already has.
+                    if !existing.status.is_terminal() {
+                        existing.status = obj_status;
+                        existing.progress = progress;
+                    }
+                    if let Some(d) = detail {
+                        existing.detail = Some(d);
+                    }
+                } else {
+                    self.objects.push(WorkspaceObject {
+                        id,
+                        kind: obj_kind,
+                        label,
+                        status: obj_status,
+                        progress,
+                        tagged: false,
+                        detail,
+                    });
                 }
             }
             AgentMsg::Unknown(_) => {}

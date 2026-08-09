@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 prism-client = { path = "../client" }
+prism-runtime = { path = "../runtime" }
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

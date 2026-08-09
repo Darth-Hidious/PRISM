@@ -44,6 +44,8 @@ pub enum FakeScenario {
     BackendWarningError,
     /// ANSI injection: payloads with unsafe control sequences.
     AnsiInjection,
+    /// Domain objects: object creation, progress updates, and terminal states.
+    ObjectProgress,
 }
 
 impl FakeScenario {
@@ -59,6 +61,7 @@ impl FakeScenario {
             "cost_metrics" => Ok(Self::CostMetrics),
             "backend_warning_error" => Ok(Self::BackendWarningError),
             "ansi_injection" => Ok(Self::AnsiInjection),
+            "object_progress" => Ok(Self::ObjectProgress),
             other => bail!(
                 "unknown fake backend scenario: '{other}'. \
                  Available scenarios: {}",
@@ -79,6 +82,7 @@ impl FakeScenario {
             Self::CostMetrics => "cost_metrics",
             Self::BackendWarningError => "backend_warning_error",
             Self::AnsiInjection => "ansi_injection",
+            Self::ObjectProgress => "object_progress",
         }
     }
 
@@ -94,6 +98,7 @@ impl FakeScenario {
             "cost_metrics",
             "backend_warning_error",
             "ansi_injection",
+            "object_progress",
         ]
     }
 }
@@ -553,6 +558,98 @@ impl FakeBackend {
                     }),
                 );
                 self.notify("ui.text.flush", serde_json::json!({}));
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
+            FakeScenario::ObjectProgress => {
+                // 1. A structure object appears immediately (completed).
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-struct-1",
+                        "kind": "structure",
+                        "label": "W0.3 Mo0.2 Ta0.3 Nb0.2 BCC",
+                        "status": "completed",
+                        "detail": "BCC lattice, a=3.14A, E=-8.42 eV/atom",
+                    }),
+                );
+                // 2. An alloy screening starts (running, no progress yet).
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-alloy-1",
+                        "kind": "alloy",
+                        "label": "HEA screening: CrMnFeCoNi",
+                        "status": "running",
+                    }),
+                );
+                // 3. A simulation starts (running, progress reported).
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-sim-1",
+                        "kind": "simulation",
+                        "label": "MD NPT 300K 1atm 10000 steps",
+                        "status": "running",
+                        "progress_current": 1500,
+                        "progress_total": 10000,
+                    }),
+                );
+                // 4. Sim progresses.
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-sim-1",
+                        "kind": "simulation",
+                        "label": "MD NPT 300K 1atm 10000 steps",
+                        "status": "running",
+                        "progress_current": 5000,
+                        "progress_total": 10000,
+                    }),
+                );
+                // 5. Alloy screening completes.
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-alloy-1",
+                        "kind": "alloy",
+                        "label": "HEA screening: CrMnFeCoNi",
+                        "status": "completed",
+                        "detail": "5 candidates, best: Cr0.2Mn0.2Fe0.2Co0.2Ni0.2 Hmix=-3.1 kJ/mol",
+                    }),
+                );
+                // 6. Sim finishes.
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-sim-1",
+                        "kind": "simulation",
+                        "label": "MD NPT 300K 1atm 10000 steps",
+                        "status": "completed",
+                        "detail": "Final E=-42.7 eV, T=301K, P=0.98atm, trajectory: traj_001.xyz",
+                    }),
+                );
+                // 7. A failed sim appears.
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-sim-2",
+                        "kind": "simulation",
+                        "label": "MD NVT 500K 5000 steps",
+                        "status": "failed",
+                        "detail": "Error: divergence at step 2341, dt too large for T=500K",
+                    }),
+                );
+                // 8. A result object.
+                self.notify(
+                    "ui.object.update",
+                    serde_json::json!({
+                        "id": "obj-result-1",
+                        "kind": "result",
+                        "label": "DFT relaxation: W-BCC",
+                        "status": "completed",
+                        "detail": "a_opt=3.16A, E_coh=-8.91 eV/atom, bulk_mod=302 GPa",
+                    }),
+                );
                 self.notify("ui.turn.complete", serde_json::json!({}));
             }
         }

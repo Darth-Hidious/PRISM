@@ -241,6 +241,52 @@ mod tests {
         assert_eq!(papers[1].dedup_key(), "arxiv:2402.00001v2");
     }
 
+    /// Pins the `journal_ref` arm's GUARD, which nothing else exercises.
+    ///
+    /// The arm is written `"journal_ref" if !value.trim().is_empty()`, so a
+    /// blank one must fall through to `_ => {}` and leave `journal` as `None`.
+    /// Both existing fixtures miss this: the first carries a non-empty
+    /// journal_ref, the second omits the element entirely — that tests "field
+    /// never entered", a different path. So the guard's false branch had no
+    /// coverage, and rewriting it as an unguarded arm with the check dropped
+    /// would still have passed every test in the crate.
+    ///
+    /// Empty and whitespace-only are separate cases on purpose: `is_empty()`
+    /// alone would accept `"   "` and store a blank journal string.
+    #[test]
+    fn a_blank_journal_ref_is_not_recorded_as_a_journal() {
+        let feed = |inner: &str| {
+            format!(
+                r#"<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2403.00009v1</id>
+    <title>Blank journal</title>
+    {inner}
+  </entry>
+</feed>"#
+            )
+        };
+
+        for inner in [
+            "<arxiv:journal_ref></arxiv:journal_ref>",
+            "<arxiv:journal_ref>   </arxiv:journal_ref>",
+            "<arxiv:journal_ref>\n\t</arxiv:journal_ref>",
+        ] {
+            let papers = parse(feed(inner).as_bytes()).unwrap();
+            assert_eq!(papers.len(), 1, "fixture should yield one entry: {inner}");
+            assert_eq!(
+                papers[0].journal, None,
+                "blank journal_ref must not be recorded: {inner:?}"
+            );
+        }
+
+        // The positive half, so the assertions above cannot pass against a
+        // parser that simply never populates `journal`.
+        let papers =
+            parse(feed("<arxiv:journal_ref> Nature 1 </arxiv:journal_ref>").as_bytes()).unwrap();
+        assert_eq!(papers[0].journal.as_deref(), Some("Nature 1"));
+    }
+
     #[test]
     fn empty_feed_yields_nothing_not_garbage() {
         let papers = parse(b"<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>").unwrap();

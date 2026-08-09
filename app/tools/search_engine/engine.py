@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -31,6 +32,16 @@ def _sanitize_error(msg: str) -> str:
 
 
 DEFAULT_HEALTH_PATH = Path.home() / ".prism" / "cache" / "provider_health.json"
+
+
+def _offline_policy_enabled() -> bool:
+    """Hard offline mode, read per call — same contract as the Rust side.
+
+    Only a trimmed "1" enables it; everything else, including "true", reads as
+    off. Matches `prism_runtime::offline::enabled`.
+    """
+    return os.environ.get("PRISM_OFFLINE", "").strip() == "1"
+
 
 
 # S7: the OPTIMADE providers known (live-probed 2026-07) to support server-side
@@ -278,16 +289,39 @@ class SearchEngine:
         for pid, result in provider_results.items():
             provider = next(p for p in providers if p.id == pid)
             if isinstance(result, BaseException):
-                # S1: the breaker + an honest log. Each task records its OWN
-                # start (above), so latency here is per-provider, not the old
-                # cumulative search-wide `start`.
-                self._health.get(pid).record_failure()
-                status = (
-                    "timeout"
-                    if isinstance(result, asyncio.CancelledError)
-                    or isinstance(result, asyncio.TimeoutError)
-                    else "http_error"
-                )
+                # A refusal by the hard-offline policy is NOT evidence about
+                # the provider, so it must not touch the breaker.
+                #
+                # It did. `record_failure()` fired for any exception, and the
+                # offline socket guard surfaces as one. Two searches under
+                # PRISM_OFFLINE=1 hit `consecutive_failures >= 2` and opened
+                # the circuit for EVERY provider — measured: 50 open circuits
+                # before, 53 after, with `matcloud.mc3d-pbesol-v1` at exactly
+                # 2. That state persists to ~/.prism/cache/provider_health.json,
+                # so coming back online meant a 300s cooldown per provider,
+                # caused by a policy decision rather than any provider fault.
+                if _offline_policy_enabled():
+                    # Hand back the half-open probe slot. `record_failure` was
+                    # the only thing clearing it, so skipping the breaker also
+                    # skipped the release and stranded the provider: once a
+                    # cooldown-eligible probe landed while offline,
+                    # `should_query()` returned False for the rest of the
+                    # PROCESS — even back online, even for a provider that
+                    # would now succeed, reported only as "No providers
+                    # available". Worse than the bug the skip was added to fix.
+                    self._health.get(pid).release_probe_claim()
+                    status = "offline_blocked"
+                else:
+                    # S1: the breaker + an honest log. Each task records its OWN
+                    # start (above), so latency here is per-provider, not the old
+                    # cumulative search-wide `start`.
+                    self._health.get(pid).record_failure()
+                    status = (
+                        "timeout"
+                        if isinstance(result, asyncio.CancelledError)
+                        or isinstance(result, asyncio.TimeoutError)
+                        else "http_error"
+                    )
                 log = ProviderQueryLog(
                     provider_id=pid,
                     provider_name=provider.name,
@@ -341,7 +375,25 @@ class SearchEngine:
         )
 
         # 8. Cache and persist health
-        self._cache.put(query, search_result)
+        #
+        # Cache only when a provider actually ANSWERED. `put` was
+        # unconditional, so a search in which every provider failed — which is
+        # exactly what hard offline produces — stored an empty result under a
+        # 24h TTL, keyed by `query_hash()`, which covers the query parameters
+        # and nothing about the network. A later ONLINE search of the same
+        # query then short-circuited at the cache check (step 1) and returned
+        # zero materials without contacting anyone. Reproduced end to end: a
+        # provider that raises while offline and returns a hit when online gave
+        # `materials=0, cached=True` on the online call.
+        #
+        # Worse than the circuit-breaker case fixed alongside it: 24 hours
+        # instead of a 300s cooldown, and ONE failed search instead of two.
+        #
+        # A genuinely empty answer IS cached — a provider that replied "no
+        # matches" is real knowledge. What is not cached is an answer nobody
+        # gave.
+        if any(log.status == "success" for log in query_log):
+            self._cache.put(query, search_result)
         self._health.save()
 
         # S5: restore the default deadline (the override was per-call only).
@@ -400,7 +452,15 @@ class SearchEngine:
             return materials, log
 
         except asyncio.TimeoutError:
-            self._health.get(provider.id).record_failure()
+            # Same rule as the fan-out branch: a timeout while the offline
+            # policy is on is the policy, not the provider. This second call
+            # site was missed by the first fix, so offline still poisoned
+            # health through any provider that timed out rather than raising
+            # the socket guard's error immediately.
+            if _offline_policy_enabled():
+                self._health.get(provider.id).release_probe_claim()
+            else:
+                self._health.get(provider.id).record_failure()
             log = ProviderQueryLog(
                 provider_id=provider.id,
                 provider_name=provider.name,

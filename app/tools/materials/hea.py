@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """High-Entropy Alloy (HEA) / Multi-Principal-Element Alloy (MPEA) design tools.
 
 SCOPE (honest): these are empirical Hume-Rothery-style SCREENING heuristics —
@@ -496,7 +496,8 @@ _HEA_SCHEMA: dict = {
         "Hume-Rothery-style first-pass screen — NOT phase equilibria: no "
         "phase fractions, no temperature dependence, no Gibbs energies "
         "(that is what CALPHAD databases like Thermo-Calc TCHEA compute). "
-        "Pure math from open literature parameters."
+        "Pure math from open literature parameters. Supply composition or "
+        "fractions — one of the two is mandatory, and either alone is enough."
     ),
     "properties": {
         "composition": {
@@ -529,6 +530,7 @@ _HEA_SCHEMA: dict = {
             ),
         },
     },
+    "required": [],
     "additionalProperties": False,
 }
 

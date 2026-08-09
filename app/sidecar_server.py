@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Science-sidecar tool server — stdin/stdout JSON-line protocol.
 
 Same wire protocol as `app.tool_server`, but runs inside the SIDECAR venv

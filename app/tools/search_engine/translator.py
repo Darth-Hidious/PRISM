@@ -1,7 +1,57 @@
 """Deterministic query translation -- MaterialSearchQuery to provider-native syntax."""
 from __future__ import annotations
 
+import re
+from math import gcd
+
 from app.tools.search_engine.query import MaterialSearchQuery
+
+_FORMULA_TOKEN = re.compile(r"([A-Z][a-z]?)(\d*)")
+
+
+def optimade_reduced_formula(formula: str) -> str | None:
+    """Canonicalise a written formula to OPTIMADE ``chemical_formula_reduced``.
+
+    The spec requires element symbols in ALPHABETICAL order with proportions
+    divided by their greatest common divisor and a proportion of 1 omitted.
+    A human writes ``TiO2``; the canonical form is ``O2Ti``.
+
+    This was not being done. ``chemical_formula_reduced="TiO2"`` was sent
+    verbatim, and every spec-compliant provider answered HTTP 200 with zero
+    hits — Materials Project included, which holds hundreds of TiO2 entries.
+    The federation reported every provider as "success" while returning almost
+    nothing, so the failure looked like an empty database rather than a bad
+    query.
+
+    Returns ``None`` when the string does not parse as a simple formula
+    (parentheses, hydrates, charges, wildcards). The caller then sends the
+    original text rather than a guess: a formula we cannot canonicalise is
+    better handled by the provider than mangled here.
+    """
+    text = (formula or "").strip()
+    if not text or not text[0].isupper():
+        return None
+    # Reject anything with structure this parser does not model.
+    if not re.fullmatch(r"(?:[A-Z][a-z]?\d*)+", text):
+        return None
+
+    counts: dict[str, int] = {}
+    for symbol, digits in _FORMULA_TOKEN.findall(text):
+        if not symbol:
+            continue
+        counts[symbol] = counts.get(symbol, 0) + (int(digits) if digits else 1)
+    if not counts:
+        return None
+
+    divisor = 0
+    for n in counts.values():
+        divisor = gcd(divisor, n)
+    if divisor > 1:
+        counts = {sym: n // divisor for sym, n in counts.items()}
+
+    return "".join(
+        f"{sym}{n if n > 1 else ''}" for sym, n in sorted(counts.items())
+    )
 
 
 class QueryTranslator:
@@ -25,7 +75,11 @@ class QueryTranslator:
                 parts.append(f'NOT elements HAS "{e}"')
 
         if query.formula:
-            parts.append(f'chemical_formula_reduced="{query.formula}"')
+            # Canonicalise: the spec wants alphabetical, GCD-reduced. Falling
+            # back to the raw text keeps formulas this parser cannot model
+            # (hydrates, parentheses) working exactly as before.
+            canonical = optimade_reduced_formula(query.formula) or query.formula
+            parts.append(f'chemical_formula_reduced="{canonical}"')
 
         if query.n_elements:
             if query.n_elements.min is not None:

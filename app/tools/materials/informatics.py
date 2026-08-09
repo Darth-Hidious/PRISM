@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Free materials-informatics tools (E7-E11): the Citrine/Intellegens-equivalent stack.
 
 These rival what commercial materials-informatics platforms charge for, using
@@ -65,8 +65,17 @@ def _structure_similarity_tool() -> Tool:
                 "type": "string", "enum": ["loose", "normal", "strict"], "default": "normal",
                 "description": "StructureMatcher tolerance preset.",
             },
-            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            "limit": {
+                "type": "integer", "minimum": 1, "maximum": 50, "default": 10,
+                "description": (
+                    "How many analogs to return (default 10). Also widens the "
+                    "search: 3x this many candidates are pulled from the "
+                    "federation before scoring, so a larger limit costs a larger "
+                    "OPTIMADE query."
+                ),
+            },
         },
+        "required": ["query_formula"],
         "additionalProperties": False,
     }
 
@@ -252,7 +261,19 @@ def _predict_property_tool() -> Tool:
                          "description": "Compositions to predict (e.g. ['Cu2O','Fe2O3'])."},
             "property": {"type": "string", "default": "formation_energy_per_atom",
                          "description": "Property to predict (an MP summary field)."},
-            "model": {"type": "string", "enum": ["random_forest", "gradient_boosting"], "default": "random_forest"},
+            "model": {
+                "type": "string", "enum": ["random_forest", "gradient_boosting"],
+                "default": "random_forest",
+                "description": (
+                    "sklearn regressor family fitted on the pulled MP rows "
+                    "(default 'random_forest'). Only random_forest reports a "
+                    "per-prediction uncertainty — the standard deviation across "
+                    "its independently fitted trees. gradient_boosting returns "
+                    "predictions with uncertainty null: its trees are sequential "
+                    "residual fitters, so their spread is not an uncertainty. "
+                    "Use random_forest unless you specifically want a boosted fit."
+                ),
+            },
         },
         "required": ["formulas"],
         "additionalProperties": False,
@@ -322,9 +343,26 @@ def _predict_property_tool() -> Tool:
                 continue
             x = np.array(feats).reshape(1, -1)
             pred = float(model.predict(x)[0])
-            # Uncertainty: std across trees (RandomForest) or repeat-prediction.
+            # Uncertainty: spread across the ensemble's independent fits.
+            #
+            # Gated on the ensemble KIND, not on `hasattr(estimators_)`, which
+            # both regressors have. The schema offers `gradient_boosting`, and
+            # picking it used to crash the whole call: its `estimators_` is a
+            # 2-D ndarray, so iterating yields sub-arrays and `t.predict` raises
+            # AttributeError. `Tool.execute` caught that generically, so the
+            # agent got `{"error": "AttributeError: ..."}` and ZERO predictions
+            # from a documented enum value — a total, opaque failure that reads
+            # like a PRISM bug.
+            #
+            # Flattening it would make the call succeed and the number wrong:
+            # boosting trees are sequential residual fitters, not independent
+            # estimates, so their spread is not an uncertainty. Boosting
+            # therefore returns predictions with `uncertainty: null`, which the
+            # response already models.
             unc = None
-            if hasattr(model, "estimators_"):
+            from sklearn.ensemble import RandomForestRegressor
+
+            if isinstance(model, RandomForestRegressor):
                 tree_preds = [float(t.predict(x)[0]) for t in model.estimators_]
                 unc = float(np.std(tree_preds))
             predictions.append({
@@ -378,7 +416,9 @@ def _pareto_screen_tool() -> Tool:
                 "description": (
                     "Candidate materials with their objective values, e.g. "
                     "[{formula:'Ti',density:4.5,modulus:110,hull:0}, ...]. "
-                    "Omit to auto-pull from screen_materials."
+                    "Max 200. Must be supplied — there is no auto-pull; run "
+                    "screen_materials or predict_property first and pass the "
+                    "rows in."
                 ),
             },
             "objectives": {
@@ -450,7 +490,14 @@ def _pareto_screen_tool() -> Tool:
 
     return Tool(
         name="pareto_screen",
-        description="Multi-objective Pareto-front screening (find non-dominated materials across N objectives).",
+        description=(
+            "Screen candidates you already have for the multi-objective Pareto "
+            "front. Returns the non-dominated set across N possibly conflicting "
+            "objectives (e.g. minimise density while maximising modulus), each "
+            "with its objective values, plus the dominated count. Exact O(n^2) "
+            "dominance over supplied candidates — max 200, and any candidate "
+            "missing an objective value is dropped rather than guessed."
+        ),
         input_schema=schema, func=_run, requires_approval=False,
         source="builtin", source_detail="materials.informatics",
     )
@@ -480,7 +527,14 @@ def _suggest_next_experiments_tool() -> Tool:
                                          "uncertainty": {"type": "number"}}},
                 "description": "Candidate pool with predicted values + uncertainties (from predict_property).",
             },
-            "n_suggestions": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            "n_suggestions": {
+                "type": "integer", "minimum": 1, "maximum": 20, "default": 5,
+                "description": (
+                    "How many top-ranked candidates to return (default 5). The "
+                    "acquisition score is computed for the whole pool regardless; "
+                    "this only truncates the returned list."
+                ),
+            },
             "acquisition": {"type": "string", "enum": ["ei", "ucb"], "default": "ei",
                             "description": "ei = Expected Improvement; ucb = Upper Confidence Bound."},
             "direction": {"type": "string", "enum": ["max", "min"], "default": "max",
@@ -546,8 +600,12 @@ def _suggest_next_experiments_tool() -> Tool:
     return Tool(
         name="suggest_next_experiments",
         description=(
-            "Active-learning next-experiment suggestion (EI/UCB acquisition). "
-            "Free Intellegens/Citrine active-learning loop equivalent."
+            "Rank a candidate pool by active-learning acquisition value "
+            "(Expected Improvement or Upper Confidence Bound) to decide which "
+            "experiments to run next. Returns the top-n candidates with their "
+            "acquisition score and a plain-text reason. Needs each candidate to "
+            "already carry a predicted value and an uncertainty — e.g. from "
+            "predict_property; candidates missing either are skipped."
         ),
         input_schema=schema, func=_run, requires_approval=False,
         source="builtin", source_detail="materials.informatics",

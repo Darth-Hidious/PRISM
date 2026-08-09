@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """THE platform HTTP client for PRISM agent tools.
 
 Every tool that talks to api.marc27.com goes through this module — no tool

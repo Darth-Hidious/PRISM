@@ -333,6 +333,12 @@ async fn sync_dataset_from_peer(
     // The dataset name travels as plain JSON data, never spliced into a
     // query language string (Bug #45 stays fixed by construction).
     let query_url = format!("{peer_url}/api/query");
+    // Hard offline. `peer_url` is built from an address another node ANNOUNCED
+    // over the mesh, so it is attacker-influenceable by any peer with Kafka
+    // access — the destination is not ours to trust. `crates/mesh` had no
+    // dependency on prism-runtime at all, so nothing here consulted the policy.
+    // `check_url` rather than `enabled()`: a loopback peer is legitimate.
+    prism_runtime::offline::check_url(&query_url).map_err(|r| anyhow::anyhow!(r))?;
     let body = serde_json::json!({
         "query": dataset_name,
         "mode": "graph",
@@ -445,4 +451,59 @@ async fn sync_dataset_from_peer(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OfflineEnvGuard, test_env_lock};
+
+    /// The guard `9926eac0` described as the more consequential of the two had
+    /// NO test at all — a reviewer's point that stood: best-covered path was
+    /// not highest-risk path. `peer_url` is built from an address another node
+    /// ANNOUNCED, so this refuses a destination we do not control.
+    ///
+    /// `sync` propagates rather than skipping (unlike the fan-out): an explicit
+    /// single-dataset sync should say why it refused.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_remote_peer_sync_is_refused_offline() {
+        let _guard = test_env_lock();
+        let _restore = OfflineEnvGuard::capture();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let client = reqwest::Client::new();
+        let err = sync_dataset_from_peer(&client, "http://203.0.113.9:9100", "ds", &None)
+            .await
+            .expect_err("offline must refuse a remote peer");
+        let msg = err.to_string();
+        assert!(msg.contains("offline mode"), "{msg}");
+        assert!(
+            msg.contains("203.0.113.9"),
+            "must name what it blocked: {msg}"
+        );
+    }
+
+    /// A loopback peer is not refused by policy — it fails on connect instead.
+    /// Without this, the test above would pass even if the guard refused every
+    /// peer unconditionally.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_loopback_peer_sync_is_not_refused_by_policy() {
+        let _guard = test_env_lock();
+        let _restore = OfflineEnvGuard::capture();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(400))
+            .build()
+            .expect("client");
+        let err = sync_dataset_from_peer(&client, "http://127.0.0.1:1", "ds", &None)
+            .await
+            .expect_err("nothing is listening on port 1");
+        assert!(
+            !err.to_string().contains("offline mode"),
+            "loopback must not be refused by policy: {err}"
+        );
+    }
 }

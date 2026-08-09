@@ -124,3 +124,129 @@ def test_half_open_claim_not_persisted():
     # to_dict must not include the claim
     assert "half_open_probe_claimed" not in h.to_dict()
 
+
+def _raising_provider(pid: str):
+    """A provider whose search raises, the way the offline socket guard does."""
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class P(Provider):
+        id = pid
+        name = pid
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        async def search(self, query):
+            raise ConnectionError("offline mode: external DNS/network access blocked")
+
+    return P()
+
+
+def _engine_with(health):
+    from app.tools.search_engine.cache.engine import SearchCache
+    from app.tools.search_engine.engine import SearchEngine
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+
+    reg = ProviderRegistry()
+    reg.register(_raising_provider("p"))
+    return SearchEngine(
+        registry=reg, cache=SearchCache(disk_dir=None), health_manager=health
+    )
+
+
+def test_hard_offline_never_penalises_provider_health(monkeypatch):
+    """A refusal by the offline policy says nothing about the provider.
+
+    It used to say plenty. The engine's failure branch called
+    `record_failure()` for ANY exception, and the offline socket guard
+    (`app/tools/_offline.py`) surfaces as one. `record_failure` opens the
+    circuit at `consecutive_failures >= 2`, so TWO searches under
+    PRISM_OFFLINE=1 opened the circuit for every provider — measured on the
+    real health file: 50 open circuits before, 53 after, with
+    `matcloud.mc3d-pbesol-v1` at exactly 2.
+
+    That state persists to `~/.prism/cache/provider_health.json`, so coming
+    back online meant a 300s cooldown per provider caused by a policy decision
+    rather than any provider fault — hard offline silently degrading the
+    product's later ONLINE behaviour.
+
+    Drives the real `SearchEngine.search()` fan-out, not a re-implementation of
+    its rule: an earlier version of this test asserted on the helper and a
+    local HealthManager, and a mutation that disabled the engine's actual gate
+    passed it.
+    """
+    import asyncio
+
+    from app.tools.search_engine.query import MaterialSearchQuery
+    from app.tools.search_engine.resilience.circuit_breaker import HealthManager
+
+    # DISTINCT queries per call: an identical repeat is served from the
+    # engine's cache and never reaches the provider, so two identical searches
+    # produce only ONE recorded failure — which silently weakened the
+    # policy-off half of this test until it was caught.
+    queries = [
+        MaterialSearchQuery(elements=["Fe"], limit=5),
+        MaterialSearchQuery(elements=["Cu"], limit=5),
+    ]
+
+    # Policy ON: two searches, and the breaker must be untouched.
+    monkeypatch.setenv("PRISM_OFFLINE", "1")
+    health = HealthManager(persist_path=None)
+    engine = _engine_with(health)
+    for query in queries:
+        result = asyncio.run(engine.search(query))
+    assert health.get("p").consecutive_failures == 0
+    assert health.get("p").circuit_state == "closed"
+    assert result.query_log[0].status == "offline_blocked"
+
+    # Policy OFF: the SAME failure must still open the circuit, or this would
+    # have disabled the breaker outright rather than scoping it.
+    monkeypatch.setenv("PRISM_OFFLINE", "0")
+    health = HealthManager(persist_path=None)
+    engine = _engine_with(health)
+    for query in queries:
+        result = asyncio.run(engine.search(query))
+    assert health.get("p").consecutive_failures >= 2
+    assert health.get("p").circuit_state == "open"
+    assert result.query_log[0].status != "offline_blocked"
+
+
+def test_an_offline_refusal_hands_back_the_half_open_probe_slot(monkeypatch):
+    """Skipping the breaker must not also skip RELEASING the probe claim.
+
+    `half_open_probe_claimed` means "a probe is in flight", and it was cleared
+    only by `record_success`/`record_failure`. So the offline gate — added to
+    stop policy refusals poisoning provider health — also stopped the release,
+    and stranded the provider: once a cooldown-eligible probe landed while
+    offline, `should_query()` returned False for the rest of the PROCESS, even
+    back online, even for a provider that would now succeed, surfaced only as
+    "No providers available for this query".
+
+    That was worse than the bug the gate was added to fix, and it is the
+    default path on a machine whose circuits are already open — which the real
+    health file was: 50 of 53.
+    """
+    import asyncio
+    import time
+
+    from app.tools.search_engine.query import MaterialSearchQuery
+    from app.tools.search_engine.resilience.circuit_breaker import HealthManager
+
+    health = HealthManager(persist_path=None)
+    engine = _engine_with(health)
+
+    # Circuit open, cooldown elapsed: the next query takes the half-open probe.
+    h = health.get("p")
+    h.circuit_state = "open"
+    h.consecutive_failures = 2
+    h.last_failure = time.time() - 400  # older than the 300s cooldown
+
+    monkeypatch.setenv("PRISM_OFFLINE", "1")
+    asyncio.run(engine.search(MaterialSearchQuery(elements=["Fe"], limit=5)))
+
+    h = health.get("p")
+    assert h.half_open_probe_claimed is False, (
+        "the probe slot was never handed back — this provider is now skipped "
+        "for the life of the process, online or not"
+    )
+    # No probe ran, so nothing is known: the breaker must not have moved either.
+    assert h.consecutive_failures == 2
+    assert h.should_query() is True

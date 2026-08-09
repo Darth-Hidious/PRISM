@@ -50,6 +50,7 @@ prism-agent = { path = "../agent" }
 prism-python-bridge = { path = "../python-bridge" }
 prism-retrieval = { path = "../retrieval" }
 prism-runtime = { path = "../runtime" }
+prism-policy = { path = "../policy" }
 prism-server = { path = "../server" }
 prism-workflows = { path = "../workflows" }
 prism-campaign = { path = "../campaign" }

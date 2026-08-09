@@ -183,26 +183,109 @@ pub struct MeshStartOptions {
 /// - Updates the `MeshHandle`'s peer list automatically.
 ///
 /// Returns a `JoinHandle` that runs until the `CancellationToken` is cancelled.
+/// `PRISM_OFFLINE` is process-global; serialize every test in this CRATE that
+/// mutates it. One lock, shared — `federated_query.rs` uses this too.
+///
+/// Two files each declaring their own `static LOCK` for the same variable is
+/// the shape that has bitten this codebase five times: the locks do not know
+/// about each other, they compile into one test binary, and cargo's runner is
+/// multi-threaded, so they serialize nothing across files. Pattern borrowed
+/// from `prism-agent`'s `skills::TEST_ENV_LOCK`.
+///
+/// **Re-exported, not declared.** Being the only lock in THIS binary is not
+/// enough: the moment a file here reaches for
+/// `prism_runtime::offline::test_support::env_lock()` instead, the two stop
+/// excluding each other. That is exactly how prism-cli broke after nine
+/// previous fixes to this same shape. Aliasing makes both spellings one mutex.
+#[cfg(test)]
+pub(crate) use prism_runtime::offline::test_support::ENV_LOCK as TEST_ENV_LOCK;
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Restores `PRISM_OFFLINE` on drop, so a failed assertion cannot leave it set
+/// for the rest of the test binary.
+#[cfg(test)]
+pub(crate) struct OfflineEnvGuard(Option<String>);
+
+#[cfg(test)]
+impl OfflineEnvGuard {
+    pub(crate) fn capture() -> Self {
+        Self(std::env::var(prism_runtime::offline::ENV).ok())
+    }
+}
+
+#[cfg(test)]
+impl Drop for OfflineEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.0.take() {
+                Some(v) => std::env::set_var(prism_runtime::offline::ENV, v),
+                None => std::env::remove_var(prism_runtime::offline::ENV),
+            }
+        }
+    }
+}
+
+/// Why the mesh will not start, if it will not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MeshRefusal {
+    /// Hard offline. mDNS announce is link-local multicast — it never leaves
+    /// the LAN, but it broadcasts this node's name, capabilities and
+    /// auth-token hash to every device on it, and `discover` then pulls peers
+    /// in. An operator who set PRISM_OFFLINE asked not to participate in a
+    /// network, not "remote hosts only".
+    Offline,
+    /// The mesh is a trusted network: you cannot join without proving identity.
+    /// The auth token carries org/project/roles, checked by every peer.
+    NotAuthenticated,
+}
+
+/// The start decision, split out of `start_mesh` so it is testable without a
+/// clock.
+///
+/// The first version of this test asserted the gate indirectly — "the spawned
+/// task joined within 5 s, so it must have refused" — which measures the
+/// runtime's ability to schedule, not the decision. An adversarial reviewer
+/// reproduced that as a real failure at 5.03 s under a concurrent cargo build,
+/// against a path that returns in under 20 ms. A 250x margin was not enough,
+/// because wall-clock was the wrong observable.
+///
+/// Offline is checked FIRST: it is the operator's explicit instruction, and it
+/// should not depend on whether they also happen to be logged in.
+pub(crate) fn mesh_start_refusal(opts: &MeshStartOptions) -> Option<MeshRefusal> {
+    if prism_runtime::offline::enabled() {
+        return Some(MeshRefusal::Offline);
+    }
+    if opts.auth_token.is_none() {
+        return Some(MeshRefusal::NotAuthenticated);
+    }
+    None
+}
+
 pub fn start_mesh(
     handle: MeshHandle,
     opts: MeshStartOptions,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // ── RBAC gate: refuse to start mesh without auth ──────────
-        // The mesh is a trusted network. You cannot join without
-        // proving your identity via `prism login`. The auth_token
-        // carries org_id, project_id, and roles — checked by every
-        // peer before accepting requests from this node.
-        if opts.auth_token.is_none() {
-            // States the fact, not a command to go and type. Every surface that
-            // renders this (app, TUI, CLI) must offer authentication in place;
-            // telling a human to quit and run something is the defect this
-            // product keeps being called out for.
-            eprintln!("\x1b[33m  ⚠ Mesh disabled: not authenticated.\x1b[0m");
-            eprintln!(
-                "\x1b[33m    The mesh requires platform authentication for RBAC enforcement.\x1b[0m"
-            );
+        if let Some(refusal) = mesh_start_refusal(&opts) {
+            match refusal {
+                MeshRefusal::Offline => tracing::info!("mesh disabled: offline mode"),
+                MeshRefusal::NotAuthenticated => {
+                    // States the fact, not a command to go and type. Every
+                    // surface that renders this (app, TUI, CLI) must offer
+                    // authentication in place; telling a human to quit and run
+                    // something is the defect this product keeps being called
+                    // out for.
+                    eprintln!("\x1b[33m  ⚠ Mesh disabled: not authenticated.\x1b[0m");
+                    eprintln!(
+                        "\x1b[33m    The mesh requires platform authentication for RBAC enforcement.\x1b[0m"
+                    );
+                }
+            }
             return;
         }
 
@@ -329,6 +412,73 @@ mod tests {
             capabilities: vec!["compute".into()],
             authenticated: true,
             auth_hash: None,
+        }
+    }
+
+    /// The gate is asserted DIRECTLY, not inferred from how fast a task joined.
+    ///
+    /// The previous version spawned `start_mesh` and asserted it finished
+    /// within 5 s. That measures the runtime's ability to schedule: a reviewer
+    /// reproduced a real failure at 5.03 s under a concurrent cargo build,
+    /// against a path that returns in under 20 ms. Wall-clock was the wrong
+    /// observable, and a 250x margin did not save it.
+    #[test]
+    fn offline_refuses_the_mesh_before_authentication_is_even_considered() {
+        let _guard = test_env_lock();
+        let _restore = OfflineEnvGuard::capture();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+
+        // Authenticated, so NotAuthenticated cannot be what refuses — otherwise
+        // this would pass for the wrong reason.
+        let opts = MeshStartOptions {
+            auth_token: Some("test-token".into()),
+            ..bare_opts()
+        };
+        assert_eq!(mesh_start_refusal(&opts), Some(MeshRefusal::Offline));
+
+        // And offline outranks a missing token: an operator's explicit
+        // instruction should not depend on whether they happen to be logged in.
+        let anon = MeshStartOptions {
+            auth_token: None,
+            ..bare_opts()
+        };
+        assert_eq!(mesh_start_refusal(&anon), Some(MeshRefusal::Offline));
+    }
+
+    /// Online: the pre-existing RBAC gate still refuses an anonymous node, and
+    /// an authenticated one is allowed to start. Without this the test above
+    /// would pass even if the function refused unconditionally.
+    #[test]
+    fn online_keeps_the_rbac_gate_and_allows_an_authenticated_node() {
+        let _guard = test_env_lock();
+        let _restore = OfflineEnvGuard::capture();
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        let anon = MeshStartOptions {
+            auth_token: None,
+            ..bare_opts()
+        };
+        assert_eq!(
+            mesh_start_refusal(&anon),
+            Some(MeshRefusal::NotAuthenticated)
+        );
+
+        let ok = MeshStartOptions {
+            auth_token: Some("test-token".into()),
+            ..bare_opts()
+        };
+        assert_eq!(mesh_start_refusal(&ok), None, "nothing should refuse");
+    }
+
+    fn bare_opts() -> MeshStartOptions {
+        MeshStartOptions {
+            node_name: "offline-test".into(),
+            publish_port: 9100,
+            broadcast: true,
+            capabilities: vec!["compute".into()],
+            discovery_interval_secs: 3600,
+            event_tx: None,
+            auth_token: None,
         }
     }
 

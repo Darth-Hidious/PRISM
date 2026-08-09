@@ -547,6 +547,90 @@ fn snapshot_tiny_terminal_basic_chat_40x12() {
     insta::assert_snapshot!("tiny_terminal_basic_chat_40x12", rendered);
 }
 
+/// The workspace tab strip must never WRAP, at any terminal width.
+///
+/// Adding a fourth tab pushed the full strip (`[Activity] Tools Files
+/// Objects`, 31 columns) past the sidebar width on a small terminal. The
+/// paragraph wrapped, "Objects" landed on its own line, and it silently cost a
+/// row of panel content — every entry shifted down. That regression shipped
+/// inside a 41-file bulk snapshot update and a reviewer caught it, not the
+/// suite: a snapshot records whatever it is given, so it cannot object to a
+/// layout getting worse. This asserts the invariant directly.
+///
+/// Mutation: make `workspace_tabs_line` always use the FULL labels and this
+/// fails at 40 columns.
+#[test]
+fn workspace_tab_strip_never_wraps_at_any_width() {
+    for (w, h) in [(40, 12), (60, 20), (100, 30), (200, 60)] {
+        let app = fake_app();
+        let rendered = render_app_to_string(&app, w, h);
+        let strip = rendered
+            .lines()
+            .find(|l| l.contains("[Activity]") || l.contains("[Act]"))
+            .unwrap_or_else(|| panic!("no workspace tab strip rendered at {w}x{h}"));
+        // All four tabs must sit on that ONE line. If the strip wrapped, the
+        // trailing tab is on the next line and this fails.
+        for (full, short) in [
+            ("Activity", "Act"),
+            ("Tools", "Too"),
+            ("Files", "Fil"),
+            ("Objects", "Obj"),
+        ] {
+            assert!(
+                strip.contains(full) || strip.contains(short),
+                "tab `{full}` missing from the strip at {w}x{h} — it wrapped \
+                 onto another line and stole a row of panel content.\n\
+                 strip: {strip:?}"
+            );
+        }
+    }
+}
+
+/// The acceptance criterion for the whole Objects tab: **a running object must
+/// never render as complete.**
+///
+/// `object_update_running_never_renders_as_complete` in tests/unit.rs carries
+/// that name but asserts only model state — it never renders anything, and it
+/// cannot, because the render harness (`render_app_to_string`) lives here. A
+/// test named after a render invariant that never renders is how the invariant
+/// goes unguarded. This checks the pixels.
+///
+/// The hard case is a job at FULL progress that has not reported completion —
+/// 10000/10000 and still `running`. That is exactly when a reader (or a
+/// rounding bug) is most tempted to call it done, and exactly when the user
+/// would stop waiting for a result that has not arrived.
+#[test]
+fn a_running_object_never_renders_as_done() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "sim-full".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K".into(),
+        status: "running".into(),
+        progress_current: Some(10_000),
+        progress_total: Some(10_000),
+        detail: None,
+    });
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    let row = rendered
+        .lines()
+        .find(|l| l.contains("MD NPT 300K"))
+        .expect("the running object must be rendered at all");
+
+    assert!(
+        !row.contains("done"),
+        "a running object rendered as done — the user stops waiting for a \
+         result that has not arrived.\nrow: {row:?}"
+    );
+    assert!(
+        row.contains("100%") || row.contains("running"),
+        "a running object must render its progress or the word running.\nrow: {row:?}"
+    );
+}
+
 /// Snapshot: wide terminal basic chat at 200x60.
 #[test]
 fn snapshot_wide_terminal_basic_chat_200x60() {
@@ -1217,6 +1301,74 @@ fn snapshot_workspace_activity_detail_100x30() {
     let rendered = render_app_to_string(&app, 100, 30);
     assert_no_terminal_controls(&rendered);
     insta::assert_snapshot!("workspace_activity_detail_100x30", rendered);
+}
+
+/// Snapshot: the Objects tab with a mix of running, completed, and failed
+/// domain objects at 100x30.
+#[test]
+fn snapshot_workspace_objects_tab_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-1".into(),
+        kind: "structure".into(),
+        label: "W-BCC a=3.14A".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("E=-8.42 eV/atom".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-2".into(),
+        kind: "simulation".into(),
+        label: "MD NPT 300K 10000 steps".into(),
+        status: "running".into(),
+        progress_current: Some(5000),
+        progress_total: Some(10000),
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-3".into(),
+        kind: "alloy".into(),
+        label: "CrMnFeCoNi HEA".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("5 candidates".into()),
+    });
+    // Tag the alloy for the agent.
+    app.objects[2].tagged = true;
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "obj-4".into(),
+        kind: "simulation".into(),
+        label: "MD NVT 500K".into(),
+        status: "failed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: Some("divergence at step 2341".into()),
+    });
+    freeze_metrics(&mut app);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.workspace_selected = 1; // the running sim
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_objects_tab_100x30", rendered);
+}
+
+/// Snapshot: the Objects tab when empty — must say so plainly.
+#[test]
+fn snapshot_workspace_objects_empty_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    freeze_metrics(&mut app);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_objects_empty_100x30", rendered);
 }
 
 // ── Form pane (generic structured input) ────────────────────────────

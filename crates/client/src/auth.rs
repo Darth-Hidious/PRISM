@@ -72,6 +72,27 @@ struct PollPayload {
 pub struct DeviceFlowAuth;
 
 impl DeviceFlowAuth {
+    /// Refuse a device-flow call under hard offline mode.
+    ///
+    /// These three methods take a raw `&reqwest::Client`, normally obtained via
+    /// `PlatformClient::inner()` — which hands out the inner client and so
+    /// bypasses `PlatformClient::offline_guard` entirely. Every verb on
+    /// `PlatformClient` is guarded; the device flow escaped through that one
+    /// accessor, so `PRISM_OFFLINE=1 prism setup` still ran a device login and
+    /// `prism resume` still POSTed the REFRESH TOKEN to the remote host.
+    ///
+    /// Guarding here rather than at the three call sites covers every current
+    /// and future `inner()` consumer of this flow.
+    fn offline_guard(path: &str) -> Result<()> {
+        if prism_runtime::offline::enabled() {
+            anyhow::bail!(
+                "offline mode: POST {path} blocked by --offline \
+                 (remove the flag to reach the platform)"
+            );
+        }
+        Ok(())
+    }
+
     /// Start the device authorisation flow.
     ///
     /// Calls `POST {base_url}/auth/device/start` with `client_id=prism-cli`.
@@ -80,6 +101,7 @@ impl DeviceFlowAuth {
         base_url: &str,
     ) -> Result<DeviceCodeResponse> {
         let url = format!("{base_url}/auth/device/start");
+        Self::offline_guard(&url)?;
         debug!(%url, "starting device flow");
 
         let resp = client
@@ -107,6 +129,9 @@ impl DeviceFlowAuth {
         interval: u64,
     ) -> Result<TokenResponse> {
         let url = format!("{base_url}/auth/device/poll");
+        // Before the sleep loop: refusing after a wait would be indistinguishable
+        // from a slow network to anyone watching.
+        Self::offline_guard(&url)?;
         let mut sleep_secs = interval.max(1);
 
         loop {
@@ -168,6 +193,7 @@ impl DeviceFlowAuth {
         refresh_token: &str,
     ) -> Result<TokenResponse> {
         let url = format!("{base_url}/auth/refresh");
+        Self::offline_guard(&url)?;
         debug!(%url, "refreshing token");
 
         // Billable in the "must not be duplicated" sense rather than the
@@ -198,5 +224,107 @@ impl DeviceFlowAuth {
         resp.json::<TokenResponse>()
             .await
             .context("failed to parse refresh response")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host that would take the full connect timeout if a request were
+    /// actually issued. The guard must refuse before that, so these tests are
+    /// fast — a slow one means the guard did not fire.
+    const UNROUTABLE: &str = "http://127.0.0.1:1";
+
+    /// The refresh path is the one that matters most: it POSTs the REFRESH
+    /// TOKEN, and it runs unattended whenever a session nears expiry. It takes
+    /// a raw `&reqwest::Client` obtained via `PlatformClient::inner()`, which
+    /// bypasses `PlatformClient`'s own guard — so before this it ran under
+    /// hard offline mode and sent the token anyway.
+    /// Serializing an env mutation around an await REQUIRES holding the guard
+    /// across it — dropping it early is exactly the race the lock prevents,
+    /// since `PRISM_OFFLINE` is process-global. Matches the existing precedent
+    /// in `agent/src/protocol.rs` and `agent/src/meta_tools.rs`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn refresh_token_is_refused_offline() {
+        let _guard = prism_runtime::offline::test_support::env_lock();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        let client = reqwest::Client::new();
+        let result = DeviceFlowAuth::refresh_token(&client, UNROUTABLE, "refresh-abc").await;
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        let err = result
+            .expect_err("offline must refuse the refresh")
+            .to_string();
+        assert!(err.contains("offline mode"), "{err}");
+        assert!(
+            err.contains("/auth/refresh"),
+            "must name what it blocked: {err}"
+        );
+        // The secret must never appear in the refusal.
+        assert!(
+            !err.contains("refresh-abc"),
+            "credential leaked into the error: {err}"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn device_flow_start_is_refused_offline() {
+        let _guard = prism_runtime::offline::test_support::env_lock();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        let client = reqwest::Client::new();
+        let result = DeviceFlowAuth::start_device_flow(&client, UNROUTABLE).await;
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        let err = result
+            .expect_err("offline must refuse device login")
+            .to_string();
+        assert!(err.contains("offline mode"), "{err}");
+        assert!(err.contains("/auth/device/start"), "{err}");
+    }
+
+    /// The poll refuses BEFORE its sleep loop; refusing after would look
+    /// identical to a slow network.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn device_flow_poll_is_refused_offline_without_sleeping() {
+        let _guard = prism_runtime::offline::test_support::env_lock();
+        unsafe { std::env::set_var(prism_runtime::offline::ENV, "1") };
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let result = DeviceFlowAuth::poll_for_token(&client, UNROUTABLE, "code", 30).await;
+        let elapsed = started.elapsed();
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        let err = result.expect_err("offline must refuse polling").to_string();
+        assert!(err.contains("offline mode"), "{err}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "refused only after sleeping {elapsed:?} — guard is after the sleep"
+        );
+    }
+
+    /// Offline unset means the guard is inert: the call proceeds and fails for
+    /// a network reason, not a policy one. Without this the tests above would
+    /// pass even if the guard refused unconditionally.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_guard_is_inert_when_offline_is_unset() {
+        let _guard = prism_runtime::offline::test_support::env_lock();
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(400))
+            .build()
+            .expect("client");
+        let err = DeviceFlowAuth::start_device_flow(&client, UNROUTABLE)
+            .await
+            .expect_err("unroutable host still fails")
+            .to_string();
+        assert!(
+            !err.contains("offline mode"),
+            "guard fired with offline unset: {err}"
+        );
     }
 }

@@ -147,7 +147,14 @@ async fn main() -> Result<()> {
                 platform_node_id: None,
                 rbac_db_path: None,
                 org_id: None,
-                offline: false,
+                // `prism-node` is a SHIPPED, standalone binary (install.sh:147),
+                // not the same path as the CLI's `prism node up` — which does
+                // pass a real value here (cli/src/main.rs:3190). Hardcoding
+                // false meant `PRISM_OFFLINE=1 prism-node up` resolved a real
+                // credential and opened `wss://api.marc27.com/...?token=<token>`
+                // (daemon.rs:525) as if offline had never been set. The guard
+                // at daemon.rs:263 was correct all along; nothing ever armed it.
+                offline: prism_runtime::offline::enabled(),
                 // Standalone daemon has no in-process ChatService, so tool
                 // relay is honestly unavailable here (InvokeTool → "no local
                 // tool executor"). The rich path is `prism node up` (CLI),

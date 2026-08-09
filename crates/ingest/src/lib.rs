@@ -1,17 +1,24 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Data ingestion and ontology pipeline for PRISM nodes.
 //!
-//! Converts raw data (CSV, Parquet, databases) into structured, queryable
-//! knowledge through an LLM-driven pipeline:
+//! Converts delimited and columnar files (CSV, TSV, Parquet) into structured,
+//! queryable knowledge through an LLM-driven pipeline:
 //!
 //! ```text
 //! Raw Data → Schema Detection → Entity Extraction → Graph + Embeddings
 //!                                     (LLM)         (bundled Turso store)
 //! ```
 //!
-//! The core trait [`OntologyConstructor`] is pluggable — ships with an LLM-based
-//! implementation and is designed so that a future DMMS (Differentiable Manifold
-//! Materials Science) engine can slot in behind the same interface.
+//! There is no database connector: [`connectors`] contains exactly
+//! [`connectors::CsvConnector`] and [`connectors::ParquetConnector`]. This
+//! header previously claimed "databases" as a supported source.
+//!
+//! [`OntologyConstructor`] describes the intended plug point for a future DMMS
+//! (Differentiable Manifold Materials Science) engine, but nothing consumes it
+//! yet: the pipeline calls [`ontology::LlmOntologyConstructor`]'s inherent
+//! `extract_entities_with_mapping` directly, and the workspace has no
+//! `dyn OntologyConstructor` holder. Implementing the trait alone will not put
+//! a new engine on the ingest path.
 
 pub mod connectors;
 pub mod graph_validation;

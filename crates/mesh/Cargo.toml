@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Hard-offline policy. Peer addresses are supplied by other nodes.
+prism-runtime = { path = "../runtime" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::platform_env::PlatformVar;
 use crate::{PrismPaths, StoredCredentials};
 
 /// JSON-RPC error code used for a missing platform credential.
@@ -83,6 +84,21 @@ impl PlatformAuth {
     /// Whether this is a stable, non-expiring API key.
     pub fn is_api_key(&self) -> bool {
         matches!(self, Self::ApiKey(_))
+    }
+
+    /// Classify a raw credential by shape: the frozen `m27_` prefix marks a
+    /// stable API key (`X-API-Key`); anything else is a rotating session
+    /// credential (`Bearer`).
+    ///
+    /// Public so callers that hold a credential but not a whole
+    /// [`ResolvedPlatformAuth`] — the boot checks, for one — get the same
+    /// answer as the resolver instead of re-deriving the prefix rule.
+    pub fn classify(value: &str) -> Self {
+        if value.starts_with("m27_") {
+            Self::ApiKey(value.to_string())
+        } else {
+            Self::Bearer(value.to_string())
+        }
     }
 }
 
@@ -188,11 +204,13 @@ pub fn resolve_from_environment(
     paths: Option<&PrismPaths>,
     default_api_base: &str,
 ) -> Result<ResolvedPlatformAuth> {
-    let api_base = env::var("MARC27_API_URL").unwrap_or_else(|_| default_api_base.to_string());
-    let api_key = env::var("MARC27_API_KEY").ok();
-    let token = env::var("MARC27_TOKEN")
-        .ok()
-        .or_else(|| env::var("MARC27_API_TOKEN").ok());
+    let api_base = PlatformVar::API_URL
+        .get()
+        .unwrap_or_else(|| default_api_base.to_string());
+    let api_key = PlatformVar::API_KEY.get();
+    let token = PlatformVar::TOKEN
+        .get()
+        .or_else(|| PlatformVar::API_TOKEN.get());
     let node_token = paths
         .and_then(PrismPaths::load_node_token)
         .map(|token| token.key);
@@ -269,11 +287,7 @@ fn interactive_auth_env_enabled() -> bool {
 }
 
 fn classify_token(value: &str) -> PlatformAuth {
-    if value.starts_with("m27_") {
-        PlatformAuth::ApiKey(value.to_string())
-    } else {
-        PlatformAuth::Bearer(value.to_string())
-    }
+    PlatformAuth::classify(value)
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {

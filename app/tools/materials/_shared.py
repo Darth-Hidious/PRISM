@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 MARC27. Licensed under MIT License.
+# Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """Shared process-level registry access for the materials tools (SCI-9/C3 fix).
 
 The screening/informatics/structure tools previously called
