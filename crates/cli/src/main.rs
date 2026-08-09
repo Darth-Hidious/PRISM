@@ -6814,6 +6814,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
                 );
             }
+            if let Some(report) = dropped_relationships_report(result) {
+                println!("{report}");
+            }
             if let Some(embeddings) = result.get("embeddings") {
                 let count = embeddings
                     .get("vectors")
@@ -6979,6 +6982,37 @@ fn print_ingest_summary(summary: &serde_json::Value) {
         }
         println!("\n  Completed WITH ERRORS — data for the failed steps was NOT stored.");
     }
+}
+
+/// The referential-containment drop report for one local-tabular ingest
+/// result: how many extracted relationships were dropped for referencing
+/// entities the extraction never declared, and why — `None` when nothing
+/// was dropped. A drop is a PARTIAL result (the valid remainder was stored,
+/// exit stays 0), never a silent one: these lines are the user's only
+/// window on it, so they are kept out of `print_ingest_summary` where the
+/// honesty of the report is testable without capturing stdout.
+fn dropped_relationships_report(result: &serde_json::Value) -> Option<String> {
+    let dropped = result.get("dropped_relationships")?.as_array()?;
+    if dropped.is_empty() {
+        return None;
+    }
+    let extracted = result
+        .get("entities")
+        .and_then(|value| value.get("relationships"))
+        .and_then(|value| value.as_array())
+        .map(Vec::len);
+    let mut out = format!(
+        "  Dropped: {}{} relationship(s) referencing entities the extraction never \
+         declared — NOT stored (an endpoint is never invented to patch an edge):",
+        dropped.len(),
+        extracted
+            .map(|total| format!(" of {total}"))
+            .unwrap_or_default(),
+    );
+    for reason in dropped.iter().filter_map(|value| value.as_str()) {
+        out.push_str(&format!("\n    ! {reason}"));
+    }
+    Some(out)
 }
 
 /// Step failures from an ingest summary (either local-pipeline shape
@@ -12505,6 +12539,44 @@ mod tests {
             !msg.contains("secret query text"),
             "query text surfaced in the error path: {msg}"
         );
+    }
+
+    /// Relationships the pipeline dropped (referential containment) must
+    /// reach the user's summary — count AND per-relationship reason. A drop
+    /// only visible in `--json` is silent for everyone else.
+    #[test]
+    fn dropped_relationships_reach_the_ingest_summary() {
+        // The local-tabular result shape `print_ingest_summary` reads.
+        let result = serde_json::json!({
+            "entities": {
+                "entities": [{"type": "Alloy", "name": "Zorblatt-9", "properties": {}}],
+                "relationships": [
+                    {"from": "Zorblatt-9", "rel": "GLUED_TO", "to": "Phantomium"},
+                    {"from": "Ghostium", "rel": "GLUED_TO", "to": "Phantomium"},
+                    {"from": "Zorblatt-9", "rel": "HAS_PROPERTY", "to": "squishiness"}
+                ]
+            },
+            "dropped_relationships": [
+                "Zorblatt-9-[GLUED_TO]->Phantomium: undeclared endpoint(s): Phantomium",
+                "Ghostium-[GLUED_TO]->Phantomium: undeclared endpoint(s): Ghostium, Phantomium"
+            ],
+            "graph": {"nodes_created": 2, "edges_created": 1}
+        });
+        let report = dropped_relationships_report(&result)
+            .expect("a non-empty drop list must produce a report");
+        assert!(report.contains("2 of 3"), "{report}");
+        assert!(report.contains("Phantomium"), "{report}");
+        assert!(report.contains("Ghostium"), "{report}");
+        assert!(report.contains("NOT stored"), "{report}");
+
+        // Nothing dropped (or a shape without the field) ⇒ no report line.
+        assert_eq!(
+            dropped_relationships_report(&serde_json::json!({
+                "dropped_relationships": []
+            })),
+            None
+        );
+        assert_eq!(dropped_relationships_report(&serde_json::json!({})), None);
     }
 
     /// The mode `query --federated` sends must be one the server still

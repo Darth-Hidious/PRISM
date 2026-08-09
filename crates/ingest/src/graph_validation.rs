@@ -111,7 +111,12 @@ pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphVal
         }
     }
 
-    // Check 5: Orphan relationships — reference entities not in the set
+    // Check 5: Orphan relationships — reference entities not in the set.
+    // Deliberately KEPT at Error severity: a dangling edge must never be
+    // written, and `passed` has to stay fail-closed for any consumer that
+    // writes on it. The tabular pipeline CONTAINS this one class instead of
+    // failing the whole ingest — it drops exactly the dangling relationships,
+    // re-validates, and reports the drop (`pipeline::validate_before_graph_write`).
     for r in &entities.relationships {
         if !entity_names.contains(r.from.as_str()) {
             issues.push(GraphIssue {

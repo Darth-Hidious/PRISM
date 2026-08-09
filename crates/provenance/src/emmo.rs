@@ -11,7 +11,7 @@
 //! (`GraphNode` / `GraphEdge` / `TraversalResult` / `RecalledFact`), so a
 //! federated fetch from this local store is a drop-in.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use turso::Value;
@@ -1725,6 +1725,23 @@ async fn count_matching(conn: &turso::Connection, sql: &str) -> Result<i64> {
     Ok(n)
 }
 
+/// Distinct subject/object display names of `facts`, first-seen order,
+/// deduped on `canonical_key` — the harvesting the fact-based embedding
+/// entry points share with the name-based ones.
+fn distinct_fact_names<F: FactPayload>(facts: &[F]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for payload in facts {
+        let fact = payload.to_local_fact();
+        for name in [fact.subject, fact.object] {
+            if seen.insert(canonical_key(&name)) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Write API
 // ─────────────────────────────────────────────────────────────────────────
@@ -1901,6 +1918,39 @@ impl ProvenanceStore {
         }
         .await;
         finish_write_txn(txn, result).await
+    }
+
+    /// UPSERT one extracted entity as a typed node with NO edge — the
+    /// tabular ingest's referential-containment path: an entity the
+    /// extraction declared but no stored fact references still lands (and
+    /// is visible to `graph_search`), instead of being erased because every
+    /// edge that named it dangled, or none named it at all.
+    ///
+    /// `label` is the caller's DECLARED entity type — this method never
+    /// invents one. No PROV-O assertion is recorded: an entity declaration
+    /// asserts no subject–predicate–object fact, so there is nothing to
+    /// reify ([`Self::entity_origin`] honestly answers `None` until a fact
+    /// mentions the name). The row is tenant-scoped and timestamped like
+    /// every other entity write, and idempotent on its label-qualified key.
+    pub async fn write_extracted_entity(
+        &self,
+        name: &str,
+        label: &str,
+        props_json: Option<String>,
+        tenant: &str,
+    ) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("refusing to write an entity with an empty name");
+        }
+        if label.trim().is_empty() {
+            bail!("refusing to write entity '{name}' with an empty label");
+        }
+        // Under the shared write lock so this single-statement write cannot
+        // join (and be rolled back with) a raw transaction some other task
+        // has open on the one shared connection.
+        let _same_handle_guard = self.write_lock.lock().await;
+        self.upsert_entity(name, label, tenant, props_json).await?;
+        Ok(())
     }
 
     async fn write_fact_as<F: FactPayload>(
@@ -2965,17 +3015,28 @@ impl ProvenanceStore {
         tenant: &str,
         backend: &dyn prism_embed::EmbedBackend,
     ) -> Result<usize> {
-        // Distinct display names, first-seen order.
+        self.embed_and_store_names(&distinct_fact_names(facts), tenant, backend)
+            .await
+    }
+
+    /// [`Self::embed_and_store_entities`] by entity display NAME rather than
+    /// by fact — for nodes that were written without any fact (standalone
+    /// extracted entities, referential containment). Names are deduped on
+    /// `canonical_key` (first-seen order) and resolved to their
+    /// label-qualified keys via the entity table itself, so names that never
+    /// landed there are skipped. Returns the number of vectors stored.
+    pub async fn embed_and_store_names(
+        &self,
+        names: &[String],
+        tenant: &str,
+        backend: &dyn prism_embed::EmbedBackend,
+    ) -> Result<usize> {
         let mut seen = std::collections::HashSet::new();
-        let mut names: Vec<String> = Vec::new();
-        for payload in facts {
-            let fact = payload.to_local_fact();
-            for name in [fact.subject, fact.object] {
-                if seen.insert(canonical_key(&name)) {
-                    names.push(name);
-                }
-            }
-        }
+        let names: Vec<String> = names
+            .iter()
+            .filter(|n| seen.insert(canonical_key(n)))
+            .cloned()
+            .collect();
         if names.is_empty() {
             return Ok(0);
         }
@@ -3020,7 +3081,14 @@ impl ProvenanceStore {
     /// entity. Failures are logged and swallowed — an ingest must never
     /// fail because of the embedding model.
     pub async fn embed_entities_best_effort<F: FactPayload>(&self, facts: &[F], tenant: &str) {
-        if facts.is_empty() {
+        self.embed_names_best_effort(&distinct_fact_names(facts), tenant)
+            .await
+    }
+
+    /// [`Self::embed_entities_best_effort`] by entity display NAME — the
+    /// variant for writes that include fact-less standalone entities.
+    pub async fn embed_names_best_effort(&self, names: &[String], tenant: &str) {
+        if names.is_empty() {
             return;
         }
         let backend = match tokio::task::spawn_blocking(prism_embed::from_config).await {
@@ -3035,7 +3103,7 @@ impl ProvenanceStore {
             }
         };
         match self
-            .embed_and_store_entities(facts, tenant, backend.as_ref())
+            .embed_and_store_names(names, tenant, backend.as_ref())
             .await
         {
             Ok(stored) => tracing::debug!(stored, tenant, "entity vectors stored in Turso"),

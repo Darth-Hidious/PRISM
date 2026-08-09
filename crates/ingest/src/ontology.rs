@@ -377,13 +377,19 @@ mod tests {
         assert!(prompt.contains("PROCESSED_BY"));
     }
 
-    /// The byte-identity contract: with the built-in EMMO ontology active,
-    /// the extraction prompt is EXACTLY the string the pre-trait hardcoded
-    /// builder produced — the expected value below is that builder's output,
-    /// reconstructed literal-for-literal. Existing users' extractions must
-    /// not shift by a byte because the vocabulary moved behind a trait.
+    /// The byte-identity contract, amended ONCE: with the built-in EMMO
+    /// ontology active, the extraction prompt is EXACTLY the string the
+    /// pre-trait hardcoded builder produced PLUS the referential-integrity
+    /// line ("Every name used in \"from\" or \"to\" MUST also appear…").
+    /// That single divergence is deliberate: the verbatim legacy text told
+    /// the model nothing about declaring relationship endpoints, while
+    /// graph validation refuses undeclared endpoints (`orphan_rel`, Error
+    /// severity) — so the byte-identical prompt reliably produced
+    /// extractions that could not be stored (live 2026-08-08: 13 entities,
+    /// 13 relationships, 17 orphan errors, nothing written). Everything
+    /// else must still not shift by a byte.
     #[test]
-    fn emmo_prompt_is_byte_identical_to_the_legacy_hardcoded_prompt() {
+    fn emmo_prompt_is_the_legacy_prompt_plus_only_the_referential_rule() {
         let schema = SchemaAnalysis {
             columns: vec!["Composition".into(), "Hardness_HV".into()],
             detected_types: vec!["string".into(), "float".into()],
@@ -416,6 +422,7 @@ mod tests {
              - PROCESSED_BY (material → process, with order)\n\
              - HAS_PROPERTY (material → property)\n\
              - HAS_PHASE (material → phase)\n\n\
+             Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".\n\n\
              Return ONLY valid JSON with this structure:\n\
              {\n\
                \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\

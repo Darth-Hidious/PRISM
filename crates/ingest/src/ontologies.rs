@@ -41,6 +41,17 @@ use crate::graph_validation::{GraphIssue, GraphSeverity};
 /// with, and what an absent `[ontology] id` selects.
 pub const DEFAULT_ONTOLOGY_ID: &str = "emmo";
 
+/// The referential-integrity rule, stated in EVERY extraction prompt: graph
+/// validation refuses a relationship whose `from`/`to` names no declared
+/// entity (`orphan_rel`), so a prompt that never states the rule instructs
+/// the model into unstorable output — the exact declaration-vs-enforcement
+/// drift this module exists to close (live case 2026-08-08: 13 entities and
+/// 13 relationships extracted, 17 `orphan_rel` errors, nothing stored).
+/// One constant shared by the trait default AND [`EmmoOntology`]'s legacy
+/// override, so the two prompts cannot drift on the invariant.
+const REFERENTIAL_INTEGRITY_RULE: &str =
+    "Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".";
+
 /// The unit vocabulary an ontology's facts cite. A declaration, not an
 /// enforcement point: on the tabular path units are free-form strings, and
 /// the typed enforcement that exists (text extraction → `MaterialFact`) is
@@ -96,6 +107,7 @@ pub trait Ontology: Send + Sync {
              Identify ALL entities and relationships present in the data.\n\
              Every entity \"type\" MUST be one of: {}.\n\
              Every relationship \"rel\" MUST be one of: {}.\n\
+             {REFERENTIAL_INTEGRITY_RULE}\n\
              Return ONLY valid JSON with this structure:\n\
              {{\n\
              \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
@@ -160,11 +172,19 @@ const EMMO_REL_TYPES: &[&str] = &[
 /// The built-in EMMO materials-science ontology — the vocabulary this
 /// codebase always extracted and validated with, now declared through the
 /// same trait any other ontology plugs in through. Behaviour is deliberately
-/// byte-identical to the pre-trait hardcoding, including its one known
-/// drift: the legacy prompt instructs `HAS_PHASE`, which the legacy
-/// validator list never contained (so it warns as `unknown_rel`). Fixing
-/// that drift would change validation reports for existing users, so it is
-/// preserved, not repaired, here.
+/// byte-identical to the pre-trait hardcoding, with ONE deliberate
+/// exception: the instruction block now also states
+/// [`REFERENTIAL_INTEGRITY_RULE`]. The legacy text instructed relationships
+/// without requiring their endpoints be declared, while the validator
+/// refuses exactly that (`orphan_rel`, Error) — so the byte-identical
+/// prompt reliably produced unstorable extractions (2026-08-08 live run:
+/// 17 orphan errors, zero facts stored). Preserving those bytes preserved
+/// the defect; the rule is added, everything else stays verbatim.
+///
+/// The one known harmless drift IS still preserved: the legacy prompt
+/// instructs `HAS_PHASE`, which the legacy validator list never contained
+/// (so it warns as `unknown_rel`). Fixing that would change validation
+/// reports for existing users, so it is preserved, not repaired, here.
 pub struct EmmoOntology;
 
 impl Ontology for EmmoOntology {
@@ -194,26 +214,31 @@ impl Ontology for EmmoOntology {
             .to_string()
     }
 
-    /// The legacy `## Instructions` block, verbatim (byte-identity contract).
+    /// The legacy `## Instructions` block, verbatim EXCEPT for the added
+    /// [`REFERENTIAL_INTEGRITY_RULE`] line — the deliberate byte-identity
+    /// break documented on [`EmmoOntology`]: the verbatim text is what
+    /// produced extractions the validator then refused wholesale.
     fn extraction_instructions(&self) -> String {
-        "## Instructions\n\
-         Identify ALL materials science entities:\n\
-         - Alloy/Material compositions (type: \"Alloy\" or \"Material\")\n\
-         - Elements with fractions (type: \"Element\")\n\
-         - Processing steps with parameters (type: \"Process\")\n\
-         - Measured properties with values and units (type: \"Property\")\n\
-         - Phases or crystal structures (type: \"Phase\")\n\n\
-         Identify ALL relationships:\n\
-         - CONTAINS (material → element, with weight = fraction)\n\
-         - PROCESSED_BY (material → process, with order)\n\
-         - HAS_PROPERTY (material → property)\n\
-         - HAS_PHASE (material → phase)\n\n\
-         Return ONLY valid JSON with this structure:\n\
-         {\n\
-           \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\
-           \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}]\n\
-         }\n"
-            .to_string()
+        format!(
+            "## Instructions\n\
+             Identify ALL materials science entities:\n\
+             - Alloy/Material compositions (type: \"Alloy\" or \"Material\")\n\
+             - Elements with fractions (type: \"Element\")\n\
+             - Processing steps with parameters (type: \"Process\")\n\
+             - Measured properties with values and units (type: \"Property\")\n\
+             - Phases or crystal structures (type: \"Phase\")\n\n\
+             Identify ALL relationships:\n\
+             - CONTAINS (material → element, with weight = fraction)\n\
+             - PROCESSED_BY (material → process, with order)\n\
+             - HAS_PROPERTY (material → property)\n\
+             - HAS_PHASE (material → phase)\n\n\
+             {REFERENTIAL_INTEGRITY_RULE}\n\n\
+             Return ONLY valid JSON with this structure:\n\
+             {{\n\
+               \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
+               \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}}]\n\
+             }}\n"
+        )
     }
 
     /// EMMO's domain checks, moved verbatim from `graph_validation`
@@ -670,6 +695,30 @@ mod tests {
         assert!(instructions.contains("\"relationships\""));
         let preamble = onto.extraction_preamble();
         assert!(preamble.contains("'chem'"), "{preamble}");
+    }
+
+    /// Every prompt states the invariant the validator enforces: a `from`/
+    /// `to` name must be a declared entity (`orphan_rel` is Error severity).
+    /// Checked on BOTH instruction builders — the trait default any new
+    /// ontology inherits, and EMMO's legacy override (whose byte-identity
+    /// was deliberately broken for exactly this line: the verbatim text
+    /// produced unstorable extractions). The fragment is hardcoded here so
+    /// a reworded-away rule fails too.
+    #[test]
+    fn every_instruction_builder_states_the_referential_integrity_rule() {
+        let default_flavour = Fake {
+            id: "chem",
+            entities: &["Molecule"],
+            rels: &["REACTS_WITH"],
+        }
+        .extraction_instructions();
+        let emmo = EmmoOntology.extraction_instructions();
+        for (who, text) in [("trait default", default_flavour), ("emmo", emmo)] {
+            assert!(
+                text.contains("MUST also appear as an entity in"),
+                "{who} instructions no longer state the referential-integrity rule:\n{text}"
+            );
+        }
     }
 
     /// `active` resolves the default when unconfigured, the named id when

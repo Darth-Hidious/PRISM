@@ -10,7 +10,9 @@ use crate::local_facts::to_local_facts;
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
 use crate::validation::{self, Severity, ValidationReport};
-use crate::{DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, SchemaAnalysis};
+use crate::{
+    DataSource, EmbeddingBatch, EntitySet, GraphUpdate, LlmConfig, Relationship, SchemaAnalysis,
+};
 
 /// Result of a complete ingest operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,19 @@ pub struct IngestResult {
     /// result shape stays stable for older consumers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<EmbeddingBatch>,
+    /// Relationships dropped before the graph write because they referenced
+    /// a name never declared in `entities` (referential containment): one
+    /// entry per dropped relationship, naming the missing endpoint(s).
+    /// NON-EMPTY is a PARTIAL result, not a step failure — every entity and
+    /// every well-formed relationship was still stored, so this never joins
+    /// `errors` (exit stays 0). It exists because the two alternatives are
+    /// both worse: failing the whole ingest discards everything valid (the
+    /// pre-containment behaviour that kept the graph empty), and inventing
+    /// the missing entity would fabricate a type the extraction never
+    /// stated. Callers MUST surface it — a drop the user cannot see is a
+    /// silent drop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_relationships: Vec<String>,
     /// Step failures. NON-EMPTY means configured pipeline steps did NOT
     /// complete — callers must surface these and exit non-zero. The old
     /// behavior (audit critical: log-and-None) made `prism ingest` print
@@ -224,28 +239,47 @@ impl IngestPipeline {
         // documented "runs before writing to Neo4j" gate with zero callers
         // (AUDIT_BACKLOG 20 / INGESTION_AUDIT #20), so LLM extraction output
         // went straight to the graph unchecked. Run it whenever entities
-        // exist, and refuse the graph write on Error-severity issues (orphan
-        // relationships, empty names) rather than upserting garbage.
+        // exist. Error-severity issues refuse the graph write, with ONE
+        // contained class: a relationship whose endpoint was never declared
+        // (`orphan_rel`) invalidates THAT relationship, not the ingest — it
+        // is dropped and reported (`dropped_relationships`), and everything
+        // valid is still stored. Failing wholesale here is what kept the
+        // graph empty (2026-08-08: 17 orphan errors discarded 13 good
+        // entities); inventing the missing endpoint would fabricate a type.
+        let mut dropped_relationships: Vec<String> = Vec::new();
+        let mut write_set: Option<EntitySet> = None;
         let graph_validation = entities.as_ref().map(|entity_set| {
-            let (report, blocking_error) =
-                validate_before_graph_write(ontology.as_ref(), entity_set);
-            if let Some(msg) = blocking_error {
-                tracing::error!(issues = report.issues.len(), "{msg}");
-                errors.push(msg);
-            } else if !report.issues.is_empty() {
-                tracing::warn!(
-                    issues = report.issues.len(),
-                    "graph validation found non-blocking issues"
-                );
+            let (report, plan) = validate_before_graph_write(ontology.as_ref(), entity_set);
+            match plan {
+                GraphWritePlan::Blocked(msg) => {
+                    tracing::error!(issues = report.issues.len(), "{msg}");
+                    errors.push(msg);
+                }
+                GraphWritePlan::Proceed { set, dropped } => {
+                    if !dropped.is_empty() {
+                        tracing::warn!(
+                            dropped = dropped.len(),
+                            extracted = entity_set.relationships.len(),
+                            "relationships referencing undeclared entities were dropped; \
+                             the valid remainder is stored"
+                        );
+                    } else if !report.issues.is_empty() {
+                        tracing::warn!(
+                            issues = report.issues.len(),
+                            "graph validation found non-blocking issues"
+                        );
+                    }
+                    dropped_relationships = dropped;
+                    write_set = Some(set);
+                }
             }
             report
         });
-        let graph_validation_passed = graph_validation.as_ref().is_none_or(|r| r.passed);
 
         // Step 4: local EMMO graph write into the bundled Turso store (if
-        // entities exist and validation passed). This replaced the Neo4j
-        // upsert (Neo4j retirement, step 1) — the store is bundled, so no
-        // backend config gates the write.
+        // entities exist and validation produced a writable set). This
+        // replaced the Neo4j upsert (Neo4j retirement, step 1) — the store
+        // is bundled, so no backend config gates the write.
         // Facts land under the ontology's storage tenant: the default
         // ontology keeps the bare "local" tenant every existing store was
         // written with; any other ontology gets a composed tenant, which is
@@ -253,7 +287,7 @@ impl IngestPipeline {
         // tenant-qualified isolation that separates local and peer knowledge).
         let tenant =
             crate::ontologies::storage_tenant(prism_provenance::LOCAL_TENANT, ontology.id());
-        let graph = if graph_validation_passed && let Some(entity_set) = &entities {
+        let graph = if let Some(entity_set) = &write_set {
             match self.write_local_graph(entity_set, &source, &tenant).await {
                 Ok(update) => {
                     tracing::info!(
@@ -274,7 +308,7 @@ impl IngestPipeline {
         };
 
         // Entity vectors are written to the bundled Turso store by
-        // `write_local_graph` (embed_entities_best_effort); the old Qdrant
+        // `write_local_graph` (embed_names_best_effort); the old Qdrant
         // upsert step was redundant and has been removed.
         Ok(IngestResult {
             source,
@@ -286,6 +320,7 @@ impl IngestPipeline {
             graph_validation,
             graph,
             embeddings: None,
+            dropped_relationships,
             errors,
         })
     }
@@ -337,38 +372,46 @@ impl IngestPipeline {
                 .write_fact_with_evidence(fact, &prov, EvidenceClass::Research)
                 .await?;
         }
-        // Best-effort: vectorize the freshly written entity names into the
-        // same Turso store so `prism query --semantic` works without Qdrant.
-        // Failures are logged inside and never fail the ingest.
-        store.embed_entities_best_effort(&facts, &prov.tenant).await;
 
         // Count what the store actually received, not what the LLM proposed.
-        //
-        // `to_local_facts` maps RELATIONSHIPS, so an extracted entity that is
-        // not an endpoint of any relationship produces no fact and never
-        // reaches the store. Reporting `entity_set.entities.len()` therefore
-        // claimed nodes that were silently dropped: 50 entities with 3
-        // relationships reported "50 nodes created" while the store saw at
-        // most 6 names.
-        let written: std::collections::HashSet<&str> = facts
+        // `to_local_facts` maps RELATIONSHIPS, so the fact writes above
+        // upserted exactly the endpoint names.
+        let mut written: std::collections::HashSet<&str> = facts
             .iter()
             .flat_map(|f| [f.subject.as_str(), f.object.as_str()])
             .collect();
 
-        let dropped = entity_set
-            .entities
-            .iter()
-            .filter(|e| !written.contains(e.name.as_str()))
-            .count();
-        if dropped > 0 {
-            // The drop is by design; being quiet about it was not.
-            tracing::warn!(
-                dropped,
-                extracted = entity_set.entities.len(),
-                stored = written.len(),
-                "entities appearing in no relationship were not written to the graph"
-            );
+        // Entities in no stored relationship land as standalone typed nodes:
+        // the extraction asserted they exist, and an absent relationship —
+        // or one dropped by referential containment — must not erase them.
+        // Their label is the DECLARED entity type, never an invented one.
+        // (They used to be dropped with a warning; storing 0 of 13 extracted
+        // entities because the edges dangled is the failure this replaced.)
+        for e in &entity_set.entities {
+            if !written.insert(e.name.as_str()) {
+                continue; // already a node via some relationship (or a duplicate name)
+            }
+            let label = match e.entity_type.trim() {
+                // The store's own generic label — the same one write_fact
+                // gives targets of unknown kind — never a guessed type.
+                "" => "Entity",
+                t => t,
+            };
+            let props = match &e.properties {
+                serde_json::Value::Object(map) if !map.is_empty() => Some(e.properties.to_string()),
+                _ => None,
+            };
+            store
+                .write_extracted_entity(&e.name, label, props, &prov.tenant)
+                .await?;
         }
+
+        // Best-effort: vectorize every node name this write landed (endpoint
+        // AND standalone) into the same Turso store so `prism query
+        // --semantic` works without Qdrant. Failures are logged inside and
+        // never fail the ingest.
+        let names: Vec<String> = written.iter().map(|s| s.to_string()).collect();
+        store.embed_names_best_effort(&names, &prov.tenant).await;
 
         Ok(GraphUpdate {
             nodes_created: written.len(),
@@ -383,34 +426,118 @@ impl Default for IngestPipeline {
     }
 }
 
+/// What pre-write graph validation decided may be written.
+enum GraphWritePlan {
+    /// Write `set` — the extracted set minus any dangling relationships.
+    /// `dropped` carries one reason per relationship dropped for
+    /// referencing a name never declared as an entity. Containment, not
+    /// repair: the missing entity is never invented, and the drop always
+    /// reaches the caller (`IngestResult::dropped_relationships`).
+    Proceed {
+        set: EntitySet,
+        dropped: Vec<String>,
+    },
+    /// Error-severity issues a targeted drop cannot repair: write nothing.
+    Blocked(String),
+}
+
 /// Run graph-quality validation on extracted entities — against the ACTIVE
-/// ontology's vocabulary — and decide whether the graph write should
-/// proceed. Returns the full report plus, when Error-severity issues are
-/// present, a message describing why the write was blocked (`None` means
-/// the write may proceed).
+/// ontology's vocabulary — and decide what the graph write may store.
+/// Returns the full report on the extraction AS THE MODEL EMITTED IT (the
+/// honest record, orphans included) plus the plan.
+///
+/// Exactly ONE error class is containable: `orphan_rel`, a relationship
+/// whose `from`/`to` was never declared. Dropping that relationship loses
+/// one claim; inventing the endpoint would require fabricating a type, and
+/// failing the whole ingest discards every valid fact with it (the
+/// pre-containment behaviour that kept the graph empty). Every other
+/// error-severity issue — empty names, zero entities, an ontology's own
+/// domain errors — still blocks the write, proven by RE-validating the
+/// reduced set rather than by trusting issue categories.
 fn validate_before_graph_write(
     ontology: &dyn crate::ontologies::Ontology,
     entity_set: &EntitySet,
 ) -> (
     crate::graph_validation::GraphValidationReport,
-    Option<String>,
+    GraphWritePlan,
 ) {
     let report = crate::graph_validation::validate_graph(ontology, entity_set);
     if report.passed {
-        return (report, None);
+        let plan = GraphWritePlan::Proceed {
+            set: entity_set.clone(),
+            dropped: Vec::new(),
+        };
+        return (report, plan);
     }
+
+    let (kept, dropped) = partition_dangling_relationships(entity_set);
+    if dropped.is_empty() {
+        // Nothing dangled — the errors are of a kind a drop cannot repair.
+        let msg = blocking_message(&report);
+        return (report, GraphWritePlan::Blocked(msg));
+    }
+    let set = EntitySet {
+        entities: entity_set.entities.clone(),
+        relationships: kept,
+    };
+    // Fail-closed proof that the drop repaired EVERYTHING at error
+    // severity: the reduced set must validate clean of errors, or the
+    // write stays blocked exactly as before.
+    let recheck = crate::graph_validation::validate_graph(ontology, &set);
+    if recheck.passed {
+        (report, GraphWritePlan::Proceed { set, dropped })
+    } else {
+        (report, GraphWritePlan::Blocked(blocking_message(&recheck)))
+    }
+}
+
+/// The refusal message for a report whose error-severity issues block the
+/// graph write (unchanged wording from the pre-containment gate).
+fn blocking_message(report: &crate::graph_validation::GraphValidationReport) -> String {
     let error_issues: Vec<&str> = report
         .issues
         .iter()
         .filter(|i| i.severity == crate::graph_validation::GraphSeverity::Error)
         .map(|i| i.message.as_str())
         .collect();
-    let msg = format!(
+    format!(
         "graph validation failed ({} error-severity issue(s)): {}",
         error_issues.len(),
         error_issues.join("; ")
-    );
-    (report, Some(msg))
+    )
+}
+
+/// Split relationships into those whose endpoints are all declared entities
+/// and those referencing an undeclared name — one human-readable reason per
+/// dropped relationship, naming exactly which endpoint(s) were missing.
+/// Membership is by entity NAME, the same set `validate_graph`'s orphan
+/// check (Check 5) tests.
+fn partition_dangling_relationships(set: &EntitySet) -> (Vec<Relationship>, Vec<String>) {
+    let names: std::collections::HashSet<&str> =
+        set.entities.iter().map(|e| e.name.as_str()).collect();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for r in &set.relationships {
+        let mut missing = Vec::new();
+        if !names.contains(r.from.as_str()) {
+            missing.push(r.from.as_str());
+        }
+        if !names.contains(r.to.as_str()) && r.to != r.from {
+            missing.push(r.to.as_str());
+        }
+        if missing.is_empty() {
+            kept.push(r.clone());
+        } else {
+            dropped.push(format!(
+                "{}-[{}]->{}: undeclared endpoint(s): {}",
+                r.from,
+                r.rel_type,
+                r.to,
+                missing.join(", ")
+            ));
+        }
+    }
+    (kept, dropped)
 }
 
 /// Decide whether entity extraction may run on this input at all. Returns
@@ -494,11 +621,16 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// A dangling endpoint invalidates THAT relationship, not the ingest:
+    /// the plan keeps every entity, drops exactly the dangling edge, and
+    /// reports it — while the report stays an honest record of the raw
+    /// extraction (`orphan_rel` Error, `passed == false`). The missing
+    /// entity is NOT invented into the write set.
     #[test]
-    fn validate_before_graph_write_blocks_on_orphan_relationship() {
+    fn validate_before_graph_write_contains_dangling_relationships() {
         use crate::{Entity, Relationship};
         // "Fe" is referenced by the relationship but never extracted as an
-        // entity — this used to reach Neo4j unchecked (AUDIT_BACKLOG 20).
+        // entity. This used to fail the whole ingest, storing nothing.
         let entity_set = EntitySet {
             entities: vec![Entity {
                 entity_type: "Alloy".into(),
@@ -513,12 +645,24 @@ mod tests {
                 order: None,
             }],
         };
-        let (report, blocking_error) =
+        let (report, plan) =
             validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
-        assert!(!report.passed);
-        let msg = blocking_error.expect("orphan relationship must block the graph write");
-        assert!(msg.contains("graph validation failed"));
-        assert!(msg.contains("Fe"));
+        assert!(!report.passed, "the report keeps recording the orphan");
+        assert!(report.issues.iter().any(|i| i.category == "orphan_rel"));
+        let GraphWritePlan::Proceed { set, dropped } = plan else {
+            panic!("a purely-dangling extraction must be contained, not blocked");
+        };
+        assert_eq!(set.entities.len(), 1, "every declared entity is kept");
+        assert!(
+            set.relationships.is_empty(),
+            "the dangling relationship must not be written"
+        );
+        assert!(
+            !set.entities.iter().any(|e| e.name == "Fe"),
+            "the missing endpoint must never be auto-declared"
+        );
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("Fe"), "{}", dropped[0]);
     }
 
     #[test]
@@ -532,10 +676,14 @@ mod tests {
             }],
             relationships: vec![],
         };
-        let (report, blocking_error) =
+        let (report, plan) =
             validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
         assert!(report.passed);
-        assert!(blocking_error.is_none());
+        let GraphWritePlan::Proceed { set, dropped } = plan else {
+            panic!("clean entities must proceed");
+        };
+        assert_eq!(set.entities.len(), 1);
+        assert!(dropped.is_empty());
     }
 
     #[test]
@@ -649,12 +797,14 @@ mod tests {
         }
     }
 
-    /// `nodes_created` must count what the store received, not what the LLM
-    /// proposed. `to_local_facts` maps relationships only, so an entity in no
-    /// relationship is silently dropped — and the old count reported it as
-    /// created anyway.
+    /// An entity in no relationship still lands — as a standalone node under
+    /// its DECLARED type — and `nodes_created` keeps counting what the store
+    /// actually received, which now includes it. (History: these entities
+    /// were first silently dropped while being counted, then honestly
+    /// dropped with a warning; referential containment made the pipeline
+    /// store everything valid instead.)
     #[tokio::test]
-    async fn write_local_graph_does_not_count_entities_it_never_wrote() {
+    async fn write_local_graph_stores_relationshipless_entities_as_typed_nodes() {
         use crate::{Entity, Relationship};
 
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
@@ -681,7 +831,7 @@ mod tests {
                     name: "Fe".into(),
                     properties: serde_json::json!({}),
                 },
-                // Referenced by nothing — never reaches the store.
+                // Referenced by nothing — must land as a standalone node.
                 Entity {
                     entity_type: "Element".into(),
                     name: "Nickel".into(),
@@ -707,19 +857,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            update.nodes_created, 2,
-            "counted an entity that was never written (3 extracted, only Steel and Fe stored)",
+            update.nodes_created, 3,
+            "all three extracted entities must be stored (and counted)",
         );
         assert_eq!(update.edges_created, 1);
 
-        // And prove the claim: the dropped entity really is absent.
+        // And prove the claim: the relationship-less entity really landed,
+        // under the type the extraction DECLARED — never an invented one.
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .unwrap();
         let hits = store.graph_search("Nickel", "local", 10).await.unwrap();
         assert!(
-            !hits.iter().any(|n| n.name == "Nickel"),
-            "Nickel was reported as created and is in the store after all",
+            hits.iter()
+                .any(|n| n.name == "Nickel" && n.label == "Element"),
+            "the relationship-less entity is missing from the store (or mislabeled): {hits:?}",
         );
 
         for suffix in ["", "-wal", "-shm"] {
@@ -902,6 +1054,7 @@ mod tests {
             graph_validation: None,
             graph: None,
             embeddings: None,
+            dropped_relationships: Vec::new(),
             errors: Vec::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -910,17 +1063,27 @@ mod tests {
         assert!(!json.contains("graph_validation"));
         assert!(!json.contains("graph"));
         assert!(!json.contains("embeddings"));
+        // No drops ⇒ no dropped_relationships key (clean stays clean)…
+        assert!(!json.contains("dropped_relationships"));
         // No errors ⇒ no errors key either (clean success stays clean)…
         assert!(!json.contains("errors"));
         // …but step failures MUST be visible in the JSON (the old shape hid
-        // failed steps entirely — audit critical #2).
+        // failed steps entirely — audit critical #2)…
         let failed = IngestResult {
             errors: vec!["local graph write failed: disk full".into()],
-            ..result
+            ..result.clone()
         };
         let json = serde_json::to_string(&failed).unwrap();
         assert!(json.contains("errors"));
         assert!(json.contains("disk full"));
+        // …and so must contained drops — a drop the JSON hides is silent.
+        let partial = IngestResult {
+            dropped_relationships: vec!["A-[R]->B: undeclared endpoint(s): B".into()],
+            ..result
+        };
+        let json = serde_json::to_string(&partial).unwrap();
+        assert!(json.contains("dropped_relationships"));
+        assert!(json.contains("undeclared endpoint"));
     }
 
     // ── Refusing extraction from empty / Error-severity input ─────────
@@ -1183,6 +1346,239 @@ mod tests {
         );
         assert!(result.graph.is_none());
         server.verify().await;
+    }
+
+    // ── Referential containment, at PRODUCTION dispatch ────────────────
+    //
+    // These exercise `ingest_file` itself with deliberately NOVEL names and
+    // relationship types: the property under test is containment of
+    // dangling endpoints, not today's EMMO vocabulary.
+
+    /// The containment deliverable: an extraction with dangling endpoints
+    /// stores every entity and every well-formed relationship, drops ONLY
+    /// the dangling edges, reports the drop in the result, and stays a
+    /// clean run (`errors` empty ⇒ exit 0) — while the missing endpoints
+    /// are NEVER invented into the store.
+    #[tokio::test]
+    async fn dangling_relationships_are_dropped_and_the_valid_remainder_is_stored() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Zorblatt-9", "properties": {}},
+                {"type": "Property", "name": "squishiness", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Zorblatt-9", "rel": "HAS_PROPERTY", "to": "squishiness"},
+                {"from": "Zorblatt-9", "rel": "GLUED_TO", "to": "Phantomium"},
+                {"from": "Ghostium", "rel": "GLUED_TO", "to": "Phantomium"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // A contained drop is a partial SUCCESS: no step failure, exit 0.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        // The report stays an honest record of the raw extraction.
+        let report = result.graph_validation.expect("validation ran");
+        assert!(!report.passed);
+        assert!(report.issues.iter().any(|i| i.category == "orphan_rel"));
+
+        // The drop is REPORTED: which relationships, and which endpoint(s)
+        // were never declared.
+        assert_eq!(
+            result.dropped_relationships.len(),
+            2,
+            "{:?}",
+            result.dropped_relationships
+        );
+        let drops = result.dropped_relationships.join("\n");
+        assert!(drops.contains("Phantomium"), "{drops}");
+        assert!(drops.contains("Ghostium"), "{drops}");
+        assert!(
+            !drops.contains("HAS_PROPERTY"),
+            "the well-formed relationship was reported dropped: {drops}"
+        );
+
+        // Everything valid was stored: both entities, the one good edge.
+        let graph = result.graph.expect("the valid remainder must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        for name in ["Zorblatt-9", "squishiness"] {
+            let hits = store.graph_search(name, "local", 10).await.unwrap();
+            assert!(hits.iter().any(|n| n.name == name), "{name} not stored");
+        }
+        // Dropping loses a claim; inventing corrupts the graph. Neither
+        // undeclared endpoint may exist as a node…
+        for phantom in ["Phantomium", "Ghostium"] {
+            let hits = store.graph_search(phantom, "local", 10).await.unwrap();
+            assert!(
+                hits.is_empty(),
+                "undeclared endpoint '{phantom}' was auto-declared into the store: {hits:?}"
+            );
+        }
+        // …and the dangling edge may not exist either, while the good one does.
+        let tr = store
+            .get_neighbors("Zorblatt-9", None, "local", 10)
+            .await
+            .unwrap();
+        assert!(tr.edges.iter().any(|e| e.rel_type == "HAS_PROPERTY"));
+        assert!(
+            !tr.edges.iter().any(|e| e.rel_type == "GLUED_TO"),
+            "a dangling relationship reached the store: {:?}",
+            tr.edges
+        );
+        server.verify().await;
+    }
+
+    /// EVERY relationship dangling is still a partial success: the declared
+    /// entities land (that is what "stores everything valid" means when
+    /// nothing else is), zero edges, the drop is reported, exit stays 0.
+    /// (Zero ENTITIES remains a hard failure — pinned by
+    /// `rows_with_zero_entities_found_is_not_a_refusal` above.)
+    #[tokio::test]
+    async fn all_relationships_dropped_still_stores_the_entities() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Klaxonite", "properties": {"note": "novel"}},
+                {"type": "Phase", "name": "omega-weird", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Klaxonite", "rel": "BONDED_WITH", "to": "Unseen-1"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.dropped_relationships.len(),
+            1,
+            "{:?}",
+            result.dropped_relationships
+        );
+        assert!(result.dropped_relationships[0].contains("Unseen-1"));
+
+        let graph = result.graph.expect("entities alone are still a write");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 0));
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        // Stored under their DECLARED types.
+        let hits = store.graph_search("Klaxonite", "local", 10).await.unwrap();
+        assert!(
+            hits.iter()
+                .any(|n| n.name == "Klaxonite" && n.label == "Alloy"),
+            "{hits:?}"
+        );
+        let hits = store
+            .graph_search("omega-weird", "local", 10)
+            .await
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|n| n.name == "omega-weird" && n.label == "Phase"),
+            "{hits:?}"
+        );
+        assert!(
+            store
+                .graph_search("Unseen-1", "local", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the undeclared endpoint was invented into the store"
+        );
+    }
+
+    /// Containment must not blanket-weaken validation: an error a drop
+    /// cannot repair (here an empty entity name) still blocks the ENTIRE
+    /// write — nothing stored, nothing reported as "dropped and the rest
+    /// written", store never opened.
+    #[tokio::test]
+    async fn non_orphan_errors_still_block_the_whole_write() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "", "properties": {}},
+                {"type": "Alloy", "name": "Bloopium", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Bloopium", "rel": "MELDS_WITH", "to": "Nowhereium"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("empty name"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(result.graph.is_none(), "a blocked run must write nothing");
+        assert!(
+            result.dropped_relationships.is_empty(),
+            "a blocked run drops nothing — nothing was written behind it: {:?}",
+            result.dropped_relationships
+        );
+        assert!(
+            !db_path.exists(),
+            "a blocked ingest opened/created the provenance store"
+        );
+    }
+
+    /// The invariant the validator enforces is STATED in the prompt that
+    /// actually reaches the model — asserted on the request body the mock
+    /// LLM received, for the shipped default (EMMO's legacy override, whose
+    /// byte-identity was deliberately broken for exactly this line). The
+    /// fragment is hardcoded so a reworded-away rule dies too. The trait
+    /// default is covered in `ontologies::tests`.
+    #[tokio::test]
+    async fn the_prompt_sent_to_the_model_states_the_referential_rule() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(emmo_extraction()).await;
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,element\nSteel,Fe\n");
+        let pipeline = pipeline_against(server.uri(), scratch.db_path());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(requests.len(), 1);
+        let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+        assert!(
+            sent.contains("MUST also appear as an entity in"),
+            "the extraction prompt no longer states the referential-integrity \
+             rule; the validator will refuse what the model was told to emit:\n{sent}"
+        );
     }
 
     // ── Pluggable ontologies, at PRODUCTION dispatch ───────────────────
