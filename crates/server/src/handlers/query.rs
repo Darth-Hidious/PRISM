@@ -320,10 +320,11 @@ async fn local_semantic_lookup(
 }
 
 /// Map local Turso graph nodes into the same JSON shape the retired Neo4j
-/// path returned (`{type, name, properties}`), keeping the wire format
-/// stable for existing clients — plus the additive `tenant` field naming
-/// the owner, so a peer node is visibly a peer node instead of the
-/// attribution being fetched and dropped at this boundary. Properties may
+/// path returned (`{type, name, properties}`), keeping `type` as the storage
+/// label old clients use for identity. The declared extraction
+/// `entity_type`, canonical `class_iri`, and owner `tenant` are additive, so
+/// a peer node is visibly classified and attributed without re-keying it.
+/// Properties may
 /// carry `origin_source` — the locator of the source this node's
 /// knowledge came from — which mesh peers syncing these rows use to keep
 /// corroboration honest (`crates/mesh/src/sync.rs`). A node with no
@@ -336,7 +337,9 @@ fn graph_nodes_to_results(
         .iter()
         .map(|(n, origin)| {
             serde_json::json!({
-                "type": n.entity_type,
+                "type": n.label,
+                "entity_type": n.entity_type,
+                "class_iri": n.class_iri,
                 "name": n.name,
                 "tenant": n.tenant,
                 "properties": match origin.as_deref().map(redact_filesystem_origin) {
@@ -630,8 +633,9 @@ mod tests {
         // (additive — older clients ignore it); one without stays `{}`.
         let node = prism_provenance::GraphNode {
             name: "Ti-6Al-4V".into(),
-            entity_type: "Matter".into(),
+            entity_type: "Alloy".into(),
             label: "Matter".into(),
+            class_iri: Some("https://w3id.org/emmo#EMMO_example_alloy".into()),
             tenant: "local".into(),
         };
         let nodes = vec![
@@ -643,12 +647,16 @@ mod tests {
             vec![
                 serde_json::json!({
                     "type": "Matter",
+                    "entity_type": "Alloy",
+                    "class_iri": "https://w3id.org/emmo#EMMO_example_alloy",
                     "name": "Ti-6Al-4V",
                     "tenant": "local",
                     "properties": { "origin_source": "doi:10.1234/abc" },
                 }),
                 serde_json::json!({
                     "type": "Matter",
+                    "entity_type": "Alloy",
+                    "class_iri": "https://w3id.org/emmo#EMMO_example_alloy",
                     "name": "Ti-6Al-4V",
                     "tenant": "local",
                     "properties": {},
@@ -764,6 +772,7 @@ mod tests {
             name: "Ti-6Al-4V".into(),
             entity_type: "Matter".into(),
             label: "Matter".into(),
+            class_iri: None,
             tenant: LOCAL_ONTOLOGY_TENANT.into(),
         };
         let served = graph_nodes_to_results(&[(

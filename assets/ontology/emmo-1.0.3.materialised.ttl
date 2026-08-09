@@ -1,0 +1,299 @@
+# PRISM materialised subset of EMMO 1.0.3.
+# Contains material by the EMMO authors and contributors; publisher EMMC ASBL.
+# Source: https://github.com/emmo-repo/EMMO/archive/refs/tags/1.0.3.tar.gz
+# Licensed under CC BY 4.0: https://creativecommons.org/licenses/by/4.0/legalcode
+
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix emmo: <https://w3id.org/emmo#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+<https://w3id.org/emmo/emmo> a owl:Ontology ;
+    owl:versionIRI <https://w3id.org/emmo/1.0.3/emmo> ;
+    dcterms:creator <https://orcid.org/0000-0003-3805-8761>, <https://orcid.org/0000-0002-4181-2852>, <https://orcid.org/0000-0002-1560-809X> ;
+    dcterms:contributor <https://orcid.org/0000-0003-0514-9229>, <https://orcid.org/0000-0001-8869-3718>, <https://orcid.org/0009-0008-8009-5009>, <https://orcid.org/0000-0003-4065-9742>, <https://orcid.org/0000-0001-7815-6636>, <https://orcid.org/0000-0002-8758-6109> ;
+    dcterms:publisher <https://w3id.org/emmo#EMMC_ASBL> ;
+    dcterms:license <https://creativecommons.org/licenses/by/4.0/legalcode> ;
+    dcterms:source <https://github.com/emmo-repo/EMMO/archive/refs/tags/1.0.3.tar.gz> ;
+    dcterms:title "PRISM materialised subset of EMMO 1.0.3"@en .
+
+<https://w3id.org/emmo#EMMO_057e7d57_aff0_49de_911a_8861d85cef40> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_be8592a7_68d1_4a06_ad23_82f2b56ef926>
+    ; skos:prefLabel "Symbolic"@en
+    .
+
+<https://w3id.org/emmo#EMMO_09f0ac34_c349_46b5_acf0_0edeae52cca1> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_b295158f_fda4_4124_ab58_d9ea4ccfca5a>
+    ; skos:prefLabel "InteractingSystem"@en
+    .
+
+<https://w3id.org/emmo#EMMO_0f3e0646_4f06_4588_9779_6a4f05c5a8d6> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_38b579de_4331_40e0_803d_09efa298e726>
+    ; skos:prefLabel "PhysicalObjectByBond"@en
+    .
+
+<https://w3id.org/emmo#EMMO_1141d225_fe90_4230_82c6_31cab6a4e3fe> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_057e7d57_aff0_49de_911a_8861d85cef40>
+    ; skos:prefLabel "SymbolicByStructure"@en
+    .
+
+<https://w3id.org/emmo#EMMO_194e367c_9783_4bf5_96d0_9ad597d48d9a> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_1a40459e_10d8_49b3_bb8c_c3595fb1d0bb>
+    ; skos:prefLabel "Dataset"@en
+    .
+
+<https://w3id.org/emmo#EMMO_1a40459e_10d8_49b3_bb8c_c3595fb1d0bb> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_3e7add3d_e6ed_489a_a796_8e31fef9b490>
+    ; skos:prefLabel "DataByStructure"@en
+    .
+
+<https://w3id.org/emmo#EMMO_1e877c70_3b01_45a8_a8f6_8ce4f6a24660> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_49267eba_5548_4163_8f36_518d65b583f9>
+    ; skos:prefLabel "Contrast"@en
+    .
+
+<https://w3id.org/emmo#EMMO_35d2e130_6e01_41ed_94f7_00b333d46cf9> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_4a2bf359_c47b_4aa3_9811_b59c3e1dac1e>
+    ; skos:prefLabel "Conventional"@en
+    .
+
+<https://w3id.org/emmo#EMMO_38b579de_4331_40e0_803d_09efa298e726> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_09f0ac34_c349_46b5_acf0_0edeae52cca1>
+    ; skos:prefLabel "PhysicalObject"@en
+    .
+
+<https://w3id.org/emmo#EMMO_38f31ba5_348f_4ac2_9a67_a62b5dd7aadd> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_7286b164_df4c_4c14_a4b5_d41ad9c121f3>
+    ; skos:prefLabel "CodedByStructure"@en
+    .
+
+<https://w3id.org/emmo#EMMO_39348191_08fd_4bb6_9b1e_012d5b2f1ff6> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_4207e895_8b83_4318_996a_72cfb32acd94>
+    ; skos:prefLabel "MaterialByClassicalMaterialsScience"@en
+    .
+
+<https://w3id.org/emmo#EMMO_3e7add3d_e6ed_489a_a796_8e31fef9b490> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_1e877c70_3b01_45a8_a8f6_8ce4f6a24660>
+    ; skos:prefLabel "Data"@en
+    .
+
+<https://w3id.org/emmo#EMMO_41cecfc2_bb6b_45f3_b6cc_e7740d931afe> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_5b2222df_4da6_442f_8244_96e9e45887d1>
+    ; skos:prefLabel "MatterByStructure"@en
+    .
+
+<https://w3id.org/emmo#EMMO_4207e895_8b83_4318_996a_72cfb32acd94> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_6e9cb807_fc68_4bcf_b3ba_5fccc887c644>,
+        <https://w3id.org/emmo#EMMO_bc37743c_37c4_4ec7_9d58_d1aae5567352>
+    ; skos:prefLabel "Material"@en
+    .
+
+<https://w3id.org/emmo#EMMO_43d0bb2c_bb0e_4312_a0de_084c29ff7f9e> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_5b2222df_4da6_442f_8244_96e9e45887d1>
+    ; skos:prefLabel "MatterByType"@en
+    .
+
+<https://w3id.org/emmo#EMMO_43e9a05d_98af_41b4_92f6_00f79a09bfce> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_e04884d9_eda6_487e_93d5_7722d7eda96b>
+    ; skos:prefLabel "Process"@en
+    .
+
+<https://w3id.org/emmo#EMMO_49267eba_5548_4163_8f36_518d65b583f9> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_c5ddfdba_c074_4aa4_ad6b_1ac4942d300d>
+    ; skos:prefLabel "Perspective"@en
+    .
+
+<https://w3id.org/emmo#EMMO_4a2bf359_c47b_4aa3_9811_b59c3e1dac1e> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_b21a56ed_f969_4612_a6ec_cb7766f7f31d>
+    ; skos:prefLabel "SignByReferent"@en
+    .
+
+<https://w3id.org/emmo#EMMO_4c1f58cd_6e2c_48fb_8098_1cbb762abb05> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_4db521a3_f80f_436b_b9c7_e4b52b1383ea>
+    ; skos:prefLabel "MetallicMaterial"@en
+    .
+
+<https://w3id.org/emmo#EMMO_4db521a3_f80f_436b_b9c7_e4b52b1383ea> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_39348191_08fd_4bb6_9b1e_012d5b2f1ff6>
+    ; skos:prefLabel "MaterialByType"@en
+    .
+
+# Materialised OWL conclusion: ChemicalElement rdfs:subClassOf ChemicalSpecies.
+# Basis: ChemicalSpecies owl:equivalentClass an owl:unionOf containing ChemicalElement.
+<https://w3id.org/emmo#EMMO_4f40def1_3cd7_4067_9596_541e9a5134cf> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_a1083d0a_c1fb_471f_8e20_a98f881ad527>,
+        <https://w3id.org/emmo#EMMO_abf7efbe_6b04_41b8_8326_4dd0f6be753e>,
+        <https://w3id.org/emmo#EMMO_cbcf8fe6_6da6_49e0_ab4d_00f737ea9689>
+    ; skos:prefLabel "ChemicalElement"@en
+    .
+
+<https://w3id.org/emmo#EMMO_53ed8611_2cd7_4286_9ef0_36572117b963> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_802d3e92_8770_4f98_a289_ccaaab7fdddf>
+    ; skos:prefLabel "Fusion"@en
+    .
+
+<https://w3id.org/emmo#EMMO_57d977ab_0036_4779_b59a_e47620afdb9c> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_0f3e0646_4f06_4588_9779_6a4f05c5a8d6>
+    ; skos:prefLabel "CompositePhysicalObject"@en
+    .
+
+<https://w3id.org/emmo#EMMO_5b2222df_4da6_442f_8244_96e9e45887d1> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_38b579de_4331_40e0_803d_09efa298e726>
+    ; skos:prefLabel "Matter"@en
+    .
+
+<https://w3id.org/emmo#EMMO_649bf97b_4397_4005_90d9_219755d92e34> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_1e877c70_3b01_45a8_a8f6_8ce4f6a24660>
+    ; skos:prefLabel "Perceptual"@en
+    .
+
+<https://w3id.org/emmo#EMMO_668fbd5b_6f1b_405c_9c6b_d6067bd0595a> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_8b0923ab_b500_477b_9ce9_8b3a3e4dc4f2>
+    ; skos:prefLabel "PhaseOfMatter"@en
+    .
+
+<https://w3id.org/emmo#EMMO_6e9cb807_fc68_4bcf_b3ba_5fccc887c644> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_43d0bb2c_bb0e_4312_a0de_084c29ff7f9e>
+    ; skos:prefLabel "OrdinaryMatter"@en
+    .
+
+<https://w3id.org/emmo#EMMO_7286b164_df4c_4c14_a4b5_d41ad9c121f3> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_35d2e130_6e01_41ed_94f7_00b333d46cf9>
+    ; skos:prefLabel "Coded"@en
+    .
+
+<https://w3id.org/emmo#EMMO_76bd5e44_bf5a_49f9_a517_eea5e8bcbc2d> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_53ed8611_2cd7_4286_9ef0_36572117b963>
+    ; skos:prefLabel "CausalCluster"@en
+    .
+
+<https://w3id.org/emmo#EMMO_802d3e92_8770_4f98_a289_ccaaab7fdddf> a owl:Class
+    ; skos:prefLabel "EMMO"@en
+    .
+
+<https://w3id.org/emmo#EMMO_8b0923ab_b500_477b_9ce9_8b3a3e4dc4f2> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_bc37743c_37c4_4ec7_9d58_d1aae5567352>
+    ; skos:prefLabel "ContinuumSubstance"@en
+    .
+
+<https://w3id.org/emmo#EMMO_8bb6b688_812a_4cb9_b76c_d5a058928719> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_49267eba_5548_4163_8f36_518d65b583f9>
+    ; skos:prefLabel "Semiotics"@en
+    .
+
+<https://w3id.org/emmo#EMMO_a1083d0a_c1fb_471f_8e20_a98f881ad527> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_1141d225_fe90_4230_82c6_31cab6a4e3fe>
+    ; skos:prefLabel "Symbol"@en
+    .
+
+<https://w3id.org/emmo#EMMO_abf7efbe_6b04_41b8_8326_4dd0f6be753e> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_d8d2144e_5c8d_455d_a643_5caf4d8d9df8>
+    ; skos:prefLabel "Chemical"@en
+    .
+
+<https://w3id.org/emmo#EMMO_b21a56ed_f969_4612_a6ec_cb7766f7f31d> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_b803f122_4acb_4064_9d71_c1e5fd091fc9>
+    ; skos:prefLabel "Sign"@en
+    .
+
+<https://w3id.org/emmo#EMMO_b295158f_fda4_4124_ab58_d9ea4ccfca5a> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_e7aac247_31d6_4b2e_9fd2_e842b1b7ccac>
+    ; skos:prefLabel "GenericPhysicalSystem"@en
+    .
+
+<https://w3id.org/emmo#EMMO_b7bcff25_ffc3_474e_9ab5_01b1664bd4ba> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_38f31ba5_348f_4ac2_9a67_a62b5dd7aadd>
+    ; skos:prefLabel "Property"@en
+    .
+
+<https://w3id.org/emmo#EMMO_b803f122_4acb_4064_9d71_c1e5fd091fc9> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_8bb6b688_812a_4cb9_b76c_d5a058928719>
+    ; skos:prefLabel "SemioticEntity"@en
+    .
+
+<https://w3id.org/emmo#EMMO_bc37743c_37c4_4ec7_9d58_d1aae5567352> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_41cecfc2_bb6b_45f3_b6cc_e7740d931afe>,
+        <https://w3id.org/emmo#EMMO_57d977ab_0036_4779_b59a_e47620afdb9c>
+    ; skos:prefLabel "Substance"@en
+    .
+
+<https://w3id.org/emmo#EMMO_be8592a7_68d1_4a06_ad23_82f2b56ef926> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_c66ad523_3937_485e_91bb_ad488ddb373f>
+    ; skos:prefLabel "DiscreteData"@en
+    .
+
+<https://w3id.org/emmo#EMMO_c5ae6d8e_6b39_431f_8de4_ae4e357abc04> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_649bf97b_4397_4005_90d9_219755d92e34>
+    ; skos:prefLabel "Visual"@en
+    .
+
+<https://w3id.org/emmo#EMMO_c5ddfdba_c074_4aa4_ad6b_1ac4942d300d> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_53ed8611_2cd7_4286_9ef0_36572117b963>,
+        <https://w3id.org/emmo#EMMO_eb3a768e_d53e_4be9_a23b_0714833c36de>
+    ; skos:prefLabel "CausalStructure"@en
+    .
+
+<https://w3id.org/emmo#EMMO_c66ad523_3937_485e_91bb_ad488ddb373f> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_3e7add3d_e6ed_489a_a796_8e31fef9b490>
+    ; skos:prefLabel "DataByDiscretness"@en
+    .
+
+<https://w3id.org/emmo#EMMO_c74da218_9147_4f03_92d1_8894abca55f3> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_3e7add3d_e6ed_489a_a796_8e31fef9b490>,
+        <https://w3id.org/emmo#EMMO_c5ae6d8e_6b39_431f_8de4_ae4e357abc04>
+    ; skos:prefLabel "Graphical"@en
+    .
+
+<https://w3id.org/emmo#EMMO_cbcf8fe6_6da6_49e0_ab4d_00f737ea9689> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_abf7efbe_6b04_41b8_8326_4dd0f6be753e>
+    ; skos:prefLabel "ChemicalSpecies"@en
+    .
+
+<https://w3id.org/emmo#EMMO_ccdc1a41_6e96_416b_92ec_efe67917434a> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_c74da218_9147_4f03_92d1_8894abca55f3>
+    ; skos:prefLabel "Document"@en
+    .
+
+<https://w3id.org/emmo#EMMO_d8d2144e_5c8d_455d_a643_5caf4d8d9df8> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_057e7d57_aff0_49de_911a_8861d85cef40>
+    ; skos:prefLabel "Language"@en
+    .
+
+<https://w3id.org/emmo#EMMO_e04884d9_eda6_487e_93d5_7722d7eda96b> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_49267eba_5548_4163_8f36_518d65b583f9>
+    ; skos:prefLabel "Persistence"@en
+    .
+
+<https://w3id.org/emmo#EMMO_e7aac247_31d6_4b2e_9fd2_e842b1b7ccac> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_76bd5e44_bf5a_49f9_a517_eea5e8bcbc2d>,
+        <https://w3id.org/emmo#EMMO_c5ddfdba_c074_4aa4_ad6b_1ac4942d300d>
+    ; skos:prefLabel "CausalSystem"@en
+    .
+
+<https://w3id.org/emmo#EMMO_eb3a768e_d53e_4be9_a23b_0714833c36de> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_802d3e92_8770_4f98_a289_ccaaab7fdddf>
+    ; skos:prefLabel "Item"@en
+    .
+
+<https://w3id.org/emmo#EMMO_7aec67a4_fb96_47c6_80a3_8fea557b2cbb> a owl:ObjectProperty
+    ; skos:prefLabel "hasChemicalSpecies"@en
+    .
+
+<https://w3id.org/emmo#EMMO_a8bd7094_6b40_47af_b1f4_a69d81a3afbd> a owl:ObjectProperty
+    ; skos:prefLabel "isPartOf"@en
+    .
+
+<https://w3id.org/emmo#EMMO_b1c64830_45c7_499d_9a72_68f517d57823> a owl:ObjectProperty
+    ; skos:prefLabel "manufacturedWith"@en
+    .
+
+<https://w3id.org/emmo#EMMO_dba27ca1_33c9_4443_a912_1519ce4c39ec> a owl:ObjectProperty
+    ; skos:prefLabel "hasConstituent"@en
+    .
+
+<https://w3id.org/emmo#EMMO_e1097637_70d2_4895_973f_2396f04fa204> a owl:ObjectProperty
+    ; skos:prefLabel "hasProperty"@en
+    .
+

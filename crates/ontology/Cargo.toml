@@ -1,0 +1,18 @@
+# @file Cargo.toml
+# @project PRISM / Ontology
+# @req REQ-OWL-1.1, REQ-OWL-1.2
+# @classification ESA-funded deliverable; project source-available.
+
+[package]
+name = "prism-ontology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sophia.workspace = true
+thiserror.workspace = true

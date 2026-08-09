@@ -1001,7 +1001,8 @@ enum NodeCommands {
         /// Serve a specific model for inference via Ollama.
         #[arg(long)]
         serve: Option<String>,
-        /// Run in offline mode (no platform registration, local Kafka for mesh).
+        /// Run in offline mode (no platform registration; mesh networking
+        /// disabled).
         #[arg(long)]
         offline: bool,
         /// Dashboard HTTP port (default: 7327).
@@ -3260,6 +3261,10 @@ async fn main() -> Result<()> {
                 };
 
                 // ── Start mesh networking (mDNS discovery + optional broadcast) ──
+                // One resolution of "did the operator ask for offline?" — the
+                // `--offline` flag or `PRISM_OFFLINE=1` — shared by the mesh
+                // refusal and the boot line (same merge as daemon_options.offline).
+                let mesh_offline = offline || prism_runtime::offline::enabled();
                 let mesh_cancel = tokio_util::sync::CancellationToken::new();
                 // Resolve Kafka brokers: explicit flag > implicit from --with-kafka
                 let kafka_requested = kafka_brokers.is_some() || with_kafka;
@@ -3275,25 +3280,32 @@ async fn main() -> Result<()> {
                     discovery: vec![prism_mesh::DiscoveryMethod::Mdns],
                     kafka_brokers: resolved_kafka_brokers.clone(),
                 };
-                let mesh_handle =
-                    prism_mesh::init_mesh_with_id(mesh_config, mesh_node_id_persisted)?;
-                let mesh_node_id = mesh_handle.node_id();
+                let mesh_start_options = prism_mesh::MeshStartOptions {
+                    node_name: daemon_options.name.clone(),
+                    publish_port: dashboard_port,
+                    broadcast,
+                    capabilities: Vec::new(),
+                    discovery_interval_secs: 30,
+                    event_tx: Some(server_state.ws_broadcast.clone()),
+                    auth_token: mesh_auth_token.clone(),
+                    offline: mesh_offline,
+                };
+                // The handle the REST API reports is minted from the SAME
+                // decision `start_mesh` acts on. An `Online` handle was
+                // previously written unconditionally, so `/api/mesh/nodes`
+                // answered `"online": true` (and `mesh peers` printed
+                // "Mesh: online") while the boot line in the same process
+                // said "Mesh disabled" — and `mesh sync` against such a node
+                // "succeeded" with 0 entities instead of failing at its
+                // publisher-lookup guard.
+                let mesh_handle = match prism_mesh::mesh_start_refusal(&mesh_start_options) {
+                    None => prism_mesh::init_mesh_with_id(mesh_config, mesh_node_id_persisted)?,
+                    Some(_) => prism_mesh::MeshHandle::Offline,
+                };
                 let mesh_peers_shared = mesh_handle.peers_shared();
-                // Update server state so REST API reports mesh as online
                 *server_state.mesh.write().unwrap_or_else(|e| e.into_inner()) = mesh_handle.clone();
-                let mesh_task = prism_mesh::start_mesh(
-                    mesh_handle,
-                    prism_mesh::MeshStartOptions {
-                        node_name: daemon_options.name.clone(),
-                        publish_port: dashboard_port,
-                        broadcast,
-                        capabilities: Vec::new(),
-                        discovery_interval_secs: 30,
-                        event_tx: Some(server_state.ws_broadcast.clone()),
-                        auth_token: mesh_auth_token.clone(),
-                    },
-                    mesh_cancel.clone(),
-                );
+                let mesh_task =
+                    prism_mesh::start_mesh(mesh_handle, mesh_start_options, mesh_cancel.clone());
                 // Initialize federated query client for cross-mesh
                 // searches. It carries the owner's platform token so each
                 // peer can VERIFY who is querying and mint a session —
@@ -3355,7 +3367,12 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                if !mesh_has_auth {
+                if mesh_offline {
+                    // `resolved_platform_auth` is forced to None under
+                    // offline, so keying this line on auth alone blamed
+                    // "not authenticated" for the operator's own --offline.
+                    println!("  \u{26A0} Mesh: disabled (offline mode)");
+                } else if !mesh_has_auth {
                     println!("  \u{26A0} Mesh: disabled (not authenticated)");
                 } else if broadcast {
                     println!("  \u{2713} Mesh: broadcasting (mDNS + platform discovery)");
@@ -3369,12 +3386,12 @@ async fn main() -> Result<()> {
                     let kafka_cfg = prism_mesh::kafka::KafkaConfig {
                         brokers: brokers.clone(),
                         topic_prefix: "prism.mesh".into(),
-                        group_id: format!(
-                            "prism-{}",
-                            mesh_node_id
-                                .map(|id| id.to_string())
-                                .unwrap_or_else(|| "unknown".into())
-                        ),
+                        // The persisted identity, not the handle's: when the
+                        // mesh was refused the handle is Offline (node_id
+                        // None), but the Kafka transport is started
+                        // separately and must keep its durable consumer
+                        // group either way.
+                        group_id: format!("prism-{mesh_node_id_persisted}"),
                     };
 
                     match prism_mesh::kafka::MeshKafkaConsumer::new(&kafka_cfg) {
@@ -3385,7 +3402,9 @@ async fn main() -> Result<()> {
                             let peers_arc = mesh_peers_shared.clone().unwrap_or_else(|| {
                                 std::sync::Arc::new(std::sync::RwLock::new(Vec::new()))
                             });
-                            let our_node_id = mesh_node_id.unwrap_or_else(uuid::Uuid::nil);
+                            // Persisted identity, not the handle's: `nil`
+                            // here would break the sync handler's self-skip.
+                            let our_node_id = mesh_node_id_persisted;
                             let subscriptions = server_state.subscriptions.clone();
 
                             // Peer-synced facts land in the bundled Turso
@@ -3451,18 +3470,16 @@ async fn main() -> Result<()> {
                             let producer = std::sync::Arc::new(producer);
                             // Store producer in server state so mesh handlers can publish
                             let _ = server_state.kafka_producer.set(producer.clone());
-                            if let Some(nid) = mesh_node_id {
-                                let _ = server_state.node_id.set(nid);
-                            }
+                            let _ = server_state.node_id.set(mesh_node_id_persisted);
                             tracing::info!("Kafka producer ready and wired to mesh handlers");
 
                             // Announce this node on the mesh via Kafka
-                            if let Some(nid) = mesh_node_id {
+                            {
                                 let announce_producer = producer.clone();
                                 let node_name = daemon_options.name.clone();
                                 tokio::spawn(async move {
                                     let msg = prism_mesh::protocol::MeshMessage::Announce {
-                                        node_id: nid,
+                                        node_id: mesh_node_id_persisted,
                                         name: node_name,
                                         address: "127.0.0.1".to_string(),
                                         port: dashboard_port,
@@ -5374,6 +5391,9 @@ async fn handle_mesh_command(
                     discovery_interval_secs: 5,
                     event_tx: None,
                     auth_token,
+                    // No --offline flag on `mesh discover`; PRISM_OFFLINE=1
+                    // still refuses inside mesh_start_refusal.
+                    offline: false,
                 },
                 cancel.clone(),
             );
@@ -5611,6 +5631,20 @@ async fn handle_mesh_command(
                          cannot attribute the synced data to a publisher"
                     )
                 })?;
+
+            // Self-peer guard. The Kafka path skips its own publishes
+            // (sync.rs: `node_id == our_node_id`); without the same check
+            // here, a node pointed at its own dashboard syncs its own facts
+            // into `mesh:{its own id}` and then serves them back as peer
+            // knowledge.
+            let our_node_id = prism_mesh::load_or_create_node_id(&paths.state_dir)?;
+            if publisher == our_node_id {
+                bail!(
+                    "peer at {peer} is this node itself (mesh node {publisher}) — \
+                     a node cannot pull its own dataset as peer knowledge. \
+                     Point --peer at another node's dashboard."
+                );
+            }
 
             // The owner's platform token lets the peer VERIFY who is
             // pulling. Without a login, a loopback peer still works (it
@@ -6109,9 +6143,17 @@ fn text_locality_for(configured: &str, llm_base_url: Option<&str>) -> TextLocali
     match configured {
         "local" => TextLocality::Local,
         "cloud" => TextLocality::Cloud,
-        // auto: local iff the extraction model runs on this machine.
+        // auto: local iff the extraction model runs on this machine — a
+        // loopback HTTP server, or `gguf://local`, PRISM's own embedded
+        // engine. The gguf sentinel is not a network URL at all, so it is
+        // matched here by the LLM crate's own predicate rather than by
+        // widening `is_loopback_url`, which answers a different (security)
+        // question — "does this URL target the loopback interface" — for
+        // the offline gate and the local-server sweep.
         _ => match llm_base_url {
-            Some(url) if is_loopback_url(url) => TextLocality::Local,
+            Some(url) if is_loopback_url(url) || prism_ingest::llm::is_local_gguf_url(url) => {
+                TextLocality::Local
+            }
             _ => TextLocality::CloudNoLocalModel,
         },
     }
@@ -6565,6 +6607,7 @@ async fn run_local_text_ingest_file(
              (CSV/Parquet), or set [ontology] id = \"emmo\"."
         );
     }
+    let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
 
     if mapping_path.is_some() {
         eprintln!(
@@ -6676,7 +6719,16 @@ async fn run_local_text_ingest_file(
 
     store.record_activity(&prov).await?;
     for fact in &facts {
-        store.write_fact(fact, &prov).await?;
+        store
+            .write_fact_with_classification(
+                fact,
+                &prov,
+                prism_provenance::OntologyClassification {
+                    version_iri: ontology.version_iri().as_str(),
+                    artifact_sha256: ontology.artifact_sha256(),
+                },
+            )
+            .await?;
     }
     // Best-effort: vectorize the freshly written entity names into the same
     // Turso store so `prism query --semantic` works without Qdrant.
@@ -13557,6 +13609,32 @@ mod tests {
     }
 
     #[test]
+    fn text_locality_treats_embedded_gguf_as_local() {
+        // `prism use local --url gguf://local` is the MOST on-device
+        // configuration possible — no server, no socket, weights loaded
+        // in-process. `is_loopback_url` parses its host as Domain("local")
+        // and says false, which routed documents to the platform (or, logged
+        // out, printed "no on-device model to extract with" — a lie).
+        for url in ["gguf://local", "gguf://local/"] {
+            assert_eq!(
+                text_locality_for("auto", Some(url)),
+                TextLocality::Local,
+                "{url} runs in-process and must classify as local"
+            );
+        }
+        // The sentinel is exact — a lookalike remote URL must not ride in.
+        assert_eq!(
+            text_locality_for("auto", Some("gguf://local.example.com")),
+            TextLocality::CloudNoLocalModel
+        );
+        // And an explicit cloud choice is still never second-guessed.
+        assert_eq!(
+            text_locality_for("cloud", Some("gguf://local")),
+            TextLocality::Cloud
+        );
+    }
+
+    #[test]
     fn text_locality_auto_without_a_model_is_not_a_cloud_choice() {
         // The fresh-install case: no `[llm] model`, so `build_llm_config`
         // fails and there is nothing on-device to extract with. This must
@@ -14521,8 +14599,9 @@ data:\n\
     fn test_node(name: &str, tenant: &str) -> prism_provenance::GraphNode {
         prism_provenance::GraphNode {
             name: name.into(),
-            entity_type: "Matter".into(),
+            entity_type: "Alloy".into(),
             label: "Matter".into(),
+            class_iri: Some("https://w3id.org/emmo#EMMO_example_alloy".into()),
             tenant: tenant.into(),
         }
     }
@@ -14557,8 +14636,9 @@ data:\n\
             facts: vec![test_recalled_fact("tensile strength", "local")],
         };
         let out = format_local_ontology(&results);
-        // Entity lines keep the Neo4j path's `[type] name` shape.
-        assert!(out.contains("  [Matter] Ti-6Al-4V\n"), "got: {out}");
+        // Entity lines display the declared extraction type, independently
+        // of the compatibility storage label (`Matter`).
+        assert!(out.contains("  [Alloy] Ti-6Al-4V\n"), "got: {out}");
         assert!(
             out.contains("Ti-6Al-4V -[hasPart]-> alpha phase\n"),
             "got: {out}"
@@ -14603,9 +14683,9 @@ data:\n\
         let out = format_local_ontology(&results);
 
         // Both same-named entities appear; exactly the peer one is tagged.
-        assert!(out.contains("  [Matter] Ti-6Al-4V\n"), "got: {out}");
+        assert!(out.contains("  [Alloy] Ti-6Al-4V\n"), "got: {out}");
         assert!(
-            out.contains("  [Matter] Ti-6Al-4V  [peer mesh:node-a]\n"),
+            out.contains("  [Alloy] Ti-6Al-4V  [peer mesh:node-a]\n"),
             "got: {out}"
         );
         // The header separates local from peer counts.

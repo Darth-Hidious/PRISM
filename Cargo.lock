@@ -5084,6 +5084,7 @@ dependencies = [
  "hex",
  "polars",
  "prism-llm",
+ "prism-ontology",
  "prism-provenance",
  "reqwest",
  "serde",
@@ -5191,6 +5192,17 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "prism-ontology"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sophia",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
