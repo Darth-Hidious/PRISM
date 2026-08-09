@@ -23,6 +23,9 @@
 //! disappearing during a refactor. Anything finer would need real control-flow
 //! analysis and would be brittle enough that people would delete the test.
 
+/// Pre-main store isolation — every integration binary must declare this.
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

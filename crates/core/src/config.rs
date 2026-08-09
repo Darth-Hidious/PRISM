@@ -75,6 +75,12 @@ pub struct MeshSection {
 pub struct OntologySection {
     #[serde(default = "default_engine")]
     pub engine: String,
+    /// Id of the ontology vocabulary local tabular ingest extracts and
+    /// validates with, resolved through prism-ingest's process-wide
+    /// ontology registry. Default: "emmo" (the built-in EMMO materials
+    /// vocabulary). An id nothing registered fails ingest loudly.
+    #[serde(default = "default_ontology_id")]
+    pub id: String,
     #[serde(default = "default_llm_provider")]
     pub llm_provider: String,
     /// Custom ontology mapping rules YAML file path.
@@ -345,6 +351,9 @@ fn default_mesh_port() -> u16 {
 fn default_engine() -> String {
     "llm".into()
 }
+fn default_ontology_id() -> String {
+    "emmo".into()
+}
 fn default_llm_provider() -> String {
     "platform".into()
 }
@@ -423,6 +432,7 @@ impl Default for OntologySection {
     fn default() -> Self {
         Self {
             engine: default_engine(),
+            id: default_ontology_id(),
             llm_provider: default_llm_provider(),
             mapping_file: None,
             locality: default_locality(),
@@ -552,6 +562,7 @@ mod tests {
         assert_eq!(config.services.mode, "managed");
         assert_eq!(config.platform.url, "https://platform.marc27.com");
         assert_eq!(config.ontology.engine, "llm");
+        assert_eq!(config.ontology.id, "emmo");
         assert_eq!(config.ontology.llm_provider, "platform");
         assert_eq!(config.indexer.mode, "platform");
         assert_eq!(config.searcher.mode, "platform");
@@ -649,6 +660,18 @@ api_key_env = "ANTHROPIC_API_KEY"
             config.ontology.mapping_file.as_deref(),
             Some("mappings/materials.yaml")
         );
+        // No `id` in the [ontology] block above → the default ontology.
+        assert_eq!(config.ontology.id, "emmo");
+    }
+
+    /// The `[ontology] id` knob parses, and its absence means the built-in
+    /// default — existing configs select exactly what they always got.
+    #[test]
+    fn ontology_id_knob_parses_and_defaults_to_emmo() {
+        let config: NodeConfig = toml::from_str("[ontology]\nid = \"chem\"\n").unwrap();
+        assert_eq!(config.ontology.id, "chem");
+        let config: NodeConfig = toml::from_str("").unwrap();
+        assert_eq!(config.ontology.id, "emmo");
     }
 
     #[test]

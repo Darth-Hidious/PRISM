@@ -1403,6 +1403,31 @@ fn truncate_for_error(text: &str) -> String {
 // override), then `$PRISM_PROVENANCE_DB`, then `~/.prism/provenance.db`.
 // The written record id is stored under the step id (and any declared
 // `outputs` binding for `record_id`).
+
+/// Production fallback for the provenance step's store path: the user's
+/// `~/.prism/provenance.db`.
+#[cfg(not(feature = "test-guard"))]
+fn home_fallback_store_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".prism/provenance.db"))
+}
+
+/// `test-guard` build (this crate's own test targets, armed by the self
+/// dev-dependency; never a production build): a test ran a provenance step
+/// with no `provenance_db` in context and no `$PRISM_PROVENANCE_DB` — the
+/// next open would have been the user's LIVE store. Abort loudly instead;
+/// same rationale as `prism_agent::hooks::provenance_db_path` (a panic can
+/// be swallowed, an abort cannot).
+#[cfg(feature = "test-guard")]
+fn home_fallback_store_path() -> Option<PathBuf> {
+    eprintln!(
+        "FATAL (prism-workflows test-guard): a provenance step fell through \
+         to the $HOME store fallback — the user's live provenance store \
+         (~/.prism/provenance.db). Pass `provenance_db` in the workflow \
+         context or set PRISM_PROVENANCE_DB to a scratch path."
+    );
+    std::process::abort();
+}
+
 async fn run_provenance_step(
     step: &WorkflowStep,
     context: &mut BTreeMap<String, serde_json::Value>,
@@ -1431,9 +1456,7 @@ async fn run_provenance_step(
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
         .or_else(|| env::var("PRISM_PROVENANCE_DB").ok().map(PathBuf::from))
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".prism/provenance.db"))
-        })
+        .or_else(home_fallback_store_path)
         .ok_or_else(|| {
             anyhow!(
                 "provenance step '{}': cannot resolve a provenance db path \

@@ -379,6 +379,20 @@ pub async fn start_server(
     Ok((addr, handle))
 }
 
+/// Unit-test binary: point provenance writes at a scratch store BEFORE any
+/// test (or thread) starts. The chat-handler tests drive the REAL agent
+/// loop, which otherwise opens the user's live `~/.prism/provenance.db` —
+/// prism-agent's `test-guard` (armed for this crate's tests via
+/// dev-dependencies) aborts on that. Integration binaries do the same
+/// through `tests/common/mod.rs`.
+// SAFETY (ctor): pre-main; the body only touches the environment, which is
+// exactly what must happen before any thread can exist.
+#[cfg(test)]
+#[ctor::ctor(unsafe)]
+fn isolate_provenance_store_for_unit_tests() {
+    prism_agent::testsupport::isolate_provenance_store_pre_main();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -112,6 +112,17 @@ pub const CORE_TOOL_SET: &[&str] = &[
     "hea_descriptors",
     "polymer_insulation_properties",
     "evaluate_candidate",
+    // ...and search + compute without INGESTION means a core-set model can
+    // read the literature and put nothing into the knowledge graph — the
+    // same "it chose the only thing on offer" failure as compute, for the
+    // ingest half of the loop. `papers` is the unattended literature read;
+    // `ingest_file` (approval-gated) ingests local files, including hosted
+    // PDF ingest via platform=true; `ingest_and_wait` lands a URL in the
+    // platform graph and VERIFIES it finished instead of reporting an
+    // unconfirmed submission.
+    "papers",
+    "ingest_file",
+    "ingest_and_wait",
     // environment / discovery
     "status",
     "list_tools",
@@ -410,6 +421,21 @@ mod tests {
             "polymer_insulation_properties",
             "evaluate_candidate",
         ] {
+            assert!(
+                CORE_TOOL_SET.contains(&tool),
+                "{tool} must be reachable by a core-set model"
+            );
+        }
+    }
+
+    /// A weak/local model must be able to INGEST, not only search and
+    /// compute. The owner's framing: "The LLM will be trying to ingest
+    /// stuff from a lot of places. It should be able to do that." — a core
+    /// set with no ingestion tool reproduces the recorded compute failure
+    /// ("it chose the only thing on offer") for the ingest half of the loop.
+    #[test]
+    fn core_tool_set_can_ingest_not_only_search_and_compute() {
+        for tool in ["papers", "ingest_file", "ingest_and_wait"] {
             assert!(
                 CORE_TOOL_SET.contains(&tool),
                 "{tool} must be reachable by a core-set model"

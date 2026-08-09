@@ -101,16 +101,20 @@ impl LlmOntologyConstructor {
         self.client.embed(texts).await
     }
 
+    /// Build the tabular extraction prompt. The preamble and the
+    /// `## Instructions` block come from the ACTIVE ontology — the same
+    /// adapter whose declared vocabulary `graph_validation` accepts — so
+    /// what the model is told to emit and what the validator accepts
+    /// cannot drift apart per ontology.
     fn build_extraction_prompt_with_mapping(
+        ontology: &dyn crate::ontologies::Ontology,
         schema: &SchemaAnalysis,
         sample_rows: &[Vec<String>],
         mapping: Option<&crate::mapping::OntologyMapping>,
     ) -> String {
         let mut prompt = String::with_capacity(2048);
-        prompt.push_str(
-            "You are a materials science data analyst. Given a dataset schema and sample rows, \
-             extract all entities and relationships into a structured JSON format.\n\n",
-        );
+        prompt.push_str(&ontology.extraction_preamble());
+        prompt.push_str("\n\n");
 
         prompt.push_str("## Schema\n");
         prompt.push_str("Columns: ");
@@ -128,25 +132,7 @@ impl LlmOntologyConstructor {
         }
         prompt.push('\n');
 
-        prompt.push_str(
-            "## Instructions\n\
-             Identify ALL materials science entities:\n\
-             - Alloy/Material compositions (type: \"Alloy\" or \"Material\")\n\
-             - Elements with fractions (type: \"Element\")\n\
-             - Processing steps with parameters (type: \"Process\")\n\
-             - Measured properties with values and units (type: \"Property\")\n\
-             - Phases or crystal structures (type: \"Phase\")\n\n\
-             Identify ALL relationships:\n\
-             - CONTAINS (material → element, with weight = fraction)\n\
-             - PROCESSED_BY (material → process, with order)\n\
-             - HAS_PROPERTY (material → property)\n\
-             - HAS_PHASE (material → phase)\n\n\
-             Return ONLY valid JSON with this structure:\n\
-             {\n\
-               \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\
-               \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}]\n\
-             }\n",
-        );
+        prompt.push_str(&ontology.extraction_instructions());
 
         // Append custom mapping rules if provided
         if let Some(m) = mapping {
@@ -256,15 +242,17 @@ impl OntologyConstructor for LlmOntologyConstructor {
 impl LlmOntologyConstructor {
     pub async fn extract_entities_with_samples(
         &self,
+        ontology: &dyn crate::ontologies::Ontology,
         schema: &SchemaAnalysis,
         sample_rows: &[Vec<String>],
     ) -> Result<EntitySet> {
-        self.extract_entities_with_mapping(schema, sample_rows, None)
+        self.extract_entities_with_mapping(ontology, schema, sample_rows, None)
             .await
     }
 
     pub async fn extract_entities_with_mapping(
         &self,
+        ontology: &dyn crate::ontologies::Ontology,
         schema: &SchemaAnalysis,
         sample_rows: &[Vec<String>],
         mapping: Option<&crate::mapping::OntologyMapping>,
@@ -310,7 +298,7 @@ impl LlmOntologyConstructor {
             "extracting entities via LLM with samples"
         );
 
-        let prompt = Self::build_extraction_prompt_with_mapping(schema, rows, mapping);
+        let prompt = Self::build_extraction_prompt_with_mapping(ontology, schema, rows, mapping);
         let response = self.generate(&prompt).await?;
 
         let raw: ExtractionOutput =
@@ -375,14 +363,66 @@ mod tests {
             detected_types: vec!["string".into(), "float".into()],
         };
         let rows = vec![vec!["Nb25Mo25Ta25W25".into(), "542".into()]];
-        let prompt =
-            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &rows, None);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(
+            &crate::ontologies::EmmoOntology,
+            &schema,
+            &rows,
+            None,
+        );
 
         assert!(prompt.contains("Composition (string)"));
         assert!(prompt.contains("Hardness_HV (float)"));
         assert!(prompt.contains("Nb25Mo25Ta25W25"));
         assert!(prompt.contains("CONTAINS"));
         assert!(prompt.contains("PROCESSED_BY"));
+    }
+
+    /// The byte-identity contract: with the built-in EMMO ontology active,
+    /// the extraction prompt is EXACTLY the string the pre-trait hardcoded
+    /// builder produced — the expected value below is that builder's output,
+    /// reconstructed literal-for-literal. Existing users' extractions must
+    /// not shift by a byte because the vocabulary moved behind a trait.
+    #[test]
+    fn emmo_prompt_is_byte_identical_to_the_legacy_hardcoded_prompt() {
+        let schema = SchemaAnalysis {
+            columns: vec!["Composition".into(), "Hardness_HV".into()],
+            detected_types: vec!["string".into(), "float".into()],
+        };
+        let rows = vec![vec!["Nb25Mo25Ta25W25".into(), "542".into()]];
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(
+            &crate::ontologies::EmmoOntology,
+            &schema,
+            &rows,
+            None,
+        );
+
+        let expected = concat!(
+            "You are a materials science data analyst. Given a dataset schema and sample rows, \
+             extract all entities and relationships into a structured JSON format.\n\n",
+            "## Schema\n",
+            "Columns: Composition (string), Hardness_HV (float)\n\n",
+            "## Sample Rows\n",
+            "Row 1: [\"Nb25Mo25Ta25W25\", \"542\"]\n",
+            "\n",
+            "## Instructions\n\
+             Identify ALL materials science entities:\n\
+             - Alloy/Material compositions (type: \"Alloy\" or \"Material\")\n\
+             - Elements with fractions (type: \"Element\")\n\
+             - Processing steps with parameters (type: \"Process\")\n\
+             - Measured properties with values and units (type: \"Property\")\n\
+             - Phases or crystal structures (type: \"Phase\")\n\n\
+             Identify ALL relationships:\n\
+             - CONTAINS (material → element, with weight = fraction)\n\
+             - PROCESSED_BY (material → process, with order)\n\
+             - HAS_PROPERTY (material → property)\n\
+             - HAS_PHASE (material → phase)\n\n\
+             Return ONLY valid JSON with this structure:\n\
+             {\n\
+               \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\
+               \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}]\n\
+             }\n",
+        );
+        assert_eq!(prompt, expected);
     }
 
     #[test]
@@ -440,8 +480,12 @@ mod tests {
             columns: vec!["Composition".into()],
             detected_types: vec!["string".into()],
         };
-        let prompt =
-            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(
+            &crate::ontologies::EmmoOntology,
+            &schema,
+            &[],
+            None,
+        );
         // Must still include schema and instructions — just no row data.
         assert!(prompt.contains("Composition (string)"));
         assert!(prompt.contains("CONTAINS"));
@@ -457,8 +501,12 @@ mod tests {
             columns,
             detected_types: types,
         };
-        let prompt =
-            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(
+            &crate::ontologies::EmmoOntology,
+            &schema,
+            &[],
+            None,
+        );
         // All 12 columns must appear.
         for i in 0..12 {
             assert!(prompt.contains(&format!("col_{i}")));
@@ -471,8 +519,12 @@ mod tests {
             columns: vec!["X".into()],
             detected_types: vec!["int".into()],
         };
-        let prompt =
-            LlmOntologyConstructor::build_extraction_prompt_with_mapping(&schema, &[], None);
+        let prompt = LlmOntologyConstructor::build_extraction_prompt_with_mapping(
+            &crate::ontologies::EmmoOntology,
+            &schema,
+            &[],
+            None,
+        );
         assert!(prompt.contains("## Instructions"));
         assert!(prompt.contains("Return ONLY valid JSON"));
     }
@@ -598,7 +650,7 @@ mod tests {
         // below distinguishes the refusal from any such failure.
         let constructor = LlmOntologyConstructor::new(LlmConfig::default());
         let err = constructor
-            .extract_entities_with_samples(&schema, &[])
+            .extract_entities_with_samples(&crate::ontologies::EmmoOntology, &schema, &[])
             .await
             .expect_err("zero sample rows must be refused");
         let msg = format!("{err:#}");

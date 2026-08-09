@@ -283,6 +283,54 @@ fn provenance_model() -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// Resolve the path of the durable provenance store.
+///
+/// Order: `$PRISM_PROVENANCE_DB` — the platform's documented override for
+/// this database (the workflow provenance step honors the same variable),
+/// and the injection point tests use to aim writes at a scratch store —
+/// then the production default `~/.prism/provenance.db`, unchanged.
+///
+/// Every open of the durable store in this crate MUST resolve its path
+/// here; open-coding the default is how the test suite ended up writing
+/// into the user's live database.
+#[track_caller]
+pub fn provenance_db_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("PRISM_PROVENANCE_DB")
+        && !p.is_empty()
+    {
+        return std::path::PathBuf::from(p);
+    }
+    default_store_path()
+}
+
+#[cfg(not(feature = "test-guard"))]
+fn default_store_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".prism/provenance.db"))
+        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"))
+}
+
+/// `test-guard` build (every test target of this crate, via the self
+/// dev-dependency; never a production build): resolving the default path
+/// means test code was about to open the user's LIVE provenance store.
+/// Abort — deliberately not a panic, because two call sites resolve inside
+/// detached `tokio::spawn` tasks, where a panic is silently swallowed and
+/// the offending test stays green.
+#[cfg(feature = "test-guard")]
+#[track_caller]
+fn default_store_path() -> std::path::PathBuf {
+    eprintln!(
+        "FATAL (prism-agent test-guard): {} resolved the DEFAULT provenance \
+         store path — the user's live provenance store (~/.prism/provenance.db). \
+         Isolate the test by setting PRISM_PROVENANCE_DB to a scratch path: \
+         integration binaries declare `mod common;`, the lib test binary \
+         injects it pre-main. Aborting instead of panicking because a panic \
+         inside a detached tokio task is swallowed.",
+        std::panic::Location::caller(),
+    );
+    std::process::abort();
+}
+
 /// Build the default hook registry with safety + cost + audit + provenance hooks.
 pub fn build_default_hooks() -> HookRegistry {
     let mut registry = HookRegistry::new();
@@ -540,9 +588,7 @@ fn provenance_hook() -> Hook {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     handle.spawn(async move {
-                        let db_path = dirs::home_dir()
-                            .map(|h| h.join(".prism/provenance.db"))
-                            .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                        let db_path = provenance_db_path();
                         match prism_provenance::ProvenanceStore::open(&db_path).await {
                             Ok(store) => {
                                 if let Err(e) = store.record(&record).await {
@@ -607,6 +653,53 @@ mod tests {
     /// poisoned lock (`into_inner`) since the guard only serializes — it holds no
     /// invariant of its own.
     static SERIAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Guard self-test: a test that resolves the DEFAULT store path (no
+    /// `PRISM_PROVENANCE_DB` override) must be killed, not allowed to open
+    /// the user's live `~/.prism/provenance.db`. Runs the probe below in a
+    /// subprocess because the guard aborts the whole process — deliberately,
+    /// since a panic inside a detached tokio task is swallowed and the
+    /// offending test would stay green.
+    ///
+    /// `PRISM_TEST_NO_STORE_ISOLATION=1` keeps the probe process's pre-main
+    /// ctor from re-injecting a scratch path — i.e. the probe IS "one test
+    /// with its isolation removed".
+    #[test]
+    fn guard_kills_a_test_that_resolves_the_default_store_path() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "hooks::tests::guard_probe_resolves_default_store_path",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove("PRISM_PROVENANCE_DB")
+            .env("PRISM_TEST_NO_STORE_ISOLATION", "1")
+            .output()
+            .expect("spawn guard probe subprocess");
+        assert!(
+            !out.status.success(),
+            "guard did NOT fire: the probe resolved the default (live) store \
+             path and exited cleanly.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("test-guard"),
+            "probe died, but without the guard's abort message — it must \
+             fail FOR THE RIGHT REASON.\nstderr: {stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "probe: run only as the subprocess of \
+                guard_kills_a_test_that_resolves_the_default_store_path"]
+    fn guard_probe_resolves_default_store_path() {
+        let _ = super::provenance_db_path();
+    }
 
     #[test]
     fn safety_hook_blocks_destructive_keywords() {

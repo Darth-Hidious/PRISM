@@ -57,6 +57,11 @@ pub struct PipelineConfig {
     /// Path of the bundled Turso provenance store the extracted facts are
     /// written to. If None, defaults to `~/.prism/provenance.db`.
     pub provenance_db: Option<PathBuf>,
+    /// Id of the ontology this run extracts and validates with, resolved
+    /// through the process-wide registry (`crate::ontologies`). `None` ⇒
+    /// the built-in default (EMMO). An id nothing registered fails the run
+    /// loudly — never a silent EMMO fallback.
+    pub ontology: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -66,6 +71,7 @@ impl Default for PipelineConfig {
             max_sample_rows: 10,
             mapping: None,
             provenance_db: None,
+            ontology: None,
         }
     }
 }
@@ -92,6 +98,7 @@ impl IngestPipeline {
                 max_sample_rows: 10,
                 mapping: None,
                 provenance_db: None,
+                ontology: None,
             },
         }
     }
@@ -132,6 +139,13 @@ impl IngestPipeline {
     async fn run_pipeline(&self, df: DataFrame, source: DataSource) -> Result<IngestResult> {
         let row_count = df.height();
         let column_count = df.width();
+
+        // Resolve the ACTIVE ontology once, up front: the extraction prompt
+        // and graph validation both read this ONE adapter, so what the model
+        // is instructed to emit and what the validator accepts cannot
+        // disagree. An unregistered configured id fails the whole run here —
+        // ingesting under a silently substituted vocabulary would be worse.
+        let ontology = crate::ontologies::active(self.config.ontology.as_deref())?;
 
         // Step 1: Schema detection
         let schema = SchemaDetector::detect(&df)?;
@@ -180,7 +194,12 @@ impl IngestPipeline {
             );
 
             match constructor
-                .extract_entities_with_mapping(&schema, &sample_rows, self.config.mapping.as_ref())
+                .extract_entities_with_mapping(
+                    ontology.as_ref(),
+                    &schema,
+                    &sample_rows,
+                    self.config.mapping.as_ref(),
+                )
                 .await
             {
                 Ok(entities) => {
@@ -208,7 +227,8 @@ impl IngestPipeline {
         // exist, and refuse the graph write on Error-severity issues (orphan
         // relationships, empty names) rather than upserting garbage.
         let graph_validation = entities.as_ref().map(|entity_set| {
-            let (report, blocking_error) = validate_before_graph_write(entity_set);
+            let (report, blocking_error) =
+                validate_before_graph_write(ontology.as_ref(), entity_set);
             if let Some(msg) = blocking_error {
                 tracing::error!(issues = report.issues.len(), "{msg}");
                 errors.push(msg);
@@ -226,8 +246,15 @@ impl IngestPipeline {
         // entities exist and validation passed). This replaced the Neo4j
         // upsert (Neo4j retirement, step 1) — the store is bundled, so no
         // backend config gates the write.
+        // Facts land under the ontology's storage tenant: the default
+        // ontology keeps the bare "local" tenant every existing store was
+        // written with; any other ontology gets a composed tenant, which is
+        // what keeps two vocabularies in one store from blending (the same
+        // tenant-qualified isolation that separates local and peer knowledge).
+        let tenant =
+            crate::ontologies::storage_tenant(prism_provenance::LOCAL_TENANT, ontology.id());
         let graph = if graph_validation_passed && let Some(entity_set) = &entities {
-            match self.write_local_graph(entity_set, &source).await {
+            match self.write_local_graph(entity_set, &source, &tenant).await {
                 Ok(update) => {
                     tracing::info!(
                         nodes = update.nodes_created,
@@ -263,12 +290,14 @@ impl IngestPipeline {
         })
     }
 
-    /// Write the extracted entities/relationships as EMMO facts (with one
-    /// PROV-O activity for the run) into the bundled Turso provenance store.
+    /// Write the extracted entities/relationships as typed facts (with one
+    /// PROV-O activity for the run) into the bundled Turso provenance store,
+    /// under the active ontology's storage tenant.
     async fn write_local_graph(
         &self,
         entity_set: &EntitySet,
         source: &DataSource,
+        tenant: &str,
     ) -> Result<GraphUpdate> {
         let db_path = match &self.config.provenance_db {
             Some(p) => p.clone(),
@@ -291,8 +320,9 @@ impl IngestPipeline {
             agent_kind: "SoftwareAgent".into(),
             source_entity_id: source.path.clone(),
             source_kind: "Document".into(),
-            // Local single-user store — no per-pipeline tenancy (yet).
-            tenant: "local".into(),
+            // "local" for the default ontology; "local@{id}" otherwise —
+            // see `ontologies::storage_tenant`.
+            tenant: tenant.to_string(),
             started_at: now.clone(),
             ended_at: now,
             locality: "local".into(),
@@ -353,17 +383,19 @@ impl Default for IngestPipeline {
     }
 }
 
-/// Run graph-quality validation on extracted entities and decide whether the
-/// graph write should proceed. Returns the full report plus, when
-/// Error-severity issues are present, a message describing why the write
-/// was blocked (`None` means the write may proceed).
+/// Run graph-quality validation on extracted entities — against the ACTIVE
+/// ontology's vocabulary — and decide whether the graph write should
+/// proceed. Returns the full report plus, when Error-severity issues are
+/// present, a message describing why the write was blocked (`None` means
+/// the write may proceed).
 fn validate_before_graph_write(
+    ontology: &dyn crate::ontologies::Ontology,
     entity_set: &EntitySet,
 ) -> (
     crate::graph_validation::GraphValidationReport,
     Option<String>,
 ) {
-    let report = crate::graph_validation::validate_graph(entity_set);
+    let report = crate::graph_validation::validate_graph(ontology, entity_set);
     if report.passed {
         return (report, None);
     }
@@ -481,7 +513,8 @@ mod tests {
                 order: None,
             }],
         };
-        let (report, blocking_error) = validate_before_graph_write(&entity_set);
+        let (report, blocking_error) =
+            validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
         assert!(!report.passed);
         let msg = blocking_error.expect("orphan relationship must block the graph write");
         assert!(msg.contains("graph validation failed"));
@@ -499,7 +532,8 @@ mod tests {
             }],
             relationships: vec![],
         };
-        let (report, blocking_error) = validate_before_graph_write(&entity_set);
+        let (report, blocking_error) =
+            validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
         assert!(report.passed);
         assert!(blocking_error.is_none());
     }
@@ -528,6 +562,7 @@ mod tests {
             max_sample_rows: 10,
             mapping: None,
             provenance_db: Some(db_path.clone()),
+            ontology: None,
         });
 
         let entity_set = EntitySet {
@@ -571,7 +606,7 @@ mod tests {
         };
 
         let update = pipeline
-            .write_local_graph(&entity_set, &source)
+            .write_local_graph(&entity_set, &source, "local")
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 3);
@@ -631,6 +666,7 @@ mod tests {
             max_sample_rows: 10,
             mapping: None,
             provenance_db: Some(db_path.clone()),
+            ontology: None,
         });
 
         let entity_set = EntitySet {
@@ -666,7 +702,7 @@ mod tests {
         };
 
         let update = pipeline
-            .write_local_graph(&entity_set, &source)
+            .write_local_graph(&entity_set, &source, "local")
             .await
             .unwrap();
 
@@ -936,6 +972,7 @@ mod tests {
             max_sample_rows: 10,
             mapping: None,
             provenance_db: Some(db_path),
+            ontology: None,
         })
     }
 
@@ -1146,5 +1183,271 @@ mod tests {
         );
         assert!(result.graph.is_none());
         server.verify().await;
+    }
+
+    // ── Pluggable ontologies, at PRODUCTION dispatch ───────────────────
+    //
+    // These tests exercise `ingest_file` itself: the ontology is registered
+    // in the PROCESS-WIDE registry at runtime and selected by id through
+    // `PipelineConfig.ontology` — no local registry, no direct calls into
+    // the adapter. They die if the pipeline stops consulting the registry,
+    // stops building the prompt from the active ontology, stops validating
+    // against it, or stops composing the storage tenant from its id.
+
+    /// A minimal chemistry vocabulary, nothing like EMMO's.
+    struct ChemOntology {
+        id: &'static str,
+    }
+
+    impl crate::ontologies::Ontology for ChemOntology {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn entity_types(&self) -> &'static [&'static str] {
+            &["Molecule"]
+        }
+        fn relationship_types(&self) -> &'static [&'static str] {
+            &["REACTS_WITH"]
+        }
+        fn unit_vocabulary(&self) -> crate::ontologies::UnitVocabulary {
+            crate::ontologies::UnitVocabulary {
+                name: "FREE",
+                prefix: None,
+            }
+        }
+    }
+
+    /// A mock LLM endpoint that returns `extraction` for every chat call.
+    async fn mock_llm(extraction: serde_json::Value) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"content": extraction.to_string()},
+                "finish_reason": "stop"
+            }]
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn chem_extraction() -> serde_json::Value {
+        serde_json::json!({
+            "entities": [
+                {"type": "Molecule", "name": "H2O", "properties": {}},
+                {"type": "Molecule", "name": "O3", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "H2O", "rel": "REACTS_WITH", "to": "O3"}
+            ]
+        })
+    }
+
+    fn emmo_extraction() -> serde_json::Value {
+        serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Steel", "properties": {}},
+                {"type": "Element", "name": "Fe", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Steel", "rel": "CONTAINS", "to": "Fe", "weight": 1.0}
+            ]
+        })
+    }
+
+    /// The core requirement, both directions, through the real pipeline: a
+    /// SECOND ontology registered at runtime (1) instructs extraction from
+    /// ITS vocabulary, (2) validates ITS facts as in-vocabulary and EMMO's
+    /// as foreign, and (3) EMMO (the default) flags the second ontology's
+    /// facts as foreign — prompt and validator both reading the ONE active
+    /// adapter.
+    #[tokio::test]
+    async fn a_second_ontology_instructs_and_validates_from_its_own_vocabulary() {
+        use std::sync::Arc;
+
+        // Mutates/reads process-wide registries around other tests'
+        // mutation windows: one shared lock for this binary.
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        crate::ontologies::register_ontology(Arc::new(ChemOntology {
+            id: "chem-crossval",
+        }))
+        .expect("a novel ontology must register");
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("molecule,reacts_with\nH2O,O3\n");
+
+        // ── Chem facts under the chem ontology: in-vocabulary. ──────────
+        let server = mock_llm(chem_extraction()).await;
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            ontology: Some("chem-crossval".into()),
+            ..pipeline_against(server.uri(), scratch.db_path()).config
+        });
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        // The PROMPT was built from the chem vocabulary, not EMMO's: the
+        // request that actually reached the model names the chem types and
+        // carries none of the EMMO instruction block.
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(requests.len(), 1);
+        let sent = String::from_utf8_lossy(&requests[0].body).into_owned();
+        assert!(
+            sent.contains("Molecule"),
+            "prompt lacks the chem vocabulary"
+        );
+        assert!(sent.contains("REACTS_WITH"), "prompt lacks the chem rels");
+        assert!(
+            !sent.contains("materials science data analyst"),
+            "the EMMO preamble leaked into a chem extraction"
+        );
+
+        // Validation accepted the chem vocabulary…
+        let report = result.graph_validation.expect("validation ran");
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_type" || i.category == "unknown_rel"),
+            "{:?}",
+            report.issues
+        );
+
+        // ── The SAME chem facts under the DEFAULT ontology: foreign. ────
+        let server = mock_llm(chem_extraction()).await;
+        let pipeline = pipeline_against(server.uri(), scratch.db_path());
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        let report = result.graph_validation.expect("validation ran");
+        assert!(
+            report.issues.iter().any(|i| i.category == "unknown_type"
+                && i.message.contains("Molecule")
+                && i.message.contains("expected one of: Alloy")),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_rel" && i.message.contains("REACTS_WITH")),
+            "{:?}",
+            report.issues
+        );
+
+        // ── And EMMO-shaped facts under the chem ontology: foreign. ─────
+        let server = mock_llm(emmo_extraction()).await;
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            ontology: Some("chem-crossval".into()),
+            ..pipeline_against(server.uri(), scratch.db_path()).config
+        });
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        let report = result.graph_validation.expect("validation ran");
+        assert!(
+            report.issues.iter().any(|i| i.category == "unknown_type"
+                && i.message.contains("Alloy")
+                && i.message.contains("expected one of: Molecule")),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_rel" && i.message.contains("CONTAINS")),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// Coexistence: EMMO and a second ontology ingested into ONE store land
+    /// in disjoint, tenant-scoped subgraphs. Reads scoped to each tenant see
+    /// only their own facts, and the default read scope (local + mesh) never
+    /// picks up the second ontology's subgraph.
+    #[tokio::test]
+    async fn two_ontologies_coexist_in_one_store_without_blending() {
+        use std::sync::Arc;
+
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        crate::ontologies::register_ontology(Arc::new(ChemOntology { id: "chem-coexist" }))
+            .expect("a novel ontology must register");
+
+        let scratch = RefusalScratch::new();
+        let db_path = scratch.db_path();
+        let csv = scratch.csv("a,b\nx,y\n");
+
+        // Run 1: default (EMMO) → bare "local" tenant, as always.
+        let server = mock_llm(emmo_extraction()).await;
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.graph.is_some());
+
+        // Run 2: chem → composed "local@chem-coexist" tenant, SAME store.
+        let server = mock_llm(chem_extraction()).await;
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            ontology: Some("chem-coexist".into()),
+            ..pipeline_against(server.uri(), db_path.clone()).config
+        });
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.graph.is_some());
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+
+        // EMMO's subgraph is visible under "local" and ONLY there.
+        let hits = store.graph_search("Steel", "local", 10).await.unwrap();
+        assert!(hits.iter().any(|n| n.name == "Steel"));
+        let hits = store
+            .graph_search("Steel", "local@chem-coexist", 10)
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "EMMO facts leaked into the chem tenant");
+
+        // Chem's subgraph is visible under its composed tenant and ONLY there.
+        let hits = store
+            .graph_search("H2O", "local@chem-coexist", 10)
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|n| n.name == "H2O"));
+        let hits = store.graph_search("H2O", "local", 10).await.unwrap();
+        assert!(
+            hits.is_empty(),
+            "chem facts blended into the default EMMO tenant"
+        );
+
+        // Assertions are tenant-scoped the same way.
+        let facts = store
+            .recall_with_context("H2O", "local@chem-coexist", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].tenant, "local@chem-coexist");
+        assert!(
+            store
+                .recall_with_context("H2O", "local", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The DEFAULT read scope (local + discovered mesh tenants) does not
+        // silently absorb the second ontology's subgraph.
+        assert_eq!(store.default_read_tenants().await.unwrap(), ["local"]);
     }
 }
