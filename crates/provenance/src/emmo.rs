@@ -878,46 +878,87 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
 /// subsequent `open()` of that database, permanently, until someone edits it by
 /// hand. Skipping one row and saying so is recoverable; bricking the store is
 /// not.
+///
+/// "and saying so" is load-bearing and is why each statement re-counts its own
+/// predicate afterwards. `execute` returns rows CHANGED, and a row dropped by
+/// `OR IGNORE` is not counted — so without the recount a collision is
+/// indistinguishable from having had nothing to do. The row that loses a
+/// collision keeps its unqualified key, and every read path builds
+/// `{tenant}|{key}`, so it becomes unreachable: silent, tenant-scoped data
+/// loss. A skip must be loud enough that someone can go and find the row.
 async fn migrate_keys_to_tenant_qualified(conn: &turso::Connection) -> Result<()> {
     // `instr(key, '|') = 0` ⇒ not yet qualified. Entities and vectors
     // first, then the edge endpoints that reference them.
     const EDGE_ID_EXPR: &str =
         "tenant || '|' || source_key || '|' || rel_type || '|' || target_key";
-    let edge_id_sql = format!(
-        // `emmo_edge.id` is derived from (tenant, source_key, rel_type,
-        // target_key), so rewriting the endpoints above invalidates it — the
-        // next `upsert_edge` would compute a different id and insert a
-        // duplicate. Recompute it from its components, which is exactly what
-        // `upsert_edge` does.
-        //
-        // The `id <> {expr}` predicate is what makes a second pass free rather
-        // than merely harmless: without it this matches every tenanted row and
-        // rewrites each one to the value it already holds.
-        "UPDATE OR IGNORE emmo_edge SET id = {EDGE_ID_EXPR}
-          WHERE tenant IS NOT NULL AND tenant <> '' AND id <> {EDGE_ID_EXPR}"
+    // `emmo_edge.id` is derived from (tenant, source_key, rel_type,
+    // target_key), so rewriting the endpoints above invalidates it — the next
+    // `upsert_edge` would compute a different id and insert a duplicate.
+    // Recompute it from its components, which is what `upsert_edge` does.
+    //
+    // The already-migrated predicate is what makes a second pass free rather
+    // than merely harmless: without it this matches every tenanted row and
+    // rewrites each one to the value it already holds.
+    //
+    // `IS NOT` rather than `<>`, and the three component NULL guards: all three
+    // of `source_key`, `rel_type` and `target_key` are nullable `TEXT`, and
+    // SQLite's `||` yields NULL if ANY operand is NULL. Under `<>` a row with a
+    // NULL component compares NULL — neither true nor false — so it is
+    // excluded, the version is stamped, and it is never retried. The guards
+    // keep the concatenation non-NULL; `IS NOT` additionally catches a row
+    // whose own `id` is NULL.
+    let edge_id_where = format!(
+        "WHERE tenant IS NOT NULL AND tenant <> '' \
+         AND source_key IS NOT NULL AND rel_type IS NOT NULL AND target_key IS NOT NULL \
+         AND id IS NOT ({EDGE_ID_EXPR})"
     );
-    for (what, sql) in [
+    let edge_id_sql = format!("UPDATE OR IGNORE emmo_edge SET id = {EDGE_ID_EXPR} {edge_id_where}");
+
+    const UNQUALIFIED: &str = "WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''";
+    let entity_sql =
+        format!("UPDATE OR IGNORE emmo_entity SET key = tenant || '|' || key {UNQUALIFIED}");
+    let embedding_sql =
+        format!("UPDATE OR IGNORE emmo_embedding SET key = tenant || '|' || key {UNQUALIFIED}");
+    const EDGE_ENDPOINT: &str = "AND tenant IS NOT NULL AND tenant <> ''";
+    let source_sql = format!(
+        "UPDATE OR IGNORE emmo_edge SET source_key = tenant || '|' || source_key \
+         WHERE instr(source_key, '|') = 0 {EDGE_ENDPOINT}"
+    );
+    let target_sql = format!(
+        "UPDATE OR IGNORE emmo_edge SET target_key = tenant || '|' || target_key \
+         WHERE instr(target_key, '|') = 0 {EDGE_ENDPOINT}"
+    );
+
+    for (what, sql, remaining_sql) in [
         (
             "emmo_entity.key",
-            "UPDATE OR IGNORE emmo_entity SET key = tenant || '|' || key
-               WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+            entity_sql.as_str(),
+            format!("SELECT COUNT(*) FROM emmo_entity {UNQUALIFIED}"),
         ),
         (
             "emmo_embedding.key",
-            "UPDATE OR IGNORE emmo_embedding SET key = tenant || '|' || key
-               WHERE instr(key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+            embedding_sql.as_str(),
+            format!("SELECT COUNT(*) FROM emmo_embedding {UNQUALIFIED}"),
         ),
         (
             "emmo_edge.source_key",
-            "UPDATE OR IGNORE emmo_edge SET source_key = tenant || '|' || source_key
-               WHERE instr(source_key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+            source_sql.as_str(),
+            format!(
+                "SELECT COUNT(*) FROM emmo_edge WHERE instr(source_key, '|') = 0 {EDGE_ENDPOINT}"
+            ),
         ),
         (
             "emmo_edge.target_key",
-            "UPDATE OR IGNORE emmo_edge SET target_key = tenant || '|' || target_key
-               WHERE instr(target_key, '|') = 0 AND tenant IS NOT NULL AND tenant <> ''",
+            target_sql.as_str(),
+            format!(
+                "SELECT COUNT(*) FROM emmo_edge WHERE instr(target_key, '|') = 0 {EDGE_ENDPOINT}"
+            ),
         ),
-        ("emmo_edge.id", edge_id_sql.as_str()),
+        (
+            "emmo_edge.id",
+            edge_id_sql.as_str(),
+            format!("SELECT COUNT(*) FROM emmo_edge {edge_id_where}"),
+        ),
     ] {
         let affected = conn
             .execute(sql, ())
@@ -930,8 +971,34 @@ async fn migrate_keys_to_tenant_qualified(conn: &turso::Connection) -> Result<()
                 "tenant-qualified legacy keys"
             );
         }
+        // Anything still matching the predicate lost a primary-key collision.
+        let skipped = count_matching(conn, &remaining_sql).await?;
+        if skipped > 0 {
+            tracing::warn!(
+                column = what,
+                rows = skipped,
+                "legacy keys could NOT be tenant-qualified: the qualified key already exists. \
+                 These rows keep their unqualified key and are invisible to every tenant-scoped \
+                 read. Recovering them means reconciling the duplicate pair by hand."
+            );
+        }
     }
     Ok(())
+}
+
+/// Run a `SELECT COUNT(*)` and drain the cursor before returning.
+async fn count_matching(conn: &turso::Connection, sql: &str) -> Result<i64> {
+    let mut rows = conn.query(sql, ()).await?;
+    let n = match rows.next().await? {
+        Some(row) => row
+            .get_value(0)
+            .ok()
+            .and_then(|v| v.as_integer().copied())
+            .unwrap_or(0),
+        None => 0,
+    };
+    while rows.next().await?.is_some() {}
+    Ok(n)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2728,6 +2795,193 @@ mod tests {
             untouched, 1,
             "the edge-key migration ran again after the database was stamped — \
              it rewrites every tenanted edge id, on every open",
+        );
+    }
+
+    /// The positive direction: an UNSTAMPED database must actually migrate.
+    ///
+    /// Its sibling above only proves the migration is skipped once stamped —
+    /// which a `run_key_migrations` short-circuited to `Ok(())` would also
+    /// satisfy, and so would an inverted `IS NOT` predicate. This pins that the
+    /// stale edge id is genuinely rewritten to the value `upsert_edge` would
+    /// compute, so "does not run twice" cannot be achieved by never running.
+    #[tokio::test]
+    async fn an_unstamped_database_rewrites_a_stale_edge_id() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        drop(store);
+
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO emmo_edge
+                   (id, source_key, target_key, rel_type, predicate, confidence, tenant, props_json)
+                   VALUES ('stale-edge-id', 't1|Matter:steel', 't1|Phase:bcc',
+                           'has_phase', 'has_phase', 0.9, 't1', '{}')"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+        }
+
+        ProvenanceStore::open(&db.path).await.unwrap();
+
+        let database = turso::Builder::new_local(db.path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT id FROM emmo_edge WHERE tenant = 't1'", ())
+            .await
+            .unwrap();
+        let id = rows
+            .next()
+            .await
+            .unwrap()
+            .and_then(|r| r.get_value(0).ok())
+            .and_then(|v| v.as_text().map(|s| s.to_string()))
+            .unwrap_or_default();
+        while rows.next().await.unwrap().is_some() {}
+        assert_eq!(
+            id, "t1|t1|Matter:steel|has_phase|t1|Phase:bcc",
+            "an unstamped database did not rewrite the stale edge id — the \
+             migration never ran, or its predicate excludes rows it must match",
+        );
+    }
+
+    /// An edge row with a NULL component must not be silently skipped forever.
+    ///
+    /// `source_key`, `rel_type` and `target_key` are nullable `TEXT`, and
+    /// SQLite's `||` yields NULL if any operand is NULL. Under a plain `<>` the
+    /// comparison is NULL — neither true nor false — so the row is excluded,
+    /// the version is stamped, and it is never retried. It must be left intact
+    /// rather than rewritten to NULL.
+    #[tokio::test]
+    async fn a_null_component_edge_is_left_intact_not_nulled() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        drop(store);
+
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO emmo_edge
+                   (id, source_key, target_key, rel_type, predicate, confidence, tenant, props_json)
+                   VALUES ('keep-me', 't1|Matter:steel', 't1|Phase:bcc',
+                           NULL, 'has_phase', 0.9, 't1', '{}')"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+        }
+
+        ProvenanceStore::open(&db.path).await.unwrap();
+
+        let database = turso::Builder::new_local(db.path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM emmo_edge WHERE id = 'keep-me'", ())
+            .await
+            .unwrap();
+        let kept = rows
+            .next()
+            .await
+            .unwrap()
+            .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+            .unwrap_or(0);
+        while rows.next().await.unwrap().is_some() {}
+        assert_eq!(
+            kept, 1,
+            "the NULL-component edge was rewritten to a NULL id instead of \
+             being left alone",
+        );
+    }
+
+    /// Both migrations must survive being re-run, because the stamp is written
+    /// only after BOTH have finished.
+    ///
+    /// A crash between them — or between the second and the stamp — leaves the
+    /// version unstamped, so the next open re-enters and runs both again. The
+    /// old code guarded and stamped the assertion re-key on its own; folding it
+    /// under a shared guard replaced that protection with an assumption, so pin
+    /// the assumption.
+    #[tokio::test]
+    async fn running_both_migrations_twice_is_stable() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let mut prov = test_prov();
+        prov.tenant = "local".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta"),
+                &prov,
+            )
+            .await
+            .unwrap();
+        // Compare the actual KEYS, not row counts. A non-idempotent migration
+        // re-prefixes `local|` onto keys that already carry it, which corrupts
+        // every key while leaving the counts identical — a count-only snapshot
+        // passes against exactly the bug this test exists to catch. (Found by
+        // mutation: stripping the `instr(key,'|') = 0` guard survived a
+        // count-based version of this assertion.)
+        async fn snapshot(s: &ProvenanceStore) -> Vec<String> {
+            let mut out = Vec::new();
+            for sql in [
+                "SELECT key FROM emmo_entity ORDER BY key",
+                "SELECT id FROM emmo_edge ORDER BY id",
+                "SELECT id FROM prov_assertion ORDER BY id",
+            ] {
+                let mut rows = s.conn.query(sql, ()).await.unwrap();
+                while let Some(row) = rows.next().await.unwrap() {
+                    out.push(
+                        row.get_value(0)
+                            .ok()
+                            .and_then(|v| v.as_text().map(|t| t.to_string()))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            out
+        }
+        let before = snapshot(&store).await;
+        assert!(
+            !before.is_empty(),
+            "precondition: the fixture must have written rows to compare",
+        );
+        store
+            .conn
+            .execute("PRAGMA user_version = 0", ())
+            .await
+            .unwrap();
+        drop(store);
+
+        // Re-enter the migrations twice more on an already-migrated database.
+        for _ in 0..2 {
+            let s = ProvenanceStore::open(&db.path).await.unwrap();
+            s.conn.execute("PRAGMA user_version = 0", ()).await.unwrap();
+            drop(s);
+        }
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let after = snapshot(&store).await;
+
+        assert_eq!(
+            before, after,
+            "re-running the migrations changed the stored keys — they are not \
+             idempotent, so a crash before the stamp corrupts the store",
         );
     }
 
