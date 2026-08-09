@@ -16,7 +16,10 @@ from app.tools.search_engine.result import (
     PropertyValue,
     ProviderQueryLog,
 )
-from app.tools.search_engine.translator import QueryTranslator
+from app.tools.search_engine.translator import (
+    QueryTranslator,
+    optimade_reduced_formula,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +183,16 @@ class OptimadeProvider(Provider):
             or attrs.get("chemical_formula_hill")
             or ""
         )
+        # Identity formula: prefer the spec's canonical `chemical_formula_reduced`
+        # (alphabetical, GCD-reduced) so "TiO2" from one provider and "O2Ti"
+        # from another key identically. Canonicalise through the same tested
+        # helper the wire filter uses; a formula it cannot model (hydrates,
+        # parentheses) is used verbatim rather than mangled. The DISPLAY
+        # formula above keeps the provider's descriptive spelling.
+        identity_source = attrs.get("chemical_formula_reduced") or formula
+        identity_formula = (
+            optimade_reduced_formula(identity_source) or identity_source
+        )
         elements = attrs.get("elements", [])
         nelements = attrs.get("nelements") or len(elements)
 
@@ -189,14 +202,37 @@ class OptimadeProvider(Provider):
             kind="structured_api",
         )
 
+        # Symmetry, from the fields the OPTIMADE spec actually defines.
+        # `space_group_symbol` is NOT in the specification and no live
+        # provider returns it (live-probed MP OPTIMADE 2026-08: it returns
+        # space_group_it_number / space_group_symbol_hall /
+        # space_group_symbol_hermann_mauguin); reading it made symmetry None
+        # for essentially every federation hit.
+        sg_number = attrs.get("space_group_it_number")
+        sg_symbol = (
+            attrs.get("space_group_symbol_hermann_mauguin")
+            or attrs.get("space_group_symbol_hermann_mauguin_extended")
+            or attrs.get("space_group_symbol_hall")
+        )
         space_group = None
-        sg_val = attrs.get("space_group_symbol")
-        if sg_val:
+        sg_display = sg_symbol or (str(sg_number) if sg_number is not None else None)
+        if sg_display:
             space_group = PropertyValue(
-                value=sg_val,
+                value=sg_display,
                 source=source,
                 extraction=extraction,
             )
+        # Identity discriminator: prefer the International Tables NUMBER --
+        # it has no notation variants ("P42/mnm" vs "P4_2/mnm"), so entries
+        # from different providers key identically. When symmetry is absent
+        # the attribute is OMITTED (never a sentinel): the identity plugin
+        # then refuses to fuse this record with anything (IdentityNotFusable).
+        identity_sg = (
+            str(sg_number) if sg_number is not None else sg_symbol
+        )
+        identity_attrs = {"formula": identity_formula}
+        if identity_sg:
+            identity_attrs["space_group"] = str(identity_sg)
 
         lattice = None
         lv_val = attrs.get("lattice_vectors")
@@ -229,10 +265,7 @@ class OptimadeProvider(Provider):
             identity=MaterialIdentity(
                 domain="crystal",
                 representation="formula_space_group",
-                attributes={
-                    "formula": formula,
-                    "space_group": str(space_group.value) if space_group else "unknown",
-                },
+                attributes=identity_attrs,
             ),
             space_group=space_group,
             lattice_vectors=lattice,

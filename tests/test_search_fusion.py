@@ -154,6 +154,144 @@ def test_polymer_repeat_unit_identity_fuses_without_colliding_with_a_different_p
     assert polyethylene.extra_properties["dielectric_constant"].value == 2.3
 
 
+def _optimade_material(provider_id, attributes, entry_id="x-1"):
+    """Parse a raw OPTIMADE entry through the REAL adapter, then fuse it."""
+    from app.tools.search_engine.providers.endpoint import (
+        BehaviorConfig,
+        CapabilitiesConfig,
+        ProviderEndpoint,
+    )
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
+
+    provider = OptimadeProvider(
+        endpoint=ProviderEndpoint(
+            id=provider_id, name=provider_id, base_url="https://example.org",
+            api_type="optimade", enabled=True,
+            behavior=BehaviorConfig(), capabilities=CapabilitiesConfig(),
+        )
+    )
+    return provider._parse_entry({"id": entry_id, "attributes": attributes})
+
+
+def test_tio2_polymorphs_from_three_providers_stay_three_materials():
+    """Anatase, rutile and brookite share a formula, not an identity.
+
+    Before: no provider returns the non-spec `space_group_symbol`, every
+    identity recorded space_group="unknown", all polymorphs landed in ONE
+    bucket, and truth-discovery averaged their genuinely different band gaps
+    as competing claims about one material -- manufactured data."""
+    from app.tools.search_engine.fusion import fuse_materials
+
+    anatase = _optimade_material("mp", {
+        "chemical_formula_reduced": "O2Ti", "elements": ["O", "Ti"],
+        "nelements": 2, "space_group_it_number": 141,
+    }, entry_id="mp-anatase")
+    rutile = _optimade_material("oqmd", {
+        "chemical_formula_descriptive": "TiO2", "elements": ["O", "Ti"],
+        "nelements": 2, "space_group_it_number": 136,
+    }, entry_id="oqmd-rutile")
+    brookite = _optimade_material("cod", {
+        "chemical_formula_reduced": "O2Ti", "elements": ["O", "Ti"],
+        "nelements": 2, "space_group_symbol_hermann_mauguin": "Pbca",
+    }, entry_id="cod-brookite")
+
+    fused = fuse_materials([anatase, rutile, brookite])
+
+    assert len(fused) == 3
+    # Each polymorph keeps its own symmetry; none was excluded from fusion --
+    # they are fusable identities that are genuinely DIFFERENT.
+    assert {m.identity.attributes["space_group"] for m in fused} == {
+        "141", "136", "Pbca",
+    }
+    assert all(m.fusion_exclusion is None for m in fused)
+    # And the formula spellings ("TiO2" vs "O2Ti") did key identically.
+    assert {m.identity.attributes["formula"] for m in fused} == {"O2Ti"}
+
+
+def test_same_polymorph_from_optimade_and_mp_native_still_merges():
+    """Entries that DO carry symmetry keep merging -- across adapters: the
+    OPTIMADE it_number and MP's symmetry number produce the same key."""
+    from app.tools.search_engine.fusion import fuse_materials
+    from app.tools.search_engine.providers.endpoint import ProviderEndpoint
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
+    via_optimade = _optimade_material("oqmd", {
+        "chemical_formula_reduced": "O2Ti", "elements": ["O", "Ti"],
+        "nelements": 2, "space_group_it_number": 136,
+        "space_group_symbol_hermann_mauguin": "P4_2/mnm",
+    }, entry_id="oqmd-136")
+
+    mp = MaterialsProjectProvider(
+        endpoint=ProviderEndpoint(
+            id="mp_native", name="MP", base_url="https://api.materialsproject.org",
+            api_type="mp_native", enabled=True,
+        )
+    )
+    via_mp_native = mp._parse_doc({
+        "material_id": "mp-2657", "formula_pretty": "TiO2",
+        "elements": ["O", "Ti"], "nelements": 2,
+        "symmetry": {"symbol": "P4_2/mnm", "number": 136},
+    })
+
+    fused = fuse_materials([via_optimade, via_mp_native])
+    assert len(fused) == 1
+    assert set(fused[0].sources) == {"oqmd", "mp_native"}
+
+
+def test_record_without_symmetry_is_not_fused_with_anything():
+    """An absent discriminator is never a value to merge on: two same-formula
+    records with no symmetry stay separate (from each other AND from the
+    record that has symmetry), each carrying an honest audit note."""
+    from app.tools.search_engine.fusion import fuse_materials
+
+    with_symmetry = _optimade_material("mp", {
+        "chemical_formula_reduced": "O2Ti", "elements": ["O", "Ti"],
+        "nelements": 2, "space_group_it_number": 136,
+    }, entry_id="mp-rutile")
+    bare_a = _optimade_material("cod", {
+        "chemical_formula_reduced": "O2Ti", "elements": ["O", "Ti"],
+        "nelements": 2,
+    }, entry_id="cod-bare")
+    bare_b = _optimade_material("nmd", {
+        "chemical_formula_reduced": "O2Ti", "elements": ["O", "Ti"],
+        "nelements": 2,
+    }, entry_id="nmd-bare")
+
+    fused = fuse_materials([with_symmetry, bare_a, bare_b])
+
+    assert len(fused) == 3
+    notes = [m.fusion_exclusion for m in fused if m.fusion_exclusion]
+    assert len(notes) == 2
+    assert all("no symmetry data" in note for note in notes)
+    keyed = [m for m in fused if m.fusion_exclusion is None]
+    assert len(keyed) == 1 and keyed[0].sources == ["mp"]
+
+
+def test_legacy_unknown_sentinel_is_not_a_mergeable_space_group():
+    """Contract enforcement against FUTURE adapters: an identity carrying the
+    old space_group="unknown" sentinel is treated as having no discriminator,
+    not as a value shared by every polymorph of the formula."""
+    from app.tools.search_engine.fusion import fuse_materials
+
+    a = _mat("prov-a", formula="TiO2", sg="unknown")
+    b = _mat("prov-b", formula="TiO2", sg="unknown")
+    fused = fuse_materials([a, b])
+    assert len(fused) == 2
+    assert all("no symmetry data" in m.fusion_exclusion for m in fused)
+
+
+def test_legacy_record_without_identity_carries_an_honest_note():
+    from app.tools.search_engine.fusion import fuse_materials
+
+    legacy = _mat("mp")
+    legacy.identity = None
+    fused = fuse_materials([legacy])
+    assert len(fused) == 1
+    assert fused[0].fusion_exclusion == "not mergeable: no domain identity"
+
+
 def test_fusion_rejects_an_unknown_identity_domain():
     from app.tools.search_engine.fusion import fuse_materials
 

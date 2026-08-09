@@ -88,7 +88,15 @@ class QueryTranslator:
                 parts.append(f"nelements<={int(query.n_elements.max)}")
 
         if query.space_group:
-            parts.append(f'space_group_symbol="{query.space_group}"')
+            # The OPTIMADE spec defines `space_group_it_number` (int, 1-230)
+            # and `space_group_symbol_hermann_mauguin` (str). The previously
+            # sent `space_group_symbol` is NOT a spec field and no live
+            # provider filters on it.
+            sg = query.space_group
+            if isinstance(sg, int) or str(sg).strip().isdigit():
+                parts.append(f"space_group_it_number={int(str(sg).strip())}")
+            else:
+                parts.append(f'space_group_symbol_hermann_mauguin="{sg}"')
 
         return " AND ".join(parts) if parts else ""
 
@@ -101,6 +109,19 @@ class QueryTranslator:
             kwargs["elements"] = query.elements
         if query.formula:
             kwargs["formula"] = query.formula
+        if query.n_elements:
+            # MPRester summary search takes num_elements as a (min, max) tuple.
+            lo = int(query.n_elements.min) if query.n_elements.min is not None else 1
+            hi = int(query.n_elements.max) if query.n_elements.max is not None else 20
+            kwargs["num_elements"] = (lo, hi)
+        if query.space_group:
+            # MPRester supports both: spacegroup_number (International Tables
+            # number) and spacegroup_symbol (Hermann-Mauguin).
+            sg = query.space_group
+            if isinstance(sg, int) or str(sg).strip().isdigit():
+                kwargs["spacegroup_number"] = int(str(sg).strip())
+            else:
+                kwargs["spacegroup_symbol"] = str(sg)
         if query.band_gap:
             lo = query.band_gap.min if query.band_gap.min is not None else 0
             hi = query.band_gap.max if query.band_gap.max is not None else 100
@@ -113,5 +134,14 @@ class QueryTranslator:
             lo = query.energy_above_hull.min if query.energy_above_hull.min is not None else 0
             hi = query.energy_above_hull.max if query.energy_above_hull.max is not None else 10
             kwargs["energy_above_hull"] = (lo, hi)
+        if query.bulk_modulus:
+            # MPRester's k_vrh filter IS the Voigt-Reuss-Hill bulk modulus in
+            # GPa -- the same number _parse_doc reads from the summary
+            # `bulk_modulus` field. Previously this filter was silently
+            # dropped AND the field never requested, so a bulk_modulus query
+            # against mp_native was guaranteed zero results.
+            lo = query.bulk_modulus.min if query.bulk_modulus.min is not None else 0
+            hi = query.bulk_modulus.max if query.bulk_modulus.max is not None else 1000
+            kwargs["k_vrh"] = (lo, hi)
 
         return kwargs

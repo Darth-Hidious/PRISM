@@ -177,29 +177,118 @@ def test_mp_describe_query_keyed_path_is_mp_native_not_optimade():
     assert "HAS ALL" not in described  # no OPTIMADE syntax
 
 
-def test_mp_describe_query_keyless_path_reports_the_narrowed_proxy_pull():
+def test_mp_describe_query_keyless_path_is_honest_about_the_proxy():
     """Audit truthfulness, proxy branch (the DEFAULT install, no MP_API_KEY):
-    the platform proxy issues only a narrowed formula pull, so that is what
-    must be recorded. Recording to_mp_kwargs here would advertise constraints
-    (band_gap range, full element set) that are never sent."""
+    a formula query records the formula pull; an elements-only query records
+    the refusal that search() will raise -- NOT a fabricated narrowed pull
+    (the old behavior degraded elements=["Fe","O"] to formula="Fe")."""
     from app.tools.search_engine.providers.materials_project import (
         MaterialsProjectProvider,
     )
     from app.tools.search_engine.translator import QueryTranslator
 
     p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
-    q = MaterialSearchQuery(elements=["Fe", "O"], band_gap=PropertyRange(min=1.0, max=3.0))
+
+    formula_q = MaterialSearchQuery(formula="Fe2O3", band_gap=PropertyRange(min=1.0, max=3.0))
     with patch.dict("os.environ", {}, clear=True):
-        described = p.describe_query(q)
-    # The proxy narrows to the FIRST element -- exactly _proxy_formula, the
-    # same helper _search_via_platform_proxy dispatches with.
-    assert p._proxy_formula(q) == "Fe"
-    assert 'formula="Fe"' in described
+        described = p.describe_query(formula_q)
+    assert 'formula="Fe2O3"' in described
     assert "platform_proxy" in described
-    assert described != str(QueryTranslator.to_mp_kwargs(q))
+    assert described != str(QueryTranslator.to_mp_kwargs(formula_q))
     assert "band_gap" not in described  # never sent by the proxy path
+
+    elements_q = MaterialSearchQuery(elements=["Fe", "O"])
+    with patch.dict("os.environ", {}, clear=True):
+        described = p.describe_query(elements_q)
+    assert "cannot serve elements-only queries" in described
+    assert 'formula="Fe"' not in described  # the old fabricated narrowing
 
     # A query the proxy path cannot serve at all must say so, not pretend.
     empty_q = MaterialSearchQuery(n_elements=PropertyRange(min=2, max=3))
     with patch.dict("os.environ", {}, clear=True):
         assert "no request will be issued" in p.describe_query(empty_q)
+
+
+def test_mp_proxy_elements_only_raises_instead_of_substituting():
+    """elements=["Ni","Al"] used to become formula="Ni" -- pure nickel
+    labelled success. The proxy path must refuse honestly instead: the raise
+    reaches the engine, which records a provider failure in the query log."""
+    import asyncio
+
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
+    p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
+    called = MagicMock()
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("app.tools.data._query_materials_project", called),
+    ):
+        with pytest.raises(RuntimeError, match="elements-only"):
+            asyncio.run(p.search(MaterialSearchQuery(elements=["Ni", "Al"])))
+    called.assert_not_called()  # no substituted formula pull went out
+
+
+def test_mp_parse_doc_identity_prefers_spacegroup_number():
+    """The identity discriminator is the IT number when MP supplies it, so it
+    keys identically with OPTIMADE's space_group_it_number."""
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
+    p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
+    doc = {
+        "material_id": "mp-2657",
+        "formula_pretty": "TiO2",
+        "elements": ["O", "Ti"],
+        "nelements": 2,
+        "symmetry": {"symbol": "P4_2/mnm", "number": 136},
+    }
+    material = p._parse_doc(doc)
+    assert material.identity.attributes["space_group"] == "136"
+    assert material.space_group.value == "P4_2/mnm"  # display keeps the symbol
+    # Identity formula is canonicalised like the OPTIMADE adapter's.
+    assert material.identity.attributes["formula"] == "O2Ti"
+    assert material.formula == "TiO2"
+
+
+def test_mp_parse_doc_missing_symmetry_omits_identity_space_group():
+    """No symmetry: OMIT the attribute (no 'unknown' sentinel that merged
+    every polymorph of a formula into one fabricated record)."""
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
+    p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
+    doc = {
+        "material_id": "mp-9999",
+        "formula_pretty": "TiO2",
+        "elements": ["O", "Ti"],
+        "nelements": 2,
+    }
+    material = p._parse_doc(doc)
+    assert material.space_group is None
+    assert "space_group" not in material.identity.attributes
+    assert "unknown" not in material.identity.attributes.values()
+
+
+def test_mp_parse_doc_reads_vrh_bulk_modulus():
+    """bulk_modulus is declared filterable/returned for mp_native; the parsed
+    material must actually carry it (VRH average, GPa) or every hit fails the
+    client-side range filter and the capability guarantees zero results."""
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+
+    p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
+    doc = {
+        "material_id": "mp-149",
+        "formula_pretty": "Si",
+        "elements": ["Si"],
+        "nelements": 1,
+        "bulk_modulus": {"voigt": 88.9, "reuss": 87.8, "vrh": 88.4},
+    }
+    material = p._parse_doc(doc)
+    assert material.bulk_modulus.value == 88.4
+    assert material.bulk_modulus.unit == "GPa"
