@@ -82,3 +82,14 @@ def test_optimade_parse_provider_specific_fields():
     assert material.id == "12345"
     assert "_oqmd_band_gap" in material.extra_properties
     assert material.extra_properties["_oqmd_band_gap"].value == 2.1
+
+
+def test_optimade_describe_query_is_the_wire_filter():
+    """describe_query reports exactly the OPTIMADE filter search() sends."""
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.translator import QueryTranslator
+
+    p = OptimadeProvider(endpoint=_make_endpoint())
+    q = MaterialSearchQuery(elements=["Fe", "O"])
+    assert p.describe_query(q) == QueryTranslator.to_optimade(q)
+    assert 'elements HAS ALL "Fe","O"' in p.describe_query(q)

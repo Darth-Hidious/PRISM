@@ -31,6 +31,43 @@ class MaterialsProjectProvider(Provider):
             returned_properties=set(endpoint.capabilities.returned_properties),
         )
 
+    @staticmethod
+    def _proxy_formula(query: MaterialSearchQuery) -> str:
+        """The narrowed formula the keyless platform-proxy path issues.
+
+        The proxy supports only formula pulls: an explicit formula wins,
+        else the FIRST element is used as a broad pull, else nothing is
+        issued at all. Shared by ``_search_via_platform_proxy`` (dispatch)
+        and ``describe_query`` (audit) so the recorded description can never
+        drift from what the proxy path actually requests.
+        """
+        if query.formula:
+            return query.formula
+        if query.elements:
+            return query.elements[0]
+        return ""
+
+    def describe_query(self, query: MaterialSearchQuery) -> str:
+        """The intended query of the path ``search()`` will take (same branch).
+
+        - Local MP_API_KEY present: the MPRester summary-search kwargs
+          (QueryTranslator.to_mp_kwargs) -- what that path passes to MP.
+        - Keyless (the default install): the platform proxy issues ONLY the
+          narrowed formula pull, so that is what gets recorded. Reporting
+          to_mp_kwargs here would advertise constraints (band_gap ranges,
+          full element sets) that are never sent -- the exact lie this
+          method exists to remove.
+        """
+        if os.environ.get("MP_API_KEY", ""):
+            return str(QueryTranslator.to_mp_kwargs(query))
+        formula = self._proxy_formula(query)
+        if not formula:
+            return "platform_proxy: no formula/elements -- no request will be issued"
+        return (
+            f'platform_proxy formula="{formula}" '
+            "(query narrowed to a formula pull; proxy path)"
+        )
+
     async def search(self, query: MaterialSearchQuery) -> list[Material]:
         # E13 proxy fix: route MP requests through the platform proxy when there
         # is no LOCAL MP_API_KEY. The old code's _resolve_api_key tier-2 returned
@@ -80,12 +117,10 @@ class MaterialsProjectProvider(Provider):
             # "queried MP, found nothing".
             raise RuntimeError(f"MP platform proxy unavailable (import failed): {exc}") from exc
 
-        # Build a formula query if the query has one; else do a wildcard pull.
-        formula = query.formula
-        if not formula and query.elements:
-            # MP proxy takes formula; without one, do a broad pull by the first
-            # element (the proxy returns up to 20 per call).
-            formula = query.elements[0]
+        # The proxy takes only a formula; _proxy_formula narrows the query the
+        # same way describe_query reports it (formula, else first element as a
+        # broad pull -- the proxy returns up to 20 per call -- else nothing).
+        formula = self._proxy_formula(query)
         if not formula:
             return []
 

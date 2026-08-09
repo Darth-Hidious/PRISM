@@ -37,7 +37,7 @@ def test_provider_query_log():
     log = ProviderQueryLog(
         provider_id="mp", provider_name="Materials Project",
         endpoint_url="https://optimade.materialsproject.org/v1/structures",
-        query_sent='elements HAS ALL "Fe","O"',
+        query_description='elements HAS ALL "Fe","O"',
         started_at=1000.0, completed_at=1000.34, latency_ms=340.0,
         status="success", http_status_code=200, result_count=89,
     )

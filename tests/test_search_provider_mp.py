@@ -157,3 +157,49 @@ def test_mp_provider_proxy_success_parses_materials():
     assert len(results) == 1
     assert results[0].id == "mp-1234"
     assert results[0].band_gap.value == 2.2
+
+
+def test_mp_describe_query_keyed_path_is_mp_native_not_optimade():
+    """Audit truthfulness, MPRester branch: with a local MP_API_KEY the
+    provider describes its own MP-native kwargs, not the OPTIMADE filter
+    string the engine used to record."""
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+    from app.tools.search_engine.translator import QueryTranslator
+
+    p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
+    q = MaterialSearchQuery(elements=["Fe", "O"], band_gap=PropertyRange(min=1.0, max=3.0))
+    with patch.dict("os.environ", {"MP_API_KEY": "local-key"}):
+        described = p.describe_query(q)
+    assert described == str(QueryTranslator.to_mp_kwargs(q))
+    assert described != QueryTranslator.to_optimade(q)
+    assert "HAS ALL" not in described  # no OPTIMADE syntax
+
+
+def test_mp_describe_query_keyless_path_reports_the_narrowed_proxy_pull():
+    """Audit truthfulness, proxy branch (the DEFAULT install, no MP_API_KEY):
+    the platform proxy issues only a narrowed formula pull, so that is what
+    must be recorded. Recording to_mp_kwargs here would advertise constraints
+    (band_gap range, full element set) that are never sent."""
+    from app.tools.search_engine.providers.materials_project import (
+        MaterialsProjectProvider,
+    )
+    from app.tools.search_engine.translator import QueryTranslator
+
+    p = MaterialsProjectProvider(endpoint=_make_mp_endpoint())
+    q = MaterialSearchQuery(elements=["Fe", "O"], band_gap=PropertyRange(min=1.0, max=3.0))
+    with patch.dict("os.environ", {}, clear=True):
+        described = p.describe_query(q)
+    # The proxy narrows to the FIRST element -- exactly _proxy_formula, the
+    # same helper _search_via_platform_proxy dispatches with.
+    assert p._proxy_formula(q) == "Fe"
+    assert 'formula="Fe"' in described
+    assert "platform_proxy" in described
+    assert described != str(QueryTranslator.to_mp_kwargs(q))
+    assert "band_gap" not in described  # never sent by the proxy path
+
+    # A query the proxy path cannot serve at all must say so, not pretend.
+    empty_q = MaterialSearchQuery(n_elements=PropertyRange(min=2, max=3))
+    with patch.dict("os.environ", {}, clear=True):
+        assert "no request will be issued" in p.describe_query(empty_q)

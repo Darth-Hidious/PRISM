@@ -89,7 +89,16 @@ class ProviderQueryLog(BaseModel):
     provider_id: str
     provider_name: str
     endpoint_url: str
-    query_sent: str
+    # The provider's own pre-dispatch description of the query it intended to
+    # issue (Provider.describe_query) -- a logical/intended query, NOT a
+    # captured wire transcript. Renamed from `query_sent`: that name claimed a
+    # wire capture the value never was (computed before search(), never tied
+    # to the transport). No migration shim for the rename: nothing in the app
+    # calls SearchCache.flush_to_disk/load_from_disk today (only a test
+    # round-trips them), so no persisted entries with the old field exist. If
+    # disk persistence is ever wired up, old-field entries would fail
+    # validation and be skipped as a cache miss.
+    query_description: str
 
     started_at: float
     completed_at: float

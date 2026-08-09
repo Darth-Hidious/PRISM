@@ -288,6 +288,105 @@ def test_s3_early_completion_cancels_slow_providers():
     assert statuses["fast2"] == "success"
 
 
+def test_engine_records_providers_own_query_description():
+    """The audit trail records each provider's OWN intended query
+    (describe_query), not a blanket OPTIMADE translation."""
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class NativeProvider(Provider):
+        id = "native"
+        name = "Native"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        def describe_query(self, query):
+            return "NATIVE-DSL elements=Fe"
+
+        async def search(self, query):
+            return [_mock_material("native")]
+
+    reg = ProviderRegistry()
+    reg.register(NativeProvider())
+    engine = _isolated_engine(reg)
+    result = asyncio.run(engine.search(MaterialSearchQuery(elements=["Fe"])))
+    assert result.query_log[0].query_description == "NATIVE-DSL elements=Fe"
+
+
+def test_engine_describe_query_failure_never_fails_the_provider_query():
+    """Item 6: describe_query is audit formatting. A provider whose
+    description code RAISES must still be queried and logged as success,
+    with an explicit failure marker in query_description -- never an
+    operational failure, never an escaped exception."""
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class BrokenDescribeProvider(Provider):
+        id = "broken_describe"
+        name = "BrokenDescribe"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        def describe_query(self, query):
+            raise RuntimeError("audit formatting blew up")
+
+        async def search(self, query):
+            return [_mock_material("bd")]
+
+    reg = ProviderRegistry()
+    reg.register(BrokenDescribeProvider())
+    engine = _isolated_engine(reg)
+    result = asyncio.run(engine.search(MaterialSearchQuery(elements=["Fe"])))
+    log = result.query_log[0]
+    assert log.status == "success"  # the search itself was unaffected
+    assert log.result_count == 1
+    assert "describe_query failed" in log.query_description
+
+
+def test_engine_describe_query_non_str_return_never_fails_the_provider_query():
+    """The guard must catch non-str RETURNS, not only raised exceptions: a
+    describe_query returning None or a coroutine used to pass the guard and
+    then blow up ProviderQueryLog(query_description=...) validation AFTER a
+    successful search -- defeating the guard's whole purpose. The search
+    stays a success; the marker names the wrong type."""
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+
+    class NoneDescribeProvider(Provider):
+        id = "none_describe"
+        name = "NoneDescribe"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        def describe_query(self, query):
+            return None  # broken adapter: forgot to return the string
+
+        async def search(self, query):
+            return [_mock_material("nd")]
+
+    class CoroDescribeProvider(Provider):
+        id = "coro_describe"
+        name = "CoroDescribe"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        async def describe_query(self, query):  # accidentally async
+            return "never awaited"
+
+        async def search(self, query):
+            return [_mock_material("cd")]
+
+    reg = ProviderRegistry()
+    reg.register(NoneDescribeProvider())
+    reg.register(CoroDescribeProvider())
+    engine = _isolated_engine(reg)
+    result = asyncio.run(engine.search(MaterialSearchQuery(elements=["Fe"])))
+    logs = {log.provider_id: log for log in result.query_log}
+    assert logs["none_describe"].status == "success"
+    assert logs["none_describe"].result_count == 1
+    assert "NoneType" in logs["none_describe"].query_description
+    assert "not str" in logs["none_describe"].query_description
+    assert logs["coro_describe"].status == "success"
+    assert logs["coro_describe"].result_count == 1
+    assert "not str" in logs["coro_describe"].query_description
+
+
 def _make_log(pid, status, error_message=None):
     """Helper: build a ProviderQueryLog with the given status."""
     from app.tools.search_engine.result import ProviderQueryLog
@@ -296,7 +395,7 @@ def _make_log(pid, status, error_message=None):
         provider_id=pid,
         provider_name=pid,
         endpoint_url=f"https://example/{pid}",
-        query_sent="",
+        query_description="",
         started_at=0.0,
         completed_at=0.0,
         latency_ms=100.0,
