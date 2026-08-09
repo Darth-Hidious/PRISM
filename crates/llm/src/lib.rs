@@ -61,6 +61,13 @@ fn default_timeout_secs() -> u64 {
 /// output clamp ([`LlmClient::effective_max_tokens`]).
 const CONTEXT_MARGIN_TOKENS: u64 = 1024;
 
+/// Sent as `max_tokens` when the operator has set no ceiling. Not a policy
+/// limit — it is large enough to be irrelevant next to any real context
+/// window, so the effective bound is `context_window - prompt - margin` and,
+/// beyond that, the server's own clamp. Output is metered and billed per
+/// token; counting is the control, not truncation.
+const UNCAPPED_OUTPUT_TOKENS: u64 = 1_000_000;
+
 impl Default for LlmConfig {
     fn default() -> Self {
         // These are fallback defaults only — real values come from prism.toml
@@ -823,7 +830,25 @@ impl LlmClient {
     /// with no catalog entry).
     fn effective_max_tokens(&self, est_prompt_tokens: u64) -> u64 {
         const FLOOR: u64 = 256;
-        let model_max = self.config.max_output_tokens.unwrap_or(4096);
+        // PRISM does NOT cap output on the operator's behalf.
+        //
+        // The previous 4096 default was a cost guard, added after unbounded
+        // platform output burned real credits. But output is METERED and
+        // BILLED per token — counting it is the control, not truncating it.
+        // Capping does not save anyone money; it just decides for the user,
+        // and it silently breaks any model that reasons before it answers.
+        // Gemma 4 12B spent ~2.7k tokens of `reasoning_content` against that
+        // default, hit the ceiling, and returned no JSON at all. PRISM's bug,
+        // not the model's — and the next model will reason more, not less.
+        //
+        // What genuinely bounds output: the CONTEXT WINDOW (enforced below and
+        // again by the server), per-token metering, and the solvency check
+        // that fails closed when credits run out. An explicit
+        // `max_output_tokens` is still honoured — the operator may cap.
+        let model_max = self
+            .config
+            .max_output_tokens
+            .unwrap_or(UNCAPPED_OUTPUT_TOKENS);
         // Clamp the requested output so it can never collide with the input:
         // context_window − estimated prompt − margin. When the context window is
         // unknown, only the configured max applies. Embedded local models now
@@ -3014,10 +3039,48 @@ mod tests {
     }
 
     #[test]
-    fn effective_max_tokens_defaults_to_4096() {
-        // No catalog max + unknown context (local model) → conservative 4096.
+    fn prism_imposes_no_output_ceiling_of_its_own() {
+        // Was `effective_max_tokens_defaults_to_4096`, which pinned a cost
+        // guard as if it were a model limit. Output is metered and billed per
+        // token, so counting is the control — truncating is not. A 4096
+        // default silently broke every model that reasons before answering:
+        // Gemma 4 12B spent ~2.7k tokens of reasoning against it and returned
+        // no JSON at all.
         let client = LlmClient::new(LlmConfig::default());
-        assert_eq!(client.effective_max_tokens(0), 4096);
+        assert!(
+            client.effective_max_tokens(0) >= 100_000,
+            "with no operator ceiling and no known context, PRISM must not \
+             impose a limit of its own; got {}",
+            client.effective_max_tokens(0)
+        );
+    }
+
+    #[test]
+    fn the_context_window_is_what_actually_bounds_output() {
+        // The real bound, and the only one PRISM applies unasked: whatever the
+        // context still has room for after the prompt and the margin.
+        let config = LlmConfig {
+            max_output_tokens: None,
+            context_window: Some(32_768),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(
+            client.effective_max_tokens(8_000),
+            32_768 - 8_000 - CONTEXT_MARGIN_TOKENS
+        );
+    }
+
+    #[test]
+    fn an_explicit_operator_ceiling_is_still_honoured() {
+        // The operator may cap. PRISM may not cap on their behalf.
+        let config = LlmConfig {
+            max_output_tokens: Some(2_048),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(client.effective_max_tokens(1_000), 2_048);
     }
 
     #[test]
