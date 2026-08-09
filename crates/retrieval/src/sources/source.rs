@@ -351,6 +351,36 @@ mod tests {
         assert_eq!(s.min_interval(), Duration::from_millis(3000));
     }
 
+    /// Pins ALL EIGHT politeness intervals through the registry. These were
+    /// duplicated from the old `SourceId::min_interval()` match into the
+    /// eight adapters; nothing structural keeps them in agreement with each
+    /// source's published guidance, and silent drift on a rate limit is how
+    /// the tool gets banned.
+    #[test]
+    fn builtin_intervals_match_published_politeness_guidance() {
+        let reg = SourceRegistry::builtin();
+        let expected: [(&str, u64); 8] = [
+            ("arxiv", 3000),
+            ("openalex", 200),
+            ("crossref", 200),
+            ("pubmed", 340),
+            ("semantic_scholar", 1000),
+            ("preprints_europepmc", 500),
+            ("chemrxiv", 500),
+            ("doaj", 500),
+        ];
+        for (id, millis) in expected {
+            let source = reg
+                .get(id)
+                .unwrap_or_else(|| panic!("source '{id}' must be registered"));
+            assert_eq!(
+                source.min_interval(),
+                Duration::from_millis(millis),
+                "politeness interval drifted for source '{id}'"
+            );
+        }
+    }
+
     #[test]
     fn registering_a_test_source_does_not_touch_the_enum() {
         // A source unknown to SourceId can be registered and looked up purely

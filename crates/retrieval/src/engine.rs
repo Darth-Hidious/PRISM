@@ -65,23 +65,37 @@ pub struct RetrievalEngine {
     registry: SourceRegistry,
     /// The sources this engine fans out to, in reporting order.
     selected: Vec<Arc<dyn Source>>,
+    /// Configured ids that resolved to no adapter, in configuration order.
+    /// Reported by every `search` as an error status — a configured source
+    /// must never silently vanish from the outcome.
+    missing: Vec<String>,
 }
 
 impl RetrievalEngine {
     pub fn new(cfg: EngineConfig) -> Self {
-        let registry = SourceRegistry::builtin();
+        Self::with_registry(cfg, SourceRegistry::builtin())
+    }
+
+    /// Build an engine over an explicit registry — the seam tests use to
+    /// substitute adapters; [`RetrievalEngine::new`] passes the built-ins.
+    pub(crate) fn with_registry(cfg: EngineConfig, registry: SourceRegistry) -> Self {
         let mut limiters = HashMap::new();
         let mut selected: Vec<Arc<dyn Source>> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
         for id in &cfg.sources {
             // Resolve the configured SourceId to its registry adapter. A
-            // configured id with no adapter is skipped (cannot happen for the
-            // eight built-ins) rather than silently fabricated.
-            if let Some(source) = registry.get(id.as_str()) {
-                limiters.insert(
-                    source.id().to_string(),
-                    Arc::new(RateLimiter::new(source.min_interval())),
-                );
-                selected.push(source);
+            // configured id with no adapter (cannot happen for the eight
+            // built-ins) is remembered and reported by search(), never
+            // silently dropped.
+            match registry.get(id.as_str()) {
+                Some(source) => {
+                    limiters.insert(
+                        source.id().to_string(),
+                        Arc::new(RateLimiter::new(source.min_interval())),
+                    );
+                    selected.push(source);
+                }
+                None => missing.push(id.as_str().to_string()),
             }
         }
         // The client timeout is a backstop comfortably ABOVE the per-source
@@ -97,17 +111,29 @@ impl RetrievalEngine {
             limiters,
             registry,
             selected,
+            missing,
         }
     }
 
     /// Register an additional source at runtime and add it to the fan-out
     /// selection. This is the plugin seam: a source unknown to [`SourceId`]
     /// can be served without touching the enum or any match arm.
+    ///
+    /// Registering an id that is already selected REPLACES it — honouring
+    /// [`SourceRegistry::register`]'s shadowing contract — so the id keeps
+    /// one fan-out slot, one status entry, and adopts the new adapter's
+    /// `min_interval`.
     pub fn register_source(&mut self, source: Arc<dyn Source>) {
-        self.limiters
-            .entry(source.id().to_string())
-            .or_insert_with(|| Arc::new(RateLimiter::new(source.min_interval())));
-        self.selected.push(source.clone());
+        let id = source.id().to_string();
+        self.limiters.insert(
+            id.clone(),
+            Arc::new(RateLimiter::new(source.min_interval())),
+        );
+        self.missing.retain(|m| *m != id);
+        match self.selected.iter_mut().find(|s| s.id() == id) {
+            Some(slot) => *slot = source.clone(),
+            None => self.selected.push(source.clone()),
+        }
         self.registry.register(source);
     }
 
@@ -236,6 +262,19 @@ impl RetrievalEngine {
             }
         }
 
+        // Configured sources that resolved to no adapter are reported with
+        // the same vocabulary the sweep uses — never silently omitted.
+        for id in &self.missing {
+            source_status.push(SourceStatus {
+                source: id.clone(),
+                status: "error".to_string(),
+                count: 0,
+                latency_ms: 0.0,
+                cache_hit: false,
+                error: Some(format!("no adapter registered for source '{id}'")),
+            });
+        }
+
         SearchOutcome {
             papers,
             duplicates_merged,
@@ -279,7 +318,20 @@ mod tests {
     #[tokio::test]
     async fn registered_adapter_is_queried_without_enum_or_match() {
         let mut engine = isolated_engine();
-        engine.register_source(Arc::new(EchoSource));
+        let registered: Arc<dyn Source> = Arc::new(EchoSource);
+        engine.register_source(registered.clone());
+
+        // The write went through the REGISTRY, not just the fan-out list:
+        // the id resolves there, to exactly the adapter we registered.
+        let via_registry = engine
+            .registry()
+            .get("echo")
+            .expect("registered id must resolve through the registry");
+        assert!(
+            Arc::ptr_eq(&via_registry, &registered),
+            "registry must hold the registered adapter itself"
+        );
+
         let outcome = engine.search("anything", 10).await;
 
         // The test source was actually consulted.
@@ -292,6 +344,93 @@ mod tests {
         assert_eq!(outcome.papers.len(), 1);
         assert_eq!(outcome.papers[0].source, "echo");
         assert_eq!(outcome.papers[0].source_id, "echo-1");
+    }
+
+    /// Registering an id twice must SHADOW, not duplicate: one fan-out slot,
+    /// one status entry, and the replacement's behaviour and politeness
+    /// interval win everywhere (selection, limiter, registry).
+    #[tokio::test]
+    async fn re_registering_an_id_shadows_selection_limiter_and_registry() {
+        let mut engine = isolated_engine();
+        engine.register_source(Arc::new(NamedSource {
+            id: "dup",
+            title: "first",
+            interval: Duration::from_millis(700),
+        }));
+        engine.register_source(Arc::new(NamedSource {
+            id: "dup",
+            title: "second",
+            interval: Duration::from_millis(250),
+        }));
+
+        let outcome = engine.search("anything", 10).await;
+        // ONE status for the id — the old adapter no longer runs.
+        assert_eq!(
+            outcome.source_status.len(),
+            1,
+            "shadowed id must produce exactly one status entry"
+        );
+        assert_eq!(outcome.source_status[0].source, "dup");
+        assert_eq!(outcome.source_status[0].count, 1);
+        // The replacement's behaviour wins.
+        assert_eq!(outcome.papers.len(), 1);
+        assert_eq!(outcome.papers[0].title, "second");
+        // The replacement's politeness interval wins.
+        assert_eq!(
+            engine.limiters["dup"].min_interval(),
+            Duration::from_millis(250),
+            "limiter must adopt the replacement adapter's min_interval"
+        );
+        // The registry resolves to the replacement too.
+        assert_eq!(
+            engine
+                .registry()
+                .get("dup")
+                .expect("dup registered")
+                .min_interval(),
+            Duration::from_millis(250)
+        );
+    }
+
+    /// A configured source with no adapter must surface as an error status —
+    /// the same vocabulary the sweep uses — never silently vanish. And
+    /// registering the adapter afterwards heals the report.
+    #[tokio::test]
+    async fn configured_source_with_no_adapter_reports_error_status() {
+        let mut engine = RetrievalEngine::with_registry(
+            EngineConfig {
+                sources: vec![SourceId::Arxiv],
+                cache_dir: None,
+                ..EngineConfig::default()
+            },
+            SourceRegistry::new(), // empty: nothing resolves
+        );
+
+        let outcome = engine.search("anything", 10).await;
+        assert_eq!(outcome.papers.len(), 0);
+        assert_eq!(
+            outcome.source_status.len(),
+            1,
+            "a configured source must never be silently omitted"
+        );
+        let status = &outcome.source_status[0];
+        assert_eq!(status.source, "arxiv");
+        assert_eq!(status.status, "error");
+        assert_eq!(
+            status.error.as_deref(),
+            Some("no adapter registered for source 'arxiv'")
+        );
+
+        // Registering an adapter for the missing id clears the error.
+        engine.register_source(Arc::new(NamedSource {
+            id: "arxiv",
+            title: "healed",
+            interval: Duration::from_millis(1),
+        }));
+        let outcome = engine.search("anything", 10).await;
+        assert_eq!(outcome.source_status.len(), 1);
+        assert_eq!(outcome.source_status[0].source, "arxiv");
+        assert_eq!(outcome.source_status[0].status, "ok");
     }
 
     /// A source that fails must be distinguishable from one that returned
@@ -341,6 +480,51 @@ mod tests {
                 external_ids: Default::default(),
                 abstract_text: None,
                 url: "urn:echo:1".to_string(),
+                fulltext_url: None,
+                fulltext_format: None,
+                journal: None,
+            }])
+        }
+        async fn fetch_page(
+            &self,
+            ctx: &FetchCtx,
+            query: &str,
+            _cursor: &str,
+        ) -> anyhow::Result<(Vec<Paper>, Option<String>)> {
+            self.fetch(ctx, query).await.map(|p| (p, None))
+        }
+    }
+
+    /// Configurable adapter: fixed id, one paper carrying `title`, and a
+    /// declared politeness interval — enough to observe shadowing.
+    struct NamedSource {
+        id: &'static str,
+        title: &'static str,
+        interval: Duration,
+    }
+    #[async_trait]
+    impl Source for NamedSource {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn min_interval(&self) -> Duration {
+            self.interval
+        }
+        fn initial_cursor(&self) -> &'static str {
+            "0"
+        }
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<Vec<Paper>> {
+            Ok(vec![Paper {
+                source: self.id.to_string(),
+                source_id: format!("{}-{}", self.id, self.title),
+                title: self.title.to_string(),
+                authors: Vec::new(),
+                year: None,
+                published: None,
+                doi: None,
+                external_ids: Default::default(),
+                abstract_text: None,
+                url: format!("urn:{}:{}", self.id, self.title),
                 fulltext_url: None,
                 fulltext_format: None,
                 journal: None,

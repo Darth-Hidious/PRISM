@@ -121,9 +121,12 @@ pub struct FetchCtx {
 }
 
 impl FetchCtx {
-    /// Polite limiter for `id`. The engine pre-populates one per registered
-    /// source (from the adapter's `min_interval`); the fallback exists only
-    /// for ids the engine was not configured with.
+    /// Polite limiter for `id`. Both engine paths guarantee an entry exists
+    /// before an adapter runs — `search` pre-populates one per selected
+    /// source, `run_sweep` inserts one when it resolves the adapter, each
+    /// derived from the adapter's `min_interval` — so the unlimited
+    /// fallback is unreachable through the engine. It remains only for
+    /// hand-built contexts (adapter unit tests).
     pub fn limiter(&self, id: &str) -> Arc<RateLimiter> {
         self.limiters
             .get(id)

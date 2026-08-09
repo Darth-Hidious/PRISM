@@ -20,6 +20,13 @@ impl RateLimiter {
         }
     }
 
+    /// The interval this limiter enforces. Test-only: production code
+    /// derives intervals from adapters, never back out of limiters.
+    #[cfg(test)]
+    pub(crate) fn min_interval(&self) -> Duration {
+        self.min_interval
+    }
+
     /// Wait until the next request slot, then claim it. The guard is held
     /// across the sleep: concurrent waiters reserve successive slots
     /// instead of all computing the same gap from the same `last` and
