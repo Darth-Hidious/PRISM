@@ -3,11 +3,37 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER, USER_AGENT};
 
 use crate::ratelimit::RateLimiter;
+
+/// A non-success HTTP status that survived the retry budget, carried TYPED
+/// so `SourceError::classify` can map it onto the failure taxonomy
+/// (401/403 → auth, 429 → rate_limited, 400-class → unsupported_query,
+/// the rest → transport). Display is byte-identical to the `bail!` string
+/// it replaced — reporting output is pinned by tests and must not shift.
+#[derive(Debug)]
+pub struct HttpStatusFailure {
+    pub status: reqwest::StatusCode,
+    pub url: String,
+    pub attempts: u32,
+}
+
+impl std::fmt::Display for HttpStatusFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HTTP {status} from {url} after {attempts} attempt(s)",
+            status = self.status,
+            url = self.url,
+            attempts = self.attempts
+        )
+    }
+}
+
+impl std::error::Error for HttpStatusFailure {}
 
 /// One retryable GET. Returns the body bytes on HTTP 200.
 ///
@@ -59,7 +85,12 @@ pub async fn get_with_retry(
         }
         let retryable = status.as_u16() == 429 || status.is_server_error();
         if !retryable || attempt >= max_attempts {
-            bail!("HTTP {status} from {url} after {attempt} attempt(s)");
+            return Err(HttpStatusFailure {
+                status,
+                url: url.to_string(),
+                attempts: attempt,
+            }
+            .into());
         }
         let retry_after_secs = response
             .headers()

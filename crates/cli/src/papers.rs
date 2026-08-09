@@ -94,9 +94,16 @@ pub enum PapersCommands {
     },
 }
 
-fn parse_sources(list: &Option<String>) -> Result<Vec<SourceId>> {
+/// Parse `--sources` into REGISTRY id strings — what selection is typed by.
+/// The [`SourceId`] enum is used only as the CLI's name catalogue: the CLI
+/// can only select built-ins (it has no way to register a third-party
+/// adapter), so an unknown name is a typo and fails here with the list.
+fn parse_sources(list: &Option<String>) -> Result<Vec<String>> {
     let Some(raw) = list else {
-        return Ok(prism_retrieval::all_sources());
+        return Ok(prism_retrieval::all_sources()
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect());
     };
     let mut out = Vec::new();
     for name in raw.split(',') {
@@ -104,7 +111,7 @@ fn parse_sources(list: &Option<String>) -> Result<Vec<SourceId>> {
             continue;
         }
         match SourceId::from_name(name) {
-            Some(id) => out.push(id),
+            Some(id) => out.push(id.as_str().to_string()),
             None => bail!(
                 "unknown source {name:?}; known sources: {}",
                 prism_retrieval::all_sources()
@@ -121,11 +128,7 @@ fn parse_sources(list: &Option<String>) -> Result<Vec<SourceId>> {
     Ok(out)
 }
 
-fn build_engine(
-    sources: Vec<SourceId>,
-    mailto: &Option<String>,
-    no_cache: bool,
-) -> RetrievalEngine {
+fn build_engine(sources: Vec<String>, mailto: &Option<String>, no_cache: bool) -> RetrievalEngine {
     let cfg = EngineConfig {
         sources,
         mailto: mailto.clone(),
@@ -245,7 +248,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
         }
         PapersCommands::FullText { pmc, url, format } => {
             let paper = paper_for_fulltext(&pmc, &url, &format)?;
-            let engine = build_engine(vec![SourceId::Arxiv], &None, false);
+            let engine = build_engine(vec![SourceId::Arxiv.as_str().to_string()], &None, false);
             match engine.fetch_fulltext_for(&paper).await? {
                 Some(fulltext) => println!("{}", serde_json::to_string_pretty(&fulltext)?),
                 None => println!(
@@ -269,7 +272,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             store,
         } => {
             let paper = paper_for_fulltext(&pmc, &url, &format)?;
-            let engine = build_engine(vec![SourceId::Arxiv], &None, false);
+            let engine = build_engine(vec![SourceId::Arxiv.as_str().to_string()], &None, false);
             let Some(fulltext) = engine.fetch_fulltext_for(&paper).await? else {
                 println!(
                     "{}",

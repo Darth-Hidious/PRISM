@@ -1,9 +1,13 @@
 //! The ingestion surface.
 //!
 //! A literature source is a plugin implementing [`Source`]: a stable id, a
-//! politeness interval, a paging start point, and two async fetchers. The
+//! politeness interval, a paging start point, a serving-capability
+//! declaration, and two async fetchers with a typed failure taxonomy. The
 //! engine and sweep talk to sources **only** through [`SourceRegistry`]
-//! dispatch — there is no `match` over an enum anywhere on the fetch path.
+//! dispatch — there is no `match` over an enum anywhere on the fetch path,
+//! and selection (engine config, sweep plans, the CLI) names sources by
+//! their registry id STRING, so an adapter registered at runtime can be
+//! chosen without any enum edit.
 //! Adding a source means writing one module that exposes `ID`,
 //! `INITIAL_CURSOR`, `fetch`, `fetch_page`, then one `register(...)` line in
 //! [`SourceRegistry::builtin`]. Swapping a built-in for your own
@@ -13,7 +17,7 @@
 //!
 //! The built-in [`crate::sources::SourceId`] enum is retained only as a CLI
 //! convenience (name parsing, default selection); it is not consulted by the
-//! fetch path.
+//! fetch path or by selection.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +29,147 @@ use crate::model::SourcePage;
 
 use super::FetchCtx;
 use super::{arxiv, chemrxiv, crossref, doaj, europepmc, openalex, pubmed, semantic_scholar};
+
+/// What an adapter can actually SERVE, declared per adapter and verified
+/// against its own translator by tests (`tests/capability_declarations.rs`)
+/// — never merely asserted in prose or a manifest.
+///
+/// Deliberately narrow: literature sources have NO caller-selectable filter
+/// surface beyond the free-text query. Every fetch takes exactly `query` plus
+/// the paging inputs (`ctx.limit`, cursor); no field filters, date ranges or
+/// sort orders exist anywhere in the pipeline (CLI: `--query/--limit`;
+/// `SweepPlan`: query + paging). Declaring a filter vocabulary here would be
+/// a capability model with nothing behind it — the exact "advertised field
+/// the translator silently drops" lie this declaration exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceCaps {
+    /// Largest per-page row count the translator will actually put on the
+    /// wire. Requests above it are clamped; verified by matching the mock
+    /// server's received page-size parameter against this declaration.
+    pub max_page_size: usize,
+    /// Deepest cursor position the translator will request a page at, when
+    /// the source has an offset ceiling (Crossref, Semantic Scholar).
+    /// `None` means the translator imposes no ceiling of its own — it says
+    /// nothing about limits the server may still enforce.
+    pub max_offset: Option<u64>,
+}
+
+/// Typed failure taxonomy for source fetches — Declaration 4 of the adapter
+/// contract. Callers get a machine-readable kind (retry/backoff/reporting can
+/// branch on it) while the human-readable error strings stay exactly what
+/// they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// The source rejected or requires credentials (HTTP 401/403/407).
+    Auth,
+    /// The source is throttling us (HTTP 429 surviving the retry budget).
+    RateLimited,
+    /// The source refused the request itself (HTTP 400/404/405/414/422) —
+    /// retrying the same query cannot succeed.
+    UnsupportedQuery,
+    /// The source answered but the body could not be parsed.
+    Malformed,
+    /// The network failed: connect/DNS/TLS, a 5xx surviving retries, or the
+    /// offline policy refusing the host.
+    Transport,
+    /// The caller's deadline ended the fetch (the per-source timeout).
+    Cancelled,
+}
+
+/// A source fetch failure: a [`FailureKind`] plus the underlying error.
+///
+/// Display is DELEGATED to the wrapped error (honouring `{:#}` alternate
+/// formatting), so status reporting strings are byte-identical to the old
+/// bare `anyhow::Error` path — the taxonomy adds information, it does not
+/// reword anything.
+#[derive(Debug)]
+pub struct SourceError {
+    kind: FailureKind,
+    source: anyhow::Error,
+}
+
+impl SourceError {
+    /// Wrap an error under an explicitly chosen kind. Third-party adapters
+    /// use this to state their own taxonomy mapping.
+    pub fn new(kind: FailureKind, source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            kind,
+            source: source.into(),
+        }
+    }
+
+    /// Build from a plain message under an explicitly chosen kind.
+    pub fn msg(
+        kind: FailureKind,
+        message: impl std::fmt::Display + std::fmt::Debug + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            kind,
+            source: anyhow::Error::msg(message),
+        }
+    }
+
+    pub fn kind(&self) -> FailureKind {
+        self.kind
+    }
+
+    /// Classify an error escaping the built-in fetch pipeline. The mapping
+    /// covers every escape that pipeline has: a typed
+    /// [`crate::http::HttpStatusFailure`] (mapped by status), a
+    /// `reqwest::Error` (transport), and body-parse failures
+    /// (`serde_json`/`quick_xml` → malformed). Anything unrecognized is
+    /// `Transport`: the only untyped escapes today are the offline-policy
+    /// refusal and connect failures, both transport-layer.
+    pub fn classify(err: anyhow::Error) -> Self {
+        let mut kind = None;
+        for cause in err.chain() {
+            kind = if let Some(http) = cause.downcast_ref::<crate::http::HttpStatusFailure>() {
+                Some(match http.status.as_u16() {
+                    401 | 403 | 407 => FailureKind::Auth,
+                    429 => FailureKind::RateLimited,
+                    400 | 404 | 405 | 414 | 422 => FailureKind::UnsupportedQuery,
+                    _ => FailureKind::Transport,
+                })
+            } else if cause.downcast_ref::<reqwest::Error>().is_some() {
+                Some(FailureKind::Transport)
+            } else if cause.downcast_ref::<serde_json::Error>().is_some()
+                || cause.downcast_ref::<quick_xml::Error>().is_some()
+            {
+                Some(FailureKind::Malformed)
+            } else {
+                None
+            };
+            if kind.is_some() {
+                break;
+            }
+        }
+        Self {
+            kind: kind.unwrap_or(FailureKind::Transport),
+            source: err,
+        }
+    }
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` on a SourceError prints the wrapped chain exactly as `{:#}`
+        // on the bare anyhow::Error did — pinned by the reporting tests.
+        if f.alternate() {
+            write!(f, "{:#}", self.source)
+        } else {
+            write!(f, "{}", self.source)
+        }
+    }
+}
+
+impl std::error::Error for SourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Display already carries the top message; the chain below it is
+        // the cause.
+        self.source.chain().nth(1)
+    }
+}
 
 /// One federated literature source. The contract the engine and sweep depend
 /// on; everything else is an implementation detail of the adapter.
@@ -42,11 +187,16 @@ pub trait Source: Send + Sync {
     fn min_interval(&self) -> Duration;
     /// Where paging starts for this source.
     fn initial_cursor(&self) -> &'static str;
+    /// What this adapter's translator can actually serve. Declarations are
+    /// verified against the wire requests the translator emits — a claimed
+    /// capability the translator does not honour is a test failure.
+    fn capabilities(&self) -> SourceCaps;
     /// Fetch the first page for `query`. An empty page means the source had
-    /// nothing; use `Err` to report failure (they are reported differently).
+    /// nothing; use `Err` to report failure (they are reported differently),
+    /// stating the failure's [`FailureKind`].
     /// The page carries completeness accounting (`raw_count`, `available`) so
     /// a caller can tell "got everything" from "got less than exists".
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage>;
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError>;
     /// Fetch one page identified by a source-specific cursor. Returns the
     /// page and the successor cursor, when the source says there may be more.
     /// The successor decision must derive from the RAW record count the
@@ -56,7 +206,7 @@ pub trait Source: Send + Sync {
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)>;
+    ) -> Result<(SourcePage, Option<String>), SourceError>;
 }
 
 /// Ordered registry of adapters. Iteration order is registration order, which
@@ -174,16 +324,26 @@ impl Source for Arxiv {
     fn initial_cursor(&self) -> &'static str {
         arxiv::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        arxiv::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: arxiv::MAX_PAGE_SIZE,
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        arxiv::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        arxiv::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        arxiv::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -198,16 +358,26 @@ impl Source for Openalex {
     fn initial_cursor(&self) -> &'static str {
         openalex::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        openalex::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: openalex::MAX_PAGE_SIZE,
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        openalex::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        openalex::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        openalex::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -222,16 +392,26 @@ impl Source for Crossref {
     fn initial_cursor(&self) -> &'static str {
         crossref::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        crossref::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: crossref::MAX_PAGE_SIZE,
+            max_offset: Some(crossref::MAX_OFFSET),
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        crossref::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        crossref::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        crossref::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -246,16 +426,26 @@ impl Source for Pubmed {
     fn initial_cursor(&self) -> &'static str {
         pubmed::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        pubmed::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: pubmed::MAX_PAGE_SIZE,
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        pubmed::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        pubmed::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        pubmed::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -270,16 +460,26 @@ impl Source for SemanticScholar {
     fn initial_cursor(&self) -> &'static str {
         semantic_scholar::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        semantic_scholar::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: semantic_scholar::MAX_PAGE_SIZE,
+            max_offset: Some(semantic_scholar::MAX_OFFSET),
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        semantic_scholar::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        semantic_scholar::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        semantic_scholar::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -294,16 +494,26 @@ impl Source for Preprints {
     fn initial_cursor(&self) -> &'static str {
         europepmc::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        europepmc::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: europepmc::MAX_PAGE_SIZE,
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        europepmc::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        europepmc::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        europepmc::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -318,16 +528,26 @@ impl Source for Chemrxiv {
     fn initial_cursor(&self) -> &'static str {
         chemrxiv::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        chemrxiv::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: chemrxiv::MAX_PAGE_SIZE,
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        chemrxiv::fetch(ctx, query)
+            .await
+            .map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        chemrxiv::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        chemrxiv::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -342,16 +562,24 @@ impl Source for Doaj {
     fn initial_cursor(&self) -> &'static str {
         doaj::INITIAL_CURSOR
     }
-    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
-        doaj::fetch(ctx, query).await
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: doaj::MAX_PAGE_SIZE,
+            max_offset: None,
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        doaj::fetch(ctx, query).await.map_err(SourceError::classify)
     }
     async fn fetch_page(
         &self,
         ctx: &FetchCtx,
         query: &str,
         cursor: &str,
-    ) -> Result<(SourcePage, Option<String>)> {
-        doaj::fetch_page(ctx, query, cursor).await
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        doaj::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
     }
 }
 
@@ -511,7 +739,13 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<SourcePage> {
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<SourcePage, SourceError> {
             Ok(SourcePage::default())
         }
         async fn fetch_page(
@@ -519,7 +753,7 @@ mod tests {
             ctx: &FetchCtx,
             query: &str,
             _: &str,
-        ) -> Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }
@@ -536,7 +770,13 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<SourcePage> {
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<SourcePage, SourceError> {
             Ok(SourcePage::default())
         }
         async fn fetch_page(
@@ -544,8 +784,63 @@ mod tests {
             ctx: &FetchCtx,
             query: &str,
             _: &str,
-        ) -> Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
+    }
+
+    /// Pins the classification table at the unit level: every HTTP status
+    /// class maps to ITS kind, parse failures map to `Malformed`, and the
+    /// documented fallback is `Transport`. Collapsing any two kinds into one
+    /// fails here (and again at engine level in `tests/failure_taxonomy.rs`).
+    #[test]
+    fn classification_keeps_the_kinds_distinct() {
+        let http = |code: u16| {
+            SourceError::classify(anyhow::Error::new(crate::http::HttpStatusFailure {
+                status: reqwest::StatusCode::from_u16(code).unwrap(),
+                url: "http://x.example/q".to_string(),
+                attempts: 1,
+            }))
+            .kind()
+        };
+        assert_eq!(http(401), FailureKind::Auth);
+        assert_eq!(http(403), FailureKind::Auth);
+        assert_eq!(http(429), FailureKind::RateLimited);
+        assert_eq!(http(400), FailureKind::UnsupportedQuery);
+        assert_eq!(http(404), FailureKind::UnsupportedQuery);
+        assert_eq!(http(500), FailureKind::Transport);
+        assert_eq!(http(503), FailureKind::Transport);
+
+        let parse = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert_eq!(
+            SourceError::classify(anyhow::Error::new(parse)).kind(),
+            FailureKind::Malformed
+        );
+        // The documented fallback: untyped escapes are transport-layer.
+        assert_eq!(
+            SourceError::classify(anyhow::anyhow!("offline mode refused host")).kind(),
+            FailureKind::Transport
+        );
+    }
+
+    /// The taxonomy adds information without rewording: `{:#}` on a
+    /// classified error prints exactly what `{:#}` printed on the bare
+    /// anyhow chain — status reporting strings are pinned elsewhere and
+    /// must not shift underneath them.
+    #[test]
+    fn classified_errors_report_the_same_strings() {
+        let bare = anyhow::Error::new(crate::http::HttpStatusFailure {
+            status: reqwest::StatusCode::from_u16(429).unwrap(),
+            url: "http://x.example/q".to_string(),
+            attempts: 3,
+        })
+        .context("fetching page 2");
+        let bare_text = format!("{bare:#}");
+        let classified = SourceError::classify(bare);
+        assert_eq!(format!("{classified:#}"), bare_text);
+        assert_eq!(
+            bare_text,
+            "fetching page 2: HTTP 429 Too Many Requests from http://x.example/q after 3 attempt(s)"
+        );
     }
 }

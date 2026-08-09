@@ -128,6 +128,13 @@ pub struct SourceStatus {
     pub latency_ms: f64,
     pub cache_hit: bool,
     pub error: Option<String>,
+    /// Typed kind when the SOURCE failed (`status` "error"/"timeout") —
+    /// retry, backoff and reporting can branch on it. `None` on success and
+    /// for configuration failures (an id with no registered adapter), which
+    /// are not source failures. The `status` string and `error` text are
+    /// unchanged; this field only adds information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<crate::sources::source::FailureKind>,
 }
 
 /// Result of one federated search.

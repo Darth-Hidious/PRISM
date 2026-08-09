@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use prism_retrieval::{EngineConfig, RetrievalEngine, SourceId};
+use prism_retrieval::{EngineConfig, FailureKind, RetrievalEngine};
 
 const ARXIV_BODY: &str = r#"<?xml version="1.0"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
@@ -44,10 +44,10 @@ const CROSSREF_BODY: &str = r#"{
 
 fn engine_for(server_url: &str, cache_dir: Option<std::path::PathBuf>) -> RetrievalEngine {
     let mut overrides = HashMap::new();
-    overrides.insert(SourceId::Arxiv, server_url.to_string());
-    overrides.insert(SourceId::Crossref, server_url.to_string());
+    overrides.insert("arxiv".to_string(), server_url.to_string());
+    overrides.insert("crossref".to_string(), server_url.to_string());
     let cfg = EngineConfig {
-        sources: vec![SourceId::Arxiv, SourceId::Crossref],
+        sources: vec!["arxiv".to_string(), "crossref".to_string()],
         base_overrides: overrides,
         cache_dir,
         per_source_timeout_secs: 10,
@@ -152,6 +152,11 @@ async fn one_source_failing_never_silences_the_others() {
         .unwrap();
     assert_eq!(failed.status, "error");
     assert!(failed.error.as_deref().unwrap().contains("500"));
+    assert_eq!(
+        failed.failure_kind,
+        Some(FailureKind::Transport),
+        "a 5xx surviving retries is typed as transport"
+    );
     let ok = outcome
         .source_status
         .iter()
@@ -191,10 +196,10 @@ async fn a_source_timeout_is_reported_as_timeout() {
     });
 
     let mut overrides = HashMap::new();
-    overrides.insert(SourceId::Arxiv, server.url());
-    overrides.insert(SourceId::Crossref, format!("http://{blackhole_addr}"));
+    overrides.insert("arxiv".to_string(), server.url());
+    overrides.insert("crossref".to_string(), format!("http://{blackhole_addr}"));
     let cfg = EngineConfig {
-        sources: vec![SourceId::Arxiv, SourceId::Crossref],
+        sources: vec!["arxiv".to_string(), "crossref".to_string()],
         base_overrides: overrides,
         cache_dir: None,
         per_source_timeout_secs: 1,
@@ -210,6 +215,11 @@ async fn a_source_timeout_is_reported_as_timeout() {
         .find(|s| s.source == "crossref")
         .unwrap();
     assert_eq!(timed_out.status, "timeout");
+    assert_eq!(
+        timed_out.failure_kind,
+        Some(FailureKind::Cancelled),
+        "our per-source deadline ended the fetch — typed as cancelled"
+    );
     // arXiv is unaffected.
     assert_eq!(outcome.papers.len(), 2);
 }

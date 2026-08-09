@@ -11,6 +11,13 @@ const DEFAULT_BASE: &str = "https://api.crossref.org";
 
 pub const ID: &str = "crossref";
 pub const INITIAL_CURSOR: &str = "0";
+/// Largest `rows` this translator will put on the wire. Declared as the
+/// adapter's capability and verified against the actual request in
+/// `tests/capability_declarations.rs`.
+pub const MAX_PAGE_SIZE: usize = 100;
+/// Deepest `offset` this translator will request a page at — Crossref
+/// refuses offsets past 10 000. Declared and verified likewise.
+pub const MAX_OFFSET: u64 = 10_000;
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
     let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
@@ -27,7 +34,7 @@ pub async fn fetch_page(
     cursor: &str,
 ) -> Result<(SourcePage, Option<String>)> {
     let offset: usize = cursor.parse().unwrap_or(0);
-    let rows = ctx.limit.min(100);
+    let rows = ctx.limit.min(MAX_PAGE_SIZE);
     let base = ctx.base(ID, DEFAULT_BASE);
     let mut url = format!(
         "{base}/works?query={q}&rows={rows}&offset={offset}",
@@ -38,8 +45,8 @@ pub async fn fetch_page(
     }
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let page = parse(&body)?;
-    let next =
-        (page.raw_count >= rows && offset + rows <= 10_000).then(|| (offset + rows).to_string());
+    let next = (page.raw_count >= rows && (offset + rows) as u64 <= MAX_OFFSET)
+        .then(|| (offset + rows).to_string());
     Ok((page, next))
 }
 

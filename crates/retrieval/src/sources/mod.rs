@@ -29,7 +29,7 @@ pub mod semantic_scholar;
 /// no `match` over [`SourceId`] on any fetch path.
 pub mod source;
 
-pub use source::{Source, SourceRegistry};
+pub use source::{FailureKind, Source, SourceCaps, SourceError, SourceRegistry};
 
 /// The sources this engine federates across.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

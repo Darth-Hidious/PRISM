@@ -10,6 +10,10 @@ const DEFAULT_BASE: &str = "https://chemrxiv.org/engage/chemrxiv/public-api/v1";
 
 pub const ID: &str = "chemrxiv";
 pub const INITIAL_CURSOR: &str = "0";
+/// Largest `limit` this translator will put on the wire. Declared as the
+/// adapter's capability and verified against the actual request in
+/// `tests/capability_declarations.rs`.
+pub const MAX_PAGE_SIZE: usize = 100;
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
     let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
@@ -25,7 +29,7 @@ pub async fn fetch_page(
     cursor: &str,
 ) -> Result<(SourcePage, Option<String>)> {
     let skip: usize = cursor.parse().unwrap_or(0);
-    let limit = ctx.limit.min(100);
+    let limit = ctx.limit.min(MAX_PAGE_SIZE);
     let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
         "{base}/items?term={q}&limit={limit}&skip={skip}",

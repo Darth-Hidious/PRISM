@@ -14,6 +14,10 @@ const DEFAULT_BASE: &str = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 
 pub const ID: &str = "preprints_europepmc";
 pub const INITIAL_CURSOR: &str = "";
+/// Largest `pageSize` this translator will put on the wire. Declared as the
+/// adapter's capability and verified against the actual request in
+/// `tests/capability_declarations.rs`.
+pub const MAX_PAGE_SIZE: usize = 25;
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
     let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
@@ -35,7 +39,7 @@ pub async fn fetch_page(
     let scoped = format!("({query}) AND SRC:PPR");
     let url = format!(
         "{base}/search?format=json&pageSize={n}&cursorMark={m}&query={q}",
-        n = ctx.limit.min(25),
+        n = ctx.limit.min(MAX_PAGE_SIZE),
         m = url_encode(mark),
         q = url_encode(&scoped)
     );

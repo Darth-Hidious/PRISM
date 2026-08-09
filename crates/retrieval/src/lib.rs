@@ -28,5 +28,7 @@ pub mod sweep;
 pub use engine::{EngineConfig, RetrievalEngine, default_cache_dir};
 pub use fulltext::{BlockKind, Fulltext, Locator, TextBlock};
 pub use model::{FulltextFormat, Paper, SearchOutcome, SourcePage, SourceStatus};
-pub use sources::{FetchCtx, SourceId, all_sources};
+pub use sources::{
+    FailureKind, FetchCtx, Source, SourceCaps, SourceError, SourceId, SourceRegistry, all_sources,
+};
 pub use sweep::{SweepOutcome, SweepPlan, SweepState};

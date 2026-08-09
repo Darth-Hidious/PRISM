@@ -11,6 +11,10 @@ const DEFAULT_BASE: &str = "http://export.arxiv.org/api/query";
 
 pub const ID: &str = "arxiv";
 pub const INITIAL_CURSOR: &str = "0";
+/// Largest `max_results` this translator will put on the wire. Declared as
+/// the adapter's capability and verified against the actual request in
+/// `tests/capability_declarations.rs`.
+pub const MAX_PAGE_SIZE: usize = 100;
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
     let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
@@ -31,11 +35,12 @@ pub async fn fetch_page(
     let url = format!(
         "{base}?search_query=all:{q}&start={start}&max_results={n}",
         q = url_encode(query),
-        n = ctx.limit.min(100)
+        n = ctx.limit.min(MAX_PAGE_SIZE)
     );
     let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let page = parse(&body)?;
-    let next = (page.raw_count >= ctx.limit.min(100)).then(|| (start + page.raw_count).to_string());
+    let next = (page.raw_count >= ctx.limit.min(MAX_PAGE_SIZE))
+        .then(|| (start + page.raw_count).to_string());
     Ok((page, next))
 }
 

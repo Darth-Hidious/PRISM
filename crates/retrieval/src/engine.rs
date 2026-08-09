@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::cache::DiskCache;
 use crate::model::{Paper, SearchOutcome, SourceStatus};
 use crate::ratelimit::RateLimiter;
-use crate::sources::{self, FetchCtx, Source, SourceId, SourceRegistry, all_sources};
+use crate::sources::source::FailureKind;
+use crate::sources::{self, FetchCtx, Source, SourceRegistry, all_sources};
 
 pub const DEFAULT_USER_AGENT: &str = concat!(
     "prism-retrieval/",
@@ -26,14 +27,18 @@ pub struct EngineConfig {
     pub user_agent: String,
     /// Contact address for polite pools (OpenAlex, Crossref).
     pub mailto: Option<String>,
-    /// Sources to fan out to, in deterministic reporting order.
-    pub sources: Vec<SourceId>,
+    /// Sources to fan out to, in deterministic reporting order — REGISTRY id
+    /// strings (`"arxiv"`, ...), so a runtime-registered adapter is selectable
+    /// exactly like a built-in. The [`crate::sources::SourceId`] enum is only
+    /// a CLI convenience for producing these strings; selection never
+    /// consults it.
+    pub sources: Vec<String>,
     pub per_source_timeout_secs: u64,
     pub cache_dir: Option<std::path::PathBuf>,
     pub cache_ttl_secs: u64,
     pub max_attempts: u32,
-    /// Test/mirror overrides, keyed by source name.
-    pub base_overrides: HashMap<SourceId, String>,
+    /// Test/mirror overrides, keyed by registry id string.
+    pub base_overrides: HashMap<String, String>,
 }
 
 impl Default for EngineConfig {
@@ -41,7 +46,10 @@ impl Default for EngineConfig {
         Self {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             mailto: None,
-            sources: all_sources(),
+            sources: all_sources()
+                .iter()
+                .map(|id| id.as_str().to_string())
+                .collect(),
             per_source_timeout_secs: 30,
             cache_dir: default_cache_dir(),
             cache_ttl_secs: 24 * 60 * 60,
@@ -76,18 +84,21 @@ impl RetrievalEngine {
         Self::with_registry(cfg, SourceRegistry::builtin())
     }
 
-    /// Build an engine over an explicit registry — the seam tests use to
-    /// substitute adapters; [`RetrievalEngine::new`] passes the built-ins.
-    pub(crate) fn with_registry(cfg: EngineConfig, registry: SourceRegistry) -> Self {
+    /// Build an engine over an explicit registry — the third-party seam:
+    /// register your own adapters, then select them by registry id string
+    /// in `cfg.sources` exactly like a built-in. [`RetrievalEngine::new`]
+    /// passes the built-ins.
+    pub fn with_registry(cfg: EngineConfig, registry: SourceRegistry) -> Self {
         let mut limiters = HashMap::new();
         let mut selected: Vec<Arc<dyn Source>> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
         for id in &cfg.sources {
-            // Resolve the configured SourceId to its registry adapter. A
+            // Resolve the configured id string to its registry adapter — the
+            // registry is the only naming authority; no enum is consulted. A
             // configured id with no adapter (cannot happen for the eight
             // built-ins) is remembered and reported by search(), never
             // silently dropped.
-            match registry.get(id.as_str()) {
+            match registry.get(id) {
                 Some(source) => {
                     limiters.insert(
                         source.id().to_string(),
@@ -95,7 +106,7 @@ impl RetrievalEngine {
                     );
                     selected.push(source);
                 }
-                None => missing.push(id.as_str().to_string()),
+                None => missing.push(id.clone()),
             }
         }
         // The client timeout is a backstop comfortably ABOVE the per-source
@@ -187,12 +198,7 @@ impl RetrievalEngine {
                 .expect("configured user agent must be a valid header"),
             mailto: self.cfg.mailto.clone(),
             limit,
-            base_overrides: self
-                .cfg
-                .base_overrides
-                .iter()
-                .map(|(id, url)| (id.as_str().to_string(), url.clone()))
-                .collect(),
+            base_overrides: self.cfg.base_overrides.clone(),
             limiters: self.limiters.clone(),
             cache,
             max_attempts: self.cfg.max_attempts,
@@ -271,6 +277,7 @@ impl RetrievalEngine {
                             .copied()
                             .unwrap_or(false),
                         error: None,
+                        failure_kind: None,
                     });
                 }
                 Ok(Err(e)) => source_status.push(SourceStatus {
@@ -281,6 +288,7 @@ impl RetrievalEngine {
                     latency_ms,
                     cache_hit: false,
                     error: Some(format!("{e:#}")),
+                    failure_kind: Some(e.kind()),
                 }),
                 Err(_) => source_status.push(SourceStatus {
                     source: source_id.to_string(),
@@ -293,6 +301,9 @@ impl RetrievalEngine {
                         "exceeded per-source timeout of {}s",
                         self.cfg.per_source_timeout_secs
                     )),
+                    // Our deadline ended the fetch; the source neither
+                    // answered nor failed on its own.
+                    failure_kind: Some(FailureKind::Cancelled),
                 }),
             }
         }
@@ -308,6 +319,9 @@ impl RetrievalEngine {
                 latency_ms: 0.0,
                 cache_hit: false,
                 error: Some(format!("no adapter registered for source '{id}'")),
+                // A configuration failure, not a source failure — the
+                // taxonomy describes what SOURCES do.
+                failure_kind: None,
             });
         }
 
@@ -329,6 +343,7 @@ mod tests {
 
     use super::*;
     use crate::model::{Paper, SourcePage};
+    use crate::sources::source::{SourceCaps, SourceError};
     use crate::sources::{FetchCtx, Source};
 
     #[test]
@@ -463,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn replacing_builtin_arxiv_serves_search_from_the_replacement() {
         let mut engine = RetrievalEngine::new(EngineConfig {
-            sources: vec![SourceId::Arxiv],
+            sources: vec!["arxiv".to_string()],
             cache_dir: None,
             ..EngineConfig::default()
         });
@@ -502,7 +517,7 @@ mod tests {
     async fn configured_source_with_no_adapter_reports_error_status() {
         let mut engine = RetrievalEngine::with_registry(
             EngineConfig {
-                sources: vec![SourceId::Arxiv],
+                sources: vec!["arxiv".to_string()],
                 cache_dir: None,
                 ..EngineConfig::default()
             },
@@ -522,6 +537,10 @@ mod tests {
         assert_eq!(
             status.error.as_deref(),
             Some("no adapter registered for source 'arxiv'")
+        );
+        assert_eq!(
+            status.failure_kind, None,
+            "a configuration failure is not a source failure"
         );
 
         // Registering an adapter for the missing id clears the error. (The
@@ -559,6 +578,11 @@ mod tests {
         assert_eq!(status.count, 0);
         assert!(!status.cache_hit);
         assert_eq!(status.error.as_deref(), Some("boom-adapter-failed"));
+        assert_eq!(
+            status.failure_kind,
+            Some(FailureKind::Transport),
+            "the adapter's declared failure kind must reach the status"
+        );
     }
 
     // ── Test-only adapters ───────────────────────────────────────────────
@@ -577,7 +601,13 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<SourcePage> {
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<SourcePage, SourceError> {
             Ok(SourcePage {
                 papers: vec![Paper {
                     source: "echo".to_string(),
@@ -603,7 +633,7 @@ mod tests {
             ctx: &FetchCtx,
             query: &str,
             _cursor: &str,
-        ) -> anyhow::Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }
@@ -626,7 +656,13 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<SourcePage> {
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<SourcePage, SourceError> {
             Ok(SourcePage {
                 papers: vec![Paper {
                     source: self.id.to_string(),
@@ -652,7 +688,7 @@ mod tests {
             ctx: &FetchCtx,
             query: &str,
             _cursor: &str,
-        ) -> anyhow::Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }
@@ -669,15 +705,24 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> anyhow::Result<SourcePage> {
-            Err(anyhow::anyhow!("boom-adapter-failed"))
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<SourcePage, SourceError> {
+            Err(SourceError::msg(
+                FailureKind::Transport,
+                "boom-adapter-failed",
+            ))
         }
         async fn fetch_page(
             &self,
             ctx: &FetchCtx,
             query: &str,
             _cursor: &str,
-        ) -> anyhow::Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             self.fetch(ctx, query).await.map(|p| (p, None))
         }
     }

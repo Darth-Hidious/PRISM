@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use prism_retrieval::{EngineConfig, RetrievalEngine, SourceId, SweepPlan, sweep};
+use prism_retrieval::{EngineConfig, RetrievalEngine, SweepPlan, sweep};
 
 fn feed(arxiv_id: &str, title: &str, doi: Option<&str>) -> String {
     let doi = doi
@@ -43,9 +43,9 @@ const EMPTY_FEED: &str = r#"<?xml version="1.0"?>
 
 fn engine_for(server_url: &str, cache_dir: std::path::PathBuf) -> RetrievalEngine {
     let mut overrides = HashMap::new();
-    overrides.insert(SourceId::Arxiv, server_url.to_string());
+    overrides.insert("arxiv".to_string(), server_url.to_string());
     let cfg = EngineConfig {
-        sources: vec![SourceId::Arxiv],
+        sources: vec!["arxiv".to_string()],
         base_overrides: overrides,
         cache_dir: Some(cache_dir),
         per_source_timeout_secs: 10,
@@ -60,7 +60,7 @@ fn engine_for(server_url: &str, cache_dir: std::path::PathBuf) -> RetrievalEngin
 fn plan(max_pages: usize) -> SweepPlan {
     SweepPlan {
         query: "test".to_string(),
-        sources: vec![SourceId::Arxiv],
+        sources: vec!["arxiv".to_string()],
         max_pages_per_source: max_pages,
         per_page_limit: 1,
     }

@@ -28,13 +28,16 @@ use serde::{Deserialize, Serialize};
 use crate::engine::RetrievalEngine;
 use crate::model::{Paper, SourceStatus};
 use crate::ratelimit::RateLimiter;
-use crate::sources::SourceId;
+use crate::sources::source::FailureKind;
 
 /// What a sweep will do. Changing the plan invalidates a saved state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SweepPlan {
     pub query: String,
-    pub sources: Vec<SourceId>,
+    /// REGISTRY id strings (`"arxiv"`, ...): a plan can sweep any registered
+    /// adapter, including one registered at runtime — the
+    /// [`crate::sources::SourceId`] enum is never consulted here.
+    pub sources: Vec<String>,
     /// Hard cap of pages per source (protects against cursor loops and
     /// source-side offset ceilings).
     pub max_pages_per_source: usize,
@@ -63,15 +66,15 @@ pub struct SweepState {
 }
 
 impl SweepState {
-    fn item_key(id: SourceId, cursor: &str) -> String {
-        format!("{}|{}", id.as_str(), cursor)
+    fn item_key(id: &str, cursor: &str) -> String {
+        format!("{id}|{cursor}")
     }
 
-    pub fn is_done(&self, id: SourceId, cursor: &str) -> bool {
+    pub fn is_done(&self, id: &str, cursor: &str) -> bool {
         self.completed.contains(&Self::item_key(id, cursor))
     }
 
-    fn mark_done(&mut self, id: SourceId, cursor: &str) {
+    fn mark_done(&mut self, id: &str, cursor: &str) {
         self.completed.insert(Self::item_key(id, cursor));
     }
 }
@@ -103,8 +106,20 @@ fn load_state(path: &Path, plan: &SweepPlan) -> Result<Option<SweepState>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading sweep state {path:?}")),
     };
-    let state: SweepState =
+    let mut state: SweepState =
         serde_json::from_str(&raw).with_context(|| format!("parsing sweep state {path:?}"))?;
+    // Checkpoints written before string selection stored SourceId variant
+    // names ("Arxiv"). Normalize them to registry ids so an old resume of
+    // the SAME plan is recognized instead of failing as a "different plan".
+    // (The completed-page keys always used the registry id, so they need no
+    // migration.)
+    for source in &mut state.plan.sources {
+        if let Ok(legacy) = serde_json::from_value::<crate::sources::SourceId>(
+            serde_json::Value::String(source.clone()),
+        ) {
+            *source = legacy.as_str().to_string();
+        }
+    }
     if state.plan != *plan {
         bail!(
             "sweep state at {} belongs to a different plan; delete it or use the same plan",
@@ -156,21 +171,21 @@ impl RetrievalEngine {
 
         for id in &plan.sources {
             let source_start = Instant::now();
-            // Resolve the configured source to its registry adapter. The eight
-            // built-ins always resolve; an unresolvable id is reported
-            // honestly and skipped, never fabricated.
-            let Some(src) = self.registry().get(id.as_str()) else {
+            // Resolve the configured id string to its registry adapter — the
+            // registry is the only naming authority; no enum is consulted.
+            // The eight built-ins always resolve; an unresolvable id is
+            // reported honestly and skipped, never fabricated.
+            let Some(src) = self.registry().get(id) else {
                 source_status.push(SourceStatus {
-                    source: id.as_str().to_string(),
+                    source: id.clone(),
                     status: "error".to_string(),
                     count: 0,
                     available: None,
                     latency_ms: source_start.elapsed().as_secs_f64() * 1000.0,
                     cache_hit: false,
-                    error: Some(format!(
-                        "no adapter registered for source '{}'",
-                        id.as_str()
-                    )),
+                    error: Some(format!("no adapter registered for source '{id}'")),
+                    // A configuration failure, not a source failure.
+                    failure_kind: None,
                 });
                 completes.push(false);
                 continue;
@@ -192,6 +207,7 @@ impl RetrievalEngine {
             // Last server-reported total for the query, when any page said.
             let mut available_this_source: Option<u64> = None;
             let mut error_this_source: Option<String> = None;
+            let mut failure_kind_this_source: Option<FailureKind> = None;
             let mut timed_out_this_source = false;
             let mut exhausted = false;
             // Where this source's contribution to the run begins. Sources are
@@ -204,7 +220,7 @@ impl RetrievalEngine {
                 if pages_this_source >= plan.max_pages_per_source {
                     break;
                 }
-                if state.is_done(*id, &cursor) {
+                if state.is_done(id, &cursor) {
                     // Replay from cache to find the successor cursor. The
                     // replayed page's papers still belong in the outcome —
                     // a resume must not silently drop completed work — and
@@ -263,14 +279,13 @@ impl RetrievalEngine {
                             // cannot be replayed honestly; restart this source
                             // from its first page.
                             tracing::warn!(
-                                "sweep replay failed for {} at cursor {cursor}: {e:#}; \
-                                 restarting source from the beginning",
-                                id.as_str()
+                                "sweep replay failed for {id} at cursor {cursor}: {e:#}; \
+                                 restarting source from the beginning"
                             );
                             cursor = src.initial_cursor().to_string();
                             state
                                 .completed
-                                .retain(|k| !k.starts_with(&format!("{}|", id.as_str())));
+                                .retain(|k| !k.starts_with(&format!("{id}|")));
                             // Reset the page budget: the source restarts from
                             // page one, and the pages consumed before the
                             // restart must not starve the re-fetched chain —
@@ -302,6 +317,7 @@ impl RetrievalEngine {
                                 "exceeded per-source timeout of {}s",
                                 self.config().per_source_timeout_secs
                             ));
+                            failure_kind_this_source = Some(FailureKind::Cancelled);
                             timed_out_this_source = true;
                             break;
                         }
@@ -341,7 +357,7 @@ impl RetrievalEngine {
                                 }
                             }
                         }
-                        state.mark_done(*id, &cursor);
+                        state.mark_done(id, &cursor);
                         state.papers_seen = papers.len() + duplicates_merged;
                         save_state(state_path, &state)?;
                         match next {
@@ -354,6 +370,7 @@ impl RetrievalEngine {
                     }
                     Ok(Err(e)) => {
                         error_this_source = Some(format!("{e:#}"));
+                        failure_kind_this_source = Some(e.kind());
                         break;
                     }
                     Err(_) => {
@@ -361,6 +378,7 @@ impl RetrievalEngine {
                             "exceeded per-source timeout of {}s",
                             self.config().per_source_timeout_secs
                         ));
+                        failure_kind_this_source = Some(FailureKind::Cancelled);
                         timed_out_this_source = true;
                         break;
                     }
@@ -393,6 +411,7 @@ impl RetrievalEngine {
                 latency_ms,
                 cache_hit: false,
                 error: error_this_source,
+                failure_kind: failure_kind_this_source,
             });
         }
 
@@ -416,7 +435,7 @@ pub fn default_state_path(state_dir: &Path, plan: &SweepPlan) -> PathBuf {
     hasher.update(plan.query.as_bytes());
     for source in &plan.sources {
         hasher.update(b"|");
-        hasher.update(source.as_str().as_bytes());
+        hasher.update(source.as_bytes());
     }
     let hex: String = hasher
         .finalize()
@@ -434,6 +453,7 @@ mod tests {
     use super::*;
     use crate::engine::EngineConfig;
     use crate::model::SourcePage;
+    use crate::sources::source::{SourceCaps, SourceError};
     use crate::sources::{FetchCtx, Source, SourceRegistry};
 
     fn page_of(papers: Vec<Paper>) -> SourcePage {
@@ -447,7 +467,7 @@ mod tests {
     fn plan() -> SweepPlan {
         SweepPlan {
             query: "test".to_string(),
-            sources: vec![SourceId::Arxiv],
+            sources: vec!["arxiv".to_string()],
             max_pages_per_source: 3,
             per_page_limit: 10,
         }
@@ -488,7 +508,13 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
             self.fetch_page(ctx, query, "0").await.map(|(p, _)| p)
         }
         async fn fetch_page(
@@ -496,7 +522,7 @@ mod tests {
             ctx: &FetchCtx,
             _query: &str,
             cursor: &str,
-        ) -> Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             self.limiters_seen
                 .lock()
                 .expect("limiters_seen poisoned")
@@ -524,7 +550,13 @@ mod tests {
         fn initial_cursor(&self) -> &'static str {
             "0"
         }
-        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<SourcePage> {
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _ctx: &FetchCtx, _query: &str) -> Result<SourcePage, SourceError> {
             tokio::time::sleep(Duration::from_secs(4)).await;
             Ok(page_of(vec![paper("too-late")]))
         }
@@ -533,7 +565,7 @@ mod tests {
             _ctx: &FetchCtx,
             _query: &str,
             _cursor: &str,
-        ) -> Result<(SourcePage, Option<String>)> {
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
             tokio::time::sleep(Duration::from_secs(4)).await;
             Ok((page_of(vec![paper("too-late")]), None))
         }
@@ -618,6 +650,11 @@ mod tests {
             status.error.as_deref(),
             Some("exceeded per-source timeout of 1s")
         );
+        assert_eq!(
+            status.failure_kind,
+            Some(FailureKind::Cancelled),
+            "our deadline ended the fetch — typed as cancelled"
+        );
     }
 
     /// The replay path re-fetches over the network when the cache entry is
@@ -634,7 +671,7 @@ mod tests {
             plan: plan(),
             ..Default::default()
         };
-        state.mark_done(SourceId::Arxiv, "0");
+        state.mark_done("arxiv", "0");
         save_state(&state_path, &state).unwrap();
 
         let outcome = engine.run_sweep(&plan(), &state_path).await.unwrap();
@@ -644,6 +681,10 @@ mod tests {
         assert_eq!(
             outcome.source_status[0].error.as_deref(),
             Some("exceeded per-source timeout of 1s")
+        );
+        assert_eq!(
+            outcome.source_status[0].failure_kind,
+            Some(FailureKind::Cancelled)
         );
     }
 
@@ -655,15 +696,45 @@ mod tests {
             plan: plan(),
             ..Default::default()
         };
-        state.mark_done(SourceId::Arxiv, "0");
+        state.mark_done("arxiv", "0");
         save_state(&path, &state).unwrap();
         let loaded = load_state(&path, &plan()).unwrap().unwrap();
-        assert!(loaded.is_done(SourceId::Arxiv, "0"));
-        assert!(!loaded.is_done(SourceId::Arxiv, "10"));
+        assert!(loaded.is_done("arxiv", "0"));
+        assert!(!loaded.is_done("arxiv", "10"));
 
         let mut other = plan();
         other.query = "different".to_string();
         assert!(load_state(&path, &other).is_err());
+    }
+
+    /// A checkpoint written BEFORE string selection stored SourceId variant
+    /// names in its plan ("Arxiv"). It must load as the SAME plan — the
+    /// legacy names are normalized to registry ids — not fail as a
+    /// "different plan" the user never changed.
+    #[test]
+    fn legacy_variant_named_checkpoint_resumes_as_the_same_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let legacy = serde_json::json!({
+            "plan": {
+                "query": "test",
+                "sources": ["Arxiv"],
+                "max_pages_per_source": 3,
+                "per_page_limit": 10,
+            },
+            "completed": ["arxiv|0"],
+            "papers_seen": 1,
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let loaded = load_state(&path, &plan())
+            .expect("a legacy checkpoint must not fail as a different plan")
+            .expect("state must load");
+        assert_eq!(loaded.plan.sources, vec!["arxiv".to_string()]);
+        assert!(
+            loaded.is_done("arxiv", "0"),
+            "completed keys always used registry ids and must survive"
+        );
     }
 
     #[test]

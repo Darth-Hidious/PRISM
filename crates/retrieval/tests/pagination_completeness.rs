@@ -25,9 +25,9 @@ fn engine_for(
     cache_dir: Option<std::path::PathBuf>,
 ) -> RetrievalEngine {
     let mut overrides = HashMap::new();
-    overrides.insert(source, server_url.to_string());
+    overrides.insert(source.as_str().to_string(), server_url.to_string());
     RetrievalEngine::new(EngineConfig {
-        sources: vec![source],
+        sources: vec![source.as_str().to_string()],
         base_overrides: overrides,
         cache_dir,
         per_source_timeout_secs: 10,
@@ -39,7 +39,7 @@ fn engine_for(
 fn plan_for(source: SourceId, max_pages: usize, per_page: usize) -> SweepPlan {
     SweepPlan {
         query: "test".to_string(),
-        sources: vec![source],
+        sources: vec![source.as_str().to_string()],
         max_pages_per_source: max_pages,
         per_page_limit: per_page,
     }

@@ -11,6 +11,10 @@ const DEFAULT_BASE: &str = "https://doaj.org/api/search/articles";
 
 pub const ID: &str = "doaj";
 pub const INITIAL_CURSOR: &str = "1";
+/// Largest `pageSize` this translator will put on the wire. Declared as the
+/// adapter's capability and verified against the actual request in
+/// `tests/capability_declarations.rs`.
+pub const MAX_PAGE_SIZE: usize = 100;
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<SourcePage> {
     let (page, _) = fetch_page(ctx, query, INITIAL_CURSOR).await?;
@@ -26,7 +30,7 @@ pub async fn fetch_page(
     cursor: &str,
 ) -> Result<(SourcePage, Option<String>)> {
     let page_no: usize = cursor.parse().unwrap_or(1);
-    let page_size = ctx.limit.min(100);
+    let page_size = ctx.limit.min(MAX_PAGE_SIZE);
     let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
         "{base}/{q}?pageSize={page_size}&page={page_no}",
