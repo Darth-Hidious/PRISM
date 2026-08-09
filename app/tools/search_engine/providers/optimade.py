@@ -36,6 +36,15 @@ class OptimadeProvider(Provider):
             max_results=endpoint.behavior.max_results,
         )
 
+    def describe_query(self, query: MaterialSearchQuery) -> str:
+        """The OPTIMADE filter string for /structures.
+
+        ``search()`` builds its wire filter by calling THIS method, so the
+        recorded description and the dispatched filter share one code path
+        and cannot drift (the base-class contract's intent, made literal).
+        """
+        return QueryTranslator.to_optimade(query)
+
     async def search(self, query: MaterialSearchQuery) -> list[Material]:
         """Query this OPTIMADE endpoint via async httpx (not OptimadeClient).
 
@@ -45,7 +54,7 @@ class OptimadeProvider(Provider):
         """
         import httpx
 
-        filter_string = QueryTranslator.to_optimade(query)
+        filter_string = self.describe_query(query)
         base_url = self._endpoint.base_url
         if not base_url:
             return []
