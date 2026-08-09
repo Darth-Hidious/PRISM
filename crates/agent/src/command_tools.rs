@@ -143,6 +143,8 @@ enum CommandToolKind {
     MarketplaceFind,
     IngestFile,
     IngestWatch,
+    IngestAndWait,
+    PapersIngest,
     ResearchQuery,
     ModelsList,
     ModelsSearch,
@@ -463,6 +465,15 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         requires_approval: true,
     },
     CommandToolSpec {
+        name: "ingest_and_wait",
+        root: "ingest-and-wait",
+        aliases: &[],
+        kind: CommandToolKind::IngestAndWait,
+        description: "Submit a knowledge-graph ingest job (from `url` or free-text `query`) to the hosted platform and WAIT for it to finish in one call: submit, poll, then return the resulting graph references. A failed or timed-out job is a real error, never a success document. Use this instead of `knowledge_ingest` when you need confirmation that the content actually landed in the graph — `knowledge_ingest` alone is fire-and-forget with no unattended status poll.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: false,
+    },
+    CommandToolSpec {
         name: "papers",
         root: "papers",
         aliases: &["prism_papers", "papers_search"],
@@ -481,11 +492,24 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
                 "--format",
                 "--model",
                 "--llm-url",
+                // Bounds how many blocks `claims` runs LLM extraction over —
+                // it SHAPES a read, it changes no state. Without it the
+                // unattended tool could only run claims over EVERY block.
+                "--max-blocks",
             ]),
         },
         description: "Fast literature retrieval over machine-readable APIs (arXiv, OpenAlex, Crossref, PubMed, Semantic Scholar, Europe PMC preprints, ChemRxiv, DOAJ). `subcommand=search --args [--query Q, --limit N]` for one concurrent federated search; `sweep` for resumable paginated harvesting; `full-text --args [--pmc PMC123 | --url U]` for JATS/PDF extraction with section/table locators; `claims` for EMMO-typed claim extraction (needs a configured LLM, returns zero claims honestly when none is set). Output is JSON with per-source status; every extracted claim carries evidence_class capped at 'research'.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "papers_ingest",
+        root: "papers",
+        aliases: &[],
+        kind: CommandToolKind::PapersIngest,
+        description: "Extract EMMO-typed claims from one paper's full text AND persist them into the local knowledge graph — the `--store` path of `prism papers claims`. Identify the paper by `pmc` or `url` (from a prior `papers` search/full-text call) and bound the LLM work with `max_blocks`. Approval-gated because it writes to the bundled Turso store; for claim extraction WITHOUT persistence use `papers` subcommand=claims, which is free.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
     },
     CommandToolSpec {
         name: "mesh",
@@ -1594,6 +1618,10 @@ fn ingest_schema(path_description: &str) -> Value {
                 "type": "boolean",
                 "description": "Skip LLM extraction and graph/vector writes."
             },
+            "platform": {
+                "type": "boolean",
+                "description": "Send the file to the hosted platform knowledge stack instead of extracting locally. This is the ONLY route that puts a PDF into the hosted knowledge graph; without it ingest runs the LOCAL pipeline (needs a local LLM and runtime, writes to the local Turso store). The upload connection is held while the platform extracts — this can take minutes."
+            },
             "mapping_path": {
                 "type": "string",
                 "description": "Optional YAML ontology mapping file."
@@ -1624,6 +1652,72 @@ fn ingest_schema(path_description: &str) -> Value {
             }
         },
         "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
+fn ingest_and_wait_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Source URL to fetch and extract. Provide this OR `query`."
+            },
+            "query": {
+                "type": "string",
+                "description": "Free-text to extract entities/embeddings from. Provide this OR `url`."
+            },
+            "mode": {
+                "type": "string",
+                "description": "Extraction mode: graph/embed/full (default full)."
+            },
+            "poll_timeout_secs": {
+                "type": "integer",
+                "description": "Seconds to wait for the ingest job to finish (default 1800, maximum 1800 — the agent-side execution window is sized just above it).",
+                "minimum": 1,
+                "maximum": 1800
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn papers_ingest_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "pmc": {
+                "type": "string",
+                "description": "PMC id such as PMC1234567. Provide this OR `url`."
+            },
+            "url": {
+                "type": "string",
+                "description": "Direct full-text URL (JATS XML or PDF). Provide this OR `pmc`."
+            },
+            "format": {
+                "type": "string",
+                "enum": ["jats", "pdf"],
+                "description": "Force the full-text format when the URL gives no hint."
+            },
+            "model": {
+                "type": "string",
+                "description": "Override the extraction LLM model."
+            },
+            "llm_url": {
+                "type": "string",
+                "description": "Override the extraction LLM base URL."
+            },
+            "api_key": {
+                "type": "string",
+                "description": "Optional API key for authenticated LLM providers."
+            },
+            "max_blocks": {
+                "type": "integer",
+                "description": "Extract from at most this many text blocks (0 = all). Bounds LLM run time on long documents.",
+                "minimum": 0
+            }
+        },
         "additionalProperties": false
     })
 }
@@ -2249,6 +2343,8 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::IngestWatch => {
             ingest_schema("Directory to watch continuously for ingestable files.")
         }
+        CommandToolKind::IngestAndWait => ingest_and_wait_schema(),
+        CommandToolKind::PapersIngest => papers_ingest_schema(),
         CommandToolKind::ResearchQuery => research_query_schema(),
         CommandToolKind::ModelsList => models_list_schema(),
         CommandToolKind::ModelsSearch => models_search_schema(),
@@ -2639,10 +2735,27 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
     }
 }
 
+/// The CLI's own long-work budget: `prism ingest --platform` holds the upload
+/// connection for up to 1800s while the platform extracts, and
+/// `prism ingest-and-wait` / `prism compute-run` poll for `poll_timeout_secs`
+/// (default 1800). The agent-side window must OUTLIVE that budget or the
+/// harness kills work the CLI was still legitimately doing.
+const CLI_LONG_WORK_BUDGET_SECS: u64 = 1800;
+
 fn command_timeout_for_root(root: &str) -> Duration {
     match root {
-        "workflow" | "ingest" | "query" | "run" | "research" | "deploy" | "publish"
-        | "marketplace" => Duration::from_secs(300),
+        // Literature + ingest roots do real long work: `papers sweep` is
+        // resumable paginated harvesting, `papers claims` runs one LLM call
+        // per text block, `ingest --platform` holds a connection the CLI
+        // budgets 1800s for, and `ingest-and-wait` polls up to its
+        // `poll_timeout_secs` (capped at 1800 by the typed tool). 100s of
+        // headroom so the agent-side kill never beats the CLI's own budget.
+        "papers" | "ingest" | "ingest-and-wait" => {
+            Duration::from_secs(CLI_LONG_WORK_BUDGET_SECS + 100)
+        }
+        "workflow" | "query" | "run" | "research" | "deploy" | "publish" | "marketplace" => {
+            Duration::from_secs(300)
+        }
         "node" | "mesh" => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
@@ -3074,12 +3187,16 @@ fn parse_workflow_execution_from_root_args(args: &[String]) -> Result<CommandExe
     }
 }
 
-fn build_ingest_args(input: &Value, watch: bool) -> Result<Vec<String>> {
+fn build_ingest_args(input: &Value) -> Result<Vec<String>> {
     let path = required_string(input, "path")?;
     let mut args = Vec::new();
 
-    if watch {
-        args.push("--watch".to_string());
+    // `--platform` routes the file to the hosted knowledge stack — the only
+    // way to put a PDF into the hosted knowledge graph. Without it the CLI
+    // runs the LOCAL pipeline. (The CLI dispatches --status > --platform >
+    // --watch, so this builder — which never emits --watch — stays unambiguous.)
+    if optional_bool(input, "platform") {
+        args.push("--platform".to_string());
     }
     if optional_bool(input, "schema_only") {
         args.push("--schema-only".to_string());
@@ -3246,12 +3363,95 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
         }
         CommandToolKind::IngestFile => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: build_ingest_args(input, false)?,
+            args: build_ingest_args(input)?,
         }),
-        CommandToolKind::IngestWatch => Ok(CommandExecution::Cli {
-            root: spec.root,
-            args: build_ingest_args(input, true)?,
-        }),
+        // `ingest --watch` is an infinite loop; under this bounded executor
+        // (`kill_on_drop` + a hard window) every call ended "timed out" with
+        // the watcher dead — false twice over. Refuse honestly and fast until
+        // a watcher supervisor exists (the `node up` treatment,
+        // crate::node_supervisor). The spec stays registered so old
+        // transcripts resolve; it is also hidden from the offered catalog
+        // (see UNSUPERVISABLE_TOOLS).
+        CommandToolKind::IngestWatch => bail!(
+            "ingest_watch cannot run under the agent's bounded executor: the \
+             watch loop never exits, so it would be reported as timed out and \
+             the watcher killed. Watch a directory from the CLI with \
+             `prism ingest --watch <DIR>`, or ingest files individually with \
+             `ingest_file`."
+        ),
+        CommandToolKind::IngestAndWait => {
+            let url = optional_string(input, "url");
+            let query = optional_string(input, "query");
+            if url.is_none() && query.is_none() {
+                bail!("ingest_and_wait requires `url` or `query`");
+            }
+            let mut args = Vec::new();
+            if let Some(url) = url {
+                args.push("--url".to_string());
+                args.push(url);
+            }
+            if let Some(query) = query {
+                args.push("--query".to_string());
+                args.push(query);
+            }
+            if let Some(mode) = optional_string(input, "mode") {
+                args.push("--mode".to_string());
+                args.push(mode);
+            }
+            if let Some(poll_timeout_secs) = optional_usize(input, "poll_timeout_secs") {
+                // The schema's `maximum` is a hint to the model, not a
+                // control; enforce it here so the CLI's poll budget always
+                // fits inside the agent-side execution window instead of
+                // being killed mid-poll.
+                if poll_timeout_secs as u64 > CLI_LONG_WORK_BUDGET_SECS {
+                    bail!(
+                        "`poll_timeout_secs` must be ≤ {CLI_LONG_WORK_BUDGET_SECS}: the \
+                         agent-side execution window is sized just above that \
+                         budget, and a larger poll would be killed mid-wait."
+                    );
+                }
+                args.push("--poll-timeout-secs".to_string());
+                args.push(poll_timeout_secs.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::PapersIngest => {
+            let pmc = optional_string(input, "pmc");
+            let url = optional_string(input, "url");
+            if pmc.is_none() && url.is_none() {
+                bail!("papers_ingest requires `pmc` or `url` to identify the paper");
+            }
+            let mut args = vec!["claims".to_string()];
+            for (flag, value) in [
+                ("--pmc", pmc),
+                ("--url", url),
+                ("--format", optional_string(input, "format")),
+                ("--model", optional_string(input, "model")),
+                ("--llm-url", optional_string(input, "llm_url")),
+                ("--api-key", optional_string(input, "api_key")),
+            ] {
+                if let Some(value) = value {
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+            if let Some(max_blocks) = optional_usize(input, "max_blocks") {
+                args.push("--max-blocks".to_string());
+                args.push(max_blocks.to_string());
+            }
+            // The point of this tool: persist the extracted claims into the
+            // bundled Turso store. `--store` is exactly the state-changing
+            // flag the unattended `papers` tool refuses — it lives here, on
+            // an approval-gated WorkspaceWrite tool, instead.
+            args.push("--store".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
         CommandToolKind::ResearchQuery => {
             let mut args = vec![required_string(input, "query")?];
             if let Some(depth) = optional_usize(input, "depth") {
@@ -4144,6 +4344,44 @@ fn offline_platform_failure(value: &Value) -> bool {
         .any(|text| text.contains("offline mode"))
 }
 
+/// Character cap per stream in a completed CLI child's tool-result envelope.
+///
+/// This is an ENVELOPE bound, not a model-context bound: everything past the
+/// agent loop's 30k threshold goes to durable memory with an 8k preview and a
+/// pointer promising "the FULL result is in durable memory; call recall(...)".
+/// Cutting stdout to 30k HERE made that pointer a lie for any long output —
+/// `papers full-text` prints one JSON document per paper, well past 30k — so
+/// recall returned truncated, broken JSON presented as complete. The cap now
+/// sits far above anything the CLI legitimately prints while still bounding a
+/// runaway child; a payload that IS cut carries the explicit
+/// "[Output truncated]" marker, so a cut result can never silently present
+/// itself as whole.
+const CLI_ENVELOPE_STREAM_MAX_CHARS: usize = 2_000_000;
+
+/// The one shape every completed (non-timed-out) CLI child reports through.
+/// Factored out of `execute_cli_command` so the envelope's stream bound is
+/// testable without spawning a child.
+fn completed_cli_envelope(
+    root: &str,
+    args: &[String],
+    invocation: &str,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Value {
+    json!({
+        "root": root,
+        "args": args,
+        "invocation": invocation,
+        "success": success,
+        "timed_out": false,
+        "exit_code": exit_code,
+        "stdout": truncate_for_ui(stdout.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
+        "stderr": truncate_for_ui(stderr.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
+    })
+}
+
 async fn execute_cli_command(
     runtime: &CommandToolRuntime,
     root: &'static str,
@@ -4188,23 +4426,25 @@ async fn execute_cli_command(
                 "timed_out": true,
                 "exit_code": Value::Null,
                 "stdout": "",
-                "stderr": format!("`{invocation}` is still running after {timeout_secs} seconds; interactive or long-lived sessions are not supported here."),
+                // Honest on both counts: the child is NOT still running
+                // (`kill_on_drop` terminates it as we return) and its work is
+                // abandoned, not pending.
+                "stderr": format!("`{invocation}` did not finish within {timeout_secs} seconds and was terminated; its work was abandoned. Interactive or long-lived sessions are not supported here."),
             }));
         }
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let result = json!({
-        "root": root,
-        "args": args,
-        "invocation": invocation,
-        "success": output.status.success(),
-        "timed_out": false,
-        "exit_code": output.status.code(),
-        "stdout": truncate_for_ui(stdout.trim(), 30_000),
-        "stderr": truncate_for_ui(stderr.trim(), 30_000),
-    });
+    let result = completed_cli_envelope(
+        root,
+        args,
+        invocation,
+        output.status.success(),
+        output.status.code(),
+        &stdout,
+        &stderr,
+    );
     if matches!(platform_access, CommandToolPlatformAccess::LocalOnly)
         && offline_platform_failure(&result)
     {
@@ -4414,6 +4654,16 @@ const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
 /// remaining executable for old transcripts and direct callers.
 const AGENT_SURFACE_EXCLUDED: &[&str] = &["agent"];
 
+/// Tools whose child process structurally cannot succeed under the bounded
+/// executor. `ingest_watch` runs an infinite watch loop, so every call ended
+/// with the window expiring and `kill_on_drop` killing the watcher AFTER the
+/// model was told it was "still running" — a tool that can only lie. Hidden
+/// from the offered catalog until a watcher supervisor exists (the `node up`
+/// treatment, crate::node_supervisor); the spec stays registered so old
+/// transcripts still resolve, and execution refuses honestly instead of
+/// hanging (see `build_execution`).
+const UNSUPERVISABLE_TOOLS: &[&str] = &["ingest_watch"];
+
 /// Umbrella roots whose EVERY offered verb already has a typed sibling tool.
 ///
 /// They are not deleted — `spec_by_name` still resolves them, so
@@ -4483,6 +4733,7 @@ pub fn command_tools_filtered(local_node_online: bool) -> Vec<LoadedTool> {
         .filter(|spec| !REDUNDANT_UMBRELLA_TOOLS.contains(&spec.name))
         .filter(|spec| local_node_online || !LOCAL_NODE_TOOLS.contains(&spec.name))
         .filter(|spec| !AGENT_SURFACE_EXCLUDED.contains(&spec.name))
+        .filter(|spec| !UNSUPERVISABLE_TOOLS.contains(&spec.name))
         .map(loaded_tool)
         .collect()
 }
@@ -7295,5 +7546,226 @@ ValueError: boom\n";
             }
             other => panic!("expected Cli, got {other:?}"),
         }
+    }
+
+    // ── Agent reachability of the literature/ingest paths ────────────
+    //
+    // "A capability the CLI has and the agent cannot invoke does not
+    // exist." Each test below pins one repaired reachability defect; where
+    // reachability itself is the property, the assertion is on the CATALOG
+    // the model actually sees (command_tools_filtered), not on an internal
+    // table.
+
+    /// Defect 1: `papers` fell to the 30s default while `papers sweep`
+    /// (paginated harvesting) and `papers claims` (one LLM call per block)
+    /// routinely run for minutes. The window must cover the CLI's own
+    /// long-work budget (1800s: `ingest --platform` upload hold,
+    /// `ingest-and-wait` poll default) — with headroom, so the agent-side
+    /// kill never beats a budget the CLI is still legitimately spending.
+    #[test]
+    fn papers_and_ingest_windows_cover_the_clis_long_work_budget() {
+        let budget = Duration::from_secs(CLI_LONG_WORK_BUDGET_SECS);
+        for root in ["papers", "ingest", "ingest-and-wait"] {
+            assert!(
+                command_timeout_for_root(root) > budget,
+                "`{root}` window {:?} must exceed the CLI's own {budget:?} budget",
+                command_timeout_for_root(root)
+            );
+        }
+    }
+
+    /// Defect 2a: `--max-blocks` bounds how much LLM work `claims` does —
+    /// it shapes a read, it changes no state — so the unattended `papers`
+    /// tool must accept it. Without it the agent could only run claims
+    /// over EVERY block of a paper, which cannot fit any sane window.
+    #[test]
+    fn papers_claims_accepts_max_blocks_to_bound_the_read() {
+        assert_eq!(
+            command_tool_preview(
+                "papers",
+                &json!({"subcommand": "claims", "args": ["--pmc", "PMC123", "--max-blocks", "8"]})
+            ),
+            Some("prism papers claims --pmc PMC123 --max-blocks 8".to_string())
+        );
+    }
+
+    /// Defect 2b: `--store` WRITES extracted claims into the bundled Turso
+    /// store, so it stays banned on the unattended tool — the write lives
+    /// on the approval-gated typed sibling instead.
+    #[test]
+    fn papers_umbrella_still_refuses_the_store_write() {
+        let spec = spec_by_name("papers").expect("papers spec");
+        assert!(
+            build_execution(
+                spec,
+                &json!({"subcommand": "claims", "args": ["--pmc", "PMC123", "--store"]})
+            )
+            .is_err(),
+            "unattended `papers` must not pass the state-changing --store"
+        );
+    }
+
+    /// Defect 2c: the store path exists as a typed, approval-gated sibling
+    /// (`ingest_file` pattern): offered in the catalog the model sees,
+    /// WorkspaceWrite + approval because it writes to the local graph, and
+    /// its execution always carries `--store`.
+    #[test]
+    fn papers_ingest_is_the_offered_approval_gated_store_path() {
+        for online in [false, true] {
+            assert!(
+                command_tools_filtered(online)
+                    .iter()
+                    .any(|tool| tool.name == "papers_ingest"),
+                "papers_ingest must be in the offered catalog (node online={online})"
+            );
+        }
+        assert_eq!(command_tool_requires_approval("papers_ingest"), Some(true));
+        let spec = spec_by_name("papers_ingest").expect("spec resolves");
+        assert_eq!(spec.permission_mode, PermissionMode::WorkspaceWrite);
+
+        assert_eq!(
+            command_tool_preview("papers_ingest", &json!({"pmc": "PMC123", "max_blocks": 8})),
+            Some("prism papers claims --pmc PMC123 --max-blocks 8 --store".to_string())
+        );
+        // A paper must be identified — no blind store runs.
+        assert!(build_execution(spec, &json!({})).is_err());
+    }
+
+    /// Defect 3: the typed `ingest_file` must be able to reach the hosted
+    /// platform path — the only route that puts a PDF into the hosted
+    /// knowledge graph. Assert on the offered catalog's schema (what the
+    /// model sees) and on the built argv.
+    #[test]
+    fn ingest_file_reaches_the_hosted_platform_path() {
+        let tools = command_tools_filtered(false);
+        let ingest_file = tools
+            .iter()
+            .find(|tool| tool.name == "ingest_file")
+            .expect("ingest_file offered");
+        assert!(
+            ingest_file.input_schema["properties"]
+                .as_object()
+                .expect("schema properties")
+                .contains_key("platform"),
+            "the model-facing schema must offer the hosted-platform route"
+        );
+        assert_eq!(
+            command_tool_preview(
+                "ingest_file",
+                &json!({"path": "paper.pdf", "platform": true})
+            ),
+            Some("prism ingest --platform paper.pdf".to_string())
+        );
+    }
+
+    /// Defect 4: a typed tool over `Commands::IngestAndWait` — submit, poll,
+    /// return real graph refs — offered unattended so a headless agent can
+    /// VERIFY an ingest instead of reporting unconfirmed success (approval-
+    /// gated tools are denied outright headlessly, service.rs).
+    #[test]
+    fn ingest_and_wait_is_offered_unattended_and_typed() {
+        for online in [false, true] {
+            assert!(
+                command_tools_filtered(online)
+                    .iter()
+                    .any(|tool| tool.name == "ingest_and_wait"),
+                "ingest_and_wait must be in the offered catalog (node online={online})"
+            );
+        }
+        assert_eq!(
+            command_tool_requires_approval("ingest_and_wait"),
+            Some(false),
+            "must be callable with nobody at the keyboard"
+        );
+        assert_eq!(
+            command_tool_preview(
+                "ingest_and_wait",
+                &json!({"url": "https://example.org/paper.pdf", "mode": "graph"})
+            ),
+            Some(
+                "prism ingest-and-wait --url https://example.org/paper.pdf --mode graph"
+                    .to_string()
+            )
+        );
+
+        let spec = spec_by_name("ingest_and_wait").expect("spec resolves");
+        // A source is required.
+        assert!(build_execution(spec, &json!({})).is_err());
+        // The schema's maximum is a hint, not a control: a poll budget that
+        // outlives the agent-side window is refused, not killed mid-wait.
+        assert!(
+            build_execution(
+                spec,
+                &json!({"url": "https://x", "poll_timeout_secs": 1801})
+            )
+            .is_err()
+        );
+        assert!(
+            build_execution(
+                spec,
+                &json!({"url": "https://x", "poll_timeout_secs": 1800})
+            )
+            .is_ok()
+        );
+    }
+
+    /// Defect 7: `ingest_watch` runs an infinite loop under a bounded
+    /// executor with `kill_on_drop` — every call ended "timed out" with the
+    /// watcher dead. It is hidden from the catalog the model sees and
+    /// refuses honestly (fast, with the CLI alternative) when an old
+    /// transcript still calls it by name.
+    #[test]
+    fn ingest_watch_is_hidden_and_refuses_honestly() {
+        for online in [false, true] {
+            assert!(
+                !command_tools_filtered(online)
+                    .iter()
+                    .any(|tool| tool.name == "ingest_watch"),
+                "ingest_watch must not be offered (node online={online})"
+            );
+        }
+        // Hidden ≠ unresolvable: old transcripts still find the spec...
+        assert!(is_command_tool("ingest_watch"));
+        // ...but execution refuses honestly instead of hanging for the
+        // window and lying about a killed watcher.
+        let spec = spec_by_name("ingest_watch").expect("spec resolves");
+        let error = build_execution(spec, &json!({"path": "/tmp/dir"}))
+            .expect_err("must refuse, not build a doomed watcher");
+        assert!(
+            error.to_string().contains("prism ingest --watch"),
+            "refusal must point at the working CLI route: {error}"
+        );
+    }
+
+    /// Defect 5: the durable-memory pointer promises the FULL result on
+    /// recall. The completed-child envelope must therefore not pre-cut
+    /// normal long output (`papers full-text` is one >30k JSON document per
+    /// paper); when output IS beyond the envelope bound, the payload itself
+    /// must carry the truncation marker so recall can never present a cut
+    /// result as whole.
+    #[test]
+    fn cli_envelope_preserves_long_output_for_durable_memory() {
+        let long = "x".repeat(100_000);
+        let envelope =
+            completed_cli_envelope("papers", &[], "prism papers", true, Some(0), &long, "");
+        let stored = envelope["stdout"].as_str().expect("stdout is a string");
+        assert_eq!(
+            stored.len(),
+            100_000,
+            "100k of stdout must survive the envelope whole — pre-cutting it \
+             turns the durable-memory pointer into a lie"
+        );
+        assert!(!stored.contains("[Output truncated]"));
+
+        let oversized = "y".repeat(CLI_ENVELOPE_STREAM_MAX_CHARS + 1);
+        let envelope =
+            completed_cli_envelope("papers", &[], "prism papers", true, Some(0), &oversized, "");
+        assert!(
+            envelope["stdout"]
+                .as_str()
+                .expect("stdout is a string")
+                .ends_with("[Output truncated]"),
+            "a genuinely cut payload must say so inside itself"
+        );
     }
 }
