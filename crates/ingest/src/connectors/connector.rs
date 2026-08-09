@@ -301,13 +301,15 @@ impl Default for ConnectorRegistry {
 static REGISTRY: LazyLock<RwLock<ConnectorRegistry>> =
     LazyLock::new(|| RwLock::new(ConnectorRegistry::builtin()));
 
-/// Serialises every test IN THIS BINARY that mutates the process-wide
-/// registry or reads it around another test's mutation window (`cargo test`
-/// runs a binary's tests on concurrent threads). ONE home, on purpose:
-/// per-test copies of a lock serialise nothing. Scope is exactly this
-/// binary — other crates' test binaries are separate processes with their
-/// own `REGISTRY`, so they cannot race this one. Async-aware because the
-/// guard is deliberately held across the `ingest_file` await.
+/// Serialises every test IN THIS BINARY that mutates a process-wide
+/// registry (this connector registry AND `crate::ontologies`' registry) or
+/// reads one around another test's mutation window (`cargo test` runs a
+/// binary's tests on concurrent threads). ONE home, on purpose: per-test
+/// (or per-registry) copies of a lock serialise nothing, and one lock for
+/// both registries removes any lock-ordering question. Scope is exactly
+/// this binary — other crates' test binaries are separate processes with
+/// their own `REGISTRY`, so they cannot race this one. Async-aware because
+/// the guard is deliberately held across the `ingest_file` await.
 #[cfg(test)]
 pub(crate) static GLOBAL_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());

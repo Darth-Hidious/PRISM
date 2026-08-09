@@ -7,13 +7,21 @@
 //! - Missing required properties (e.g. Alloy without name)
 //! - Invalid relationship types
 //! - Duplicate entities
-//! - Weight/order constraints on relationships
+//! - Domain constraints the active ontology declares (for EMMO:
+//!   weight/order rules on CONTAINS/PROCESSED_BY)
+//!
+//! Type membership is checked against the ACTIVE [`Ontology`]'s declared
+//! vocabulary — the SAME declaration the extraction prompt is built from —
+//! so the prompt and this validator cannot disagree about what is valid.
+//! (The vocabulary used to live here as const arrays, which let the prompt
+//! and the validator drift independently.)
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::EntitySet;
+use crate::ontologies::Ontology;
 
 /// A graph validation issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,25 +47,10 @@ pub struct GraphValidationReport {
     pub passed: bool,
 }
 
-/// Known valid relationship types in the PRISM materials science ontology.
-const VALID_REL_TYPES: &[&str] = &[
-    "CONTAINS",
-    "HAS_PROPERTY",
-    "PROCESSED_BY",
-    "OBSERVED_IN",
-    "PUBLISHED_IN",
-    "AUTHORED_BY",
-    "PART_OF",
-    "CITES",
-];
-
-/// Known valid entity types.
-const VALID_ENTITY_TYPES: &[&str] = &[
-    "Alloy", "Element", "Property", "Process", "Phase", "Paper", "Author", "Dataset", "Material",
-];
-
-/// Validate an EntitySet for structural integrity.
-pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
+/// Validate an EntitySet for structural integrity against the active
+/// ontology's vocabulary. (The EMMO type lists that used to be consts here
+/// are now [`crate::ontologies::EmmoOntology`]'s declaration.)
+pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphValidationReport {
     let mut issues = Vec::new();
 
     // Build entity name lookup
@@ -89,9 +82,11 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
         }
     }
 
-    // Check 3: Unknown entity types
+    // Check 3: Unknown entity types — against the active ontology's
+    // declared vocabulary, the same declaration the prompt is built from.
+    let entity_types = ontology.entity_types();
     for e in &entities.entities {
-        if !VALID_ENTITY_TYPES.contains(&e.entity_type.as_str()) {
+        if !entity_types.contains(&e.entity_type.as_str()) {
             issues.push(GraphIssue {
                 severity: GraphSeverity::Warning,
                 category: "unknown_type".into(),
@@ -99,7 +94,7 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
                     "Unknown entity type '{}' for '{}' — expected one of: {}",
                     e.entity_type,
                     e.name,
-                    VALID_ENTITY_TYPES.join(", ")
+                    entity_types.join(", ")
                 ),
             });
         }
@@ -140,9 +135,10 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
         }
     }
 
-    // Check 6: Unknown relationship types
+    // Check 6: Unknown relationship types — same source as check 3.
+    let rel_types = ontology.relationship_types();
     for r in &entities.relationships {
-        if !VALID_REL_TYPES.contains(&r.rel_type.as_str()) {
+        if !rel_types.contains(&r.rel_type.as_str()) {
             issues.push(GraphIssue {
                 severity: GraphSeverity::Warning,
                 category: "unknown_rel".into(),
@@ -154,65 +150,11 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
         }
     }
 
-    // Check 7: CONTAINS relationships should have weight
-    for r in &entities.relationships {
-        if r.rel_type == "CONTAINS" && r.weight.is_none() {
-            issues.push(GraphIssue {
-                severity: GraphSeverity::Info,
-                category: "missing_weight".into(),
-                message: format!(
-                    "CONTAINS relationship {} → {} has no weight fraction",
-                    r.from, r.to
-                ),
-            });
-        }
-    }
-
-    // Check 8: CONTAINS weights should be 0.0..=1.0
-    for r in &entities.relationships {
-        if r.rel_type == "CONTAINS"
-            && let Some(w) = r.weight
-            && !(0.0..=1.0).contains(&w)
-        {
-            issues.push(GraphIssue {
-                severity: GraphSeverity::Warning,
-                category: "invalid_weight".into(),
-                message: format!("CONTAINS {} → {}: weight {w} not in [0, 1]", r.from, r.to),
-            });
-        }
-    }
-
-    // Check 9: PROCESSED_BY should have order
-    for r in &entities.relationships {
-        if r.rel_type == "PROCESSED_BY" && r.order.is_none() {
-            issues.push(GraphIssue {
-                severity: GraphSeverity::Info,
-                category: "missing_order".into(),
-                message: format!("PROCESSED_BY {} → {} has no order", r.from, r.to),
-            });
-        }
-    }
-
-    // Check 10: CONTAINS weights for an alloy should sum to ~1.0
-    let mut alloy_weights: HashMap<&str, f64> = HashMap::new();
-    for r in &entities.relationships {
-        if r.rel_type == "CONTAINS"
-            && let Some(w) = r.weight
-        {
-            *alloy_weights.entry(r.from.as_str()).or_default() += w;
-        }
-    }
-    for (alloy, total) in &alloy_weights {
-        if *total > 0.0 && (*total - 1.0).abs() > 0.05 {
-            issues.push(GraphIssue {
-                severity: GraphSeverity::Warning,
-                category: "weight_sum".into(),
-                message: format!(
-                    "Alloy '{alloy}' CONTAINS weights sum to {total:.3} (expected ~1.0)"
-                ),
-            });
-        }
-    }
+    // Checks 7–10 moved into the ontology: EMMO's weight/order rules on
+    // CONTAINS/PROCESSED_BY live in `EmmoOntology::validate_domain`, emitted
+    // here in the position they always ran so reports are unchanged for
+    // existing users. Another ontology contributes its own domain checks.
+    issues.extend(ontology.validate_domain(entities));
 
     let has_errors = issues.iter().any(|i| i.severity == GraphSeverity::Error);
 
@@ -227,6 +169,7 @@ pub fn validate_graph(entities: &EntitySet) -> GraphValidationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ontologies::EmmoOntology;
     use crate::{Entity, Relationship};
 
     fn make_entity(etype: &str, name: &str) -> Entity {
@@ -272,7 +215,7 @@ mod tests {
                 },
             ],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(report.passed);
         assert!(
             report
@@ -288,7 +231,7 @@ mod tests {
             entities: vec![make_entity("Alloy", "Steel")],
             relationships: vec![make_rel("Steel", "CONTAINS", "Fe")], // Fe not in entities
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(!report.passed);
         assert!(report.issues.iter().any(|i| i.category == "orphan_rel"));
     }
@@ -299,7 +242,7 @@ mod tests {
             entities: vec![make_entity("Alloy", "")],
             relationships: vec![],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(!report.passed);
         assert!(report.issues.iter().any(|i| i.category == "empty_name"));
     }
@@ -310,7 +253,7 @@ mod tests {
             entities: vec![make_entity("Element", "Fe"), make_entity("Element", "Fe")],
             relationships: vec![],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(report.issues.iter().any(|i| i.category == "duplicate"));
     }
 
@@ -320,7 +263,7 @@ mod tests {
             entities: vec![make_entity("Alloy", "A"), make_entity("Alloy", "B")],
             relationships: vec![make_rel("A", "MAGIC_LINK", "B")],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(report.issues.iter().any(|i| i.category == "unknown_rel"));
     }
 
@@ -336,7 +279,7 @@ mod tests {
                 order: None,
             }],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(report.issues.iter().any(|i| i.category == "invalid_weight"));
     }
 
@@ -365,7 +308,7 @@ mod tests {
                 },
             ],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(report.issues.iter().any(|i| i.category == "weight_sum"));
     }
 
@@ -375,7 +318,110 @@ mod tests {
             entities: vec![],
             relationships: vec![],
         };
-        let report = validate_graph(&es);
+        let report = validate_graph(&EmmoOntology, &es);
         assert!(!report.passed);
+    }
+
+    /// The vocabulary the validator accepts is the ACTIVE ontology's, not
+    /// EMMO's: a chemistry ontology's facts validate clean under it and are
+    /// flagged foreign under EMMO — and vice versa. Domain checks travel
+    /// with the ontology too: EMMO's CONTAINS weight rules must not fire
+    /// for an ontology that never declared CONTAINS.
+    #[test]
+    fn validation_follows_the_active_ontologys_vocabulary_not_emmos() {
+        use crate::ontologies::{Ontology, UnitVocabulary};
+
+        struct Chem;
+        impl Ontology for Chem {
+            fn id(&self) -> &'static str {
+                "chem-gv"
+            }
+            fn entity_types(&self) -> &'static [&'static str] {
+                &["Molecule"]
+            }
+            fn relationship_types(&self) -> &'static [&'static str] {
+                &["REACTS_WITH"]
+            }
+            fn unit_vocabulary(&self) -> UnitVocabulary {
+                UnitVocabulary {
+                    name: "FREE",
+                    prefix: None,
+                }
+            }
+        }
+
+        let chem_set = EntitySet {
+            entities: vec![
+                make_entity("Molecule", "H2O"),
+                make_entity("Molecule", "O3"),
+            ],
+            relationships: vec![make_rel("H2O", "REACTS_WITH", "O3")],
+        };
+        let emmo_set = EntitySet {
+            entities: vec![make_entity("Alloy", "Steel"), make_entity("Element", "Fe")],
+            relationships: vec![make_rel("Steel", "CONTAINS", "Fe")],
+        };
+
+        // Chem facts under chem: fully in-vocabulary.
+        let report = validate_graph(&Chem, &chem_set);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_type" || i.category == "unknown_rel"),
+            "{:?}",
+            report.issues
+        );
+
+        // Chem facts under EMMO: every type and relationship is foreign.
+        let report = validate_graph(&EmmoOntology, &chem_set);
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|i| i.category == "unknown_type")
+                .count(),
+            2
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_rel" && i.message.contains("REACTS_WITH"))
+        );
+
+        // EMMO facts under chem: foreign the other way — and chem raises no
+        // CONTAINS weight domain issues, because those rules are EMMO's.
+        let report = validate_graph(&Chem, &emmo_set);
+        assert_eq!(
+            report
+                .issues
+                .iter()
+                .filter(|i| i.category == "unknown_type")
+                .count(),
+            2
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_rel" && i.message.contains("CONTAINS"))
+        );
+        assert!(
+            !report.issues.iter().any(|i| i.category == "missing_weight"),
+            "EMMO's domain checks fired under a non-EMMO ontology: {:?}",
+            report.issues
+        );
+
+        // And under EMMO the same set is in-vocabulary, with EMMO's own
+        // domain check (weightless CONTAINS → Info) present.
+        let report = validate_graph(&EmmoOntology, &emmo_set);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_type" || i.category == "unknown_rel")
+        );
+        assert!(report.issues.iter().any(|i| i.category == "missing_weight"));
     }
 }
