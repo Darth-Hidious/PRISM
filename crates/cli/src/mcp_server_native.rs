@@ -14,7 +14,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use prism_agent::command_tools::{CommandToolRuntime, command_tools, execute_command_tool};
+use prism_agent::command_tools::{
+    CommandToolRuntime, command_tool_requires_approval, command_tools, execute_command_tool,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -53,6 +55,22 @@ pub async fn run(project_root: PathBuf, python_bin: PathBuf) -> Result<()> {
         llm_api_key: None,
     };
 
+    // OPA policy engine for `tools/call` — the same gate the agent loop (h4)
+    // and manual `/command` dispatch run behind. An MCP host is an unattended
+    // caller with no human at the keyboard, so it gets the same standard, not
+    // a bypass. Fail-closed: if the engine cannot initialize, `None` makes
+    // every tool call refuse rather than run unchecked.
+    let mut policy = match prism_policy::PolicyEngine::with_discovery(Some(&runtime.project_root)) {
+        Ok(engine) => Some(engine),
+        Err(error) => {
+            eprintln!(
+                "[prism-mcp-native] policy engine failed to initialize — \
+                 every tool call will be refused (fail-closed): {error:#}"
+            );
+            None
+        }
+    };
+
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
@@ -80,7 +98,7 @@ pub async fn run(project_root: PathBuf, python_bin: PathBuf) -> Result<()> {
             continue;
         }
 
-        let response = match dispatch(method, params, &runtime).await {
+        let response = match dispatch(method, params, &runtime, &mut policy).await {
             Ok(result) => json!({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": id,
@@ -113,7 +131,24 @@ fn handle_notification(method: &str, _params: &Value) {
     }
 }
 
-async fn dispatch(method: &str, params: Value, runtime: &CommandToolRuntime) -> Result<Value> {
+/// An MCP tool result carrying a refusal or failure the host model must see.
+///
+/// MCP convention: tool-level failures are `isError: true` RESULTS, not
+/// JSON-RPC protocol errors — a protocol error tells the host the server
+/// broke; an error result tells its model the call was denied and why.
+fn tool_error(text: String) -> Value {
+    json!({
+        "content": [ { "type": "text", "text": text } ],
+        "isError": true,
+    })
+}
+
+async fn dispatch(
+    method: &str,
+    params: Value,
+    runtime: &CommandToolRuntime,
+    policy: &mut Option<prism_policy::PolicyEngine>,
+) -> Result<Value> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -134,6 +169,11 @@ async fn dispatch(method: &str, params: Value, runtime: &CommandToolRuntime) -> 
                         "name": t.name,
                         "description": t.description,
                         "inputSchema": t.input_schema,
+                        // Not part of the MCP core schema (hosts ignore unknown
+                        // fields), but without it a host cannot distinguish a
+                        // gated tool from an unattended one — it would offer
+                        // its model tools this server is going to refuse.
+                        "requires_approval": t.requires_approval,
                     })
                 })
                 .collect();
@@ -147,9 +187,55 @@ async fn dispatch(method: &str, params: Value, runtime: &CommandToolRuntime) -> 
                 .context("missing 'name'")?;
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-            let result = execute_command_tool(runtime, name, &args, None)
+            // Approval gate. An MCP host has nobody at the keyboard and this
+            // protocol carries no approval round-trip, so approval-gated
+            // tools are refused outright — the same standard the single-tool
+            // executor applies to relay callers (agent/src/service.rs).
+            if command_tool_requires_approval(name) == Some(true) {
+                return Ok(tool_error(format!(
+                    "'{name}' is approval-gated and cannot run over MCP: this \
+                     server has no human at the keyboard to approve it. Run it \
+                     from the PRISM TUI, where the approval prompt is shown."
+                )));
+            }
+
+            // OPA policy gate, fail-closed — mirrors the agent loop's h4
+            // check (role "agent": unattended automation; the principal names
+            // the actual caller class for policy authors and audit).
+            let Some(engine) = policy.as_mut() else {
+                return Ok(tool_error(format!(
+                    "'{name}' refused: the OPA policy engine failed to \
+                     initialize and policy cannot be bypassed (fail-closed). \
+                     Check ~/.prism/policies and .prism/policies for invalid \
+                     .rego files."
+                )));
+            };
+            let policy_input = prism_policy::PolicyInput {
+                action: "tool.call".to_string(),
+                principal: "mcp-host".to_string(),
+                role: "agent".to_string(),
+                resource: name.to_string(),
+                context: args.clone(),
+            };
+            if let prism_policy::GateOutcome::Deny { reason } =
+                prism_policy::gate_outcome(engine.evaluate(&policy_input))
+            {
+                return Ok(tool_error(format!(
+                    "'{name}' denied by OPA policy: {reason}"
+                )));
+            }
+
+            // The engine rides into execution too, so a `workflow_run`
+            // reaching the workflow engine gets the same `workflow.execute`
+            // evaluation the chat path performs.
+            let result = execute_command_tool(runtime, name, &args, policy.as_mut())
                 .await
                 .with_context(|| format!("tool {name} failed"))?;
+
+            // Command tools report execution failure in-band as
+            // `"success": false` — reflect it instead of hardcoding
+            // `isError: false` over a failed run.
+            let is_error = result.get("success").and_then(Value::as_bool) == Some(false);
 
             // MCP convention: return content array with text blocks. We
             // serialise the JSON result to a single text block — forge will
@@ -163,7 +249,7 @@ async fn dispatch(method: &str, params: Value, runtime: &CommandToolRuntime) -> 
                 "content": [
                     { "type": "text", "text": text }
                 ],
-                "isError": false,
+                "isError": is_error,
             }))
         }
 

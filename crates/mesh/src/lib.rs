@@ -290,6 +290,12 @@ pub struct MeshStartOptions {
     /// user's org/project/roles, which are checked before any peer
     /// interaction is allowed.
     pub auth_token: Option<String>,
+    /// The caller asked for offline operation (e.g. `node up --offline`).
+    /// [`mesh_start_refusal`] refuses with [`MeshRefusal::Offline`] whether
+    /// the instruction arrived as this flag or as `PRISM_OFFLINE=1` — before
+    /// this field, a flag-only `--offline` fell through to the auth check
+    /// and the refusal was mis-reported as "not authenticated".
+    pub offline: bool,
 }
 
 /// Start mesh networking as a background task.
@@ -346,8 +352,14 @@ impl Drop for OfflineEnvGuard {
 }
 
 /// Why the mesh will not start, if it will not.
+///
+/// Public so the surface that OWNS the reported state (the `node up` boot
+/// path writing `server_state.mesh`) can consult the same decision
+/// `start_mesh` acts on, instead of publishing an `Online` handle for a mesh
+/// that was refused — which is exactly how `/api/mesh/nodes` came to report
+/// `"online": true` while the same process printed "Mesh disabled".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MeshRefusal {
+pub enum MeshRefusal {
     /// Hard offline. mDNS announce is link-local multicast — it never leaves
     /// the LAN, but it broadcasts this node's name, capabilities and
     /// auth-token hash to every device on it, and `discover` then pulls peers
@@ -370,9 +382,12 @@ pub(crate) enum MeshRefusal {
 /// because wall-clock was the wrong observable.
 ///
 /// Offline is checked FIRST: it is the operator's explicit instruction, and it
-/// should not depend on whether they also happen to be logged in.
-pub(crate) fn mesh_start_refusal(opts: &MeshStartOptions) -> Option<MeshRefusal> {
-    if prism_runtime::offline::enabled() {
+/// should not depend on whether they also happen to be logged in. Both
+/// spellings of that instruction — the `--offline` flag carried in
+/// [`MeshStartOptions::offline`] and the process-wide `PRISM_OFFLINE=1` —
+/// refuse here, and refuse as [`MeshRefusal::Offline`].
+pub fn mesh_start_refusal(opts: &MeshStartOptions) -> Option<MeshRefusal> {
+    if opts.offline || prism_runtime::offline::enabled() {
         return Some(MeshRefusal::Offline);
     }
     if opts.auth_token.is_none() {
@@ -596,7 +611,26 @@ mod tests {
             discovery_interval_secs: 3600,
             event_tx: None,
             auth_token: None,
+            offline: false,
         }
+    }
+
+    /// `node up --offline` without `PRISM_OFFLINE=1` is still the operator
+    /// saying "offline" — the refusal must say so, not "not authenticated".
+    /// (That mis-attribution is what the boot line printed for months.)
+    #[test]
+    fn the_offline_flag_alone_refuses_as_offline_not_as_missing_auth() {
+        let _guard = test_env_lock();
+        let _restore = OfflineEnvGuard::capture();
+        unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
+
+        // Authenticated + offline flag: only the flag can be refusing.
+        let opts = MeshStartOptions {
+            auth_token: Some("test-token".into()),
+            offline: true,
+            ..bare_opts()
+        };
+        assert_eq!(mesh_start_refusal(&opts), Some(MeshRefusal::Offline));
     }
 
     #[test]
