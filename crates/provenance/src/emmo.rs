@@ -322,6 +322,12 @@ pub struct GraphEdge {
     pub target: String,
     pub rel_type: String,
     pub count: i64,
+    /// Tenant that owns the edge row, so a union read can attribute a
+    /// relationship to the node it arrived from. `#[serde(default)]`
+    /// keeps payloads serialized before this field deserializable (they
+    /// read as `""`, which renderers treat as unattributed).
+    #[serde(default)]
+    pub tenant: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -338,6 +344,12 @@ pub struct RecalledFact {
     pub confidence: f64,
     pub source: String,
     pub agent: String,
+    /// Tenant that owns the assertion. Without this, a union read over
+    /// local + mesh tenants returns facts that cannot be attributed to
+    /// the node they came from. `#[serde(default)]` keeps previously
+    /// serialized payloads deserializable (they read as `""`).
+    #[serde(default)]
+    pub tenant: String,
 }
 
 /// Additive read shape for conditioned, evidence-classed facts. The legacy
@@ -356,6 +368,18 @@ pub struct RecalledMaterialFact {
     pub confidence: f64,
     pub source: String,
     pub agent: String,
+    /// Tenant that owns the assertion (see [`RecalledFact::tenant`]).
+    #[serde(default)]
+    pub tenant: String,
+}
+
+/// One semantic entity hit, attributed to the tenant whose entity row it
+/// scored. Similarity is cosine, in `[-1, 1]`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SemanticEntityHit {
+    pub name: String,
+    pub tenant: String,
+    pub similarity: f32,
 }
 
 /// One stored per-source evidence contribution for an assertion.
@@ -2404,6 +2428,20 @@ impl ProvenanceStore {
 
     // ─────────────────────────────────────────────────────────────────────
     // Read API — cloud-shaped, tenant-scoped
+    //
+    // Every read takes either one tenant or a SET of tenants. The set
+    // variants (`*_scoped`) return the union of per-tenant results, which
+    // is safe because every key (`entity_key`, `emmo_edge.id`,
+    // `assertion_id`) is tenant-qualified: the union is a union of
+    // DISJOINT subgraphs and cannot blend identities. Each returned row
+    // names its owner in `tenant`. An empty tenant set reads NOTHING —
+    // it is never shorthand for "all tenants".
+    //
+    // `limit` is one budget for the whole union, not per tenant — a wider
+    // scope behaves exactly like a bigger single store, so under a small
+    // limit one tenant's strong matches can crowd out another's. That is
+    // the deliberate choice; callers needing a guaranteed floor per
+    // tenant issue per-tenant reads.
     // ─────────────────────────────────────────────────────────────────────
 
     /// Substring search over entity names (shortest names first, like the
@@ -2414,19 +2452,31 @@ impl ProvenanceStore {
         tenant: &str,
         limit: i64,
     ) -> Result<Vec<GraphNode>> {
-        let mut rows = self
-            .conn
-            .query(
-                r#"SELECT name, entity_type, label, tenant FROM emmo_entity
-                   WHERE tenant = ?1 AND name LIKE ?2
-                   ORDER BY LENGTH(name) LIMIT ?3"#,
-                [
-                    Value::Text(tenant.to_string()),
-                    Value::Text(format!("%{term}%")),
-                    Value::Integer(limit),
-                ],
-            )
-            .await?;
+        self.graph_search_scoped(term, &[tenant], limit).await
+    }
+
+    /// [`Self::graph_search`] over a set of tenants.
+    pub async fn graph_search_scoped(
+        &self,
+        term: &str,
+        tenants: &[&str],
+        limit: i64,
+    ) -> Result<Vec<GraphNode>> {
+        if tenants.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT name, entity_type, label, tenant FROM emmo_entity \
+             WHERE tenant IN ({}) AND name LIKE ?{} \
+             ORDER BY LENGTH(name) LIMIT ?{}",
+            tenant_placeholders(1, tenants.len()),
+            tenants.len() + 1,
+            tenants.len() + 2,
+        );
+        let mut params = tenant_params(tenants);
+        params.push(Value::Text(format!("%{term}%")));
+        params.push(Value::Integer(limit));
+        let mut rows = self.conn.query(&sql, params).await?;
         let mut nodes = Vec::new();
         while let Some(row) = rows.next().await? {
             nodes.push(row_to_node(&row, 0)?);
@@ -2477,41 +2527,67 @@ impl ProvenanceStore {
         tenant: &str,
         limit: i64,
     ) -> Result<TraversalResult> {
+        self.get_neighbors_scoped(name, rel_type, &[tenant], limit)
+            .await
+    }
+
+    /// [`Self::get_neighbors`] over a set of tenants. Center resolution,
+    /// node dedupe, and edge dedupe are all tenant-qualified, so the same
+    /// name owned by two tenants stays two attributed rows — neither
+    /// shadows the other.
+    pub async fn get_neighbors_scoped(
+        &self,
+        name: &str,
+        rel_type: Option<&str>,
+        tenants: &[&str],
+        limit: i64,
+    ) -> Result<TraversalResult> {
+        if tenants.is_empty() {
+            return Ok(TraversalResult {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            });
+        }
         // Resolve name → center keys/nodes: exact display name first
         // (indexed), else compare the canonical part of each key in Rust
         // (canonical_key is not expressible in SQL).
         let mut centers: Vec<(String, GraphNode)> = Vec::new();
         {
-            let mut rows = self
-                .conn
-                .query(
-                    r#"SELECT key, name, entity_type, label, tenant FROM emmo_entity
-                       WHERE tenant = ?1 AND name = ?2"#,
-                    [
-                        Value::Text(tenant.to_string()),
-                        Value::Text(name.to_string()),
-                    ],
-                )
-                .await?;
+            let sql = format!(
+                "SELECT key, name, entity_type, label, tenant FROM emmo_entity \
+                 WHERE tenant IN ({}) AND name = ?{}",
+                tenant_placeholders(1, tenants.len()),
+                tenants.len() + 1,
+            );
+            let mut params = tenant_params(tenants);
+            params.push(Value::Text(name.to_string()));
+            let mut rows = self.conn.query(&sql, params).await?;
             while let Some(row) = rows.next().await? {
                 centers.push((get_str(&row, 0)?, row_to_node(&row, 1)?));
             }
         }
         if centers.is_empty() {
             let canon = canonical_key(name);
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT key, name, entity_type, label, tenant FROM emmo_entity \
-                     WHERE tenant = ?1",
-                    [Value::Text(tenant.to_string())],
-                )
-                .await?;
+            let sql = format!(
+                "SELECT key, name, entity_type, label, tenant FROM emmo_entity \
+                 WHERE tenant IN ({})",
+                tenant_placeholders(1, tenants.len()),
+            );
+            let mut rows = self.conn.query(&sql, tenant_params(tenants)).await?;
             while let Some(row) = rows.next().await? {
                 let key = get_str(&row, 0)?;
-                // "{label}:{canonical}"; a pre-qualification key is the
-                // canonical name itself, so it still resolves.
-                let key_canon = key.split_once(':').map_or(key.as_str(), |(_, c)| c);
+                // "{tenant}|{label}:{canonical}". The tenant is stripped on
+                // its `|` BEFORE the label is stripped on `:` — a per-peer
+                // tenant is `mesh:{node_id}`, so splitting the whole key on
+                // the first `:` would cut inside the tenant and silently
+                // fail to resolve every peer entity on this fallback path.
+                // A legacy pre-qualification key (no `|`; the canonical name
+                // itself or "{label}:{canonical}") still resolves: both
+                // strips fall through to the remainder.
+                let after_tenant = key.split_once('|').map_or(key.as_str(), |(_, rest)| rest);
+                let key_canon = after_tenant
+                    .split_once(':')
+                    .map_or(after_tenant, |(_, c)| c);
                 if key_canon == canon {
                     let node = row_to_node(&row, 1)?;
                     centers.push((key, node));
@@ -2525,71 +2601,88 @@ impl ProvenanceStore {
             });
         }
 
+        // Dedupe keys include the tenant: under a union read, a peer node
+        // sharing (label, name) with a local one is a DIFFERENT node and
+        // must not be swallowed by the dedupe.
+        let node_key = |node: &GraphNode| format!("{}|{}:{}", node.tenant, node.label, node.name);
         let mut nodes: Vec<GraphNode> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (_, node) in &centers {
-            if seen.insert(format!("{}:{}", node.label, node.name)) {
+            if seen.insert(node_key(node)) {
                 nodes.push(node.clone());
             }
         }
 
         const EDGE_COLS: &str = "e.rel_type, \
              s.name, s.entity_type, s.label, s.tenant, \
-             t.name, t.entity_type, t.label, t.tenant";
+             t.name, t.entity_type, t.label, t.tenant, \
+             e.tenant";
         let mut edges: Vec<GraphEdge> = Vec::new();
-        let mut seen_edges: std::collections::HashSet<(String, String, String)> =
+        let mut seen_edges: std::collections::HashSet<(String, String, String, String)> =
             std::collections::HashSet::new();
         // One edge query per center, each cursor fully drained before the
         // next statement (turso pre-release is sensitive to interleaved
-        // open statements).
+        // open statements). Center keys are tenant-qualified, so each
+        // query can only see its own tenant's edges; the e.tenant filter
+        // stays for legacy pre-qualification rows and the index.
         for (center_key, _) in &centers {
+            let n = tenants.len();
             let mut rows = match rel_type {
                 Some(rt) => {
-                    self.conn
-                        .query(
-                            &format!(
-                                "SELECT {EDGE_COLS} FROM emmo_edge e \
-                                 JOIN emmo_entity s ON s.key = e.source_key \
-                                 JOIN emmo_entity t ON t.key = e.target_key \
-                                 WHERE e.tenant = ?1 AND (e.source_key = ?2 OR e.target_key = ?3) \
-                                   AND e.rel_type = ?4 LIMIT ?5"
-                            ),
-                            [
-                                Value::Text(tenant.to_string()),
-                                Value::Text(center_key.clone()),
-                                Value::Text(center_key.clone()),
-                                Value::Text(rt.to_string()),
-                                Value::Integer(limit),
-                            ],
-                        )
-                        .await?
+                    let sql = format!(
+                        "SELECT {EDGE_COLS} FROM emmo_edge e \
+                         JOIN emmo_entity s ON s.key = e.source_key \
+                         JOIN emmo_entity t ON t.key = e.target_key \
+                         WHERE e.tenant IN ({}) \
+                           AND (e.source_key = ?{} OR e.target_key = ?{}) \
+                           AND e.rel_type = ?{} LIMIT ?{}",
+                        tenant_placeholders(1, n),
+                        n + 1,
+                        n + 2,
+                        n + 3,
+                        n + 4,
+                    );
+                    let mut params = tenant_params(tenants);
+                    params.push(Value::Text(center_key.clone()));
+                    params.push(Value::Text(center_key.clone()));
+                    params.push(Value::Text(rt.to_string()));
+                    params.push(Value::Integer(limit));
+                    self.conn.query(&sql, params).await?
                 }
                 None => {
-                    self.conn
-                        .query(
-                            &format!(
-                                "SELECT {EDGE_COLS} FROM emmo_edge e \
-                                 JOIN emmo_entity s ON s.key = e.source_key \
-                                 JOIN emmo_entity t ON t.key = e.target_key \
-                                 WHERE e.tenant = ?1 AND (e.source_key = ?2 OR e.target_key = ?3) \
-                                 LIMIT ?4"
-                            ),
-                            [
-                                Value::Text(tenant.to_string()),
-                                Value::Text(center_key.clone()),
-                                Value::Text(center_key.clone()),
-                                Value::Integer(limit),
-                            ],
-                        )
-                        .await?
+                    let sql = format!(
+                        "SELECT {EDGE_COLS} FROM emmo_edge e \
+                         JOIN emmo_entity s ON s.key = e.source_key \
+                         JOIN emmo_entity t ON t.key = e.target_key \
+                         WHERE e.tenant IN ({}) \
+                           AND (e.source_key = ?{} OR e.target_key = ?{}) \
+                         LIMIT ?{}",
+                        tenant_placeholders(1, n),
+                        n + 1,
+                        n + 2,
+                        n + 3,
+                    );
+                    let mut params = tenant_params(tenants);
+                    params.push(Value::Text(center_key.clone()));
+                    params.push(Value::Text(center_key.clone()));
+                    params.push(Value::Integer(limit));
+                    self.conn.query(&sql, params).await?
                 }
             };
             while let Some(row) = rows.next().await? {
                 let source = row_to_node(&row, 1)?;
                 let target = row_to_node(&row, 5)?;
                 let rel = get_str(&row, 0)?;
+                let edge_tenant = get_str(&row, 9)?;
                 // An edge between two centers shows up in both queries.
-                if !seen_edges.insert((source.name.clone(), target.name.clone(), rel.clone())) {
+                // The tenant is part of the key: the same (source, rel,
+                // target) names under two tenants are two edges.
+                if !seen_edges.insert((
+                    edge_tenant.clone(),
+                    source.name.clone(),
+                    target.name.clone(),
+                    rel.clone(),
+                )) {
                     continue;
                 }
                 edges.push(GraphEdge {
@@ -2597,9 +2690,10 @@ impl ProvenanceStore {
                     target: target.name.clone(),
                     rel_type: rel,
                     count: 1,
+                    tenant: edge_tenant,
                 });
                 for node in [source, target] {
-                    if seen.insert(format!("{}:{}", node.label, node.name)) {
+                    if seen.insert(node_key(&node)) {
                         nodes.push(node);
                     }
                 }
@@ -2623,6 +2717,7 @@ impl ProvenanceStore {
                 confidence: fact.confidence,
                 source: fact.source,
                 agent: fact.agent,
+                tenant: fact.tenant,
             })
             .collect())
     }
@@ -2636,23 +2731,38 @@ impl ProvenanceStore {
         tenant: &str,
         limit: i64,
     ) -> Result<Vec<RecalledMaterialFact>> {
+        self.recall_with_context_scoped(query, &[tenant], limit)
+            .await
+    }
+
+    /// [`Self::recall_with_context`] over a set of tenants, each fact
+    /// attributed to its owner via `tenant`.
+    pub async fn recall_with_context_scoped(
+        &self,
+        query: &str,
+        tenants: &[&str],
+        limit: i64,
+    ) -> Result<Vec<RecalledMaterialFact>> {
+        if tenants.is_empty() {
+            return Ok(Vec::new());
+        }
         let pattern = format!("%{query}%");
-        let mut rows = self
-            .conn
-            .query(
-                r#"SELECT subject, predicate, object, value, unit, conditions_json,
-                          evidence_class, confidence, source, agent
-                   FROM prov_assertion
-                   WHERE tenant = ?1 AND (subject LIKE ?2 OR object LIKE ?3)
-                   ORDER BY confidence DESC LIMIT ?4"#,
-                [
-                    Value::Text(tenant.to_string()),
-                    Value::Text(pattern.clone()),
-                    Value::Text(pattern),
-                    Value::Integer(limit),
-                ],
-            )
-            .await?;
+        let sql = format!(
+            "SELECT subject, predicate, object, value, unit, conditions_json, \
+                    evidence_class, confidence, source, agent, tenant \
+             FROM prov_assertion \
+             WHERE tenant IN ({}) AND (subject LIKE ?{} OR object LIKE ?{}) \
+             ORDER BY confidence DESC LIMIT ?{}",
+            tenant_placeholders(1, tenants.len()),
+            tenants.len() + 1,
+            tenants.len() + 2,
+            tenants.len() + 3,
+        );
+        let mut params = tenant_params(tenants);
+        params.push(Value::Text(pattern.clone()));
+        params.push(Value::Text(pattern));
+        params.push(Value::Integer(limit));
+        let mut rows = self.conn.query(&sql, params).await?;
         let mut facts = Vec::new();
         while let Some(row) = rows.next().await? {
             let conditions_json = get_str(&row, 5)?;
@@ -2680,6 +2790,7 @@ impl ProvenanceStore {
                     .unwrap_or(0.0),
                 source: get_str(&row, 8)?,
                 agent: get_str(&row, 9)?,
+                tenant: get_str(&row, 10)?,
             });
         }
         Ok(facts)
@@ -2868,13 +2979,19 @@ impl ProvenanceStore {
     /// check so query paths can skip embedding-model init (and fall back
     /// to other stores) when there is nothing to search.
     pub async fn entity_embedding_count(&self, tenant: &str) -> Result<i64> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM emmo_embedding WHERE tenant = ?1",
-                [Value::Text(tenant.to_string())],
-            )
-            .await?;
+        self.entity_embedding_count_scoped(&[tenant]).await
+    }
+
+    /// [`Self::entity_embedding_count`] over a set of tenants.
+    pub async fn entity_embedding_count_scoped(&self, tenants: &[&str]) -> Result<i64> {
+        if tenants.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM emmo_embedding WHERE tenant IN ({})",
+            tenant_placeholders(1, tenants.len()),
+        );
+        let mut rows = self.conn.query(&sql, tenant_params(tenants)).await?;
         Ok(match rows.next().await? {
             Some(row) => row
                 .get_value(0)
@@ -2885,21 +3002,25 @@ impl ProvenanceStore {
         })
     }
 
-    /// Distinct stored vector widths (in bytes) for `tenant`, read from the
-    /// blobs themselves rather than the `dim` column, so a NULL or stale
-    /// `dim` cannot misreport what the index actually holds.
-    async fn entity_vector_widths(&self, tenant: &str) -> Result<Vec<usize>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT DISTINCT LENGTH(vector) FROM emmo_embedding WHERE tenant = ?1",
-                [Value::Text(tenant.to_string())],
-            )
-            .await?;
+    /// Distinct stored `(tenant, vector width in bytes)` pairs across
+    /// `tenants`, read from the blobs themselves rather than the `dim`
+    /// column, so a NULL or stale `dim` cannot misreport what the index
+    /// actually holds. Per-tenant so a mismatch error can name WHICH
+    /// tenant holds the offending vectors.
+    async fn entity_vector_widths(&self, tenants: &[&str]) -> Result<Vec<(String, usize)>> {
+        if tenants.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT DISTINCT tenant, LENGTH(vector) FROM emmo_embedding WHERE tenant IN ({})",
+            tenant_placeholders(1, tenants.len()),
+        );
+        let mut rows = self.conn.query(&sql, tenant_params(tenants)).await?;
         let mut widths = Vec::new();
         while let Some(row) = rows.next().await? {
-            if let Some(bytes) = row.get_value(0)?.as_integer().copied() {
-                widths.push(bytes.max(0) as usize);
+            let tenant = get_str(&row, 0)?;
+            if let Some(bytes) = row.get_value(1)?.as_integer().copied() {
+                widths.push((tenant, bytes.max(0) as usize));
             }
         }
         Ok(widths)
@@ -2925,56 +3046,210 @@ impl ProvenanceStore {
         tenant: &str,
         limit: usize,
     ) -> Result<Vec<(String, f32)>> {
-        let stored = self.entity_vector_widths(tenant).await?;
+        Ok(self
+            .semantic_search_entities_scoped(query_vec, &[tenant], limit)
+            .await?
+            .into_iter()
+            .map(|hit| (hit.name, hit.similarity))
+            .collect())
+    }
+
+    /// [`Self::semantic_search_entities`] over a set of tenants.
+    ///
+    /// Grouped by `(tenant, name)`, NOT by name alone: under a union read
+    /// a peer's entity carrying the same display name as a local one is a
+    /// different entity, and a name-only GROUP BY would let one silently
+    /// shadow the other. Same-name-same-tenant under two labels still
+    /// collapses to its best-scoring row, exactly as before.
+    ///
+    /// The honesty contract of the single-tenant form holds: `Ok(vec![])`
+    /// means nothing is embedded for ANY of these tenants; a dimension
+    /// mismatch anywhere in the scope is a loud `Err` naming the tenants,
+    /// never a silently shrunken result.
+    pub async fn semantic_search_entities_scoped(
+        &self,
+        query_vec: &[f32],
+        tenants: &[&str],
+        limit: usize,
+    ) -> Result<Vec<SemanticEntityHit>> {
+        let stored = self.entity_vector_widths(tenants).await?;
         if stored.is_empty() {
             return Ok(Vec::new()); // genuinely empty index — not a failure
         }
         // A mismatch silently matches nothing, so refuse loudly instead.
-        // Checked up front so the message can name both dimensionalities;
-        // Turso's own error ("Vectors must have the same dimensions")
-        // names neither.
+        // Checked up front so the message can name each tenant's
+        // dimensionality (Turso's own error — "Vectors must have the same
+        // dimensions" — names neither), and the whole UNION refuses:
+        // quietly dropping the mismatched tenant would make its knowledge
+        // invisible again, which is the exact failure this read scope
+        // exists to end. The offender is named so it can be re-ingested
+        // or scoped out.
         let want = query_vec.len() * 4;
-        if stored.iter().any(|w| *w != want) {
-            let mut dims: Vec<usize> = stored.iter().map(|w| w / 4).collect();
-            dims.sort_unstable();
-            let dims: Vec<String> = dims.iter().map(usize::to_string).collect();
+        if stored.iter().any(|(_, w)| *w != want) {
+            let mut per_tenant: Vec<String> = stored
+                .iter()
+                .map(|(tenant, w)| format!("'{tenant}' holds {}-dimension vectors", w / 4))
+                .collect();
+            per_tenant.sort_unstable();
             anyhow::bail!(
-                "local semantic index is unusable: tenant '{tenant}' holds {}-dimension \
-                 vectors but the query embedding is {}-dimension. The embedding backend \
-                 changed since those vectors were written — re-ingest with the current \
-                 backend, or point PRISM_EMBED_BACKEND back at the one that wrote them.",
-                dims.join("/"),
+                "local semantic index is unusable: {} but the query embedding is \
+                 {}-dimension. The embedding backend changed since the mismatched \
+                 tenant's vectors were written — re-ingest that tenant with the \
+                 current backend, point PRISM_EMBED_BACKEND back at the one that \
+                 wrote them, or scope the query to the matching tenants.",
+                per_tenant.join(", "),
                 query_vec.len(),
             );
         }
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT n.name, MIN(vector_distance_cos(e.vector, ?2)) AS distance \
-                 FROM emmo_embedding e JOIN emmo_entity n ON n.key = e.key \
-                 WHERE e.tenant = ?1 \
-                 GROUP BY n.name ORDER BY distance ASC LIMIT ?3",
-                [
-                    Value::Text(tenant.to_string()),
-                    Value::Blob(prism_embed::vec_to_le_bytes(query_vec)),
-                    Value::Integer(limit.max(1) as i64),
-                ],
-            )
-            .await?;
+        let n = tenants.len();
+        let sql = format!(
+            "SELECT n.name, n.tenant, MIN(vector_distance_cos(e.vector, ?{})) AS distance \
+             FROM emmo_embedding e JOIN emmo_entity n ON n.key = e.key \
+             WHERE e.tenant IN ({}) \
+             GROUP BY n.tenant, n.name ORDER BY distance ASC LIMIT ?{}",
+            n + 1,
+            tenant_placeholders(1, n),
+            n + 2,
+        );
+        let mut params = tenant_params(tenants);
+        params.push(Value::Blob(prism_embed::vec_to_le_bytes(query_vec)));
+        params.push(Value::Integer(limit.max(1) as i64));
+        let mut rows = self.conn.query(&sql, params).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let name = get_str(&row, 0)?;
+            let tenant = get_str(&row, 1)?;
             // `vector_distance_cos` is `1 - cosine_similarity`, in [0, 2].
-            let distance = match row.get_value(1)? {
+            let distance = match row.get_value(2)? {
                 Value::Real(d) => d,
                 Value::Integer(d) => d as f64,
                 other => anyhow::bail!("vector_distance_cos returned {other:?}, expected a number"),
             };
-            out.push((name, 1.0 - distance as f32));
+            out.push(SemanticEntityHit {
+                name,
+                tenant,
+                similarity: 1.0 - distance as f32,
+            });
         }
         Ok(out)
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Tenant discovery + peer-echo detection
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The tenants a DEFAULT read spans: [`LOCAL_TENANT`] plus every mesh
+    /// tenant actually present in the store. Peer tenants are DISCOVERED,
+    /// not hardcoded, so both the legacy shared `"mesh"` tenant and
+    /// per-peer `"mesh:{node_id}"` tenants are found regardless of which
+    /// shape the sync side currently writes. Deterministic order: local
+    /// first, then mesh tenants sorted.
+    pub async fn default_read_tenants(&self) -> Result<Vec<String>> {
+        let mut mesh: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Entities and assertions can each exist without the other
+        // (`record_assertion` alone writes no entity), so both tables are
+        // consulted. Each cursor is fully drained before the next query
+        // (turso pre-release is sensitive to interleaved open statements).
+        for table in ["emmo_entity", "prov_assertion"] {
+            let mut rows = self
+                .conn
+                .query(
+                    &format!(
+                        "SELECT DISTINCT tenant FROM {table} \
+                         WHERE tenant = 'mesh' OR tenant LIKE 'mesh:%'"
+                    ),
+                    (),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                mesh.insert(get_str(&row, 0)?);
+            }
+        }
+        let mut tenants = Vec::with_capacity(1 + mesh.len());
+        tenants.push(LOCAL_TENANT.to_string());
+        tenants.extend(mesh);
+        Ok(tenants)
+    }
+
+    /// Which MESH tenants already assert this exact triple (canonical
+    /// identity, via [`assertion_id`]).
+    ///
+    /// This is the read-side tripwire for the laundering loop: an agent
+    /// that READS a peer fact and WRITES it back under `"local"` creates
+    /// a fresh local-tenant assertion that the tenant-qualified keys
+    /// cannot stop, because at the store boundary that write is
+    /// indistinguishable from honest independent corroboration (the same
+    /// fact extracted from a genuinely independent source). Writers of
+    /// agent- or user-supplied facts call this and surface a LOUD warning
+    /// when the triple already arrived over the mesh, instead of letting
+    /// peer knowledge be silently absorbed as local.
+    pub async fn peer_tenants_asserting(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Vec<String>> {
+        let tenants = self.default_read_tenants().await?;
+        self.peer_tenants_asserting_among(&tenants, subject, predicate, object)
+            .await
+    }
+
+    /// [`Self::peer_tenants_asserting`] against an already-discovered
+    /// tenant list, so a caller checking MANY triples (an ingest run)
+    /// discovers the mesh tenants once instead of twice per fact.
+    /// [`LOCAL_TENANT`] entries are skipped — holding the triple locally
+    /// is not an echo.
+    pub async fn peer_tenants_asserting_among(
+        &self,
+        tenants: &[String],
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<Vec<String>> {
+        let mut holders = Vec::new();
+        for tenant in tenants {
+            if tenant == LOCAL_TENANT {
+                continue;
+            }
+            let id = assertion_id(tenant, subject, predicate, object);
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM prov_assertion WHERE id = ?1",
+                    [Value::Text(id)],
+                )
+                .await?;
+            let held = rows.next().await?.is_some();
+            while rows.next().await?.is_some() {}
+            if held {
+                holders.push(tenant.clone());
+            }
+        }
+        Ok(holders)
+    }
+}
+
+/// Tenant every local single-user write uses, and the tenant a default
+/// read scope always includes (see
+/// [`ProvenanceStore::default_read_tenants`]).
+pub const LOCAL_TENANT: &str = "local";
+
+/// `?start, ?start+1, …` — one numbered placeholder per tenant, for
+/// `tenant IN (…)` filters over a caller-chosen tenant set.
+fn tenant_placeholders(start: usize, count: usize) -> String {
+    (0..count)
+        .map(|i| format!("?{}", start + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The tenant set as leading positional SQL parameters.
+fn tenant_params(tenants: &[&str]) -> Vec<Value> {
+    tenants
+        .iter()
+        .map(|tenant| Value::Text((*tenant).to_string()))
+        .collect()
 }
 
 /// Read a `GraphNode` from four consecutive columns starting at `offset`
@@ -6258,5 +6533,366 @@ mod tests {
             1,
             "the peer tenant has no Matter row of its own"
         );
+    }
+
+    // ── Union reads (mesh-aware read scope) ────────────────────────────
+
+    /// Writes one local fact and one peer fact sharing the subject name
+    /// "Ti-6Al-4V": local says has_phase → alpha, mesh:node-a says
+    /// has_phase → beta.
+    async fn store_with_local_and_peer_fact(store: &ProvenanceStore) {
+        let mut local = test_prov();
+        local.tenant = "local".into();
+        local.source_entity_id = "doc:local".into();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &local)
+            .await
+            .unwrap();
+        let mut peer = test_prov();
+        peer.tenant = "mesh:node-a".into();
+        peer.activity_id = "act_peer".into();
+        peer.source_entity_id = "doc:peer".into();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "beta"), &peer)
+            .await
+            .unwrap();
+    }
+
+    /// THE SHADOWING TRAP, graph side: under a union read, the same
+    /// display name owned by two tenants is TWO rows, each naming its
+    /// owner — neither may silently disappear, in search, in recall, or
+    /// in the neighbor traversal's dedupe.
+    #[tokio::test]
+    async fn union_read_shows_local_and_peer_rows_of_the_same_name_attributed() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store_with_local_and_peer_fact(&store).await;
+        let scope = ["local", "mesh:node-a"];
+
+        // graph_search: one row per owner.
+        let hits = store
+            .graph_search_scoped("Ti-6Al-4V", &scope, 10)
+            .await
+            .unwrap();
+        let mut owners: Vec<&str> = hits
+            .iter()
+            .filter(|n| n.name == "Ti-6Al-4V")
+            .map(|n| n.tenant.as_str())
+            .collect();
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            ["local", "mesh:node-a"],
+            "one tenant's entity shadowed the other's: {hits:?}"
+        );
+
+        // recall: both facts arrive, each attributed to its owner.
+        let facts = store
+            .recall_with_context_scoped("Ti-6Al-4V", &scope, 10)
+            .await
+            .unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.object == "alpha" && f.tenant == "local"),
+            "local fact lost or misattributed: {facts:?}"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.object == "beta" && f.tenant == "mesh:node-a"),
+            "peer fact lost or misattributed: {facts:?}"
+        );
+
+        // get_neighbors: the tenant-qualified dedupe keeps both same-named
+        // centers, and each edge names the tenant it belongs to.
+        let traversal = store
+            .get_neighbors_scoped("Ti-6Al-4V", None, &scope, 10)
+            .await
+            .unwrap();
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V" && n.tenant == "local"),
+            "local center lost in the union traversal: {:?}",
+            traversal.nodes
+        );
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V" && n.tenant == "mesh:node-a"),
+            "peer center swallowed by the node dedupe: {:?}",
+            traversal.nodes
+        );
+        assert!(
+            traversal
+                .edges
+                .iter()
+                .any(|e| e.target == "alpha" && e.tenant == "local"),
+            "local edge lost or unattributed: {:?}",
+            traversal.edges
+        );
+        assert!(
+            traversal
+                .edges
+                .iter()
+                .any(|e| e.target == "beta" && e.tenant == "mesh:node-a"),
+            "peer edge lost or unattributed: {:?}",
+            traversal.edges
+        );
+
+        // And the single-tenant reads still see ONLY their own tenant —
+        // the union is opt-in per call, isolation is untouched.
+        let local_only = store.graph_search("Ti-6Al-4V", "local", 10).await.unwrap();
+        assert!(local_only.iter().all(|n| n.tenant == "local"));
+    }
+
+    /// THE SHADOWING TRAP, semantic side: `GROUP BY name` alone would let
+    /// a peer entity named like a local one collapse into a single row —
+    /// one of them disappearing with no signal. Grouped by (tenant, name),
+    /// both hits return, attributed.
+    #[tokio::test]
+    async fn semantic_union_returns_same_name_from_both_tenants() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store_with_local_and_peer_fact(&store).await;
+        store
+            .store_entity_embedding(
+                &entity_key("local", "Matter", "Ti-6Al-4V"),
+                "local",
+                &[1.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+        store
+            .store_entity_embedding(
+                &entity_key("mesh:node-a", "Matter", "Ti-6Al-4V"),
+                "mesh:node-a",
+                &[0.9, 0.1, 0.0],
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .semantic_search_entities_scoped(&[1.0, 0.0, 0.0], &["local", "mesh:node-a"], 10)
+            .await
+            .unwrap();
+        let mut owners: Vec<&str> = hits
+            .iter()
+            .filter(|hit| hit.name == "Ti-6Al-4V")
+            .map(|hit| hit.tenant.as_str())
+            .collect();
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            ["local", "mesh:node-a"],
+            "a name-only GROUP BY shadowed one tenant's entity: {hits:?}"
+        );
+    }
+
+    /// The default read scope is DISCOVERED from the store: local plus
+    /// whatever mesh tenants exist — the legacy shared `"mesh"` and the
+    /// per-peer `"mesh:{node_id}"` shape both — and never a foreign
+    /// non-mesh tenant.
+    #[tokio::test]
+    async fn default_read_tenants_is_local_plus_discovered_mesh_tenants() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // Empty store: just local.
+        assert_eq!(store.default_read_tenants().await.unwrap(), ["local"]);
+
+        for tenant in ["local", "mesh", "mesh:node-a", "t1"] {
+            let mut prov = test_prov();
+            prov.tenant = tenant.into();
+            prov.activity_id = format!("act_{tenant}");
+            store
+                .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.default_read_tenants().await.unwrap(),
+            ["local", "mesh", "mesh:node-a"],
+            "default scope must include every mesh tenant and no foreign tenant"
+        );
+    }
+
+    /// THE LAUNDERING LOOP this store cannot prevent: read a peer fact,
+    /// write it back under "local". At the store boundary that write is
+    /// indistinguishable from honest independent corroboration (a real
+    /// second source stating the same fact), so the write LANDS — and the
+    /// read-side tripwire must therefore detect the echo so callers can
+    /// be loud about it. This test pins both halves honestly.
+    #[tokio::test]
+    async fn peer_fact_written_back_as_local_is_detected_as_an_echo() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // The peer's knowledge arrives under its mesh tenant.
+        let mut peer = test_prov();
+        peer.tenant = "mesh:node-a".into();
+        peer.source_entity_id = "doc:peer".into();
+        store
+            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "beta"), &peer)
+            .await
+            .unwrap();
+
+        // The tripwire sees the echo — including under canonicalization
+        // (case/whitespace variants are the SAME triple identity).
+        assert_eq!(
+            store
+                .peer_tenants_asserting("Ti-6Al-4V", "has_phase", "beta")
+                .await
+                .unwrap(),
+            ["mesh:node-a"]
+        );
+        assert_eq!(
+            store
+                .peer_tenants_asserting("  TI-6AL-4V ", "has_phase", "BETA")
+                .await
+                .unwrap(),
+            ["mesh:node-a"],
+            "canonical variants of the triple must still trip the wire"
+        );
+        // A triple nobody synced stays clean.
+        assert!(
+            store
+                .peer_tenants_asserting("Inconel 718", "has_phase", "gamma")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The write-back itself DOES land as a local assertion — that is
+        // the open hazard, pinned here so it cannot be silently forgotten:
+        // if a future pass makes the store reject or divert such writes,
+        // this assertion should be UPDATED to pin the new behaviour.
+        let mut relabelled = test_prov();
+        relabelled.tenant = "local".into();
+        relabelled.source_entity_id = "doc:peer".into();
+        store
+            .write_fact(
+                &fact("phase", "Ti-6Al-4V", "has_phase", "beta"),
+                &relabelled,
+            )
+            .await
+            .unwrap();
+        let landed = store
+            .recall_with_context("beta", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            landed.len(),
+            1,
+            "write-back landed differently than documented — update the hazard notes"
+        );
+        // Detection still stands after the laundering write.
+        assert_eq!(
+            store
+                .peer_tenants_asserting("Ti-6Al-4V", "has_phase", "beta")
+                .await
+                .unwrap(),
+            ["mesh:node-a"]
+        );
+    }
+
+    /// `get_neighbors`' canonical fallback parses the entity key
+    /// ("{tenant}|{label}:{canonical}"). A per-peer tenant is
+    /// `mesh:{node_id}` — it CONTAINS a colon — so splitting the whole
+    /// key on its first `:` cuts inside the tenant and silently fails to
+    /// resolve every peer entity exactly when the query casing differs
+    /// from the stored name (the one case the fallback exists for).
+    /// Found by adversarial review; this pins the tenant-aware parse.
+    #[tokio::test]
+    async fn canonical_fallback_resolves_entities_under_colon_bearing_tenants() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store_with_local_and_peer_fact(&store).await;
+
+        // "TI-6AL-4V" matches no stored display name exactly, forcing the
+        // canonical fallback for BOTH tenants.
+        let traversal = store
+            .get_neighbors_scoped("TI-6AL-4V", None, &["local", "mesh:node-a"], 10)
+            .await
+            .unwrap();
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V" && n.tenant == "local"),
+            "local center must resolve via the canonical fallback: {:?}",
+            traversal.nodes
+        );
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V" && n.tenant == "mesh:node-a"),
+            "a mesh:{{node_id}} tenant's entity silently failed canonical \
+             resolution — the tenant's colon was parsed as the label separator: {:?}",
+            traversal.nodes
+        );
+        assert!(
+            traversal
+                .edges
+                .iter()
+                .any(|e| e.target == "beta" && e.tenant == "mesh:node-a"),
+            "peer edges must come with the fallback-resolved center: {:?}",
+            traversal.edges
+        );
+    }
+
+    /// The scoped honesty contract under a MIXED index: when one tenant
+    /// in scope holds vectors of a different width, the whole union must
+    /// refuse loudly AND name which tenant holds what — never shrink to
+    /// the matching tenants, and never blame the wrong index.
+    #[tokio::test]
+    async fn semantic_union_dimension_mismatch_names_each_tenant() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store_with_local_and_peer_fact(&store).await;
+        store
+            .store_entity_embedding(
+                &entity_key("local", "Matter", "Ti-6Al-4V"),
+                "local",
+                &[1.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+        // The peer synced vectors from a different embedding backend.
+        store
+            .store_entity_embedding(
+                &entity_key("mesh:node-a", "Matter", "Ti-6Al-4V"),
+                "mesh:node-a",
+                &[1.0, 0.0, 0.0, 0.0],
+            )
+            .await
+            .unwrap();
+
+        let err = store
+            .semantic_search_entities_scoped(&[1.0, 0.0, 0.0], &["local", "mesh:node-a"], 10)
+            .await
+            .expect_err("a mismatched tenant must fail the union loudly, not shrink it");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("'local' holds 3-dimension"),
+            "error must name the local tenant's width: {msg}"
+        );
+        assert!(
+            msg.contains("'mesh:node-a' holds 4-dimension"),
+            "error must name the offending tenant's width: {msg}"
+        );
+
+        // Scoped down to the matching tenant, search works again — the
+        // remedy the error message names.
+        let hits = store
+            .semantic_search_entities_scoped(&[1.0, 0.0, 0.0], &["local"], 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tenant, "local");
     }
 }

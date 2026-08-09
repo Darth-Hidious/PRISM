@@ -30,6 +30,15 @@ pub struct QueryRequest {
     /// When true, also fan out the query to mesh peers and merge results.
     #[serde(default)]
     pub federated: bool,
+    /// Optional explicit tenant scope for the local store reads. Absent
+    /// (the default) means `"local"` plus every mesh tenant present in
+    /// the store — peer knowledge is shown BY DEFAULT, labelled with its
+    /// owning tenant, per the owner's no-flag decision. Tenants are
+    /// discovered from the store, never hardcoded, so both the legacy
+    /// shared `"mesh"` tenant and per-peer `"mesh:{node_id}"` tenants
+    /// work.
+    #[serde(default)]
+    pub tenants: Option<Vec<String>>,
 }
 
 fn default_mode() -> String {
@@ -71,6 +80,16 @@ pub async fn execute_query(
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: "Limit too high (max 1,000).".into(),
+            }),
+        ));
+    }
+    if let Some(tenants) = &body.tenants
+        && (tenants.len() > 32 || tenants.iter().any(|t| t.is_empty() || t.len() > 128))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid tenant scope (max 32 tenants, each 1-128 characters).".into(),
             }),
         ));
     }
@@ -120,9 +139,34 @@ fn default_provenance_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("provenance.db"))
 }
 
-/// Query the bundled Turso store for locally-ingested ontology entities,
-/// each paired with the origin locator this node can honestly report for
-/// it (`None` when no stored assertion mentions the entity).
+/// The tenant set a read spans: an explicit request scope verbatim, or
+/// the default of `"local"` plus every mesh tenant present in the store.
+/// Discovery failure degrades to local-only rather than erroring — a
+/// broken discovery must not take local query down with it — but at WARN,
+/// not debug: a silently narrowed scope serves responses that are
+/// indistinguishable from "this node has no peers", hiding synced peer
+/// knowledge again. Remains open: the response itself does not yet carry
+/// a "scope degraded" marker.
+async fn read_scope(
+    store: &prism_provenance::ProvenanceStore,
+    explicit: Option<&[String]>,
+) -> Vec<String> {
+    match explicit {
+        Some(tenants) => tenants.to_vec(),
+        None => store.default_read_tenants().await.unwrap_or_else(|e| {
+            tracing::warn!(
+                "mesh tenant discovery failed — serving LOCAL knowledge only \
+                 (peer knowledge may exist but cannot be listed): {e:#}"
+            );
+            vec![LOCAL_ONTOLOGY_TENANT.to_string()]
+        }),
+    }
+}
+
+/// Query the bundled Turso store for locally-held ontology entities
+/// (local + mesh tenants by default), each paired with the origin locator
+/// this node can honestly report for it (`None` when no stored assertion
+/// mentions the entity).
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
 /// `None`, which the handler renders as an empty result set. `None` is
@@ -132,6 +176,7 @@ async fn local_graph_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
+    scope: Option<&[String]>,
 ) -> Option<Vec<(prism_provenance::GraphNode, Option<String>)>> {
     let store = match prism_provenance::ProvenanceStore::open(db_path).await {
         Ok(store) => store,
@@ -141,11 +186,13 @@ async fn local_graph_lookup(
         }
     };
     let limit = limit.max(1) as i64;
+    let scope = read_scope(&store, scope).await;
+    let tenants: Vec<&str> = scope.iter().map(String::as_str).collect();
 
     // Exact/canonical entity name → 1-hop neighborhood (the Turso
     // counterpart of Neo4j `neighbors`).
     let mut nodes = match store
-        .get_neighbors(text, None, LOCAL_ONTOLOGY_TENANT, limit)
+        .get_neighbors_scoped(text, None, &tenants, limit)
         .await
     {
         Ok(traversal) => traversal.nodes,
@@ -157,7 +204,7 @@ async fn local_graph_lookup(
 
     // No exact center → substring search over entity names.
     if nodes.is_empty() {
-        nodes = match store.graph_search(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+        nodes = match store.graph_search_scoped(text, &tenants, limit).await {
             Ok(nodes) => nodes,
             Err(e) => {
                 tracing::debug!("local graph search failed: {e:#}");
@@ -173,11 +220,13 @@ async fn local_graph_lookup(
     // Attach the origin each entity can honestly be attributed to, so a
     // mesh peer syncing these rows can key corroboration on the ORIGINAL
     // source instead of collapsing every relay to `mesh:unattributed`.
+    // Each node's origin is looked up under ITS OWN tenant — a peer
+    // node's origin is what the peer conveyed, not a local attribution.
     // A read failure degrades to an unattributed row, never an error.
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
         let origin = store
-            .entity_origin(&node.name, LOCAL_ONTOLOGY_TENANT)
+            .entity_origin(&node.name, &node.tenant)
             .await
             .unwrap_or_else(|e| {
                 tracing::debug!("entity origin read failed: {e:#}");
@@ -206,7 +255,8 @@ async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> anyhow::Result<Vec<(String, f32)>> {
+    scope: Option<&[String]>,
+) -> anyhow::Result<Vec<prism_provenance::SemanticEntityHit>> {
     use anyhow::Context as _;
 
     // No store file at all ⇒ nothing was ever ingested. That is an empty
@@ -224,8 +274,10 @@ async fn local_semantic_lookup(
                 db_path.display()
             )
         })?;
+    let scope = read_scope(&store, scope).await;
+    let tenants: Vec<&str> = scope.iter().map(String::as_str).collect();
     let embedded = store
-        .entity_embedding_count(LOCAL_ONTOLOGY_TENANT)
+        .entity_embedding_count_scoped(&tenants)
         .await
         .context("local semantic index could not be counted")?;
     if embedded == 0 {
@@ -250,17 +302,20 @@ async fn local_semantic_lookup(
         .context("embedding backend returned no vector for the query")?;
 
     store
-        .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
+        .semantic_search_entities_scoped(&query_vec, &tenants, limit)
         .await
 }
 
 /// Map local Turso graph nodes into the same JSON shape the retired Neo4j
 /// path returned (`{type, name, properties}`), keeping the wire format
-/// stable for existing clients. The one property a node may carry is
-/// `origin_source` — the locator of the source this node's knowledge came
-/// from — which mesh peers syncing these rows use to keep corroboration
-/// honest (`crates/mesh/src/sync.rs`). A node with no attributable origin
-/// keeps the historical empty `properties`, never an invented locator.
+/// stable for existing clients — plus the additive `tenant` field naming
+/// the owner, so a peer node is visibly a peer node instead of the
+/// attribution being fetched and dropped at this boundary. Properties may
+/// carry `origin_source` — the locator of the source this node's
+/// knowledge came from — which mesh peers syncing these rows use to keep
+/// corroboration honest (`crates/mesh/src/sync.rs`). A node with no
+/// attributable origin keeps the historical empty `properties`, never an
+/// invented locator.
 fn graph_nodes_to_results(
     nodes: &[(prism_provenance::GraphNode, Option<String>)],
 ) -> Vec<serde_json::Value> {
@@ -270,6 +325,7 @@ fn graph_nodes_to_results(
             serde_json::json!({
                 "type": n.entity_type,
                 "name": n.name,
+                "tenant": n.tenant,
                 "properties": match origin.as_deref().map(redact_filesystem_origin) {
                     Some(origin) => serde_json::json!({ "origin_source": origin }),
                     None => serde_json::json!({}),
@@ -327,13 +383,17 @@ fn redact_filesystem_origin(origin: &str) -> String {
 }
 
 /// Map local Turso semantic hits into the same JSON shape the retired
-/// Qdrant path returned (`{id, score}`), keeping the wire format stable.
-fn semantic_hits_to_results(hits: &[(String, f32)]) -> Vec<serde_json::Value> {
+/// Qdrant path returned (`{id, score}`), keeping the wire format stable —
+/// plus the additive `tenant` field naming the owner.
+fn semantic_hits_to_results(
+    hits: &[prism_provenance::SemanticEntityHit],
+) -> Vec<serde_json::Value> {
     hits.iter()
-        .map(|(id, score)| {
+        .map(|hit| {
             serde_json::json!({
-                "id": id,
-                "score": score,
+                "id": hit.name,
+                "score": hit.similarity,
+                "tenant": hit.tenant,
             })
         })
         .collect()
@@ -348,9 +408,14 @@ async fn handle_graph_query(
     body: &QueryRequest,
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let nodes = local_graph_lookup(&default_provenance_db_path(), &body.query, body.limit)
-        .await
-        .unwrap_or_default();
+    let nodes = local_graph_lookup(
+        &default_provenance_db_path(),
+        &body.query,
+        body.limit,
+        body.tenants.as_deref(),
+    )
+    .await
+    .unwrap_or_default();
     let results = graph_nodes_to_results(&nodes);
     let count = results.len() as u64;
 
@@ -396,21 +461,27 @@ async fn handle_semantic_query(
         });
     };
 
-    let hits =
-        match local_semantic_lookup(&default_provenance_db_path(), &body.query, body.limit).await {
-            Ok(hits) => hits,
-            Err(e) => {
-                let error = format!("{e:#}");
-                audit(
-                    format!("source=turso-local, error={error}"),
-                    prism_core::audit::AuditOutcome::Failure,
-                );
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse { error }),
-                ));
-            }
-        };
+    let hits = match local_semantic_lookup(
+        &default_provenance_db_path(),
+        &body.query,
+        body.limit,
+        body.tenants.as_deref(),
+    )
+    .await
+    {
+        Ok(hits) => hits,
+        Err(e) => {
+            let error = format!("{e:#}");
+            audit(
+                format!("source=turso-local, error={error}"),
+                prism_core::audit::AuditOutcome::Failure,
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error }),
+            ));
+        }
+    };
     let results = semantic_hits_to_results(&hits);
     let count = results.len() as u64;
 
@@ -560,21 +631,29 @@ mod tests {
                 serde_json::json!({
                     "type": "Matter",
                     "name": "Ti-6Al-4V",
+                    "tenant": "local",
                     "properties": { "origin_source": "doi:10.1234/abc" },
                 }),
                 serde_json::json!({
                     "type": "Matter",
                     "name": "Ti-6Al-4V",
+                    "tenant": "local",
                     "properties": {},
                 }),
             ]
         );
 
-        // Semantic: same {id, score} shape as the Qdrant path.
-        let hits = vec![("Ti-6Al-4V".to_string(), 0.87_f32)];
+        // Semantic: same {id, score} shape as the Qdrant path, plus the
+        // additive owner attribution.
+        let hits = vec![prism_provenance::SemanticEntityHit {
+            name: "Ti-6Al-4V".to_string(),
+            tenant: "mesh:node-a".to_string(),
+            similarity: 0.87_f32,
+        }];
         let results = semantic_hits_to_results(&hits);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["id"], "Ti-6Al-4V");
+        assert_eq!(results[0]["tenant"], "mesh:node-a");
         let score = results[0]["score"].as_f64().expect("score is a number");
         assert!((score - f64::from(0.87_f32)).abs() < 1e-6, "got: {score}");
     }
@@ -583,11 +662,13 @@ mod tests {
     async fn local_graph_lookup_misses_cleanly_on_empty_or_unopenable_store() {
         let db = TempProvenanceDb::new();
         assert!(
-            local_graph_lookup(&db.path, "titanium", 10).await.is_none(),
+            local_graph_lookup(&db.path, "titanium", 10, None)
+                .await
+                .is_none(),
             "empty store must be a clean graph miss"
         );
         assert!(
-            local_graph_lookup(&std::env::temp_dir(), "titanium", 10)
+            local_graph_lookup(&std::env::temp_dir(), "titanium", 10, None)
                 .await
                 .is_none(),
             "graph store open failure must degrade to a miss"
@@ -603,14 +684,14 @@ mod tests {
         // Fresh (empty) store: a real empty answer. Zero stored embeddings
         // short-circuits BEFORE the embedding backend is built, so this
         // stays model-free.
-        let hits = local_semantic_lookup(&db.path, "titanium", 10)
+        let hits = local_semantic_lookup(&db.path, "titanium", 10, None)
             .await
             .expect("an empty index is an empty answer, not a failure");
         assert!(hits.is_empty());
 
         // Unopenable path (a directory): a loud error naming the store,
         // never an empty result set the caller would read as "no matches".
-        let err = local_semantic_lookup(&std::env::temp_dir(), "titanium", 10)
+        let err = local_semantic_lookup(&std::env::temp_dir(), "titanium", 10, None)
             .await
             .expect_err("an unopenable store must not masquerade as no matches");
         let msg = format!("{err:#}");
@@ -625,7 +706,7 @@ mod tests {
         let missing = std::env::temp_dir()
             .join(format!("prism_absent_{}", uuid::Uuid::new_v4()))
             .join(".prism/provenance.db");
-        let hits = local_semantic_lookup(&missing, "titanium", 10)
+        let hits = local_semantic_lookup(&missing, "titanium", 10, None)
             .await
             .expect("a never-created store is an empty index, not a broken one");
         assert!(hits.is_empty());
@@ -761,7 +842,7 @@ mod tests {
 
         // Exact name → neighbor traversal, carrying the origin the entity
         // was ingested from (what a syncing mesh peer keys corroboration on).
-        let nodes = local_graph_lookup(&db.path, "Ti-6Al-4V", 10)
+        let nodes = local_graph_lookup(&db.path, "Ti-6Al-4V", 10, None)
             .await
             .expect("ingested entity must be queryable");
         assert!(
@@ -771,16 +852,93 @@ mod tests {
         );
 
         // Substring → graph_search fallback.
-        let nodes = local_graph_lookup(&db.path, "6Al", 10)
+        let nodes = local_graph_lookup(&db.path, "6Al", 10, None)
             .await
             .expect("substring match must be queryable");
         assert!(nodes.iter().any(|(n, _)| n.name == "Ti-6Al-4V"));
 
         // Unknown term → clean miss (handler renders an empty result set).
         assert!(
-            local_graph_lookup(&db.path, "no-such-entity-xyz", 10)
+            local_graph_lookup(&db.path, "no-such-entity-xyz", 10, None)
                 .await
                 .is_none()
+        );
+    }
+
+    /// Peer knowledge is served BY DEFAULT alongside local knowledge, each
+    /// node attributed to its owner — and an explicit scope narrows the
+    /// read. A same-named peer entity must not shadow the local one.
+    #[tokio::test]
+    async fn peer_nodes_are_served_by_default_and_scope_narrows() {
+        let db = TempProvenanceDb::new();
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .expect("open temp store");
+        let now = chrono::Utc::now().to_rfc3339();
+        let local = prism_provenance::LocalProvenance {
+            activity_id: "act_local".into(),
+            agent_id: "prism-ingest".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:local".into(),
+            source_kind: "Document".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "local".into(),
+            origin_source_id: None,
+        };
+        let peer = prism_provenance::LocalProvenance {
+            activity_id: "act_peer".into(),
+            source_entity_id: "doc:peer".into(),
+            tenant: "mesh:node-a".into(),
+            ..local.clone()
+        };
+        let fact = |object: &str| prism_provenance::LocalFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: object.into(),
+            value: None,
+            unit: None,
+            confidence: Some(0.9),
+            kind: Some("phase".into()),
+        };
+        store.write_fact(&fact("alpha"), &local).await.unwrap();
+        store.write_fact(&fact("beta"), &peer).await.unwrap();
+
+        // Default scope: both tenants' same-named entities, attributed.
+        let nodes = local_graph_lookup(&db.path, "Ti-6Al-4V", 10, None)
+            .await
+            .expect("default scope must span local + mesh tenants");
+        assert!(
+            nodes
+                .iter()
+                .any(|(n, _)| n.name == "Ti-6Al-4V" && n.tenant == "local"),
+            "local entity lost under the union"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(n, _)| n.name == "Ti-6Al-4V" && n.tenant == "mesh:node-a"),
+            "peer entity invisible by default"
+        );
+        // The peer node's origin is what the peer conveyed, not a local
+        // attribution.
+        assert!(
+            nodes
+                .iter()
+                .any(|(n, origin)| n.tenant == "mesh:node-a"
+                    && origin.as_deref() == Some("doc:peer")),
+            "peer origin must come from the peer tenant's own assertions"
+        );
+
+        // Explicit local-only scope: the peer row is excluded.
+        let scope = vec![LOCAL_ONTOLOGY_TENANT.to_string()];
+        let nodes = local_graph_lookup(&db.path, "Ti-6Al-4V", 10, Some(&scope))
+            .await
+            .expect("local scope still matches the local entity");
+        assert!(
+            nodes.iter().all(|(n, _)| n.tenant == "local"),
+            "an explicit local scope must not include peer tenants"
         );
     }
 }

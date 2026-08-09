@@ -6425,6 +6425,37 @@ async fn run_local_text_ingest_file(
         // Local ingest reads the source itself — the locator IS the origin.
         origin_source_id: None,
     };
+    // Peer-echo tripwire, BEFORE the writes: an agent that read a peer
+    // fact out of `prism query` and fed it back through `prism ingest`
+    // re-asserts it under "local" — laundering peer knowledge into local,
+    // which corroboration then counts as independent evidence. The store
+    // cannot block that write (it is indistinguishable from a genuinely
+    // independent source stating the same fact), so the collision is
+    // reported LOUDLY instead of absorbed silently. This is DETECTION,
+    // not prevention: the write below proceeds either way.
+    let (peer_echoes, peer_echo_check_errors) = collect_peer_echoes(&store, &facts).await;
+    if !peer_echoes.is_empty() {
+        eprintln!(
+            "  WARNING: {} extracted fact(s) already exist under mesh peer tenant(s).",
+            peer_echoes.len()
+        );
+        eprintln!(
+            "           If this document restates knowledge you received over the mesh \
+             (e.g. it was produced from a `prism query` result), this ingest launders \
+             peer knowledge into your local tenant and future corroboration will count \
+             it as independent evidence. If the document is a genuinely independent \
+             source, no action is needed. The write proceeds either way; the echoes \
+             are listed under `peer_echoes` in the ingest summary."
+        );
+    }
+    if !peer_echo_check_errors.is_empty() {
+        eprintln!(
+            "  WARNING: {} fact(s) could not be checked against mesh tenants — their \
+             laundering status is UNKNOWN, not clean (see `peer_echo_check_errors`).",
+            peer_echo_check_errors.len()
+        );
+    }
+
     store.record_activity(&prov).await?;
     for fact in &facts {
         store.write_fact(fact, &prov).await?;
@@ -6453,7 +6484,62 @@ async fn run_local_text_ingest_file(
         // from zero facts because the document held none. Only this field
         // tells them apart on the user's side.
         "parse_error": parse_error,
+        // Facts that already exist under a mesh peer tenant — the loud
+        // half of the laundering tripwire (see the WARNING above).
+        "peer_echoes": peer_echoes,
+        // Facts whose echo check FAILED: unknown status, not clean.
+        "peer_echo_check_errors": peer_echo_check_errors,
     }))
+}
+
+/// Peer-echo scan for facts about to be written under the local tenant:
+/// which of them already exist under a mesh tenant (see
+/// `ProvenanceStore::peer_tenants_asserting_among`). Returns the echo rows
+/// for the ingest summary plus any check FAILURES — a failed check means a
+/// fact whose laundering status is unknown, which callers must report
+/// rather than swallow (a `tracing::warn!` here would be dark by default:
+/// the subscriber uses `EnvFilter::from_default_env()`, whose default
+/// directive is ERROR). Mesh tenants are discovered once for the whole
+/// batch, not per fact.
+async fn collect_peer_echoes(
+    store: &prism_provenance::ProvenanceStore,
+    facts: &[prism_provenance::MaterialFact],
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let mut echoes = Vec::new();
+    let mut errors = Vec::new();
+    if facts.is_empty() {
+        return (echoes, errors);
+    }
+    let tenants = match store.default_read_tenants().await {
+        Ok(tenants) => tenants,
+        Err(e) => {
+            errors.push(format!(
+                "mesh tenant discovery failed — no fact could be checked: {e:#}"
+            ));
+            return (echoes, errors);
+        }
+    };
+    for fact in facts {
+        match store
+            .peer_tenants_asserting_among(&tenants, &fact.subject, &fact.predicate, &fact.object)
+            .await
+        {
+            Ok(holders) if !holders.is_empty() => {
+                echoes.push(serde_json::json!({
+                    "subject": fact.subject,
+                    "predicate": fact.predicate,
+                    "object": fact.object,
+                    "peer_tenants": holders,
+                }));
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!(
+                "'{} {} {}': {e:#}",
+                fact.subject, fact.predicate, fact.object
+            )),
+        }
+    }
+    (echoes, errors)
 }
 
 fn print_ingest_summary(summary: &serde_json::Value) {
@@ -6631,6 +6717,34 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     println!("  Facts: {facts} written to local store ({store})");
                     if let Some(model) = value_string(summary, &["model"]) {
                         println!("  Model: {model}");
+                    }
+                    // The laundering tripwire must reach STDOUT with the
+                    // summary — the earlier stderr warning is lost to any
+                    // caller that captures stdout only (exactly the shape
+                    // of an agent-driven ingest).
+                    let echoes = summary
+                        .get("peer_echoes")
+                        .and_then(|value| value.as_array())
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if echoes > 0 {
+                        println!(
+                            "  Warning: {echoes} fact(s) already exist under mesh peer \
+                             tenant(s) — if this document was produced from a mesh read, \
+                             this ingest laundered peer knowledge into 'local' \
+                             (details: `peer_echoes` in --json output)."
+                        );
+                    }
+                    let unchecked = summary
+                        .get("peer_echo_check_errors")
+                        .and_then(|value| value.as_array())
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if unchecked > 0 {
+                        println!(
+                            "  Warning: {unchecked} peer-echo check(s) failed — those \
+                             facts' laundering status is unknown, not clean."
+                        );
                     }
                 }
             }
@@ -10342,17 +10456,37 @@ async fn handle_platform_query(
 /// `write_local_graph` and `handle_text_ingest` — both stamp `"local"`).
 const LOCAL_ONTOLOGY_TENANT: &str = "local";
 
-/// Locally-ingested EMMO ontology matches read from the bundled Turso
+/// Locally-held EMMO ontology matches read from the bundled Turso
 /// provenance store (`~/.prism/provenance.db`) — the store `prism ingest`
-/// writes into. This is what makes a local ingest visible to `prism query`
-/// without any external services running.
+/// writes into and mesh sync lands peer knowledge in. This is what makes
+/// a local ingest (or a peer sync) visible to `prism query` without any
+/// external services running.
 struct LocalOntologyResults {
     nodes: Vec<prism_provenance::GraphNode>,
     edges: Vec<prism_provenance::GraphEdge>,
-    facts: Vec<prism_provenance::RecalledFact>,
+    facts: Vec<prism_provenance::RecalledMaterialFact>,
 }
 
-/// Query the bundled Turso store for locally-ingested ontology.
+/// The tenant set a CLI read spans: local plus every mesh tenant present
+/// in the store (peer knowledge is shown BY DEFAULT, labelled — the
+/// owner's decision, so the two-machine story needs no flag). Discovery
+/// failure degrades to local-only rather than erroring — a broken
+/// discovery must not take local query down with it — but it says so ON
+/// STDERR: a silent narrowing would make peer knowledge invisible again
+/// while looking exactly like "no peers exist", and `tracing::warn!` is
+/// dark by default under `EnvFilter::from_default_env()`.
+async fn read_scope(store: &prism_provenance::ProvenanceStore) -> Vec<String> {
+    store.default_read_tenants().await.unwrap_or_else(|e| {
+        eprintln!(
+            "  warning: mesh tenant discovery failed — showing LOCAL knowledge only \
+             (peer knowledge may exist but cannot be listed): {e:#}"
+        );
+        vec![LOCAL_ONTOLOGY_TENANT.to_string()]
+    })
+}
+
+/// Query the bundled Turso store for locally-held ontology (local + mesh
+/// tenants).
 ///
 /// Never errors: any failure (store unopenable, query error) degrades to
 /// `None`, which the caller renders as "no matches". `None` is also
@@ -10371,11 +10505,13 @@ async fn local_ontology_lookup(
         }
     };
     let limit = limit.max(1) as i64;
+    let scope = read_scope(&store).await;
+    let tenants: Vec<&str> = scope.iter().map(String::as_str).collect();
 
     // Exact/canonical entity name → 1-hop neighborhood (the Turso
     // counterpart of Neo4j `neighbors`).
     let (mut nodes, edges) = match store
-        .get_neighbors(text, None, LOCAL_ONTOLOGY_TENANT, limit)
+        .get_neighbors_scoped(text, None, &tenants, limit)
         .await
     {
         Ok(traversal) => (traversal.nodes, traversal.edges),
@@ -10387,7 +10523,7 @@ async fn local_ontology_lookup(
 
     // No exact center → substring search over entity names.
     if nodes.is_empty() {
-        nodes = match store.graph_search(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+        nodes = match store.graph_search_scoped(text, &tenants, limit).await {
             Ok(nodes) => nodes,
             Err(e) => {
                 tracing::debug!("local ontology graph search failed: {e:#}");
@@ -10396,8 +10532,13 @@ async fn local_ontology_lookup(
         };
     }
 
-    // Provenance-backed assertions mentioning the query term.
-    let facts = match store.recall(text, LOCAL_ONTOLOGY_TENANT, limit).await {
+    // Provenance-backed assertions mentioning the query term — the
+    // complete shape, so evidence class and owning tenant reach the
+    // printer instead of being fetched and thrown away.
+    let facts = match store
+        .recall_with_context_scoped(text, &tenants, limit)
+        .await
+    {
         Ok(facts) => facts,
         Err(e) => {
             tracing::debug!("local ontology recall failed: {e:#}");
@@ -10432,7 +10573,7 @@ async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
-) -> Result<Vec<(String, f32)>> {
+) -> Result<Vec<prism_provenance::SemanticEntityHit>> {
     // No store file at all ⇒ nothing was ever ingested. That is an empty
     // index, not a broken one, so it must not raise the alarm a fresh
     // install would otherwise trip on (opening a path under a missing
@@ -10448,8 +10589,10 @@ async fn local_semantic_lookup(
                 db_path.display()
             )
         })?;
+    let scope = read_scope(&store).await;
+    let tenants: Vec<&str> = scope.iter().map(String::as_str).collect();
     let embedded = store
-        .entity_embedding_count(LOCAL_ONTOLOGY_TENANT)
+        .entity_embedding_count_scoped(&tenants)
         .await
         .context("local semantic index could not be counted")?;
     if embedded == 0 {
@@ -10474,24 +10617,65 @@ async fn local_semantic_lookup(
         .context("embedding backend returned no vector for the query")?;
 
     store
-        .semantic_search_entities(&query_vec, LOCAL_ONTOLOGY_TENANT, limit)
+        .semantic_search_entities_scoped(&query_vec, &tenants, limit)
         .await
+}
+
+/// Origin marker appended to a row that came from a mesh peer rather than
+/// this machine's own ingests. Empty for local rows, so a store with no
+/// peer knowledge prints exactly what it always did.
+///
+/// Peer rows show the tenant verbatim (`[peer mesh:node-a]`, or
+/// `[peer mesh]` for the legacy shared tenant): the whole point of NOT
+/// merging tenants is that the reader can tell whose knowledge a line is,
+/// so the label is the real storage identity, not a prettified alias. An
+/// empty tenant (a pre-attribution serialized edge) is rendered as local
+/// rather than invented.
+fn peer_tag(tenant: &str) -> String {
+    if tenant == LOCAL_ONTOLOGY_TENANT || tenant.is_empty() {
+        String::new()
+    } else {
+        format!("  [peer {tenant}]")
+    }
 }
 
 /// Render local-ontology matches in the same shape the retired Neo4j path
 /// printed: one `[type] name` line per entity, plus relationship and fact
-/// lines.
+/// lines. Rows owned by a mesh tenant carry a trailing `[peer …]` marker,
+/// and every fact line names its evidence class — a peer fact must be
+/// visibly a peer fact, and a claim must be visibly classed.
 fn format_local_ontology(results: &LocalOntologyResults) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     if !results.nodes.is_empty() {
-        let _ = writeln!(
-            out,
-            "  Found {} matching entities (local ontology):\n",
-            results.nodes.len()
-        );
+        let peers = results
+            .nodes
+            .iter()
+            .filter(|node| !peer_tag(&node.tenant).is_empty())
+            .count();
+        if peers == 0 {
+            let _ = writeln!(
+                out,
+                "  Found {} matching entities (local ontology):\n",
+                results.nodes.len()
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  Found {} matching entities ({} local, {} from mesh peers):\n",
+                results.nodes.len(),
+                results.nodes.len() - peers,
+                peers
+            );
+        }
         for node in &results.nodes {
-            let _ = writeln!(out, "  [{}] {}", node.entity_type, node.name);
+            let _ = writeln!(
+                out,
+                "  [{}] {}{}",
+                node.entity_type,
+                node.name,
+                peer_tag(&node.tenant)
+            );
         }
     }
     if !results.edges.is_empty() {
@@ -10499,8 +10683,11 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
         for edge in &results.edges {
             let _ = writeln!(
                 out,
-                "  {} -[{}]-> {}",
-                edge.source, edge.rel_type, edge.target
+                "  {} -[{}]-> {}{}",
+                edge.source,
+                edge.rel_type,
+                edge.target,
+                peer_tag(&edge.tenant)
             );
         }
     }
@@ -10509,8 +10696,14 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
         for fact in &results.facts {
             let _ = writeln!(
                 out,
-                "  {} -[{}]-> {}  (confidence {:.2}, source {})",
-                fact.subject, fact.predicate, fact.object, fact.confidence, fact.source
+                "  {} -[{}]-> {}  (confidence {:.2}, evidence {}, source {}){}",
+                fact.subject,
+                fact.predicate,
+                fact.object,
+                fact.confidence,
+                fact.evidence_class.as_str(),
+                fact.source,
+                peer_tag(&fact.tenant)
             );
         }
     }
@@ -10528,8 +10721,14 @@ async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
         // here rather than printing an empty, reassuring list.
         let results = local_semantic_lookup(&turso_db, text, limit).await?;
         println!("\nSemantic search results ({} matches):\n", results.len());
-        for (i, (id, score)) in results.iter().enumerate() {
-            println!("  {}. {id}  (score: {score:.4})", i + 1);
+        for (i, hit) in results.iter().enumerate() {
+            println!(
+                "  {}. {}  (score: {:.4}){}",
+                i + 1,
+                hit.name,
+                hit.similarity,
+                peer_tag(&hit.tenant)
+            );
         }
         if results.is_empty() {
             println!(
@@ -13939,42 +14138,193 @@ data:\n\
         }
     }
 
+    fn test_node(name: &str, tenant: &str) -> prism_provenance::GraphNode {
+        prism_provenance::GraphNode {
+            name: name.into(),
+            entity_type: "Matter".into(),
+            label: "Matter".into(),
+            tenant: tenant.into(),
+        }
+    }
+
+    fn test_recalled_fact(object: &str, tenant: &str) -> prism_provenance::RecalledMaterialFact {
+        prism_provenance::RecalledMaterialFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "hasProperty".into(),
+            object: object.into(),
+            value: None,
+            unit: None,
+            conditions: Vec::new(),
+            evidence_class: prism_provenance::EvidenceClass::Research,
+            confidence: 0.9,
+            source: "doc:test".into(),
+            agent: "prism-ingest".into(),
+            tenant: tenant.into(),
+        }
+    }
+
     #[test]
     fn local_ontology_formatting_matches_neo4j_shape() {
         let results = LocalOntologyResults {
-            nodes: vec![prism_provenance::GraphNode {
-                name: "Ti-6Al-4V".into(),
-                entity_type: "Matter".into(),
-                label: "Matter".into(),
-                tenant: "local".into(),
-            }],
+            nodes: vec![test_node("Ti-6Al-4V", "local")],
             edges: vec![prism_provenance::GraphEdge {
                 source: "Ti-6Al-4V".into(),
                 target: "alpha phase".into(),
                 rel_type: "hasPart".into(),
                 count: 1,
+                tenant: "local".into(),
             }],
-            facts: vec![prism_provenance::RecalledFact {
-                subject: "Ti-6Al-4V".into(),
-                predicate: "hasProperty".into(),
-                object: "tensile strength".into(),
-                confidence: 0.9,
-                source: "doc:test".into(),
-                agent: "prism-ingest".into(),
-            }],
+            facts: vec![test_recalled_fact("tensile strength", "local")],
         };
         let out = format_local_ontology(&results);
         // Entity lines keep the Neo4j path's `[type] name` shape.
-        assert!(out.contains("  [Matter] Ti-6Al-4V"), "got: {out}");
+        assert!(out.contains("  [Matter] Ti-6Al-4V\n"), "got: {out}");
         assert!(
-            out.contains("Ti-6Al-4V -[hasPart]-> alpha phase"),
+            out.contains("Ti-6Al-4V -[hasPart]-> alpha phase\n"),
+            "got: {out}"
+        );
+        // The fact line carries the evidence class — a claim must be
+        // visibly classed, for local facts as much as for peer facts.
+        assert!(
+            out.contains(
+                "Ti-6Al-4V -[hasProperty]-> tensile strength  \
+                 (confidence 0.90, evidence research, source doc:test)"
+            ),
+            "got: {out}"
+        );
+        // An all-local result prints NO peer markers anywhere.
+        assert!(!out.contains("[peer"), "got: {out}");
+        assert!(out.contains("(local ontology)"), "got: {out}");
+    }
+
+    /// THE POINT of the union read: a peer row must be visibly a peer row.
+    /// A local and a peer entity carrying the SAME name both appear, each
+    /// attributed — neither shadows the other, and only the peer one is
+    /// tagged.
+    #[test]
+    fn peer_rows_are_visibly_attributed_and_local_rows_are_not() {
+        let results = LocalOntologyResults {
+            nodes: vec![
+                test_node("Ti-6Al-4V", "local"),
+                test_node("Ti-6Al-4V", "mesh:node-a"),
+            ],
+            edges: vec![prism_provenance::GraphEdge {
+                source: "Ti-6Al-4V".into(),
+                target: "beta phase".into(),
+                rel_type: "hasPart".into(),
+                count: 1,
+                tenant: "mesh:node-a".into(),
+            }],
+            facts: vec![
+                test_recalled_fact("tensile strength", "local"),
+                test_recalled_fact("elongation", "mesh:node-a"),
+            ],
+        };
+        let out = format_local_ontology(&results);
+
+        // Both same-named entities appear; exactly the peer one is tagged.
+        assert!(out.contains("  [Matter] Ti-6Al-4V\n"), "got: {out}");
+        assert!(
+            out.contains("  [Matter] Ti-6Al-4V  [peer mesh:node-a]\n"),
+            "got: {out}"
+        );
+        // The header separates local from peer counts.
+        assert!(out.contains("(1 local, 1 from mesh peers)"), "got: {out}");
+        // Peer relationship and fact lines carry the marker; local fact
+        // lines do not.
+        assert!(
+            out.contains("Ti-6Al-4V -[hasPart]-> beta phase  [peer mesh:node-a]"),
             "got: {out}"
         );
         assert!(
             out.contains(
-                "Ti-6Al-4V -[hasProperty]-> tensile strength  (confidence 0.90, source doc:test)"
+                "Ti-6Al-4V -[hasProperty]-> elongation  \
+                 (confidence 0.90, evidence research, source doc:test)  [peer mesh:node-a]"
             ),
             "got: {out}"
+        );
+        assert!(
+            out.contains(
+                "Ti-6Al-4V -[hasProperty]-> tensile strength  \
+                 (confidence 0.90, evidence research, source doc:test)\n"
+            ),
+            "got: {out}"
+        );
+    }
+
+    /// The documented `#[serde(default)]` path: a pre-attribution payload
+    /// deserializes its tenant as `""`, which must render as LOCAL (no
+    /// marker) — never as an invented peer.
+    #[test]
+    fn empty_tenant_renders_as_local_not_an_invented_peer() {
+        assert_eq!(peer_tag(""), "");
+        assert_eq!(peer_tag(LOCAL_ONTOLOGY_TENANT), "");
+        assert_eq!(peer_tag("mesh:node-a"), "  [peer mesh:node-a]");
+        assert_eq!(peer_tag("mesh"), "  [peer mesh]");
+    }
+
+    /// The CLI half of the laundering tripwire: facts that the mesh
+    /// already asserts are flagged with their holding tenants; facts
+    /// nobody synced are not. A future refactor that drops this block
+    /// from the ingest path breaks this test, not just a stderr line.
+    #[tokio::test]
+    async fn collect_peer_echoes_flags_facts_the_mesh_already_asserts() {
+        let db = TempProvenanceDb::new();
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .expect("open temp store");
+        let now = chrono::Utc::now().to_rfc3339();
+        let peer = prism_provenance::LocalProvenance {
+            activity_id: "act_peer".into(),
+            agent_id: "peer-sync".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:peer".into(),
+            source_kind: "Document".into(),
+            tenant: "mesh:node-a".into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "mesh".into(),
+            origin_source_id: None,
+        };
+        store
+            .write_fact(
+                &prism_provenance::LocalFact {
+                    subject: "Ti-6Al-4V".into(),
+                    predicate: "has_phase".into(),
+                    object: "beta".into(),
+                    value: None,
+                    unit: None,
+                    confidence: Some(0.9),
+                    kind: Some("phase".into()),
+                },
+                &peer,
+            )
+            .await
+            .unwrap();
+
+        let material_fact = |subject: &str, object: &str| prism_provenance::MaterialFact {
+            subject: subject.into(),
+            predicate: "has_phase".into(),
+            object: object.into(),
+            value: None,
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: Some("phase".into()),
+            evidence_class: prism_provenance::EvidenceClass::Research,
+        };
+        let facts = vec![
+            material_fact("Ti-6Al-4V", "beta"),      // the peer's fact, echoed
+            material_fact("Inconel 718", "gamma''"), // genuinely new
+        ];
+
+        let (echoes, errors) = collect_peer_echoes(&store, &facts).await;
+        assert!(errors.is_empty(), "no check may fail here: {errors:?}");
+        assert_eq!(echoes.len(), 1, "exactly the echoed fact is flagged");
+        assert_eq!(echoes[0]["object"], "beta");
+        assert_eq!(
+            echoes[0]["peer_tenants"],
+            serde_json::json!(["mesh:node-a"])
         );
     }
 
@@ -14056,6 +14406,84 @@ data:\n\
                 .is_none(),
             "store open failure must degrade to a miss"
         );
+    }
+
+    /// Peer knowledge is read BY DEFAULT (the owner chose default-on over
+    /// an opt-in flag), and a peer entity sharing the local entity's name
+    /// must not shadow it — both rows return, each naming its tenant.
+    /// This pins the CLI's default scope wiring: a read pinned back to
+    /// `tenant = "local"` makes the peer row vanish and this test fail.
+    #[tokio::test]
+    async fn local_ontology_lookup_shows_peer_knowledge_by_default_attributed() {
+        let db = TempProvenanceDb::new();
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .expect("open temp store");
+        let now = chrono::Utc::now().to_rfc3339();
+        let local = prism_provenance::LocalProvenance {
+            activity_id: "act_local".into(),
+            agent_id: "prism-ingest".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:local".into(),
+            source_kind: "Document".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+            started_at: now.clone(),
+            ended_at: now.clone(),
+            locality: "local".into(),
+            origin_source_id: None,
+        };
+        let peer = prism_provenance::LocalProvenance {
+            activity_id: "act_peer".into(),
+            source_entity_id: "doc:peer".into(),
+            tenant: "mesh:node-a".into(),
+            ..local.clone()
+        };
+        let fact = |object: &str| prism_provenance::LocalFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: object.into(),
+            value: None,
+            unit: None,
+            confidence: Some(0.9),
+            kind: Some("phase".into()),
+        };
+        store.write_fact(&fact("alpha"), &local).await.unwrap();
+        store.write_fact(&fact("beta"), &peer).await.unwrap();
+
+        let hit = local_ontology_lookup(&db.path, "Ti-6Al-4V", 10)
+            .await
+            .expect("both tenants' knowledge must be readable");
+
+        // The same-named entity appears once PER TENANT — the shadowing
+        // trap: if either row disappears, a sync became invisible.
+        assert!(
+            hit.nodes
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V" && n.tenant == "local"),
+            "local entity lost: {:?}",
+            hit.nodes
+        );
+        assert!(
+            hit.nodes
+                .iter()
+                .any(|n| n.name == "Ti-6Al-4V" && n.tenant == "mesh:node-a"),
+            "peer entity invisible by default: {:?}",
+            hit.nodes
+        );
+
+        // Facts arrive attributed, with the evidence class present.
+        let alpha = hit
+            .facts
+            .iter()
+            .find(|f| f.object == "alpha")
+            .expect("local fact");
+        assert_eq!(alpha.tenant, "local");
+        let beta = hit
+            .facts
+            .iter()
+            .find(|f| f.object == "beta")
+            .expect("peer fact");
+        assert_eq!(beta.tenant, "mesh:node-a");
     }
 
     // ── Lazy venv provisioning: who really needs the interpreter ───────
