@@ -269,6 +269,20 @@ impl LlmOntologyConstructor {
         sample_rows: &[Vec<String>],
         mapping: Option<&crate::mapping::OntologyMapping>,
     ) -> Result<EntitySet> {
+        // Zero sample rows means there is nothing real to extract from: the
+        // prompt would carry only the header names, and the model invents
+        // plausible-looking entities from them — the same failure mode the
+        // trait's `extract_entities` refuses as blind extraction. This is
+        // the last gate before the prompt is built, so no caller can reach
+        // the model without data.
+        if sample_rows.is_empty() {
+            anyhow::bail!(
+                "refusing entity extraction with zero sample rows — it produces \
+                 fabricated entities from column names alone (schema has {} \
+                 columns, no data rows). Feed real rows from the connector.",
+                schema.columns.len()
+            );
+        }
         let max_rows = self.config.max_sample_rows;
         let rows = if sample_rows.len() > max_rows {
             &sample_rows[..max_rows]
@@ -568,6 +582,31 @@ mod tests {
             Some(2),
             "string order parses"
         );
+    }
+
+    /// The live-path guard: zero sample rows are refused BEFORE any prompt
+    /// is built or any request leaves the process — the model would
+    /// otherwise invent entities from the column names alone.
+    #[tokio::test]
+    async fn extract_entities_with_zero_sample_rows_refuses() {
+        let schema = SchemaAnalysis {
+            columns: vec!["Composition".into(), "Hardness_HV".into()],
+            detected_types: vec!["string".into(), "float".into()],
+        };
+        // Deliberately unconfigured client: if the guard were missing, this
+        // would fail with a transport error instead — the message assertion
+        // below distinguishes the refusal from any such failure.
+        let constructor = LlmOntologyConstructor::new(LlmConfig::default());
+        let err = constructor
+            .extract_entities_with_samples(&schema, &[])
+            .await
+            .expect_err("zero sample rows must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fabricated entities from column names alone"),
+            "{msg}"
+        );
+        assert!(msg.contains("2 columns"), "{msg}");
     }
 
     #[test]
