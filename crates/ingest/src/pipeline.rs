@@ -254,13 +254,15 @@ impl IngestPipeline {
         // documented "runs before writing to Neo4j" gate with zero callers
         // (AUDIT_BACKLOG 20 / INGESTION_AUDIT #20), so LLM extraction output
         // went straight to the graph unchecked. Run it whenever entities
-        // exist. Error-severity issues refuse the graph write, with ONE
-        // contained class: a relationship whose endpoint was never declared
-        // (`orphan_rel`) invalidates THAT relationship, not the ingest — it
-        // is dropped and reported (`dropped_relationships`), and everything
-        // valid is still stored. Failing wholesale here is what kept the
-        // graph empty (2026-08-08: 17 orphan errors discarded 13 good
-        // entities); inventing the missing endpoint would fabricate a type.
+        // exist. Error-severity issues refuse the graph write, with TWO
+        // contained classes: a relationship whose endpoint was never declared
+        // (`orphan_rel`) invalidates THAT relationship, and an entity whose
+        // name normalised to nothing invalidates THAT entity — each is
+        // dropped and reported (`dropped_relationships`/`dropped_entities`),
+        // and everything valid is still stored. Failing wholesale here is
+        // what kept the graph empty (2026-08-08: 17 orphan errors discarded
+        // 13 good entities); inventing a missing endpoint would fabricate a
+        // type.
         let mut dropped_relationships: Vec<String> = Vec::new();
         let mut dropped_entities: Vec<String> = Vec::new();
         let mut write_set: Option<EntitySet> = None;
@@ -535,9 +537,10 @@ impl Default for IngestPipeline {
 /// What pre-write graph validation decided may be written.
 enum GraphWritePlan {
     /// Write `set` — the extracted set minus entities whose declared type
-    /// the active ontology maps to no storage label, and minus any dangling
-    /// relationships (including ones dangling BECAUSE their endpoint was
-    /// dropped as unmapped). `dropped` carries one reason per dropped
+    /// the active ontology maps to no storage label, minus entities whose
+    /// name normalised to nothing at the extraction boundary, and minus any
+    /// dangling relationships (including ones dangling BECAUSE their
+    /// endpoint was dropped). `dropped` carries one reason per dropped
     /// relationship, `dropped_entities` one per dropped entity. Containment,
     /// not repair: nothing is invented — not a missing endpoint, not a
     /// storage label — and every drop reaches the caller
@@ -556,14 +559,18 @@ enum GraphWritePlan {
 /// Returns the full report on the extraction AS THE MODEL EMITTED IT (the
 /// honest record, orphans included) plus the plan.
 ///
-/// Exactly ONE error class is containable: `orphan_rel`, a relationship
-/// whose `from`/`to` was never declared. Dropping that relationship loses
-/// one claim; inventing the endpoint would require fabricating a type, and
-/// failing the whole ingest discards every valid fact with it (the
-/// pre-containment behaviour that kept the graph empty). Every other
-/// error-severity issue — empty names, zero entities, an ontology's own
-/// domain errors — still blocks the write, proven by RE-validating the
-/// reduced set rather than by trusting issue categories.
+/// Two error classes are containable. `orphan_rel`: a relationship whose
+/// `from`/`to` was never declared — dropping it loses one claim; inventing
+/// the endpoint would require fabricating a type, and failing the whole
+/// ingest discards every valid fact with it (the pre-containment behaviour
+/// that kept the graph empty). `empty_name`: an entity whose name
+/// normalised to NOTHING at the extraction boundary (the model emitted only
+/// quote characters or whitespace) — there is nothing to store or key on,
+/// so it is dropped and reported via `dropped_entities`, and anything that
+/// referenced it dangles and is dropped with it. Every other
+/// error-severity issue — zero entities, an ontology's own domain errors —
+/// still blocks the write, proven by RE-validating the reduced set rather
+/// than by trusting issue categories.
 fn validate_before_graph_write(
     ontology: &dyn crate::ontologies::Ontology,
     entity_set: &EntitySet,
@@ -589,6 +596,17 @@ fn validate_before_graph_write(
             .collect::<Vec<_>>()
             .join(", ");
         for e in &entity_set.entities {
+            // A name the extraction boundary normalised to NOTHING (the
+            // model emitted only quote characters or whitespace) is a
+            // rejection, not a storable empty name — there is nothing to
+            // key on. Drop-and-report, like the unmapped-type case below.
+            if e.name.trim().is_empty() {
+                dropped.push(format!(
+                    "entity of type '{}': empty name after normalisation — rejected, not stored",
+                    e.entity_type
+                ));
+                continue;
+            }
             let extraction_label = e.entity_type.trim();
             if ontology.class_for_label(extraction_label).is_some()
                 && ontology.storage_label(extraction_label).is_some()
@@ -1931,19 +1949,219 @@ mod tests {
         );
     }
 
+    // ── Name normalisation at the extraction boundary ──────────────────
+    //
+    // The live defect (2026-08-08, qwen2.5:3b over a 5-row alloys CSV): the
+    // model declared elements bare (`Ti`) and referenced them QUOTED
+    // (`"Ti"`) in relationships. Exact-match referential integrity then
+    // dropped ALL 15 edges — 11 nodes, ZERO edges, a disconnected graph —
+    // and material names landed in the store with literal quote characters
+    // (`"316L"`, `"Ti-6Al-4V"`, `"LPBF"`). These tests drive the REAL
+    // `ingest_file` dispatch through a mock LLM emitting exactly that shape.
+
+    /// Entity names and relationship endpoints are normalised by the SAME
+    /// function at the extraction boundary, so quote-mismatched spellings of
+    /// the same declared thing agree by construction: every edge survives,
+    /// and no stored name carries a surrounding quote character.
+    #[tokio::test]
+    async fn quoted_names_and_endpoints_agree_by_construction_and_edges_survive() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                // Declared bare — referenced ASCII-quoted below.
+                {"type": "Alloy", "name": "Zorblattium", "properties": {}},
+                // Declared ASCII-quoted — referenced bare below.
+                {"type": "Element", "name": "\"Quotium\"", "properties": {}},
+                // Declared curly-quoted — referenced single-quoted below.
+                {"type": "Phase", "name": "\u{201C}omega-quoted\u{201D}", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "\"Zorblattium\"", "rel": "CONTAINS", "to": "Quotium", "weight": 0.5},
+                {"from": "Zorblattium", "rel": "HAS_PHASE", "to": "'omega-quoted'"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // Nothing dangles, nothing is dropped, the run is clean.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            result.dropped_relationships.is_empty(),
+            "quote-mismatched endpoints still dangle: {:?}",
+            result.dropped_relationships
+        );
+        assert!(
+            result.dropped_entities.is_empty(),
+            "{:?}",
+            result.dropped_entities
+        );
+
+        // Both edges survive — the graph is CONNECTED, not nodes-only.
+        let graph = result.graph.expect("the normalised set must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (3, 2));
+
+        // Stored names are the bare spellings, with no quote characters.
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        const QUOTES: &[char] = &['"', '\'', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}'];
+        for name in ["Zorblattium", "Quotium", "omega-quoted"] {
+            let hits = store.graph_search(name, "local", 10).await.unwrap();
+            assert!(
+                hits.iter().any(|n| n.name == name),
+                "{name} not stored bare: {hits:?}"
+            );
+            assert!(
+                hits.iter().all(|n| !n.name.contains(QUOTES)),
+                "a stored name kept its quotes: {hits:?}"
+            );
+        }
+        // Both edges are attached to the bare-named node — endpoints agree.
+        let tr = store
+            .get_neighbors("Zorblattium", None, "local", 10)
+            .await
+            .unwrap();
+        for target in ["Quotium", "omega-quoted"] {
+            assert!(
+                tr.edges.iter().any(|e| e.target == target),
+                "edge to {target} missing: {:?}",
+                tr.edges
+            );
+        }
+    }
+
+    /// Only BALANCED SURROUNDING quotes come off. An interior quote is data
+    /// — `6" nozzle extrusion` is a six-inch nozzle, not a quoting artefact
+    /// — and must reach the store intact on the entity AND on the endpoint
+    /// referencing it.
+    #[tokio::test]
+    async fn interior_quotes_are_data_and_reach_the_store_intact() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Pipium", "properties": {}},
+                {"type": "Process", "name": "6\" nozzle extrusion", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Pipium", "rel": "PROCESSED_BY", "to": "6\" nozzle extrusion", "order": 1}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            result.dropped_relationships.is_empty(),
+            "{:?}",
+            result.dropped_relationships
+        );
+        let graph = result.graph.expect("the set must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("nozzle", "local", 10).await.unwrap();
+        assert!(
+            hits.iter().any(|n| n.name == "6\" nozzle extrusion"),
+            "the interior quote was stripped or the name mangled: {hits:?}"
+        );
+    }
+
+    /// A name that is NOTHING BUT quotes (`""`) normalises to empty — a
+    /// rejection, not an empty name: never stored, dropped and REPORTED via
+    /// `dropped_entities`, while the valid remainder still lands and any
+    /// relationship referencing the rejected entity is dropped with it.
+    /// Nothing is invented to fill the hole.
+    #[tokio::test]
+    async fn empty_after_normalisation_names_are_dropped_and_reported() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "\"\"", "properties": {}},
+                {"type": "Alloy", "name": "Solidium", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Solidium", "rel": "CONTAINS", "to": "\"\"", "weight": 0.5}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // A contained drop is a partial SUCCESS — not a blocked write.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.dropped_entities.len(),
+            1,
+            "{:?}",
+            result.dropped_entities
+        );
+        assert!(
+            result.dropped_entities[0].contains("empty name after normalisation"),
+            "{}",
+            result.dropped_entities[0]
+        );
+        assert_eq!(
+            result.dropped_relationships.len(),
+            1,
+            "{:?}",
+            result.dropped_relationships
+        );
+
+        // Only the real entity landed; no empty-named node, no edge to one.
+        let graph = result.graph.expect("the valid remainder must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (1, 0));
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Solidium", "local", 10).await.unwrap();
+        assert!(hits.iter().any(|n| n.name == "Solidium"), "{hits:?}");
+        let tr = store
+            .get_neighbors("Solidium", None, "local", 10)
+            .await
+            .unwrap();
+        assert!(
+            tr.edges.is_empty(),
+            "an edge to a rejected entity reached the store: {:?}",
+            tr.edges
+        );
+    }
+
     /// Containment must not blanket-weaken validation: an error a drop
-    /// cannot repair (here an empty entity name) still blocks the ENTIRE
-    /// write — nothing stored, nothing reported as "dropped and the rest
-    /// written", store never opened.
+    /// cannot repair (here ZERO entities extracted, while relationships
+    /// still reference a world that was never declared) still blocks the
+    /// ENTIRE write — nothing stored, nothing reported as "dropped and the
+    /// rest written", store never opened. (An empty entity NAME was this
+    /// test's original exemplar; since name normalisation it is the
+    /// contained `empty_name` drop instead — pinned by
+    /// `empty_after_normalisation_names_are_dropped_and_reported`.)
     #[tokio::test]
     async fn non_orphan_errors_still_block_the_whole_write() {
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
 
         let server = mock_llm(serde_json::json!({
-            "entities": [
-                {"type": "Alloy", "name": "", "properties": {}},
-                {"type": "Alloy", "name": "Bloopium", "properties": {}}
-            ],
+            "entities": [],
             "relationships": [
                 {"from": "Bloopium", "rel": "MELDS_WITH", "to": "Nowhereium"}
             ]
@@ -1959,7 +2177,7 @@ mod tests {
 
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
-            result.errors[0].contains("empty name"),
+            result.errors[0].contains("No entities were extracted"),
             "{}",
             result.errors[0]
         );

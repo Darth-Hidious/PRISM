@@ -53,13 +53,22 @@ fn default_max_sample_rows() -> usize {
     10
 }
 fn default_timeout_secs() -> u64 {
-    300
+    // 0 = no read deadline. Research runs are long by nature; the operator may
+    // impose a deadline, PRISM does not impose one on them.
+    0
 }
 
 /// Tokens kept free between the estimated prompt and the context window, so a
 /// requested `max_tokens` can never overrun the input. Feeds the client-side
 /// output clamp ([`LlmClient::effective_max_tokens`]).
 const CONTEXT_MARGIN_TOKENS: u64 = 1024;
+
+/// Sent as `max_tokens` when the operator has set no ceiling. Not a policy
+/// limit — it is large enough to be irrelevant next to any real context
+/// window, so the effective bound is `context_window - prompt - margin` and,
+/// beyond that, the server's own clamp. Output is metered and billed per
+/// token; counting is the control, not truncation.
+const UNCAPPED_OUTPUT_TOKENS: u64 = 1_000_000;
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -363,13 +372,29 @@ pub fn chat_completions_url(base_url: &str) -> String {
 impl LlmClient {
     pub fn new(mut config: LlmConfig) -> Self {
         let backend = match choose_backend(&config.base_url) {
-            BackendChoice::Http => LlmBackend::Http(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(config.timeout_secs))
-                    .connect_timeout(Duration::from_secs(30))
-                    .build()
-                    .expect("failed to build HTTP client"),
-            ),
+            BackendChoice::Http => LlmBackend::Http({
+                // No read deadline unless the operator sets one.
+                //
+                // PRISM is a materials-research harness, not a web service.
+                // Extracting facts from a paper with a reasoning model takes
+                // minutes; a 12B model on consumer hardware takes minutes on a
+                // single CSV. A default deadline does not make the science
+                // faster, it just fails the run partway through and throws the
+                // work away — and it got worse the moment output stopped being
+                // capped, because a model that thinks longer is now allowed to.
+                //
+                // The CONNECT timeout stays: refusing to hang on an endpoint
+                // that is not there is different from refusing to wait for one
+                // that is working.
+                //
+                // `timeout_secs = 0` means "no deadline" and is the default.
+                let mut builder =
+                    reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
+                if config.timeout_secs > 0 {
+                    builder = builder.timeout(Duration::from_secs(config.timeout_secs));
+                }
+                builder.build().expect("failed to build HTTP client")
+            }),
             BackendChoice::LocalGguf => {
                 let local = local::LocalGguf::new(config.model.clone());
                 if let Some(context_window) = local.context_window() {
@@ -673,8 +698,8 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(&messages)),
         });
+        let body = self.with_operator_output_cap(body, Self::estimate_tokens(&messages));
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
         Ok(Self::extract_content(&data))
@@ -690,8 +715,8 @@ impl LlmClient {
             // unbounded output (thousands of tokens observed) on every call —
             // real, billed credits with no cap. Send the same context-clamped
             // budget every other chat path uses.
-            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(messages)),
         });
+        let body = self.with_operator_output_cap(body, Self::estimate_tokens(messages));
         let resp = self.post(&url, &body).await?;
         let text = resp
             .text()
@@ -770,12 +795,12 @@ impl LlmClient {
 
         let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(est),
         });
+        let mut body = self.with_operator_output_cap(body, est);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
@@ -821,9 +846,54 @@ impl LlmClient {
     /// model needs more (or less) room than a hardcoded 4096. Falls back to
     /// 4096 only when the config doesn't carry a value (e.g. local llama.cpp
     /// with no catalog entry).
+    /// Attach `max_tokens` ONLY when the operator asked for a ceiling.
+    ///
+    /// PRISM sends no output limit of its own. There are millions of models
+    /// and more arriving; deciding how many tokens any of them may emit is not
+    /// PRISM's call. Output is metered and billed per token — on the platform
+    /// side that is exactly how a user is charged against prepaid credits — so
+    /// counting is the control. Truncating just breaks models that reason
+    /// before answering and saves nobody anything.
+    ///
+    /// When `max_output_tokens` is unset the key is absent from the request
+    /// and the server applies its own context-derived bound.
+    fn with_operator_output_cap(
+        &self,
+        mut body: serde_json::Value,
+        est_prompt_tokens: u64,
+    ) -> serde_json::Value {
+        if self.config.max_output_tokens.is_some()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                "max_tokens".to_string(),
+                serde_json::json!(self.effective_max_tokens(est_prompt_tokens)),
+            );
+        }
+        body
+    }
+
     fn effective_max_tokens(&self, est_prompt_tokens: u64) -> u64 {
         const FLOOR: u64 = 256;
-        let model_max = self.config.max_output_tokens.unwrap_or(4096);
+        // PRISM does NOT cap output on the operator's behalf.
+        //
+        // The previous 4096 default was a cost guard, added after unbounded
+        // platform output burned real credits. But output is METERED and
+        // BILLED per token — counting it is the control, not truncating it.
+        // Capping does not save anyone money; it just decides for the user,
+        // and it silently breaks any model that reasons before it answers.
+        // Gemma 4 12B spent ~2.7k tokens of `reasoning_content` against that
+        // default, hit the ceiling, and returned no JSON at all. PRISM's bug,
+        // not the model's — and the next model will reason more, not less.
+        //
+        // What genuinely bounds output: the CONTEXT WINDOW (enforced below and
+        // again by the server), per-token metering, and the solvency check
+        // that fails closed when credits run out. An explicit
+        // `max_output_tokens` is still honoured — the operator may cap.
+        let model_max = self
+            .config
+            .max_output_tokens
+            .unwrap_or(UNCAPPED_OUTPUT_TOKENS);
         // Clamp the requested output so it can never collide with the input:
         // context_window − estimated prompt − margin. When the context window is
         // unknown, only the configured max applies. Embedded local models now
@@ -917,9 +987,9 @@ impl LlmClient {
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(prompt.len() as u64 / 4),
             "response_format": {"type": "json_object"},
         });
+        let body = self.with_operator_output_cap(body, prompt.len() as u64 / 4);
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
 
@@ -1180,14 +1250,14 @@ impl LlmClient {
                     } else {
                         0
                     };
-                let mut body = serde_json::json!({
+                let body = serde_json::json!({
                     "model": self.config.model,
                     "messages": msgs,
                     // Same fix as chat_marc27_simple: this path previously sent
                     // no cap at all, so a tool-calling turn could generate an
                     // unbounded (and unbounded-billed) response.
-                    "max_tokens": self.effective_max_tokens(est),
                 });
+                let mut body = self.with_operator_output_cap(body, est);
                 // The tool surface, identical to the OpenAI path below: the
                 // caller's already-token-bounded selection, with FULL schemas.
                 if native && !tools.is_empty() {
@@ -1369,13 +1439,13 @@ impl LlmClient {
 
         let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(est),
             "stream": true,
         });
+        let mut body = self.with_operator_output_cap(body, est);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
@@ -3061,10 +3131,48 @@ mod tests {
     }
 
     #[test]
-    fn effective_max_tokens_defaults_to_4096() {
-        // No catalog max + unknown context (local model) → conservative 4096.
+    fn prism_imposes_no_output_ceiling_of_its_own() {
+        // Was `effective_max_tokens_defaults_to_4096`, which pinned a cost
+        // guard as if it were a model limit. Output is metered and billed per
+        // token, so counting is the control — truncating is not. A 4096
+        // default silently broke every model that reasons before answering:
+        // Gemma 4 12B spent ~2.7k tokens of reasoning against it and returned
+        // no JSON at all.
         let client = LlmClient::new(LlmConfig::default());
-        assert_eq!(client.effective_max_tokens(0), 4096);
+        assert!(
+            client.effective_max_tokens(0) >= 100_000,
+            "with no operator ceiling and no known context, PRISM must not \
+             impose a limit of its own; got {}",
+            client.effective_max_tokens(0)
+        );
+    }
+
+    #[test]
+    fn the_context_window_is_what_actually_bounds_output() {
+        // The real bound, and the only one PRISM applies unasked: whatever the
+        // context still has room for after the prompt and the margin.
+        let config = LlmConfig {
+            max_output_tokens: None,
+            context_window: Some(32_768),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(
+            client.effective_max_tokens(8_000),
+            32_768 - 8_000 - CONTEXT_MARGIN_TOKENS
+        );
+    }
+
+    #[test]
+    fn an_explicit_operator_ceiling_is_still_honoured() {
+        // The operator may cap. PRISM may not cap on their behalf.
+        let config = LlmConfig {
+            max_output_tokens: Some(2_048),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(client.effective_max_tokens(1_000), 2_048);
     }
 
     #[test]

@@ -75,6 +75,50 @@ fn lenient_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D:
     })
 }
 
+/// Normalise one extracted name at the extraction boundary — the single
+/// place [`ExtractionOutput`] becomes the internal [`EntitySet`]. Applied to
+/// entity `name` and relationship `from`/`to` by the same function, so both
+/// sides of every later exact-match comparison (referential integrity,
+/// fact-write keying) are produced identically and agree by construction.
+///
+/// The live failure this exists for (2026-08-08, qwen2.5:3b over a 5-row
+/// alloys CSV): the model declared elements bare (`Ti`) and referenced them
+/// QUOTED (`"Ti"`) in relationships — every edge dangled and the stored
+/// graph had 11 nodes and ZERO edges. The raw model JSON really contained
+/// `"name": "\"Ti-6Al-4V\""` for an unquoted CSV cell.
+///
+/// What comes off: surrounding whitespace, and BALANCED surrounding quote
+/// pairs — ASCII `"…"` / `'…'` and the Unicode curly forms `“…”` / `‘…’` —
+/// stripped repeatedly with re-trimming between layers, so `"'Ti'"` fully
+/// unwraps. What is deliberately preserved: interior quotes (`6" pipe`,
+/// `Ni-"free" steel` are data), unbalanced quotes (`"Ti`), and mismatched
+/// ends (`“Ti"`). Idempotent: a normalised name passes through unchanged.
+///
+/// A name that normalises to EMPTY is not repaired here: it flows on and
+/// the graph-write plan rejects it — dropped and reported via
+/// `dropped_entities` — because an empty name is a rejection, not a name
+/// (`pipeline::validate_before_graph_write`).
+fn normalise_extracted_name(raw: &str) -> String {
+    const PAIRS: [(char, char); 4] = [
+        ('"', '"'),
+        ('\'', '\''),
+        ('\u{201C}', '\u{201D}'), // “ … ”
+        ('\u{2018}', '\u{2019}'), // ‘ … ’
+    ];
+    let mut name = raw.trim();
+    loop {
+        let mut chars = name.chars();
+        let (Some(first), Some(last)) = (chars.next(), chars.next_back()) else {
+            break; // zero or one char left — nothing strippable
+        };
+        if !PAIRS.contains(&(first, last)) {
+            break;
+        }
+        name = name[first.len_utf8()..name.len() - last.len_utf8()].trim();
+    }
+    name.to_string()
+}
+
 impl LlmOntologyConstructor {
     pub fn new(config: LlmConfig) -> Self {
         let client = crate::llm::LlmClient::new(config.clone());
@@ -307,12 +351,16 @@ impl LlmOntologyConstructor {
         let raw: ExtractionOutput =
             serde_json::from_str(&response).context("LLM returned invalid extraction JSON")?;
 
+        // Names are normalised HERE — the one place raw model output becomes
+        // the internal EntitySet — on entity names AND relationship endpoints
+        // alike, so nothing downstream (aliasing, validation, keying) can see
+        // a name the other side of a comparison was denied.
         let mut entities: Vec<Entity> = raw
             .entities
             .into_iter()
             .map(|e| Entity {
                 entity_type: e.entity_type,
-                name: e.name,
+                name: normalise_extracted_name(&e.name),
                 properties: if e.properties.is_null() {
                     serde_json::Value::Object(Default::default())
                 } else {
@@ -325,9 +373,9 @@ impl LlmOntologyConstructor {
             .relationships
             .into_iter()
             .map(|r| Relationship {
-                from: r.from,
+                from: normalise_extracted_name(&r.from),
                 rel_type: r.rel,
-                to: r.to,
+                to: normalise_extracted_name(&r.to),
                 weight: r.weight,
                 order: r.order,
             })
@@ -719,5 +767,85 @@ entity_rules:
         let json = r#"{"type": "Element", "name": "Mo", "properties": null}"#;
         let entity: RawEntity = serde_json::from_str(json).unwrap();
         assert!(entity.properties.is_null());
+    }
+
+    // --- normalise_extracted_name: the extraction-boundary name contract ---
+
+    #[test]
+    fn normalisation_strips_balanced_surrounding_quotes_and_whitespace() {
+        for (raw, want) in [
+            ("\"Ti\"", "Ti"),
+            ("'Al'", "Al"),
+            ("\u{201C}316L\u{201D}", "316L"),
+            ("\u{2018}LPBF\u{2019}", "LPBF"),
+            ("  \"Ti-6Al-4V\"  ", "Ti-6Al-4V"),
+            ("\" Ti \"", "Ti"),             // whitespace inside the quotes
+            ("\"'Ti'\"", "Ti"),             // nested layers unwrap fully
+            ("'\u{201C}Fe\u{201D}'", "Fe"), // mixed nesting too
+            ("  bare name  ", "bare name"), // no quotes: trim only
+        ] {
+            assert_eq!(normalise_extracted_name(raw), want, "raw: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalisation_preserves_interior_and_unbalanced_quotes() {
+        for keep in [
+            "6\" pipe",          // interior ASCII quote is data
+            "Ni-\"free\" steel", // interior pair is data
+            "d'Arcy alloy",      // interior apostrophe is data
+            "\"Ti",              // leading only — unbalanced
+            "Ti\"",              // trailing only — unbalanced
+            "\u{201C}Ti\"",      // mismatched ends stay
+            "\"",                // a single quote char is not a pair
+        ] {
+            assert_eq!(
+                normalise_extracted_name(keep),
+                keep,
+                "must survive: {keep:?}"
+            );
+        }
+        // A balanced OUTER pair comes off; the interior quote survives.
+        assert_eq!(normalise_extracted_name("\"6\" pipe\""), "6\" pipe");
+    }
+
+    /// The brief's pinned property: normalise(normalise(x)) == normalise(x).
+    #[test]
+    fn normalisation_is_idempotent() {
+        for raw in [
+            "\"Ti\"",
+            "'Al'",
+            "\u{201C}316L\u{201D}",
+            "\"'Ti'\"",
+            "6\" pipe",
+            "Ni-\"free\" steel",
+            "\"Ti",
+            "\u{201C}Ti\"",
+            "\"6\" pipe\"",
+            "\"\"",
+            "''",
+            "  spaced  ",
+            "",
+            "\"",
+        ] {
+            let once = normalise_extracted_name(raw);
+            assert_eq!(
+                normalise_extracted_name(&once),
+                once,
+                "not idempotent for raw: {raw:?}"
+            );
+        }
+    }
+
+    /// Quote-only and whitespace-only names normalise to empty — the value
+    /// is passed through, and the REJECTION happens downstream in the
+    /// graph-write plan (dropped + reported via `dropped_entities`), pinned
+    /// at production dispatch by
+    /// `pipeline::tests::empty_after_normalisation_names_are_dropped_and_reported`.
+    #[test]
+    fn normalisation_can_empty_a_name() {
+        for raw in ["\"\"", "''", "   ", "\u{201C}\u{201D}", "\"  \"", "\"''\""] {
+            assert_eq!(normalise_extracted_name(raw), "", "raw: {raw:?}");
+        }
     }
 }

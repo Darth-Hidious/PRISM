@@ -5887,6 +5887,11 @@ fn build_llm_config(
         api_key,
         embedding_model: llm.embedding_model.clone(),
         timeout_secs: llm.timeout_secs,
+        // Without this, extraction against a reasoning model is capped at
+        // the client's conservative 4096 and the whole budget goes to
+        // reasoning_content — zero JSON out, and the resulting error told
+        // the user to raise a knob this path never plumbed.
+        max_output_tokens: llm.max_output_tokens,
         ..Default::default()
     })
 }
@@ -6671,6 +6676,7 @@ async fn run_local_text_ingest_file(
     let extraction =
         prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
     let parse_error = extraction.parse_error.clone();
+    let dropped_facts = extraction.dropped_facts.clone();
     let facts = extraction.facts;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -6760,6 +6766,13 @@ async fn run_local_text_ingest_file(
         // from zero facts because the document held none. Only this field
         // tells them apart on the user's side.
         "parse_error": parse_error,
+        // Facts dropped ONE BY ONE during extraction: malformed shape, or a
+        // unit that resolves to no QUDT identifier (a numeric value is never
+        // stored with its unit discarded — that once made 880 GPa
+        // indistinguishable from 880 MPa). Same contract as the tabular
+        // pipeline's `dropped_relationships`: a PARTIAL result the summary
+        // must surface, never a silent drop.
+        "dropped_facts": dropped_facts,
         // Facts that already exist under a mesh peer tenant — the loud
         // half of the laundering tripwire (see the WARNING above).
         "peer_echoes": peer_echoes,
@@ -6997,6 +7010,13 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     let store =
                         value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
                     println!("  Facts: {facts} written to local store ({store})");
+                    // Per-fact drops are the text path's analogue of the
+                    // tabular `dropped_relationships` report: a PARTIAL
+                    // result the user must see — these lines are the only
+                    // window on it outside --json.
+                    if let Some(report) = dropped_facts_report(summary) {
+                        println!("{report}");
+                    }
                     if let Some(model) = value_string(summary, &["model"]) {
                         println!("  Model: {model}");
                     }
@@ -7113,6 +7133,30 @@ fn dropped_entities_report(result: &serde_json::Value) -> Option<String> {
         extracted
             .map(|total| format!(" of {total}"))
             .unwrap_or_default(),
+    );
+    for reason in dropped.iter().filter_map(|value| value.as_str()) {
+        out.push_str(&format!("\n    ! {reason}"));
+    }
+    Some(out)
+}
+
+/// The per-fact drop report for one local TEXT ingest, same contract as
+/// [`dropped_relationships_report`]: extracted facts that were NOT written
+/// because they were malformed or carried a unit that resolves to no QUDT
+/// identifier — one entry per dropped fact, with the reason. A numeric
+/// value whose unit cannot be resolved is dropped WHOLE, never stored
+/// unit-less (unit-less floats once made 880 GPa indistinguishable from
+/// 880 MPa). A drop is a PARTIAL result (the valid remainder was stored,
+/// exit stays 0), never a silent one. `None` when nothing was dropped.
+fn dropped_facts_report(summary: &serde_json::Value) -> Option<String> {
+    let dropped = summary.get("dropped_facts")?.as_array()?;
+    if dropped.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "  Dropped: {} extracted fact(s) NOT stored (a value whose unit cannot be \
+         resolved to a QUDT identifier is dropped whole, never stored unit-less):",
+        dropped.len(),
     );
     for reason in dropped.iter().filter_map(|value| value.as_str()) {
         out.push_str(&format!("\n    ! {reason}"));
@@ -12720,6 +12764,37 @@ mod tests {
         assert_eq!(dropped_entities_report(&serde_json::json!({})), None);
     }
 
+    /// Facts the TEXT extractor dropped one by one (unresolvable unit,
+    /// malformed shape) must reach the user's summary — count AND per-fact
+    /// reason, same contract as dropped relationships/entities on the
+    /// tabular path. A drop only visible in `--json` is silent for everyone
+    /// else, and a silently vanished measurement is exactly the failure
+    /// mode this path exists to prevent.
+    #[test]
+    fn dropped_facts_reach_the_ingest_summary() {
+        let summary = serde_json::json!({
+            "backend": "local_text",
+            "facts_written": 2,
+            "dropped_facts": [
+                "'steel has_measurement hardness': unit \"banana\" is neither a QUDT \
+                 identifier nor a recognised unit spelling carrying numeric value 250"
+            ],
+        });
+        let report =
+            dropped_facts_report(&summary).expect("a non-empty drop list must produce a report");
+        assert!(report.contains("1 extracted fact(s)"), "{report}");
+        assert!(report.contains("banana"), "{report}");
+        assert!(report.contains("NOT stored"), "{report}");
+        assert!(report.contains("never stored unit-less"), "{report}");
+
+        // Nothing dropped (or a shape without the field) ⇒ no report line.
+        assert_eq!(
+            dropped_facts_report(&serde_json::json!({ "dropped_facts": [] })),
+            None
+        );
+        assert_eq!(dropped_facts_report(&serde_json::json!({})), None);
+    }
+
     /// The mode `query --federated` sends must be one the server still
     /// serves: `execute_query` accepts only graph/semantic/federated and
     /// 400s anything else. This function sent `"nl"` — a mode deleted with
@@ -15338,6 +15413,171 @@ data:\n\
         assert!(
             msg.contains("broken.pdf"),
             "error must name the file: {msg}"
+        );
+    }
+
+    /// End-to-end through the PRODUCTION text-ingest path
+    /// (`run_local_text_ingest_file` against a mocked OpenAI-shaped LLM):
+    ///
+    /// 1. plain unit spellings (`MPa`, `g/cm3`) — what the default local
+    ///    model actually writes — are normalised to QUDT identifiers and
+    ///    STORED, instead of one of them failing the whole document with a
+    ///    bogus "could not be parsed as JSON" report;
+    /// 2. a numeric fact whose unit resolves to nothing is dropped WHOLE —
+    ///    it must not reach the store with a null unit (unit-less floats
+    ///    once made 880 GPa indistinguishable from 880 MPa here);
+    /// 3. the drop arrives in the summary (`dropped_facts`), with a reason.
+    ///
+    /// HOME is overridden under the shared env lock because the production
+    /// path derives the store location from `$HOME/.prism` — the point is
+    /// precisely NOT to bypass that derivation with an injected path.
+    // Same contract as the other ENV_LOCK tests here: the guard must span
+    // the awaits so no parallel test observes the overridden HOME.
+    /// Restores the prior `$HOME` on drop. Only construct while holding
+    /// `boot_checks::ENV_LOCK` — HOME is process-global.
+    struct HomeGuard(Option<std::ffi::OsString>);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// `[llm] max_output_tokens` must reach the extraction client.
+    /// gemma-4-12B (a reasoning model) spent the entire default 4096-token
+    /// budget on reasoning_content and produced zero JSON — and the
+    /// client's error message pointed at exactly this knob, which
+    /// `build_llm_config` silently dropped until now.
+    #[test]
+    fn llm_max_output_tokens_reaches_the_extraction_client() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _restore_home = HomeGuard(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let dir = project_with_ontology_config("[llm]\nmax_output_tokens = 8192\n");
+        let cfg = build_llm_config(dir.path(), Some("http://127.0.0.1:9"), Some("m"), None)
+            .expect("config must build");
+        assert_eq!(cfg.max_output_tokens, Some(8192));
+
+        // Unset → None: the client's conservative default stays binding.
+        let dir = project_with_ontology_config("");
+        let cfg = build_llm_config(dir.path(), Some("http://127.0.0.1:9"), Some("m"), None)
+            .expect("config must build");
+        assert_eq!(cfg.max_output_tokens, None);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn text_ingest_normalises_units_and_reports_per_fact_drops() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut server = mockito::Server::new_async().await;
+        let extraction = r#"{"facts":[
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":880.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"density","value":4.43,"unit":"g/cm3","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"hardness","value":349.0,"unit":"banana","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+        ]}"#;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": extraction}}]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = project.path();
+        let md = root.join("alloy-datasheet.md");
+        std::fs::write(
+            &md,
+            "Ti-6Al-4V: UTS 880 MPa, density 4.43 g/cm3, hardness 349 banana.",
+        )
+        .unwrap();
+
+        let summary = run_local_text_ingest_file(
+            &md,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+        )
+        .await
+        .expect("a document with one bad fact must still ingest the good ones");
+
+        // The two normalisable facts landed; the envelope parsed, so the
+        // old "could not be parsed as JSON" misreport must be gone.
+        assert_eq!(summary["facts_written"], 2, "summary: {summary}");
+        assert_eq!(summary["parse_error"], serde_json::Value::Null);
+        // The drop is REPORTED, with a reason a human can act on…
+        let dropped = summary["dropped_facts"]
+            .as_array()
+            .expect("dropped_facts must be in the summary");
+        assert_eq!(dropped.len(), 1, "summary: {summary}");
+        let reason = dropped[0].as_str().unwrap();
+        assert!(
+            reason.contains("banana") && reason.contains("hardness"),
+            "the reason must name the offending unit and fact: {reason}"
+        );
+        // …and the summary printer renders it (count + reason line).
+        let report = dropped_facts_report(&summary).expect("the printer must surface the drop");
+        assert!(report.contains("banana"), "{report}");
+
+        // The store the production path wrote is under the overridden HOME.
+        let db_path = home.path().join(".prism/provenance.db");
+        assert_eq!(
+            summary["store"].as_str().unwrap(),
+            db_path.display().to_string(),
+            "the store must be the HOME-derived one"
+        );
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .expect("the store the ingest wrote must open");
+        let uts = store.recall_with_context("UTS", "local", 10).await.unwrap();
+        assert_eq!(uts.len(), 1, "{uts:?}");
+        assert_eq!(uts[0].value, Some(880.0));
+        assert_eq!(
+            uts[0].unit.as_deref(),
+            Some("QUDT:MegaPA"),
+            "the stored unit must be the NORMALISED identifier"
+        );
+        let density = store
+            .recall_with_context("density", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(density.len(), 1, "{density:?}");
+        assert_eq!(density[0].value, Some(4.43));
+        assert_eq!(density[0].unit.as_deref(), Some("QUDT:GM-PER-CentiM3"));
+        // THE rule: the unresolvable-unit fact is nowhere in the store —
+        // not with a null unit, not with any unit.
+        let hardness = store
+            .recall_with_context("hardness", "local", 10)
+            .await
+            .unwrap();
+        assert!(
+            hardness.is_empty(),
+            "a numeric value whose unit could not be resolved must never be stored: {hardness:?}"
         );
     }
 }
