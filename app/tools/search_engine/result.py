@@ -81,6 +81,12 @@ class Material(BaseModel):
     extra_properties: dict[str, PropertyValue] = Field(default_factory=dict)
     # Present whenever multiple candidates for a property were considered.
     fusion_audit: dict[str, PropertyFusionAudit] = Field(default_factory=dict)
+    # Set by fusion when this record could not participate in identity-keyed
+    # merging (no domain identity, or an identity missing a required
+    # discriminator such as symmetry data).  The record is kept as its own
+    # material; this field says WHY it stayed alone instead of dropping it or
+    # silently grouping it with same-formula lookalikes.
+    fusion_exclusion: str | None = None
     raw: dict = Field(default_factory=dict, exclude=True)
 
 

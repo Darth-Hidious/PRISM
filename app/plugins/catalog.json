@@ -21,7 +21,7 @@
         "obtain_url": "https://materialsproject.org/dashboard"
       },
       "capabilities": {
-        "filterable_fields": ["elements", "formula", "nelements", "space_group", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal"],
+        "filterable_fields": ["elements", "formula", "nelements", "space_group", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus"],
         "returned_properties": ["formula", "elements", "band_gap", "formation_energy", "energy_above_hull", "bulk_modulus", "is_metal", "is_stable"]
       },
       "platform": {

@@ -15,7 +15,10 @@ from dataclasses import dataclass
 import json
 from typing import Iterable
 
-from app.tools.search_engine.identity import fusion_key as identity_fusion_key
+from app.tools.search_engine.identity import (
+    IdentityNotFusable,
+    fusion_key as identity_fusion_key,
+)
 from app.tools.search_engine.result import (
     FusionCandidate,
     Material,
@@ -378,24 +381,45 @@ def _merge_group(
     return fused
 
 
+def _isolated(material: Material, reason: str) -> Material:
+    """Keep an unmergeable record as its own material, saying why."""
+    return material.model_copy(update={"fusion_exclusion": reason})
+
+
 def fuse_materials(materials: list[Material]) -> list[Material]:
     """Fuse known domain identities using reliability, never provider arrival.
 
-    Legacy records without a domain-supplied identity are returned as isolated
-    records.  They are not assigned a guessed crystal key, so they cannot
-    silently collide.  An explicitly supplied but unregistered domain raises a
-    ``ValueError`` instead of falling back to a crystal formula key.
+    Records that cannot safely merge are returned as ISOLATED materials with
+    ``fusion_exclusion`` naming the reason -- never dropped, never grouped:
+
+    - No domain-supplied identity (legacy records): no guessed crystal key,
+      so they cannot silently collide.
+    - Identity present but missing a required discriminator (the plugin
+      raises ``IdentityNotFusable``, e.g. a crystal with no symmetry data):
+      such a record is not fusable with ANYTHING, including other
+      discriminator-less records of the same formula, because "we both don't
+      know the space group" is not evidence of being the same polymorph.
+
+    An explicitly supplied but unregistered domain still raises ``ValueError``
+    instead of falling back to a crystal formula key.
     """
     if not materials:
         return []
 
     groups: dict[str, list[Material]] = defaultdict(list)
-    unfused_legacy: list[Material] = []
+    unmergeable: list[Material] = []
     for material in materials:
         if material.identity is None:
-            unfused_legacy.append(material)
+            unmergeable.append(
+                _isolated(material, "not mergeable: no domain identity")
+            )
             continue
-        groups[_fusion_key(material)].append(material)
+        try:
+            key = _fusion_key(material)
+        except IdentityNotFusable as reason:
+            unmergeable.append(_isolated(material, f"not mergeable: {reason}"))
+            continue
+        groups[key].append(material)
 
     claim_groups = [
         claims
@@ -415,4 +439,4 @@ def fuse_materials(materials: list[Material]) -> list[Material]:
         else group[0]
         for group in groups.values()
     ]
-    return fused + unfused_legacy
+    return fused + unmergeable

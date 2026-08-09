@@ -45,11 +45,20 @@ def test_to_optimade_combined():
     assert "nelements<=3" in f
 
 
-def test_to_optimade_space_group():
+def test_to_optimade_space_group_symbol_uses_spec_field():
+    """`space_group_symbol` is NOT an OPTIMADE field; the spec defines
+    `space_group_symbol_hermann_mauguin` (and `space_group_it_number`)."""
     from app.tools.search_engine.translator import QueryTranslator
     q = MaterialSearchQuery(space_group="Fm-3m")
     f = QueryTranslator.to_optimade(q)
-    assert 'space_group_symbol="Fm-3m"' in f
+    assert 'space_group_symbol_hermann_mauguin="Fm-3m"' in f
+
+
+def test_to_optimade_space_group_number_uses_it_number():
+    from app.tools.search_engine.translator import QueryTranslator
+    q = MaterialSearchQuery(space_group=225)
+    f = QueryTranslator.to_optimade(q)
+    assert "space_group_it_number=225" in f
 
 
 def test_to_optimade_empty_query():
@@ -78,3 +87,37 @@ def test_to_mp_kwargs_empty():
     q = MaterialSearchQuery()
     kw = QueryTranslator.to_mp_kwargs(q)
     assert kw == {}
+
+
+def test_to_mp_kwargs_n_elements():
+    """`nelements` is advertised as filterable on mp_native; the translator
+    must actually send it (MPRester's num_elements tuple), not drop it."""
+    from app.tools.search_engine.translator import QueryTranslator
+    q = MaterialSearchQuery(n_elements=PropertyRange(min=2, max=3))
+    kw = QueryTranslator.to_mp_kwargs(q)
+    assert kw["num_elements"] == (2, 3)
+
+
+def test_to_mp_kwargs_space_group_symbol():
+    from app.tools.search_engine.translator import QueryTranslator
+    q = MaterialSearchQuery(space_group="Fm-3m")
+    kw = QueryTranslator.to_mp_kwargs(q)
+    assert kw["spacegroup_symbol"] == "Fm-3m"
+    assert "spacegroup_number" not in kw
+
+
+def test_to_mp_kwargs_space_group_number():
+    from app.tools.search_engine.translator import QueryTranslator
+    q = MaterialSearchQuery(space_group=225)
+    kw = QueryTranslator.to_mp_kwargs(q)
+    assert kw["spacegroup_number"] == 225
+    assert "spacegroup_symbol" not in kw
+
+
+def test_to_mp_kwargs_bulk_modulus_maps_to_k_vrh():
+    """A declared-filterable bulk_modulus used to be dropped AND the field
+    never requested -- a capability that guaranteed zero results."""
+    from app.tools.search_engine.translator import QueryTranslator
+    q = MaterialSearchQuery(bulk_modulus=PropertyRange(min=100.0, max=300.0))
+    kw = QueryTranslator.to_mp_kwargs(q)
+    assert kw["k_vrh"] == (100.0, 300.0)
