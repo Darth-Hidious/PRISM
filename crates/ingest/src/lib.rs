@@ -30,6 +30,7 @@
 
 pub mod connectors;
 pub mod graph_validation;
+pub mod induction;
 /// Re-export LLM client from the standalone `prism-llm` crate.
 /// This keeps backward compatibility — existing code using `prism_ingest::llm::*`
 /// and `prism_ingest::LlmConfig` continues to work.

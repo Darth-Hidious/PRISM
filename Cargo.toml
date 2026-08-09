@@ -62,6 +62,10 @@ toml = "0.8"
 toml_edit = { version = "0.25", features = ["serde"] }
 url = { version = "2.5.8", features = ["serde"] }
 
+# RDF (ontology-induction TTL artifacts: emit + parse). Dual-licensed
+# "Apache-2.0 / CECILL-B" — the Apache-2.0 leg applies here.
+sophia = "0.10"
+
 # Document parsing (retrieval engine: Atom/JATS XML, PDF text)
 quick-xml = "0.41"
 pdf-extract = "0.12"

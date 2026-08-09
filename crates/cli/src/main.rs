@@ -14,6 +14,7 @@ mod local_llm;
 mod mcp_server_native;
 mod notebook;
 mod onboarding;
+mod ontology_cmd;
 mod papers;
 use prism_core::providers;
 mod pyiron_cmd;
@@ -220,6 +221,14 @@ enum Commands {
     Papers {
         #[command(subcommand)]
         command: crate::papers::PapersCommands,
+    },
+    /// Induce, validate, and promote domain ontologies (corpus → TTL
+    /// artifact). Ontologies are produced BY the LLM from source text —
+    /// induction emits a versioned, provenance-stamped DRAFT artifact;
+    /// promotion is the deliberate act that accepts it.
+    Ontology {
+        #[command(subcommand)]
+        command: crate::ontology_cmd::OntologyCommands,
     },
     /// Ingest a data file into the knowledge graph.
     Ingest {
@@ -1546,6 +1555,9 @@ fn command_needs_python(command: Option<&Commands>) -> bool {
             | Commands::Federation { .. }
             | Commands::Publish { .. },
         ) => false,
+        // Ontology induction is Rust + the configured LLM HTTP endpoint;
+        // no handler takes the interpreter path.
+        Some(Commands::Ontology { .. }) => false,
         // Reports on the venv — including its absence — rather than using it.
         Some(Commands::Doctor { .. }) => false,
         // Pure platform HTTP: these talk to the API over reqwest and print
@@ -3626,6 +3638,9 @@ async fn main() -> Result<()> {
         },
         Commands::Papers { command } => {
             crate::papers::handle(command, &cli.project_root).await?;
+        }
+        Commands::Ontology { command } => {
+            crate::ontology_cmd::handle(command, &cli.project_root).await?;
         }
         Commands::Ingest {
             path,
