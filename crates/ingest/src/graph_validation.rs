@@ -82,11 +82,17 @@ pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphVal
         }
     }
 
-    // Check 3: Unknown entity types — against the active ontology's
-    // declared vocabulary, the same declaration the prompt is built from.
-    let entity_types = ontology.entity_types();
+    // Check 3: Unknown entity types — resolve the model's human-facing label
+    // through the active ontology to a canonical class IRI. This is the same
+    // declaration the prompt is built from (`REQ-OWL-S1-LABEL-RESOLUTION`).
+    let entity_types: Vec<&str> = ontology
+        .classes()
+        .iter()
+        .flat_map(|decl| decl.extraction_labels.iter())
+        .map(String::as_str)
+        .collect();
     for e in &entities.entities {
-        if !entity_types.contains(&e.entity_type.as_str()) {
+        if ontology.class_for_label(e.entity_type.as_str()).is_none() {
             issues.push(GraphIssue {
                 severity: GraphSeverity::Warning,
                 category: "unknown_type".into(),
@@ -140,10 +146,10 @@ pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphVal
         }
     }
 
-    // Check 6: Unknown relationship types — same source as check 3.
-    let rel_types = ontology.relationship_types();
+    // Check 6: Unknown relationship types — resolve the extraction label to
+    // its declared object-property IRI (`REQ-OWL-S1-RELATION-RESOLUTION`).
     for r in &entities.relationships {
-        if !rel_types.contains(&r.rel_type.as_str()) {
+        if ontology.relation_for_label(r.rel_type.as_str()).is_none() {
             issues.push(GraphIssue {
                 severity: GraphSeverity::Warning,
                 category: "unknown_rel".into(),
@@ -272,6 +278,29 @@ mod tests {
         assert!(report.issues.iter().any(|i| i.category == "unknown_rel"));
     }
 
+    /// Regression for the former three-way drift: the prompt and local-fact
+    /// mapper both used `HAS_PHASE`, while validation alone called it foreign.
+    /// The loaded object-property declaration now makes it legal.
+    #[test]
+    fn has_phase_is_accepted_from_the_loaded_relation_declaration() {
+        let es = EntitySet {
+            entities: vec![
+                make_entity("Material", "Steel"),
+                make_entity("Phase", "BCC"),
+            ],
+            relationships: vec![make_rel("Steel", "HAS_PHASE", "BCC")],
+        };
+        let report = validate_graph(&EmmoOntology, &es);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "unknown_rel"),
+            "HAS_PHASE is still absent from the active ontology declaration: {:?}",
+            report.issues
+        );
+    }
+
     #[test]
     fn detects_weight_out_of_range() {
         let es = EntitySet {
@@ -334,26 +363,60 @@ mod tests {
     /// for an ontology that never declared CONTAINS.
     #[test]
     fn validation_follows_the_active_ontologys_vocabulary_not_emmos() {
-        use crate::ontologies::{Ontology, UnitVocabulary};
+        use crate::ontologies::{ClassDecl, Iri, Ontology, RelationDecl};
 
-        struct Chem;
+        struct Chem {
+            classes: Vec<ClassDecl>,
+            relations: Vec<RelationDecl>,
+            version_iri: Iri,
+            artifact_sha256: String,
+        }
+
+        impl Chem {
+            fn new() -> Self {
+                Self {
+                    classes: vec![ClassDecl {
+                        iri: Iri::new("https://example.test/class/molecule".to_string())
+                            .expect("test class IRI is valid"),
+                        pref_label: Some("Molecule".to_string()),
+                        parents: Vec::new(),
+                        extraction_labels: vec!["Molecule".to_string()],
+                    }],
+                    relations: vec![RelationDecl {
+                        iri: Iri::new("https://example.test/property/reacts-with".to_string())
+                            .expect("test property IRI is valid"),
+                        pref_label: Some("reactsWith".to_string()),
+                        extraction_labels: vec!["REACTS_WITH".to_string()],
+                    }],
+                    version_iri: Iri::new("https://example.test/ontology/1".to_string())
+                        .expect("test version IRI is valid"),
+                    artifact_sha256: "0".repeat(64),
+                }
+            }
+        }
+
         impl Ontology for Chem {
             fn id(&self) -> &'static str {
                 "chem-gv"
             }
-            fn entity_types(&self) -> &'static [&'static str] {
-                &["Molecule"]
+            fn version_iri(&self) -> &Iri {
+                &self.version_iri
             }
-            fn relationship_types(&self) -> &'static [&'static str] {
-                &["REACTS_WITH"]
+            fn artifact_sha256(&self) -> &str {
+                &self.artifact_sha256
             }
-            fn unit_vocabulary(&self) -> UnitVocabulary {
-                UnitVocabulary {
-                    name: "FREE",
-                    prefix: None,
-                }
+            fn classes(&self) -> &[ClassDecl] {
+                &self.classes
+            }
+            fn relations(&self) -> &[RelationDecl] {
+                &self.relations
+            }
+            fn is_a(&self, sub: &Iri, sup: &Iri) -> bool {
+                sub == sup
             }
         }
+
+        let chem = Chem::new();
 
         let chem_set = EntitySet {
             entities: vec![
@@ -368,7 +431,7 @@ mod tests {
         };
 
         // Chem facts under chem: fully in-vocabulary.
-        let report = validate_graph(&Chem, &chem_set);
+        let report = validate_graph(&chem, &chem_set);
         assert!(
             !report
                 .issues
@@ -397,7 +460,7 @@ mod tests {
 
         // EMMO facts under chem: foreign the other way — and chem raises no
         // CONTAINS weight domain issues, because those rules are EMMO's.
-        let report = validate_graph(&Chem, &emmo_set);
+        let report = validate_graph(&chem, &emmo_set);
         assert_eq!(
             report
                 .issues

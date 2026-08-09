@@ -6550,6 +6550,7 @@ async fn run_local_text_ingest_file(
              (CSV/Parquet), or set [ontology] id = \"emmo\"."
         );
     }
+    let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
 
     if mapping_path.is_some() {
         eprintln!(
@@ -6661,7 +6662,16 @@ async fn run_local_text_ingest_file(
 
     store.record_activity(&prov).await?;
     for fact in &facts {
-        store.write_fact(fact, &prov).await?;
+        store
+            .write_fact_with_classification(
+                fact,
+                &prov,
+                prism_provenance::OntologyClassification {
+                    version_iri: ontology.version_iri().as_str(),
+                    artifact_sha256: ontology.artifact_sha256(),
+                },
+            )
+            .await?;
     }
     // Best-effort: vectorize the freshly written entity names into the same
     // Turso store so `prism query --semantic` works without Qdrant.
@@ -14506,8 +14516,9 @@ data:\n\
     fn test_node(name: &str, tenant: &str) -> prism_provenance::GraphNode {
         prism_provenance::GraphNode {
             name: name.into(),
-            entity_type: "Matter".into(),
+            entity_type: "Alloy".into(),
             label: "Matter".into(),
+            class_iri: Some("https://w3id.org/emmo#EMMO_example_alloy".into()),
             tenant: tenant.into(),
         }
     }
@@ -14542,8 +14553,9 @@ data:\n\
             facts: vec![test_recalled_fact("tensile strength", "local")],
         };
         let out = format_local_ontology(&results);
-        // Entity lines keep the Neo4j path's `[type] name` shape.
-        assert!(out.contains("  [Matter] Ti-6Al-4V\n"), "got: {out}");
+        // Entity lines display the declared extraction type, independently
+        // of the compatibility storage label (`Matter`).
+        assert!(out.contains("  [Alloy] Ti-6Al-4V\n"), "got: {out}");
         assert!(
             out.contains("Ti-6Al-4V -[hasPart]-> alpha phase\n"),
             "got: {out}"
@@ -14588,9 +14600,9 @@ data:\n\
         let out = format_local_ontology(&results);
 
         // Both same-named entities appear; exactly the peer one is tagged.
-        assert!(out.contains("  [Matter] Ti-6Al-4V\n"), "got: {out}");
+        assert!(out.contains("  [Alloy] Ti-6Al-4V\n"), "got: {out}");
         assert!(
-            out.contains("  [Matter] Ti-6Al-4V  [peer mesh:node-a]\n"),
+            out.contains("  [Alloy] Ti-6Al-4V  [peer mesh:node-a]\n"),
             "got: {out}"
         );
         // The header separates local from peer counts.

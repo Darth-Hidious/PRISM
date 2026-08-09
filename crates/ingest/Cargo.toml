@@ -21,6 +21,7 @@ serde_yaml = { workspace = true }
 uuid = { workspace = true }
 polars = { workspace = true }
 prism-llm = { path = "../llm" }
+prism-ontology = { path = "../ontology" }
 prism-provenance = { path = "../provenance" }
 
 [dev-dependencies]

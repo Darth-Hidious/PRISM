@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use polars::prelude::*;
-use prism_provenance::{EvidenceClass, FactNodeLabels, LocalProvenance, ProvenanceStore};
+use prism_provenance::{
+    ClassifiedFactNodes, ClassifiedNode, EvidenceClass, LocalProvenance, OntologyClassification,
+    ProvenanceStore,
+};
 use serde::{Deserialize, Serialize};
 use tracing;
 
@@ -376,29 +379,51 @@ impl IngestPipeline {
         source: &DataSource,
         tenant: &str,
     ) -> Result<GraphUpdate> {
-        // Declared name → storage label, from the ONE declaration. First
-        // declaration wins on a (rare) same-name/different-type collision,
-        // matching the standalone-write dedup below.
-        let mut storage_labels: std::collections::HashMap<&str, &'static str> =
+        // Declared name → ontology classification, from the ONE active
+        // declaration. First declaration wins on a (rare)
+        // same-name/different-type collision, matching the standalone-write
+        // dedup below. The compatibility storage label remains the entity-key
+        // input; the declared type and canonical IRI are additive metadata.
+        let mut classifications: std::collections::HashMap<&str, ClassifiedNode<'_>> =
             std::collections::HashMap::new();
         for e in &entity_set.entities {
-            if let Some(label) = ontology.storage_label(e.entity_type.trim()) {
-                storage_labels.entry(e.name.as_str()).or_insert(label);
-            } else {
-                bail!(
-                    "entity '{}' has type '{}', which ontology '{}' maps to no \
-                     storage label — the write plan must drop and report it, \
-                     never store a label the ontology does not declare",
+            let extraction_label = e.entity_type.trim();
+            let class = ontology.class_for_label(extraction_label).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "entity '{}' has type '{}', which ontology '{}' resolves to no class IRI — \
+                     the write plan must drop and report it, never invent a canonical identity",
                     e.name,
                     e.entity_type,
                     ontology.id()
-                );
-            }
-        }
-        let label_of = |name: &str| -> Result<&'static str> {
-            storage_labels.get(name).copied().ok_or_else(|| {
+                )
+            })?;
+            let declared_type = class
+                .extraction_labels
+                .iter()
+                .find(|label| label.as_str() == extraction_label)
+                .map(String::as_str)
+                .expect("class_for_label returned a declaration carrying the exact label");
+            let storage_label = ontology.storage_label(declared_type).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no declared entity (and so no storage label) for fact endpoint \
+                    "entity '{}' has type '{}', which ontology '{}' maps to no storage label — \
+                     the write plan must drop and report it, never store an undeclared label",
+                    e.name,
+                    e.entity_type,
+                    ontology.id()
+                )
+            })?;
+            classifications
+                .entry(e.name.as_str())
+                .or_insert(ClassifiedNode {
+                    entity_type: declared_type,
+                    storage_label,
+                    class_iri: class.iri.as_str(),
+                });
+        }
+        let classification_of = |name: &str| -> Result<ClassifiedNode<'_>> {
+            classifications.get(name).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no declared entity (and so no class IRI/storage label) for fact endpoint \
                      '{name}' — dangling relationships must be dropped before the write"
                 )
             })
@@ -435,14 +460,25 @@ impl IngestPipeline {
         };
         store.record_activity(&prov).await?;
 
+        let ontology_classification = OntologyClassification {
+            version_iri: ontology.version_iri().as_str(),
+            artifact_sha256: ontology.artifact_sha256(),
+        };
+
         let facts = to_local_facts(entity_set);
         for fact in &facts {
-            let labels = FactNodeLabels {
-                subject: label_of(&fact.subject)?,
-                object: label_of(&fact.object)?,
+            let nodes = ClassifiedFactNodes {
+                subject: classification_of(&fact.subject)?,
+                object: classification_of(&fact.object)?,
             };
             store
-                .write_fact_with_evidence(fact, &prov, EvidenceClass::Research, labels)
+                .write_classified_fact_with_evidence(
+                    fact,
+                    &prov,
+                    EvidenceClass::Research,
+                    nodes,
+                    ontology_classification,
+                )
                 .await?;
         }
 
@@ -472,7 +508,7 @@ impl IngestPipeline {
                 _ => None,
             };
             store
-                .write_extracted_entity(&e.name, label_of(&e.name)?, props, &prov.tenant)
+                .write_classified_entity(&e.name, classification_of(&e.name)?, props, &prov.tenant)
                 .await?;
         }
 
@@ -545,17 +581,27 @@ fn validate_before_graph_write(
     let (kept_entities, dropped_entities): (Vec<Entity>, Vec<String>) = {
         let mut kept = Vec::new();
         let mut dropped = Vec::new();
+        let declared = ontology
+            .classes()
+            .iter()
+            .flat_map(|class| class.extraction_labels.iter())
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
         for e in &entity_set.entities {
-            if ontology.storage_label(e.entity_type.trim()).is_some() {
+            let extraction_label = e.entity_type.trim();
+            if ontology.class_for_label(extraction_label).is_some()
+                && ontology.storage_label(extraction_label).is_some()
+            {
                 kept.push(e.clone());
             } else {
                 dropped.push(format!(
-                    "entity '{}': type '{}' has no storage label in ontology '{}' \
+                    "entity '{}': type '{}' has no storage label or canonical class IRI in ontology '{}' \
                      (declared: {})",
                     e.name,
                     e.entity_type,
                     ontology.id(),
-                    ontology.entity_types().join(", ")
+                    declared
                 ));
             }
         }
@@ -881,13 +927,9 @@ mod tests {
             format: "csv".into(),
         };
 
+        let emmo = crate::ontologies::EmmoOntology;
         let update = pipeline
-            .write_local_graph(
-                &crate::ontologies::EmmoOntology,
-                &entity_set,
-                &source,
-                "local",
-            )
+            .write_local_graph(&emmo, &entity_set, &source, "local")
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 3);
@@ -984,13 +1026,9 @@ mod tests {
             format: "csv".into(),
         };
 
+        let emmo = crate::ontologies::EmmoOntology;
         let update = pipeline
-            .write_local_graph(
-                &crate::ontologies::EmmoOntology,
-                &entity_set,
-                &source,
-                "local",
-            )
+            .write_local_graph(&emmo, &entity_set, &source, "local")
             .await
             .unwrap();
 
@@ -1086,10 +1124,10 @@ mod tests {
                 // Process → Manufacturing: the store's one label for a step,
                 // standalone or via PROCESSED_BY.
                 entity("Process", "annealing", serde_json::json!({})),
-                // Generic-arm subject and object (AUTHORED_BY has no typed
-                // arm): declared labels, never `Matter`/`Entity`.
+                // Generic-arm subject and object (PART_OF has no typed arm):
+                // declared labels, never `Matter`/`Entity`.
                 entity("Paper", "Smith2020", serde_json::json!({})),
-                entity("Author", "Jane Smith", serde_json::json!({})),
+                entity("Paper", "Proceedings2020", serde_json::json!({})),
                 // Standalone (containment-path) nodes: same mapping as the
                 // fact writes — Material converges on Matter.
                 entity("Dataset", "DS-1", serde_json::json!({})),
@@ -1107,7 +1145,7 @@ mod tests {
                     order: Some(1),
                     ..rel("Steel", "PROCESSED_BY", "annealing")
                 },
-                rel("Smith2020", "AUTHORED_BY", "Jane Smith"),
+                rel("Smith2020", "PART_OF", "Proceedings2020"),
             ],
         };
         let source = DataSource {
@@ -1115,13 +1153,9 @@ mod tests {
             format: "csv".into(),
         };
 
+        let emmo = crate::ontologies::EmmoOntology;
         let update = pipeline
-            .write_local_graph(
-                &crate::ontologies::EmmoOntology,
-                &entity_set,
-                &source,
-                "local",
-            )
+            .write_local_graph(&emmo, &entity_set, &source, "local")
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 10);
@@ -1131,7 +1165,7 @@ mod tests {
             .await
             .unwrap();
         for e in &entity_set.entities {
-            let expected = crate::ontologies::EmmoOntology
+            let expected = emmo
                 .storage_label(&e.entity_type)
                 .expect("every declared type is storable");
             let hits = store.graph_search(&e.name, "local", 10).await.unwrap();
@@ -1149,6 +1183,19 @@ mod tests {
             assert!(
                 labels.iter().all(|l| *l == expected),
                 "'{}' declared {} must store under '{expected}' in EVERY role, got {labels:?}",
+                e.name,
+                e.entity_type,
+            );
+            let expected_iri = emmo
+                .class_for_label(&e.entity_type)
+                .expect("every declared test type resolves")
+                .iri
+                .as_str();
+            assert!(
+                hits.iter().filter(|n| n.name == e.name).all(|n| {
+                    n.entity_type == e.entity_type && n.class_iri.as_deref() == Some(expected_iri)
+                }),
+                "'{}' must retain declared type '{}' and canonical IRI '{expected_iri}': {hits:?}",
                 e.name,
                 e.entity_type,
             );
@@ -1970,21 +2017,53 @@ mod tests {
         id: &'static str,
     }
 
+    static CHEM_VERSION_IRI: std::sync::LazyLock<crate::ontologies::Iri> =
+        std::sync::LazyLock::new(|| {
+            crate::ontologies::Iri::new("https://example.invalid/chem/1".to_string())
+                .expect("test version IRI is absolute")
+        });
+    static CHEM_CLASSES: std::sync::LazyLock<Vec<crate::ontologies::ClassDecl>> =
+        std::sync::LazyLock::new(|| {
+            vec![crate::ontologies::ClassDecl {
+                iri: crate::ontologies::Iri::new(
+                    "https://example.invalid/chem#Molecule".to_string(),
+                )
+                .expect("test class IRI is absolute"),
+                pref_label: Some("Molecule".into()),
+                parents: Vec::new(),
+                extraction_labels: vec!["Molecule".into()],
+            }]
+        });
+    static CHEM_RELATIONS: std::sync::LazyLock<Vec<crate::ontologies::RelationDecl>> =
+        std::sync::LazyLock::new(|| {
+            vec![crate::ontologies::RelationDecl {
+                iri: crate::ontologies::Iri::new(
+                    "https://example.invalid/chem#reactsWith".to_string(),
+                )
+                .expect("test property IRI is absolute"),
+                pref_label: Some("reactsWith".into()),
+                extraction_labels: vec!["REACTS_WITH".into()],
+            }]
+        });
+
     impl crate::ontologies::Ontology for ChemOntology {
         fn id(&self) -> &'static str {
             self.id
         }
-        fn entity_types(&self) -> &'static [&'static str] {
-            &["Molecule"]
+        fn version_iri(&self) -> &crate::ontologies::Iri {
+            &CHEM_VERSION_IRI
         }
-        fn relationship_types(&self) -> &'static [&'static str] {
-            &["REACTS_WITH"]
+        fn artifact_sha256(&self) -> &str {
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
         }
-        fn unit_vocabulary(&self) -> crate::ontologies::UnitVocabulary {
-            crate::ontologies::UnitVocabulary {
-                name: "FREE",
-                prefix: None,
-            }
+        fn classes(&self) -> &[crate::ontologies::ClassDecl] {
+            &CHEM_CLASSES
+        }
+        fn relations(&self) -> &[crate::ontologies::RelationDecl] {
+            &CHEM_RELATIONS
+        }
+        fn is_a(&self, sub: &crate::ontologies::Iri, sup: &crate::ontologies::Iri) -> bool {
+            sub == sup
         }
     }
 
@@ -2029,6 +2108,102 @@ mod tests {
                 {"from": "Steel", "rel": "CONTAINS", "to": "Fe", "weight": 1.0}
             ]
         })
+    }
+
+    /// Production-dispatch proof for canonical class identity, the repaired
+    /// HAS_PHASE declaration, and assertion classification provenance.
+    ///
+    /// The test deliberately enters through `ingest_file -> active(None)`;
+    /// constructing a graph fixture directly would not detect a hardcoded
+    /// production bypass (REQ-OWL-S1-CANONICAL-CLASS-IDENTITY,
+    /// REQ-OWL-S1-CLASSIFICATION-PROVENANCE, REQ-OWL-S1-HAS-PHASE).
+    #[tokio::test]
+    async fn production_dispatch_persists_class_iris_and_ontology_stamp_for_has_phase() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Steel", "properties": {}},
+                {"type": "Phase", "name": "BCC", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Steel", "rel": "HAS_PHASE", "to": "BCC"}
+            ]
+        }))
+        .await;
+        let scratch = RefusalScratch::new();
+        let db_path = scratch.db_path();
+        let csv = scratch.csv("alloy,phase\nSteel,BCC\n");
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let report = result.graph_validation.expect("validation ran");
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "unknown_rel" && issue.message.contains("HAS_PHASE")),
+            "HAS_PHASE drift returned: {:?}",
+            report.issues
+        );
+
+        let ontology = crate::ontologies::active(None).expect("production EMMO resolves");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        for (name, declared_type, storage_label) in
+            [("Steel", "Alloy", "Matter"), ("BCC", "Phase", "Phase")]
+        {
+            let expected_iri = ontology
+                .class_for_label(declared_type)
+                .expect("production label resolver knows the extracted type")
+                .iri
+                .as_str();
+            let nodes = store.graph_search(name, "local", 10).await.unwrap();
+            assert!(
+                nodes.iter().any(|node| {
+                    node.name == name
+                        && node.label == storage_label
+                        && node.entity_type == declared_type
+                        && node.class_iri.as_deref() == Some(expected_iri)
+                }),
+                "production persistence lost the declared type or canonical IRI: {nodes:?}"
+            );
+            assert!(
+                nodes
+                    .iter()
+                    .filter_map(|node| node.class_iri.as_deref())
+                    .all(|iri| {
+                        ontology
+                            .classes()
+                            .iter()
+                            .any(|class| class.iri.as_str() == iri)
+                    }),
+                "a stored class_iri is not declared by the loaded ontology: {nodes:?}"
+            );
+        }
+
+        let traversal = store
+            .get_neighbors("Steel", Some("HAS_PHASE"), "local", 10)
+            .await
+            .unwrap();
+        assert!(
+            traversal.edges.iter().any(|edge| edge.source == "Steel"
+                && edge.target == "BCC"
+                && edge.rel_type == "HAS_PHASE"),
+            "HAS_PHASE did not reach the phase persistence arm: {traversal:?}"
+        );
+
+        let assertion = prism_provenance::assertion_id("local", "Steel", "HAS_PHASE", "BCC");
+        let classifications = store.assertion_classifications(&assertion).await.unwrap();
+        assert!(
+            classifications.iter().any(|classification| {
+                classification.version_iri == ontology.version_iri().as_str()
+                    && classification.artifact_sha256 == ontology.artifact_sha256()
+            }),
+            "assertion has no matching ontology version/hash stamp: {classifications:?}"
+        );
     }
 
     /// The core requirement, both directions, through the real pipeline: a
@@ -2099,9 +2274,10 @@ mod tests {
         let result = pipeline.ingest_file(&csv).await.unwrap();
         let report = result.graph_validation.expect("validation ran");
         assert!(
-            report.issues.iter().any(|i| i.category == "unknown_type"
-                && i.message.contains("Molecule")
-                && i.message.contains("expected one of: Alloy")),
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "unknown_type" && i.message.contains("Molecule")),
             "{:?}",
             report.issues
         );

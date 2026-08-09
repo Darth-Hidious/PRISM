@@ -3557,6 +3557,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mownstr"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b33dce847b8623c1f2e473ed3a05e43d0c395e3b93fab62378b6ae94b0a1c42c"
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4015,6 +4021,12 @@ name = "owo-colors"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
+
+[[package]]
+name = "oxiri"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54b4ed3a7192fa19f5f48f99871f2755047fabefd7f222f12a1df1773796a102"
 
 [[package]]
 name = "pack1"
@@ -5071,6 +5083,7 @@ dependencies = [
  "futures-util",
  "polars",
  "prism-llm",
+ "prism-ontology",
  "prism-provenance",
  "reqwest",
  "serde",
@@ -5175,6 +5188,17 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "prism-ontology"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sophia",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6028,6 +6052,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "resiter"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbc95d56eb1865f69288945759cc0879d60ee68168dce676730275804ad2b276"
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6678,6 +6708,133 @@ name = "softaes"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45e14297decde697ddf377c25752aead0927d5cfc89c2684d2af96901a4ceeea"
+
+[[package]]
+name = "sophia"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d042d7aba4cf579028c1d1baf6a6eef0640c25f07b7515fcb3d6216f400566a8"
+dependencies = [
+ "sophia_api",
+ "sophia_c14n",
+ "sophia_inmem",
+ "sophia_iri",
+ "sophia_isomorphism",
+ "sophia_resource",
+ "sophia_term",
+ "sophia_turtle",
+]
+
+[[package]]
+name = "sophia_api"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c12f9db8c8e0d45f49582f3d3782e28b0f38c6225448edb2af1cee028c658d1"
+dependencies = [
+ "lazy_static",
+ "log",
+ "mownstr",
+ "regex",
+ "resiter",
+ "serde",
+ "sophia_bcp47",
+ "sophia_iri",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sophia_bcp47"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "867126821839373d9d62b5755e8bbb321ce4c0d72df806340a8d0384ea5ae0a0"
+dependencies = [
+ "mownstr",
+ "regex",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sophia_c14n"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35af2214b407f8c447e00d5f32548c1a56b5cf5d5c7001f47d85a323222db822"
+dependencies = [
+ "base64 0.22.1",
+ "log",
+ "sha2 0.11.0",
+ "sophia_api",
+ "sophia_iri",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sophia_inmem"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe80457d61964da2317a72afdbd6c376b233f13cb5181d0137089b25cbc20ff7"
+dependencies = [
+ "sophia_api",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sophia_iri"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9736c34ba10d2efe736035837ccb149494587c7c4bcc87202162582ca383cbb3"
+dependencies = [
+ "oxiri",
+ "regex",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sophia_isomorphism"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5969f485b268246d74995a124a4cb7c1776b6ad08af3e48f1a09d9216c8cc49d"
+dependencies = [
+ "sophia_api",
+ "sophia_c14n",
+ "sophia_iri",
+]
+
+[[package]]
+name = "sophia_resource"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce54eb7dca054dcf4aeae00b06e3004677cd8945f9b7fb0d9a94f72c67aee25"
+dependencies = [
+ "sophia_api",
+ "sophia_iri",
+ "sophia_turtle",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sophia_term"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7417c4df607414544ef01c2a0213384554508e1cab83c056ea10babbc79c8bef"
+dependencies = [
+ "lazy_static",
+ "sophia_api",
+]
+
+[[package]]
+name = "sophia_turtle"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bae4c23b7aa456357e68359020876f28056f51b66f0c07922edd13c7b54871c"
+dependencies = [
+ "regex",
+ "sophia_api",
+ "sophia_iri",
+ "thiserror 2.0.18",
+ "uuid",
+]
 
 [[package]]
 name = "spin"

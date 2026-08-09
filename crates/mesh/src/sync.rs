@@ -507,9 +507,11 @@ pub async fn sync_dataset_from_peer(
             ..prov.clone()
         };
         store
-            .write_synced_entity(
+            .write_synced_entity_with_identity(
                 name,
+                peer_row_entity_type(row),
                 peer_row_label(row),
+                peer_row_class_iri(row),
                 peer_row_props(row),
                 dataset_name,
                 &row_prov,
@@ -533,17 +535,43 @@ pub async fn sync_dataset_from_peer(
 /// less than letting a peer mint arbitrary label strings into the store.
 const MAX_LABEL_LEN: usize = 64;
 
+fn peer_row_identifier<'a>(row: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    let value = row.get(field)?.as_str()?.trim();
+    (!value.is_empty()
+        && value.len() <= MAX_LABEL_LEN
+        && value.chars().all(|c| c.is_ascii_alphanumeric()))
+    .then_some(value)
+}
+
 fn peer_row_label(row: &serde_json::Value) -> &str {
-    match row.get("type").and_then(|v| v.as_str()).map(str::trim) {
-        Some(label)
-            if !label.is_empty()
-                && label.len() <= MAX_LABEL_LEN
-                && label.chars().all(|c| c.is_ascii_alphanumeric()) =>
-        {
-            label
-        }
-        _ => "Entity",
+    peer_row_identifier(row, "type").unwrap_or("Entity")
+}
+
+/// New peers send the declared extraction type separately. An old peer has
+/// only `type`, whose historical meaning is the storage label, so that label
+/// is also the most honest declared-type fallback available.
+fn peer_row_entity_type(row: &serde_json::Value) -> &str {
+    peer_row_identifier(row, "entity_type").unwrap_or_else(|| peer_row_label(row))
+}
+
+/// Canonical IRIs are optional peer input. Keep only bounded absolute IRI
+/// strings with a syntactically valid ASCII scheme and no whitespace or
+/// control characters; absent or malformed input remains honestly unknown.
+const MAX_CLASS_IRI_LEN: usize = 2_048;
+
+fn peer_row_class_iri(row: &serde_json::Value) -> Option<&str> {
+    let iri = row.get("class_iri")?.as_str()?.trim();
+    if iri.is_empty()
+        || iri.len() > MAX_CLASS_IRI_LEN
+        || iri.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
     }
+    let (scheme, remainder) = iri.split_once(':')?;
+    let mut chars = scheme.chars();
+    let valid_scheme = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (valid_scheme && !remainder.is_empty()).then_some(iri)
 }
 
 /// Peer-supplied properties, kept only when they are a non-empty JSON
@@ -749,7 +777,7 @@ mod tests {
     async fn two_publishers_land_under_their_own_tenants() {
         let peer = spawn_mock_peer(http_response(
             "200 OK",
-            r#"{"results":[{"type":"Phase","name":"alpha phase","properties":{"origin_source":"doi:10.1234/abc"}}],"count":1,"mode":"graph"}"#,
+            r#"{"results":[{"type":"Matter","entity_type":"Phase","class_iri":"https://w3id.org/emmo#EMMO_example_phase","name":"alpha phase","properties":{"origin_source":"doi:10.1234/abc"}}],"count":1,"mode":"graph"}"#,
         ));
         let db = TempDb::new();
         let cfg = Some(SyncConfig {
@@ -788,11 +816,16 @@ mod tests {
                 .graph_search("alpha phase", &tenant, 10)
                 .await
                 .unwrap();
-            assert!(
-                nodes
-                    .iter()
-                    .any(|n| n.name == "alpha phase" && n.entity_type == "Phase"),
-                "peer entity must keep its label under {tenant}: {nodes:?}"
+            let node = nodes
+                .iter()
+                .find(|node| node.name == "alpha phase")
+                .expect("peer entity must be present");
+            assert_eq!(node.label, "Matter", "storage identity must survive sync");
+            assert_eq!(node.entity_type, "Phase", "declared type must survive sync");
+            assert_eq!(
+                node.class_iri.as_deref(),
+                Some("https://w3id.org/emmo#EMMO_example_phase"),
+                "canonical class identity must survive sync"
             );
             // Each tenant's assertion carries exactly ONE evidence row with
             // the mesh-namespaced origin — the peers never corroborated
@@ -851,6 +884,34 @@ mod tests {
         assert_eq!(peer_row_label(&row("x".repeat(65).into())), "Entity");
         assert_eq!(peer_row_label(&row(serde_json::json!(7))), "Entity");
         assert_eq!(peer_row_label(&serde_json::json!({"name": "x"})), "Entity");
+    }
+
+    #[test]
+    fn peer_classification_fields_are_additive_with_old_peer_fallbacks() {
+        let classified = serde_json::json!({
+            "type": "Matter",
+            "entity_type": "Alloy",
+            "class_iri": "https://w3id.org/emmo#EMMO_example_alloy",
+        });
+        assert_eq!(peer_row_label(&classified), "Matter");
+        assert_eq!(peer_row_entity_type(&classified), "Alloy");
+        assert_eq!(
+            peer_row_class_iri(&classified),
+            Some("https://w3id.org/emmo#EMMO_example_alloy")
+        );
+
+        let old_peer = serde_json::json!({ "type": "Phase" });
+        assert_eq!(peer_row_entity_type(&old_peer), "Phase");
+        assert_eq!(peer_row_class_iri(&old_peer), None);
+
+        for malformed in [
+            serde_json::json!({ "class_iri": "relative/path" }),
+            serde_json::json!({ "class_iri": "1http://invalid-scheme" }),
+            serde_json::json!({ "class_iri": "https://bad iri" }),
+            serde_json::json!({ "class_iri": "x".repeat(MAX_CLASS_IRI_LEN + 1) }),
+        ] {
+            assert_eq!(peer_row_class_iri(&malformed), None);
+        }
     }
 
     /// Properties survive only as a bounded JSON object; junk and oversize
