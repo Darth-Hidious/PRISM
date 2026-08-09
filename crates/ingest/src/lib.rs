@@ -21,6 +21,12 @@
 //! `extract_entities_with_mapping` directly, and the workspace has no
 //! `dyn OntologyConstructor` holder. Implementing the trait alone will not put
 //! a new engine on the ingest path.
+//!
+//! The ontology VOCABULARY, by contrast, IS pluggable: [`ontologies`] holds
+//! the process-wide registry of [`ontologies::Ontology`] adapters. The
+//! pipeline resolves the ACTIVE ontology (`[ontology] id` in `prism.toml`)
+//! and reads both the extraction prompt and graph validation from that one
+//! adapter, so instructing and validating cannot drift apart.
 
 pub mod connectors;
 pub mod graph_validation;
@@ -31,6 +37,7 @@ pub use prism_llm as llm;
 pub use prism_llm::LlmConfig;
 pub mod local_facts;
 pub mod mapping;
+pub mod ontologies;
 pub mod ontology;
 pub mod pipeline;
 pub mod schema;

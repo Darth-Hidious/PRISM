@@ -6404,6 +6404,22 @@ async fn submit_platform_ingest_chunk(
     Ok(response.json().await?)
 }
 
+/// Resolve the active ontology id for local ingest from `prism.toml`
+/// (`[ontology] id`, default "emmo"), refusing unimplemented `[ontology]
+/// engine` values loudly — that knob used to be read by nothing, so any
+/// value silently behaved like "llm".
+fn active_ontology_from_config(project_root: &Path) -> Result<String> {
+    let node_config = prism_core::config::NodeConfig::load(Some(project_root));
+    let engine = node_config.ontology.engine;
+    if engine != "llm" {
+        bail!(
+            "[ontology] engine = \"{engine}\" is not implemented — only \"llm\" is. \
+             Remove the setting or set engine = \"llm\"."
+        );
+    }
+    Ok(node_config.ontology.id)
+}
+
 async fn run_local_ingest_file(
     path: &Path,
     project_root: &Path,
@@ -6419,12 +6435,18 @@ async fn run_local_ingest_file(
         .map(prism_ingest::mapping::OntologyMapping::from_file)
         .transpose()?;
 
+    // The `[ontology] id` knob selects which vocabulary this ingest
+    // extracts and validates with; an unregistered id fails the run loudly
+    // inside the pipeline instead of silently ingesting as EMMO.
+    let ontology = Some(active_ontology_from_config(project_root)?);
+
     let config = if schema_only {
         PipelineConfig {
             llm: None,
             max_sample_rows: 10,
             mapping: None,
             provenance_db: None,
+            ontology,
         }
     } else {
         let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
@@ -6433,6 +6455,7 @@ async fn run_local_ingest_file(
             max_sample_rows: 10,
             mapping,
             provenance_db: None,
+            ontology,
         }
     };
 
@@ -6514,6 +6537,20 @@ async fn run_local_text_ingest_file(
     schema_only: bool,
     mapping_path: Option<&Path>,
 ) -> Result<serde_json::Value> {
+    // Text-document extraction is wired to the built-in EMMO ontology only
+    // (EMMO prompt, QUDT-typed MaterialFacts). Refuse honestly under any
+    // other active ontology rather than extracting with the wrong
+    // vocabulary — only the tabular pipeline consults the ontology registry
+    // today.
+    let ontology_id = active_ontology_from_config(project_root)?;
+    if ontology_id != prism_ingest::ontologies::DEFAULT_ONTOLOGY_ID {
+        bail!(
+            "text-document ingest currently extracts with the built-in EMMO ontology only; \
+             the active ontology '{ontology_id}' has no text extractor. Ingest tabular data \
+             (CSV/Parquet), or set [ontology] id = \"emmo\"."
+        );
+    }
+
     if mapping_path.is_some() {
         eprintln!(
             "Warning: --mapping is only applied to the local tabular ingest pipeline and is ignored for {}.",
@@ -14864,5 +14901,91 @@ data:\n\
                 "{argv:?} is one-shot and must not sync"
             );
         }
+    }
+
+    // ── `[ontology]` config knob → local ingest ────────────────────────
+
+    /// Write a project-scoped prism.toml; project config REPLACES the
+    /// user's global one in `NodeConfig::load`, so these tests are
+    /// deterministic regardless of ~/.prism/prism.toml.
+    fn project_with_ontology_config(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".prism")).unwrap();
+        std::fs::write(dir.path().join(".prism/prism.toml"), body).unwrap();
+        dir
+    }
+
+    /// The `[ontology] id` knob ACTUALLY selects: the configured id travels
+    /// from prism.toml through `run_local_ingest_file` into the pipeline's
+    /// registry lookup. An unregistered id is refused loudly (naming what is
+    /// registered), the default id ingests, and an unimplemented
+    /// `[ontology] engine` — a knob nothing used to read — now refuses
+    /// instead of silently meaning "llm".
+    #[tokio::test]
+    async fn ontology_config_knob_selects_the_ingest_vocabulary() {
+        let dir = project_with_ontology_config("[ontology]\nid = \"zzz-unregistered\"\n");
+        let root = dir.path();
+        let csv = root.join("data.csv");
+        std::fs::write(&csv, "a\n1\n").unwrap();
+
+        let err = run_local_ingest_file(&csv, root, None, None, None, true, None)
+            .await
+            .expect_err("an unregistered configured ontology must refuse ingest");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("zzz-unregistered"), "{msg}");
+        assert!(msg.contains("emmo"), "{msg}");
+
+        // The default id resolves and ingests (schema-only run).
+        std::fs::write(
+            root.join(".prism/prism.toml"),
+            "[ontology]\nid = \"emmo\"\n",
+        )
+        .unwrap();
+        let out = run_local_ingest_file(&csv, root, None, None, None, true, None)
+            .await
+            .expect("the default ontology must ingest");
+        assert_eq!(out["backend"], "local_tabular");
+
+        // An unimplemented engine is a loud refusal, not a silent "llm".
+        std::fs::write(
+            root.join(".prism/prism.toml"),
+            "[ontology]\nengine = \"dmms\"\n",
+        )
+        .unwrap();
+        let err = run_local_ingest_file(&csv, root, None, None, None, true, None)
+            .await
+            .expect_err("an unimplemented ontology engine must refuse");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("dmms"), "{msg}");
+        assert!(msg.contains("llm"), "{msg}");
+    }
+
+    /// Text-document ingest is EMMO-wired (EMMO prompt, QUDT-typed facts):
+    /// under any other active ontology it must refuse honestly BEFORE any
+    /// model or runtime is contacted, not extract with the wrong vocabulary.
+    #[tokio::test]
+    async fn text_ingest_refuses_a_non_default_ontology_honestly() {
+        let dir = project_with_ontology_config("[ontology]\nid = \"chem\"\n");
+        let root = dir.path();
+        let md = root.join("notes.md");
+        std::fs::write(&md, "# title\nbody text\n").unwrap();
+
+        // TEST-NET-1 runtime URL: the guard fires before anything is
+        // contacted, so an unreachable address is part of the proof.
+        let err = run_local_text_ingest_file(
+            &md,
+            root,
+            None,
+            None,
+            None,
+            "http://192.0.2.1:1",
+            true,
+            None,
+        )
+        .await
+        .expect_err("a non-default ontology must refuse text ingest");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("EMMO"), "{msg}");
+        assert!(msg.contains("chem"), "{msg}");
     }
 }
