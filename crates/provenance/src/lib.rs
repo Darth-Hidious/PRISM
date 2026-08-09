@@ -35,6 +35,7 @@ use turso::Value;
 use uuid::Uuid;
 
 pub mod emmo;
+pub mod units;
 pub use emmo::{
     AssertionClassification, ClassifiedFactNodes, ClassifiedNode, ConditionValue, EvidenceClass,
     EvidenceContribution, EvidenceSource, FactNodeLabels, FactPayload, GraphEdge, GraphNode,

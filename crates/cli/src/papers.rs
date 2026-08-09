@@ -340,6 +340,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             // being invisible — but this loop was discarding it with `.facts`,
             // leaving the literature path exactly as silent as before.
             let mut extraction_failures: Vec<serde_json::Value> = Vec::new();
+            // Facts the extractor dropped ONE BY ONE (malformed shape, or a
+            // unit no QUDT identifier could be resolved for). Distinct from
+            // `extraction_failures` (a whole block yielding nothing) and
+            // from `rejected` (claims refused at validation): these never
+            // became claims at all, and only this list says why.
+            let mut dropped_facts: Vec<serde_json::Value> = Vec::new();
             let mut truncated_bytes = 0usize;
             // Extract per located block so every claim inherits a locator a
             // human can follow back into the document.
@@ -361,6 +367,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         .with_context(|| "LLM fact extraction failed")?;
                 if let Some(reason) = &extraction.parse_error {
                     extraction_failures.push(json!({
+                        "section": block.locator.section_path,
+                        "reason": reason,
+                    }));
+                }
+                for reason in &extraction.dropped_facts {
+                    dropped_facts.push(json!({
                         "section": block.locator.section_path,
                         "reason": reason,
                     }));
@@ -453,6 +465,11 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     // Non-empty means some blocks produced nothing because the
                     // model misbehaved, NOT because the paper was silent there.
                     "extraction_failures": extraction_failures,
+                    // Facts dropped individually during extraction (bad shape
+                    // or an unresolvable unit) — they never became claims,
+                    // and a numeric value is never kept with its unit
+                    // discarded. One entry per fact, with the reason.
+                    "dropped_facts": dropped_facts,
                     "truncated_bytes": truncated_bytes,
                 }))?
             );
