@@ -600,30 +600,41 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 /// rather than holding a store. Anything unguarded here is paid on every one of
 /// those opens.
 ///
-/// Both migrations live behind ONE guard and ONE stamp because they must run in
-/// order on the same pass. `rekey_assertions_by_tenant` used to own the check
-/// and the stamp itself, while `migrate_keys_to_tenant_qualified` ran
-/// unguarded after it; folding the key migration under the same constant
-/// without moving the stamp would have made it skip forever, since the re-key
-/// stamps before the key migration is reached.
+/// The two migrations share a stamp but NOT a threshold. The assertion re-key
+/// is gated on its own generation and the EMMO key migration on the current
+/// one, because a database already at v3 has the right assertion digests and
+/// only needs its EMMO keys qualified — running the re-key anyway would
+/// SHA-256 every assertion in the store for a version that changes no digest,
+/// which is precisely the per-open cost this guard exists to remove, just paid
+/// once and expensively.
+///
+/// One stamp, written after both, because the v3-stamped-with-unqualified-keys
+/// state is REAL: the old code let `rekey_assertions_by_tenant` stamp v3 and
+/// then ran `migrate_keys_to_tenant_qualified` unguarded later in
+/// `init_schema`, so a process that died in between left exactly that on disk.
+/// Stamping v4 only after the key migration is what lets such a database
+/// finish the job on its next open.
 ///
 /// Downgrade hazard, stated rather than hidden: an older PRISM build knows
 /// nothing about `user_version` and would write tenant-less ids again; a newer
 /// build then sees the version already set and skips them. Recovering from that
 /// needs the version reset by hand.
 async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
-    if read_user_version(conn).await? >= ASSERTION_TENANT_KEY_VERSION {
+    let version = read_user_version(conn).await?;
+    if version >= EMMO_KEY_MIGRATION_VERSION {
         return Ok(());
     }
 
-    rekey_assertions_by_tenant(conn).await?;
+    if version < ASSERTION_TENANT_KEY_VERSION {
+        rekey_assertions_by_tenant(conn).await?;
+    }
     migrate_keys_to_tenant_qualified(conn).await?;
 
     // Stamp even when nothing needed changing — a fresh store has empty tables,
     // and returning without stamping would make every subsequent open repeat
     // the scans this guard exists to avoid.
     conn.execute(
-        &format!("PRAGMA user_version = {ASSERTION_TENANT_KEY_VERSION}"),
+        &format!("PRAGMA user_version = {EMMO_KEY_MIGRATION_VERSION}"),
         (),
     )
     .await?;
@@ -639,12 +650,21 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
 /// v3: length prefix widened to `u64` (was architecture-dependent `usize`) and
 ///     optional fields tagged so absent and empty stop colliding. Both change
 ///     the digest, so the re-key runs once more.
-/// v4: no digest change. `migrate_keys_to_tenant_qualified` joined the guard —
-///     it had been running on every open, rewriting `emmo_edge.id` for every
-///     tenanted row each time. A v3 database has already had its keys
-///     qualified by those unguarded passes, so the migration finds nothing to
-///     do; the bump exists to make the guard take effect at all.
-const ASSERTION_TENANT_KEY_VERSION: i64 = 4;
+///
+/// Generations above this one do not change the digest, so a database already
+/// at v3 must NOT be re-keyed: the scan SHA-256s every assertion in the store,
+/// which on a large graph is the exact hot-path cost the guard exists to avoid.
+const ASSERTION_TENANT_KEY_VERSION: i64 = 3;
+
+/// Schema generation covering the EMMO key qualification, and the value
+/// actually stamped once every migration has run.
+///
+/// v4: no assertion-digest change. `migrate_keys_to_tenant_qualified` joined
+///     the guard — it had been running on every open, rewriting `emmo_edge.id`
+///     for every tenanted row each time. Held separate from
+///     [`ASSERTION_TENANT_KEY_VERSION`] so a v3 database qualifies its EMMO
+///     keys without paying for an assertion re-key it does not need.
+const EMMO_KEY_MIGRATION_VERSION: i64 = 4;
 
 /// Tenant to attribute a row to when the stored value is absent.
 ///
@@ -2672,7 +2692,76 @@ mod tests {
         let conn = database.connect().unwrap();
         assert_eq!(
             read_user_version(&conn).await.unwrap(),
-            ASSERTION_TENANT_KEY_VERSION,
+            EMMO_KEY_MIGRATION_VERSION,
+            "the stamp must be the LATEST generation, not the assertion one — \
+             stamping the assertion version would leave the key migration \
+             re-running on every open",
+        );
+    }
+
+    /// A v3 database must finish the job without re-hashing its assertions.
+    ///
+    /// v3 -> v4 changes no assertion digest, and the re-key SHA-256s every
+    /// assertion in the store, so gating both migrations on one threshold would
+    /// pay that scan for nothing. Pinned by observation: an assertion row
+    /// carrying a deliberately wrong id is left alone (the re-key did not run)
+    /// while the unqualified EMMO key beside it IS qualified (the key migration
+    /// did), and the database ends stamped at v4.
+    #[tokio::test]
+    async fn a_v3_database_migrates_keys_without_rekeying_assertions() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        drop(store);
+
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant)
+                   VALUES ('deliberately-not-a-digest', 'steel', 'has_phase', 'bcc', '[]',
+                           'research', 0.7, 1, 'act', 'x.csv', 'agent', 't1')"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO emmo_entity (key, name, label, entity_type, tenant, props_json, created_at)
+                 VALUES ('Matter:steel', 'steel', 'Matter', 'Matter', 't1', '{}', '2026-01-01T00:00:00Z')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 3", ()).await.unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion WHERE id = 'deliberately-not-a-digest'",
+            )
+            .await,
+            1,
+            "the assertion re-key ran on a v3 database — it rehashes every \
+             assertion for a generation that changes no digest",
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_entity WHERE instr(key, '|') = 0",
+            )
+            .await,
+            0,
+            "the key migration did not run on a v3 database",
+        );
+        assert_eq!(
+            read_user_version(&store.conn).await.unwrap(),
+            EMMO_KEY_MIGRATION_VERSION,
         );
     }
 
@@ -3549,16 +3638,21 @@ mod tests {
             ] {
                 store.conn.execute(sql, ()).await.unwrap();
             }
-            // Rewind the schema stamp too, not just the rows. The key
-            // migration is now one-shot behind `user_version`, so a faithful
-            // pre-migration fixture has to look pre-migration on BOTH counts —
-            // a database carrying unqualified keys while stamped as migrated
-            // cannot occur, because the stamp is only written after the
-            // migration has run. The sibling assertion-re-key test does the
-            // same thing for the same reason.
+            // Rewind the schema stamp to 3, not 0 — this is the real upgrade
+            // state, and it is reachable in the wild. The old code let
+            // `rekey_assertions_by_tenant` stamp v3 and then ran
+            // `migrate_keys_to_tenant_qualified` unguarded LATER in
+            // `init_schema`, so any process that died in between left a v3
+            // database carrying unqualified EMMO keys on disk.
+            //
+            // Rewinding to 0 would still enter the migration and pass, but it
+            // would stop covering the v3 -> v4 path entirely: an
+            // implementation that left the stamp constant at 3, or skipped the
+            // key migration for a v3 database, would go undetected. At 3 this
+            // test fails for both.
             store
                 .conn
-                .execute("PRAGMA user_version = 0", ())
+                .execute("PRAGMA user_version = 3", ())
                 .await
                 .unwrap();
             assert_eq!(
