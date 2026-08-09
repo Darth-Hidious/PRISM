@@ -764,6 +764,27 @@ mod tests {
         }
     }
 
+    /// `--sources ntrs` must select the NTRS adapter: the CLI's name
+    /// catalogue (SourceId), the default selection, and the registry that
+    /// actually serves fetches all have to agree, or the name parses while
+    /// the engine reports an unknown source.
+    #[test]
+    fn ntrs_is_selectable_and_backed_by_a_registered_adapter() {
+        let ids = parse_sources(&Some("ntrs".to_string())).expect("'ntrs' must parse");
+        assert_eq!(ids, ["ntrs"]);
+        let default = parse_sources(&None).expect("default set must parse");
+        assert!(
+            default.contains(&"ntrs".to_string()),
+            "ntrs missing from the default selection: {default:?}"
+        );
+        assert!(
+            prism_retrieval::SourceRegistry::builtin()
+                .get("ntrs")
+                .is_some(),
+            "the catalogue names 'ntrs' but no adapter is registered under it"
+        );
+    }
+
     /// The probe must refuse a remote host BEFORE resolving it. `papers` is an
     /// agent tool with `requires_approval: false` whose flag allow-list
     /// includes `--llm-url`, and the spawned CLI inherits `PRISM_OFFLINE`

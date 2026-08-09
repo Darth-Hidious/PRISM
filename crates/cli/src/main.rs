@@ -6056,7 +6056,12 @@ enum IngestBackend {
 
 /// Text-document formats the platform's holistic ingest accepts — that
 /// backend's own surface, NOT a shadow of the connector registry.
-const PLATFORM_TEXT_EXTENSIONS: &[&str] = &["pdf", "json", "jsonl", "owl", "cif", "txt", "md"];
+// `owl` and `cif` were advertised here for a while, but no OWL or CIF parser
+// exists anywhere in this workspace — both were read as raw text and fed to
+// the materials-fact prompt, i.e. the product claimed a capability it did not
+// have. They are refused (with this list in the error) until a real parser
+// lands.
+const PLATFORM_TEXT_EXTENSIONS: &[&str] = &["pdf", "json", "jsonl", "txt", "md"];
 
 fn ingest_backend(path: &Path) -> Option<IngestBackend> {
     // Tabular formats are whatever the connector registry claims — the one
@@ -6601,23 +6606,39 @@ async fn run_local_text_ingest_file(
         );
     }
 
-    // Local PDF parsing isn't wired yet. Be honest and skip — never quietly
-    // fall back to the cloud against the user's locality choice.
-    if ingest_format(path) == "pdf" {
-        let reason = "local PDF parsing isn't available yet — ingest text/markdown/json locally, or set locality = \"cloud\" for PDFs";
-        eprintln!("  Skipping {}: {reason}", path.display());
-        return Ok(serde_json::json!({
-            "backend": "local_text",
-            "path": path.display().to_string(),
-            "format": "pdf",
-            "skipped": true,
-            "reason": reason,
-        }));
-    }
-
-    // Non-PDF text formats just read the file — the runtime sidecar is
-    // never contacted (the PDF branch is excluded above).
-    let (text, _pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
+    // PDFs are parsed ON DEVICE, with the same extractor `prism papers
+    // full-text` uses (`prism_retrieval::fulltext::parse_pdf`, pdf-extract
+    // underneath): bytes in, text out, no runtime sidecar and no network.
+    // The parse runs under `spawn_blocking` because PDF extraction is
+    // CPU-bound (it would stall the async runtime) and can PANIC on
+    // malformed input — `spawn_blocking` catches the unwind as a JoinError,
+    // which is reported as an honest per-file error instead of tearing down
+    // the whole ingest run.
+    let (text, _pages, warning) = if ingest_format(path) == "pdf" {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read PDF {}", path.display()))?;
+        let parsed =
+            tokio::task::spawn_blocking(move || prism_retrieval::fulltext::parse_pdf(&bytes)).await;
+        let fulltext = match parsed {
+            Ok(result) => {
+                result.with_context(|| format!("parsing PDF {} locally", path.display()))?
+            }
+            Err(join_error) if join_error.is_panic() => bail!(
+                "PDF text extraction panicked on {} — the file is likely malformed or \
+                 unsupported; nothing was extracted and nothing was written",
+                path.display()
+            ),
+            Err(join_error) => {
+                return Err(anyhow!(join_error))
+                    .with_context(|| format!("PDF parse task failed for {}", path.display()));
+            }
+        };
+        (fulltext.plain_text, None, None)
+    } else {
+        // Non-PDF text formats just read the file. Either way the runtime
+        // sidecar is never contacted on the local path.
+        extract_platform_ingest_text(path, runtime_url).await?
+    };
     let chars = text.chars().count();
     if text.trim().is_empty() {
         bail!("No ingestable text found in {}", path.display());
@@ -13526,6 +13547,11 @@ mod tests {
             Some(IngestBackend::LocalTabular)
         );
         assert_eq!(ingest_backend(Path::new("/tmp/image.png")), None);
+        // No OWL or CIF parser exists anywhere in this workspace; while these
+        // were advertised they were read as raw text and fed to a materials-
+        // fact prompt. Refusing is the honest answer until a parser lands.
+        assert_eq!(ingest_backend(Path::new("/tmp/onto.owl")), None);
+        assert_eq!(ingest_backend(Path::new("/tmp/structure.cif")), None);
     }
 
     /// Everything the unsupported-format message advertises must actually
@@ -15207,5 +15233,111 @@ data:\n\
         let msg = format!("{err:#}");
         assert!(msg.contains("EMMO"), "{msg}");
         assert!(msg.contains("chem"), "{msg}");
+    }
+
+    /// Build a minimal one-page PDF whose content stream draws `text` —
+    /// enough for pdf-extract to find extractable text. Cross-reference
+    /// offsets are computed, not hardcoded, so the fixture is valid byte-
+    /// for-byte without a binary blob in the repo.
+    fn minimal_pdf(text: &str) -> Vec<u8> {
+        let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{object}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_pos = out.len();
+        out.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+        );
+        for offset in offsets {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// The local text path parses PDFs ON DEVICE: production dispatch
+    /// (`run_local_text_ingest_file`, the same function `handle_ingest`
+    /// calls) must extract text from a real PDF and report its size — never
+    /// skip, never contact a runtime. The TEST-NET-1 runtime URL proves the
+    /// second half: any contact would fail the test.
+    ///
+    /// Mutation check: restoring the old "local PDF parsing isn't available
+    /// yet" refusal branch makes this die on `skipped`.
+    #[tokio::test]
+    async fn local_text_ingest_parses_a_pdf_on_device() {
+        let dir = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = dir.path();
+        let pdf = root.join("paper.pdf");
+        std::fs::write(&pdf, minimal_pdf("Ti-6Al-4V tensile strength 1100 MPa")).unwrap();
+
+        let out = run_local_text_ingest_file(
+            &pdf,
+            root,
+            None,
+            None,
+            None,
+            "http://192.0.2.1:1",
+            true, // schema-only: text extraction without an LLM or a store
+            None,
+        )
+        .await
+        .expect("a parseable PDF must ingest locally");
+        assert_eq!(out["backend"], "local_text");
+        assert_eq!(out["format"], "pdf");
+        assert!(
+            out.get("skipped").is_none(),
+            "the local PDF branch must parse, not skip: {out}"
+        );
+        let chars = out["chars"].as_u64().expect("chars must be reported");
+        assert!(chars > 0, "no text extracted: {out}");
+    }
+
+    /// A malformed PDF is an honest per-file error naming the file — not a
+    /// skip, not a silent empty success, and not a crash of the whole run.
+    #[tokio::test]
+    async fn local_text_ingest_reports_an_unparseable_pdf_honestly() {
+        let dir = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = dir.path();
+        let pdf = root.join("broken.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4 garbage, not really a pdf").unwrap();
+
+        let err = run_local_text_ingest_file(
+            &pdf,
+            root,
+            None,
+            None,
+            None,
+            "http://192.0.2.1:1",
+            true,
+            None,
+        )
+        .await
+        .expect_err("a malformed PDF must be an error, not a silent skip");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("broken.pdf"),
+            "error must name the file: {msg}"
+        );
     }
 }

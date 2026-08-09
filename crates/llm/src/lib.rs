@@ -922,7 +922,54 @@ impl LlmClient {
         });
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
+
+        // Self-heal for thinking-mode budget burn (measured live with Gemma 4
+        // 12B on llama-server: the model spent its entire max_tokens on
+        // `reasoning_content` and produced no JSON, so EVERY extraction
+        // failed). Retry ONCE with thinking disabled via
+        // `chat_template_kwargs` — llama-server honors it, Ollama ignores it
+        // (both verified against live servers), and the field is only ever
+        // sent to a backend that has already exhibited thinking-mode burn,
+        // so providers that reject unknown parameters never see it. If the
+        // retry does not produce usable content either, the ORIGINAL
+        // diagnosis below is what the caller gets.
+        if Self::burned_budget_on_reasoning(&data["choices"][0]) {
+            let mut retry_body = body.clone();
+            retry_body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+            match self.post(&url, &retry_body).await {
+                Ok(retry_resp) => {
+                    if let Ok(retry_data) = retry_resp.json::<serde_json::Value>().await
+                        && let Ok(text) = Self::extract_json_content(&retry_data["choices"][0])
+                    {
+                        return Ok(text);
+                    }
+                    tracing::warn!(
+                        "thinking-disabled retry still produced no JSON; reporting the \
+                         original thinking-mode diagnosis"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "thinking-disabled retry failed ({e:#}); reporting the original \
+                         thinking-mode diagnosis"
+                    );
+                }
+            }
+        }
         Self::extract_json_content(&data["choices"][0])
+    }
+
+    /// True when a chat choice shows the thinking-mode failure signature:
+    /// no visible content, `finish_reason: "length"`, and a non-empty
+    /// `reasoning_content` — i.e. the whole output budget went to reasoning.
+    fn burned_budget_on_reasoning(choice: &serde_json::Value) -> bool {
+        let msg = &choice["message"];
+        msg["content"].as_str().unwrap_or_default().is_empty()
+            && choice["finish_reason"].as_str() == Some("length")
+            && !msg["reasoning_content"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
     }
 
     /// Strip a Markdown code fence (```json … ``` or ``` … ```) from around
@@ -3108,6 +3155,96 @@ mod tests {
         });
         let err = LlmClient::extract_json_content(&choice).unwrap_err();
         assert!(err.to_string().contains("finish_reason=stop"));
+    }
+
+    /// Thinking-mode budget burn self-heals through the PRODUCTION
+    /// `generate_json` dispatch: the first wire response burns the whole
+    /// budget on `reasoning_content`, and the client must retry the same
+    /// endpoint ONCE with `chat_template_kwargs.enable_thinking = false`
+    /// (the mock for the retry only answers a request carrying that field).
+    /// Removing the retry, or breaking the burn predicate, fails this test
+    /// with the thinking-mode diagnosis.
+    #[tokio::test]
+    async fn generate_json_retries_thinking_burn_with_thinking_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let burn = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning_content": "thinking… ".repeat(50)}
+            }]
+        });
+        // Created FIRST so the retry mock (created second) is matched first;
+        // the initial request lacks chat_template_kwargs and falls through
+        // to this one.
+        let first = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(burn.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let retry = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "chat_template_kwargs": {"enable_thinking": false}
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "{\"facts\": []}"}
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: server.url(),
+            model: "test-model".to_string(),
+            ..LlmConfig::default()
+        });
+        let out = client
+            .generate_json("extract facts")
+            .await
+            .expect("the thinking-disabled retry must recover the extraction");
+        assert_eq!(out, "{\"facts\": []}");
+        first.assert_async().await;
+        retry.assert_async().await;
+    }
+
+    /// When the retry ALSO burns its budget on reasoning, the caller gets
+    /// the original actionable diagnosis — not a success, not a generic
+    /// empty-content error.
+    #[tokio::test]
+    async fn generate_json_reports_the_original_diagnosis_when_the_retry_fails_too() {
+        let mut server = mockito::Server::new_async().await;
+        let burn = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning_content": "thinking… ".repeat(50)}
+            }]
+        });
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(burn.to_string())
+            .expect(2) // the original AND the failed retry
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: server.url(),
+            model: "test-model".to_string(),
+            ..LlmConfig::default()
+        });
+        let err = client.generate_json("extract facts").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("thinking"), "message was: {msg}");
+        assert!(msg.contains("max_output_tokens"), "message was: {msg}");
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod chemrxiv;
 pub mod crossref;
 pub mod doaj;
 pub mod europepmc;
+pub mod ntrs;
 pub mod openalex;
 pub mod pubmed;
 pub mod semantic_scholar;
@@ -44,6 +45,9 @@ pub enum SourceId {
     Preprints,
     Chemrxiv,
     Doaj,
+    /// NASA Technical Reports Server — US government technical reports,
+    /// generally public domain.
+    Ntrs,
 }
 
 impl SourceId {
@@ -57,6 +61,7 @@ impl SourceId {
             SourceId::Preprints => "preprints_europepmc",
             SourceId::Chemrxiv => "chemrxiv",
             SourceId::Doaj => "doaj",
+            SourceId::Ntrs => "ntrs",
         }
     }
 
@@ -80,6 +85,8 @@ impl SourceId {
             SourceId::Preprints => Duration::from_millis(500),
             SourceId::Chemrxiv => Duration::from_millis(500),
             SourceId::Doaj => Duration::from_millis(500),
+            // NTRS publishes no rate guidance; match the conservative pools.
+            SourceId::Ntrs => Duration::from_millis(500),
         }
     }
 }
@@ -94,6 +101,7 @@ pub fn all_sources() -> Vec<SourceId> {
         SourceId::Preprints,
         SourceId::Chemrxiv,
         SourceId::Doaj,
+        SourceId::Ntrs,
     ]
 }
 
