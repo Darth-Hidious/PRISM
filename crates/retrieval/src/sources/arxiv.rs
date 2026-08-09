@@ -4,11 +4,12 @@
 use anyhow::Result;
 use quick_xml::events::Event;
 
-use super::{FetchCtx, SourceId, normalize_doi, url_encode};
+use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::{FulltextFormat, Paper};
 
 const DEFAULT_BASE: &str = "http://export.arxiv.org/api/query";
 
+pub const ID: &str = "arxiv";
 pub const INITIAL_CURSOR: &str = "0";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -24,13 +25,13 @@ pub async fn fetch_page(
     cursor: &str,
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let start: usize = cursor.parse().unwrap_or(0);
-    let base = ctx.base(SourceId::Arxiv, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
         "{base}?search_query=all:{q}&start={start}&max_results={n}",
         q = url_encode(query),
         n = ctx.limit.min(100)
     );
-    let (body, _cached) = ctx.fetch_cached(SourceId::Arxiv, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let papers = parse(&body)?;
     let next = (papers.len() >= ctx.limit.min(100)).then(|| (start + papers.len()).to_string());
     Ok((papers, next))
@@ -164,7 +165,7 @@ fn finalize(d: EntryDraft) -> Option<Paper> {
     };
     let has_pdf = d.pdf_url.is_some();
     Some(Paper {
-        source: SourceId::Arxiv.as_str().to_string(),
+        source: ID.to_string(),
         source_id: arxiv_id,
         title: collapse_whitespace(&d.title),
         authors: d.authors,

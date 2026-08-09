@@ -2024,6 +2024,10 @@ impl<'a> LfmArgumentParser<'a> {
                 // even though clippy suggests it: `pop()` mutates, and a guard
                 // that fails would fall through to `_ => {}` having already
                 // consumed the stack entry. Same result today, a trap later.
+                //
+                // The merged-away branch version WAS that guard form, for
+                // `b']'` specifically. Resolved toward this one deliberately:
+                // the comment above is the reason it exists.
                 b'}' | b']' => {
                     let opener = if byte == b'}' { b'{' } else { b'[' };
                     if nesting.pop() != Some(opener) {

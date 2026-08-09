@@ -4,11 +4,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, url_encode};
+use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::{FulltextFormat, Paper};
 
 const DEFAULT_BASE: &str = "https://api.openalex.org";
 
+pub const ID: &str = "openalex";
 pub const INITIAL_CURSOR: &str = "1";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -25,7 +26,7 @@ pub async fn fetch_page(
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let page: usize = cursor.parse().unwrap_or(1);
     let per_page = ctx.limit.min(200);
-    let base = ctx.base(SourceId::Openalex, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let mut url = format!(
         "{base}/works?search={q}&per-page={per_page}&page={page}",
         q = url_encode(query)
@@ -33,7 +34,7 @@ pub async fn fetch_page(
     if let Some(mailto) = &ctx.mailto {
         url.push_str(&format!("&mailto={}", url_encode(mailto)));
     }
-    let (body, _cached) = ctx.fetch_cached(SourceId::Openalex, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let papers = parse(&body)?;
     let next = (papers.len() >= per_page).then(|| (page + 1).to_string());
     Ok((papers, next))
@@ -130,7 +131,7 @@ fn parse_work(work: &Value) -> Option<Paper> {
     let url = landing.unwrap_or_else(|| format!("https://api.openalex.org/works/{openalex_id}"));
 
     Some(Paper {
-        source: SourceId::Openalex.as_str().to_string(),
+        source: ID.to_string(),
         source_id: openalex_id,
         title,
         authors,

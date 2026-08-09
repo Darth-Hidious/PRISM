@@ -13,7 +13,6 @@ use reqwest::header::HeaderMap;
 
 use crate::cache::DiskCache;
 use crate::http::{get_with_retry, identification_headers};
-use crate::model::Paper;
 use crate::ratelimit::RateLimiter;
 
 pub mod arxiv;
@@ -24,6 +23,13 @@ pub mod europepmc;
 pub mod openalex;
 pub mod pubmed;
 pub mod semantic_scholar;
+
+/// The plugin surface: a [`source::Source`] trait plus a [`source::SourceRegistry`].
+/// The engine and sweep dispatch exclusively through the registry; there is
+/// no `match` over [`SourceId`] on any fetch path.
+pub mod source;
+
+pub use source::{Source, SourceRegistry};
 
 /// The sources this engine federates across.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -92,53 +98,69 @@ pub fn all_sources() -> Vec<SourceId> {
 }
 
 /// Everything one fetch needs. Base URLs are overridable per source (tests,
-/// mirrors).
+/// mirrors). Maps are keyed by the source's id string (e.g. `"arxiv"`) — the
+/// same key the registry, the disk cache and `source_status` use — so a
+/// source needs no [`SourceId`] variant to participate.
 pub struct FetchCtx {
     pub client: reqwest::Client,
     pub headers: HeaderMap,
     pub mailto: Option<String>,
     pub limit: usize,
-    pub base_overrides: HashMap<SourceId, String>,
-    pub limiters: HashMap<SourceId, Arc<RateLimiter>>,
+    pub base_overrides: HashMap<String, String>,
+    pub limiters: HashMap<String, Arc<RateLimiter>>,
     pub cache: Option<DiskCache>,
     pub max_attempts: u32,
-    /// Which sources were served entirely from cache this round.
-    pub cache_hits: std::sync::Mutex<HashMap<SourceId, bool>>,
+    /// Which sources were served entirely from cache this round, keyed by id.
+    pub cache_hits: std::sync::Mutex<HashMap<String, bool>>,
+    /// Requests actually issued to the network this round.
+    pub network_fetches: std::sync::atomic::AtomicUsize,
+    /// Responses served from the disk cache this round.
+    pub cache_fetches: std::sync::atomic::AtomicUsize,
     /// Shared politeness limiter for full-text downloads across all hosts.
     pub fulltext_limiter: Arc<RateLimiter>,
 }
 
 impl FetchCtx {
-    pub fn limiter(&self, id: SourceId) -> Arc<RateLimiter> {
+    /// Polite limiter for `id`. Both engine paths guarantee an entry exists
+    /// before an adapter runs — `search` pre-populates one per selected
+    /// source, `run_sweep` inserts one when it resolves the adapter, each
+    /// derived from the adapter's `min_interval` — so the unlimited
+    /// fallback is unreachable through the engine. It remains only for
+    /// hand-built contexts (adapter unit tests).
+    pub fn limiter(&self, id: &str) -> Arc<RateLimiter> {
         self.limiters
-            .get(&id)
+            .get(id)
             .cloned()
-            .unwrap_or_else(|| Arc::new(RateLimiter::new(id.min_interval())))
+            .unwrap_or_else(|| Arc::new(RateLimiter::new(Duration::ZERO)))
     }
 
-    pub fn base(&self, id: SourceId, default: &str) -> String {
+    pub fn base(&self, id: &str, default: &str) -> String {
         self.base_overrides
-            .get(&id)
+            .get(id)
             .cloned()
             .unwrap_or_else(|| default.to_string())
     }
 
     /// GET with cache-first semantics: a fresh cache hit is parsed without
     /// touching the network. Returns (body, cache_hit).
-    pub async fn fetch_cached(&self, id: SourceId, url: &str) -> Result<(Vec<u8>, bool)> {
+    pub async fn fetch_cached(&self, id: &str, url: &str) -> Result<(Vec<u8>, bool)> {
         if let Some(cache) = &self.cache
-            && let Some(body) = cache.get(id.as_str(), url)
+            && let Some(body) = cache.get(id, url)
         {
             // A source counts as cache-hit only when ALL its requests this
             // round came from cache (PubMed makes two).
             let mut hits = self.cache_hits.lock().expect("cache_hits poisoned");
-            hits.entry(id).or_insert(true);
+            hits.entry(id.to_string()).or_insert(true);
+            self.cache_fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok((body, true));
         }
         {
             let mut hits = self.cache_hits.lock().expect("cache_hits poisoned");
-            hits.insert(id, false);
+            hits.insert(id.to_string(), false);
         }
+        self.network_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let limiter = self.limiter(id);
         let body = get_with_retry(
             &self.client,
@@ -150,9 +172,9 @@ impl FetchCtx {
         .await?
         .to_vec();
         if let Some(cache) = &self.cache
-            && let Err(e) = cache.put(id.as_str(), url, &body)
+            && let Err(e) = cache.put(id, url, &body)
         {
-            tracing::warn!("cache write failed for {}: {e}", id.as_str());
+            tracing::warn!("cache write failed for {id}: {e}");
         }
         Ok((body, false))
     }
@@ -161,54 +183,6 @@ impl FetchCtx {
 /// Build default identification headers for the engine.
 pub fn default_headers(user_agent: &str) -> Result<HeaderMap> {
     identification_headers(user_agent)
-}
-
-/// Dispatch one query to one source.
-pub async fn fetch_source(id: SourceId, ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
-    match id {
-        SourceId::Arxiv => arxiv::fetch(ctx, query).await,
-        SourceId::Openalex => openalex::fetch(ctx, query).await,
-        SourceId::Crossref => crossref::fetch(ctx, query).await,
-        SourceId::Pubmed => pubmed::fetch(ctx, query).await,
-        SourceId::SemanticScholar => semantic_scholar::fetch(ctx, query).await,
-        SourceId::Preprints => europepmc::fetch(ctx, query).await,
-        SourceId::Chemrxiv => chemrxiv::fetch(ctx, query).await,
-        SourceId::Doaj => doaj::fetch(ctx, query).await,
-    }
-}
-
-/// The cursor that starts a source's page chain.
-pub fn initial_cursor(id: SourceId) -> &'static str {
-    match id {
-        SourceId::Arxiv => arxiv::INITIAL_CURSOR,
-        SourceId::Openalex => openalex::INITIAL_CURSOR,
-        SourceId::Crossref => crossref::INITIAL_CURSOR,
-        SourceId::Pubmed => pubmed::INITIAL_CURSOR,
-        SourceId::SemanticScholar => semantic_scholar::INITIAL_CURSOR,
-        SourceId::Preprints => europepmc::INITIAL_CURSOR,
-        SourceId::Chemrxiv => chemrxiv::INITIAL_CURSOR,
-        SourceId::Doaj => doaj::INITIAL_CURSOR,
-    }
-}
-
-/// Fetch one page identified by a source-specific cursor. Returns the papers
-/// and the successor cursor, when the source says there may be more.
-pub async fn fetch_page(
-    id: SourceId,
-    ctx: &FetchCtx,
-    query: &str,
-    cursor: &str,
-) -> Result<(Vec<Paper>, Option<String>)> {
-    match id {
-        SourceId::Arxiv => arxiv::fetch_page(ctx, query, cursor).await,
-        SourceId::Openalex => openalex::fetch_page(ctx, query, cursor).await,
-        SourceId::Crossref => crossref::fetch_page(ctx, query, cursor).await,
-        SourceId::Pubmed => pubmed::fetch_page(ctx, query, cursor).await,
-        SourceId::SemanticScholar => semantic_scholar::fetch_page(ctx, query, cursor).await,
-        SourceId::Preprints => europepmc::fetch_page(ctx, query, cursor).await,
-        SourceId::Chemrxiv => chemrxiv::fetch_page(ctx, query, cursor).await,
-        SourceId::Doaj => doaj::fetch_page(ctx, query, cursor).await,
-    }
 }
 
 /// Percent-encode for query components (RFC 3986 unreserved set kept).

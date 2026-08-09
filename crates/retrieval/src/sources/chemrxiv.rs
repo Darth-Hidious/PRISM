@@ -3,11 +3,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{FetchCtx, SourceId, normalize_doi, url_encode};
+use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::Paper;
 
 const DEFAULT_BASE: &str = "https://chemrxiv.org/engage/chemrxiv/public-api/v1";
 
+pub const ID: &str = "chemrxiv";
 pub const INITIAL_CURSOR: &str = "0";
 
 pub async fn fetch(ctx: &FetchCtx, query: &str) -> Result<Vec<Paper>> {
@@ -23,12 +24,12 @@ pub async fn fetch_page(
 ) -> Result<(Vec<Paper>, Option<String>)> {
     let skip: usize = cursor.parse().unwrap_or(0);
     let limit = ctx.limit.min(100);
-    let base = ctx.base(SourceId::Chemrxiv, DEFAULT_BASE);
+    let base = ctx.base(ID, DEFAULT_BASE);
     let url = format!(
         "{base}/items?term={q}&limit={limit}&skip={skip}",
         q = url_encode(query)
     );
-    let (body, _cached) = ctx.fetch_cached(SourceId::Chemrxiv, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
     let papers = parse(&body)?;
     let next = (papers.len() >= limit).then(|| (skip + papers.len()).to_string());
     Ok((papers, next))
@@ -104,7 +105,7 @@ fn parse_item(item: &Value) -> Option<Paper> {
     }
 
     Some(Paper {
-        source: SourceId::Chemrxiv.as_str().to_string(),
+        source: ID.to_string(),
         source_id: item_id.clone(),
         title,
         authors,

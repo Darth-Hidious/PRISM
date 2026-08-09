@@ -189,6 +189,18 @@ impl ProvenanceStore {
         let mut journal_mode = conn.query("PRAGMA journal_mode=DELETE", ()).await?;
         while journal_mode.next().await?.is_some() {}
 
+        // Wait for a competing writer instead of failing the open.
+        //
+        // Nothing holds this store: the agent loop opens it once per turn and
+        // hooks open it per tool call in a spawned task, so two writers
+        // colliding is ordinary operation, not an edge case. With no busy
+        // timeout the loser errors immediately, and the callers that swallow
+        // that error drop the record — one at `agent_loop.rs` with no log at
+        // all. Five seconds is long enough to outlast any single write here
+        // and short enough that a genuinely stuck lock still surfaces.
+        let mut busy = conn.query("PRAGMA busy_timeout=5000", ()).await?;
+        while busy.next().await?.is_some() {}
+
         Self::init_schema(&conn).await?;
         Ok(Self { conn })
     }
