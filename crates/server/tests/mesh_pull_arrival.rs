@@ -26,6 +26,9 @@
 //! platform token fails the pull with a 401 — so the verification path is
 //! demonstrably consulted, not bypassed.
 
+/// Pre-main store isolation — every integration binary must declare this.
+mod common;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

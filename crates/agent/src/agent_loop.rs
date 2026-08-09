@@ -173,9 +173,7 @@ async fn load_session_memory() -> Option<String> {
         // unrelated writes, so injecting it would show foreign steps.
         return None;
     }
-    let db_path = dirs::home_dir()
-        .map(|h| h.join(".prism/provenance.db"))
-        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+    let db_path = crate::hooks::provenance_db_path();
     match prism_provenance::ProvenanceStore::open(&db_path).await {
         Ok(store) => match store.query_by_session(&session_id).await {
             Ok(records) => session_memory_block(&records),
@@ -1270,9 +1268,7 @@ pub async fn run_turn(
             }));
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let db_path = dirs::home_dir()
-                        .map(|h| h.join(".prism/provenance.db"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                    let db_path = crate::hooks::provenance_db_path();
                     if let Ok(store) = prism_provenance::ProvenanceStore::open(&db_path).await {
                         match store.record(&record).await {
                             // Semantic memory: embed the turn for `recall`.
@@ -1700,9 +1696,7 @@ pub async fn run_turn(
                         sub_result.map(|value| serde_json::json!({ "result": value }))
                     } else {
                         // Open the same Turso store the provenance hook writes to.
-                        let db_path = dirs::home_dir()
-                            .map(|h| h.join(".prism/provenance.db"))
-                            .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+                        let db_path = crate::hooks::provenance_db_path();
                         let store = prism_provenance::ProvenanceStore::open(&db_path).await.ok();
                         // Real session id so `recall` scopes to THIS session
                         // instead of the pre-fix literal "session" bucket.

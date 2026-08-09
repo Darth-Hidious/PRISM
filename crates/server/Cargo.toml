@@ -41,3 +41,9 @@ ed25519-dalek = { workspace = true }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 prism-python-bridge = { path = "../python-bridge" }
+# Arm prism-agent's live-store guard for this crate's test runs and expose
+# agent's test-support (pre-main store isolation). The chat-handler tests
+# drive the REAL agent loop, which otherwise opens the user's live
+# ~/.prism/provenance.db (caught by the guard under `cargo test --workspace`).
+prism-agent = { path = "../agent", features = ["test-guard"] }
+ctor = "1.0.12"

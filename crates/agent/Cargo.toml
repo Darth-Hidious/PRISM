@@ -9,6 +9,12 @@ authors.workspace = true
 default = []
 local-inference = ["prism-llm/local-inference"]
 local-inference-cuda = ["prism-llm/local-inference-cuda"]
+# Test-only guard: resolving the DEFAULT provenance store path
+# (~/.prism/provenance.db — the user's live database) aborts the process.
+# Enabled for every test target of this crate through the self
+# dev-dependency below; dev-dependencies never apply to production builds,
+# so production resolution is unchanged. See hooks::provenance_db_path.
+test-guard = []
 
 [dependencies]
 prism-ingest = { path = "../ingest" }
@@ -52,3 +58,9 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 prism-ingest = { path = "../ingest" }
 prism-python-bridge = { path = "../python-bridge" }
+# Self dev-dependency: turns `test-guard` on for every test target of this
+# crate (lib unit tests and tests/*) without affecting downstream builds.
+# Removing this silently disarms the live-store guard —
+# tests/store_isolation.rs trips if that happens.
+prism-agent = { path = ".", features = ["test-guard"] }
+ctor = "1.0.12"

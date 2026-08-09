@@ -507,9 +507,7 @@ impl ChatService {
                     "outcome:error".to_string()
                 },
             ];
-            let db_path = dirs::home_dir()
-                .map(|h| h.join(".prism/provenance.db"))
-                .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"));
+            let db_path = crate::hooks::provenance_db_path();
             match prism_provenance::ProvenanceStore::open(&db_path).await {
                 Ok(store) => {
                     if let Err(e) = store.record(&record).await {

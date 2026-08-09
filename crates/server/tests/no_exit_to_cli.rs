@@ -12,6 +12,9 @@
 //! in the separate `prism-app` repo, and an adversarial reviewer caught three
 //! live user-facing violations that claim had implied were gone.
 
+/// Pre-main store isolation — every integration binary must declare this.
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

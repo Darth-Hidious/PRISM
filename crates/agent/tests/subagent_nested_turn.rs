@@ -18,6 +18,9 @@
 //!
 //! Requires `python3` on PATH; tests skip (with a note) when absent.
 
+/// Pre-main store isolation — every integration binary must declare this.
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use prism_agent::agent_loop;
