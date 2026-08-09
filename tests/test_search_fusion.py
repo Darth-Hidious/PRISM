@@ -310,3 +310,178 @@ def test_fusion_empty_input():
     from app.tools.search_engine.fusion import fuse_materials
 
     assert fuse_materials([]) == []
+
+
+# ---------------------------------------------------------------------------
+# Identity-plugin registration and deliberate replacement, proven through
+# REAL fusion -- not by calling the plugin directly. A hardcoded
+# "if crystal / elif polymer" fusion_key would pass every earlier test in
+# this file; it cannot pass these.
+# ---------------------------------------------------------------------------
+
+
+class _SpinSystemIdentityPlugin:
+    """Test-only identity plugin for a domain the codebase has never heard
+    of. Module-level SINGLETON on purpose: re-registering the same object is
+    the documented idempotent no-op, so re-running the test in one process
+    (pytest --lf, repeat plugins) cannot trip the duplicate-domain refusal."""
+
+    domain = "spin_system_test"
+
+    def fusion_key(self, identity):
+        import json as _json
+
+        if identity.representation != "hamiltonian_tag":
+            raise ValueError(
+                "spin_system identity representation must be 'hamiltonian_tag'"
+            )
+        tag = (identity.attributes.get("hamiltonian_tag") or "").strip()
+        if not tag:
+            raise ValueError(
+                "spin_system identity requires a non-empty hamiltonian_tag"
+            )
+        return _json.dumps([identity.domain, tag])
+
+
+_SPIN_SYSTEM_PLUGIN = _SpinSystemIdentityPlugin()
+
+
+def test_registered_novel_domain_drives_real_fusion():
+    """register_identity_plugin for a domain the codebase has never heard of,
+    then fuse_materials -- production fusion -- must group by OUR plugin's
+    key: same-anchor records merge, a different anchor stays separate."""
+    from app.tools.search_engine.fusion import fuse_materials
+    from app.tools.search_engine.identity import register_identity_plugin
+
+    # Registered once for the process; the domain is test-unique and inert
+    # for every other test. register_identity_plugin is the SUPPORTED way in.
+    register_identity_plugin(_SPIN_SYSTEM_PLUGIN)
+
+    def spin(pid, tag, coupling):
+        return Material(
+            id=f"{pid}-1",
+            formula="",
+            elements=[],
+            n_elements=0,
+            sources=[pid],
+            identity=MaterialIdentity(
+                domain="spin_system_test",
+                representation="hamiltonian_tag",
+                attributes={"hamiltonian_tag": tag},
+            ),
+            extra_properties={
+                "exchange_coupling": PropertyValue(
+                    value=coupling, source=f"lab:{pid}", unit="meV"
+                )
+            },
+        )
+
+    fused = fuse_materials([
+        spin("lab_a", "kagome-J1J2", 1.0),
+        spin("lab_b", "kagome-J1J2", 1.2),
+        spin("lab_c", "pyrochlore-J1", 9.9),
+    ])
+
+    assert len(fused) == 2, "two anchors -> two materials"
+    merged = [m for m in fused if len(m.sources) > 1]
+    assert len(merged) == 1, "same-anchor records must merge under the novel plugin"
+    assert set(merged[0].sources) == {"lab_a", "lab_b"}
+    assert merged[0].fusion_exclusion is None
+    lone = [m for m in fused if len(m.sources) == 1]
+    assert lone[0].sources == ["lab_c"]
+
+
+def test_replace_identity_plugin_swaps_crystal_through_real_fusion():
+    """Replacement, proven through production fusion: the built-in crystal
+    plugin ISOLATES records lacking a space group; after a deliberate
+    replace_identity_plugin with a formula-only implementation the same
+    records MERGE. Only a fusion path consulting the live plugin table can
+    change behaviour between the two calls."""
+    import json as _json
+
+    from app.tools.search_engine.fusion import fuse_materials
+    from app.tools.search_engine.identity import (
+        CrystalIdentityPlugin,
+        replace_identity_plugin,
+    )
+
+    def crystal_no_symmetry(pid, band_gap):
+        return Material(
+            id=f"{pid}-1",
+            formula="Fe2O3",
+            elements=["Fe", "O"],
+            n_elements=2,
+            sources=[pid],
+            identity=MaterialIdentity(
+                domain="crystal",
+                representation="formula_space_group",
+                attributes={"formula": "Fe2O3"},  # no space_group supplied
+            ),
+            band_gap=PropertyValue(value=band_gap, source=f"optimade:{pid}", unit="eV"),
+        )
+
+    records = [crystal_no_symmetry("mp", 2.0), crystal_no_symmetry("aflow", 2.2)]
+
+    # Baseline: the built-in refuses to pool polymorph-ambiguous records.
+    isolated = fuse_materials(records)
+    assert len(isolated) == 2
+    assert all(m.fusion_exclusion for m in isolated)
+
+    class FormulaOnlyCrystalPlugin:
+        domain = "crystal"
+
+        def fusion_key(self, identity):
+            formula = "".join((identity.attributes.get("formula") or "").split())
+            if not formula:
+                raise ValueError("crystal identity requires a non-empty formula")
+            return _json.dumps(["crystal-formula-only", formula])
+
+    mine = FormulaOnlyCrystalPlugin()
+    displaced = replace_identity_plugin(mine)
+    try:
+        assert isinstance(displaced, CrystalIdentityPlugin), (
+            "we displaced the genuine built-in, not test residue"
+        )
+        fused = fuse_materials(records)
+        assert len(fused) == 1, "the replacement's key must now group these"
+        assert set(fused[0].sources) == {"mp", "aflow"}
+        assert fused[0].fusion_exclusion is None
+    finally:
+        # Round-trip restore -- replace returns the displaced plugin for
+        # exactly this purpose.
+        assert replace_identity_plugin(displaced) is mine
+
+
+def test_identity_plugin_two_call_contract_is_strict_both_ways():
+    """register refuses a taken domain (accidental collision is loud) and
+    names the deliberate path; replace refuses a free domain (a typo'd
+    domain cannot silently ADD a plugin). Same-object re-registration is an
+    idempotent no-op, mirroring provider factories."""
+    from app.tools.search_engine.identity import (
+        _IDENTITY_PLUGINS,
+        register_identity_plugin,
+        replace_identity_plugin,
+    )
+
+    class TakenDomainPlugin:
+        domain = "crystal"
+
+        def fusion_key(self, identity):
+            return "x"
+
+    with pytest.raises(ValueError, match="replace_identity_plugin"):
+        register_identity_plugin(TakenDomainPlugin())
+
+    class FreeDomainPlugin:
+        domain = "never_registered_domain"
+
+        def fusion_key(self, identity):
+            return "x"
+
+    with pytest.raises(ValueError, match="no identity plugin registered"):
+        replace_identity_plugin(FreeDomainPlugin())
+
+    # Same object, same domain: no-op, not a refusal (module re-imports).
+    crystal = _IDENTITY_PLUGINS["crystal"]
+    register_identity_plugin(crystal)
+    assert _IDENTITY_PLUGINS["crystal"] is crystal

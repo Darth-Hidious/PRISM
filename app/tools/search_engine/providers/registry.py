@@ -43,23 +43,62 @@ def register_provider_factory(api_type: str, factory: ProviderFactory) -> None:
     that ``importlib.reload``, test re-imports, and double-loading a module
     under two names all work. Registering a DIFFERENT factory for a taken
     api_type raises, because two factories for one api_type would mean one
-    of them silently wins.
+    of them silently wins. Taking over a built-in (or any taken key) is a
+    supported, DELIBERATE act with its own call:
+    ``replace_provider_factory``.
     """
     if not isinstance(api_type, str) or not api_type.strip():
         raise ValueError("provider factory must be registered under a non-empty api_type")
     if not callable(factory):
         raise ValueError("provider factory must be callable: (ProviderEndpoint) -> Provider")
-    # Store the TRIMMED key: endpoints match on ep.api_type, which is never
-    # whitespace-padded, so an untrimmed key would register a factory no
-    # endpoint could ever reach.
+    # Store the TRIMMED key: ProviderEndpoint normalises api_type the same
+    # way (a field validator strips it), so both sides of the dispatch meet
+    # on the trimmed value and neither a padded key nor a padded config
+    # entry can silently miss the other.
     key = api_type.strip()
     with _REGISTRY_LOCK:  # check-then-set must be atomic across threads
         existing = _PROVIDER_FACTORIES.get(key)
         if existing is not None:
             if existing is factory:
                 return  # idempotent: same factory, same key
-            raise ValueError(f"provider factory already registered for api_type {key!r}")
+            raise ValueError(
+                f"provider factory already registered for api_type {key!r}; "
+                "use replace_provider_factory to swap it deliberately"
+            )
         _PROVIDER_FACTORIES[key] = factory
+
+
+def replace_provider_factory(api_type: str, factory: ProviderFactory) -> ProviderFactory:
+    """Deliberately swap the factory for an ALREADY-registered ``api_type``.
+
+    The two-call contract, shared by every adapter plane: ``register``
+    refuses a taken key, so an accidental collision fails loudly instead of
+    one factory silently winning; ``replace`` refuses a FREE key, so a
+    typo'd api_type cannot silently ADD a second adapter while the built-in
+    you meant to displace keeps running. This is how an operator swaps out
+    a built-in ("optimade", "mp_native") for their own implementation.
+
+    Returns the displaced factory -- hand it back to this function to
+    restore the original -- and logs what was displaced.
+    """
+    if not isinstance(api_type, str) or not api_type.strip():
+        raise ValueError("provider factory must be registered under a non-empty api_type")
+    if not callable(factory):
+        raise ValueError("provider factory must be callable: (ProviderEndpoint) -> Provider")
+    key = api_type.strip()
+    with _REGISTRY_LOCK:  # check-then-set must be atomic across threads
+        displaced = _PROVIDER_FACTORIES.get(key)
+        if displaced is None:
+            raise ValueError(
+                f"no provider factory registered for api_type {key!r} to replace; "
+                "use register_provider_factory to add a new one"
+            )
+        _PROVIDER_FACTORIES[key] = factory
+    logger.info(
+        "provider factory for api_type %r replaced: %r displaced by %r",
+        key, displaced, factory,
+    )
+    return displaced
 
 
 def unregister_provider_factory(api_type: str) -> bool:

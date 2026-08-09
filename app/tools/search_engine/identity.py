@@ -8,9 +8,20 @@ crystal-specific key.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from typing import Protocol
 
 from app.tools.search_engine.result import MaterialIdentity
+
+logger = logging.getLogger(__name__)
+
+# Guards the check-then-set in register/replace: without it two threads
+# racing different plugins for one domain could both pass the check and one
+# would silently win -- the exact failure the refusal exists to prevent.
+# (Reads in fusion_key stay lock-free: a dict read is atomic under the GIL,
+# same contract as the provider-factory table.)
+_PLUGINS_LOCK = threading.Lock()
 
 
 class IdentityNotFusable(Exception):
@@ -124,21 +135,66 @@ _IDENTITY_PLUGINS: dict[str, IdentityPlugin] = {
 }
 
 
+def _validated_domain(plugin: IdentityPlugin) -> str:
+    domain = getattr(plugin, "domain", "")
+    if not isinstance(domain, str) or not domain.strip():
+        raise ValueError("identity plugin must declare a non-empty domain")
+    if not callable(getattr(plugin, "fusion_key", None)):
+        raise ValueError("identity plugin must define fusion_key(identity)")
+    return domain
+
+
 def register_identity_plugin(plugin: IdentityPlugin) -> None:
     """Register a domain-owned identity plugin for an explicitly named domain.
 
     Registration is deliberately explicit: a material labelled with an
     unregistered domain raises from ``fusion_key`` instead of falling back to a
     crystal formula key.
+
+    Re-registering the SAME plugin object is a no-op (module re-imports).
+    Registering a DIFFERENT plugin for a taken domain raises, because two
+    plugins for one domain would mean one silently wins; taking over a
+    domain is a deliberate act with its own call:
+    ``replace_identity_plugin``.
     """
-    domain = getattr(plugin, "domain", "")
-    if not isinstance(domain, str) or not domain.strip():
-        raise ValueError("identity plugin must declare a non-empty domain")
-    if not callable(getattr(plugin, "fusion_key", None)):
-        raise ValueError("identity plugin must define fusion_key(identity)")
-    if domain in _IDENTITY_PLUGINS:
-        raise ValueError(f"identity plugin already registered for domain {domain!r}")
-    _IDENTITY_PLUGINS[domain] = plugin
+    domain = _validated_domain(plugin)
+    with _PLUGINS_LOCK:  # check-then-set must be atomic across threads
+        existing = _IDENTITY_PLUGINS.get(domain)
+        if existing is not None:
+            if existing is plugin:
+                return  # idempotent: same plugin, same domain
+            raise ValueError(
+                f"identity plugin already registered for domain {domain!r}; "
+                "use replace_identity_plugin to swap it deliberately"
+            )
+        _IDENTITY_PLUGINS[domain] = plugin
+
+
+def replace_identity_plugin(plugin: IdentityPlugin) -> IdentityPlugin:
+    """Deliberately swap the plugin for an ALREADY-registered domain.
+
+    The two-call contract, shared by every adapter plane: ``register``
+    refuses a taken domain (an accidental collision fails loudly),
+    ``replace`` refuses a FREE domain (a typo'd domain cannot silently ADD a
+    plugin while the one you meant to displace keeps running).
+
+    Returns the displaced plugin -- hand it back to this function to restore
+    the original -- and logs what was displaced.
+    """
+    domain = _validated_domain(plugin)
+    with _PLUGINS_LOCK:  # check-then-set must be atomic across threads
+        displaced = _IDENTITY_PLUGINS.get(domain)
+        if displaced is None:
+            raise ValueError(
+                f"no identity plugin registered for domain {domain!r} to replace; "
+                "use register_identity_plugin to add a new one"
+            )
+        _IDENTITY_PLUGINS[domain] = plugin
+    logger.info(
+        "identity plugin for domain %r replaced: %r displaced by %r",
+        domain, displaced, plugin,
+    )
+    return displaced
 
 
 def fusion_key(identity: MaterialIdentity) -> str:

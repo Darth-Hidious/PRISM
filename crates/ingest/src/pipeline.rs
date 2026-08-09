@@ -6,7 +6,6 @@ use prism_provenance::{EvidenceClass, LocalProvenance, ProvenanceStore};
 use serde::{Deserialize, Serialize};
 use tracing;
 
-use crate::connectors::{CsvConnector, ParquetConnector};
 use crate::local_facts::to_local_facts;
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
@@ -126,20 +125,6 @@ impl IngestPipeline {
         };
         let df = connector.load(path)?;
         let source = connector.to_data_source(path)?;
-        self.run_pipeline(df, source).await
-    }
-
-    /// Ingest a CSV file through the full pipeline.
-    pub async fn ingest_csv(&self, path: &Path) -> Result<IngestResult> {
-        let df = CsvConnector::load(path)?;
-        let source = CsvConnector::to_data_source(path)?;
-        self.run_pipeline(df, source).await
-    }
-
-    /// Ingest a Parquet file through the full pipeline.
-    pub async fn ingest_parquet(&self, path: &Path) -> Result<IngestResult> {
-        let df = ParquetConnector::load(path)?;
-        let source = ParquetConnector::to_data_source(path)?;
         self.run_pipeline(df, source).await
     }
 
@@ -669,6 +654,12 @@ mod tests {
         use crate::connectors::{Connector, register_connector};
         use std::sync::Arc;
 
+        // Mutates the process-wide registry: serialise with every other
+        // global-registry test in this binary (one shared lock, one home).
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
         struct Demo;
         impl Connector for Demo {
             fn id(&self) -> &'static str {
@@ -688,7 +679,7 @@ mod tests {
             }
         }
 
-        register_connector(Arc::new(Demo));
+        register_connector(Arc::new(Demo)).expect("a novel connector must register");
 
         let path = std::env::temp_dir().join(format!("prism_demo_{}.demo", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"content irrelevant: Demo::load ignores it").unwrap();
@@ -706,11 +697,95 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// THE named requirement, at PRODUCTION dispatch: REPLACE the built-in
+    /// csv connector in the process-wide registry, and `ingest_file` — the
+    /// real entry point — must parse `.csv` with the replacement. Dies if
+    /// the pipeline hardcodes csv anywhere or if `replace_connector` stops
+    /// swapping the registry the pipeline reads.
+    ///
+    /// Registry state is process-global, so containment is enforced, not
+    /// assumed: the replacement window is serialised behind the shared
+    /// `GLOBAL_REGISTRY_TEST_LOCK` (sibling tests read the registry
+    /// concurrently otherwise), the replacement claims exactly the
+    /// built-in's extensions, and the built-in is restored by a drop guard
+    /// that runs win, lose, or PANIC — an unwind out of `ingest_file` must
+    /// not leave the fake csv connector installed for the rest of the
+    /// process.
+    #[tokio::test]
+    async fn replacing_the_builtin_csv_connector_serves_ingest_file() {
+        use crate::connectors::{Connector, CsvConnector, replace_connector};
+        use std::sync::Arc;
+
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        /// Restores the built-in csv connector on drop — including on
+        /// panic/unwind, so a failure inside the pipeline can never poison
+        /// the process-wide registry for sibling tests.
+        struct RestoreCsv;
+        impl Drop for RestoreCsv {
+            fn drop(&mut self) {
+                crate::connectors::replace_connector(Arc::new(CsvConnector))
+                    .expect("restoring the built-in csv connector");
+            }
+        }
+
+        struct MyCsvEngine;
+        impl Connector for MyCsvEngine {
+            fn id(&self) -> &'static str {
+                "csv"
+            }
+            fn extensions(&self) -> &'static [&'static str] {
+                &["csv", "tsv"]
+            }
+            fn load(&self, _: &Path) -> Result<DataFrame> {
+                Ok(df!("my_own_column" => &[7i64]).expect("literal frame"))
+            }
+            fn to_data_source(&self, path: &Path) -> Result<DataSource> {
+                Ok(DataSource {
+                    path: path.display().to_string(),
+                    format: "csv".into(),
+                })
+            }
+        }
+
+        let displaced =
+            replace_connector(Arc::new(MyCsvEngine)).expect("the built-in csv must be replaceable");
+        // From here on the guard owns the restore: it runs on success,
+        // failed assertion, and panic alike.
+        let _restore = RestoreCsv;
+        assert_eq!(displaced.id(), "csv");
+
+        let path = std::env::temp_dir().join(format!("prism_replace_{}.csv", uuid::Uuid::new_v4()));
+        // Real csv content: a genuine csv parser would read one column "a".
+        // Only the replacement produces "my_own_column".
+        std::fs::write(&path, b"a\n1\n").unwrap();
+
+        let result = IngestPipeline::new().ingest_file(&path).await;
+
+        let result = result.expect("csv must still ingest through the replacement");
+        assert_eq!(
+            result.schema.columns,
+            vec!["my_own_column"],
+            "ingest_file must dispatch to the REPLACEMENT csv connector",
+        );
+        assert_eq!((result.row_count, result.column_count), (1, 1));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The refusal path reads the same registry: unclaimed extensions bail
     /// with the supported list. (Containment asserts only — the sibling
     /// test above registers an extra connector in this same process.)
     #[tokio::test]
     async fn ingest_file_refuses_unclaimed_extensions_with_supported_list() {
+        // Reads the process-wide registry (the supported list): serialise
+        // with the sibling tests that mutate it, so the message is never
+        // observed mid-replacement-window.
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
         let err = IngestPipeline::new()
             .ingest_file(Path::new("/tmp/data.nope"))
             .await

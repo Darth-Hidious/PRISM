@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AuthConfig(BaseModel):
@@ -54,6 +54,14 @@ class ProviderEndpoint(BaseModel):
     behavior: BehaviorConfig = Field(default_factory=BehaviorConfig)
     capabilities: CapabilitiesConfig = Field(default_factory=CapabilitiesConfig)
     reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
+
+    @field_validator("api_type")
+    @classmethod
+    def _normalize_api_type(cls, value: str) -> str:
+        """Trim ``api_type`` exactly the way factory keys are trimmed at
+        registration: a config entry ``"  optimade  "`` must route to the
+        ``"optimade"`` factory, not silently match nothing and vanish."""
+        return value.strip()
 
 
 def load_registry():

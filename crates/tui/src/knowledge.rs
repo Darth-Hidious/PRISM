@@ -292,12 +292,41 @@ mod tests {
 
     /// The picker previously offered `.pdf .csv .json`; the registry now
     /// exposes more formats but must not reorder the ones users already
-    /// had — new formats append after the legacy trio.
+    /// had — new formats append after the legacy trio. Asserted as a
+    /// PROPERTY against the live registry, not a frozen list: registering
+    /// a new connector must extend this picker, never redden this test.
     #[test]
     fn picker_preserves_legacy_order_and_appends_new_formats() {
+        let exts = ingest_extensions();
+
+        // The legacy formats that are on offer keep their historic order,
+        // up front.
+        let legacy_present: Vec<&str> = LEGACY_PICKER_ORDER
+            .iter()
+            .copied()
+            .filter(|l| exts.contains(l))
+            .collect();
+        assert!(
+            exts.starts_with(&legacy_present),
+            "legacy formats must lead in their historic order: {exts:?}",
+        );
+
+        // Everything after them is exactly the non-legacy offer — text
+        // formats then registry claims, deduplicated, in their own order.
+        let mut expected_rest: Vec<&str> = Vec::new();
+        for ext in TEXT_INGEST_EXTENSIONS
+            .iter()
+            .copied()
+            .chain(prism_ingest::connectors::registry().extensions())
+        {
+            if !LEGACY_PICKER_ORDER.contains(&ext) && !expected_rest.contains(&ext) {
+                expected_rest.push(ext);
+            }
+        }
         assert_eq!(
-            ingest_extensions(),
-            ["pdf", "csv", "json", "tsv", "parquet", "pq"],
+            &exts[legacy_present.len()..],
+            expected_rest.as_slice(),
+            "non-legacy formats keep their registration order after the trio",
         );
     }
 

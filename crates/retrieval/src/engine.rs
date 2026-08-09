@@ -115,26 +115,56 @@ impl RetrievalEngine {
         }
     }
 
-    /// Register an additional source at runtime and add it to the fan-out
+    /// Register an ADDITIONAL source at runtime and add it to the fan-out
     /// selection. This is the plugin seam: a source unknown to [`SourceId`]
     /// can be served without touching the enum or any match arm.
     ///
-    /// Registering an id that is already selected REPLACES it — honouring
-    /// [`SourceRegistry::register`]'s shadowing contract — so the id keeps
-    /// one fan-out slot, one status entry, and adopts the new adapter's
-    /// `min_interval`.
-    pub fn register_source(&mut self, source: Arc<dyn Source>) {
+    /// The two-call contract shared by every adapter plane: a taken id is
+    /// refused — an accidental collision must fail loudly, never silently
+    /// shadow — and swapping an existing adapter is the deliberate call
+    /// [`RetrievalEngine::replace_source`]. On refusal nothing changes:
+    /// no limiter, no fan-out slot, no registry entry.
+    pub fn register_source(&mut self, source: Arc<dyn Source>) -> anyhow::Result<()> {
         let id = source.id().to_string();
+        // Refuse FIRST: a refused registration must not touch the limiter
+        // table, the missing list, or the fan-out selection.
+        self.registry.register(source.clone())?;
         self.limiters.insert(
             id.clone(),
             Arc::new(RateLimiter::new(source.min_interval())),
         );
         self.missing.retain(|m| *m != id);
-        match self.selected.iter_mut().find(|s| s.id() == id) {
-            Some(slot) => *slot = source.clone(),
-            None => self.selected.push(source.clone()),
+        // The id was free in the registry, so it cannot already hold a
+        // fan-out slot (selection only ever holds registry-resolved ids).
+        self.selected.push(source);
+        Ok(())
+    }
+
+    /// Deliberately swap the adapter behind an ALREADY-registered id. The
+    /// replacement wins everywhere the id appears: registry lookup, the
+    /// fan-out slot (kept in place — one slot, one status entry), and the
+    /// politeness limiter, which adopts the replacement's `min_interval`.
+    ///
+    /// Strict on purpose: a free id is refused, because a typo'd id must
+    /// not silently ADD a source while the adapter the caller meant to
+    /// displace keeps running. If the id is registered but not part of
+    /// this engine's fan-out selection, the selection stays unchanged —
+    /// which sources run is the configuration's decision; `replace_source`
+    /// only changes WHO serves an id.
+    ///
+    /// Returns the displaced adapter — hand it back to this function to
+    /// restore the original.
+    pub fn replace_source(&mut self, source: Arc<dyn Source>) -> anyhow::Result<Arc<dyn Source>> {
+        let id = source.id().to_string();
+        let displaced = self.registry.replace(source.clone())?;
+        self.limiters.insert(
+            id.clone(),
+            Arc::new(RateLimiter::new(source.min_interval())),
+        );
+        if let Some(slot) = self.selected.iter_mut().find(|s| s.id() == id) {
+            *slot = source;
         }
-        self.registry.register(source);
+        Ok(displaced)
     }
 
     /// Read-only access to the registry (lookups, iteration).
@@ -319,7 +349,9 @@ mod tests {
     async fn registered_adapter_is_queried_without_enum_or_match() {
         let mut engine = isolated_engine();
         let registered: Arc<dyn Source> = Arc::new(EchoSource);
-        engine.register_source(registered.clone());
+        engine
+            .register_source(registered.clone())
+            .expect("a free id must register");
 
         // The write went through the REGISTRY, not just the fan-out list:
         // the id resolves there, to exactly the adapter we registered.
@@ -346,29 +378,53 @@ mod tests {
         assert_eq!(outcome.papers[0].source_id, "echo-1");
     }
 
-    /// Registering an id twice must SHADOW, not duplicate: one fan-out slot,
-    /// one status entry, and the replacement's behaviour and politeness
-    /// interval win everywhere (selection, limiter, registry).
+    /// The two-call contract at the engine surface: registering a taken id
+    /// is REFUSED (and the refusal changes nothing — the first adapter
+    /// keeps running), while `replace_source` deliberately swaps it: one
+    /// fan-out slot, one status entry, and the replacement's behaviour and
+    /// politeness interval win everywhere (selection, limiter, registry).
     #[tokio::test]
-    async fn re_registering_an_id_shadows_selection_limiter_and_registry() {
+    async fn replace_source_swaps_selection_limiter_and_registry() {
         let mut engine = isolated_engine();
-        engine.register_source(Arc::new(NamedSource {
-            id: "dup",
-            title: "first",
-            interval: Duration::from_millis(700),
-        }));
-        engine.register_source(Arc::new(NamedSource {
-            id: "dup",
-            title: "second",
-            interval: Duration::from_millis(250),
-        }));
+        engine
+            .register_source(Arc::new(NamedSource {
+                id: "dup",
+                title: "first",
+                interval: Duration::from_millis(700),
+            }))
+            .expect("a free id must register");
+
+        // Accidental collision: refused loudly, first adapter untouched.
+        let err = engine
+            .register_source(Arc::new(NamedSource {
+                id: "dup",
+                title: "accidental",
+                interval: Duration::from_millis(1),
+            }))
+            .expect_err("a taken id must be refused");
+        assert!(format!("{err:#}").contains("already registered"), "{err:#}");
+        assert_eq!(
+            engine.limiters["dup"].min_interval(),
+            Duration::from_millis(700),
+            "a refused registration must not touch the limiter"
+        );
+
+        // Deliberate replacement: the displaced adapter comes back.
+        let displaced = engine
+            .replace_source(Arc::new(NamedSource {
+                id: "dup",
+                title: "second",
+                interval: Duration::from_millis(250),
+            }))
+            .expect("a registered id must be replaceable");
+        assert_eq!(displaced.min_interval(), Duration::from_millis(700));
 
         let outcome = engine.search("anything", 10).await;
         // ONE status for the id — the old adapter no longer runs.
         assert_eq!(
             outcome.source_status.len(),
             1,
-            "shadowed id must produce exactly one status entry"
+            "replaced id must produce exactly one status entry"
         );
         assert_eq!(outcome.source_status[0].source, "dup");
         assert_eq!(outcome.source_status[0].count, 1);
@@ -389,6 +445,47 @@ mod tests {
                 .expect("dup registered")
                 .min_interval(),
             Duration::from_millis(250)
+        );
+    }
+
+    /// THE named requirement, at PRODUCTION dispatch: replace a BUILT-IN
+    /// source on an engine built by [`RetrievalEngine::new`] — the builtin
+    /// registry, arxiv selected by ordinary configuration — and `search`
+    /// must be served by the replacement (canned papers, no network). This
+    /// test dies if `replace_source` stops swapping the registry, the
+    /// fan-out slot, or if search stops dispatching through them.
+    #[tokio::test]
+    async fn replacing_builtin_arxiv_serves_search_from_the_replacement() {
+        let mut engine = RetrievalEngine::new(EngineConfig {
+            sources: vec![SourceId::Arxiv],
+            cache_dir: None,
+            ..EngineConfig::default()
+        });
+
+        let displaced = engine
+            .replace_source(Arc::new(NamedSource {
+                id: "arxiv",
+                title: "my-own-arxiv",
+                interval: Duration::from_millis(1),
+            }))
+            .expect("the built-in arxiv adapter must be replaceable");
+        // We displaced the genuine built-in (its published politeness
+        // interval identifies it), not some test residue.
+        assert_eq!(displaced.id(), "arxiv");
+        assert_eq!(displaced.min_interval(), Duration::from_millis(3000));
+
+        let outcome = engine.search("anything", 5).await;
+        assert_eq!(outcome.source_status.len(), 1);
+        assert_eq!(outcome.source_status[0].source, "arxiv");
+        assert_eq!(
+            outcome.source_status[0].status, "ok",
+            "the replacement must serve the id: {:?}",
+            outcome.source_status[0].error
+        );
+        assert_eq!(outcome.papers.len(), 1);
+        assert_eq!(
+            outcome.papers[0].title, "my-own-arxiv",
+            "search must be served by the REPLACEMENT adapter"
         );
     }
 
@@ -421,12 +518,16 @@ mod tests {
             Some("no adapter registered for source 'arxiv'")
         );
 
-        // Registering an adapter for the missing id clears the error.
-        engine.register_source(Arc::new(NamedSource {
-            id: "arxiv",
-            title: "healed",
-            interval: Duration::from_millis(1),
-        }));
+        // Registering an adapter for the missing id clears the error. (The
+        // id is absent from this engine's EMPTY registry, so this is a
+        // genuine registration, not a replacement.)
+        engine
+            .register_source(Arc::new(NamedSource {
+                id: "arxiv",
+                title: "healed",
+                interval: Duration::from_millis(1),
+            }))
+            .expect("an id missing from the registry must register");
         let outcome = engine.search("anything", 10).await;
         assert_eq!(outcome.source_status.len(), 1);
         assert_eq!(outcome.source_status[0].source, "arxiv");
@@ -439,7 +540,9 @@ mod tests {
     #[tokio::test]
     async fn adapter_error_surfaces_as_status_error_not_empty() {
         let mut engine = isolated_engine();
-        engine.register_source(Arc::new(ErrSource));
+        engine
+            .register_source(Arc::new(ErrSource))
+            .expect("a free id must register");
         let outcome = engine.search("anything", 10).await;
 
         assert_eq!(outcome.papers.len(), 0);
@@ -496,7 +599,7 @@ mod tests {
     }
 
     /// Configurable adapter: fixed id, one paper carrying `title`, and a
-    /// declared politeness interval — enough to observe shadowing.
+    /// declared politeness interval — enough to observe replacement.
     struct NamedSource {
         id: &'static str,
         title: &'static str,

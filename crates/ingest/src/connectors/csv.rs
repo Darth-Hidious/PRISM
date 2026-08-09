@@ -19,9 +19,9 @@ enum Delimited {
 
 impl Delimited {
     /// `.tsv` reached this connector through two routes that both advertise it
-    /// as supported — `IngestPipeline::ingest_file` maps `"csv" | "tsv"` to
-    /// `ingest_csv`, and the CLI's `ingest_backend` routes `tsv` to
-    /// `LocalTabular` — but the reader was built from
+    /// as supported — `IngestPipeline::ingest_file` routes `"csv" | "tsv"`
+    /// here through the connector registry, and the CLI's `ingest_backend`
+    /// routes `tsv` to `LocalTabular` — but the reader was built from
     /// `CsvReadOptions::default()`, whose separator is a comma. A
     /// tab-separated file therefore parsed as ONE column per row, and that
     /// single blob was what went to the LLM for entity extraction. Nothing

@@ -13,6 +13,13 @@ registries, dispatch, or enums:
    ``~/.prism/providers.yaml`` — importable module names or absolute paths
    to ``.py`` files.
 
+REPLACING a built-in with your own system is the same shape with the other
+call: ``registry.replace_provider_factory("optimade", MyOwnProvider)``.
+``register`` refuses a taken api_type (accidental collisions fail loudly);
+``replace`` refuses a free one (a typo cannot silently add instead of
+replacing), logs what it displaced, and returns the displaced factory so
+it can be restored.
+
 A broken adapter is skipped with a WARNING naming the module and error; it
 never takes down the other providers. This file must stay side-effect-free
 (no submodule imports) so the package can never import-cycle with them.

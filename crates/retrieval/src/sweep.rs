@@ -493,7 +493,8 @@ mod tests {
 
     fn hang_engine() -> RetrievalEngine {
         let mut reg = SourceRegistry::new();
-        reg.register(Arc::new(HangSource));
+        reg.register(Arc::new(HangSource))
+            .expect("a free id must register");
         RetrievalEngine::with_registry(
             EngineConfig {
                 sources: Vec::new(),
@@ -514,7 +515,8 @@ mod tests {
     async fn sweep_source_absent_from_config_gets_the_adapters_real_interval() {
         let capture = Arc::new(CaptureSource::default());
         let mut reg = SourceRegistry::new();
-        reg.register(capture.clone() as Arc<dyn Source>);
+        reg.register(capture.clone() as Arc<dyn Source>)
+            .expect("a free id must register");
         let engine = RetrievalEngine::with_registry(
             EngineConfig {
                 sources: Vec::new(), // NOT configured with arxiv

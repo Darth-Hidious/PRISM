@@ -5854,6 +5854,10 @@ enum IngestBackend {
     PlatformText,
 }
 
+/// Text-document formats the platform's holistic ingest accepts — that
+/// backend's own surface, NOT a shadow of the connector registry.
+const PLATFORM_TEXT_EXTENSIONS: &[&str] = &["pdf", "json", "jsonl", "owl", "cif", "txt", "md"];
+
 fn ingest_backend(path: &Path) -> Option<IngestBackend> {
     // Tabular formats are whatever the connector registry claims — the one
     // place that owns the extension→connector decision. A new file
@@ -5869,14 +5873,23 @@ fn ingest_backend(path: &Path) -> Option<IngestBackend> {
         .to_ascii_lowercase();
 
     // Text documents go to the platform's holistic ingest, not to a local
-    // file connector — this list is that backend's surface, not a shadow
-    // of the connector registry.
-    match ext.as_str() {
-        "pdf" | "json" | "jsonl" | "owl" | "cif" | "txt" | "md" => {
-            Some(IngestBackend::PlatformText)
-        }
-        _ => None,
+    // file connector.
+    if PLATFORM_TEXT_EXTENSIONS.contains(&ext.as_str()) {
+        Some(IngestBackend::PlatformText)
+    } else {
+        None
     }
+}
+
+/// Every format `ingest_backend` routes somewhere: the connector registry's
+/// claims (so a newly registered connector is ADVERTISED with zero edits
+/// here, exactly as it is routed), then the platform text formats. The
+/// unsupported-format error must never advertise a route `ingest_backend`
+/// will not take, nor hide one it will.
+fn supported_ingest_formats() -> String {
+    let mut formats: Vec<&str> = prism_ingest::connectors::registry().extensions();
+    formats.extend(PLATFORM_TEXT_EXTENSIONS);
+    formats.join(", ")
 }
 
 fn ingest_format(path: &Path) -> String {
@@ -7075,8 +7088,9 @@ async fn handle_ingest(
                 .await?
             }
             None => bail!(
-                "Unsupported ingest format for {}. Supported: csv, tsv, parquet, pq, pdf, json, jsonl, owl, cif, txt, md",
-                target.display()
+                "Unsupported ingest format for {}. Supported: {}",
+                target.display(),
+                supported_ingest_formats()
             ),
         };
         summaries.push(summary);
@@ -12892,6 +12906,32 @@ mod tests {
             Some(IngestBackend::LocalTabular)
         );
         assert_eq!(ingest_backend(Path::new("/tmp/image.png")), None);
+    }
+
+    /// Everything the unsupported-format message advertises must actually
+    /// route. This is the falsifiable direction here: the message is built
+    /// from `extensions()` + `PLATFORM_TEXT_EXTENSIONS` while the router
+    /// reads `claims()` + the same const, so an `extensions()`/`claims()`
+    /// incoherence, or anything added to the message without a route,
+    /// fails. (The reverse direction — a runtime-registered connector must
+    /// be ADVERTISED — is proven with novel data in `prism_ingest`'s
+    /// connector tests; asserting it here against only built-ins would be
+    /// a tautology a hardcoded list could satisfy, and implementing a
+    /// novel `Connector` in this crate would need a polars dev-dependency.)
+    #[test]
+    fn every_advertised_ingest_format_actually_routes() {
+        let supported = supported_ingest_formats();
+        let advertised: Vec<&str> = supported.split(", ").collect();
+        assert!(
+            !advertised.is_empty(),
+            "the message must advertise something"
+        );
+        for ext in &advertised {
+            assert!(
+                ingest_backend(Path::new(&format!("/tmp/x.{ext}"))).is_some(),
+                "'{ext}' is advertised but does not route",
+            );
+        }
     }
 
     #[test]

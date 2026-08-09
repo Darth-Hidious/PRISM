@@ -903,3 +903,123 @@ def test_load_platform_providers_merges_marketplace_and_user(tmp_path):
     assert len(result) == 1
     assert result[0]["id"] == "test_native"
     assert result[0]["base_url"] == "https://test.org"
+
+
+# ---------------------------------------------------------------------------
+# Deliberate replacement -- the owner's named requirement: "I am able to
+# remove OPTIMADE with my own systems later on."
+# ---------------------------------------------------------------------------
+
+
+def test_replace_provider_factory_swaps_out_optimade_in_production_dispatch():
+    """THE requirement, proven at PRODUCTION dispatch: replace the built-in
+    'optimade' factory and a real ProviderRegistry.from_endpoints -- not a
+    registry built inside the test -- must construct OUR provider for an
+    api_type 'optimade' endpoint. An implementation that hardcoded
+    OptimadeProvider anywhere on the from_endpoints path dies here."""
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.providers.registry import (
+        ProviderRegistry,
+        replace_provider_factory,
+    )
+
+    class MyOwnImplementation(Provider):
+        def __init__(self, endpoint):
+            self._endpoint = endpoint
+            self.id = endpoint.id
+            self.name = endpoint.name
+            self.capabilities = ProviderCapabilities()
+
+        async def search(self, query):
+            return []
+
+    displaced = replace_provider_factory("optimade", MyOwnImplementation)
+    try:
+        # We displaced the genuine built-in, not some test residue.
+        assert displaced is OptimadeProvider
+        reg = ProviderRegistry.from_endpoints([
+            {
+                "id": "any_optimade_db",
+                "name": "Any OPTIMADE DB",
+                "base_url": "https://example.org/optimade",
+                "api_type": "optimade",
+                "enabled": True,
+            },
+        ])
+        providers = reg.get_all()
+        assert len(providers) == 1, "the endpoint must not vanish"
+        assert isinstance(providers[0], MyOwnImplementation), (
+            "production dispatch must construct the REPLACEMENT provider"
+        )
+        assert not isinstance(providers[0], OptimadeProvider)
+    finally:
+        # Restore the built-in for the rest of the session; replace returns
+        # the displaced factory precisely so this round-trip is possible.
+        assert replace_provider_factory("optimade", displaced) is MyOwnImplementation
+
+
+def test_replace_provider_factory_refuses_a_free_key():
+    """The strict half of the two-call contract: replace on an unregistered
+    key refuses. A typo'd api_type ('optimde') must not silently ADD a second
+    adapter while the built-in the caller meant to displace keeps running."""
+    import pytest
+
+    from app.tools.search_engine.providers.registry import replace_provider_factory
+
+    with pytest.raises(ValueError, match="no provider factory registered"):
+        replace_provider_factory("optimde", lambda ep: None)
+
+
+def test_replace_provider_factory_logs_what_it_displaced(caplog):
+    """A deliberate replacement is loud: it logs the key, the displaced
+    factory, and the replacement."""
+    import logging
+
+    from app.tools.search_engine.providers.registry import (
+        register_provider_factory,
+        replace_provider_factory,
+        unregister_provider_factory,
+    )
+
+    def original(ep):
+        return None
+
+    def substitute(ep):
+        return None
+
+    register_provider_factory("loudswap_native", original)
+    try:
+        with caplog.at_level(
+            logging.INFO, logger="app.tools.search_engine.providers.registry"
+        ):
+            assert replace_provider_factory("loudswap_native", substitute) is original
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "loudswap_native" in m and "original" in m and "substitute" in m
+            for m in messages
+        ), f"replacement must log what it displaced, got: {messages}"
+    finally:
+        assert unregister_provider_factory("loudswap_native") is True
+
+
+def test_endpoint_api_type_whitespace_matches_the_trimmed_factory_key():
+    """Defect fix: factory keys are trimmed at registration but endpoint
+    api_type was not, so a config entry '  optimade  ' matched no factory and
+    the provider silently vanished. Both sides now normalise identically --
+    the padded entry must construct a provider, not be skipped."""
+    from app.tools.search_engine.providers.optimade import OptimadeProvider
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+
+    reg = ProviderRegistry.from_endpoints([
+        {
+            "id": "padded",
+            "name": "Padded",
+            "base_url": "https://padded.example.org",
+            "api_type": "  optimade  ",
+            "enabled": True,
+        },
+    ])
+    providers = reg.get_all()
+    assert len(providers) == 1, "a whitespace-padded api_type must still route"
+    assert isinstance(providers[0], OptimadeProvider)

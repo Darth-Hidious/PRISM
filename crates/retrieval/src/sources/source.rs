@@ -6,7 +6,10 @@
 //! dispatch — there is no `match` over an enum anywhere on the fetch path.
 //! Adding a source means writing one module that exposes `ID`,
 //! `INITIAL_CURSOR`, `fetch`, `fetch_page`, then one `register(...)` line in
-//! [`SourceRegistry::builtin`].
+//! [`SourceRegistry::builtin`]. Swapping a built-in for your own
+//! implementation is [`SourceRegistry::replace`] — `register` refuses a
+//! taken id so accidental collisions fail loudly, `replace` refuses a free
+//! id so a typo cannot silently add instead of replacing.
 //!
 //! The built-in [`crate::sources::SourceId`] enum is retained only as a CLI
 //! convenience (name parsing, default selection); it is not consulted by the
@@ -71,28 +74,57 @@ impl SourceRegistry {
     /// The eight built-in literature sources, in canonical order.
     pub fn builtin() -> Self {
         let mut reg = Self::new();
-        reg.register(Arc::new(Arxiv));
-        reg.register(Arc::new(Openalex));
-        reg.register(Arc::new(Crossref));
-        reg.register(Arc::new(Pubmed));
-        reg.register(Arc::new(SemanticScholar));
-        reg.register(Arc::new(Preprints));
-        reg.register(Arc::new(Chemrxiv));
-        reg.register(Arc::new(Doaj));
+        let builtins: [Arc<dyn Source>; 8] = [
+            Arc::new(Arxiv),
+            Arc::new(Openalex),
+            Arc::new(Crossref),
+            Arc::new(Pubmed),
+            Arc::new(SemanticScholar),
+            Arc::new(Preprints),
+            Arc::new(Chemrxiv),
+            Arc::new(Doaj),
+        ];
+        for source in builtins {
+            reg.register(source)
+                .expect("built-in source ids are unique");
+        }
         reg
     }
 
-    /// Add a source. Later registrations win on id collision (shadowing the
-    /// earlier entry) so a caller can override a built-in without rebuilding
-    /// the whole registry.
-    pub fn register(&mut self, source: Arc<dyn Source>) {
+    /// Add a source under a FREE id.
+    ///
+    /// The two-call contract shared by every adapter plane: `register`
+    /// refuses a taken id, because an accidental collision — two adapters
+    /// both believing they own an id — must fail loudly instead of one
+    /// silently winning. Taking over a built-in (or any registered id) is
+    /// a deliberate act with its own call: [`SourceRegistry::replace`].
+    pub fn register(&mut self, source: Arc<dyn Source>) -> Result<()> {
         let id = source.id().to_string();
-        if let Some(idx) = self.by_id.get(&id).copied() {
-            self.sources[idx] = source;
-        } else {
-            self.by_id.insert(id, self.sources.len());
-            self.sources.push(source);
+        if self.by_id.contains_key(&id) {
+            anyhow::bail!(
+                "source '{id}' is already registered; use replace() to swap it deliberately"
+            );
         }
+        self.by_id.insert(id, self.sources.len());
+        self.sources.push(source);
+        Ok(())
+    }
+
+    /// Deliberately swap the adapter behind an ALREADY-registered id,
+    /// keeping its slot in the iteration order. Strict on purpose: a free
+    /// id is refused, because a typo'd id must not silently ADD a source
+    /// while the adapter the caller meant to displace keeps running.
+    ///
+    /// Returns the displaced adapter — hand it back to this function to
+    /// restore the original — and logs what was displaced.
+    pub fn replace(&mut self, source: Arc<dyn Source>) -> Result<Arc<dyn Source>> {
+        let id = source.id();
+        let Some(&idx) = self.by_id.get(id) else {
+            anyhow::bail!("no source '{id}' registered to replace; use register() to add it");
+        };
+        let displaced = std::mem::replace(&mut self.sources[idx], source);
+        tracing::info!(source = id, "source adapter deliberately replaced");
+        Ok(displaced)
     }
 
     /// Look up a source by id.
@@ -386,10 +418,106 @@ mod tests {
         // A source unknown to SourceId can be registered and looked up purely
         // through the registry — no enum variant, no match arm involved.
         let mut reg = SourceRegistry::builtin();
-        reg.register(Arc::new(Demo));
+        reg.register(Arc::new(Demo)).expect("free id must register");
         assert_eq!(reg.get("demo").map(|s| s.id()), Some("demo"));
         // The built-ins are untouched.
         assert_eq!(reg.all().len(), 9);
+    }
+
+    /// The two-call contract: `register` refuses a taken id (accidental
+    /// collision is loud, nothing silently wins) and names the deliberate
+    /// path; `replace` refuses a free id (a typo cannot silently ADD while
+    /// the adapter the caller meant to displace keeps running).
+    #[test]
+    fn register_and_replace_are_strict_both_ways() {
+        let mut reg = SourceRegistry::builtin();
+        let before = reg.all().len();
+
+        // Demo2 claims "arxiv" — a built-in id — so this is the accidental
+        // collision case.
+        let err = reg
+            .register(Arc::new(Demo2))
+            .expect_err("a taken id must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already registered"), "{msg}");
+        assert!(
+            msg.contains("replace"),
+            "the refusal must name the deliberate path: {msg}"
+        );
+
+        let err = match reg.replace(Arc::new(Demo)) {
+            Err(e) => e,
+            Ok(_) => panic!("replacing an id that is not registered must be refused"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no source 'demo'"), "{msg}");
+
+        assert_eq!(reg.all().len(), before, "refusals must change nothing");
+    }
+
+    /// Deliberate replacement: the displaced adapter comes back (the
+    /// restore path), the slot keeps its iteration order, and lookups
+    /// resolve to the replacement.
+    #[test]
+    fn replace_swaps_in_place_and_returns_the_displaced_adapter() {
+        let mut reg = SourceRegistry::builtin();
+        let order_before: Vec<&str> = reg.all().iter().map(|s| s.id()).collect();
+
+        let displaced = reg
+            .replace(Arc::new(Demo2))
+            .expect("a registered id must be replaceable");
+        assert_eq!(displaced.id(), "arxiv");
+        assert_eq!(
+            displaced.min_interval(),
+            Duration::from_millis(3000),
+            "we displaced the genuine built-in"
+        );
+        assert_eq!(
+            reg.get("arxiv").map(|s| s.min_interval()),
+            Some(Duration::ZERO),
+            "lookup must resolve to the replacement"
+        );
+        let order_after: Vec<&str> = reg.all().iter().map(|s| s.id()).collect();
+        assert_eq!(
+            order_after, order_before,
+            "replacement keeps the slot, order and count"
+        );
+
+        // Round-trip restore: hand the displaced adapter back.
+        let mine = reg.replace(displaced).expect("restore must succeed");
+        assert_eq!(mine.min_interval(), Duration::ZERO);
+        assert_eq!(
+            reg.get("arxiv").map(|s| s.min_interval()),
+            Some(Duration::from_millis(3000))
+        );
+    }
+
+    /// Claims the BUILT-IN id "arxiv" with a zero interval — the test
+    /// double for both the accidental collision and the deliberate
+    /// replacement of a built-in.
+    struct Demo2;
+    #[async_trait]
+    impl Source for Demo2 {
+        fn id(&self) -> &'static str {
+            "arxiv"
+        }
+        fn min_interval(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn initial_cursor(&self) -> &'static str {
+            "0"
+        }
+        async fn fetch(&self, _: &FetchCtx, _: &str) -> Result<Vec<Paper>> {
+            Ok(Vec::new())
+        }
+        async fn fetch_page(
+            &self,
+            ctx: &FetchCtx,
+            query: &str,
+            _: &str,
+        ) -> Result<(Vec<Paper>, Option<String>)> {
+            self.fetch(ctx, query).await.map(|p| (p, None))
+        }
     }
 
     struct Demo;
