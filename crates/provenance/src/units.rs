@@ -32,6 +32,24 @@ use crate::QudtUnit;
 /// information the percent sign alone does not carry — so those facts are
 /// dropped loudly instead of stored blurred.
 const UNIT_SPELLINGS: &[(&str, &str)] = &[
+    // Dimensionless quantities.
+    //
+    // A dimensionless quantity is NOT a missing unit — it is a specific one,
+    // and QUDT names it. Without this row the ingest rule "a value with no
+    // unit is a wrong number" (correct: 880 GPa must not be confused with 880
+    // MPa) silently discarded every quantity that is dimensionless BY
+    // DEFINITION. Measured on a polymer tribology paper: 33 of 74 extracted
+    // facts were coefficients of friction, and every one was dropped as
+    // malformed. Coefficient of friction is the customer's second
+    // requirement, so PRISM could not store the property it was being asked
+    // about. Poisson's ratio, relative permittivity, Weibull modulus and
+    // refractive index all share the shape.
+    ("unitless", "QUDT:UNITLESS"),
+    ("dimensionless", "QUDT:UNITLESS"),
+    ("none", "QUDT:UNITLESS"),
+    ("n/a", "QUDT:UNITLESS"),
+    ("-", "QUDT:UNITLESS"),
+    ("1", "QUDT:UNITLESS"),
     // Pressure / stress / elastic moduli
     ("pa", "QUDT:PA"),
     ("pascal", "QUDT:PA"),

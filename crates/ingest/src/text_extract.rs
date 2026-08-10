@@ -269,7 +269,7 @@ Reply with ONLY this JSON:
   {{"subject": "Ti-6Al-4V", "predicate": "has_phase", "object": "alpha-beta", "conditions": [], "confidence": 0.8, "kind": "phase", "evidence_class": "research"}}
 ]}}
 
-`unit` and every numerical condition unit MUST use an existing QUDT identifier with the `QUDT:` prefix; do not invent unit names. Write the QUDT form of the paper's unit, for example: MPa is "QUDT:MegaPA", GPa is "QUDT:GigaPA", K is "QUDT:K", g/cm3 is "QUDT:GM-PER-CentiM3", W/(m·K) is "QUDT:W-PER-M-K". Each condition is structured as `name`, numeric-or-text `value`, and `unit` (null only for categorical values such as atmosphere). A measurement without its stated conditions is incomplete: preserve temperature, pressure, frequency, thickness, atmosphere, electrode geometry, and other conditions explicitly present in the paper. Literature extraction is always evidence_class `research` (ORANGE/unverified), regardless of confidence or corroborating sources.
+`unit` and every numerical condition unit MUST use an existing QUDT identifier with the `QUDT:` prefix; do not invent unit names. Write the QUDT form of the paper's unit, for example: a DIMENSIONLESS quantity (coefficient of friction, Poisson ratio, relative permittivity, Weibull modulus, refractive index) is "QUDT:UNITLESS" — never null; MPa is "QUDT:MegaPA", GPa is "QUDT:GigaPA", K is "QUDT:K", g/cm3 is "QUDT:GM-PER-CentiM3", W/(m·K) is "QUDT:W-PER-M-K". Each condition is structured as `name`, numeric-or-text `value`, and `unit` (null only for categorical values such as atmosphere). A measurement without its stated conditions is incomplete: preserve temperature, pressure, frequency, thickness, atmosphere, electrode geometry, and other conditions explicitly present in the paper. Literature extraction is always evidence_class `research` (ORANGE/unverified), regardless of confidence or corroborating sources.
 
 Use "kind" to classify: measurement | phase | composition | processing | structure | application. Only extract facts you are confident about (confidence > 0.3)."#
     )
@@ -499,6 +499,48 @@ fn extract_json_block(raw: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A dimensionless quantity is not a MISSING unit — it is a specific one.
+    /// Measured on a polymer tribology paper: 33 of 74 extracted facts were
+    /// coefficients of friction and every one was dropped as malformed,
+    /// because the alloy-derived rule "a value with no unit is a wrong
+    /// number" has no way to say "this quantity has no dimension". COF is the
+    /// customer requirement PRISM was being asked about.
+    #[test]
+    fn a_dimensionless_measurement_is_storable() {
+        for spelling in ["QUDT:UNITLESS", "unitless", "dimensionless", "-", "none"] {
+            let raw = serde_json::json!({
+                "subject": "PTFE", "predicate": "has_measurement",
+                "object": "coefficient of friction", "kind": "measurement",
+                "value": 0.04, "unit": spelling,
+                "confidence": 0.9, "evidence_class": "research", "conditions": []
+            });
+            let fact =
+                convert_fact(raw).unwrap_or_else(|e| panic!("'{spelling}' must resolve: {e}"));
+            assert_eq!(fact.value, Some(0.04));
+            assert!(
+                fact.unit
+                    .as_ref()
+                    .is_some_and(|u| u.as_str().contains("UNITLESS")),
+                "'{spelling}' must resolve to the QUDT dimensionless unit, got {:?}",
+                fact.unit,
+            );
+        }
+    }
+
+    /// …and a genuinely absent unit is STILL refused. The rule that stops
+    /// 880 GPa being confused with 880 MPa must not be weakened by this.
+    #[test]
+    fn a_missing_unit_is_still_refused() {
+        let raw = serde_json::json!({
+            "subject": "Ti-6Al-4V", "predicate": "has_measurement",
+            "object": "UTS", "kind": "measurement",
+            "value": 880.0,
+            "confidence": 0.9, "evidence_class": "research", "conditions": []
+        });
+        let err = convert_fact(raw).expect_err("a unit-less number must be refused");
+        assert!(err.contains("no unit at all"), "{err}");
+    }
 
     /// A number stated for ONE material must not support the same number
     /// claimed for ANOTHER. `supporting_quote` alone allows it: its span
