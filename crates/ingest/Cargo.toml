@@ -20,7 +20,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_yaml = { workspace = true }
-sha2 = { workspace = true }
 hex = { workspace = true }
 sophia = { workspace = true }
 uuid = { workspace = true }
@@ -31,5 +30,4 @@ prism-provenance = { path = "../provenance" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true }
 wiremock = "0.6"
