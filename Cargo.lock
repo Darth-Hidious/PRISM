@@ -5091,6 +5091,7 @@ dependencies = [
  "prism-llm",
  "prism-ontology",
  "prism-provenance",
+ "prism-retrieval",
  "reqwest",
  "serde",
  "serde_json",

@@ -16296,13 +16296,22 @@ data:\n\
     /// exactly one chunk's request and no two mocks ever match one request
     /// (mockito serves the first-created mock still missing hits, which
     /// makes overlapping matchers order-dependent).
+    /// A document that spans three windows AND actually states the facts the
+    /// stub extractor returns.
+    ///
+    /// The subjects are named in the text on purpose: extraction now drops
+    /// facts the source does not support (a model that invents a material
+    /// must not be able to write it into the graph), so a fixture whose
+    /// document never mentions `EarlyFactium` would exercise the drop path
+    /// instead of the windowing and merge behaviour these tests are about.
     fn three_chunk_text() -> String {
         let filler = |n: usize| "filler sentence about processing. ".repeat(n);
-        let mut text = String::from("AAAMARKER ");
+        let mut text =
+            String::from("AAAMARKER EarlyFactium and Survivium exhibit the alpha phase. ");
         text.push_str(&filler(70)); // MIDMARKER lands ~byte 2390: window 2 only
         text.push_str("MIDMARKER ");
         text.push_str(&filler(50)); // ZZZMARKER lands ~byte 4100: window 3 only
-        text.push_str("ZZZMARKER the very late fact paragraph.");
+        text.push_str("ZZZMARKER LateFactium exhibits the omega phase.");
         assert!(text.len() > 4_000, "fixture must span three windows");
         text
     }

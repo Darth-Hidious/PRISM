@@ -71,13 +71,120 @@ pub async fn extract_facts_from_text(
 ) -> Result<TextExtraction> {
     let prompt = build_extraction_prompt(title, text);
     let (raw, usage) = llm.generate_json_with_usage(&prompt).await?;
-    let (facts, dropped_facts, parse_error) = parse_extraction(&raw);
+    let (facts, mut dropped_facts, parse_error) = parse_extraction(&raw);
+    let facts = retain_grounded(facts, text, &mut dropped_facts);
     Ok(TextExtraction {
         facts,
         parse_error,
         dropped_facts,
         usage,
     })
+}
+
+/// Keep only the facts the SOURCE TEXT actually supports.
+///
+/// Every other check on this path asks whether a fact is well-formed: does its
+/// class exist in the ontology, does its unit resolve to a QUDT identifier, do
+/// its endpoints refer to entities that were also extracted. None of them ask
+/// the only question that matters for a knowledge graph — **is it in the
+/// document?** — so a model that invents a plausible material and a plausible
+/// number produces a fact that passes everything and is stored at whatever
+/// confidence it claimed for itself.
+///
+/// That is not hypothetical. Handed a NASA title page and abstract about
+/// superalloy lattice blocks, `qwen2.5:3b` returned `Ti-6Al-4V`, an ultimate
+/// tensile strength of 1140 MPa, and an alpha-beta phase. The words
+/// `Ti-6Al-4V`, `1140` and `alpha-beta` appear nowhere in that text. All three
+/// were written to the graph with `confidence: 0.9`.
+///
+/// The check reuses the span finder `prism papers` has always run
+/// ([`prism_retrieval::claims::supporting_quote`]): a fact survives only if a
+/// verbatim sentence or table row of the source mentions its subject, its
+/// object, and its number. The two document paths differed on this and nothing
+/// made them agree — one refused unsupported claims, the other stored them.
+///
+/// Dropped facts go to `dropped_facts`, whose contract already is "a PARTIAL
+/// result the caller MUST surface": the user is told what the model made up,
+/// rather than it silently becoming part of their graph.
+fn retain_grounded(
+    facts: Vec<MaterialFact>,
+    text: &str,
+    dropped_facts: &mut Vec<String>,
+) -> Vec<MaterialFact> {
+    facts
+        .into_iter()
+        .filter(|fact| {
+            let grounded = match fact.value {
+                // A NUMBER is exact, and a wrong number is the failure that
+                // actually corrupts a materials graph. Demand a real span:
+                // one sentence or table row carrying the subject, the object
+                // and the value together.
+                Some(_) => prism_retrieval::claims::supporting_quote(
+                    &fact.subject,
+                    &fact.object,
+                    fact.value,
+                    text,
+                )
+                .is_some(),
+                // A value-less relational claim ("HR-1 is a Fe-Ni-base
+                // superalloy") is only ever a PARAPHRASE of the document, so
+                // demanding subject and object verbatim in one span deletes
+                // true facts: measured on a NASA rocket-engine paper, the
+                // strict rule dropped `NASA HR-1` (present 5 times),
+                // `GRCop-84` (5) and `L-PBF` (7). What can be checked exactly
+                // is the SUBJECT — a material the document never names cannot
+                // be something the document said, and that is precisely what
+                // caught the invented `Ti-6Al-4V`.
+                None => subject_appears(&fact.subject, text),
+            };
+            if grounded {
+                return true;
+            }
+            dropped_facts.push(format!(
+                "{} {} {}{}: not supported by the document — {}, so the model appears \
+                 to have invented it",
+                fact.subject,
+                fact.predicate,
+                fact.object,
+                fact.value.map(|v| format!(" ({v})")).unwrap_or_default(),
+                match fact.value {
+                    Some(_) => "no sentence or table row carries it with that value",
+                    None => "the document never names that subject",
+                },
+            ));
+            false
+        })
+        .collect()
+}
+
+/// Whether the document names `subject` at all.
+///
+/// Case-insensitive, and tolerant of the one rewrite models reliably make:
+/// expanding an abbreviation into `Full Name (ABBR)` when the document uses
+/// only one of the two forms. Either half counts, so a paper that says
+/// `L-PBF` throughout supports a fact whose subject is
+/// `Laser Powder Bed Fusion (L-PBF)`.
+fn subject_appears(subject: &str, text: &str) -> bool {
+    let haystack = text.to_lowercase();
+    let subject = subject.trim().to_lowercase();
+    if subject.is_empty() {
+        return false;
+    }
+    if haystack.contains(&subject) {
+        return true;
+    }
+    // `Full Name (ABBR)` -> try "full name" and "abbr" separately.
+    if let Some((before, rest)) = subject.split_once('(') {
+        let before = before.trim();
+        let abbr = rest.trim_end_matches(')').trim();
+        if !before.is_empty() && haystack.contains(before) {
+            return true;
+        }
+        if !abbr.is_empty() && haystack.contains(abbr) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build the extraction prompt over the WHOLE supplied text. Frames the
@@ -339,6 +446,135 @@ fn extract_json_block(raw: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The FALSE-POSITIVE regression, measured on the NASA rocket-engine
+    /// paper: the strict rule dropped `NASA HR-1` (5 occurrences), `GRCop-84`
+    /// (5) and `L-PBF` (7) as invented. A guard that silently deletes true
+    /// facts is the same defect as one that admits false ones.
+    #[test]
+    fn relational_facts_the_document_supports_are_not_dropped() {
+        let source = "NASA HR-1 is an Fe-Ni-base superalloy developed for hydrogen \
+                      environments. GRCop-84 offers oxidation and blanching resistance. \
+                      Components were built by Laser Powder Bed Fusion.";
+        let facts: Vec<MaterialFact> = [
+            // Object paraphrased; subject present.
+            ("NASA HR-1", "is_a", "Fe-Ni-base superalloy"),
+            (
+                "GRCop-84",
+                "has_property",
+                "oxidation and blanching resistance",
+            ),
+            // Subject expanded to `Full Name (ABBR)`; document says only the
+            // full name.
+            (
+                "Laser Powder Bed Fusion (L-PBF)",
+                "is_a",
+                "Metal Additive Manufacturing Process",
+            ),
+        ]
+        .into_iter()
+        .map(|(s, p, o)| MaterialFact {
+            subject: s.into(),
+            predicate: p.into(),
+            object: o.into(),
+            value: None,
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: None,
+            evidence_class: Default::default(),
+        })
+        .collect();
+
+        let mut dropped = Vec::new();
+        let kept = retain_grounded(facts, source, &mut dropped);
+        assert_eq!(kept.len(), 3, "real facts were dropped: {dropped:?}");
+        assert!(dropped.is_empty());
+    }
+
+    /// …and the loosened rule still catches the invention that started this:
+    /// a subject the document never names.
+    #[test]
+    fn a_relational_fact_about_an_absent_subject_is_still_dropped() {
+        let source = "Evaluations of Additively Manufactured Superalloy Lattice Blocks. \
+                      Cast lattice block structures made up of high-temperature \
+                      superalloys were previously shown to offer high strength.";
+        let invented = MaterialFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: "alpha-beta".into(),
+            value: None,
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: None,
+            evidence_class: Default::default(),
+        };
+        let mut dropped = Vec::new();
+        assert!(retain_grounded(vec![invented], source, &mut dropped).is_empty());
+        assert_eq!(dropped.len(), 1);
+        assert!(
+            dropped[0].contains("never names that subject"),
+            "{}",
+            dropped[0]
+        );
+    }
+
+    /// THE regression, verbatim. This exact abstract went to `qwen2.5:3b`,
+    /// which returned Ti-6Al-4V / UTS 1140 MPa / alpha-beta phase — none of
+    /// which appear in it — and all three were written to the graph at
+    /// confidence 0.9 because nothing on this path asked whether they were in
+    /// the document.
+    #[test]
+    fn facts_the_document_never_stated_are_dropped_not_stored() {
+        let source = "Evaluations of Additively Manufactured Superalloy Lattice Blocks. \
+                      Timothy P. Gabb, NASA Glenn Research Center, Cleveland, Ohio. \
+                      Cast lattice block structures made up of high-temperature \
+                      superalloys were previously shown to offer high strength.";
+        let fabricated = MaterialFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "HAS_MEASUREMENT".into(),
+            object: "UTS".into(),
+            value: Some(1140.0),
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: Default::default(),
+        };
+        let mut dropped = Vec::new();
+        let kept = retain_grounded(vec![fabricated], source, &mut dropped);
+
+        assert!(kept.is_empty(), "an invented fact must never be stored");
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("Ti-6Al-4V"), "{}", dropped[0]);
+        assert!(dropped[0].contains("not supported"), "{}", dropped[0]);
+    }
+
+    /// The other half, or the guard would be a fact shredder: something the
+    /// document DOES state survives untouched.
+    #[test]
+    fn facts_the_document_states_survive() {
+        let source = "The Ti-6Al-4V specimens exhibited an ultimate tensile strength \
+                      of 1140 MPa at room temperature after hot isostatic pressing.";
+        let real = MaterialFact {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "HAS_MEASUREMENT".into(),
+            object: "ultimate tensile strength".into(),
+            value: Some(1140.0),
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: Default::default(),
+        };
+        let mut dropped = Vec::new();
+        let kept = retain_grounded(vec![real.clone()], source, &mut dropped);
+
+        assert_eq!(kept.len(), 1, "a stated fact must survive: {dropped:?}");
+        assert_eq!(kept[0].subject, "Ti-6Al-4V");
+        assert!(dropped.is_empty());
+    }
     use super::*;
 
     #[test]

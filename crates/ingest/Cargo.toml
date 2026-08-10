@@ -29,6 +29,8 @@ image = { workspace = true }
 prism-llm = { path = "../llm" }
 prism-ontology = { path = "../ontology" }
 prism-provenance = { path = "../provenance" }
+# The span finder that decides whether a fact is actually IN the document.
+prism-retrieval = { path = "../retrieval" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
