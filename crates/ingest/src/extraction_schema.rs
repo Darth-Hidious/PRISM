@@ -12,9 +12,18 @@
 //! What the schema deliberately does NOT lock: entity `properties` stays an
 //! open object (extra keys as primitive values) because compositions and
 //! process parameters are legitimately free-form; only its `value` and
-//! `unit` members are typed. And form is all a grammar can give — a density
-//! carrying a legal-but-wrong pressure unit still decodes, which is why
-//! [`crate::graph_validation`] checks quantity kinds after the fact.
+//! `unit` members are typed. The one field-use rule the schema DOES enforce
+//! is per-type: the active ontology's quantitative classes
+//! ([`Ontology::quantitative_labels`]) get a `oneOf` variant REQUIRING the
+//! `value` and `unit` members (nullable — the authoritative home for a
+//! measured number is the per-edge relationship channel), because "the
+//! vocabulary of each field" was never enough — the model satisfied the
+//! enum-locked schema by naming a Property `"1100 MPa"` with an empty
+//! properties bag. And form is all a grammar can give — a density carrying
+//! a legal-but-wrong pressure unit still decodes, which is why
+//! [`crate::graph_validation`] checks quantity kinds after the fact, and a
+//! measurement packed into the NAME still decodes, which is why it also
+//! rejects those.
 //!
 //! Interop note: `additionalProperties` as a typed sub-schema is what
 //! llama-server and vLLM's converters accept; OpenAI's `strict` mode
@@ -51,54 +60,147 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
         .map(|(id, _)| *id)
         .collect();
 
-    let entity_item = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "type": {"type": "string", "enum": entity_types},
-            "name": {"type": "string"},
+    // One entity-item builder for both variants below: `types` locks the
+    // `type` enum, `required_members` is what the `properties` object must
+    // carry. The value/unit member schemas and the primitive-extras rule
+    // are IDENTICAL across variants — only the requirement differs.
+    let entity_item = |types: &[&str], required_members: &[&str]| {
+        serde_json::json!({
+            "type": "object",
             "properties": {
-                "type": "object",
+                "type": {"type": "string", "enum": types},
+                "name": {"type": "string"},
                 "properties": {
-                    "value": {"type": ["number", "string", "null"]},
-                    "unit": {"anyOf": [
-                        {"type": "string", "enum": units},
-                        {"type": "null"}
-                    ]},
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": ["number", "string", "null"]},
+                        "unit": {"anyOf": [
+                            {"type": "string", "enum": units},
+                            {"type": "null"}
+                        ]},
+                    },
+                    "required": required_members,
+                    // Free-form extras (composition systems, process params)
+                    // stay allowed — as primitives, so `unit`/`value` cannot be
+                    // smuggled in as nested structure.
+                    "additionalProperties": {"type": ["string", "number", "boolean", "null"]},
                 },
-                // Free-form extras (composition systems, process params)
-                // stay allowed — as primitives, so `unit`/`value` cannot be
-                // smuggled in as nested structure.
-                "additionalProperties": {"type": ["string", "number", "boolean", "null"]},
             },
-        },
-        "required": ["type", "name", "properties"],
-        "additionalProperties": false,
-    });
+            "required": ["type", "name", "properties"],
+            "additionalProperties": false,
+        })
+    };
+
+    // Per-type variants — the field-use half the enum lock alone cannot
+    // give. The active ontology's quantitative classes (its declaration,
+    // `Ontology::quantitative_labels`) REQUIRE the `value` and `unit`
+    // members: the model can no longer satisfy the schema by naming a
+    // Property "1100 MPa" with an empty properties bag (measured live
+    // 2026-08-08 — value and unit stored as text inside the entity NAME,
+    // nothing queryable as a number). Both members stay NULLABLE: the
+    // authoritative channel for a measured number is the per-edge
+    // relationship `value`/`unit` below (a value on a SHARED property node
+    // attributes to nobody — live 2026-08-10: one node's 880 was stored as
+    // five alloys' yield strength), so a shared property node must be able
+    // to say `null` honestly, and a closed-enum unit must never be forced
+    // onto a quantity outside the vocabulary (Vickers hardness is absent
+    // deliberately). Everything else keeps the historical open shape, so an
+    // ontology with no quantitative classes emits a byte-identical schema.
+    let quantitative: Vec<&str> = ontology.quantitative_labels();
+    let other_types: Vec<&str> = entity_types
+        .iter()
+        .copied()
+        .filter(|t| !quantitative.contains(t))
+        .collect();
+    let entity_items = if quantitative.is_empty() {
+        entity_item(&entity_types, &[])
+    } else {
+        let quantitative_item = entity_item(&quantitative, &["value", "unit"]);
+        if other_types.is_empty() {
+            quantitative_item
+        } else {
+            serde_json::json!({"oneOf": [
+                quantitative_item,
+                entity_item(&other_types, &[]),
+            ]})
+        }
+    };
 
     // An ontology may legitimately declare zero relations; an empty `enum`
     // is invalid JSON Schema, so lock the array shut instead of guessing.
+    //
+    // Relationship variants are split BY RELATION: the declared measurement
+    // relations (`Ontology::measurement_relations`) become two dedicated
+    // variants — a measured edge whose typed `value` and enum-locked `unit`
+    // are REQUIRED and which has NO `weight`/`order` members at all, and a
+    // bare property link with endpoints only — while every other relation
+    // keeps the historical shape (weight/order, no value/unit). Each
+    // exclusion is a measured escape hatch, closed: with `unit` merely
+    // optional the live 12B model emitted every per-row value and not one
+    // unit (2026-08-10 run 2 — all ten numeric facts honestly dropped
+    // unit-less), and with `weight` available on the same edge it put every
+    // number THERE and satisfied the grammar without ever entering the
+    // measured variant (run 3 — all ten values silently unmappable). A
+    // number on a measured edge has exactly one place to go, and that place
+    // demands its unit from the ONE declared vocabulary; a quantity with no
+    // unit in the vocabulary is stated as a bare link — no number, never a
+    // guessed unit.
+    let measurement_rels: Vec<&str> = ontology.measurement_relations();
+    let plain_rels: Vec<&str> = relationship_types
+        .iter()
+        .copied()
+        .filter(|r| !measurement_rels.contains(r))
+        .collect();
+    let plain_edge = |rels: &[&str]| {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "string"},
+                "rel": {"type": "string", "enum": rels},
+                "to": {"type": "string"},
+                // The parser is deliberately lenient here ("balance",
+                // "19.0") — the schema must not be stricter than what
+                // the pipeline accepts, or it would forbid domain-real
+                // values like a remainder fraction.
+                "weight": {"type": ["number", "string", "null"]},
+                "order": {"type": ["integer", "string", "null"]},
+            },
+            "required": ["from", "rel", "to"],
+            "additionalProperties": false,
+        })
+    };
     let relationship_items = if relationship_types.is_empty() {
         serde_json::json!({"type": "array", "maxItems": 0, "items": {"type": "object"}})
+    } else if measurement_rels.is_empty() {
+        serde_json::json!({"type": "array", "items": plain_edge(&relationship_types)})
     } else {
-        serde_json::json!({
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "from": {"type": "string"},
-                    "rel": {"type": "string", "enum": relationship_types},
-                    "to": {"type": "string"},
-                    // The parser is deliberately lenient here ("balance",
-                    // "19.0") — the schema must not be stricter than what
-                    // the pipeline accepts, or it would forbid domain-real
-                    // values like a remainder fraction.
-                    "weight": {"type": ["number", "string", "null"]},
-                    "order": {"type": ["integer", "string", "null"]},
-                },
-                "required": ["from", "rel", "to"],
-                "additionalProperties": false,
+        let measured_edge = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "string"},
+                "rel": {"type": "string", "enum": measurement_rels},
+                "to": {"type": "string"},
+                "value": {"type": ["number", "string"]},
+                "unit": {"type": "string", "enum": units},
             },
-        })
+            "required": ["from", "rel", "to", "value", "unit"],
+            "additionalProperties": false,
+        });
+        let bare_property_link = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": {"type": "string"},
+                "rel": {"type": "string", "enum": measurement_rels},
+                "to": {"type": "string"},
+            },
+            "required": ["from", "rel", "to"],
+            "additionalProperties": false,
+        });
+        let mut variants = vec![measured_edge, bare_property_link];
+        if !plain_rels.is_empty() {
+            variants.push(plain_edge(&plain_rels));
+        }
+        serde_json::json!({"type": "array", "items": {"oneOf": variants}})
     };
 
     JsonSchemaSpec {
@@ -106,7 +208,7 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
         schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "entities": {"type": "array", "items": entity_item},
+                "entities": {"type": "array", "items": entity_items},
                 "relationships": relationship_items,
             },
             "required": ["entities", "relationships"],
@@ -185,44 +287,89 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Every entity-type enum in the schema, across whichever item shape the
+    /// ontology produced: the single historical item, or the per-type
+    /// `oneOf` variants a quantitative declaration adds.
+    fn entity_type_enums(schema: &serde_json::Value) -> Vec<Vec<String>> {
+        let items = "/properties/entities/items";
+        if let Some(variants) = schema
+            .pointer(&format!("{items}/oneOf"))
+            .and_then(|v| v.as_array())
+        {
+            (0..variants.len())
+                .map(|i| enum_values(schema, &format!("{items}/oneOf/{i}/properties/type/enum")))
+                .collect()
+        } else {
+            vec![enum_values(
+                schema,
+                &format!("{items}/properties/type/enum"),
+            )]
+        }
+    }
+
     /// The schema is the DECLARATION, not a frozen list: every extraction
-    /// label the active ontology declares appears in the matching enum, and
-    /// nothing else does. Run against two ontologies with disjoint
+    /// label the active ontology declares appears in exactly ONE entity-type
+    /// enum, and nothing else does. Run against two ontologies with disjoint
     /// vocabularies so a hardcoded derivation cannot satisfy both.
     #[test]
     fn schema_enums_are_exactly_the_active_ontologys_declarations() {
         let chem = Chem::new(&["REACTS_WITH", "CATALYZED_BY"]);
         for ontology in [&chem as &dyn Ontology, &EmmoOntology] {
             let spec = extraction_json_schema(ontology);
-            let entity_enum = enum_values(
-                &spec.schema,
-                "/properties/entities/items/properties/type/enum",
+            let variant_enums = entity_type_enums(&spec.schema);
+            let mut entity_enum: Vec<String> = variant_enums.iter().flatten().cloned().collect();
+            let unique: std::collections::HashSet<&String> = entity_enum.iter().collect();
+            assert_eq!(
+                unique.len(),
+                entity_enum.len(),
+                "a label appears in more than one variant for ontology '{}': {variant_enums:?}",
+                ontology.id()
             );
-            let declared: Vec<String> = ontology
+            let mut declared: Vec<String> = ontology
                 .classes()
                 .iter()
                 .flat_map(|d| d.extraction_labels.iter().cloned())
                 .collect();
+            entity_enum.sort();
+            declared.sort();
             assert_eq!(
                 entity_enum,
                 declared,
-                "entity enum drifted from ontology '{}'",
+                "entity enums drifted from ontology '{}'",
                 ontology.id()
             );
 
-            let rel_enum = enum_values(
-                &spec.schema,
-                "/properties/relationships/items/properties/rel/enum",
-            );
-            let declared_rels: Vec<String> = ontology
+            let declared_rels: std::collections::BTreeSet<String> = ontology
                 .relations()
                 .iter()
                 .flat_map(|d| d.extraction_labels.iter().cloned())
                 .collect();
+            // Across however many edge variants the ontology produced
+            // (single historical shape, or measured/bare/plain), the UNION
+            // of rel enums is exactly the declared relationship vocabulary.
+            let items = "/properties/relationships/items";
+            let variant_count = spec
+                .schema
+                .pointer(&format!("{items}/oneOf"))
+                .and_then(|v| v.as_array())
+                .map(Vec::len);
+            let rel_union: std::collections::BTreeSet<String> = match variant_count {
+                Some(n) => (0..n)
+                    .flat_map(|i| {
+                        enum_values(
+                            &spec.schema,
+                            &format!("{items}/oneOf/{i}/properties/rel/enum"),
+                        )
+                    })
+                    .collect(),
+                None => enum_values(&spec.schema, &format!("{items}/properties/rel/enum"))
+                    .into_iter()
+                    .collect(),
+            };
             assert_eq!(
-                rel_enum,
+                rel_union,
                 declared_rels,
-                "relationship enum drifted from ontology '{}'",
+                "relationship enums drifted from ontology '{}'",
                 ontology.id()
             );
             assert_eq!(spec.name, format!("{}_tabular_extraction", ontology.id()));
@@ -231,20 +378,194 @@ mod tests {
 
     /// The unit enum is the ONE declared QUDT vocabulary — same table the
     /// quantity-kind validator reads, so decoder and validator cannot drift.
+    /// Checked in BOTH per-type variants: the quantitative one and the open
+    /// one carry the same vocabulary.
     #[test]
     fn unit_enum_is_the_shared_qudt_declaration() {
         let spec = extraction_json_schema(&EmmoOntology);
-        let unit_enum = enum_values(
-            &spec.schema,
-            "/properties/entities/items/properties/properties/properties/unit/anyOf/0/enum",
-        );
         let declared: Vec<String> = qudt_units::EXTRACTION_UNITS
             .iter()
             .map(|(id, _)| (*id).to_string())
             .collect();
-        assert_eq!(unit_enum, declared);
-        // And the identifiers the wild emits unconstrained are NOT legal.
-        assert!(!unit_enum.iter().any(|u| u == "MPa" || u == "g/cm3"));
+        for variant in 0..2 {
+            let unit_enum = enum_values(
+                &spec.schema,
+                &format!(
+                    "/properties/entities/items/oneOf/{variant}\
+                     /properties/properties/properties/unit/anyOf/0/enum"
+                ),
+            );
+            assert_eq!(unit_enum, declared, "variant {variant}");
+            // And the identifiers the wild emits unconstrained are NOT legal.
+            assert!(!unit_enum.iter().any(|u| u == "MPa" || u == "g/cm3"));
+        }
+    }
+
+    /// THE per-type contract, pinned at the production schema builder: the
+    /// quantitative variant's `type` enum is exactly the active ontology's
+    /// quantitative declaration, its `properties` REQUIRES `value` and
+    /// `unit`, and its `value` admits no null — while the open variant
+    /// keeps the historical no-requirement shape and excludes the
+    /// quantitative labels. Dropping the requirement (the mutation that
+    /// re-opens "Property named 1100 MPa with an empty bag") kills this.
+    #[test]
+    fn quantitative_types_require_typed_value_and_unit() {
+        let spec = extraction_json_schema(&EmmoOntology);
+        let quant = spec
+            .schema
+            .pointer("/properties/entities/items/oneOf/0")
+            .expect("EMMO declares quantitative classes, so the items are per-type variants");
+
+        assert_eq!(
+            enum_values(quant, "/properties/type/enum"),
+            EmmoOntology.quantitative_labels(),
+            "the quantitative variant's enum is the declaration"
+        );
+        let required: Vec<String> = quant
+            .pointer("/properties/properties/required")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            required,
+            ["value", "unit"],
+            "a quantitative entity must be REQUIRED to carry value and unit"
+        );
+        // Both members stay NULLABLE: the per-edge relationship channel is
+        // the authoritative home for a measured number (a shared property
+        // node must be able to say null honestly), and a closed-enum unit
+        // must never be forced onto an out-of-vocabulary quantity.
+        assert_eq!(
+            quant.pointer("/properties/properties/properties/value/type"),
+            Some(&serde_json::json!(["number", "string", "null"])),
+        );
+
+        let open = spec
+            .schema
+            .pointer("/properties/entities/items/oneOf/1")
+            .expect("the non-quantitative variant");
+        let open_enum = enum_values(open, "/properties/type/enum");
+        assert!(
+            !open_enum.iter().any(|t| t == "Property"),
+            "the open variant must exclude the quantitative labels: {open_enum:?}"
+        );
+        assert_eq!(
+            open.pointer("/properties/properties/required"),
+            Some(&serde_json::json!([])),
+            "the open variant keeps the historical no-requirement shape"
+        );
+    }
+
+    /// The per-edge measurement channel is on the wire, and every measured
+    /// escape hatch is CLOSED: the measured-edge variant carries the
+    /// declared measurement relations only and REQUIRES a non-null `value`
+    /// with a non-null, enum-locked `unit` (with `unit` optional, the live
+    /// 12B model emitted every per-row value and not one unit — run 2);
+    /// neither the measured edge nor the bare property link declares
+    /// `weight`/`order` at all (with `weight` available, the same model put
+    /// every number there and never entered the measured variant — run 3);
+    /// and ordinary relations keep the historical weight/order shape with
+    /// no value/unit. Weakening any of these is the mutation this test
+    /// exists to kill.
+    #[test]
+    fn measured_edges_couple_value_to_unit_and_offer_no_numeric_escape() {
+        let declared_units: Vec<String> = qudt_units::EXTRACTION_UNITS
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+        let spec = extraction_json_schema(&EmmoOntology);
+        let items = spec
+            .schema
+            .pointer("/properties/relationships/items")
+            .expect("relationship items present");
+
+        let measured = items.pointer("/oneOf/0").expect("measured-edge variant");
+        assert_eq!(
+            enum_values(measured, "/properties/rel/enum"),
+            EmmoOntology.measurement_relations(),
+            "the measured edge carries the declared measurement relations only"
+        );
+        assert_eq!(
+            measured.pointer("/required"),
+            Some(&serde_json::json!(["from", "rel", "to", "value", "unit"])),
+            "stating a value must REQUIRE stating its unit"
+        );
+        assert_eq!(
+            measured.pointer("/properties/value/type"),
+            Some(&serde_json::json!(["number", "string"])),
+            "a measured value admits no null"
+        );
+        assert_eq!(
+            enum_values(measured, "/properties/unit/enum"),
+            declared_units,
+            "the edge unit is the ONE declared vocabulary, non-null"
+        );
+        assert!(
+            measured.pointer("/properties/weight").is_none()
+                && measured.pointer("/properties/order").is_none(),
+            "a measured edge must offer NO unitless numeric slot"
+        );
+
+        let bare = items.pointer("/oneOf/1").expect("bare property link");
+        assert_eq!(
+            enum_values(bare, "/properties/rel/enum"),
+            EmmoOntology.measurement_relations(),
+        );
+        for member in ["value", "unit", "weight", "order"] {
+            assert!(
+                bare.pointer(&format!("/properties/{member}")).is_none(),
+                "the bare property link must not declare {member}"
+            );
+        }
+
+        let plain = items.pointer("/oneOf/2").expect("ordinary-edge variant");
+        let plain_enum = enum_values(plain, "/properties/rel/enum");
+        assert!(
+            plain_enum.iter().any(|r| r == "CONTAINS")
+                && !plain_enum.iter().any(|r| r == "HAS_PROPERTY"),
+            "ordinary edges carry everything but the measurement relations: {plain_enum:?}"
+        );
+        assert!(
+            plain.pointer("/properties/weight").is_some()
+                && plain.pointer("/properties/value").is_none(),
+            "ordinary edges keep weight/order and gain no value channel"
+        );
+
+        // An ontology declaring no measurement relations keeps ONE
+        // historical edge shape — no variants, no value/unit anywhere.
+        let chem = extraction_json_schema(&Chem::new(&["REACTS_WITH"]));
+        let chem_items = chem
+            .schema
+            .pointer("/properties/relationships/items")
+            .expect("chem relationship items");
+        assert!(chem_items.pointer("/oneOf").is_none());
+        assert!(chem_items.pointer("/properties/value").is_none());
+        assert!(chem_items.pointer("/properties/weight").is_some());
+    }
+
+    /// An ontology declaring NO quantitative classes keeps the single item
+    /// shape byte-for-byte — no `oneOf`, no requirement — so nothing changes
+    /// for MatKG, induced ontologies, or any third-party vocabulary that
+    /// never opted in.
+    #[test]
+    fn no_quantitative_declaration_keeps_the_single_open_item() {
+        let spec = extraction_json_schema(&Chem::new(&["REACTS_WITH"]));
+        assert!(
+            spec.schema
+                .pointer("/properties/entities/items/oneOf")
+                .is_none(),
+            "no quantitative declaration must mean no per-type variants"
+        );
+        assert_eq!(
+            spec.schema
+                .pointer("/properties/entities/items/properties/properties/required"),
+            Some(&serde_json::json!([])),
+            "and no requirement on the open bag"
+        );
     }
 
     /// Zero declared relations must lock the array shut, not emit an

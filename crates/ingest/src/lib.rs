@@ -100,6 +100,20 @@ pub struct Relationship {
     pub weight: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<u32>,
+    /// The measured value THIS relationship states — the per-subject
+    /// attribution channel for measurements. A value on the target entity
+    /// cannot say WHOSE value it is once several subjects reference the
+    /// same property node (measured live 2026-08-10: one "yield strength"
+    /// node carrying 880 was referenced by five alloys, and 880 MPa was
+    /// stored as every alloy's yield strength — four falsehoods); a value
+    /// on the relationship is per-edge by construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    /// Unit spelling for `value`, resolved through the ONE controlled
+    /// vocabulary (`prism_provenance::units::resolve_unit`) at fact
+    /// mapping — never stored raw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +148,8 @@ mod tests {
                 to: "Nb".into(),
                 weight: Some(0.25),
                 order: None,
+                value: None,
+                unit: None,
             }],
         };
         let json = serde_json::to_string(&set).unwrap();
@@ -210,6 +226,8 @@ mod tests {
             to: "B".into(),
             weight: None,
             order: None,
+            value: None,
+            unit: None,
         };
         let json = serde_json::to_string(&rel).unwrap();
         assert!(!json.contains("\"weight\""));
@@ -224,6 +242,8 @@ mod tests {
             to: "B".into(),
             weight: None,
             order: None,
+            value: None,
+            unit: None,
         };
         let json = serde_json::to_string(&rel).unwrap();
         assert!(!json.contains("\"order\""));
@@ -237,6 +257,8 @@ mod tests {
             to: "Anneal".into(),
             weight: Some(1.0),
             order: Some(2),
+            value: None,
+            unit: None,
         };
         let json = serde_json::to_string(&rel).unwrap();
         let parsed: Relationship = serde_json::from_str(&json).unwrap();

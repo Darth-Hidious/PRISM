@@ -1411,6 +1411,17 @@ fn home_fallback_store_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".prism/provenance.db"))
 }
 
+// Same reasoning as `prism_agent::hooks`: `test-guard` is a public cargo
+// feature, so `--all-features` on a release build would compile this abort
+// into a shipped binary. Fail the build instead.
+#[cfg(all(feature = "test-guard", not(debug_assertions)))]
+compile_error!(
+    "prism-workflows: the `test-guard` feature aborts the process on a $HOME \
+     store fallback and must never be compiled into a release build. It is \
+     armed automatically for test targets by the self dev-dependency; do not \
+     enable it by hand, and do not use --all-features on a release build."
+);
+
 /// `test-guard` build (this crate's own test targets, armed by the self
 /// dev-dependency; never a production build): a test ran a provenance step
 /// with no `provenance_db` in context and no `$PRISM_PROVENANCE_DB` — the

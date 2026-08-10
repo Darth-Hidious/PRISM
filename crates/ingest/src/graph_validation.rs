@@ -185,6 +185,24 @@ pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphVal
         }
     }
 
+    // Check 12: a measurement packed into a quantitative entity's NAME —
+    // the form-versus-field failure the per-type schema variant and prompt
+    // rule push against but cannot make impossible (a grammar constrains
+    // shape, not which field a thing belongs in). Error severity: a
+    // Property NAMED "1100 MPa" stores the number as unqueryable text
+    // inside an identity key — data corruption, not a style issue. The
+    // pipeline CONTAINS this class too: the packed entity is dropped and
+    // reported, the valid remainder is stored.
+    for e in &entities.entities {
+        if let Some(reason) = measurement_packed_in_name(ontology, e) {
+            issues.push(GraphIssue {
+                severity: GraphSeverity::Error,
+                category: "measurement_in_name".into(),
+                message: reason,
+            });
+        }
+    }
+
     // Checks 7–10 moved into the ontology: EMMO's weight/order rules on
     // CONTAINS/PROCESSED_BY live in `EmmoOntology::validate_domain`, emitted
     // here in the position they always ran so reports are unchanged for
@@ -225,6 +243,49 @@ pub fn unit_kind_mismatch(entity: &Entity) -> Option<String> {
     })
 }
 
+/// The form-versus-field corruption in ONE entity's NAME, or `None`: an
+/// entity of a quantitative type (the active ontology's declaration,
+/// [`Ontology::quantitative_labels`]) whose name IS a measurement — a bare
+/// number (`"1100"`) or a number with a spelling the ONE controlled unit
+/// vocabulary resolves (`"1100 MPa"`, `"8.19 g/cm3"`) — instead of a
+/// property name. Stored, such an entity holds the value and unit as text
+/// inside an identity key, unqueryable as a number (live 2026-08-08: 39
+/// entities, `prov_assertion.value` null throughout); a reported drop is
+/// honest, a Property named after a measurement is data corruption.
+///
+/// Names that merely START with a number keep passing (`"0.2% proof
+/// stress"`, `"2024 aluminium"`): the whole name must be the number, or the
+/// tail must resolve through `prism_provenance::units::resolve_unit` —
+/// never a guess about unknown spellings. Shared by Check 12 above and the
+/// pipeline's containment partition, so what is flagged and what is
+/// dropped-and-reported cannot disagree.
+#[must_use]
+pub fn measurement_packed_in_name(ontology: &dyn Ontology, entity: &Entity) -> Option<String> {
+    // Trimmed like every other label lookup on the write path
+    // (`pipeline::validate_before_graph_write`), so a whitespace-padded
+    // type cannot slip a packed name past this one check.
+    if !ontology
+        .quantitative_labels()
+        .contains(&entity.entity_type.trim())
+    {
+        return None;
+    }
+    let name = entity.name.trim();
+    let (value, tail) = crate::local_facts::split_leading_number(name)?;
+    let described = if tail.is_empty() {
+        format!("the bare number {value}")
+    } else {
+        let unit = prism_provenance::units::resolve_unit(tail)?;
+        format!("the measurement {value} {tail} ({})", unit.as_str())
+    };
+    Some(format!(
+        "{} '{}' is named after {described}, not after a property — a \
+         measurement stored as a NAME is unqueryable text, so the entity is \
+         dropped and reported, never stored as a fake {}",
+        entity.entity_type, name, entity.entity_type
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +307,8 @@ mod tests {
             to: to.into(),
             weight: None,
             order: None,
+            value: None,
+            unit: None,
         }
     }
 
@@ -264,6 +327,8 @@ mod tests {
                     to: "Nb".into(),
                     weight: Some(0.5),
                     order: None,
+                    value: None,
+                    unit: None,
                 },
                 Relationship {
                     from: "NbMoTaW".into(),
@@ -271,6 +336,8 @@ mod tests {
                     to: "Mo".into(),
                     weight: Some(0.5),
                     order: None,
+                    value: None,
+                    unit: None,
                 },
             ],
         };
@@ -359,6 +426,8 @@ mod tests {
                 to: "Y".into(),
                 weight: Some(1.5),
                 order: None,
+                value: None,
+                unit: None,
             }],
         };
         let report = validate_graph(&EmmoOntology, &es);
@@ -380,6 +449,8 @@ mod tests {
                     to: "A".into(),
                     weight: Some(0.3),
                     order: None,
+                    value: None,
+                    unit: None,
                 },
                 Relationship {
                     from: "ABC".into(),
@@ -387,6 +458,8 @@ mod tests {
                     to: "B".into(),
                     weight: Some(0.3),
                     order: None,
+                    value: None,
+                    unit: None,
                 },
             ],
         };
@@ -463,6 +536,60 @@ mod tests {
                 .issues
                 .iter()
                 .any(|i| i.category == "unit_kind_mismatch"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    /// The measured live defect, mechanically caught: a Property NAMED
+    /// "1100 MPa" (or "8.19 g/cm3", or a bare number) is an Error — the
+    /// value and unit would be stored as text inside the entity name,
+    /// unqueryable as a number.
+    #[test]
+    fn property_named_after_a_measurement_is_an_error() {
+        for name in ["1100 MPa", "8.19 g/cm3", "1100MPa", "1100"] {
+            let es = EntitySet {
+                entities: vec![
+                    make_entity("Alloy", "Inconel 718"),
+                    make_entity("Property", name),
+                ],
+                relationships: vec![],
+            };
+            let report = validate_graph(&EmmoOntology, &es);
+            assert!(!report.passed, "{name:?} must block");
+            let issue = report
+                .issues
+                .iter()
+                .find(|i| i.category == "measurement_in_name")
+                .unwrap_or_else(|| panic!("{name:?} must be reported: {:?}", report.issues));
+            assert_eq!(issue.severity, GraphSeverity::Error);
+            assert!(issue.message.contains(name), "{}", issue.message);
+        }
+    }
+
+    /// And the guard must not over-fire: real property names, names that
+    /// merely start with a number, unknown unit tails, and non-quantitative
+    /// types all pass — including the SAME packed name on a type the
+    /// ontology never declared quantitative.
+    #[test]
+    fn measurement_in_name_does_not_over_fire() {
+        let clean = EntitySet {
+            entities: vec![
+                make_entity("Property", "yield strength"),
+                make_entity("Property", "0.2% proof stress"),
+                make_entity("Property", "542 HV"), // HV resolves to no unit — no claim
+                make_entity("Property", "316L"),
+                make_entity("Alloy", "1100 MPa"), // absurd but not OUR claim: Alloy is not quantitative
+                make_entity("Phase", "8.19 g/cm3"),
+            ],
+            relationships: vec![],
+        };
+        let report = validate_graph(&EmmoOntology, &clean);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.category == "measurement_in_name"),
             "{:?}",
             report.issues
         );
