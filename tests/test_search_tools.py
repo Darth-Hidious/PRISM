@@ -8,7 +8,12 @@ direct testing because prior_art_search dispatches into them.
 import json
 from unittest.mock import MagicMock, patch
 from app.tools.base import ToolRegistry
-from app.tools.search import create_search_tools, _literature_search, _patent_search
+from app.tools.search import (
+    _literature_search,
+    _patent_search,
+    _prior_art_search,
+    create_search_tools,
+)
 
 
 class TestCreateSearchTools:
@@ -45,8 +50,26 @@ class TestLiteratureSearchFunc:
              "title": "Paper 2", "abstract_text": "A2", "url": "u2"},
         ],
         "duplicates_merged": 0,
+        "relevance": {
+            "status": "applied",
+            "candidates": 3,
+            "evaluated": 3,
+            "dropped": 1,
+            "threshold": 0.60,
+            "backend": "openai:relevance-fixture",
+            "returned_unfiltered": False,
+            "off_topic_examples": [{
+                "source": "arxiv",
+                "source_id": "peek-cv",
+                "title": (
+                    "PEEK: Picking Essential frames via Efficient "
+                    "Knowledge distillation"
+                ),
+                "score": 0.21,
+            }],
+        },
         "source_status": [
-            {"source": "arxiv", "status": "ok", "count": 1,
+            {"source": "arxiv", "status": "ok", "count": 2,
              "cache_hit": False, "error": None},
             {"source": "semantic_scholar", "status": "ok", "count": 1,
              "cache_hit": False, "error": None},
@@ -72,9 +95,59 @@ class TestLiteratureSearchFunc:
         assert len(result["results"]) == 2
         # Per-source outcomes must reach the caller — a thin result set with
         # a failed source is a different fact from a genuinely empty one.
-        assert result["source_status"]["arxiv"] == "ok (1 results)"
+        assert result["source_status"]["arxiv"] == "ok (2 results)"
+        # Filtering is equally provenance-bearing: callers must see that a
+        # third candidate was removed and be able to audit an example.
+        assert result["relevance"]["status"] == "applied"
+        assert result["relevance"]["dropped"] == 1
+        assert result["relevance"]["off_topic_examples"][0]["source_id"] == "peek-cv"
         # Every record carries the literature evidence ceiling.
         assert all(r["evidence_class"] == "research" for r in result["results"])
+
+    @patch("app.tools.search.spawn.run")
+    @patch("app.tools.search._resolve_prism_binary",
+           return_value="/usr/local/bin/prism")
+    def test_prior_art_reports_when_papers_were_returned_unfiltered(
+        self, _binary, mock_run,
+    ):
+        outcome = json.loads(self.ENGINE_OUTCOME)
+        outcome["papers"].append({
+            "source": "arxiv",
+            "source_id": "peek-cv",
+            "title": (
+                "PEEK: Picking Essential frames via Efficient Knowledge "
+                "distillation"
+            ),
+            "abstract_text": "A computer-vision frame-selection paper.",
+            "url": "u3",
+        })
+        outcome["relevance"] = {
+            "status": "unavailable",
+            "candidates": 3,
+            "evaluated": 0,
+            "dropped": 0,
+            "threshold": 0.60,
+            "returned_unfiltered": True,
+            "off_topic_examples": [],
+            "message": (
+                "no embedding backend was available; papers were returned "
+                "unfiltered"
+            ),
+        }
+        proc = self._engine_proc()
+        proc.stdout = json.dumps(outcome)
+        mock_run.return_value = proc
+
+        result = _prior_art_search(
+            query="PEEK dielectric breakdown strength",
+            source="papers",
+        )
+
+        assert result["counts"]["papers"] == 3
+        assert result["papers_relevance"] == outcome["relevance"]
+        assert result["papers_relevance"]["status"] == "unavailable"
+        assert result["papers_relevance"]["returned_unfiltered"] is True
+        assert "returned unfiltered" in result["papers_relevance"]["message"]
 
     @patch("app.tools.search.spawn.run")
     @patch("app.tools.search._resolve_prism_binary",

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache::DiskCache;
 use crate::model::{Paper, SearchOutcome, SourceStatus};
 use crate::ratelimit::RateLimiter;
+use crate::relevance::{RelevancePolicy, RelevanceReport, filter_papers};
 use crate::sources::source::FailureKind;
 use crate::sources::{self, FetchCtx, Source, SourceRegistry, all_sources};
 
@@ -39,6 +40,10 @@ pub struct EngineConfig {
     pub max_attempts: u32,
     /// Test/mirror overrides, keyed by registry id string.
     pub base_overrides: HashMap<String, String>,
+    /// `None` preserves the legacy search result set and order. `Some` runs
+    /// semantic relevance after deduplication.
+    #[serde(default)]
+    pub relevance: Option<RelevancePolicy>,
 }
 
 impl Default for EngineConfig {
@@ -55,6 +60,7 @@ impl Default for EngineConfig {
             cache_ttl_secs: 24 * 60 * 60,
             max_attempts: 3,
             base_overrides: HashMap::new(),
+            relevance: None,
         }
     }
 }
@@ -77,6 +83,10 @@ pub struct RetrievalEngine {
     /// Reported by every `search` as an error status — a configured source
     /// must never silently vanish from the outcome.
     missing: Vec<String>,
+    /// Lazy because the native backend may perform blocking model setup on
+    /// first use. The cell also caches honest unavailability and init failure.
+    relevance_backend:
+        tokio::sync::OnceCell<Result<Option<Arc<dyn prism_embed::EmbedBackend>>, String>>,
 }
 
 impl RetrievalEngine {
@@ -123,7 +133,31 @@ impl RetrievalEngine {
             registry,
             selected,
             missing,
+            relevance_backend: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Enable semantic relevance for this engine with a caller-overridable
+    /// corpus policy. Without this (or `EngineConfig.relevance`), search keeps
+    /// its exact legacy result set and order.
+    pub fn with_relevance_policy(mut self, policy: RelevancePolicy) -> Self {
+        self.cfg.relevance = Some(policy);
+        self
+    }
+
+    /// Supply an embedding backend directly, including explicit `None` to
+    /// model an unavailable deployment. This is also the deterministic seam
+    /// for tests and callers with their own backend lifecycle. Call it before
+    /// the first relevance-enabled search.
+    pub fn with_relevance_backend(
+        self,
+        backend: Option<Arc<dyn prism_embed::EmbedBackend>>,
+    ) -> Self {
+        assert!(
+            self.relevance_backend.set(Ok(backend)).is_ok(),
+            "relevance backend was already initialized"
+        );
+        self
     }
 
     /// Register an ADDITIONAL source at runtime and add it to the fan-out
@@ -187,6 +221,42 @@ impl RetrievalEngine {
         &self.cfg
     }
 
+    async fn relevance_backend(
+        &self,
+    ) -> Result<Option<Arc<dyn prism_embed::EmbedBackend>>, String> {
+        self.relevance_backend
+            .get_or_init(|| async {
+                let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+                    .await
+                    .map_err(|error| {
+                        format!("embedding backend initialization task failed: {error}")
+                    })?;
+                Ok(backend.map(Arc::from))
+            })
+            .await
+            .clone()
+    }
+
+    async fn apply_relevance(&self, query: &str, papers: &mut Vec<Paper>) -> RelevanceReport {
+        let Some(policy) = &self.cfg.relevance else {
+            return RelevanceReport::disabled(papers.len());
+        };
+        if let Err(reason) = policy.validate() {
+            return RelevanceReport::failed(papers.len(), policy, None, reason);
+        }
+
+        let backend = match self.relevance_backend().await {
+            Ok(Some(backend)) => backend,
+            Ok(None) => return RelevanceReport::unavailable(papers.len(), policy),
+            Err(reason) => return RelevanceReport::failed(papers.len(), policy, None, reason),
+        };
+        let backend_id = backend.id().to_string();
+        match filter_papers(query, papers, policy, backend.as_ref()).await {
+            Ok(report) => report,
+            Err(reason) => RelevanceReport::failed(papers.len(), policy, Some(backend_id), reason),
+        }
+    }
+
     pub(crate) fn fetch_ctx_for(&self, limit: usize) -> FetchCtx {
         let cache =
             self.cfg.cache_dir.clone().map(|dir| {
@@ -221,13 +291,13 @@ impl RetrievalEngine {
     }
 
     /// Fan out one query to every configured source concurrently. Returns
-    /// deduplicated papers plus an honest per-source status log.
+    /// deduplicated papers plus honest source and relevance status logs.
     pub async fn search(&self, query: &str, per_source_limit: usize) -> SearchOutcome {
         let start = Instant::now();
         let ctx = self.fetch_ctx_for(per_source_limit);
         let timeout = Duration::from_secs(self.cfg.per_source_timeout_secs);
 
-        let futures = self.selected.iter().cloned().map(|source| {
+        let futures = self.selected.iter().map(|source| {
             let ctx = &ctx;
             async move {
                 let source_start = Instant::now();
@@ -325,10 +395,16 @@ impl RetrievalEngine {
             });
         }
 
+        // Relevance runs after deduplication so absorbed abstracts contribute
+        // to the scored text. On any unavailable or failed embedding path the
+        // helper leaves `papers` untouched and reports the unfiltered return.
+        let relevance = self.apply_relevance(query, &mut papers).await;
+
         SearchOutcome {
             papers,
             duplicates_merged,
             source_status,
+            relevance,
             elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
         }
     }

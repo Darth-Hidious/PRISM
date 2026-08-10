@@ -143,5 +143,10 @@ pub struct SearchOutcome {
     pub papers: Vec<Paper>,
     pub duplicates_merged: usize,
     pub source_status: Vec<SourceStatus>,
+    /// What semantic relevance checking did (or why it did not run). A
+    /// default keeps older serialized outcomes readable while making every
+    /// new search explicit about whether papers were returned unfiltered.
+    #[serde(default)]
+    pub relevance: crate::relevance::RelevanceReport,
     pub elapsed_ms: f64,
 }

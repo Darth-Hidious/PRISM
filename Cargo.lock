@@ -5293,6 +5293,7 @@ dependencies = [
  "futures-util",
  "mockito",
  "pdf-extract",
+ "prism-embed",
  "prism-runtime",
  "quick-xml",
  "reqwest",
@@ -5303,6 +5304,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

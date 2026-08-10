@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use prism_retrieval::{EngineConfig, Paper, RetrievalEngine, SourceId, SweepPlan, sweep};
+use prism_retrieval::{
+    EngineConfig, Paper, RelevancePolicy, RetrievalEngine, SourceId, SweepPlan, sweep,
+};
 use serde_json::json;
 
 #[derive(Debug, Subcommand)]
@@ -208,7 +210,8 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             no_cache,
         } => {
             let source_ids = parse_sources(&sources)?;
-            let engine = build_engine(source_ids, &mailto, no_cache);
+            let engine = build_engine(source_ids, &mailto, no_cache)
+                .with_relevance_policy(RelevancePolicy::default());
             let outcome = engine.search(&query, limit).await;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }

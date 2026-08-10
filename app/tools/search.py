@@ -150,6 +150,12 @@ def _literature_search_impl(**kwargs) -> dict:
         "count": len(results),
         "source": "literature",
         "source_status": source_status,
+        # Preserve the engine's complete relevance accounting verbatim. In
+        # particular, `unavailable`/`failed` means these papers were returned
+        # unfiltered, while `applied` can carry an exact dropped count plus
+        # bounded examples. Losing this at the adapter boundary would turn an
+        # honest Rust outcome back into a misleadingly clean agent result.
+        "relevance": outcome.get("relevance"),
         "duplicates_merged": outcome.get("duplicates_merged", 0),
         "engine_elapsed_ms": outcome.get("elapsed_ms"),
     }
@@ -252,6 +258,10 @@ def _prior_art_search(**kwargs) -> dict:
             out["papers"] = lit.get("results", [])
             out["counts"]["papers"] = lit.get("count", 0)
             out["source_status"] = lit.get("source_status", {})
+            # Relevance applies only to the literature branch of this
+            # federated result, so keep the provenance explicit in the key.
+            # This is the same report emitted by `prism papers search`.
+            out["papers_relevance"] = lit.get("relevance")
             # A retrieval fault (engine missing, every source down) is not an
             # empty result — keep it visible to the agent.
             if lit.get("error"):
@@ -306,7 +316,11 @@ def create_search_tools(registry: ToolRegistry) -> None:
             "missing, CNKI licence required) are reported in `papers_error` "
             "/ `patents_error` / `eastern_source_status` without failing the "
             "whole call, so the agent gets partial results and knows which "
-            "source was skipped rather than genuinely empty."
+            "source was skipped rather than genuinely empty. The "
+            "`papers_relevance` report also says whether literature results "
+            "were filtered, how many off-topic papers were dropped (with "
+            "examples), or whether embeddings were unavailable and the "
+            "papers therefore came back unfiltered."
         ),
         input_schema={
             "type": "object",
