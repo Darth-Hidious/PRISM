@@ -9,14 +9,18 @@
 //! Any YAML file dropped into the workflows directory is automatically
 //! available as `prism <workflow-name>` — no registration or compilation needed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 const BUILTIN_FORGE_YAML: &str = include_str!("../../../app/workflows/builtin/forge.yaml");
 const BUILTIN_INGEST_YAML: &str = include_str!("../../../app/workflows/builtin/ingest.yaml");
@@ -94,7 +98,32 @@ pub struct WorkflowRunResult {
     pub steps: Vec<WorkflowStepResult>,
 }
 
-/// Credential policy for workflow LLM steps.
+/// Resource policy for `parallel` workflow steps.
+///
+/// A concurrency limit is a claim about the execution environment, not a fact
+/// about workflows. Eight in-flight branches is a conservative default for a
+/// laptop doing network- and document-heavy work; callers running on smaller
+/// or larger machines should override it through
+/// [`execute_workflow_with_parallel_policy`].
+/// Keeping this declared also prevents one workflow's branch count from
+/// silently becoming its socket, file-descriptor, and memory budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelExecutionPolicy {
+    /// Maximum number of sub-steps that may be executing at once. The type
+    /// excludes zero so a configured workflow cannot deadlock waiting for a
+    /// permit that can never exist.
+    pub max_in_flight: NonZeroUsize,
+}
+
+impl Default for ParallelExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            max_in_flight: NonZeroUsize::new(8).expect("the default limit is non-zero"),
+        }
+    }
+}
+
+/// Trusted credentials for workflow steps.
 ///
 /// A workflow value such as `llm_base_url` is caller-controlled data. It may
 /// select an endpoint, but it must not make the node's environment credential
@@ -389,10 +418,39 @@ pub async fn execute_workflow_with_policy_and_options(
     spec: &WorkflowSpec,
     values: &BTreeMap<String, String>,
     execute: bool,
+    policy: Option<&mut prism_policy::PolicyEngine>,
+    principal: Option<&str>,
+    role: Option<&str>,
+    options: &WorkflowExecutionOptions,
+) -> Result<WorkflowRunResult> {
+    execute_workflow_with_parallel_policy(
+        spec,
+        values,
+        execute,
+        policy,
+        principal,
+        role,
+        options,
+        &ParallelExecutionPolicy::default(),
+    )
+    .await
+}
+
+/// Execute a workflow with an explicit resource policy for parallel fan-out.
+///
+/// This entry point leaves [`WorkflowExecutionOptions`] source-compatible for
+/// existing callers while allowing an environment to select the maximum
+/// number of in-flight branches. Nested workflows inherit the same limit.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_workflow_with_parallel_policy(
+    spec: &WorkflowSpec,
+    values: &BTreeMap<String, String>,
+    execute: bool,
     mut policy: Option<&mut prism_policy::PolicyEngine>,
     principal: Option<&str>,
     role: Option<&str>,
     options: &WorkflowExecutionOptions,
+    parallel_policy: &ParallelExecutionPolicy,
 ) -> Result<WorkflowRunResult> {
     let principal = principal.unwrap_or("agent");
     let role = role.unwrap_or(LEAST_PRIVILEGED_ROLE);
@@ -563,7 +621,15 @@ pub async fn execute_workflow_with_policy_and_options(
                     .await
                 }
                 "parallel" => {
-                    run_parallel_step(step, &mut context, !execute, &client, options).await
+                    run_parallel_step(
+                        step,
+                        &mut context,
+                        !execute,
+                        &client,
+                        options,
+                        parallel_policy,
+                    )
+                    .await
                 }
                 "workflow" => {
                     run_workflow_step(
@@ -574,6 +640,7 @@ pub async fn execute_workflow_with_policy_and_options(
                         principal,
                         role,
                         options,
+                        parallel_policy,
                     )
                     .await
                 }
@@ -1720,12 +1787,18 @@ async fn run_loop_step(
 //         action: http
 //         url: "https://nomad-lab.eu/..."
 //
+type ParallelTaskCompletion = (
+    Result<WorkflowStepResult>,
+    BTreeMap<String, serde_json::Value>,
+);
+
 async fn run_parallel_step(
     step: &WorkflowStep,
     context: &mut BTreeMap<String, serde_json::Value>,
     dry_run: bool,
     client: &reqwest::Client,
     options: &WorkflowExecutionOptions,
+    parallel_policy: &ParallelExecutionPolicy,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `steps` (canonical) | `tasks` | `branches`
     let sub_steps: Vec<WorkflowStep> = config_first(&step.config, &["steps", "tasks", "branches"])
@@ -1750,14 +1823,29 @@ async fn run_parallel_step(
         });
     }
 
-    // Execute all sub-steps concurrently via tokio::join
-    let mut handles = Vec::new();
-    for sub_step in &sub_steps {
+    let semaphore_capacity = parallel_policy
+        .max_in_flight
+        .get()
+        .min(sub_steps.len().max(1))
+        .min(Semaphore::MAX_PERMITS);
+    let semaphore = Arc::new(Semaphore::new(semaphore_capacity));
+    let mut tasks = JoinSet::new();
+    let mut task_indices = HashMap::with_capacity(sub_steps.len());
+
+    // Acquire before spawning, rather than creating one waiting task per
+    // branch. At most `max_in_flight` tasks are alive and doing work, even for
+    // the 200-document fan-out this runner is intended to support.
+    for (index, sub_step) in sub_steps.iter().enumerate() {
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("the parallel-step semaphore is never closed");
         let sub_step = sub_step.clone();
         let mut sub_context = context.clone();
         let client = client.clone();
         let options = options.clone();
-        handles.push(tokio::spawn(async move {
+        let task = tasks.spawn(async move {
+            let _permit = permit;
             let result = match sub_step.action.as_str() {
                 "set" => run_set_step(&sub_step, &mut sub_context, false),
                 "message" => run_message_step(&sub_step, &mut sub_context, false),
@@ -1767,38 +1855,137 @@ async fn run_parallel_step(
                 }
                 other => Err(anyhow!("unsupported step action in parallel: {other}")),
             };
-            (sub_step.id.clone(), result, sub_context)
-        }));
+            (index, result, sub_context)
+        });
+        task_indices.insert(task.id(), index);
     }
 
-    let mut sub_results = Vec::new();
-    for handle in handles {
-        let (sub_id, result, sub_context): (String, Result<WorkflowStepResult>, _) =
-            handle.await.context("parallel step panicked")?;
-        let step_result = result.with_context(|| format!("parallel sub-step '{sub_id}' failed"))?;
-        // Merge sub-step context back into parent
-        for (key, value) in sub_context {
-            if !context.contains_key(&key) || key == sub_id {
-                context.insert(key, value);
+    let mut completed_tasks: Vec<Option<ParallelTaskCompletion>> = std::iter::repeat_with(|| None)
+        .take(sub_steps.len())
+        .collect();
+
+    while let Some(joined) = tasks.join_next_with_id().await {
+        match joined {
+            Ok((task_id, (index, result, sub_context))) => {
+                task_indices.remove(&task_id);
+                completed_tasks[index] = Some((result, sub_context));
+            }
+            Err(join_error) => {
+                if let Some(index) = task_indices.remove(&join_error.id()) {
+                    completed_tasks[index] = Some((
+                        Err(anyhow!("parallel worker task failed: {join_error}")),
+                        BTreeMap::new(),
+                    ));
+                } else {
+                    tracing::error!(
+                        task_id = %join_error.id(),
+                        error = %join_error,
+                        "parallel worker ended without task metadata"
+                    );
+                }
             }
         }
-        sub_results.push(step_result);
     }
+
+    let mut sub_results = Vec::with_capacity(sub_steps.len());
+    let mut failures = Vec::new();
+    let mut completed = 0usize;
+    for (index, completed_task) in completed_tasks.into_iter().enumerate() {
+        let sub_step = &sub_steps[index];
+        let (result, sub_context) = completed_task.unwrap_or_else(|| {
+            (
+                Err(anyhow!(
+                    "parallel worker ended without reporting an outcome"
+                )),
+                BTreeMap::new(),
+            )
+        });
+        match result {
+            Ok(step_result) => {
+                // Merge successful contexts in declaration order. Completion
+                // timing therefore cannot make collision resolution or output
+                // ordering change between runs.
+                for (key, value) in sub_context {
+                    if !context.contains_key(&key) || key == sub_step.id {
+                        context.insert(key, value);
+                    }
+                }
+                completed += 1;
+                sub_results.push(step_result);
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                failures.push((sub_step.id.clone(), reason.clone()));
+                sub_results.push(WorkflowStepResult {
+                    id: sub_step.id.clone(),
+                    action: sub_step.action.clone(),
+                    status: "failed".to_string(),
+                    summary: format!("parallel sub-step '{}' failed: {reason}", sub_step.id),
+                    data: serde_json::json!({ "error": reason }),
+                });
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        // Preserve the established all-success contract exactly: callers see
+        // the same status, summary, context fields, and `sub_steps` shape.
+        context.insert(
+            step.id.clone(),
+            serde_json::json!({
+                "completed": sub_results.len(),
+                "steps": sub_results.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            }),
+        );
+
+        return Ok(WorkflowStepResult {
+            id: step.id.clone(),
+            action: step.action.clone(),
+            status: "completed".to_string(),
+            summary: format!("parallel {} steps completed", sub_results.len()),
+            data: serde_json::json!({ "sub_steps": sub_results }),
+        });
+    }
+
+    let failure_data = failures
+        .iter()
+        .map(|(id, reason)| serde_json::json!({ "id": id, "reason": reason }))
+        .collect::<Vec<_>>();
+    let failure_summary = failures
+        .iter()
+        .map(|(id, reason)| format!("{id}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ");
 
     context.insert(
         step.id.clone(),
         serde_json::json!({
-            "completed": sub_results.len(),
+            "completed": completed,
+            "failed": failures.len(),
             "steps": sub_results.iter().map(|r| &r.id).collect::<Vec<_>>(),
+            "failures": failure_data,
         }),
     );
 
+    // A branch failure is a partial result, not a parent-step error: returning
+    // `Err` here would discard valid sibling outputs. `partial` is carried in
+    // the workflow's ordered step results, so API and CLI callers receive it
+    // without the run becoming either a silent success or a whole-run error.
+    // This deliberately bypasses the outer retry loop: retrying the whole
+    // fan-out would repeat successful branches and their possible side effects.
     Ok(WorkflowStepResult {
         id: step.id.clone(),
         action: step.action.clone(),
-        status: "completed".to_string(),
-        summary: format!("parallel {} steps completed", sub_results.len()),
-        data: serde_json::json!({ "sub_steps": sub_results }),
+        status: "partial".to_string(),
+        summary: format!(
+            "parallel {completed} of {} steps completed; {} failed: {failure_summary}",
+            sub_results.len(),
+            failures.len()
+        ),
+        data: serde_json::json!({
+            "sub_steps": sub_results,
+            "failures": failure_data,
+        }),
     })
 }
 
@@ -1812,6 +1999,9 @@ async fn run_parallel_step(
 //       paper: "{{ paper }}"
 //       dataset: "{{ candidates }}"
 //
+// Keep authentication, credential, and resource policies explicit here so a
+// nested workflow inherits every execution boundary from its parent.
+#[allow(clippy::too_many_arguments)]
 async fn run_workflow_step(
     step: &WorkflowStep,
     context: &mut BTreeMap<String, serde_json::Value>,
@@ -1820,6 +2010,7 @@ async fn run_workflow_step(
     principal: &str,
     role: &str,
     options: &WorkflowExecutionOptions,
+    parallel_policy: &ParallelExecutionPolicy,
 ) -> Result<WorkflowStepResult> {
     // Aliases: `name` (canonical) | `workflow`
     let workflow_name = config_first(&step.config, &["name", "workflow"])
@@ -1869,7 +2060,7 @@ async fn run_workflow_step(
     let child_spec = find_workflow(&specs, workflow_name)
         .ok_or_else(|| anyhow!("sub-workflow '{}' not found", workflow_name))?;
 
-    let child_result = Box::pin(execute_workflow_with_policy_and_options(
+    let child_result = Box::pin(execute_workflow_with_parallel_policy(
         child_spec,
         &values,
         true,
@@ -1877,20 +2068,40 @@ async fn run_workflow_step(
         Some(principal),
         Some(role),
         options,
+        parallel_policy,
     ))
     .await?;
 
     // Merge child context into parent under the step id
     context.insert(step.id.clone(), serde_json::to_value(&child_result)?);
 
+    // A nested workflow must not relabel a child's partial fan-out as fully
+    // completed. Its ordered child results remain in `data` for inspection.
+    let child_is_partial = child_result
+        .steps
+        .iter()
+        .any(|result| matches!(result.status.as_str(), "partial" | "failed"));
+
     Ok(WorkflowStepResult {
         id: step.id.clone(),
         action: step.action.clone(),
-        status: "completed".to_string(),
-        summary: format!(
-            "workflow:{workflow_name} → {} steps completed",
-            child_result.steps.len()
-        ),
+        status: if child_is_partial {
+            "partial"
+        } else {
+            "completed"
+        }
+        .to_string(),
+        summary: if child_is_partial {
+            format!(
+                "workflow:{workflow_name} → {} steps completed with partial results",
+                child_result.steps.len()
+            )
+        } else {
+            format!(
+                "workflow:{workflow_name} → {} steps completed",
+                child_result.steps.len()
+            )
+        },
         data: serde_json::to_value(&child_result)?,
     })
 }
