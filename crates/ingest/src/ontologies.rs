@@ -54,6 +54,64 @@ pub const DEFAULT_ONTOLOGY_ID: &str = "emmo";
 const REFERENTIAL_INTEGRITY_RULE: &str =
     "Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".";
 
+/// The typed-measurement rule for the prompt, derived from the SAME
+/// [`Ontology::quantitative_labels`] declaration the extraction schema's
+/// per-type variant enforces structurally. The schema locks the SHAPE;
+/// this line states the INTENT the shape exists for — a schema cannot say
+/// which field a thing belongs in, which is exactly how a model came to
+/// satisfy it by naming a Property `"1100 MPa"` (live 2026-08-08: value and
+/// unit stored as text inside the entity NAME, `prov_assertion.value` null,
+/// nothing queryable as a number). And it states WHERE the number belongs:
+/// on the RELATIONSHIP, per material — a value on a shared property node
+/// attributes to nobody (live 2026-08-10: one node's 880 was stored as five
+/// alloys' yield strength). One builder shared by the trait default AND
+/// [`EmmoOntology`]'s legacy override, so the two prompts cannot drift on
+/// the invariant.
+fn typed_value_rule(labels: &[&str]) -> String {
+    let types = labels
+        .iter()
+        .map(|label| format!("\"{label}\""))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "For {types} entities: \"name\" is the property NAME (e.g. \"yield strength\"), \
+         NEVER the measured value — an entity named like \"1100 MPa\" is rejected, not \
+         stored. Each material's measured number goes on that material's OWN relationship \
+         to the property: set the relationship's \"value\" to the number and \"unit\" to \
+         one of the listed units (one value per material — never one shared number for \
+         several materials; if no listed unit fits, leave \"value\" and \"unit\" out of \
+         the relationship entirely). Units: {}. Use the unit that measures the SAME \
+         quantity as the property — a density belongs in QUDT:GM-PER-CentiM3 or \
+         QUDT:KiloGM-PER-M3, never in a pressure unit.",
+        unit_roster()
+    )
+}
+
+/// Human-readable roster of the declared extraction units, grouped by the
+/// quantity kind each measures — derived from the ONE
+/// [`crate::qudt_units::EXTRACTION_UNITS`] table, never a second list. The
+/// prompt must carry this because the grammar shows the model NOTHING: the
+/// enum lock constrains the unit to the vocabulary but cannot say which
+/// member measures what, and the live enum-locked model completed its
+/// `g/cm3` intent as `QUDT:GigaPA` — a pressure unit on every density
+/// (2026-08-10 run 4; the quantity-kind gate dropped nothing because it
+/// did not yet cover the edge channel, and the falsehoods reached the
+/// store).
+fn unit_roster() -> String {
+    let mut groups: Vec<(crate::qudt_units::QuantityKind, Vec<&'static str>)> = Vec::new();
+    for (id, kind) in crate::qudt_units::EXTRACTION_UNITS {
+        match groups.iter_mut().find(|(existing, _)| existing == kind) {
+            Some((_, ids)) => ids.push(id),
+            None => groups.push((*kind, vec![id])),
+        }
+    }
+    groups
+        .iter()
+        .map(|(kind, ids)| format!("{} for {}", ids.join("/"), kind.label()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// One ontology vocabulary. The contract the ingest pipeline depends on:
 /// the extraction prompt is built from [`Ontology::extraction_preamble`] and
 /// [`Ontology::extraction_instructions`], and graph validation accepts
@@ -146,6 +204,42 @@ pub trait Ontology: Send + Sync {
             .map(String::as_str)
     }
 
+    /// Extraction labels whose entities state a MEASURED QUANTITY — the
+    /// vocabulary's property/measurement classes. THREE consumers read this
+    /// one declaration, so they cannot drift: the extraction JSON schema
+    /// emits a per-type variant REQUIRING typed `value`/`unit` members on
+    /// these types ([`crate::extraction_schema`]), the extraction prompt
+    /// states the same rule in prose ([`typed_value_rule`]), and graph
+    /// validation rejects such an entity whose NAME is itself a measurement
+    /// ([`crate::graph_validation::measurement_packed_in_name`]) — the
+    /// form-versus-field failure where the model satisfies the schema by
+    /// naming a Property `"1100 MPa"` and the graph holds the number as
+    /// unqueryable text.
+    ///
+    /// Default: none — an ontology without measurement classes keeps the
+    /// single unconstrained entity shape and an unchanged prompt.
+    fn quantitative_labels(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Extraction labels of the relationships that CARRY a measurement —
+    /// the edges [`crate::local_facts`] maps to `measurement` facts. The
+    /// extraction schema builds these as dedicated variants: a measured
+    /// edge (typed `value` + enum-locked `unit` REQUIRED, and NO
+    /// `weight`/`order` members at all) or a bare property link (endpoints
+    /// only). The exclusions are measured necessity: given any optional
+    /// numeric slot on the edge, the live 12B model put every per-row
+    /// number there and stated no unit (2026-08-10 run 3: all ten values
+    /// landed in `weight` on the plain variant, silently unmappable) — a
+    /// number on a measured edge must have exactly one place to go, and
+    /// that place demands its unit.
+    ///
+    /// Default: none — an ontology without measurement relations keeps the
+    /// single historical edge shape.
+    fn measurement_relations(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
     /// Opening sentence of the tabular extraction prompt.
     fn extraction_preamble(&self) -> String {
         format!(
@@ -161,12 +255,22 @@ pub trait Ontology: Send + Sync {
     /// so for an ontology that does not override this, prompt and validator
     /// cannot disagree. An override owns keeping the two aligned.
     fn extraction_instructions(&self) -> String {
+        // The typed-value rule appears exactly when the declaration names
+        // quantitative classes — an ontology without them keeps this prompt
+        // byte-identical to what it always produced.
+        let quantitative = self.quantitative_labels();
+        let typed_rule = if quantitative.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", typed_value_rule(&quantitative))
+        };
         format!(
             "## Instructions\n\
              Identify ALL entities and relationships present in the data.\n\
              Every entity \"type\" MUST be one of: {}.\n\
              Every relationship \"rel\" MUST be one of: {}.\n\
              {REFERENTIAL_INTEGRITY_RULE}\n\
+             {typed_rule}\
              Return ONLY valid JSON with this structure:\n\
              {{\n\
              \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
@@ -325,6 +429,39 @@ impl Ontology for EmmoOntology {
         }
     }
 
+    /// Derived from the DECLARATION, not a frozen list: every declared
+    /// extraction class at-or-below the class the `Property` label resolves
+    /// to in the loaded closure. Today that is exactly `["Property"]`; an
+    /// ontology update declaring subclasses of it inherits the typed-value
+    /// contract (schema variant + prompt rule + packed-name rejection)
+    /// automatically.
+    fn quantitative_labels(&self) -> Vec<&str> {
+        let Some(root) = self.class_for_label("Property") else {
+            return Vec::new();
+        };
+        self.classes()
+            .iter()
+            .filter(|class| self.is_a(&class.iri, &root.iri))
+            .flat_map(|class| class.extraction_labels.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Rooted in the declaration like `quantitative_labels`: the extraction
+    /// labels of the declared `HAS_PROPERTY` object property — the one
+    /// relationship `local_facts` maps to `measurement` facts. Empty if the
+    /// declaration ever stops carrying it.
+    fn measurement_relations(&self) -> Vec<&str> {
+        self.relation_for_label("HAS_PROPERTY")
+            .map(|relation| {
+                relation
+                    .extraction_labels
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The legacy prompt opening, verbatim (byte-identity contract).
     fn extraction_preamble(&self) -> String {
         "You are a materials science data analyst. Given a dataset schema and sample rows, \
@@ -332,11 +469,15 @@ impl Ontology for EmmoOntology {
             .to_string()
     }
 
-    /// The legacy `## Instructions` block, verbatim EXCEPT for the added
-    /// [`REFERENTIAL_INTEGRITY_RULE`] line — the deliberate byte-identity
-    /// break documented on [`EmmoOntology`]: the verbatim text is what
-    /// produced extractions the validator then refused wholesale.
+    /// The legacy `## Instructions` block, verbatim EXCEPT for two added
+    /// lines — deliberate byte-identity breaks documented on
+    /// [`EmmoOntology`]: the [`REFERENTIAL_INTEGRITY_RULE`] (the verbatim
+    /// text produced extractions the validator refused wholesale) and the
+    /// [`typed_value_rule`] (the verbatim text let the model satisfy the
+    /// schema by naming a Property `"1100 MPa"`, storing the number as
+    /// unqueryable text — live 2026-08-08).
     fn extraction_instructions(&self) -> String {
+        let typed_rule = typed_value_rule(&self.quantitative_labels());
         format!(
             "## Instructions\n\
              Identify ALL materials science entities:\n\
@@ -350,7 +491,8 @@ impl Ontology for EmmoOntology {
              - PROCESSED_BY (material → process, with order)\n\
              - HAS_PROPERTY (material → property)\n\
              - HAS_PHASE (material → phase)\n\n\
-             {REFERENTIAL_INTEGRITY_RULE}\n\n\
+             {REFERENTIAL_INTEGRITY_RULE}\n\
+             {typed_rule}\n\n\
              Return ONLY valid JSON with this structure:\n\
              {{\n\
                \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
@@ -1331,6 +1473,49 @@ mod tests {
         assert_eq!(tenant, "local@matkg");
         assert_ne!(tenant, "local", "MatKG facts must never blend with local");
         assert!(!tenant.starts_with("mesh"), "and never look like a peer");
+    }
+
+    /// EMMO's quantitative declaration is DERIVED (classes at-or-below the
+    /// class the `Property` label resolves to), and today that is exactly
+    /// `["Property"]`. An ontology that declares no Property-like class —
+    /// the trait default — declares nothing quantitative, so its schema and
+    /// prompt stay byte-identical to what they always were.
+    #[test]
+    fn quantitative_labels_derive_from_the_declaration() {
+        assert_eq!(EmmoOntology.quantitative_labels(), ["Property"]);
+        let fake = Fake::new("chem-q", &["Molecule"], &["REACTS_WITH"]);
+        assert!(fake.quantitative_labels().is_empty());
+    }
+
+    /// The measurement-relation declaration mirrors the quantitative one:
+    /// EMMO's is rooted in its declared HAS_PROPERTY object property; an
+    /// ontology declaring no such relationship declares no measured edges,
+    /// so its relationship schema keeps the single historical shape.
+    #[test]
+    fn measurement_relations_derive_from_the_declaration() {
+        assert_eq!(EmmoOntology.measurement_relations(), ["HAS_PROPERTY"]);
+        let fake = Fake::new("chem-m", &["Molecule"], &["REACTS_WITH"]);
+        assert!(fake.measurement_relations().is_empty());
+    }
+
+    /// Both instruction builders state the typed-value rule exactly when the
+    /// declaration names quantitative classes: EMMO (and any default-flavour
+    /// ontology declaring them) must say the name is never the measurement;
+    /// an ontology without quantitative classes must NOT gain the line (its
+    /// prompt has no field the rule could bind to). Fragments are hardcoded
+    /// here so a reworded-away rule fails too.
+    #[test]
+    fn instruction_builders_state_the_typed_value_rule_iff_quantitative() {
+        let emmo = EmmoOntology.extraction_instructions();
+        assert!(
+            emmo.contains("NEVER the measured value") && emmo.contains("relationship's \"value\""),
+            "emmo instructions no longer state the typed-value rule:\n{emmo}"
+        );
+        let none = Fake::new("chem-q2", &["Molecule"], &["REACTS_WITH"]).extraction_instructions();
+        assert!(
+            !none.contains("NEVER the measured value"),
+            "an ontology with no quantitative classes must not gain the rule:\n{none}"
+        );
     }
 
     /// `HAS_PHASE` is now one declared, IRI-backed object property. It was

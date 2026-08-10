@@ -711,6 +711,16 @@ fn validate_before_graph_write(
                 // document is stored. The unit is never rewritten — that
                 // would fabricate a measurement the extraction never made.
                 dropped.push(reason);
+            } else if let Some(reason) =
+                crate::graph_validation::measurement_packed_in_name(ontology, e)
+            {
+                // The form-versus-field corruption (Check 12, Error): a
+                // quantitative entity NAMED after its measurement
+                // ("1100 MPa") is dropped and reported, never stored as a
+                // fake Property — the name is an identity key, and a number
+                // inside it is unqueryable text. Its relationships dangle
+                // and are dropped (and reported) below.
+                dropped.push(reason);
             } else {
                 kept.push(e.clone());
             }
@@ -912,6 +922,8 @@ mod tests {
                 to: "Fe".into(),
                 weight: None,
                 order: None,
+                value: None,
+                unit: None,
             }],
         };
         let (report, plan) =
@@ -970,6 +982,86 @@ mod tests {
         assert!(dropped_entities.is_empty());
     }
 
+    /// The measured live defect, contained at the production gate: a
+    /// Property NAMED "1100 MPa" (measurement packed into the name — the
+    /// form-versus-field failure) is dropped and REPORTED, never stored as
+    /// a fake Property; the relationship referencing it dangles and drops
+    /// with it; and the properly-typed sibling measurement is kept whole.
+    /// Removing the containment branch turns this Proceed into a Blocked —
+    /// this test dies either way a mutation leans.
+    #[test]
+    fn validate_before_graph_write_drops_and_reports_measurement_named_properties() {
+        use crate::{Entity, Relationship};
+        let rel = |to: &str| Relationship {
+            from: "Inconel 718".into(),
+            rel_type: "HAS_PROPERTY".into(),
+            to: to.into(),
+            weight: None,
+            order: None,
+            value: None,
+            unit: None,
+        };
+        let entity_set = EntitySet {
+            entities: vec![
+                Entity {
+                    entity_type: "Alloy".into(),
+                    name: "Inconel 718".into(),
+                    properties: serde_json::json!({}),
+                },
+                // The defect shape: value and unit as TEXT inside the name.
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "1100 MPa".into(),
+                    properties: serde_json::json!({}),
+                },
+                // The correct shape: name is the property NAME, value and
+                // unit are typed fields.
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "density".into(),
+                    properties: serde_json::json!({"value": 8.19, "unit": "g/cm3"}),
+                },
+            ],
+            relationships: vec![rel("1100 MPa"), rel("density")],
+        };
+        let (report, plan) =
+            validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
+        assert!(!report.passed, "the report records the packed name");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "measurement_in_name"),
+            "{:?}",
+            report.issues
+        );
+        let GraphWritePlan::Proceed {
+            set,
+            dropped,
+            dropped_entities,
+        } = plan
+        else {
+            panic!("a packed-name Property must be contained, not block the ingest");
+        };
+        assert!(
+            !set.entities.iter().any(|e| e.name == "1100 MPa"),
+            "a Property named after a measurement must never reach the write set"
+        );
+        assert_eq!(dropped_entities.len(), 1, "{dropped_entities:?}");
+        assert!(
+            dropped_entities[0].contains("1100 MPa"),
+            "{}",
+            dropped_entities[0]
+        );
+        // Its edge dangles and is dropped (and reported) with it…
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert!(dropped[0].contains("1100 MPa"), "{}", dropped[0]);
+        // …while the typed sibling survives intact.
+        assert!(set.entities.iter().any(|e| e.name == "density"));
+        assert_eq!(set.relationships.len(), 1);
+        assert_eq!(set.relationships[0].to, "density");
+    }
+
     #[test]
     fn pipeline_config_default_has_llm_and_bundled_store() {
         let cfg = PipelineConfig::default();
@@ -1022,6 +1114,8 @@ mod tests {
                     to: "Fe".into(),
                     weight: Some(0.98),
                     order: None,
+                    value: None,
+                    unit: None,
                 },
                 Relationship {
                     from: "Steel".into(),
@@ -1029,6 +1123,8 @@ mod tests {
                     to: "density".into(),
                     weight: None,
                     order: None,
+                    value: None,
+                    unit: None,
                 },
             ],
         };
@@ -1130,6 +1226,8 @@ mod tests {
                 to: "Fe".into(),
                 weight: Some(0.98),
                 order: None,
+                value: None,
+                unit: None,
             }],
         };
         let source = DataSource {
@@ -1210,6 +1308,8 @@ mod tests {
             to: to.into(),
             weight: None,
             order: None,
+            value: None,
+            unit: None,
         };
 
         let entity_set = EntitySet {
@@ -2473,19 +2573,49 @@ mod tests {
         assert_eq!(body["temperature"], 0.0);
         assert_eq!(body["seed"], prism_llm::EXTRACTION_SEED);
         let schema = &body["response_format"]["json_schema"]["schema"];
+        // EMMO declares quantitative classes, so the entity items on the
+        // WIRE are per-type variants: the quantitative one (Property,
+        // value/unit REQUIRED — the field-use half the enum lock alone
+        // never gave) and the open one (everything else).
+        let quant_enum = schema
+            .pointer("/properties/entities/items/oneOf/0/properties/type/enum")
+            .and_then(|v| v.as_array())
+            .expect("quantitative entity type enum present");
+        assert!(quant_enum.iter().any(|v| v == "Property"), "{quant_enum:?}");
+        assert_eq!(
+            schema.pointer("/properties/entities/items/oneOf/0/properties/properties/required"),
+            Some(&serde_json::json!(["value", "unit"])),
+            "the request no longer REQUIRES typed value/unit on Property \
+             entities — the model may again pack the measurement into the name"
+        );
         let entity_enum = schema
-            .pointer("/properties/entities/items/properties/type/enum")
+            .pointer("/properties/entities/items/oneOf/1/properties/type/enum")
             .and_then(|v| v.as_array())
             .expect("entity type enum present");
         assert!(entity_enum.iter().any(|v| v == "Alloy"), "{entity_enum:?}");
         let rel_enum = schema
-            .pointer("/properties/relationships/items/properties/rel/enum")
+            .pointer("/properties/relationships/items/oneOf/2/properties/rel/enum")
             .and_then(|v| v.as_array())
             .expect("relationship enum present");
         assert!(rel_enum.iter().any(|v| v == "CONTAINS"), "{rel_enum:?}");
+        // The per-edge coupling reaches the wire: a measured edge must
+        // state value AND unit (with `unit` optional the live model emitted
+        // every value and no units — run 2), and it must offer no unitless
+        // numeric slot (with `weight` available the model put every number
+        // there — run 3).
+        assert_eq!(
+            schema.pointer("/properties/relationships/items/oneOf/0/required"),
+            Some(&serde_json::json!(["from", "rel", "to", "value", "unit"])),
+        );
+        assert!(
+            schema
+                .pointer("/properties/relationships/items/oneOf/0/properties/weight")
+                .is_none(),
+        );
         let unit_enum = schema
             .pointer(
-                "/properties/entities/items/properties/properties/properties/unit/anyOf/0/enum",
+                "/properties/entities/items/oneOf/0\
+                 /properties/properties/properties/unit/anyOf/0/enum",
             )
             .and_then(|v| v.as_array())
             .expect("unit enum present");

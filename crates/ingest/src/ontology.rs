@@ -47,6 +47,16 @@ struct RawRelationship {
     weight: Option<f64>,
     #[serde(default, deserialize_with = "lenient_u32")]
     order: Option<u32>,
+    /// Per-edge measured value — the attribution channel for measurements
+    /// (a value on a SHARED target entity cannot say whose value it is; see
+    /// `Relationship::value`). Lenient like `weight`: models emit numeric
+    /// strings.
+    #[serde(default, deserialize_with = "lenient_f64")]
+    value: Option<f64>,
+    /// Unit spelling for `value`; resolved through the one controlled
+    /// vocabulary at fact mapping, never trusted raw.
+    #[serde(default)]
+    unit: Option<String>,
 }
 
 /// Accept a number, a numeric string ("3.5"), or anything else → None.
@@ -431,6 +441,8 @@ impl LlmOntologyConstructor {
                 to: normalise_extracted_name(&r.to),
                 weight: r.weight,
                 order: r.order,
+                value: r.value,
+                unit: r.unit,
             })
             .collect();
 
@@ -484,19 +496,24 @@ mod tests {
         assert!(prompt.contains("PROCESSED_BY"));
     }
 
-    /// The byte-identity contract, amended ONCE: with the built-in EMMO
+    /// The byte-identity contract, amended TWICE: with the built-in EMMO
     /// ontology active, the extraction prompt is EXACTLY the string the
     /// pre-trait hardcoded builder produced PLUS the referential-integrity
-    /// line ("Every name used in \"from\" or \"to\" MUST also appear…").
-    /// That single divergence is deliberate: the verbatim legacy text told
-    /// the model nothing about declaring relationship endpoints, while
-    /// graph validation refuses undeclared endpoints (`orphan_rel`, Error
-    /// severity) — so the byte-identical prompt reliably produced
-    /// extractions that could not be stored (live 2026-08-08: 13 entities,
-    /// 13 relationships, 17 orphan errors, nothing written). Everything
-    /// else must still not shift by a byte.
+    /// line ("Every name used in \"from\" or \"to\" MUST also appear…")
+    /// PLUS the typed-value rule ("For \"Property\" entities: \"name\" is
+    /// the property NAME…"). Both divergences are deliberate: the verbatim
+    /// legacy text told the model nothing about declaring relationship
+    /// endpoints, while graph validation refuses undeclared endpoints
+    /// (`orphan_rel`, Error severity) — so the byte-identical prompt
+    /// reliably produced extractions that could not be stored (live
+    /// 2026-08-08: 13 entities, 13 relationships, 17 orphan errors, nothing
+    /// written). And it told the model nothing about which FIELD a
+    /// measurement belongs in, so the model satisfied the schema by naming
+    /// Properties after their measurements (live 2026-08-08: "1100 MPa" as
+    /// an entity name, `prov_assertion.value` null, nothing queryable as a
+    /// number). Everything else must still not shift by a byte.
     #[test]
-    fn emmo_prompt_is_the_legacy_prompt_plus_only_the_referential_rule() {
+    fn emmo_prompt_is_the_legacy_prompt_plus_only_the_two_added_rules() {
         let schema = SchemaAnalysis {
             columns: vec!["Composition".into(), "Hardness_HV".into()],
             detected_types: vec!["string".into(), "float".into()],
@@ -529,7 +546,19 @@ mod tests {
              - PROCESSED_BY (material → process, with order)\n\
              - HAS_PROPERTY (material → property)\n\
              - HAS_PHASE (material → phase)\n\n\
-             Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".\n\n\
+             Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".\n\
+             For \"Property\" entities: \"name\" is the property NAME (e.g. \"yield strength\"), \
+             NEVER the measured value — an entity named like \"1100 MPa\" is rejected, not \
+             stored. Each material's measured number goes on that material's OWN relationship \
+             to the property: set the relationship's \"value\" to the number and \"unit\" to \
+             one of the listed units (one value per material — never one shared number for \
+             several materials; if no listed unit fits, leave \"value\" and \"unit\" out of \
+             the relationship entirely). Units: QUDT:PA/QUDT:KiloPA/QUDT:MegaPA/QUDT:GigaPA \
+             for pressure/stress; QUDT:KiloGM-PER-M3/QUDT:GM-PER-CentiM3 for density; \
+             QUDT:K/QUDT:DEG_C for temperature; QUDT:W-PER-M-K for thermal conductivity; \
+             QUDT:PERCENT for fraction. Use the unit that measures the SAME quantity as the \
+             property — a density belongs in QUDT:GM-PER-CentiM3 or QUDT:KiloGM-PER-M3, \
+             never in a pressure unit.\n\n\
              Return ONLY valid JSON with this structure:\n\
              {\n\
                \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\
@@ -748,6 +777,35 @@ mod tests {
             Some(2),
             "string order parses"
         );
+    }
+
+    /// The per-edge measurement channel parses off the wire with the same
+    /// leniency as `weight` (numeric strings happen), the unit rides along
+    /// verbatim (the ONE vocabulary resolves it at fact mapping), and both
+    /// default to None when absent — old extractions parse unchanged.
+    #[test]
+    fn relationship_value_and_unit_parse_leniently_and_default_off() {
+        let json = r#"{
+            "entities": [],
+            "relationships": [
+                {"from": "IN718", "rel": "HAS_PROPERTY", "to": "yield strength",
+                 "value": 1100.0, "unit": "QUDT:MegaPA"},
+                {"from": "IN718", "rel": "HAS_PROPERTY", "to": "density",
+                 "value": "8.19", "unit": "g/cm3"},
+                {"from": "IN718", "rel": "CONTAINS", "to": "Ni"}
+            ]
+        }"#;
+        let parsed: ExtractionOutput = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.relationships[0].value, Some(1100.0));
+        assert_eq!(parsed.relationships[0].unit.as_deref(), Some("QUDT:MegaPA"));
+        assert_eq!(
+            parsed.relationships[1].value,
+            Some(8.19),
+            "numeric string parses"
+        );
+        assert_eq!(parsed.relationships[1].unit.as_deref(), Some("g/cm3"));
+        assert_eq!(parsed.relationships[2].value, None);
+        assert_eq!(parsed.relationships[2].unit, None);
     }
 
     /// The live-path guard: zero sample rows are refused BEFORE any prompt
