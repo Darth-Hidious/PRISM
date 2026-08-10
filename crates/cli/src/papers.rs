@@ -346,7 +346,6 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             // from `rejected` (claims refused at validation): these never
             // became claims at all, and only this list says why.
             let mut dropped_facts: Vec<serde_json::Value> = Vec::new();
-            let mut truncated_bytes = 0usize;
             // Extract per located block so every claim inherits a locator a
             // human can follow back into the document.
             for block in &fulltext.blocks {
@@ -377,7 +376,6 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         "reason": reason,
                     }));
                 }
-                truncated_bytes += extraction.dropped_bytes;
                 for fact in extraction.facts {
                     // Containment: find the verbatim span of THIS block that
                     // supports the fact. Facts with no supporting span cannot
@@ -470,7 +468,10 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     // and a numeric value is never kept with its unit
                     // discarded. One entry per fact, with the reason.
                     "dropped_facts": dropped_facts,
-                    "truncated_bytes": truncated_bytes,
+                    // Every block is read WHOLE now (the extractor no longer
+                    // truncates its input); the key stays for consumers of
+                    // the old shape and is honestly always zero.
+                    "truncated_bytes": 0,
                 }))?
             );
         }

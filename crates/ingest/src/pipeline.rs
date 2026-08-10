@@ -80,15 +80,50 @@ pub struct IngestResult {
     /// "Done." with exit 0 while storing nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
+    /// Rows actually sent through LLM extraction, summed over the batches
+    /// that succeeded. `row_count` is what the source held; these two
+    /// disagreeing is ALWAYS accompanied by a per-batch entry in `errors`
+    /// naming the rows that were not processed and why. (History: exactly
+    /// 10 rows of ANY dataset were extracted and the other rows were parsed
+    /// and thrown away, reported nowhere.)
+    #[serde(default)]
+    pub rows_processed: usize,
+    /// Extraction batches planned for this run (0 when extraction was not
+    /// configured or refused). Batch size derives from the model's context
+    /// window unless `[ingest] batch_rows` overrides it.
+    #[serde(default)]
+    pub batches: usize,
+    /// Batches that did NOT complete (LLM failure, blocked validation, or a
+    /// failed graph write) — each with a matching entry in `errors`. The
+    /// other batches' facts are already stored: a mid-run failure costs the
+    /// failed batch, never the run.
+    #[serde(default)]
+    pub batches_failed: usize,
+    /// Token usage the backend reported, summed over every extraction call
+    /// of the run. Output is metered and billed per token — this is what
+    /// the run actually cost. `None` = the backend reported nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_usage: Option<prism_llm::UsageInfo>,
 }
 
+/// Progress sink for a pipeline run: one human-readable line per event
+/// (plan, batch start, batch outcome). These runs are long by design — a
+/// 12B local model takes minutes per batch — so a silent terminal is a bug;
+/// the CLI prints these to stderr as they happen.
+pub type ProgressFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Configuration for a full ingest pipeline run.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PipelineConfig {
     /// LLM config for entity extraction. If None, extraction is skipped.
     pub llm: Option<LlmConfig>,
-    /// Maximum sample rows to send to the LLM.
-    pub max_sample_rows: usize,
+    /// Rows per extraction batch (`[ingest] batch_rows`). `None` ⇒ batches
+    /// are packed to a byte budget derived from the model's context window
+    /// (`crate::batching`) — derived, not decreed. EVERY row is processed
+    /// either way; this only shapes the batches. (History: this was
+    /// `max_sample_rows: 10`, hardcoded in two places, and rows 11+ of any
+    /// dataset were parsed and thrown away without a word.)
+    pub batch_rows: Option<usize>,
     /// Custom ontology mapping rules (loaded from YAML).
     pub mapping: Option<crate::mapping::OntologyMapping>,
     /// Path of the bundled Turso provenance store the extracted facts are
@@ -99,16 +134,32 @@ pub struct PipelineConfig {
     /// the built-in default (EMMO). An id nothing registered fails the run
     /// loudly — never a silent EMMO fallback.
     pub ontology: Option<String>,
+    /// Progress sink; `None` = silent (library callers, tests).
+    pub on_progress: Option<ProgressFn>,
+}
+
+impl std::fmt::Debug for PipelineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineConfig")
+            .field("llm", &self.llm)
+            .field("batch_rows", &self.batch_rows)
+            .field("mapping", &self.mapping.is_some())
+            .field("provenance_db", &self.provenance_db)
+            .field("ontology", &self.ontology)
+            .field("on_progress", &self.on_progress.is_some())
+            .finish()
+    }
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             llm: Some(LlmConfig::default()),
-            max_sample_rows: 10,
+            batch_rows: None,
             mapping: None,
             provenance_db: None,
             ontology: None,
+            on_progress: None,
         }
     }
 }
@@ -132,11 +183,19 @@ impl IngestPipeline {
         Self {
             config: PipelineConfig {
                 llm: None,
-                max_sample_rows: 10,
+                batch_rows: None,
                 mapping: None,
                 provenance_db: None,
                 ontology: None,
+                on_progress: None,
             },
+        }
+    }
+
+    /// Emit one progress line to the configured sink, if any.
+    fn progress(&self, line: &str) {
+        if let Some(sink) = &self.config.on_progress {
+            sink(line);
         }
     }
 
@@ -202,13 +261,19 @@ impl IngestPipeline {
             );
         }
 
-        // Step 3: LLM entity extraction (if configured)
-        let mut errors: Vec<String> = Vec::new();
-        // Error-severity validation (empty frame, duplicate columns) is a
-        // refusal to extract, not a warning to scroll past — see
+        // Step 3: LLM entity extraction (if configured) — over EVERY row,
+        // in successive batches sized to the model's context window. Each
+        // batch is extracted, validated (SHACL-lite with the same contained
+        // drop classes as before), and WRITTEN before the next one starts,
+        // so a failure at batch 7 of 20 costs batch 7: everything already
+        // written stays written and the failure lands on the errors spine.
+        //
+        // Error-severity input validation (empty frame, duplicate columns)
+        // is a refusal to extract, not a warning to scroll past — see
         // `extraction_refusal`. Checked only when extraction is configured:
         // a schema-only run extracts nothing and already reports the full
         // `validation` field.
+        let mut errors: Vec<String> = Vec::new();
         let refusal = self
             .config
             .llm
@@ -219,113 +284,6 @@ impl IngestPipeline {
             errors.push(msg.clone());
         }
         let mut extraction_decoding: Option<prism_llm::JsonDecodingTrace> = None;
-        let entities = if refusal.is_none()
-            && let Some(ref llm_config) = self.config.llm
-        {
-            let constructor = LlmOntologyConstructor::new(llm_config.clone());
-            let sample_rows = extract_sample_rows(&df, self.config.max_sample_rows);
-
-            tracing::info!(
-                model = %llm_config.model,
-                sample_rows = sample_rows.len(),
-                "sending to LLM for entity extraction"
-            );
-
-            match constructor
-                .extract_entities_traced(
-                    ontology.as_ref(),
-                    &schema,
-                    &sample_rows,
-                    self.config.mapping.as_ref(),
-                )
-                .await
-            {
-                Ok(traced) => {
-                    tracing::info!(
-                        entities = traced.entities.entities.len(),
-                        relationships = traced.entities.relationships.len(),
-                        decoding = traced.decoding.mode.as_str(),
-                        "LLM extraction complete"
-                    );
-                    if let Some(reason) = &traced.decoding.degraded {
-                        // Degradation is honest at every layer: logged here,
-                        // carried on the result for the CLI summary.
-                        tracing::warn!("constrained extraction degraded: {reason}");
-                    }
-                    extraction_decoding = Some(traced.decoding);
-                    Some(traced.entities)
-                }
-                Err(e) => {
-                    tracing::error!("LLM extraction failed: {e:#}");
-                    errors.push(format!("LLM extraction failed: {e:#}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Step 3.5: Graph quality validation (SHACL-lite) — this used to be a
-        // documented "runs before writing to Neo4j" gate with zero callers
-        // (AUDIT_BACKLOG 20 / INGESTION_AUDIT #20), so LLM extraction output
-        // went straight to the graph unchecked. Run it whenever entities
-        // exist. Error-severity issues refuse the graph write, with TWO
-        // contained classes: a relationship whose endpoint was never declared
-        // (`orphan_rel`) invalidates THAT relationship, and an entity whose
-        // name normalised to nothing invalidates THAT entity — each is
-        // dropped and reported (`dropped_relationships`/`dropped_entities`),
-        // and everything valid is still stored. Failing wholesale here is
-        // what kept the graph empty (2026-08-08: 17 orphan errors discarded
-        // 13 good entities); inventing a missing endpoint would fabricate a
-        // type.
-        let mut dropped_relationships: Vec<String> = Vec::new();
-        let mut dropped_entities: Vec<String> = Vec::new();
-        let mut write_set: Option<EntitySet> = None;
-        let graph_validation = entities.as_ref().map(|entity_set| {
-            let (report, plan) = validate_before_graph_write(ontology.as_ref(), entity_set);
-            match plan {
-                GraphWritePlan::Blocked(msg) => {
-                    tracing::error!(issues = report.issues.len(), "{msg}");
-                    errors.push(msg);
-                }
-                GraphWritePlan::Proceed {
-                    set,
-                    dropped,
-                    dropped_entities: dropped_ents,
-                } => {
-                    if !dropped_ents.is_empty() {
-                        tracing::warn!(
-                            dropped = dropped_ents.len(),
-                            extracted = entity_set.entities.len(),
-                            "entities of types the active ontology maps to no storage \
-                             label were dropped; the valid remainder is stored"
-                        );
-                    }
-                    if !dropped.is_empty() {
-                        tracing::warn!(
-                            dropped = dropped.len(),
-                            extracted = entity_set.relationships.len(),
-                            "relationships referencing undeclared entities were dropped; \
-                             the valid remainder is stored"
-                        );
-                    } else if dropped_ents.is_empty() && !report.issues.is_empty() {
-                        tracing::warn!(
-                            issues = report.issues.len(),
-                            "graph validation found non-blocking issues"
-                        );
-                    }
-                    dropped_relationships = dropped;
-                    dropped_entities = dropped_ents;
-                    write_set = Some(set);
-                }
-            }
-            report
-        });
-
-        // Step 4: local EMMO graph write into the bundled Turso store (if
-        // entities exist and validation produced a writable set). This
-        // replaced the Neo4j upsert (Neo4j retirement, step 1) — the store
-        // is bundled, so no backend config gates the write.
         // Facts land under the ontology's storage tenant: the default
         // ontology keeps the bare "local" tenant every existing store was
         // written with; any other ontology gets a composed tenant, which is
@@ -333,47 +291,266 @@ impl IngestPipeline {
         // tenant-qualified isolation that separates local and peer knowledge).
         let tenant =
             crate::ontologies::storage_tenant(prism_provenance::LOCAL_TENANT, ontology.id());
-        let graph = if let Some(entity_set) = &write_set {
-            match self
-                .write_local_graph(
-                    ontology.as_ref(),
-                    entity_set,
-                    &source,
-                    &tenant,
-                    extraction_decoding.as_ref(),
-                )
-                .await
-            {
-                Ok((update, fact_drops)) => {
-                    tracing::info!(
-                        nodes = update.nodes_created,
-                        edges = update.edges_created,
-                        "local graph write complete"
-                    );
-                    // Facts the fact-mapping refused (a numeric value whose
-                    // unit is missing or unresolvable — never stored
-                    // unit-less) join the same reported drop list as
-                    // referential containment: a PARTIAL result the caller
-                    // must surface, never a silent drop.
-                    if !fact_drops.is_empty() {
-                        tracing::warn!(
-                            dropped = fact_drops.len(),
-                            "numeric facts with unresolvable units were dropped; \
-                             the valid remainder is stored"
-                        );
-                    }
-                    dropped_relationships.extend(fact_drops);
-                    Some(update)
+
+        let mut merged: Option<EntitySet> = None;
+        let mut dropped_relationships: Vec<String> = Vec::new();
+        let mut dropped_entities: Vec<String> = Vec::new();
+        let mut graph: Option<GraphUpdate> = None;
+        let mut rows_processed = 0usize;
+        let mut batches = 0usize;
+        let mut batches_failed = 0usize;
+        let mut llm_usage = None;
+
+        if refusal.is_none()
+            && let Some(ref llm_config) = self.config.llm
+        {
+            let constructor = LlmOntologyConstructor::new(llm_config.clone());
+            let all_rows = extract_all_rows(&df);
+
+            // Batch plan: the operator's `[ingest] batch_rows` override, or
+            // a byte budget DERIVED from the model's context window — the
+            // binding constraint, which the local runtime reports
+            // (`probe_context_window`). An unknown window is a config gap:
+            // it is SAID, and the documented fallback bridges it.
+            let (plan, plan_note) = match self.config.batch_rows.filter(|n| *n > 0) {
+                Some(n) => (
+                    crate::batching::pack_row_batches(&all_rows, 0, Some(n)),
+                    format!("{n} row(s) per batch ([ingest] batch_rows override)"),
+                ),
+                None => {
+                    let context_window = constructor.probe_context_window().await;
+                    let budget = crate::batching::input_byte_budget(context_window);
+                    let note = match context_window {
+                        Some(cw) => format!(
+                            "batch budget {budget} bytes of row text, derived from the \
+                             model's {cw}-token context window"
+                        ),
+                        None => format!(
+                            "context window UNKNOWN (neither configured nor reported by \
+                             the backend) — assuming the documented {}-token fallback; \
+                             batch budget {budget} bytes. Set [ingest] batch_rows in \
+                             prism.toml to override.",
+                            crate::batching::FALLBACK_CONTEXT_TOKENS
+                        ),
+                    };
+                    (
+                        crate::batching::pack_row_batches(&all_rows, budget, None),
+                        note,
+                    )
                 }
-                Err(e) => {
-                    tracing::error!("local graph write failed: {e:#}");
-                    errors.push(format!("local graph write failed: {e:#}"));
-                    None
+            };
+            batches = plan.len();
+
+            // Say what this run will roughly cost BEFORE it starts: row
+            // bytes at the same ~4-bytes/token estimate the client budgets
+            // with. Output is metered and billed per token — counting is
+            // the control, so the actual usage is reported at the end.
+            let row_bytes: usize = all_rows
+                .iter()
+                .map(|r| format!("{r:?}").len() + 12)
+                .sum::<usize>();
+            self.progress(&format!(
+                "extraction plan: {} row(s) in {} batch(es); {}; ~{} tokens of row data \
+                 will be sent (plus per-batch prompt scaffold); output is metered and \
+                 billed per token",
+                all_rows.len(),
+                batches,
+                plan_note,
+                row_bytes / crate::batching::EST_BYTES_PER_TOKEN as usize,
+            ));
+            tracing::info!(
+                model = %llm_config.model,
+                rows = all_rows.len(),
+                batches,
+                "sending to LLM for entity extraction"
+            );
+
+            for (index, (start, end)) in plan.iter().enumerate() {
+                let batch_no = index + 1;
+                let rows = &all_rows[*start..*end];
+                self.progress(&format!(
+                    "batch {batch_no}/{batches}: extracting rows {}-{} of {}…",
+                    start + 1,
+                    end,
+                    all_rows.len()
+                ));
+                let batch_tag = format!("batch {batch_no}/{batches} (rows {}-{end})", start + 1);
+                let extracted = constructor
+                    .extract_entities_traced(
+                        ontology.as_ref(),
+                        &schema,
+                        rows,
+                        self.config.mapping.as_ref(),
+                    )
+                    .await;
+                let traced = match extracted {
+                    Ok(traced) => traced,
+                    Err(e) => {
+                        tracing::error!("{batch_tag}: LLM extraction failed: {e:#}");
+                        errors.push(format!("{batch_tag}: LLM extraction failed: {e:#}"));
+                        batches_failed += 1;
+                        self.progress(&format!(
+                            "batch {batch_no}/{batches}: FAILED — continuing with the \
+                             remaining batches"
+                        ));
+                        continue;
+                    }
+                };
+                let batch_decoding = traced.decoding;
+                let entity_set = traced.entities;
+                // One trace describes the run for the summary. The first
+                // batch claims the slot; a DEGRADED batch always overrides a
+                // clean one — a capability downgrade anywhere in the run
+                // must never be masked by an earlier batch that had it.
+                let replace_trace = match &extraction_decoding {
+                    None => true,
+                    Some(prev) => prev.degraded.is_none() && batch_decoding.degraded.is_some(),
+                };
+                if replace_trace {
+                    if let Some(reason) = &batch_decoding.degraded {
+                        // Degradation is honest at every layer: logged here,
+                        // carried on the result for the CLI summary.
+                        tracing::warn!("constrained extraction degraded: {reason}");
+                    }
+                    extraction_decoding = Some(batch_decoding.clone());
+                }
+
+                // Step 3.5 per batch: graph quality validation (SHACL-lite)
+                // — this used to be a documented "runs before writing to
+                // Neo4j" gate with zero callers (AUDIT_BACKLOG 20 /
+                // INGESTION_AUDIT #20), so LLM extraction output went
+                // straight to the graph unchecked. Error-severity issues
+                // refuse the batch's write, with TWO contained classes: a
+                // relationship whose endpoint was never declared
+                // (`orphan_rel`) invalidates THAT relationship, and an
+                // entity whose name normalised to nothing invalidates THAT
+                // entity — each is dropped and reported, and everything
+                // valid is still stored. Failing wholesale here is what
+                // kept the graph empty (2026-08-08: 17 orphan errors
+                // discarded 13 good entities); inventing a missing endpoint
+                // would fabricate a type.
+                let (report, batch_plan) =
+                    validate_before_graph_write(ontology.as_ref(), &entity_set);
+                merge_extraction(&mut merged, &entity_set);
+                match batch_plan {
+                    GraphWritePlan::Blocked(msg) => {
+                        tracing::error!(issues = report.issues.len(), "{batch_tag}: {msg}");
+                        errors.push(format!("{batch_tag}: {msg}"));
+                        batches_failed += 1;
+                        self.progress(&format!(
+                            "batch {batch_no}/{batches}: BLOCKED — nothing from this batch \
+                             was written; continuing with the remaining batches"
+                        ));
+                    }
+                    GraphWritePlan::Proceed {
+                        set,
+                        dropped,
+                        dropped_entities: dropped_ents,
+                    } => {
+                        if !dropped_ents.is_empty() {
+                            tracing::warn!(
+                                dropped = dropped_ents.len(),
+                                extracted = entity_set.entities.len(),
+                                "entities of types the active ontology maps to no storage \
+                                 label were dropped; the valid remainder is stored"
+                            );
+                        }
+                        if !dropped.is_empty() {
+                            tracing::warn!(
+                                dropped = dropped.len(),
+                                extracted = entity_set.relationships.len(),
+                                "relationships referencing undeclared entities were \
+                                 dropped; the valid remainder is stored"
+                            );
+                        }
+                        dropped_relationships.extend(dropped);
+                        dropped_entities.extend(dropped_ents);
+
+                        // Step 4 per batch: local graph write into the
+                        // bundled Turso store (replaced the Neo4j upsert —
+                        // Neo4j retirement, step 1). Writing here, inside
+                        // the loop, is what makes partial progress durable.
+                        // Same-document batches CANNOT corroborate each
+                        // other: every batch writes under this run's one
+                        // provenance source (the file), and the store keys
+                        // evidence independence on the origin source
+                        // (`origin_source_key`), so a fact asserted by two
+                        // batches counts ONCE.
+                        match self
+                            .write_local_graph(
+                                ontology.as_ref(),
+                                &set,
+                                &source,
+                                &tenant,
+                                Some(&batch_decoding),
+                            )
+                            .await
+                        {
+                            Ok((update, fact_drops)) => {
+                                // Facts the fact-mapping refused (a numeric
+                                // value whose unit is missing or
+                                // unresolvable — never stored unit-less)
+                                // join the same reported drop list as
+                                // referential containment: a PARTIAL result
+                                // the caller must surface, never a silent
+                                // drop.
+                                if !fact_drops.is_empty() {
+                                    tracing::warn!(
+                                        dropped = fact_drops.len(),
+                                        "numeric facts with unresolvable units were dropped; \
+                                         the valid remainder is stored"
+                                    );
+                                }
+                                dropped_relationships.extend(fact_drops);
+                                rows_processed += end - start;
+                                self.progress(&format!(
+                                    "batch {batch_no}/{batches}: {} entities, {} \
+                                     relationships → {} node(s), {} edge(s) written",
+                                    set.entities.len(),
+                                    set.relationships.len(),
+                                    update.nodes_created,
+                                    update.edges_created,
+                                ));
+                                let sum = graph.get_or_insert(GraphUpdate {
+                                    nodes_created: 0,
+                                    edges_created: 0,
+                                });
+                                sum.nodes_created += update.nodes_created;
+                                sum.edges_created += update.edges_created;
+                            }
+                            Err(e) => {
+                                tracing::error!("{batch_tag}: local graph write failed: {e:#}");
+                                errors
+                                    .push(format!("{batch_tag}: local graph write failed: {e:#}"));
+                                batches_failed += 1;
+                            }
+                        }
+                    }
                 }
             }
-        } else {
-            None
-        };
+
+            llm_usage = constructor.total_usage();
+            if let Some(usage) = &llm_usage {
+                self.progress(&format!(
+                    "LLM usage (billed): {} prompt + {} completion = {} tokens",
+                    usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                ));
+            }
+            tracing::info!(
+                rows_processed,
+                batches,
+                batches_failed,
+                "LLM extraction complete"
+            );
+        }
+
+        // The validation record over EVERYTHING the model emitted this run
+        // (merged, de-duplicated) — the honest record, orphans included.
+        // Per-batch validation above is what GATED the writes; this field
+        // reports.
+        let graph_validation = merged
+            .as_ref()
+            .map(|set| crate::graph_validation::validate_graph(ontology.as_ref(), set));
 
         // Entity vectors are written to the bundled Turso store by
         // `write_local_graph` (embed_names_best_effort); the old Qdrant
@@ -384,7 +561,7 @@ impl IngestPipeline {
             validation,
             row_count,
             column_count,
-            entities,
+            entities: merged,
             extraction_decoding,
             graph_validation,
             graph,
@@ -392,6 +569,10 @@ impl IngestPipeline {
             dropped_relationships,
             dropped_entities,
             errors,
+            rows_processed,
+            batches,
+            batches_failed,
+            llm_usage,
         })
     }
 
@@ -841,10 +1022,12 @@ fn extraction_refusal(validation: &ValidationReport) -> Option<String> {
     ))
 }
 
-/// Extract up to `max_rows` sample rows from a DataFrame as `Vec<Vec<String>>`.
-fn extract_sample_rows(df: &DataFrame, max_rows: usize) -> Vec<Vec<String>> {
-    let n = df.height().min(max_rows);
-    (0..n)
+/// EVERY row of the DataFrame as `Vec<Vec<String>>`. Deliberately no `max`
+/// parameter: the caller batches; a row limit here is exactly the silent
+/// 10-row cap this replaced (a 10,000-row dataset lost 9,990 rows, reported
+/// nowhere).
+fn extract_all_rows(df: &DataFrame) -> Vec<Vec<String>> {
+    (0..df.height())
         .map(|i| {
             df.get_columns()
                 .iter()
@@ -858,36 +1041,88 @@ fn extract_sample_rows(df: &DataFrame, max_rows: usize) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Fold one batch's raw extraction into the run-level record, de-duplicated:
+/// entities by name (first declaration wins, matching the write path's
+/// collision rule), relationships by `(from, rel_type, to)`. This is the
+/// REPORTING merge only — it never fabricates corroboration, and the store
+/// independently refuses same-source corroboration by keying evidence on
+/// the origin source (`origin_source_key`), so two batches of ONE file
+/// asserting one fact count once at both layers.
+fn merge_extraction(merged: &mut Option<EntitySet>, batch: &EntitySet) {
+    let acc = merged.get_or_insert_with(|| EntitySet {
+        entities: Vec::new(),
+        relationships: Vec::new(),
+    });
+    for e in &batch.entities {
+        if !acc.entities.iter().any(|x| x.name == e.name) {
+            acc.entities.push(e.clone());
+        }
+    }
+    for r in &batch.relationships {
+        if !acc
+            .relationships
+            .iter()
+            .any(|x| x.from == r.from && x.rel_type == r.rel_type && x.to == r.to)
+        {
+            acc.relationships.push(r.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn extract_sample_rows_from_dataframe() {
+    fn extract_all_rows_reads_every_row() {
         let df = df!(
             "name" => &["Steel", "Copper", "Aluminum"],
             "density" => &[7.8, 8.96, 2.7]
         )
         .unwrap();
 
-        let rows = extract_sample_rows(&df, 2);
-        assert_eq!(rows.len(), 2);
+        let rows = extract_all_rows(&df);
+        assert_eq!(rows.len(), 3, "every row, not a sample");
         assert_eq!(rows[0].len(), 2);
         assert!(rows[0][0].contains("Steel"));
+        assert!(rows[2][0].contains("Aluminum"));
     }
 
     #[test]
-    fn extract_sample_rows_caps_at_df_height() {
-        let df = df!("a" => &[1, 2]).unwrap();
-        let rows = extract_sample_rows(&df, 100);
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn extract_sample_rows_empty_df() {
+    fn extract_all_rows_empty_df() {
         let df = DataFrame::empty();
-        let rows = extract_sample_rows(&df, 10);
-        assert!(rows.is_empty());
+        assert!(extract_all_rows(&df).is_empty());
+    }
+
+    #[test]
+    fn merge_extraction_deduplicates_across_batches() {
+        use crate::{Entity, Relationship};
+        let batch = |names: &[&str], rels: &[(&str, &str)]| EntitySet {
+            entities: names
+                .iter()
+                .map(|n| Entity {
+                    entity_type: "Element".into(),
+                    name: (*n).into(),
+                    properties: serde_json::json!({}),
+                })
+                .collect(),
+            relationships: rels
+                .iter()
+                .map(|(f, t)| Relationship {
+                    from: (*f).into(),
+                    rel_type: "CONTAINS".into(),
+                    to: (*t).into(),
+                    weight: None,
+                    order: None,
+                })
+                .collect(),
+        };
+        let mut merged = None;
+        merge_extraction(&mut merged, &batch(&["Fe", "Steel"], &[("Steel", "Fe")]));
+        merge_extraction(&mut merged, &batch(&["Fe", "Ni"], &[("Steel", "Fe")]));
+        let merged = merged.unwrap();
+        assert_eq!(merged.entities.len(), 3, "Fe must merge, not duplicate");
+        assert_eq!(merged.relationships.len(), 1, "the repeated edge merges");
     }
 
     /// A dangling endpoint invalidates THAT relationship, not the ingest:
@@ -991,10 +1226,11 @@ mod tests {
             std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
         let pipeline = IngestPipeline::with_config(PipelineConfig {
             llm: None,
-            max_sample_rows: 10,
+            batch_rows: None,
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            on_progress: None,
         });
 
         let entity_set = EntitySet {
@@ -1099,10 +1335,11 @@ mod tests {
             std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
         let pipeline = IngestPipeline::with_config(PipelineConfig {
             llm: None,
-            max_sample_rows: 10,
+            batch_rows: None,
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            on_progress: None,
         });
 
         let entity_set = EntitySet {
@@ -1193,10 +1430,11 @@ mod tests {
             std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
         let pipeline = IngestPipeline::with_config(PipelineConfig {
             llm: None,
-            max_sample_rows: 10,
+            batch_rows: None,
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            on_progress: None,
         });
 
         let entity = |etype: &str, name: &str, props: serde_json::Value| Entity {
@@ -1521,8 +1759,16 @@ mod tests {
             dropped_relationships: Vec::new(),
             dropped_entities: Vec::new(),
             errors: Vec::new(),
+            rows_processed: 10,
+            batches: 1,
+            batches_failed: 0,
+            llm_usage: None,
         };
         let json = serde_json::to_string(&result).unwrap();
+        // Coverage reporting is always visible; unreported usage is absent,
+        // never a fabricated zero.
+        assert!(json.contains("rows_processed"));
+        assert!(!json.contains("llm_usage"));
         // None fields should not appear in JSON.
         assert!(!json.contains("entities"));
         assert!(!json.contains("graph_validation"));
@@ -1606,10 +1852,13 @@ mod tests {
                 model: "test-model".into(),
                 ..crate::LlmConfig::default()
             }),
-            max_sample_rows: 10,
+            // One batch, no context probe: these tests pin single-call
+            // behaviour; batch derivation has its own tests.
+            batch_rows: Some(1000),
             mapping: None,
             provenance_db: Some(db_path),
             ontology: None,
+            on_progress: None,
         })
     }
 
@@ -2818,6 +3067,349 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a density under a pressure unit reached the store"
+        );
+    }
+
+    // ── Whole-dataset batching, at PRODUCTION dispatch ─────────────────
+    //
+    // The defect this replaces: `max_sample_rows: 10` was hardcoded in two
+    // places, so TEN rows of any dataset were extracted and the rest were
+    // parsed into memory and thrown away — reported nowhere. These tests
+    // drive `ingest_file` itself and assert on the requests that actually
+    // reached the (mock) model and on the facts that actually reached the
+    // store.
+
+    /// A CSV body with `n` data rows, each carrying a unique marker.
+    fn csv_rows(n: usize, pad: usize) -> String {
+        let mut body = String::from("alloy,uts_mpa\n");
+        for i in 1..=n {
+            body.push_str(&format!(
+                "alloy_row_{i:02}{},{}\n",
+                "x".repeat(pad),
+                900 + i
+            ));
+        }
+        body
+    }
+
+    /// The bodies of every extraction POST the mock model received.
+    async fn extraction_request_bodies(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("recording on")
+            .iter()
+            .filter(|r| r.url.path().ends_with("/chat/completions"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
+    }
+
+    /// EVERY row reaches the model — there is no 10-row sample. Restoring
+    /// the old fixed sample (`extract_sample_rows(&df, 10)` in the pipeline,
+    /// or the constructor-side `max_sample_rows` truncation) kills this:
+    /// rows 11-25 would never appear in any request, and `rows_processed`
+    /// would misreport the coverage.
+    #[tokio::test]
+    async fn every_row_reaches_the_model_not_a_ten_row_sample() {
+        // These tests assert EXACT row/batch counts read through the
+        // process-wide connector registry; a sibling test replaces the csv
+        // connector with a 1-row fake inside its lock window, so exact-count
+        // tests must serialize behind the SAME shared lock.
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(emmo_extraction()).await;
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv(&csv_rows(25, 0));
+        // batch_rows: None ⇒ the derived path. The mock serves no /props, so
+        // the probe honestly reports UNKNOWN and the documented fallback
+        // budget applies — far larger than 25 short rows, hence ONE batch.
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            batch_rows: None,
+            ..pipeline_against(server.uri(), scratch.db_path()).config
+        });
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.row_count, 25);
+        assert_eq!(
+            result.rows_processed, 25,
+            "coverage must be reported over EVERY row"
+        );
+        assert_eq!((result.batches, result.batches_failed), (1, 0));
+
+        let bodies = extraction_request_bodies(&server).await;
+        assert_eq!(bodies.len(), 1, "25 short rows fit one derived batch");
+        for i in 1..=25 {
+            assert!(
+                bodies[0].contains(&format!("alloy_row_{i:02}")),
+                "row {i} of 25 never reached the model — the fixed sample is back"
+            );
+        }
+    }
+
+    /// Batch size DERIVES from the context window the serving runtime
+    /// reports (`/props` → n_ctx), not from a number someone picked: a
+    /// 2048-token window must split 30 fat rows into several batches, and
+    /// the union of all batches must still cover every row. Also pins the
+    /// observability contract: the plan and every batch emit progress lines.
+    #[tokio::test]
+    async fn batch_size_derives_from_the_reported_context_window() {
+        // These tests assert EXACT row/batch counts read through the
+        // process-wide connector registry; a sibling test replaces the csv
+        // connector with a 1-row fake inside its lock window, so exact-count
+        // tests must serialize behind the SAME shared lock.
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(emmo_extraction()).await;
+        Mock::given(method("GET"))
+            .and(path("/props"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "default_generation_settings": { "n_ctx": 2048 }
+            })))
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv(&csv_rows(30, 120)); // ~140 bytes per row
+        let progress: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = std::sync::Arc::clone(&progress);
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            batch_rows: None,
+            on_progress: Some(std::sync::Arc::new(move |line: &str| {
+                sink.lock().unwrap().push(line.to_string());
+            })),
+            ..pipeline_against(server.uri(), scratch.db_path()).config
+        });
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.rows_processed, 30);
+        assert!(
+            result.batches >= 2,
+            "a 2048-token window cannot hold 30 fat rows in one batch \
+             (batches = {}); the probed window did not drive the plan",
+            result.batches
+        );
+
+        let bodies = extraction_request_bodies(&server).await;
+        assert_eq!(bodies.len(), result.batches);
+        for i in 1..=30 {
+            let marker = format!("alloy_row_{i:02}");
+            assert!(
+                bodies.iter().any(|b| b.contains(&marker)),
+                "row {i} of 30 fell between batches"
+            );
+        }
+
+        // Observable while it runs: the plan names the probed window, and
+        // every batch announces itself.
+        let lines = progress.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("extraction plan") && l.contains("2048-token context window")),
+            "no plan line naming the derived budget: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l.contains(": extracting rows"))
+                .count()
+                >= 2,
+            "per-batch progress lines missing: {lines:?}"
+        );
+    }
+
+    /// Two batches of ONE document are not two independent sources. Both
+    /// batches assert the same fact; the store must hold ONE evidence
+    /// contribution for it and the aggregate confidence must stay at the
+    /// single-sighting value — corroboration is keyed on the origin source
+    /// (`origin_source_key`), which every batch of this run shares. Making
+    /// batches corroborate each other (per-batch activity sources, a
+    /// per-batch `origin_source_id`) inflates confidence across the whole
+    /// corpus and kills this test.
+    #[tokio::test]
+    async fn two_batches_of_one_document_corroborate_nothing() {
+        // These tests assert EXACT row/batch counts read through the
+        // process-wide connector registry; a sibling test replaces the csv
+        // connector with a 1-row fake inside its lock window, so exact-count
+        // tests must serialize behind the SAME shared lock.
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        // The SAME extraction for every call, with usage reported per call.
+        let extraction = serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Zorbium", "properties": {}},
+                {"type": "Phase", "name": "omega-z", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Zorbium", "rel": "HAS_PHASE", "to": "omega-z"}
+            ]
+        });
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {"content": extraction.to_string()},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+        });
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\nx2,y2\n");
+        let db_path = scratch.db_path();
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            batch_rows: Some(1), // force 2 batches over 2 rows
+            ..pipeline_against(server.uri(), db_path.clone()).config
+        });
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!((result.batches, result.rows_processed), (2, 2));
+
+        // The merged record reports the fact ONCE, not once per batch.
+        let merged = result.entities.expect("extraction ran");
+        assert_eq!(merged.entities.len(), 2);
+        assert_eq!(merged.relationships.len(), 1);
+
+        // And the STORE holds one evidence contribution — the second batch
+        // did not count as a second source.
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let evidence = store
+            .assertion_evidence("local", "Zorbium", "HAS_PHASE", "omega-z")
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "two batches of one file must contribute ONE evidence row: {evidence:?}"
+        );
+        let recalled = store
+            .recall_with_context("Zorbium", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert!(
+            (recalled[0].confidence - 0.8).abs() < 1e-9,
+            "confidence was inflated by same-document repetition: {}",
+            recalled[0].confidence
+        );
+
+        // The run reports what it actually cost: usage summed over batches.
+        let usage = result.llm_usage.expect("the mock reports usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (200, 100, 300)
+        );
+        server.verify().await;
+    }
+
+    /// A failure at batch 2 of 2 costs batch 2: batch 1's facts are already
+    /// stored, the failure lands on the errors spine (non-zero exit for the
+    /// CLI), and the coverage report says exactly what was and was not
+    /// processed. Reverting to all-or-nothing (extract everything, then
+    /// write once) kills this test — nothing would be stored.
+    #[tokio::test]
+    async fn a_failed_batch_keeps_earlier_batches_facts() {
+        // These tests assert EXACT row/batch counts read through the
+        // process-wide connector registry; a sibling test replaces the csv
+        // connector with a 1-row fake inside its lock window, so exact-count
+        // tests must serialize behind the SAME shared lock.
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let good = serde_json::json!({
+            "choices": [{
+                "message": {"content": serde_json::json!({
+                    "entities": [
+                        {"type": "Alloy", "name": "Firstium", "properties": {}}
+                    ],
+                    "relationships": []
+                }).to_string()},
+                "finish_reason": "stop"
+            }]
+        });
+        let server = MockServer::start().await;
+        // First extraction call succeeds, every later one fails hard (400 is
+        // not retried — see prism_runtime::retry).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(good))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\nx2,y2\n");
+        let db_path = scratch.db_path();
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            batch_rows: Some(1),
+            ..pipeline_against(server.uri(), db_path.clone()).config
+        });
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // The failure is REPORTED, naming the batch and its rows…
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("batch 2/2") && result.errors[0].contains("rows 2-2"),
+            "{}",
+            result.errors[0]
+        );
+        assert_eq!((result.batches, result.batches_failed), (2, 1));
+        assert_eq!(
+            result.rows_processed, 1,
+            "coverage must reflect the shortfall"
+        );
+
+        // …and batch 1's facts SURVIVED it.
+        let graph = result.graph.expect("batch 1 must have been written");
+        assert_eq!(graph.nodes_created, 1);
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Firstium", "local", 10).await.unwrap();
+        assert!(
+            hits.iter().any(|n| n.name == "Firstium"),
+            "the failed batch discarded the earlier batch's stored facts: {hits:?}"
         );
     }
 

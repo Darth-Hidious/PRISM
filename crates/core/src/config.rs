@@ -30,6 +30,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub llm: LlmSection,
     #[serde(default)]
+    pub ingest: IngestSection,
+    #[serde(default)]
     pub indexer: ModelServiceSection,
     #[serde(default)]
     pub searcher: ModelServiceSection,
@@ -217,6 +219,25 @@ fn default_llm_timeout() -> u64 {
     // while crates/llm defaulted to 300 — two disagreeing deadlines, and the
     // shorter one silently won on the ingest path.
     0
+}
+
+/// Ingest batching — how much of a dataset or document goes into ONE
+/// extraction call. The default for both knobs is DERIVED from the model's
+/// context window (the binding constraint), not decreed: PRISM used to send
+/// exactly 10 rows of any dataset and the first 60,000 bytes of any document
+/// and silently discard the rest. These overrides exist for operators, not
+/// as protective caps — the whole input is processed either way, in batches.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IngestSection {
+    /// Rows of tabular data per extraction batch. Unset ⇒ batches are packed
+    /// to a byte budget derived from the model's context window.
+    #[serde(default)]
+    pub batch_rows: Option<usize>,
+    /// Bytes of document text per extraction window. Unset ⇒ derived from
+    /// the model's context window. Windows overlap slightly so a fact
+    /// spanning a boundary is still seen whole by one of them.
+    #[serde(default)]
+    pub chunk_bytes: Option<usize>,
 }
 
 fn is_platform_llm_provider(provider: &str) -> bool {

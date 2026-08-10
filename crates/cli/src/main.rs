@@ -6552,22 +6552,36 @@ async fn run_local_ingest_file(
     // inside the pipeline instead of silently ingesting as EMMO.
     let ontology = Some(active_ontology_from_config(project_root)?);
 
+    // `[ingest] batch_rows` is the operator's override; `None` lets the
+    // pipeline derive the batch size from the model's context window. EVERY
+    // row is processed either way — this used to be a `max_sample_rows: 10`
+    // literal (in two places), which extracted ten rows of any dataset and
+    // threw the rest away without a word.
+    let batch_rows = prism_core::config::NodeConfig::load(Some(project_root))
+        .ingest
+        .batch_rows;
+
     let config = if schema_only {
         PipelineConfig {
             llm: None,
-            max_sample_rows: 10,
+            batch_rows,
             mapping: None,
             provenance_db: None,
             ontology,
+            on_progress: None,
         }
     } else {
         let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
         PipelineConfig {
             llm: Some(llm_cfg),
-            max_sample_rows: 10,
+            batch_rows,
             mapping,
             provenance_db: None,
             ontology,
+            // Progress goes to STDERR as it happens: these runs are minutes
+            // per batch on a local 12B model, a silent terminal is a bug,
+            // and `--json` stdout must stay parseable.
+            on_progress: Some(std::sync::Arc::new(|line: &str| eprintln!("  {line}"))),
         }
     };
 
@@ -6733,11 +6747,48 @@ async fn run_local_text_ingest_file(
         .and_then(|value| value.to_str())
         .unwrap_or("untitled");
 
-    let extraction =
-        prism_ingest::text_extract::extract_facts_from_text(&llm, title, &text).await?;
-    let parse_error = extraction.parse_error.clone();
-    let dropped_facts = extraction.dropped_facts.clone();
-    let facts = extraction.facts;
+    // Window plan: the WHOLE document is processed — in overlapping windows
+    // sized by `[ingest] chunk_bytes` or derived from the model's context
+    // window (the binding constraint, which the local runtime reports).
+    // This used to be a hard 60,000-byte truncation with no chunking: a
+    // 362,000-character NASA deck yielded facts from its first sixth only.
+    let chunk_override = prism_core::config::NodeConfig::load(Some(project_root))
+        .ingest
+        .chunk_bytes;
+    let (window_bytes, window_note) = match chunk_override.filter(|n| *n > 0) {
+        Some(bytes) => (
+            bytes,
+            format!("{bytes}-byte windows ([ingest] chunk_bytes override)"),
+        ),
+        None => {
+            let context_window = llm.probe_context_window().await;
+            let budget = prism_ingest::batching::input_byte_budget(context_window);
+            let note = match context_window {
+                Some(cw) => format!(
+                    "{budget}-byte windows derived from the model's {cw}-token context window"
+                ),
+                None => format!(
+                    "context window UNKNOWN (neither configured nor reported by the \
+                     backend) — assuming the documented {}-token fallback ({budget}-byte \
+                     windows); set [ingest] chunk_bytes in prism.toml to override",
+                    prism_ingest::batching::FALLBACK_CONTEXT_TOKENS
+                ),
+            };
+            (budget, note)
+        }
+    };
+    let windows = prism_ingest::batching::chunk_windows(&text, window_bytes);
+    let chunks_total = windows.len();
+    // Cost, said BEFORE the run starts: input at the client's ~4-bytes/token
+    // estimate. Output is metered and billed per token — counting is the
+    // control, and the actual usage is reported at the end.
+    eprintln!(
+        "  extraction plan: {} bytes of text in {chunks_total} chunk(s); {window_note}; \
+         ~{} tokens of document input will be sent (plus per-chunk prompt scaffold); \
+         output is metered and billed per token",
+        text.len(),
+        text.len() / 4,
+    );
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let db_path = PathBuf::from(home).join(".prism/provenance.db");
@@ -6748,6 +6799,11 @@ async fn run_local_text_ingest_file(
         activity_id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.clone(),
         agent_kind: "SoftwareAgent".into(),
+        // ONE provenance source for every window of this document — the
+        // file itself. The store keys evidence independence on the origin
+        // source (`origin_source_key`), so two windows of the SAME document
+        // asserting one fact contribute ONE evidence row: chunking cannot
+        // fabricate corroboration or inflate confidence.
         source_entity_id: path.display().to_string(),
         source_kind: "Document".into(),
         // Local single-user store — no per-run tenancy (yet).
@@ -6758,54 +6814,174 @@ async fn run_local_text_ingest_file(
         // Local ingest reads the source itself — the locator IS the origin.
         origin_source_id: None,
     };
-    // Peer-echo tripwire, BEFORE the writes: an agent that read a peer
-    // fact out of `prism query` and fed it back through `prism ingest`
-    // re-asserts it under "local" — laundering peer knowledge into local,
-    // which corroboration then counts as independent evidence. The store
-    // cannot block that write (it is indistinguishable from a genuinely
-    // independent source stating the same fact), so the collision is
-    // reported LOUDLY instead of absorbed silently. This is DETECTION,
-    // not prevention: the write below proceeds either way.
-    let (peer_echoes, peer_echo_check_errors) = collect_peer_echoes(&store, &facts).await;
-    if !peer_echoes.is_empty() {
+    store.record_activity(&prov).await?;
+
+    let classification = prism_provenance::OntologyClassification {
+        version_iri: ontology.version_iri().as_str(),
+        artifact_sha256: ontology.artifact_sha256(),
+    };
+
+    // Chunks are extracted and written ONE AT A TIME, so a failure at chunk
+    // 7 of 20 costs chunk 7: everything already written stays written, the
+    // failure lands on the errors spine (non-zero exit), and an interrupted
+    // run keeps the chunks it finished.
+    let mut written_facts: Vec<prism_provenance::MaterialFact> = Vec::new();
+    let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dropped_facts: Vec<String> = Vec::new();
+    let mut parse_errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut peer_echoes: Vec<serde_json::Value> = Vec::new();
+    let mut peer_echo_check_errors: Vec<String> = Vec::new();
+    let mut chunks_processed = 0usize;
+    let mut llm_usage: Option<prism_ingest::llm::UsageInfo> = None;
+
+    for (index, (start, end)) in windows.iter().enumerate() {
+        let chunk_no = index + 1;
         eprintln!(
-            "  WARNING: {} extracted fact(s) already exist under mesh peer tenant(s).",
-            peer_echoes.len()
+            "  chunk {chunk_no}/{chunks_total}: extracting bytes {start}-{end} \
+             (a local model can take minutes per chunk — this is work, not a hang)…"
         );
-        eprintln!(
-            "           If this document restates knowledge you received over the mesh \
-             (e.g. it was produced from a `prism query` result), this ingest launders \
-             peer knowledge into your local tenant and future corroboration will count \
-             it as independent evidence. If the document is a genuinely independent \
-             source, no action is needed. The write proceeds either way; the echoes \
-             are listed under `peer_echoes` in the ingest summary."
-        );
+        let extraction = match prism_ingest::text_extract::extract_facts_from_text(
+            &llm,
+            title,
+            &text[*start..*end],
+        )
+        .await
+        {
+            Ok(extraction) => extraction,
+            Err(e) => {
+                errors.push(format!(
+                    "chunk {chunk_no}/{chunks_total} (bytes {start}-{end}): LLM extraction \
+                     failed: {e:#}"
+                ));
+                eprintln!(
+                    "  chunk {chunk_no}/{chunks_total}: FAILED — facts from completed \
+                     chunks are already stored; continuing with the remaining chunks"
+                );
+                continue;
+            }
+        };
+        if let Some(usage) = extraction.usage {
+            let total = llm_usage.get_or_insert(prism_ingest::llm::UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+            total.prompt_tokens += usage.prompt_tokens;
+            total.completion_tokens += usage.completion_tokens;
+            total.total_tokens += usage.total_tokens;
+        }
+        if let Some(parse_error) = extraction.parse_error {
+            parse_errors.push(format!("chunk {chunk_no}/{chunks_total}: {parse_error}"));
+        }
+        dropped_facts.extend(extraction.dropped_facts);
+
+        // De-duplicate across windows: the overlap re-reads boundary text by
+        // design, so both neighbours may extract the same fact — it is ONE
+        // fact. (The store would refuse the duplicate evidence anyway; this
+        // keeps `facts_written` honest and skips redundant writes.)
+        let new_facts: Vec<prism_provenance::MaterialFact> = extraction
+            .facts
+            .into_iter()
+            .filter(|fact| {
+                serde_json::to_string(fact)
+                    .map(|key| seen_facts.insert(key))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        // Peer-echo tripwire, BEFORE this chunk's writes: an agent that read
+        // a peer fact out of `prism query` and fed it back through `prism
+        // ingest` re-asserts it under "local" — laundering peer knowledge
+        // into local, which corroboration then counts as independent
+        // evidence. The store cannot block that write (it is
+        // indistinguishable from a genuinely independent source stating the
+        // same fact), so the collision is reported LOUDLY instead of
+        // absorbed silently. DETECTION, not prevention: the write proceeds.
+        let (echoes, check_errors) = collect_peer_echoes(&store, &new_facts).await;
+        if !echoes.is_empty() {
+            eprintln!(
+                "  WARNING: {} extracted fact(s) already exist under mesh peer tenant(s).",
+                echoes.len()
+            );
+            eprintln!(
+                "           If this document restates knowledge you received over the mesh \
+                 (e.g. it was produced from a `prism query` result), this ingest launders \
+                 peer knowledge into your local tenant and future corroboration will count \
+                 it as independent evidence. If the document is a genuinely independent \
+                 source, no action is needed. The write proceeds either way; the echoes \
+                 are listed under `peer_echoes` in the ingest summary."
+            );
+        }
+        if !check_errors.is_empty() {
+            eprintln!(
+                "  WARNING: {} fact(s) could not be checked against mesh tenants — their \
+                 laundering status is UNKNOWN, not clean (see `peer_echo_check_errors`).",
+                check_errors.len()
+            );
+        }
+        peer_echoes.extend(echoes);
+        peer_echo_check_errors.extend(check_errors);
+
+        let mut chunk_written = 0usize;
+        let mut write_error = None;
+        for fact in new_facts {
+            match store
+                .write_fact_with_classification(&fact, &prov, classification)
+                .await
+            {
+                Ok(()) => {
+                    written_facts.push(fact);
+                    chunk_written += 1;
+                }
+                Err(e) => {
+                    write_error = Some(format!(
+                        "chunk {chunk_no}/{chunks_total}: store write failed after {chunk_written} \
+                         fact(s) ('{} {} {}'): {e:#}",
+                        fact.subject, fact.predicate, fact.object
+                    ));
+                    break;
+                }
+            }
+        }
+        match write_error {
+            Some(message) => {
+                errors.push(message);
+                eprintln!(
+                    "  chunk {chunk_no}/{chunks_total}: STORE WRITE FAILED — earlier \
+                     facts are already stored; continuing with the remaining chunks"
+                );
+            }
+            None => {
+                chunks_processed += 1;
+                eprintln!("  chunk {chunk_no}/{chunks_total}: {chunk_written} fact(s) stored");
+            }
+        }
     }
-    if !peer_echo_check_errors.is_empty() {
+
+    if let Some(usage) = &llm_usage {
         eprintln!(
-            "  WARNING: {} fact(s) could not be checked against mesh tenants — their \
-             laundering status is UNKNOWN, not clean (see `peer_echo_check_errors`).",
-            peer_echo_check_errors.len()
+            "  LLM usage (billed): {} prompt + {} completion = {} tokens",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
         );
     }
 
-    store.record_activity(&prov).await?;
-    for fact in &facts {
-        store
-            .write_fact_with_classification(
-                fact,
-                &prov,
-                prism_provenance::OntologyClassification {
-                    version_iri: ontology.version_iri().as_str(),
-                    artifact_sha256: ontology.artifact_sha256(),
-                },
-            )
-            .await?;
-    }
-    // Best-effort: vectorize the freshly written entity names into the same
-    // Turso store so `prism query --semantic` works without Qdrant.
-    // Failures are logged inside and never fail the ingest.
-    store.embed_entities_best_effort(&facts, &prov.tenant).await;
+    // Best-effort: vectorize every written entity name into the same Turso
+    // store so `prism query --semantic` works without Qdrant. Failures are
+    // logged inside and never fail the ingest.
+    store
+        .embed_entities_best_effort(&written_facts, &prov.tenant)
+        .await;
+
+    // Zero facts because the model returned garbage is a different outcome
+    // from zero facts because the document held none. Only `parse_error`
+    // tells them apart on the user's side; with windows it aggregates one
+    // reason per garbled chunk.
+    let parse_error = if parse_errors.is_empty() {
+        None
+    } else {
+        Some(parse_errors.join("; "))
+    };
 
     Ok(serde_json::json!({
         "backend": "local_text",
@@ -6813,18 +6989,17 @@ async fn run_local_text_ingest_file(
         "format": ingest_format(path),
         "schema_only": false,
         "chars": chars,
-        "facts_written": facts.len(),
+        "facts_written": written_facts.len(),
         "model": agent_id,
         "store": db_path.display().to_string(),
         "warning": warning,
-        // A partial read has to be reported here, not left to a log line: the
-        // subscriber is built with `EnvFilter::from_default_env()`, whose
-        // default directive is ERROR, so `tracing::warn!` reaches nobody
-        // unless RUST_LOG is set.
-        "truncated_bytes": extraction.dropped_bytes,
-        // Zero facts because the model returned garbage is a different outcome
-        // from zero facts because the document held none. Only this field
-        // tells them apart on the user's side.
+        // Coverage, reported where a log line cannot be lost: the subscriber
+        // is built with `EnvFilter::from_default_env()`, whose default
+        // directive is ERROR, so `tracing::warn!` reaches nobody unless
+        // RUST_LOG is set. `chunks_processed < chunks_total` is ALWAYS
+        // accompanied by entries in `errors` (→ FAILED STEPS, non-zero exit).
+        "chunks_total": chunks_total,
+        "chunks_processed": chunks_processed,
         "parse_error": parse_error,
         // Facts dropped ONE BY ONE during extraction: malformed shape, or a
         // unit that resolves to no QUDT identifier (a numeric value is never
@@ -6833,6 +7008,12 @@ async fn run_local_text_ingest_file(
         // pipeline's `dropped_relationships`: a PARTIAL result the summary
         // must surface, never a silent drop.
         "dropped_facts": dropped_facts,
+        // Chunk-level step failures: extraction or store-write failures for
+        // individual chunks. The OTHER chunks' facts are already stored — a
+        // mid-run failure costs the failed chunk, never the run.
+        "errors": errors,
+        // What the run actually cost, when the backend reports usage.
+        "llm_usage": llm_usage,
         // Facts that already exist under a mesh peer tenant — the loud
         // half of the laundering tripwire (see the WARNING above).
         "peer_echoes": peer_echoes,
@@ -6960,6 +7141,12 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
                 );
             }
+            if let Some(report) = row_coverage_report(result) {
+                println!("{report}");
+            }
+            if let Some(report) = llm_usage_report(result) {
+                println!("{report}");
+            }
             if let Some(report) = extraction_decoding_report(result) {
                 println!("{report}");
             }
@@ -7046,18 +7233,13 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                 if let Some(parse_error) =
                     summary.get("parse_error").and_then(|value| value.as_str())
                 {
-                    println!("  Warning: no facts extracted \u{2014} {parse_error}");
+                    println!("  Warning: unparseable model output \u{2014} {parse_error}");
                 }
-                let truncated = summary
-                    .get("truncated_bytes")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0);
-                if truncated > 0 {
-                    println!(
-                        "  Warning: {truncated} bytes were NOT read. The document exceeds the \
-                         extraction budget and there is no chunking, so these facts come from \
-                         the start of it only."
-                    );
+                if let Some(report) = chunk_coverage_report(summary) {
+                    println!("{report}");
+                }
+                if let Some(report) = llm_usage_report(summary) {
+                    println!("{report}");
                 }
                 if summary
                     .get("schema_only")
@@ -7254,6 +7436,65 @@ fn dropped_facts_report(summary: &serde_json::Value) -> Option<String> {
         out.push_str(&format!("\n    ! {reason}"));
     }
     Some(out)
+}
+
+/// Row coverage for one local-tabular ingest: rows processed of rows held,
+/// and the batch count. This line is the user's window on the run's
+/// COMPLETENESS — the old pipeline extracted exactly 10 rows of any dataset
+/// and reported the discard nowhere. `None` when extraction did not run
+/// (schema-only). A shortfall is always accompanied by per-batch entries on
+/// the errors spine (→ FAILED STEPS, non-zero exit).
+fn row_coverage_report(result: &serde_json::Value) -> Option<String> {
+    let batches = result.get("batches")?.as_u64()?;
+    if batches == 0 {
+        return None;
+    }
+    let processed = result.get("rows_processed")?.as_u64()?;
+    let total = result.get("row_count")?.as_u64()?;
+    let failed = result
+        .get("batches_failed")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let mut out =
+        format!("  Extraction: {processed} of {total} row(s) processed in {batches} batch(es)");
+    if processed < total || failed > 0 {
+        out.push_str(&format!(
+            " — {} row(s) NOT processed ({failed} batch(es) failed; see FAILED STEPS)",
+            total.saturating_sub(processed),
+        ));
+    }
+    Some(out)
+}
+
+/// Chunk coverage for one local TEXT ingest: windows processed of windows
+/// planned. The whole document is windowed — nothing is truncated — so a
+/// shortfall here means failed chunks, each with an entry on the errors
+/// spine. `None` when the summary carries no chunk fields (schema-only).
+fn chunk_coverage_report(summary: &serde_json::Value) -> Option<String> {
+    let total = summary.get("chunks_total")?.as_u64()?;
+    let processed = summary.get("chunks_processed")?.as_u64()?;
+    let mut out = format!("  Chunks: {processed} of {total} processed (whole document windowed)");
+    if processed < total {
+        out.push_str(&format!(
+            " — {} chunk(s) FAILED; their text was not extracted (see FAILED STEPS); \
+             facts from completed chunks are stored",
+            total - processed
+        ));
+    }
+    Some(out)
+}
+
+/// What the run actually cost, when the backend reported usage: output is
+/// metered and billed per token — counting is the control, not truncation.
+/// `None` when the backend reported nothing (absence, never a made-up zero).
+fn llm_usage_report(summary: &serde_json::Value) -> Option<String> {
+    let usage = summary.get("llm_usage")?;
+    let prompt = usage.get("prompt_tokens")?.as_u64()?;
+    let completion = usage.get("completion_tokens")?.as_u64()?;
+    Some(format!(
+        "  LLM usage (billed): {prompt} prompt + {completion} completion = {} tokens",
+        prompt + completion
+    ))
 }
 
 /// Step failures from an ingest summary (either local-pipeline shape
@@ -12898,6 +13139,80 @@ mod tests {
         assert_eq!(dropped_relationships_report(&serde_json::json!({})), None);
     }
 
+    /// Row coverage must reach the user's summary: processed of total, the
+    /// batch count, and — on a shortfall — how many rows were NOT processed.
+    /// This line is the tabular run's honesty about COMPLETENESS (the old
+    /// pipeline extracted 10 rows of any dataset and said nothing); dropping
+    /// it re-silences the discard.
+    #[test]
+    fn row_coverage_reaches_the_ingest_summary() {
+        let clean = serde_json::json!({
+            "row_count": 40, "rows_processed": 40, "batches": 4, "batches_failed": 0
+        });
+        let report = row_coverage_report(&clean).expect("extraction ran");
+        assert!(report.contains("40 of 40 row(s)"), "{report}");
+        assert!(report.contains("4 batch(es)"), "{report}");
+        assert!(!report.contains("NOT processed"), "{report}");
+
+        let partial = serde_json::json!({
+            "row_count": 40, "rows_processed": 30, "batches": 4, "batches_failed": 1
+        });
+        let report = row_coverage_report(&partial).expect("extraction ran");
+        assert!(report.contains("30 of 40"), "{report}");
+        assert!(
+            report.contains("10 row(s) NOT processed") && report.contains("FAILED STEPS"),
+            "{report}"
+        );
+
+        // Schema-only runs (no batches) print no coverage line.
+        assert_eq!(
+            row_coverage_report(&serde_json::json!({"row_count": 40, "batches": 0})),
+            None
+        );
+        assert_eq!(row_coverage_report(&serde_json::json!({})), None);
+    }
+
+    /// Chunk coverage, same contract for the text path: processed of total,
+    /// and failed chunks named as failures with stored-progress spelled out.
+    #[test]
+    fn chunk_coverage_reaches_the_ingest_summary() {
+        let clean = serde_json::json!({"chunks_total": 6, "chunks_processed": 6});
+        let report = chunk_coverage_report(&clean).expect("chunk fields present");
+        assert!(report.contains("6 of 6"), "{report}");
+        assert!(!report.contains("FAILED"), "{report}");
+
+        let partial = serde_json::json!({"chunks_total": 20, "chunks_processed": 6});
+        let report = chunk_coverage_report(&partial).expect("chunk fields present");
+        assert!(report.contains("6 of 20"), "{report}");
+        assert!(report.contains("14 chunk(s) FAILED"), "{report}");
+        assert!(
+            report.contains("facts from completed chunks are stored"),
+            "{report}"
+        );
+
+        assert_eq!(chunk_coverage_report(&serde_json::json!({})), None);
+    }
+
+    /// Reported usage is what the run COST — output is metered and billed
+    /// per token; counting is the control, not truncation. Absent usage
+    /// prints nothing rather than a fabricated zero.
+    #[test]
+    fn llm_usage_reaches_the_ingest_summary() {
+        let summary = serde_json::json!({
+            "llm_usage": {"prompt_tokens": 1200, "completion_tokens": 400, "total_tokens": 1600}
+        });
+        let report = llm_usage_report(&summary).expect("usage present");
+        assert!(report.contains("1200 prompt"), "{report}");
+        assert!(report.contains("400 completion"), "{report}");
+        assert!(report.contains("1600 tokens"), "{report}");
+
+        assert_eq!(llm_usage_report(&serde_json::json!({})), None);
+        assert_eq!(
+            llm_usage_report(&serde_json::json!({"llm_usage": null})),
+            None
+        );
+    }
+
     /// Entities the pipeline dropped for having a type the active ontology
     /// maps to no storage label must reach the user's summary the same way
     /// — count AND per-entity reason. Same contract as dropped
@@ -15918,5 +16233,335 @@ data:\n\
                 "no node may be minted for a refused fact's endpoint: {hits:?}"
             );
         }
+    }
+
+    // ── Whole-document chunking through the PRODUCTION text path ───────
+    //
+    // The defect this replaces: `MAX_PROMPT_TEXT_BYTES = 60_000` truncated
+    // every document with NO chunking — a 4.1 MB NASA deck (~362K chars of
+    // text) was read to its first ~60K and the rest never seen.
+
+    /// A document text laid out so `[ingest] chunk_bytes = 2000` windows it
+    /// into exactly 3 chunks (0-2000, 1488-3488, 2976-end), with ONE unique
+    /// marker per window — so each mock LLM response can be keyed to
+    /// exactly one chunk's request and no two mocks ever match one request
+    /// (mockito serves the first-created mock still missing hits, which
+    /// makes overlapping matchers order-dependent).
+    fn three_chunk_text() -> String {
+        let filler = |n: usize| "filler sentence about processing. ".repeat(n);
+        let mut text = String::from("AAAMARKER ");
+        text.push_str(&filler(70)); // MIDMARKER lands ~byte 2390: window 2 only
+        text.push_str("MIDMARKER ");
+        text.push_str(&filler(50)); // ZZZMARKER lands ~byte 4100: window 3 only
+        text.push_str("ZZZMARKER the very late fact paragraph.");
+        assert!(text.len() > 4_000, "fixture must span three windows");
+        text
+    }
+
+    /// One OpenAI-shaped chat body whose content is `facts_json`.
+    fn chat_body(facts_json: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": facts_json}}]
+        })
+        .to_string()
+    }
+
+    /// The whole document is processed in windows and MERGED: facts from
+    /// the LAST window land in the store (the old truncation never read
+    /// it), a fact asserted by TWO windows of the same document counts as
+    /// ONE evidence contribution with UNINFLATED confidence, and the
+    /// summary reports chunks processed of total. Restoring the 60K
+    /// truncation, or making windows corroborate each other, kills this.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn text_ingest_windows_the_whole_document_and_merges_without_corroboration() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut server = mockito::Server::new_async().await;
+        // One mock per window, each keyed to that window's unique marker.
+        let _mid = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("MIDMARKER".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(r#"{"facts":[]}"#))
+            .create_async()
+            .await;
+        let early = r#"{"facts":[
+            {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
+        ]}"#;
+        let _early = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("AAAMARKER".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(early))
+            .create_async()
+            .await;
+        // The LAST window's reply also re-asserts the early fact — the
+        // overlap makes that shape realistic — and it must count ONCE.
+        let late = r#"{"facts":[
+            {"subject":"LateFactium","predicate":"has_phase","object":"omega","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"},
+            {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
+        ]}"#;
+        let _late = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("ZZZMARKER".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(late))
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        // The `[ingest] chunk_bytes` knob is exercised here too: unread, the
+        // whole text is one window and chunks_total collapses to 1.
+        let project = project_with_ontology_config(
+            "[ontology]\nid = \"emmo\"\n\n[ingest]\nchunk_bytes = 2000\n",
+        );
+        let root = project.path();
+        let md = root.join("long-deck.md");
+        let text = three_chunk_text();
+        std::fs::write(&md, &text).unwrap();
+        let expected_chunks = prism_ingest::batching::chunk_windows(&text, 2000).len();
+        assert!(expected_chunks >= 3, "fixture must window into 3+ chunks");
+
+        let summary = run_local_text_ingest_file(
+            &md,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+        )
+        .await
+        .expect("a multi-window document must ingest");
+
+        assert_eq!(
+            summary["chunks_total"].as_u64().unwrap() as usize,
+            expected_chunks,
+            "every window must be planned: {summary}"
+        );
+        assert_eq!(
+            summary["chunks_processed"], summary["chunks_total"],
+            "every window must be processed: {summary}"
+        );
+        assert_eq!(
+            summary["facts_written"], 2,
+            "the duplicated fact must merge, not double: {summary}"
+        );
+        assert_eq!(summary["errors"].as_array().unwrap().len(), 0);
+        assert_eq!(ingest_summary_errors(&summary), 0);
+
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        // THE deliverable: a fact from the END of the document is in the
+        // store. Under the old 60K front-truncation (or any single-window
+        // regression) the last window's text was never read.
+        let late = store
+            .recall_with_context("LateFactium", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(late.len(), 1, "the LAST window's fact must land: {late:?}");
+        // And the fact asserted by TWO windows of one document counts ONCE:
+        // one evidence contribution, confidence NOT inflated by noisy-OR.
+        let evidence = store
+            .assertion_evidence("local", "EarlyFactium", "has_phase", "alpha")
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "two windows of one document must contribute ONE evidence row: {evidence:?}"
+        );
+        // The evidence is attributed to the DOCUMENT, never to a window: a
+        // per-chunk source identity (e.g. "…/long-deck.md#chunk1") would
+        // slip past the in-run dedup and corroborate across runs whose
+        // window boundaries shift — silent confidence inflation.
+        assert_eq!(
+            evidence[0].source_entity_id,
+            md.display().to_string(),
+            "evidence must be keyed on the document, not the chunk"
+        );
+        let early = store
+            .recall_with_context("EarlyFactium", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(early.len(), 1);
+        assert!(
+            (early[0].confidence - 0.9).abs() < 1e-9,
+            "same-document windows inflated confidence: {}",
+            early[0].confidence
+        );
+    }
+
+    /// A chunk failing MID-RUN costs that chunk: earlier chunks' facts are
+    /// already stored, the failure is on the errors spine (→ FAILED STEPS,
+    /// non-zero exit via `ingest_summary_errors`), and the coverage says
+    /// what was and was not processed. Reverting to one-shot
+    /// extract-then-write kills this — nothing would be stored.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn text_ingest_keeps_earlier_chunks_when_a_late_chunk_fails() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut server = mockito::Server::new_async().await;
+        let _mid = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("MIDMARKER".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(r#"{"facts":[]}"#))
+            .create_async()
+            .await;
+        let early = r#"{"facts":[
+            {"subject":"Survivium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
+        ]}"#;
+        let _early = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("AAAMARKER".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(early))
+            .create_async()
+            .await;
+        // The LAST window fails hard (400 is not retried).
+        let _late = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("ZZZMARKER".into()))
+            .with_status(400)
+            .with_body("boom")
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let project = project_with_ontology_config(
+            "[ontology]\nid = \"emmo\"\n\n[ingest]\nchunk_bytes = 2000\n",
+        );
+        let root = project.path();
+        let md = root.join("long-deck.md");
+        let text = three_chunk_text();
+        std::fs::write(&md, &text).unwrap();
+        let expected_chunks = prism_ingest::batching::chunk_windows(&text, 2000).len();
+
+        let summary = run_local_text_ingest_file(
+            &md,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+        )
+        .await
+        .expect("a partial run is a reported partial result, not a crash");
+
+        let errors = summary["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{summary}");
+        let error = errors[0].as_str().unwrap();
+        assert!(
+            error.contains(&format!("chunk {expected_chunks}/{expected_chunks}")),
+            "the failure must name the chunk: {error}"
+        );
+        assert_eq!(
+            summary["chunks_processed"].as_u64().unwrap() as usize,
+            expected_chunks - 1,
+            "{summary}"
+        );
+        // The exit-code spine sees the failure…
+        assert_eq!(ingest_summary_errors(&summary), 1);
+        // …and the coverage line says it.
+        let report = chunk_coverage_report(&summary).expect("chunk fields present");
+        assert!(report.contains("FAILED"), "{report}");
+
+        // Earlier chunks' facts are already stored.
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let survivor = store
+            .recall_with_context("Survivium", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            survivor.len(),
+            1,
+            "a late-chunk failure discarded earlier chunks' stored facts"
+        );
+    }
+
+    /// The `[ingest] batch_rows` knob reaches the tabular pipeline through
+    /// the production entry point (`run_local_ingest_file`): 2 rows with
+    /// `batch_rows = 1` must produce exactly 2 extraction calls, full row
+    /// coverage, and per-batch accounting in the summary.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn ingest_batch_rows_knob_reaches_the_pipeline() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut server = mockito::Server::new_async().await;
+        let extraction = r#"{"entities":[{"type":"Alloy","name":"Knobium","properties":{}}],"relationships":[]}"#;
+        let calls = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(extraction))
+            .expect(2)
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let project =
+            project_with_ontology_config("[ontology]\nid = \"emmo\"\n\n[ingest]\nbatch_rows = 1\n");
+        let root = project.path();
+        let csv = root.join("alloys.csv");
+        std::fs::write(&csv, "alloy,uts\nrow_one,900\nrow_two,901\n").unwrap();
+
+        let summary = run_local_ingest_file(
+            &csv,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("the batched tabular ingest must run");
+
+        // Exactly one extraction call per configured batch.
+        calls.assert_async().await;
+        let result = &summary["result"];
+        assert_eq!(result["batches"], 2, "{summary}");
+        assert_eq!(result["rows_processed"], 2, "{summary}");
+        assert_eq!(result["row_count"], 2);
+        assert_eq!(ingest_summary_errors(&summary), 0);
+        // The coverage line the printer shows is derived from these fields.
+        let report = row_coverage_report(result).expect("extraction ran");
+        assert!(report.contains("2 of 2 row(s)"), "{report}");
+        assert!(report.contains("2 batch(es)"), "{report}");
     }
 }

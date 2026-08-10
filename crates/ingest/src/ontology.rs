@@ -17,7 +17,13 @@ use crate::{
 /// LLM-based ontology constructor — works with any provider via [`crate::llm::LlmClient`].
 pub struct LlmOntologyConstructor {
     client: crate::llm::LlmClient,
+    #[allow(dead_code)] // retained for parity with `new(config)` callers/tests
     config: LlmConfig,
+    /// Token usage accumulated across every extraction call this
+    /// constructor made, when the backend reports it. Output is metered and
+    /// billed per token — counting is the control — so a batched run must
+    /// be able to report what it actually cost.
+    usage: std::sync::Mutex<Option<prism_llm::UsageInfo>>,
 }
 
 // Wire format structs removed — LlmClient handles provider-specific APIs.
@@ -122,7 +128,11 @@ fn normalise_extracted_name(raw: &str) -> String {
 impl LlmOntologyConstructor {
     pub fn new(config: LlmConfig) -> Self {
         let client = crate::llm::LlmClient::new(config.clone());
-        Self { client, config }
+        Self {
+            client,
+            config,
+            usage: std::sync::Mutex::new(None),
+        }
     }
 
     /// Check that the LLM backend is reachable.
@@ -130,9 +140,40 @@ impl LlmOntologyConstructor {
         self.client.health_check().await
     }
 
-    /// Call the LLM with a prompt and expect JSON output.
+    /// The model's context window in tokens (configured, GGUF-derived, or
+    /// probed from the serving runtime) — what the pipeline derives batch
+    /// sizes from. `None` is a config gap the pipeline reports loudly.
+    pub async fn probe_context_window(&self) -> Option<u64> {
+        self.client.probe_context_window().await
+    }
+
+    /// Token usage summed over every extraction call so far, when the
+    /// backend reported any. `None` = nothing was ever reported (not zero).
+    pub fn total_usage(&self) -> Option<prism_llm::UsageInfo> {
+        self.usage.lock().expect("usage lock poisoned").clone()
+    }
+
+    /// Fold one call's reported token usage into the running total.
+    fn fold_usage(&self, usage: Option<prism_llm::UsageInfo>) {
+        if let Some(u) = usage {
+            let mut total = self.usage.lock().expect("usage lock poisoned");
+            let t = total.get_or_insert(prism_llm::UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+            t.prompt_tokens += u.prompt_tokens;
+            t.completion_tokens += u.completion_tokens;
+            t.total_tokens += u.total_tokens;
+        }
+    }
+
+    /// Call the LLM with a prompt and expect JSON output, folding reported
+    /// token usage into the running total.
     async fn generate(&self, prompt: &str) -> Result<String> {
-        self.client.generate_json(prompt).await
+        let (text, usage) = self.client.generate_json_with_usage(prompt).await?;
+        self.fold_usage(usage);
+        Ok(text)
     }
 
     /// Embed a single text string. Returns the embedding vector.
@@ -301,7 +342,7 @@ pub struct TracedExtraction {
 /// of reasoning against a 16384-token budget, zero JSON). The flag is
 /// recorded in the decoding trace and the provenance activity either way.
 fn extraction_no_think() -> bool {
-    std::env::var("LLM_NO_THINK").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    prism_llm::no_think_requested()
 }
 
 /// Convenience method: extract entities with explicit sample rows (bypasses DataSource).
@@ -355,12 +396,13 @@ impl LlmOntologyConstructor {
         if let Some(mapping) = mapping {
             mapping.validate_for(ontology)?;
         }
-        let max_rows = self.config.max_sample_rows;
-        let rows = if sample_rows.len() > max_rows {
-            &sample_rows[..max_rows]
-        } else {
-            sample_rows
-        };
+        // NO truncation here. This used to silently cap the rows at
+        // `config.max_sample_rows` (default 10) — the second of two places
+        // the same literal lived, so even a caller that sized its batch
+        // honestly lost everything past row 10 without a word. The CALLER
+        // owns batch sizing (`pipeline` derives it from the model's context
+        // window); this function extracts from exactly what it is given.
+        let rows = sample_rows;
 
         // Drop ignore_columns from what the LLM actually sees, instead of
         // only mentioning them in the prompt as a hint the model was free
@@ -399,6 +441,10 @@ impl LlmOntologyConstructor {
                 extraction_no_think(),
             )
             .await?;
+        // Output is metered and billed per token — counting is the control —
+        // so every extraction call's reported usage lands on the running
+        // total the pipeline reports at the end of a batched run.
+        self.fold_usage(constrained.usage);
         let response = constrained.text;
 
         let raw: ExtractionOutput =

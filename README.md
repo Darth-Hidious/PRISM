@@ -239,6 +239,12 @@ provider = "marc27"
 url = "https://api.marc27.com/api/v1/projects/{id}/llm"
 model = "gemini-3.1-flash-lite-preview"
 
+[ingest]
+# Extraction batch sizing. Unset, both derive from the model's context
+# window — the WHOLE dataset/document is processed either way, in batches.
+# batch_rows = 50      # rows of tabular data per extraction call
+# chunk_bytes = 60000  # bytes of document text per (overlapping) window
+
 [node]
 name = "lab-alpha"
 port = 7327

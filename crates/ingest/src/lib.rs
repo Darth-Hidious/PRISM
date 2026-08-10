@@ -28,6 +28,7 @@
 //! and reads both the extraction prompt and graph validation from that one
 //! adapter, so instructing and validating cannot drift apart.
 
+pub mod batching;
 pub mod connectors;
 pub mod extraction_schema;
 pub mod graph_validation;

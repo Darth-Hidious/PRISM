@@ -950,6 +950,21 @@ impl LlmClient {
 
     /// Generate text and parse as JSON (uses response_format).
     pub async fn generate_json(&self, prompt: &str) -> Result<String> {
+        self.generate_json_with_usage(prompt)
+            .await
+            .map(|(text, _usage)| text)
+    }
+
+    /// [`Self::generate_json`], also returning the provider-reported token
+    /// usage when the wire carries one. Output is metered and billed per
+    /// token — counting is the control — so callers that fan a document or
+    /// dataset out over many extraction calls accumulate these to report
+    /// what the run actually cost. `None` means the backend reported
+    /// nothing (the MARC27 `/stream` path), never that usage was zero.
+    pub async fn generate_json_with_usage(
+        &self,
+        prompt: &str,
+    ) -> Result<(String, Option<UsageInfo>)> {
         if let Some(local) = self.local_backend() {
             let messages = [ChatMessage {
                 role: "user".to_string(),
@@ -968,7 +983,15 @@ impl LlmClient {
                     |_| {},
                 )
                 .await?;
-            return Ok(Self::strip_json_fences(&generation.text).to_string());
+            let usage = UsageInfo {
+                prompt_tokens: generation.prompt_tokens,
+                completion_tokens: generation.completion_tokens,
+                total_tokens: generation.prompt_tokens + generation.completion_tokens,
+            };
+            return Ok((
+                Self::strip_json_fences(&generation.text).to_string(),
+                Some(usage),
+            ));
         }
         // MARC27 platform: this method used to skip the is_marc27() branch
         // that chat()/chat_with_tools() have, so ingest ontology extraction
@@ -978,10 +1001,10 @@ impl LlmClient {
         if self.is_marc27() {
             let msgs = serde_json::json!([{ "role": "user", "content": prompt }]);
             let text = self.chat_marc27_simple(&msgs).await?;
-            return Ok(Self::strip_json_fences(&text).to_string());
+            return Ok((Self::strip_json_fences(&text).to_string(), None));
         }
         let url = self.chat_completions_url();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": [
                 {"role": "user", "content": prompt}
@@ -989,6 +1012,17 @@ impl LlmClient {
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         });
+        // The reasoning kill-switch, honoured PROACTIVELY when the operator
+        // asked for it: without this, a thinking-mode model burns one whole
+        // call per request on reasoning_content before the self-heal below
+        // retries with thinking disabled — at minutes per call on a local
+        // 12B model, every chunk of a windowed document would pay twice.
+        // Opt-in via env because the kwarg is a llama-server/vLLM extension
+        // OpenAI rejects with 400 (same contract as the schema path's
+        // caller-opt-in `no_think`).
+        if no_think_requested() {
+            body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+        }
         let body = self.with_operator_output_cap(body, prompt.len() as u64 / 4);
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
@@ -1011,7 +1045,7 @@ impl LlmClient {
                     if let Ok(retry_data) = retry_resp.json::<serde_json::Value>().await
                         && let Ok(text) = Self::extract_json_content(&retry_data["choices"][0])
                     {
-                        return Ok(text);
+                        return Ok((text, Self::usage_of(&retry_data)));
                     }
                     tracing::warn!(
                         "thinking-disabled retry still produced no JSON; reporting the \
@@ -1026,7 +1060,14 @@ impl LlmClient {
                 }
             }
         }
-        Self::extract_json_content(&data["choices"][0])
+        let text = Self::extract_json_content(&data["choices"][0])?;
+        Ok((text, Self::usage_of(&data)))
+    }
+
+    /// The `usage` object of a chat-completions response, when present.
+    fn usage_of(data: &serde_json::Value) -> Option<UsageInfo> {
+        data.get("usage")
+            .and_then(|u| serde_json::from_value::<UsageInfo>(u.clone()).ok())
     }
 
     /// Generate JSON under a server-enforced schema (`response_format:
@@ -1072,7 +1113,7 @@ impl LlmClient {
         // per-request seed/temperature, so nothing deterministic or
         // constrained can be claimed. Take the existing prompt-only path.
         if self.local_backend().is_some() {
-            let text = self.generate_json(prompt).await?;
+            let (text, usage) = self.generate_json_with_usage(prompt).await?;
             return Ok(ConstrainedJson {
                 text,
                 trace: JsonDecodingTrace {
@@ -1087,12 +1128,13 @@ impl LlmClient {
                     temperature: None,
                     no_think: false,
                 },
+                usage,
             });
         }
         // MARC27 platform: /stream carries no response_format and no sampling
         // controls — the schema cannot be applied there.
         if self.is_marc27() {
-            let text = self.generate_json(prompt).await?;
+            let (text, usage) = self.generate_json_with_usage(prompt).await?;
             return Ok(ConstrainedJson {
                 text,
                 trace: JsonDecodingTrace {
@@ -1107,6 +1149,7 @@ impl LlmClient {
                     temperature: None,
                     no_think: false,
                 },
+                usage,
             });
         }
         let url = self.chat_completions_url();
@@ -1143,6 +1186,7 @@ impl LlmClient {
                         temperature: Some(0.0),
                         no_think,
                     },
+                    usage: Self::usage_of(&data),
                 })
             }
             Err(err) if error_rejects_json_schema(&err) => {
@@ -1174,6 +1218,7 @@ impl LlmClient {
                         temperature: Some(0.0),
                         no_think,
                     },
+                    usage: Self::usage_of(&data),
                 })
             }
             Err(err) => Err(err.context(
@@ -1692,6 +1737,51 @@ impl LlmClient {
         })
     }
 
+    /// The model's context window in tokens, for callers that size work to
+    /// it (ingest batching derives batch sizes from this — the window is the
+    /// binding constraint, not a number someone picked).
+    ///
+    /// Resolution order: the configured value (platform catalog, or
+    /// GGUF-derived for the embedded backend) when known; otherwise the
+    /// serving runtime is asked. llama.cpp's `/props` reports the ACTUAL
+    /// serving allocation (`default_generation_settings.n_ctx`), which is
+    /// what binds a request — deliberately preferred over `/v1/models`'
+    /// `n_ctx_train`, the trained maximum a server may not have allocated
+    /// (measured live: n_ctx_train 262144 vs n_ctx 65536).
+    ///
+    /// Returns `None` when the backend reports nothing (plain OpenAI-shaped
+    /// endpoints have no `/props`). That is a config gap the CALLER must
+    /// surface and bridge with a documented fallback — never silently.
+    pub async fn probe_context_window(&self) -> Option<u64> {
+        if let Some(cw) = self.config.context_window {
+            return Some(cw);
+        }
+        let LlmBackend::Http(client) = &self.backend else {
+            // The embedded GGUF backend writes its window into the config at
+            // construction; reaching here means it genuinely has none.
+            return None;
+        };
+        // `/props` lives at the server root; the OpenAI surface is mounted
+        // under `/v1`, so a `…/v1` base is peeled back to the root.
+        let base = self.config.base_url.trim_end_matches('/');
+        let root = base.strip_suffix("/v1").unwrap_or(base);
+        let url = format!("{root}/props");
+        prism_runtime::offline::check_url(&url).ok()?;
+        // Per-request deadline: this is a metadata poke, not a generation —
+        // an unanswered probe must degrade to "unknown", not hang the run.
+        let mut req = client.get(&url).timeout(Duration::from_secs(10));
+        if let Some((name, value)) = self.auth_header() {
+            req = req.header(name, value);
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let data: serde_json::Value = resp.json().await.ok()?;
+        data.pointer("/default_generation_settings/n_ctx")
+            .and_then(serde_json::Value::as_u64)
+    }
+
     /// Health check — verify the LLM backend is reachable.
     pub async fn health_check(&self) -> Result<()> {
         if let Some(local) = self.local_backend() {
@@ -1819,6 +1909,18 @@ fn error_rejects_tool_schemas(err: &anyhow::Error) -> bool {
 
 // ── Schema-constrained JSON generation ──────────────────────────────
 
+/// Whether requests should carry the reasoning kill-switch
+/// (`LLM_NO_THINK=1`/`true` in the environment — the same `LLM_*` surface
+/// the other model knobs use). Opt-in because the kwarg it adds
+/// (`chat_template_kwargs: {"enable_thinking": false}`) is a
+/// llama-server/vLLM extension OpenAI rejects with 400; needed because a
+/// thinking-mode model can burn ANY output budget on reasoning before the
+/// JSON starts (measured 2026-08-10, Gemma-4-12B: ~85% of any budget went
+/// to reasoning_content).
+pub fn no_think_requested() -> bool {
+    std::env::var("LLM_NO_THINK").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// The one extraction seed PRISM sends, deliberately a constant rather than
 /// a config knob: reproducibility means every run of the same input against
 /// the same model must sample identically, and a per-run seed would defeat
@@ -1892,6 +1994,12 @@ pub struct JsonDecodingTrace {
 pub struct ConstrainedJson {
     pub text: String,
     pub trace: JsonDecodingTrace,
+    /// Token usage the backend reported for this call, if any. Output is
+    /// metered and billed per token — counting is the control — so callers
+    /// that fan a dataset out over many extraction calls sum these to
+    /// report what the run actually cost. `None` means the backend
+    /// reported nothing, never that usage was zero.
+    pub usage: Option<UsageInfo>,
 }
 
 /// Whether an LLM error is the endpoint refusing `response_format:
