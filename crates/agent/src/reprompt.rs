@@ -571,6 +571,14 @@ pub enum Preflight {
     },
 }
 
+/// Usage returned by the optional classifier together with the model that
+/// actually incurred it. The turn can therefore add mixed-model costs without
+/// repricing every token as though the primary model produced it.
+pub struct PreflightUsage {
+    pub usage: UsageInfo,
+    pub model: String,
+}
+
 /// Prefix of the injected routing hint. Load-bearing: the turn strips any stale
 /// hint out of `history` by matching this.
 pub const ROUTE_HINT_PREFIX: &str = "<system-reminder>PRE-FLIGHT ROUTING — ";
@@ -603,14 +611,16 @@ pub async fn preflight(
     user_message: &str,
     history: &[ChatMessage],
     can_ask: bool,
-) -> (Preflight, Option<UsageInfo>) {
+) -> (Preflight, Option<PreflightUsage>) {
     if !enabled() {
         return (Preflight::Proceed, None);
     }
     if triage(user_message, has_prior_context(history)) == Triage::Proceed {
         return (Preflight::Proceed, None);
     }
-    let (intent, usage) = classify(llm, &classifier_model(config), user_message).await;
+    let model = classifier_model(config);
+    let (intent, usage) = classify(llm, &model, user_message).await;
+    let usage = usage.map(|usage| PreflightUsage { usage, model });
     let Some(intent) = intent else {
         return (Preflight::Proceed, usage);
     };

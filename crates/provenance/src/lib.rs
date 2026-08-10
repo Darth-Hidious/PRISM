@@ -28,7 +28,7 @@
 //! processes, so there's no cold start).
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use turso::Value;
@@ -131,6 +131,140 @@ impl Actor {
     }
 }
 
+/// Lifecycle state for a durable agent run.
+///
+/// `stuck` is deliberately absent: it is derived by comparing the heartbeat
+/// timestamp of a [`AgentRunStatus::Running`] row with an
+/// [`AgentRunStalenessPolicy`]. A process that disappears cannot reliably
+/// write one last state transition about itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentRunStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => anyhow::bail!("unknown agent run status `{other}`"),
+        }
+    }
+}
+
+/// One durable top-level or delegated agent turn.
+///
+/// `parent_run_id` is the spawn edge. It is intentionally unrelated to
+/// [`ProvenanceRecord::parent_id`], whose meaning remains the retry/repair
+/// chain between tool-call audit records.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentRun {
+    pub id: String,
+    pub parent_run_id: Option<String>,
+    pub session_id: String,
+    /// Stable execution class, currently `agent` or `subagent`.
+    pub role: String,
+    /// Human-readable task text, clipped by the writer before persistence.
+    pub label: String,
+    pub status: AgentRunStatus,
+    pub started_at: String,
+    /// Last successful lifecycle write or heartbeat.
+    pub updated_at: String,
+    pub ended_at: Option<String>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+    pub last_error: Option<String>,
+}
+
+/// Filters for [`ProvenanceStore::list_agent_runs`].
+#[derive(Debug, Clone)]
+pub struct AgentRunFilter {
+    pub session_id: Option<String>,
+    pub status: Option<AgentRunStatus>,
+    /// Select the direct children of this run. `None` leaves parent unfiltered.
+    pub parent_run_id: Option<String>,
+    /// Maximum rows returned, clamped by the store to a safe upper bound.
+    pub limit: usize,
+}
+
+const DEFAULT_AGENT_RUN_QUERY_LIMIT: usize = 100;
+const MAX_AGENT_RUN_QUERY_LIMIT: usize = 1_000;
+
+impl Default for AgentRunFilter {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            status: None,
+            parent_run_id: None,
+            limit: DEFAULT_AGENT_RUN_QUERY_LIMIT,
+        }
+    }
+}
+
+/// Policy for deriving which running agents are stale.
+///
+/// Staleness is an operator policy, not a lifecycle state. The default treats
+/// a running row as stale after five minutes without a heartbeat and bounds a
+/// single read to 1,000 rows. Callers with different turn latency or display
+/// limits should provide an explicit policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRunStalenessPolicy {
+    /// Maximum age of `updated_at` before a running row is considered stale.
+    pub stale_after: std::time::Duration,
+    /// Maximum stale rows returned, clamped by the store's global query cap.
+    pub max_results: usize,
+}
+
+impl Default for AgentRunStalenessPolicy {
+    fn default() -> Self {
+        Self {
+            stale_after: std::time::Duration::from_secs(5 * 60),
+            max_results: MAX_AGENT_RUN_QUERY_LIMIT,
+        }
+    }
+}
+
+/// Construct a new running row with a caller-visible id for spawn topology.
+pub fn new_agent_run(
+    session_id: &str,
+    role: &str,
+    label: &str,
+    parent_run_id: Option<&str>,
+) -> AgentRun {
+    let now = Utc::now().to_rfc3339();
+    AgentRun {
+        id: Uuid::new_v4().to_string(),
+        parent_run_id: parent_run_id.map(str::to_string),
+        session_id: session_id.to_string(),
+        role: role.to_string(),
+        label: label.to_string(),
+        status: AgentRunStatus::Running,
+        started_at: now.clone(),
+        updated_at: now,
+        ended_at: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        cost_usd: 0.0,
+        last_error: None,
+    }
+}
+
 /// Convert an Option<String> to a turso Value (None → Null).
 fn opt_to_value(s: &Option<String>) -> Value {
     match s {
@@ -168,6 +302,12 @@ async fn add_column_if_absent(
     }
 }
 
+/// Turso's local pager cannot initialize the same brand-new SQLite file from
+/// two independent `Database` handles concurrently. Agent turns can start in
+/// parallel, so serialize the short open/schema phase within this process;
+/// ordinary reads and writes remain concurrent after `open` returns.
+static STORE_OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct ProvenanceStore {
     conn: turso::Connection,
     /// Serializes EVERY write issued through this one handle — the raw
@@ -202,6 +342,7 @@ impl ProvenanceStore {
         let path_str = path.to_str().ok_or_else(|| {
             anyhow::anyhow!("provenance database path is not valid UTF-8: {path:?}")
         })?;
+        let _open_guard = STORE_OPEN_LOCK.lock().await;
         let db = turso::Builder::new_local(path_str)
             .build()
             .await
@@ -297,6 +438,50 @@ impl ProvenanceStore {
         )
         .await?;
 
+        // Durable lifecycle ledger for top-level and delegated agent turns.
+        // There is deliberately no FK on parent_run_id: if a best-effort parent
+        // write fails, retaining the child's claimed edge is more useful than
+        // rejecting the child row as well.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS agent_runs (
+                id TEXT PRIMARY KEY,
+                parent_run_id TEXT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('running', 'completed', 'failed', 'cancelled')
+                ),
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                ended_at TEXT,
+                tokens_in INTEGER NOT NULL DEFAULT 0 CHECK (tokens_in >= 0),
+                tokens_out INTEGER NOT NULL DEFAULT 0 CHECK (tokens_out >= 0),
+                cost_usd REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
+                last_error TEXT
+            )"#,
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_session_started \
+             ON agent_runs(session_id, started_at DESC)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_status_updated \
+             ON agent_runs(status, updated_at)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_parent_started \
+             ON agent_runs(parent_run_id, started_at)",
+            (),
+        )
+        .await?;
+
         // Semantic memory: one vector per record (little-endian f32 blob),
         // written lazily by `embed_and_store` — never on the `record()` path.
         conn.execute(
@@ -363,6 +548,194 @@ impl ProvenanceStore {
             .await?;
 
         Ok(())
+    }
+
+    /// Insert the initial `running` row for an agent turn.
+    pub async fn start_agent_run(&self, run: &AgentRun) -> Result<()> {
+        anyhow::ensure!(
+            run.status == AgentRunStatus::Running,
+            "a new agent run must start in running state"
+        );
+        anyhow::ensure!(
+            run.ended_at.is_none(),
+            "a new agent run cannot already have ended_at"
+        );
+        anyhow::ensure!(
+            run.tokens_in == 0 && run.tokens_out == 0 && run.cost_usd == 0.0,
+            "a new agent run must start with zero usage and cost"
+        );
+
+        let _same_handle_guard = self.write_lock.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                r#"INSERT INTO agent_runs
+                   (id, parent_run_id, session_id, role, label, status,
+                    started_at, updated_at, ended_at, tokens_in, tokens_out,
+                    cost_usd, last_error)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+                [
+                    Value::Text(run.id.clone()),
+                    opt_to_value(&run.parent_run_id),
+                    Value::Text(run.session_id.clone()),
+                    Value::Text(run.role.clone()),
+                    Value::Text(run.label.clone()),
+                    Value::Text(run.status.as_str().to_string()),
+                    Value::Text(run.started_at.clone()),
+                    Value::Text(run.updated_at.clone()),
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::Integer(0),
+                    Value::Real(0.0),
+                    Value::Null,
+                ],
+            )
+            .await?;
+        anyhow::ensure!(changed == 1, "agent run start did not insert a row");
+        Ok(())
+    }
+
+    /// Refresh the heartbeat of a running row.
+    pub async fn heartbeat_agent_run(&self, run_id: &str) -> Result<()> {
+        let updated_at = Utc::now().to_rfc3339();
+        let _same_handle_guard = self.write_lock.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE agent_runs SET updated_at = ?1 \
+                 WHERE id = ?2 AND status = 'running'",
+                [Value::Text(updated_at), Value::Text(run_id.to_string())],
+            )
+            .await?;
+        anyhow::ensure!(
+            changed == 1,
+            "agent run heartbeat did not update one running row"
+        );
+        Ok(())
+    }
+
+    /// Close a running row with its final usage, cost, and optional error.
+    pub async fn finish_agent_run(
+        &self,
+        run_id: &str,
+        status: AgentRunStatus,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost_usd: f64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            status != AgentRunStatus::Running,
+            "finishing an agent run requires a terminal status"
+        );
+        anyhow::ensure!(
+            cost_usd.is_finite() && cost_usd >= 0.0,
+            "agent run cost must be finite and non-negative"
+        );
+        let tokens_in = i64::try_from(tokens_in).context("agent input token count exceeds i64")?;
+        let tokens_out =
+            i64::try_from(tokens_out).context("agent output token count exceeds i64")?;
+        let ended_at = Utc::now().to_rfc3339();
+        let last_error = last_error.map(str::to_string);
+
+        let _same_handle_guard = self.write_lock.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                r#"UPDATE agent_runs
+                   SET status = ?1, updated_at = ?2, ended_at = ?2,
+                       tokens_in = ?3, tokens_out = ?4, cost_usd = ?5,
+                       last_error = ?6
+                   WHERE id = ?7 AND status = 'running'"#,
+                [
+                    Value::Text(status.as_str().to_string()),
+                    Value::Text(ended_at),
+                    Value::Integer(tokens_in),
+                    Value::Integer(tokens_out),
+                    Value::Real(cost_usd),
+                    match last_error {
+                        Some(error) => Value::Text(error),
+                        None => Value::Null,
+                    },
+                    Value::Text(run_id.to_string()),
+                ],
+            )
+            .await?;
+        anyhow::ensure!(
+            changed == 1,
+            "agent run finish did not update one running row"
+        );
+        Ok(())
+    }
+
+    /// List agent runs newest first, optionally filtered by session, status,
+    /// and direct parent.
+    pub async fn list_agent_runs(&self, filter: &AgentRunFilter) -> Result<Vec<AgentRun>> {
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+
+        if let Some(session_id) = &filter.session_id {
+            params.push(Value::Text(session_id.clone()));
+            clauses.push(format!("session_id = ?{}", params.len()));
+        }
+        if let Some(status) = filter.status {
+            params.push(Value::Text(status.as_str().to_string()));
+            clauses.push(format!("status = ?{}", params.len()));
+        }
+        if let Some(parent_run_id) = &filter.parent_run_id {
+            params.push(Value::Text(parent_run_id.clone()));
+            clauses.push(format!("parent_run_id = ?{}", params.len()));
+        }
+
+        let mut sql = format!("SELECT {AGENT_RUN_COLUMNS} FROM agent_runs");
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        params.push(Value::Integer(
+            filter.limit.min(MAX_AGENT_RUN_QUERY_LIMIT) as i64
+        ));
+        sql.push_str(&format!(
+            " ORDER BY started_at DESC LIMIT ?{}",
+            params.len()
+        ));
+
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            runs.push(row_to_agent_run(&row)?);
+        }
+        Ok(runs)
+    }
+
+    /// Return running rows whose last heartbeat is older than `policy` permits.
+    pub async fn stale_running_agent_runs(
+        &self,
+        policy: &AgentRunStalenessPolicy,
+    ) -> Result<Vec<AgentRun>> {
+        let stale_after = ChronoDuration::from_std(policy.stale_after)
+            .context("agent run staleness threshold exceeds chrono range")?;
+        let cutoff = Utc::now()
+            .checked_sub_signed(stale_after)
+            .context("agent run staleness cutoff is outside the timestamp range")?
+            .to_rfc3339();
+        let limit = policy.max_results.min(MAX_AGENT_RUN_QUERY_LIMIT) as i64;
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
+                     WHERE status = 'running' AND updated_at < ?1 \
+                     ORDER BY updated_at ASC LIMIT ?2"
+                ),
+                [Value::Text(cutoff), Value::Integer(limit)],
+            )
+            .await?;
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            runs.push(row_to_agent_run(&row)?);
+        }
+        Ok(runs)
     }
 
     pub async fn query_by_session(&self, session_id: &str) -> Result<Vec<ProvenanceRecord>> {
@@ -674,6 +1047,41 @@ fn get_opt_str(row: &turso::Row, idx: usize) -> Result<Option<String>> {
     })
 }
 
+const AGENT_RUN_COLUMNS: &str = "id, parent_run_id, session_id, role, label, status, \
+    started_at, updated_at, ended_at, tokens_in, tokens_out, cost_usd, last_error";
+
+fn get_u64(row: &turso::Row, idx: usize, field: &str) -> Result<u64> {
+    match row.get_value(idx)? {
+        Value::Integer(value) => {
+            u64::try_from(value).with_context(|| format!("agent run {field} is negative"))
+        }
+        value => anyhow::bail!("agent run {field} is not an integer: {value:?}"),
+    }
+}
+
+fn row_to_agent_run(row: &turso::Row) -> Result<AgentRun> {
+    let cost_usd = match row.get_value(11)? {
+        Value::Real(value) => value,
+        Value::Integer(value) => value as f64,
+        value => anyhow::bail!("agent run cost_usd is not numeric: {value:?}"),
+    };
+    Ok(AgentRun {
+        id: get_str(row, 0)?,
+        parent_run_id: get_opt_str(row, 1)?,
+        session_id: get_str(row, 2)?,
+        role: get_str(row, 3)?,
+        label: get_str(row, 4)?,
+        status: AgentRunStatus::from_db(&get_str(row, 5)?)?,
+        started_at: get_str(row, 6)?,
+        updated_at: get_str(row, 7)?,
+        ended_at: get_opt_str(row, 8)?,
+        tokens_in: get_u64(row, 9, "tokens_in")?,
+        tokens_out: get_u64(row, 10, "tokens_out")?,
+        cost_usd,
+        last_error: get_opt_str(row, 12)?,
+    })
+}
+
 fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
     let action_type = match get_str(row, 3)?.as_str() {
         "tool_call" => ActionType::ToolCall,
@@ -792,6 +1200,186 @@ pub fn new_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_file_accepts_concurrent_store_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("concurrent-open.db");
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..8 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                ProvenanceStore::open(&path).await.map(drop)
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            result.expect("store open task must not panic").unwrap();
+        }
+
+        let store = ProvenanceStore::open(&path).await.unwrap();
+        assert!(
+            store
+                .list_agent_runs(&AgentRunFilter::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_run_lifecycle_and_filters_round_trip() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let parent = new_agent_run("session-a", "agent", "root task", None);
+        let child = new_agent_run("session-a", "subagent", "delegated task", Some(&parent.id));
+        let other = new_agent_run("session-b", "agent", "other task", None);
+        for run in [&parent, &child, &other] {
+            store.start_agent_run(run).await.unwrap();
+        }
+        store
+            .finish_agent_run(
+                &child.id,
+                AgentRunStatus::Completed,
+                1_200,
+                340,
+                0.0125,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .finish_agent_run(
+                &parent.id,
+                AgentRunStatus::Failed,
+                10,
+                2,
+                0.001,
+                Some("provider disconnected"),
+            )
+            .await
+            .unwrap();
+        store
+            .finish_agent_run(&other.id, AgentRunStatus::Cancelled, 0, 0, 0.0, None)
+            .await
+            .unwrap();
+
+        let completed = store
+            .list_agent_runs(&AgentRunFilter {
+                session_id: Some("session-a".to_string()),
+                status: Some(AgentRunStatus::Completed),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, child.id);
+        assert_eq!(
+            completed[0].parent_run_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(completed[0].tokens_in, 1_200);
+        assert_eq!(completed[0].tokens_out, 340);
+        assert!((completed[0].cost_usd - 0.0125).abs() < f64::EPSILON);
+        assert!(completed[0].ended_at.is_some());
+
+        let children = store
+            .list_agent_runs(&AgentRunFilter {
+                parent_run_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, child.id);
+
+        let failed = store
+            .list_agent_runs(&AgentRunFilter {
+                status: Some(AgentRunStatus::Failed),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, parent.id);
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("provider disconnected")
+        );
+        let cancelled = store
+            .list_agent_runs(&AgentRunFilter {
+                status: Some(AgentRunStatus::Cancelled),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, other.id);
+    }
+
+    #[tokio::test]
+    async fn stale_running_query_returns_old_heartbeat_not_fresh() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let mut stale = new_agent_run("stale-session", "agent", "old task", None);
+        stale.started_at = "2000-01-01T00:00:00+00:00".to_string();
+        stale.updated_at = stale.started_at.clone();
+        let fresh = new_agent_run("stale-session", "agent", "fresh task", None);
+        store.start_agent_run(&stale).await.unwrap();
+        store.start_agent_run(&fresh).await.unwrap();
+
+        let policy = AgentRunStalenessPolicy {
+            stale_after: std::time::Duration::from_secs(60),
+            max_results: 10,
+        };
+        let runs = store.stale_running_agent_runs(&policy).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, stale.id);
+        assert_ne!(runs[0].id, fresh.id);
+    }
+
+    #[tokio::test]
+    async fn stale_running_query_rejects_unrepresentable_cutoff_without_panicking() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let policy = AgentRunStalenessPolicy {
+            stale_after: std::time::Duration::from_secs(8_500_000_000_000),
+            max_results: 10,
+        };
+
+        let error = store.stale_running_agent_runs(&policy).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("staleness cutoff is outside the timestamp range")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_run_schema_declares_operator_query_indexes() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = 'agent_runs'",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut names = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            names.insert(get_str(&row, 0).unwrap());
+        }
+        for expected in [
+            "idx_agent_runs_session_started",
+            "idx_agent_runs_status_updated",
+            "idx_agent_runs_parent_started",
+        ] {
+            assert!(names.contains(expected), "missing index {expected}");
+        }
+    }
 
     #[tokio::test]
     async fn test_record_and_query() {

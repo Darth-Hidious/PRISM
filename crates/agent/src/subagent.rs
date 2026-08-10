@@ -203,6 +203,8 @@ pub fn execute_spawn_subagent<'a>(
     command_tool_runtime: &'a CommandToolRuntime,
     tool_catalog: &'a ToolCatalog,
     parent_config: &'a AgentConfig,
+    parent_run_id: &'a str,
+    parent_session_id: &'a str,
     args: &'a Value,
     hooks: &'a HookRegistry,
     permissions: &'a ToolPermissionContext,
@@ -218,6 +220,8 @@ pub fn execute_spawn_subagent<'a>(
             command_tool_runtime,
             tool_catalog,
             parent_config,
+            parent_run_id,
+            parent_session_id,
             args,
             hooks,
             permissions,
@@ -237,6 +241,8 @@ async fn execute_spawn_subagent_inner(
     command_tool_runtime: &CommandToolRuntime,
     tool_catalog: &ToolCatalog,
     parent_config: &AgentConfig,
+    parent_run_id: &str,
+    parent_session_id: &str,
     args: &Value,
     hooks: &HookRegistry,
     permissions: &ToolPermissionContext,
@@ -262,6 +268,43 @@ async fn execute_spawn_subagent_inner(
         return Ok(err);
     }
     let sub = parse_args(args)?;
+
+    // The child row is created only after every spawn gate above succeeds, so
+    // refused delegation does not leave a ghost agent. Its explicit parent id
+    // is the durable spawn edge; provenance_records.parent_id remains the
+    // unrelated tool repair/retry chain.
+    let child_run = prism_provenance::new_agent_run(
+        parent_session_id,
+        "subagent",
+        &crate::agent_loop::agent_run_label(&sub.task),
+        Some(parent_run_id),
+    );
+    let db_path = crate::hooks::provenance_db_path();
+    let run_store = match prism_provenance::ProvenanceStore::open(&db_path).await {
+        Ok(store) => match store.start_agent_run(&child_run).await {
+            Ok(()) => Some(std::sync::Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %child_run.id,
+                    parent_run_id,
+                    error = %error,
+                    "subagent-run ledger start failed; continuing spawn"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                run_id = %child_run.id,
+                parent_run_id,
+                error = %error,
+                "subagent-run ledger open failed; continuing spawn"
+            );
+            None
+        }
+    };
+    let run_heartbeat =
+        crate::agent_loop::AgentRunHeartbeat::start(run_store.clone(), child_run.id.clone());
 
     // Real budget/context accounting for the subagent model (WU1: the default
     // fable model is registered, so this is never the $0 UNKNOWN fallback).
@@ -295,8 +338,7 @@ async fn execute_spawn_subagent_inner(
 
     // Snapshot the session's provenance ids so the subagent's new records can
     // be handed back as references afterwards.
-    let session_id = crate::hooks::provenance_session_id();
-    let before_ids = session_record_ids(&session_id).await;
+    let before_ids = session_record_ids(parent_session_id).await;
 
     // Harvest state filled by the nested emit callback.
     let mut streamed_text = String::new();
@@ -304,6 +346,8 @@ async fn execute_spawn_subagent_inner(
     let mut steps: Vec<String> = Vec::new();
     let mut usage: Option<UsageInfo> = None;
     let mut estimated_cost: Option<f64> = None;
+    let mut run_metrics = crate::agent_loop::AgentRunMetrics::default();
+    let nested_result;
 
     {
         // Nested event routing: the subagent's text is CAPTURED (it becomes
@@ -352,7 +396,7 @@ async fn execute_spawn_subagent_inner(
         // chain survives intact and the subagent's is isolated + discarded.
         let _chain_guard = crate::hooks::CodeRunChainGuard::new();
         let nested: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> =
-            Box::pin(crate::agent_loop::run_turn(
+            Box::pin(crate::agent_loop::run_turn_inner(
                 &sub_llm,
                 tool_server,
                 command_tool_runtime,
@@ -369,15 +413,48 @@ async fn execute_spawn_subagent_inner(
                 &mut nested_emit,
                 approval_rx,
                 policy,
+                &child_run.id,
+                &child_run.session_id,
+                &mut run_metrics,
             ));
         // `_chain_guard` restores the parent's chain on drop (Ok/Err/unwind).
-        nested.await?;
+        nested_result = nested.await;
     }
+
+    run_heartbeat.stop().await;
+
+    let (status, last_error) = match &nested_result {
+        Ok(()) => (prism_provenance::AgentRunStatus::Completed, None),
+        Err(error) => (
+            prism_provenance::AgentRunStatus::Failed,
+            Some(format!("{error:#}")),
+        ),
+    };
+    if let Some(store) = run_store.as_deref()
+        && let Err(error) = store
+            .finish_agent_run(
+                &child_run.id,
+                status,
+                run_metrics.tokens_in,
+                run_metrics.tokens_out,
+                run_metrics.cost_usd,
+                last_error.as_deref(),
+            )
+            .await
+    {
+        tracing::warn!(
+            run_id = %child_run.id,
+            parent_run_id,
+            error = %error,
+            "subagent-run ledger finish failed; preserving nested result"
+        );
+    }
+    nested_result?;
 
     // References, not blobs: best-effort provenance pointers to what the
     // subagent did (its writes are async, so a still-in-flight record may be
     // missed — recall(query=…) covers anything not listed).
-    let artifacts = harvest_artifacts(&session_id, before_ids.as_ref()).await;
+    let artifacts = harvest_artifacts(parent_session_id, before_ids.as_ref()).await;
 
     let summary_src = final_text
         .filter(|t| !t.trim().is_empty())

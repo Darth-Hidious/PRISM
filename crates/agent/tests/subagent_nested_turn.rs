@@ -100,7 +100,8 @@ fn tool_server_config(project: &Path, python: &Path) -> ToolServer {
 
 fn sse_text(text: &str) -> String {
     let chunk = serde_json::json!({
-        "choices": [{ "delta": { "content": text } }]
+        "choices": [{ "delta": { "content": text } }],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120 }
     });
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
@@ -111,7 +112,8 @@ fn sse_tool_call(tool: &str, arguments: &str) -> String {
             "index": 0,
             "id": "call_1",
             "function": { "name": tool, "arguments": arguments }
-        }] } }]
+        }] } }],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120 }
     });
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
@@ -255,14 +257,13 @@ fn tool_result_content<'a>(events: &'a [AgentEvent], tool: &str) -> Option<&'a s
 #[tokio::test(flavor = "multi_thread")]
 async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
     let _serial = SERIAL_TEST_LOCK.lock().await;
-    let Some(python) = find_python() else {
-        eprintln!("SKIP: python3 not on PATH");
-        return;
-    };
+    let python = find_python().expect("python3 is required for the durable parent-edge test");
     let project = tempfile::tempdir().expect("tempdir");
     write_stub_project(project.path());
     let base_url = start_stub_llm().await;
     let calls_log = project.path().join("calls.log");
+    let session_id = "subagent-run-parent-edge";
+    prism_agent::hooks::set_provenance_ctx(session_id, "stub-model");
 
     let (answer, events) = run_parent_turn(
         project.path(),
@@ -300,6 +301,34 @@ async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
     let log = std::fs::read_to_string(&calls_log).expect("nested tool must have executed");
     let calls = log.lines().filter(|l| l.contains("stub_echo")).count();
     assert_eq!(calls, 1, "nested tool executes exactly once");
+
+    // The same real path must leave a durable, reconstructable spawn edge.
+    let store = prism_provenance::ProvenanceStore::open(&prism_agent::hooks::provenance_db_path())
+        .await
+        .expect("open isolated agent-run ledger");
+    let runs = store
+        .list_agent_runs(&prism_provenance::AgentRunFilter {
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("query parent and child runs");
+    assert_eq!(runs.len(), 2, "one root and one child must be durable");
+    let root = runs
+        .iter()
+        .find(|run| run.role == "agent")
+        .expect("root run");
+    let child = runs
+        .iter()
+        .find(|run| run.role == "subagent")
+        .expect("subagent run");
+    assert_eq!(root.status, prism_provenance::AgentRunStatus::Completed);
+    assert_eq!(child.status, prism_provenance::AgentRunStatus::Completed);
+    assert_eq!(
+        child.parent_run_id.as_deref(),
+        Some(root.id.as_str()),
+        "the child row must carry the explicit spawn edge"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

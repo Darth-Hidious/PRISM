@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use prism_embed::EmbedBackend;
@@ -59,6 +59,208 @@ const CAPABILITY_GAP_RETRIEVE: usize = 5;
 /// Prefix of the temporary capability-gap note injected into the turn.
 const CAPABILITY_GAP_NOTE: &str =
     "You said you lacked a capability. These matching tools are now available to call: ";
+/// Operator-facing run labels are hints, not a second transcript.
+const AGENT_RUN_LABEL_CHARS: usize = 512;
+
+/// Cadence for refreshing the durable liveness timestamp of an active run.
+///
+/// The heartbeat is independent of model and tool progress, so a healthy turn
+/// remains visibly alive while it waits on a slow provider or human approval.
+/// Dropping the turn aborts its heartbeat and leaves the row `running`, which
+/// lets the stale-running query detect a cancelled task or crashed process.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentRunHeartbeatPolicy {
+    /// Time between best-effort heartbeat writes.
+    pub(crate) interval: Duration,
+}
+
+impl Default for AgentRunHeartbeatPolicy {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Scoped heartbeat task for one persisted run.
+pub(crate) struct AgentRunHeartbeat {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AgentRunHeartbeat {
+    pub(crate) fn start(
+        store: Option<Arc<prism_provenance::ProvenanceStore>>,
+        run_id: String,
+    ) -> Self {
+        Self::start_with_policy(store, run_id, AgentRunHeartbeatPolicy::default())
+    }
+
+    fn start_with_policy(
+        store: Option<Arc<prism_provenance::ProvenanceStore>>,
+        run_id: String,
+        policy: AgentRunHeartbeatPolicy,
+    ) -> Self {
+        let Some(store) = store else {
+            return Self {
+                stop_tx: None,
+                task: None,
+            };
+        };
+        if policy.interval.is_zero() {
+            tracing::warn!(
+                run_id,
+                "agent-run heartbeat interval is zero; heartbeat disabled"
+            );
+            return Self {
+                stop_tx: None,
+                task: None,
+            };
+        }
+
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(policy.interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Tokio's first interval tick is immediate. The start write already
+            // supplied the initial timestamp, so wait one full cadence.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = ticker.tick() => {
+                        if let Err(error) = store.heartbeat_agent_run(&run_id).await {
+                            tracing::warn!(
+                                run_id,
+                                error = %error,
+                                "agent-run ledger heartbeat failed; continuing turn"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            stop_tx: Some(stop_tx),
+            task: Some(task),
+        }
+    }
+
+    pub(crate) async fn stop(mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(task) = self.task.take()
+            && let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(
+                error = %error,
+                "agent-run heartbeat task failed while stopping"
+            );
+        }
+    }
+}
+
+impl Drop for AgentRunHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Usage accumulated by the active run, retained outside the inner loop so an
+/// error after a paid provider call can still close the row with honest spend.
+#[derive(Debug, Default)]
+pub(crate) struct AgentRunMetrics {
+    pub(crate) tokens_in: u64,
+    pub(crate) tokens_out: u64,
+    pub(crate) cost_usd: f64,
+}
+
+impl AgentRunMetrics {
+    pub(crate) fn record_usage(&mut self, usage: &UsageInfo, model: &str) {
+        self.tokens_in = self.tokens_in.saturating_add(usage.input_tokens);
+        self.tokens_out = self.tokens_out.saturating_add(usage.output_tokens);
+        self.cost_usd += estimate_cost(usage, &get_model_config(model));
+    }
+}
+
+pub(crate) fn agent_run_label(value: &str) -> String {
+    let value = value.trim();
+    if value.chars().count() <= AGENT_RUN_LABEL_CHARS {
+        value.to_string()
+    } else {
+        value.chars().take(AGENT_RUN_LABEL_CHARS).collect()
+    }
+}
+
+async fn start_root_agent_run(
+    run: &prism_provenance::AgentRun,
+) -> Option<Arc<prism_provenance::ProvenanceStore>> {
+    let db_path = crate::hooks::provenance_db_path();
+    match prism_provenance::ProvenanceStore::open(&db_path).await {
+        Ok(store) => match store.start_agent_run(run).await {
+            Ok(()) => Some(Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    error = %error,
+                    "agent-run ledger start failed; continuing turn"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                run_id = %run.id,
+                error = %error,
+                "agent-run ledger open failed; continuing turn"
+            );
+            None
+        }
+    }
+}
+
+async fn finish_root_agent_run(
+    store: Option<&prism_provenance::ProvenanceStore>,
+    run_id: &str,
+    result: &Result<()>,
+    metrics: &AgentRunMetrics,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let (status, last_error) = match result {
+        Ok(()) => (prism_provenance::AgentRunStatus::Completed, None),
+        Err(error) => (
+            prism_provenance::AgentRunStatus::Failed,
+            Some(format!("{error:#}")),
+        ),
+    };
+    if let Err(error) = store
+        .finish_agent_run(
+            run_id,
+            status,
+            metrics.tokens_in,
+            metrics.tokens_out,
+            metrics.cost_usd,
+            last_error.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            run_id,
+            error = %error,
+            "agent-run ledger finish failed; preserving turn result"
+        );
+    }
+}
 
 // ── Large-result handling ─────────────────────────────────────────
 
@@ -900,7 +1102,67 @@ pub async fn run_turn(
     scratchpad: &mut Scratchpad,
     emit: &mut (dyn FnMut(AgentEvent) + Send),
     approval_rx: Option<SharedApprovalReceiver>,
+    policy: Option<&mut prism_policy::PolicyEngine>,
+) -> Result<()> {
+    let session_id = crate::hooks::provenance_session_id();
+    let run =
+        prism_provenance::new_agent_run(&session_id, "agent", &agent_run_label(user_message), None);
+    // Generate the id independently of persistence. A child can still retain
+    // the intended topology if this best-effort parent write is unavailable.
+    let run_store = start_root_agent_run(&run).await;
+    let run_heartbeat = AgentRunHeartbeat::start(run_store.clone(), run.id.clone());
+    let mut run_metrics = AgentRunMetrics::default();
+    let result = run_turn_inner(
+        llm,
+        tool_server,
+        command_tool_runtime,
+        history,
+        tool_catalog,
+        config,
+        user_message,
+        task,
+        transcript,
+        hooks,
+        permissions,
+        live_permission_overrides,
+        scratchpad,
+        emit,
+        approval_rx,
+        policy,
+        &run.id,
+        &run.session_id,
+        &mut run_metrics,
+    )
+    .await;
+    run_heartbeat.stop().await;
+    finish_root_agent_run(run_store.as_deref(), &run.id, &result, &run_metrics).await;
+    result
+}
+
+/// Execute a turn inside an already-created durable run. Subagents create
+/// their child row at the spawn boundary, then call this function so the same
+/// row—and not a duplicate—is updated by the nested loop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_turn_inner(
+    llm: &LlmClient,
+    tool_server: &mut ToolServerHandle,
+    command_tool_runtime: &CommandToolRuntime,
+    history: &mut Vec<ChatMessage>,
+    tool_catalog: &ToolCatalog,
+    config: &AgentConfig,
+    user_message: &str,
+    task: Option<&crate::task::ResearchTaskContext>,
+    transcript: &mut TranscriptStore,
+    hooks: &HookRegistry,
+    permissions: &ToolPermissionContext,
+    live_permission_overrides: Option<SharedPermissionOverrides>,
+    scratchpad: &mut Scratchpad,
+    emit: &mut (dyn FnMut(AgentEvent) + Send),
+    approval_rx: Option<SharedApprovalReceiver>,
     mut policy: Option<&mut prism_policy::PolicyEngine>,
+    current_run_id: &str,
+    current_session_id: &str,
+    run_metrics: &mut AgentRunMetrics,
 ) -> Result<()> {
     // ── 1. Push user message ──────────────────────────────────────
     history.push(ChatMessage {
@@ -912,6 +1174,9 @@ pub async fn run_turn(
     transcript.append(TranscriptEntry::new("user", user_message));
 
     let mut total_usage = UsageInfo::default();
+    // `AgentConfig` can lag a runtime `/model` switch. Billing must follow the
+    // client that actually made each primary-model request.
+    let billing_model = llm.config().model.clone();
 
     // ── 1b. Pre-flight reprompt ───────────────────────────────────
     // Deterministic triage FIRST (pure function, no I/O): a well-formed expert
@@ -942,17 +1207,19 @@ pub async fn run_turn(
     // The classifier is a real billed call. Fold it into the turn's usage and
     // the cost ledger like any other — an LLM call nobody accounts for is how a
     // bill becomes a surprise.
-    if let Some(usage) = preflight.1 {
-        total_usage += UsageInfo {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
+    if let Some(billed) = preflight.1 {
+        let usage = UsageInfo {
+            input_tokens: billed.usage.prompt_tokens,
+            output_tokens: billed.usage.completion_tokens,
             ..Default::default()
         };
         transcript.record_cost(
             "reprompt_classifier",
-            usage.prompt_tokens,
-            usage.completion_tokens,
+            billed.usage.prompt_tokens,
+            billed.usage.completion_tokens,
         );
+        run_metrics.record_usage(&usage, &billed.model);
+        total_usage += usage;
     }
     match preflight.0 {
         crate::reprompt::Preflight::Proceed => {}
@@ -985,7 +1252,7 @@ pub async fn run_turn(
                 tool_call_id: None,
             });
             transcript.append(TranscriptEntry::new("assistant", question.as_str()));
-            let estimated_cost = estimate_cost(&total_usage, &get_model_config(&config.model));
+            let estimated_cost = run_metrics.cost_usd;
             emit(AgentEvent::TurnComplete {
                 text: Some(question),
                 has_more: false,
@@ -1225,13 +1492,15 @@ pub async fn run_turn(
 
         // ── 2d. Track usage ───────────────────────────────────────
         if let Some(usage) = &response.usage {
-            total_usage += UsageInfo {
+            let billed_usage = UsageInfo {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
             };
             transcript.record_cost("llm_turn", usage.prompt_tokens, usage.completion_tokens);
+            run_metrics.record_usage(&billed_usage, &billing_model);
+            total_usage += billed_usage;
         }
 
         // ── 2d-bis. Record the LLM turn in the provenance ledger ──
@@ -1450,8 +1719,7 @@ pub async fn run_turn(
                 }
 
                 // Calculate cost
-                let model_cfg = get_model_config(&config.model);
-                let estimated_cost = estimate_cost(&total_usage, &model_cfg);
+                let estimated_cost = run_metrics.cost_usd;
 
                 emit(AgentEvent::TurnComplete {
                     text: response.message.content.clone(),
@@ -1678,6 +1946,8 @@ pub async fn run_turn(
                             command_tool_runtime,
                             tool_catalog,
                             config,
+                            current_run_id,
+                            current_session_id,
                             &args,
                             hooks,
                             permissions,
@@ -2027,8 +2297,7 @@ pub async fn run_turn(
         text: "\n\n[Agent reached maximum iterations]".to_string(),
     });
 
-    let model_cfg = get_model_config(&config.model);
-    let estimated_cost = estimate_cost(&total_usage, &model_cfg);
+    let estimated_cost = run_metrics.cost_usd;
 
     emit(AgentEvent::TurnComplete {
         text: None,
@@ -2055,6 +2324,42 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_run_heartbeat_refreshes_until_stopped() {
+        let store = Arc::new(
+            prism_provenance::ProvenanceStore::open(std::path::Path::new(":memory:"))
+                .await
+                .unwrap(),
+        );
+        let run = prism_provenance::new_agent_run(
+            "heartbeat-session",
+            "agent",
+            "waiting on a provider",
+            None,
+        );
+        store.start_agent_run(&run).await.unwrap();
+        let heartbeat = AgentRunHeartbeat::start_with_policy(
+            Some(store.clone()),
+            run.id.clone(),
+            AgentRunHeartbeatPolicy {
+                interval: Duration::from_millis(5),
+            },
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        heartbeat.stop().await;
+        let rows = store
+            .list_agent_runs(&prism_provenance::AgentRunFilter {
+                session_id: Some(run.session_id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].updated_at, run.updated_at);
+    }
 
     fn tool_json(name: &str, desc: &str) -> serde_json::Value {
         serde_json::json!({ "name": name, "description": desc, "input_schema": { "type": "object" } })

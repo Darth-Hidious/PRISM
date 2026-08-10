@@ -58,6 +58,7 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 prism-ingest = { path = "../ingest" }
 prism-python-bridge = { path = "../python-bridge" }
+turso = { workspace = true }
 # Self dev-dependency: turns `test-guard` on for every test target of this
 # crate (lib unit tests and tests/*) without affecting downstream builds.
 # Removing this silently disarms the live-store guard —
