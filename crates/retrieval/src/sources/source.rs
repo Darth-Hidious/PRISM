@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use crate::model::SourcePage;
 
 use super::FetchCtx;
-use super::{arxiv, chemrxiv, crossref, doaj, europepmc, openalex, pubmed, semantic_scholar};
+use super::{arxiv, chemrxiv, crossref, doaj, europepmc, ntrs, openalex, pubmed, semantic_scholar};
 
 /// What an adapter can actually SERVE, declared per adapter and verified
 /// against its own translator by tests (`tests/capability_declarations.rs`)
@@ -225,10 +225,10 @@ impl SourceRegistry {
         }
     }
 
-    /// The eight built-in literature sources, in canonical order.
+    /// The nine built-in literature sources, in canonical order.
     pub fn builtin() -> Self {
         let mut reg = Self::new();
-        let builtins: [Arc<dyn Source>; 8] = [
+        let builtins: [Arc<dyn Source>; 9] = [
             Arc::new(Arxiv),
             Arc::new(Openalex),
             Arc::new(Crossref),
@@ -237,6 +237,7 @@ impl SourceRegistry {
             Arc::new(Preprints),
             Arc::new(Chemrxiv),
             Arc::new(Doaj),
+            Arc::new(Ntrs),
         ];
         for source in builtins {
             reg.register(source)
@@ -312,6 +313,8 @@ pub struct SemanticScholar;
 pub struct Preprints;
 pub struct Chemrxiv;
 pub struct Doaj;
+/// NASA Technical Reports Server.
+pub struct Ntrs;
 
 #[async_trait]
 impl Source for Arxiv {
@@ -583,12 +586,44 @@ impl Source for Doaj {
     }
 }
 
+#[async_trait]
+impl Source for Ntrs {
+    fn id(&self) -> &'static str {
+        ntrs::ID
+    }
+    fn min_interval(&self) -> Duration {
+        Duration::from_millis(500)
+    }
+    fn initial_cursor(&self) -> &'static str {
+        ntrs::INITIAL_CURSOR
+    }
+    fn capabilities(&self) -> SourceCaps {
+        SourceCaps {
+            max_page_size: ntrs::MAX_PAGE_SIZE,
+            max_offset: Some(ntrs::MAX_OFFSET),
+        }
+    }
+    async fn fetch(&self, ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+        ntrs::fetch(ctx, query).await.map_err(SourceError::classify)
+    }
+    async fn fetch_page(
+        &self,
+        ctx: &FetchCtx,
+        query: &str,
+        cursor: &str,
+    ) -> Result<(SourcePage, Option<String>), SourceError> {
+        ntrs::fetch_page(ctx, query, cursor)
+            .await
+            .map_err(SourceError::classify)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn builtin_registry_has_eight_sources_in_order() {
+    fn builtin_registry_has_nine_sources_in_order() {
         let reg = SourceRegistry::builtin();
         let ids: Vec<&str> = reg.all().iter().map(|s| s.id()).collect();
         assert_eq!(
@@ -601,7 +636,8 @@ mod tests {
                 "semantic_scholar",
                 "preprints_europepmc",
                 "chemrxiv",
-                "doaj"
+                "doaj",
+                "ntrs"
             ]
         );
     }
@@ -615,15 +651,15 @@ mod tests {
         assert_eq!(s.min_interval(), Duration::from_millis(3000));
     }
 
-    /// Pins ALL EIGHT politeness intervals through the registry. These were
+    /// Pins ALL NINE politeness intervals through the registry. These were
     /// duplicated from the old `SourceId::min_interval()` match into the
-    /// eight adapters; nothing structural keeps them in agreement with each
+    /// adapters; nothing structural keeps them in agreement with each
     /// source's published guidance, and silent drift on a rate limit is how
     /// the tool gets banned.
     #[test]
     fn builtin_intervals_match_published_politeness_guidance() {
         let reg = SourceRegistry::builtin();
-        let expected: [(&str, u64); 8] = [
+        let expected: [(&str, u64); 9] = [
             ("arxiv", 3000),
             ("openalex", 200),
             ("crossref", 200),
@@ -632,6 +668,7 @@ mod tests {
             ("preprints_europepmc", 500),
             ("chemrxiv", 500),
             ("doaj", 500),
+            ("ntrs", 500),
         ];
         for (id, millis) in expected {
             let source = reg
@@ -653,7 +690,7 @@ mod tests {
         reg.register(Arc::new(Demo)).expect("free id must register");
         assert_eq!(reg.get("demo").map(|s| s.id()), Some("demo"));
         // The built-ins are untouched.
-        assert_eq!(reg.all().len(), 9);
+        assert_eq!(reg.all().len(), 10);
     }
 
     /// The two-call contract: `register` refuses a taken id (accidental

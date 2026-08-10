@@ -342,6 +342,22 @@ pub struct LocalProvenance {
     pub origin_source_id: Option<String>,
 }
 
+/// The decoding/sampling record of one extraction activity, written onto
+/// the SAME `prov_activity` row by
+/// [`ProvenanceStore::record_activity_decoding`]. `None` fields mean the
+/// backend offered no such knob (embedded GGUF, MARC27 `/stream`) — the
+/// honest NULL, never a guessed default.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivityDecoding<'a> {
+    /// Sampling seed the request carried.
+    pub seed: Option<i64>,
+    /// Sampling temperature the request carried.
+    pub temperature: Option<f64>,
+    /// JSON decoding mode that actually applied:
+    /// `json_schema` | `json_object` | `prompt_only`.
+    pub mode: Option<&'a str>,
+}
+
 /// A subject/predicate/object triple to reify as a PROV-O assertion
 /// (mirrors core's `Assertion`; the stable id is derived, not carried).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,7 +588,14 @@ fn hash_optional_field(h: &mut sha2::Sha256, bytes: Option<&[u8]>) {
     }
 }
 
-fn conditioned_assertion_id(
+/// Stable id of a CONDITIONED assertion — one carrying a value, unit, or
+/// measurement conditions, which are part of its identity (see
+/// [`assertion_id`] for the bare-triple form the function reduces to when
+/// all three are absent). Public so callers that wrote a valued fact (the
+/// MatKG loader, tests pinning classification stamps) can locate its
+/// assertion row; the hashing itself stays this module's single
+/// implementation.
+pub fn conditioned_assertion_id(
     tenant: &str,
     subject: &str,
     predicate: &str,
@@ -690,7 +713,14 @@ fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
 /// — which recovers `locality` from the stored activity row — classifies
 /// with the SAME rule as the live path instead of an approximation of it.
 fn is_relay(locality: &str, tenant: &str) -> bool {
-    locality == "mesh" || tenant == "mesh" || tenant.starts_with("mesh:")
+    locality == "mesh" || is_mesh_tenant(tenant)
+}
+
+/// Whether `tenant` is a mesh tenant — the legacy shared `"mesh"` or a
+/// per-peer `"mesh:{node_id}"`. Shared by [`is_relay`] and the peer-echo
+/// tripwire so "what counts as a peer" cannot drift between the two.
+fn is_mesh_tenant(tenant: &str) -> bool {
+    tenant == "mesh" || tenant.starts_with("mesh:")
 }
 
 /// Independence key for one write, honouring an explicit origin when the
@@ -1454,6 +1484,17 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
         (),
     )
     .await?;
+    // Additive reproducibility columns (NULL on rows written before they
+    // existed, and on runs whose backend offered no such knob): the sampling
+    // seed and temperature an LLM extraction actually sent, plus the JSON
+    // decoding mode that really applied ('json_schema' = grammar-constrained
+    // to the active ontology, 'json_object' / 'prompt_only' = honest
+    // degradation). Alongside `agent_id` (the model id) these make a
+    // difference between two runs attributable — the model id alone cannot
+    // say whether two runs even sampled the same way.
+    crate::add_column_if_absent(conn, "prov_activity", "seed", "INTEGER").await?;
+    crate::add_column_if_absent(conn, "prov_activity", "temperature", "REAL").await?;
+    crate::add_column_if_absent(conn, "prov_activity", "decoding", "TEXT").await?;
 
     // `prov_assertion` is the query-optimized AGGREGATE row: `confidence`,
     // `corroborations`, and `evidence_class` are caches over
@@ -2337,10 +2378,47 @@ impl ProvenanceStore {
         // Mirror core: a measurement without a value fails schema validation
         // and is dropped (not written half-typed, not recorded as an
         // assertion). Checked before the transaction so a dropped fact never
-        // takes the write lock.
+        // takes the write lock. Defence in depth only: every ingest path
+        // rejects this shape upstream WITH a reported reason, so a caller
+        // whose fact vanishes here has already miscounted.
         if fact.kind.as_deref() == Some("measurement") && fact.value.is_none() {
             return Ok(());
         }
+
+        // Defence in depth for the unit, through the same controlled
+        // vocabulary every ingest path uses (`crate::units::resolve_unit` —
+        // never a second table): a measurement's number is meaningless
+        // without its unit (880 GPa vs 880 MPa), so a missing or
+        // unresolvable unit refuses the write LOUDLY — the old
+        // `unwrap_or_default()` here stored an empty-string unit instead.
+        // Ingest drops and reports this shape before it gets here; reaching
+        // this bail means a caller bypassed that contract. Raw spellings
+        // that DO resolve (`"MPa"`) are canonicalised so the store holds
+        // one unit vocabulary, not one per path.
+        let canonical_unit = match fact.kind.as_deref() {
+            Some("measurement") => match fact.unit.as_deref() {
+                Some(raw) => match crate::units::resolve_unit(raw) {
+                    Some(unit) => Some(unit.as_str().to_string()),
+                    None => bail!(
+                        "refusing to store measurement '{} {} {}': unit {raw:?} is neither \
+                         a QUDT identifier nor a recognised unit spelling — a number stored \
+                         without its unit is a wrong number, never stored unit-less",
+                        fact.subject,
+                        fact.predicate,
+                        fact.object
+                    ),
+                },
+                None => bail!(
+                    "refusing to store measurement '{} {} {}' carrying value {:?} with no \
+                     unit — a unit-less number is a wrong number, never stored unit-less",
+                    fact.subject,
+                    fact.predicate,
+                    fact.object,
+                    fact.value
+                ),
+            },
+            _ => fact.unit.clone(),
+        };
 
         // One fact commits atomically: EMMO entities/edges, the PROV-O
         // activity, the assertion, its evidence contribution, and the
@@ -2375,7 +2453,7 @@ impl ProvenanceStore {
                     },
                     prov,
                     fact.value,
-                    fact.unit.as_deref(),
+                    canonical_unit.as_deref(),
                     &conditions,
                     evidence_class,
                     metadata.and_then(|details| details.ontology),
@@ -2401,7 +2479,9 @@ impl ProvenanceStore {
                     let Some(value) = fact.value else {
                         return Ok(());
                     };
-                    let unit = fact.unit.clone().unwrap_or_default();
+                    let unit = canonical_unit
+                        .clone()
+                        .expect("guarded above: a measurement's unit is resolved or refused");
                     let meas_name = format!(
                         "meas_{}_{}_{value}",
                         canonical_key(&fact.subject),
@@ -2654,6 +2734,43 @@ impl ProvenanceStore {
                 ],
             )
             .await?;
+        Ok(())
+    }
+
+    /// Record the decoding/sampling parameters of one recorded activity —
+    /// an UPDATE on the SAME `prov_activity` row [`Self::record_activity`]
+    /// wrote (no parallel mechanism, no side table). A missing activity id
+    /// is a loud error: silently recording parameters against nothing would
+    /// fake the reproducibility trail this exists to provide.
+    pub async fn record_activity_decoding(
+        &self,
+        activity_id: &str,
+        decoding: &ActivityDecoding<'_>,
+    ) -> Result<()> {
+        // Same-handle serialization as record_activity — see write_lock.
+        let _same_handle_guard = self.write_lock.lock().await;
+        let affected = self
+            .conn
+            .execute(
+                r#"UPDATE prov_activity
+                   SET seed = ?2, temperature = ?3, decoding = ?4
+                   WHERE id = ?1"#,
+                [
+                    Value::Text(activity_id.to_string()),
+                    decoding.seed.map_or(Value::Null, Value::Integer),
+                    decoding.temperature.map_or(Value::Null, Value::Real),
+                    decoding
+                        .mode
+                        .map_or(Value::Null, |mode| Value::Text(mode.to_string())),
+                ],
+            )
+            .await?;
+        if affected == 0 {
+            bail!(
+                "no prov_activity row '{activity_id}' to record decoding parameters on — \
+                 record_activity must run first"
+            );
+        }
         Ok(())
     }
 
@@ -3347,7 +3464,17 @@ impl ProvenanceStore {
         predicate: &str,
         object: &str,
     ) -> Result<Vec<EvidenceContribution>> {
-        let id = assertion_id(tenant, subject, predicate, object);
+        self.assertion_evidence_by_id(&assertion_id(tenant, subject, predicate, object))
+            .await
+    }
+
+    /// [`Self::assertion_evidence`] by assertion id, for CONDITIONED
+    /// assertions (value/unit/conditions are part of their identity —
+    /// compute the id with [`conditioned_assertion_id`]). Before this
+    /// existed, a valued fact's evidence contributions were unreadable
+    /// through the public API.
+    pub async fn assertion_evidence_by_id(&self, id: &str) -> Result<Vec<EvidenceContribution>> {
+        let id = id.to_string();
         let mut rows = self
             .conn
             .query(
@@ -3728,14 +3855,22 @@ impl ProvenanceStore {
     // Tenant discovery + peer-echo detection
     // ─────────────────────────────────────────────────────────────────────
 
-    /// The tenants a DEFAULT read spans: [`LOCAL_TENANT`] plus every mesh
-    /// tenant actually present in the store. Peer tenants are DISCOVERED,
-    /// not hardcoded, so both the legacy shared `"mesh"` tenant and
-    /// per-peer `"mesh:{node_id}"` tenants are found regardless of which
-    /// shape the sync side currently writes. Deterministic order: local
-    /// first, then mesh tenants sorted.
+    /// The tenants a DEFAULT read spans: [`LOCAL_TENANT`], plus every
+    /// ontology-composed local tenant (`local@{ontology id}`, e.g. the
+    /// MatKG reference graph under `local@matkg` — see the ingest crate's
+    /// `storage_tenant`), plus every mesh tenant actually present in the
+    /// store. All non-local tenants are DISCOVERED, not hardcoded, so both
+    /// the legacy shared `"mesh"` tenant and per-peer `"mesh:{node_id}"`
+    /// tenants are found regardless of which shape the sync side currently
+    /// writes, and a reference ontology loaded yesterday is visible today
+    /// without a flag. Deterministic order: local first, then the
+    /// discovered tenants sorted (`local@…` sorts before `mesh…`).
+    ///
+    /// Every returned row of every scoped read names its owning tenant, so
+    /// widening the default scope never BLENDS subgraphs — tenant-qualified
+    /// keys keep them disjoint; this only makes them visible, labelled.
     pub async fn default_read_tenants(&self) -> Result<Vec<String>> {
-        let mut mesh: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut discovered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         // Entities and assertions can each exist without the other
         // (`record_assertion` alone writes no entity), so both tables are
         // consulted. Each cursor is fully drained before the next query
@@ -3746,18 +3881,19 @@ impl ProvenanceStore {
                 .query(
                     &format!(
                         "SELECT DISTINCT tenant FROM {table} \
-                         WHERE tenant = 'mesh' OR tenant LIKE 'mesh:%'"
+                         WHERE tenant = 'mesh' OR tenant LIKE 'mesh:%' \
+                            OR tenant LIKE 'local@%'"
                     ),
                     (),
                 )
                 .await?;
             while let Some(row) = rows.next().await? {
-                mesh.insert(get_str(&row, 0)?);
+                discovered.insert(get_str(&row, 0)?);
             }
         }
-        let mut tenants = Vec::with_capacity(1 + mesh.len());
+        let mut tenants = Vec::with_capacity(1 + discovered.len());
         tenants.push(LOCAL_TENANT.to_string());
-        tenants.extend(mesh);
+        tenants.extend(discovered);
         Ok(tenants)
     }
 
@@ -3788,7 +3924,10 @@ impl ProvenanceStore {
     /// tenant list, so a caller checking MANY triples (an ingest run)
     /// discovers the mesh tenants once instead of twice per fact.
     /// [`LOCAL_TENANT`] entries are skipped — holding the triple locally
-    /// is not an echo.
+    /// is not an echo — and so is every non-mesh tenant: this tripwire is
+    /// about PEER laundering, and a reference ontology tenant such as
+    /// `local@matkg` (now in the default read scope) holding the same
+    /// triple is reference data the user chose to load, not a peer echo.
     pub async fn peer_tenants_asserting_among(
         &self,
         tenants: &[String],
@@ -3798,7 +3937,7 @@ impl ProvenanceStore {
     ) -> Result<Vec<String>> {
         let mut holders = Vec::new();
         for tenant in tenants {
-            if tenant == LOCAL_TENANT {
+            if !is_mesh_tenant(tenant) {
                 continue;
             }
             let id = assertion_id(tenant, subject, predicate, object);
@@ -3942,6 +4081,97 @@ mod tests {
             .unwrap_or(f64::NAN)
     }
 
+    /// The reproducibility record lands on the SAME activity row
+    /// `record_activity` wrote — seed, temperature and decoding mode read
+    /// back exactly, NULLs stay NULL (a backend with no knobs must never
+    /// gain invented defaults), and recording against an activity that was
+    /// never recorded is a loud error, not a silent no-op.
+    #[tokio::test]
+    async fn activity_decoding_round_trips_on_the_activity_row() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        store.record_activity(&prov).await.unwrap();
+
+        store
+            .record_activity_decoding(
+                &prov.activity_id,
+                &ActivityDecoding {
+                    seed: Some(42),
+                    temperature: Some(0.0),
+                    mode: Some("json_schema"),
+                },
+            )
+            .await
+            .unwrap();
+
+        let seed = count(
+            &store,
+            "SELECT seed FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert_eq!(seed, 42);
+        let temperature = query_f64(
+            &store,
+            "SELECT temperature FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert!(temperature.abs() < f64::EPSILON, "{temperature}");
+        let mode = query_str(
+            &store,
+            "SELECT decoding FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert_eq!(mode, "json_schema");
+        // The model id it is attributable alongside was already there.
+        let agent = query_str(
+            &store,
+            "SELECT agent_id FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert_eq!(agent, "gemma-4-12b");
+
+        // Honest NULLs for a knob-less backend.
+        let bare = prov_from("doc:other", "act_test_2");
+        store.record_activity(&bare).await.unwrap();
+        store
+            .record_activity_decoding(
+                &bare.activity_id,
+                &ActivityDecoding {
+                    seed: None,
+                    temperature: None,
+                    mode: Some("prompt_only"),
+                },
+            )
+            .await
+            .unwrap();
+        let nulls = count(
+            &store,
+            "SELECT COUNT(*) FROM prov_activity \
+             WHERE id = 'act_test_2' AND seed IS NULL AND temperature IS NULL \
+             AND decoding = 'prompt_only'",
+        )
+        .await;
+        assert_eq!(nulls, 1);
+
+        // A phantom activity id is refused loudly.
+        let err = store
+            .record_activity_decoding(
+                "act_never_recorded",
+                &ActivityDecoding {
+                    seed: Some(1),
+                    temperature: Some(0.0),
+                    mode: Some("json_schema"),
+                },
+            )
+            .await
+            .expect_err("recording decoding on a never-recorded activity must fail");
+        assert!(
+            format!("{err:#}").contains("record_activity must run first"),
+            "{err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn write_fact_each_kind_is_searchable_and_traversable() {
         let db = TempDb::new();
@@ -4050,6 +4280,89 @@ mod tests {
         );
     }
 
+    /// Defence in depth at the store boundary (F10): a measurement's number
+    /// is meaningless without its unit, so the writer REFUSES — loudly,
+    /// never with a silent `Ok` — a measurement whose unit is missing or
+    /// resolves to no QUDT identifier, and canonicalises raw spellings that
+    /// do resolve so the store holds ONE unit vocabulary. Before this,
+    /// `unwrap_or_default()` stored an empty-string unit: a CSV `880` was
+    /// indistinguishable from 880 MPa or 880 GPa. Every ingest path drops
+    /// and reports these shapes upstream; this guard is for callers that
+    /// bypass that contract.
+    #[tokio::test]
+    async fn measurement_units_are_resolved_or_refused_never_stored_unitless() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        // No unit at all → refused loudly.
+        let mut unitless = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
+        unitless.value = Some(880.0);
+        let err = store
+            .write_fact(&unitless, &prov)
+            .await
+            .expect_err("a unit-less measurement must be refused, never stored");
+        assert!(
+            format!("{err:#}").contains("no unit"),
+            "the refusal must name the cause: {err:#}"
+        );
+
+        // A unit that resolves to nothing → refused loudly, naming it.
+        let mut gibberish = fact("measurement", "Ti-6Al-4V", "has_measurement", "hardness");
+        gibberish.value = Some(349.0);
+        gibberish.unit = Some("banana".into());
+        let err = store
+            .write_fact(&gibberish, &prov)
+            .await
+            .expect_err("an unresolvable unit must be refused, never stored raw");
+        assert!(
+            format!("{err:#}").contains("banana"),
+            "the refusal must name the spelling: {err:#}"
+        );
+
+        // Neither refused fact left a trace in the graph.
+        assert!(
+            store
+                .graph_search("Ti-6Al-4V", "t1", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused measurement must write nothing"
+        );
+
+        // A raw spelling that DOES resolve is canonicalised on the way in:
+        // the stored unit is the QUDT identifier, not the paper spelling.
+        let mut raw_spelling = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
+        raw_spelling.value = Some(880.0);
+        raw_spelling.unit = Some("MPa".into());
+        store.write_fact(&raw_spelling, &prov).await.unwrap();
+        let recalled = store.recall_with_context("UTS", "t1", 10).await.unwrap();
+        assert_eq!(recalled.len(), 1, "{recalled:?}");
+        assert_eq!(recalled[0].value, Some(880.0));
+        assert_eq!(
+            recalled[0].unit.as_deref(),
+            Some("QUDT:MegaPA"),
+            "the store must hold the canonical identifier, not the raw spelling"
+        );
+        // BOTH stored shapes agree: `recall_with_context` reads the
+        // assertion row; the synthetic Measurement NODE keeps its own copy
+        // in `props_json`, written separately — a regression could decouple
+        // them (canonical assertion, raw node) and the recall check alone
+        // would never see it.
+        let props: serde_json::Value = serde_json::from_str(
+            &query_str(
+                &store,
+                "SELECT props_json FROM emmo_entity WHERE label = 'Measurement'",
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(
+            props["unit"], "QUDT:MegaPA",
+            "the Measurement node's props must carry the canonical unit too"
+        );
+    }
+
     /// Caller-supplied node labels govern EVERY fact arm, subject and
     /// object alike — the tabular ingest passes the ACTIVE ontology's
     /// declared storage labels here, so what lands in `emmo_entity.label`
@@ -4098,6 +4411,9 @@ mod tests {
             };
             if *kind == Some("measurement") {
                 f.value = Some(42.0);
+                // The store refuses unit-less measurements (defence in
+                // depth for F10); the labeling under test is orthogonal.
+                f.unit = Some("QUDT:MegaPA".into());
             }
             store
                 .write_fact_with_evidence(
@@ -4136,6 +4452,9 @@ mod tests {
             };
             if *kind == Some("measurement") {
                 f.value = Some(42.0);
+                // The store refuses unit-less measurements (defence in
+                // depth for F10); the labeling under test is orthogonal.
+                f.unit = Some("QUDT:MegaPA".into());
             }
             store.write_fact(&f, &prov).await.unwrap();
             assert_eq!(label_of(&subj).await, "Matter", "legacy arm {kind:?}");
@@ -7750,6 +8069,43 @@ mod tests {
             store.default_read_tenants().await.unwrap(),
             ["local", "mesh", "mesh:node-a"],
             "default scope must include every mesh tenant and no foreign tenant"
+        );
+    }
+
+    /// Ontology-composed local tenants (`local@{ontology id}` — the MatKG
+    /// reference graph is `local@matkg`) are part of the DEFAULT read
+    /// scope, so loaded reference knowledge is visible to `prism query`
+    /// and the agent's query tools without a flag — but they are NOT mesh
+    /// peers: the peer-echo laundering tripwire must never report
+    /// reference data the user chose to load as a peer echo.
+    #[tokio::test]
+    async fn ontology_tenants_join_default_scope_but_are_not_peer_echoes() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        for tenant in ["local@matkg", "mesh:node-a"] {
+            let mut prov = test_prov();
+            prov.tenant = tenant.into();
+            prov.activity_id = format!("act_{tenant}");
+            store
+                .write_fact(&fact("phase", "LiFePO4", "COOCCURS_WITH", "Olivine"), &prov)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.default_read_tenants().await.unwrap(),
+            ["local", "local@matkg", "mesh:node-a"],
+            "the ontology tenant must be discovered into the default scope"
+        );
+        assert_eq!(
+            store
+                .peer_tenants_asserting("LiFePO4", "COOCCURS_WITH", "Olivine")
+                .await
+                .unwrap(),
+            ["mesh:node-a"],
+            "only MESH tenants are peers; local@matkg holding the triple is \
+             reference data, not an echo"
         );
     }
 

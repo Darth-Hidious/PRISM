@@ -19,60 +19,102 @@ const DEFAULT_CONFIDENCE: f64 = 0.8;
 /// `prism_provenance::ProvenanceStore::write_fact` expects:
 ///
 /// - `HAS_PROPERTY` → `measurement` when the target entity's freeform
-///   `properties` carry a numeric `value` (with optional `unit`); otherwise
-///   a generic edge (kind `None`) so the property is not dropped.
+///   `properties` carry a numeric `value` AND a unit that resolves through
+///   the same controlled vocabulary the text path uses
+///   (`prism_provenance::units::resolve_unit` — the stored unit is always
+///   the QUDT identifier, never the raw spelling); a numeric value whose
+///   unit is missing or unresolvable DROPS the whole relationship, reported
+///   in the second return value (a number stored without its unit is a
+///   wrong number — unit-less floats once made 880 GPa indistinguishable
+///   from 880 MPa in this store). A target with no numeric value at all
+///   stays a generic edge (kind `None`) so the property is not dropped.
 /// - `HAS_PHASE` → `phase`.
 /// - `PROCESSED_BY` → `processing`, with the step order in `value`.
 /// - `CONTAINS` → `contains`, with the fraction in `value`.
 /// - Anything else → generic edge under its own predicate.
 ///
-/// Entities that appear in no relationship produce no facts.
-pub fn to_local_facts(entity_set: &EntitySet) -> Vec<LocalFact> {
+/// Entities that appear in no relationship produce no facts. Returns
+/// `(facts, dropped)` — one human-readable reason per dropped relationship,
+/// same contract as the pipeline's `dropped_relationships`: NON-EMPTY is a
+/// PARTIAL result the caller must surface, never a silent drop.
+pub fn to_local_facts(entity_set: &EntitySet) -> (Vec<LocalFact>, Vec<String>) {
     let by_name: std::collections::HashMap<&str, &Entity> = entity_set
         .entities
         .iter()
         .map(|e| (e.name.as_str(), e))
         .collect();
 
-    entity_set
-        .relationships
-        .iter()
-        .map(|rel| {
-            let (kind, value, unit) = match rel.rel_type.as_str() {
-                "HAS_PROPERTY" => {
-                    // The numeric value + unit live in the TARGET entity's
-                    // freeform properties JSON, not on the relationship.
-                    let target = by_name.get(rel.to.as_str());
-                    let value = target
-                        .and_then(|e| e.properties.get("value"))
-                        .and_then(serde_json::Value::as_f64);
-                    match value {
-                        Some(v) => {
-                            let unit = target
-                                .and_then(|e| e.properties.get("unit"))
-                                .and_then(serde_json::Value::as_str)
-                                .map(str::to_string);
-                            (Some("measurement"), Some(v), unit)
+    let mut facts = Vec::with_capacity(entity_set.relationships.len());
+    let mut dropped = Vec::new();
+    for rel in &entity_set.relationships {
+        let (kind, value, unit) = match rel.rel_type.as_str() {
+            "HAS_PROPERTY" => {
+                // The numeric value + unit live in the TARGET entity's
+                // freeform properties JSON, not on the relationship.
+                let target = by_name.get(rel.to.as_str());
+                let value = target
+                    .and_then(|e| e.properties.get("value"))
+                    .and_then(serde_json::Value::as_f64);
+                match value {
+                    Some(v) => {
+                        let spelling = target
+                            .and_then(|e| e.properties.get("unit"))
+                            .and_then(serde_json::Value::as_str);
+                        // THE unit rule, same table as the text path: a
+                        // numeric value is stored with a resolved QUDT unit
+                        // or not at all.
+                        match spelling {
+                            Some(spelling) => {
+                                match prism_provenance::units::resolve_unit(spelling) {
+                                    Some(unit) => (
+                                        Some("measurement"),
+                                        Some(v),
+                                        Some(unit.as_str().to_string()),
+                                    ),
+                                    None => {
+                                        dropped.push(format!(
+                                            "{} -[HAS_PROPERTY]-> {}: unit {spelling:?} on \
+                                             numeric value {v} is neither a QUDT identifier \
+                                             nor a recognised unit spelling — a number stored \
+                                             without its unit is a wrong number, so the fact \
+                                             is dropped whole, never stored unit-less",
+                                            rel.from, rel.to
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                            None => {
+                                dropped.push(format!(
+                                    "{} -[HAS_PROPERTY]-> {}: numeric value {v} arrived \
+                                     with no unit at all — a unit-less number is a wrong \
+                                     number, so the fact is dropped whole, never stored \
+                                     unit-less",
+                                    rel.from, rel.to
+                                ));
+                                continue;
+                            }
                         }
-                        None => (None, None, None),
                     }
+                    None => (None, None, None),
                 }
-                "HAS_PHASE" => (Some("phase"), None, None),
-                "PROCESSED_BY" => (Some("processing"), rel.order.map(f64::from), None),
-                "CONTAINS" => (Some("contains"), rel.weight, None),
-                _ => (None, None, None),
-            };
-            LocalFact {
-                subject: rel.from.clone(),
-                predicate: rel.rel_type.clone(),
-                object: rel.to.clone(),
-                value,
-                unit,
-                confidence: Some(DEFAULT_CONFIDENCE),
-                kind: kind.map(str::to_string),
             }
-        })
-        .collect()
+            "HAS_PHASE" => (Some("phase"), None, None),
+            "PROCESSED_BY" => (Some("processing"), rel.order.map(f64::from), None),
+            "CONTAINS" => (Some("contains"), rel.weight, None),
+            _ => (None, None, None),
+        };
+        facts.push(LocalFact {
+            subject: rel.from.clone(),
+            predicate: rel.rel_type.clone(),
+            object: rel.to.clone(),
+            value,
+            unit,
+            confidence: Some(DEFAULT_CONFIDENCE),
+            kind: kind.map(str::to_string),
+        });
+    }
+    (facts, dropped)
 }
 
 #[cfg(test)]
@@ -111,15 +153,68 @@ mod tests {
             ],
             relationships: vec![rel("Ti-6Al-4V", "HAS_PROPERTY", "UTS")],
         };
-        let facts = to_local_facts(&set);
+        let (facts, dropped) = to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].kind.as_deref(), Some("measurement"));
         assert_eq!(facts[0].value, Some(1140.0));
-        assert_eq!(facts[0].unit.as_deref(), Some("MPa"));
+        // The unit is stored RESOLVED — the QUDT identifier, never the raw
+        // spelling (the text path and the store hold the same vocabulary).
+        assert_eq!(facts[0].unit.as_deref(), Some("QUDT:MegaPA"));
         assert_eq!(facts[0].subject, "Ti-6Al-4V");
         assert_eq!(facts[0].object, "UTS");
         assert_eq!(facts[0].predicate, "HAS_PROPERTY");
         assert_eq!(facts[0].confidence, Some(DEFAULT_CONFIDENCE));
+    }
+
+    /// THE unit rule on the tabular path: a numeric value whose unit is
+    /// missing or resolves to no QUDT identifier drops the WHOLE
+    /// relationship, with a reason — never a measurement with a raw or
+    /// empty unit string (F10: the store once held `unit: ""` for exactly
+    /// this shape, re-opening the 880 GPa vs 880 MPa hazard the text path
+    /// had closed).
+    #[test]
+    fn numeric_value_with_missing_or_unresolvable_unit_is_dropped_with_reason() {
+        let set = EntitySet {
+            entities: vec![
+                entity("Alloy", "Ti-6Al-4V", serde_json::json!({})),
+                // No unit at all on a numeric value.
+                entity("Property", "UTS", serde_json::json!({"value": 880.0})),
+                // A unit that resolves to nothing.
+                entity(
+                    "Property",
+                    "hardness",
+                    serde_json::json!({"value": 349.0, "unit": "banana"}),
+                ),
+                // Control: resolvable spelling → stored, resolved.
+                entity(
+                    "Property",
+                    "density",
+                    serde_json::json!({"value": 7.8, "unit": "g/cm3"}),
+                ),
+            ],
+            relationships: vec![
+                rel("Ti-6Al-4V", "HAS_PROPERTY", "UTS"),
+                rel("Ti-6Al-4V", "HAS_PROPERTY", "hardness"),
+                rel("Ti-6Al-4V", "HAS_PROPERTY", "density"),
+            ],
+        };
+        let (facts, dropped) = to_local_facts(&set);
+
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert_eq!(facts[0].object, "density");
+        assert_eq!(facts[0].unit.as_deref(), Some("QUDT:GM-PER-CentiM3"));
+
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        let drops = dropped.join("\n");
+        assert!(
+            drops.contains("UTS") && drops.contains("880") && drops.contains("no unit at all"),
+            "the unit-less drop must name the fact, the value and the cause: {drops}"
+        );
+        assert!(
+            drops.contains("hardness") && drops.contains("banana"),
+            "the unresolvable-unit drop must name the fact and the spelling: {drops}"
+        );
     }
 
     #[test]
@@ -135,7 +230,8 @@ mod tests {
             ],
             relationships: vec![rel("Ti-6Al-4V", "HAS_PROPERTY", "corrosion resistance")],
         };
-        let facts = to_local_facts(&set);
+        let (facts, dropped) = to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 1);
         // Generic edge under HAS_PROPERTY — a measurement kind without a
         // value would be dropped by write_fact.
@@ -164,7 +260,8 @@ mod tests {
                 rel("Nb25Mo25Ta25W25", "HAS_PHASE", "BCC"),
             ],
         };
-        let facts = to_local_facts(&set);
+        let (facts, dropped) = to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 3);
         assert_eq!(facts[0].kind.as_deref(), Some("contains"));
         assert_eq!(facts[0].value, Some(0.25));
@@ -181,7 +278,8 @@ mod tests {
             entities: vec![],
             relationships: vec![rel("A", "DERIVED_FROM", "B")],
         };
-        let facts = to_local_facts(&set);
+        let (facts, dropped) = to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].kind, None);
         assert_eq!(facts[0].predicate, "DERIVED_FROM");
@@ -222,8 +320,9 @@ mod tests {
             ],
         };
 
-        let facts = to_local_facts(&set);
+        let (facts, dropped) = to_local_facts(&set);
 
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 2);
         for fact in &facts {
             if fact.kind.as_deref() == Some("measurement") {

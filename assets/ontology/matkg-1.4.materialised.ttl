@@ -1,0 +1,78 @@
+# PRISM materialised MatKG 1.4 class vocabulary.
+# Contains data from MatKG by Vineeth Venugopal and Elsa Olivetti.
+# Dataset: https://doi.org/10.5281/zenodo.10144972 (MatKG 1.4)
+# Paper: Venugopal, V. & Olivetti, E. MatKG: An autonomously generated
+#        knowledge graph in Material Science. Scientific Data 11, 217 (2024).
+#        https://doi.org/10.1038/s41597-024-03039-z
+# Licensed under CC BY 4.0: https://creativecommons.org/licenses/by/4.0/legalcode
+#
+# Class IRIs are PRISM-minted: upstream MatKG identifies entities and types
+# only under the placeholder namespace http://example.com/, and its
+# entity_uri_mapping.pickle resolves entity names to that same placeholder
+# namespace, so no upstream canonical identity exists to reuse.
+
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix emmo: <https://w3id.org/emmo#> .
+@prefix matkg: <https://marc27.com/ontology/matkg#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+
+<https://marc27.com/ontology/matkg> a owl:Ontology ;
+    owl:versionIRI <https://marc27.com/ontology/matkg/1.4> ;
+    dcterms:title "PRISM materialised MatKG 1.4 class vocabulary"@en ;
+    dcterms:creator "Vineeth Venugopal", "Elsa Olivetti" ;
+    dcterms:license <https://creativecommons.org/licenses/by/4.0/legalcode> ;
+    dcterms:source <https://doi.org/10.5281/zenodo.10144972> ;
+    dcterms:bibliographicCitation "Venugopal, V. & Olivetti, E. MatKG: An autonomously generated knowledge graph in Material Science. Scientific Data 11, 217 (2024). https://doi.org/10.1038/s41597-024-03039-z" ;
+    rdfs:comment "The seven MatKG named-entity categories re-expressed as OWL classes, plus the one statistical relationship the SUBRELOBJ distribution actually carries. Entities are NER strings from ~5 million papers, not curated individuals; alignment to EMMO is therefore asserted only as skos:closeMatch, and only where the vendored EMMO 1.0.3 subset declares a verifiable counterpart."@en .
+
+matkg:Application a owl:Class
+    ; skos:prefLabel "Application"@en
+    ; skos:altLabel "APL"@en
+    ; skos:definition "An application or use context a material, method, or device is mentioned for in the materials-science literature (MatKG NER category APL)."@en
+    .
+
+matkg:CharacterisationMethod a owl:Class
+    ; skos:prefLabel "CharacterisationMethod"@en
+    ; skos:altLabel "CMT"@en
+    ; skos:definition "An experimental or analytical technique used to characterise a material (MatKG NER category CMT)."@en
+    .
+
+matkg:Chemical a owl:Class
+    ; skos:prefLabel "Chemical"@en
+    ; skos:altLabel "CHM"@en
+    ; skos:definition "A chemical, compound, or material named in the materials-science literature (MatKG NER category CHM)."@en
+    ; skos:closeMatch emmo:EMMO_abf7efbe_6b04_41b8_8326_4dd0f6be753e
+    .
+
+matkg:Descriptor a owl:Class
+    ; skos:prefLabel "Descriptor"@en
+    ; skos:altLabel "DSC"@en
+    ; skos:definition "A sample descriptor: the morphology, form, or qualitative description of a sample (MatKG NER category DSC)."@en
+    .
+
+matkg:Property a owl:Class
+    ; skos:prefLabel "Property"@en
+    ; skos:altLabel "PRO"@en
+    ; skos:definition "A material property named in the materials-science literature (MatKG NER category PRO)."@en
+    ; skos:closeMatch emmo:EMMO_b7bcff25_ffc3_474e_9ab5_01b1664bd4ba
+    .
+
+matkg:SymmetryPhaseLabel a owl:Class
+    ; skos:prefLabel "SymmetryPhaseLabel"@en
+    ; skos:altLabel "SPL"@en
+    ; skos:definition "A symmetry or phase label: a phase name, space-group or structure-prototype label attached to a material mention (MatKG NER category SPL)."@en
+    .
+
+matkg:SynthesisMethod a owl:Class
+    ; skos:prefLabel "SynthesisMethod"@en
+    ; skos:altLabel "SMT"@en
+    ; skos:definition "A synthesis or processing method used to make a material (MatKG NER category SMT)."@en
+    .
+
+matkg:cooccursWith a owl:ObjectProperty
+    ; skos:prefLabel "cooccursWith"@en
+    ; skos:definition "Statistical co-occurrence of two named entities across the materials-science literature (~5 million papers). The strength of the association is the MatKG hasCount tally carried by each loaded fact. Co-occurrence is corroboration strength, not a verified physical relationship, and emphatically not a probability."@en
+    .

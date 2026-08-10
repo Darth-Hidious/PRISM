@@ -340,6 +340,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             // being invisible — but this loop was discarding it with `.facts`,
             // leaving the literature path exactly as silent as before.
             let mut extraction_failures: Vec<serde_json::Value> = Vec::new();
+            // Facts the extractor dropped ONE BY ONE (malformed shape, or a
+            // unit no QUDT identifier could be resolved for). Distinct from
+            // `extraction_failures` (a whole block yielding nothing) and
+            // from `rejected` (claims refused at validation): these never
+            // became claims at all, and only this list says why.
+            let mut dropped_facts: Vec<serde_json::Value> = Vec::new();
             let mut truncated_bytes = 0usize;
             // Extract per located block so every claim inherits a locator a
             // human can follow back into the document.
@@ -361,6 +367,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         .with_context(|| "LLM fact extraction failed")?;
                 if let Some(reason) = &extraction.parse_error {
                     extraction_failures.push(json!({
+                        "section": block.locator.section_path,
+                        "reason": reason,
+                    }));
+                }
+                for reason in &extraction.dropped_facts {
+                    dropped_facts.push(json!({
                         "section": block.locator.section_path,
                         "reason": reason,
                     }));
@@ -453,6 +465,11 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     // Non-empty means some blocks produced nothing because the
                     // model misbehaved, NOT because the paper was silent there.
                     "extraction_failures": extraction_failures,
+                    // Facts dropped individually during extraction (bad shape
+                    // or an unresolvable unit) — they never became claims,
+                    // and a numeric value is never kept with its unit
+                    // discarded. One entry per fact, with the reason.
+                    "dropped_facts": dropped_facts,
                     "truncated_bytes": truncated_bytes,
                 }))?
             );
@@ -762,6 +779,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `--sources ntrs` must select the NTRS adapter: the CLI's name
+    /// catalogue (SourceId), the default selection, and the registry that
+    /// actually serves fetches all have to agree, or the name parses while
+    /// the engine reports an unknown source.
+    #[test]
+    fn ntrs_is_selectable_and_backed_by_a_registered_adapter() {
+        let ids = parse_sources(&Some("ntrs".to_string())).expect("'ntrs' must parse");
+        assert_eq!(ids, ["ntrs"]);
+        let default = parse_sources(&None).expect("default set must parse");
+        assert!(
+            default.contains(&"ntrs".to_string()),
+            "ntrs missing from the default selection: {default:?}"
+        );
+        assert!(
+            prism_retrieval::SourceRegistry::builtin()
+                .get("ntrs")
+                .is_some(),
+            "the catalogue names 'ntrs' but no adapter is registered under it"
+        );
     }
 
     /// The probe must refuse a remote host BEFORE resolving it. `papers` is an

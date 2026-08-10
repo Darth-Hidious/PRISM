@@ -439,30 +439,52 @@ fn validate_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
-    /// Serialise tests in this module — all of them mutate `$HOME` to
-    /// isolate the on-disk config, and that's a process-global. Without
-    /// this lock, parallel tests stomp each other's HOME and the wrong
-    /// tempdir gets read at load time. The lock is tests-only; it adds
-    /// no runtime cost in the actual binary.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    /// All tests here mutate `$HOME` (a process-global) to isolate the
+    /// on-disk config. They serialise on the ONE shared env lock
+    /// (`prism_runtime::offline::test_support::ENV_LOCK`) — this module
+    /// used to declare its own `static ENV_LOCK`, which serialised it only
+    /// against itself: a test elsewhere in this binary that overrides HOME
+    /// under the shared lock raced it and opened its store inside a HOME
+    /// this module had already swapped and deleted. A genuine failure, in
+    /// the full parallel run only. Aliasing, not declaring, is the fix
+    /// (see `boot_checks::ENV_LOCK` — same defect, tenth and eleventh
+    /// occurrence).
+    ///
+    /// `prior_home` restores the REAL `$HOME` on drop: leaving it pointed
+    /// at a deleted tempdir poisoned every later HOME-reading test in the
+    /// binary.
     struct IsolatedHome {
+        prior_home: Option<std::ffi::OsString>,
         _tmp: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
     }
 
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            // SAFETY: `_guard` (the shared env lock) is still held while
+            // this runs — struct fields drop after `drop()` returns.
+            unsafe {
+                match self.prior_home.take() {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
     fn isolated_home() -> IsolatedHome {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = prism_runtime::offline::test_support::env_lock();
+        let prior_home = std::env::var_os("HOME");
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: ENV_LOCK serialises this test module's HOME mutation.
+        // SAFETY: the shared ENV_LOCK serialises env mutation across every
+        // test in this binary that takes it.
         unsafe {
             std::env::set_var("HOME", tmp.path());
         }
         IsolatedHome {
+            prior_home,
             _tmp: tmp,
             _guard: guard,
         }
