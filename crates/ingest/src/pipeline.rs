@@ -3211,8 +3211,16 @@ mod tests {
                 .is_empty()
         );
 
-        // The DEFAULT read scope (local + discovered mesh tenants) does not
-        // silently absorb the second ontology's subgraph.
-        assert_eq!(store.default_read_tenants().await.unwrap(), ["local"]);
+        // The DEFAULT read scope DISCOVERS the second ontology's tenant —
+        // that is what makes loaded reference vocabularies (MatKG) reachable
+        // by `prism query` and the agent without a flag. Discovery is not
+        // blending: every read above proved the subgraphs stay disjoint,
+        // and each returned row names its owning tenant. (This deliberately
+        // reverses the earlier "not absorbed" pin, which predates the MatKG
+        // reference graph.)
+        assert_eq!(
+            store.default_read_tenants().await.unwrap(),
+            ["local", "local@chem-coexist"]
+        );
     }
 }

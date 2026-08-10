@@ -588,7 +588,14 @@ fn hash_optional_field(h: &mut sha2::Sha256, bytes: Option<&[u8]>) {
     }
 }
 
-fn conditioned_assertion_id(
+/// Stable id of a CONDITIONED assertion — one carrying a value, unit, or
+/// measurement conditions, which are part of its identity (see
+/// [`assertion_id`] for the bare-triple form the function reduces to when
+/// all three are absent). Public so callers that wrote a valued fact (the
+/// MatKG loader, tests pinning classification stamps) can locate its
+/// assertion row; the hashing itself stays this module's single
+/// implementation.
+pub fn conditioned_assertion_id(
     tenant: &str,
     subject: &str,
     predicate: &str,
@@ -706,7 +713,14 @@ fn origin_source_key(source_entity_id: &str, relay: bool) -> String {
 /// — which recovers `locality` from the stored activity row — classifies
 /// with the SAME rule as the live path instead of an approximation of it.
 fn is_relay(locality: &str, tenant: &str) -> bool {
-    locality == "mesh" || tenant == "mesh" || tenant.starts_with("mesh:")
+    locality == "mesh" || is_mesh_tenant(tenant)
+}
+
+/// Whether `tenant` is a mesh tenant — the legacy shared `"mesh"` or a
+/// per-peer `"mesh:{node_id}"`. Shared by [`is_relay`] and the peer-echo
+/// tripwire so "what counts as a peer" cannot drift between the two.
+fn is_mesh_tenant(tenant: &str) -> bool {
+    tenant == "mesh" || tenant.starts_with("mesh:")
 }
 
 /// Independence key for one write, honouring an explicit origin when the
@@ -3450,7 +3464,17 @@ impl ProvenanceStore {
         predicate: &str,
         object: &str,
     ) -> Result<Vec<EvidenceContribution>> {
-        let id = assertion_id(tenant, subject, predicate, object);
+        self.assertion_evidence_by_id(&assertion_id(tenant, subject, predicate, object))
+            .await
+    }
+
+    /// [`Self::assertion_evidence`] by assertion id, for CONDITIONED
+    /// assertions (value/unit/conditions are part of their identity —
+    /// compute the id with [`conditioned_assertion_id`]). Before this
+    /// existed, a valued fact's evidence contributions were unreadable
+    /// through the public API.
+    pub async fn assertion_evidence_by_id(&self, id: &str) -> Result<Vec<EvidenceContribution>> {
+        let id = id.to_string();
         let mut rows = self
             .conn
             .query(
@@ -3831,14 +3855,22 @@ impl ProvenanceStore {
     // Tenant discovery + peer-echo detection
     // ─────────────────────────────────────────────────────────────────────
 
-    /// The tenants a DEFAULT read spans: [`LOCAL_TENANT`] plus every mesh
-    /// tenant actually present in the store. Peer tenants are DISCOVERED,
-    /// not hardcoded, so both the legacy shared `"mesh"` tenant and
-    /// per-peer `"mesh:{node_id}"` tenants are found regardless of which
-    /// shape the sync side currently writes. Deterministic order: local
-    /// first, then mesh tenants sorted.
+    /// The tenants a DEFAULT read spans: [`LOCAL_TENANT`], plus every
+    /// ontology-composed local tenant (`local@{ontology id}`, e.g. the
+    /// MatKG reference graph under `local@matkg` — see the ingest crate's
+    /// `storage_tenant`), plus every mesh tenant actually present in the
+    /// store. All non-local tenants are DISCOVERED, not hardcoded, so both
+    /// the legacy shared `"mesh"` tenant and per-peer `"mesh:{node_id}"`
+    /// tenants are found regardless of which shape the sync side currently
+    /// writes, and a reference ontology loaded yesterday is visible today
+    /// without a flag. Deterministic order: local first, then the
+    /// discovered tenants sorted (`local@…` sorts before `mesh…`).
+    ///
+    /// Every returned row of every scoped read names its owning tenant, so
+    /// widening the default scope never BLENDS subgraphs — tenant-qualified
+    /// keys keep them disjoint; this only makes them visible, labelled.
     pub async fn default_read_tenants(&self) -> Result<Vec<String>> {
-        let mut mesh: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut discovered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         // Entities and assertions can each exist without the other
         // (`record_assertion` alone writes no entity), so both tables are
         // consulted. Each cursor is fully drained before the next query
@@ -3849,18 +3881,19 @@ impl ProvenanceStore {
                 .query(
                     &format!(
                         "SELECT DISTINCT tenant FROM {table} \
-                         WHERE tenant = 'mesh' OR tenant LIKE 'mesh:%'"
+                         WHERE tenant = 'mesh' OR tenant LIKE 'mesh:%' \
+                            OR tenant LIKE 'local@%'"
                     ),
                     (),
                 )
                 .await?;
             while let Some(row) = rows.next().await? {
-                mesh.insert(get_str(&row, 0)?);
+                discovered.insert(get_str(&row, 0)?);
             }
         }
-        let mut tenants = Vec::with_capacity(1 + mesh.len());
+        let mut tenants = Vec::with_capacity(1 + discovered.len());
         tenants.push(LOCAL_TENANT.to_string());
-        tenants.extend(mesh);
+        tenants.extend(discovered);
         Ok(tenants)
     }
 
@@ -3891,7 +3924,10 @@ impl ProvenanceStore {
     /// tenant list, so a caller checking MANY triples (an ingest run)
     /// discovers the mesh tenants once instead of twice per fact.
     /// [`LOCAL_TENANT`] entries are skipped — holding the triple locally
-    /// is not an echo.
+    /// is not an echo — and so is every non-mesh tenant: this tripwire is
+    /// about PEER laundering, and a reference ontology tenant such as
+    /// `local@matkg` (now in the default read scope) holding the same
+    /// triple is reference data the user chose to load, not a peer echo.
     pub async fn peer_tenants_asserting_among(
         &self,
         tenants: &[String],
@@ -3901,7 +3937,7 @@ impl ProvenanceStore {
     ) -> Result<Vec<String>> {
         let mut holders = Vec::new();
         for tenant in tenants {
-            if tenant == LOCAL_TENANT {
+            if !is_mesh_tenant(tenant) {
                 continue;
             }
             let id = assertion_id(tenant, subject, predicate, object);
@@ -8033,6 +8069,43 @@ mod tests {
             store.default_read_tenants().await.unwrap(),
             ["local", "mesh", "mesh:node-a"],
             "default scope must include every mesh tenant and no foreign tenant"
+        );
+    }
+
+    /// Ontology-composed local tenants (`local@{ontology id}` — the MatKG
+    /// reference graph is `local@matkg`) are part of the DEFAULT read
+    /// scope, so loaded reference knowledge is visible to `prism query`
+    /// and the agent's query tools without a flag — but they are NOT mesh
+    /// peers: the peer-echo laundering tripwire must never report
+    /// reference data the user chose to load as a peer echo.
+    #[tokio::test]
+    async fn ontology_tenants_join_default_scope_but_are_not_peer_echoes() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        for tenant in ["local@matkg", "mesh:node-a"] {
+            let mut prov = test_prov();
+            prov.tenant = tenant.into();
+            prov.activity_id = format!("act_{tenant}");
+            store
+                .write_fact(&fact("phase", "LiFePO4", "COOCCURS_WITH", "Olivine"), &prov)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.default_read_tenants().await.unwrap(),
+            ["local", "local@matkg", "mesh:node-a"],
+            "the ontology tenant must be discovered into the default scope"
+        );
+        assert_eq!(
+            store
+                .peer_tenants_asserting("LiFePO4", "COOCCURS_WITH", "Olivine")
+                .await
+                .unwrap(),
+            ["mesh:node-a"],
+            "only MESH tenants are peers; local@matkg holding the triple is \
+             reference data, not an echo"
         );
     }
 

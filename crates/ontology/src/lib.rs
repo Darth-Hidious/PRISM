@@ -662,6 +662,26 @@ pub fn load_bundled_emmo() -> Result<OntologyGraph, OntologyError> {
     )
 }
 
+/// Load the MatKG 1.4 class vocabulary compiled into this crate.
+///
+/// MatKG (Venugopal & Olivetti, Scientific Data 11:217, 2024;
+/// doi:10.5281/zenodo.10144972, CC BY 4.0) declares its seven NER entity
+/// categories only under the placeholder namespace `http://example.com/`,
+/// so this artifact re-expresses them under a PRISM-minted namespace. The
+/// same SHA-256 authentication as the EMMO artifact applies; the manifest
+/// carries the licence and the REQUIRED CC-BY attribution.
+///
+/// # Errors
+///
+/// Returns [`OntologyError`] if bundled bytes fail authentication or semantic
+/// validation.
+pub fn load_bundled_matkg() -> Result<OntologyGraph, OntologyError> {
+    OntologyGraph::from_bytes(
+        include_bytes!("../../../assets/ontology/matkg-1.4.materialised.ttl"),
+        include_bytes!("../../../assets/ontology/matkg-1.4.provenance.json"),
+    )
+}
+
 fn validated_iri(value: &str, context: &str) -> Result<Iri, OntologyError> {
     Iri::new(value.to_owned()).map_err(|_| OntologyError::InvalidIri {
         context: context.to_owned(),
@@ -789,12 +809,18 @@ fn build_closure(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{Iri, OntologyError, OntologyGraph, load_bundled_emmo, sha256_hex};
+    use super::{
+        Iri, OntologyError, OntologyGraph, load_bundled_emmo, load_bundled_matkg, sha256_hex,
+    };
     use serde::Deserialize;
     use serde_json::json;
 
     const ARTIFACT: &[u8] = include_bytes!("../../../assets/ontology/emmo-1.0.3.materialised.ttl");
     const MANIFEST: &[u8] = include_bytes!("../../../assets/ontology/emmo-1.0.3.provenance.json");
+    const MATKG_ARTIFACT: &[u8] =
+        include_bytes!("../../../assets/ontology/matkg-1.4.materialised.ttl");
+    const MATKG_MANIFEST: &[u8] =
+        include_bytes!("../../../assets/ontology/matkg-1.4.provenance.json");
 
     #[derive(Deserialize)]
     struct TestManifest {
@@ -818,6 +844,87 @@ mod tests {
 
         let graph = load_bundled_emmo().unwrap();
         assert_eq!(graph.sha256(), digest);
+    }
+
+    /// The MatKG artifact is pinned exactly as EMMO's is: the vendored bytes
+    /// must match the manifest digest, and the production loader must load
+    /// and re-verify those same bytes. A one-byte edit to the artifact
+    /// without a manifest update fails here.
+    #[test]
+    fn bundled_matkg_artifact_hash_matches_manifest_at_production_loader() {
+        let manifest: TestManifest = serde_json::from_slice(MATKG_MANIFEST).unwrap();
+        let digest = sha256_hex(MATKG_ARTIFACT);
+        assert_eq!(digest, manifest.materialised_sha256);
+
+        let graph = load_bundled_matkg().unwrap();
+        assert_eq!(graph.sha256(), digest);
+        assert_eq!(
+            graph.version_iri().as_str(),
+            "https://marc27.com/ontology/matkg/1.4"
+        );
+    }
+
+    /// The MatKG manifest must carry the licence and the REQUIRED CC-BY
+    /// attribution naming the authors and the dataset DOI — attribution is a
+    /// licence condition, not decoration.
+    #[test]
+    fn matkg_manifest_records_doi_licence_and_required_attribution() {
+        let manifest: serde_json::Value = serde_json::from_slice(MATKG_MANIFEST).unwrap();
+        assert_eq!(manifest["license"], "CC-BY-4.0");
+        assert_eq!(manifest["dataset_doi"], "10.5281/zenodo.10144972");
+        let attribution = manifest["attribution"]
+            .as_str()
+            .expect("attribution must be present");
+        for required in [
+            "Venugopal",
+            "Olivetti",
+            "CC BY 4.0",
+            "10.5281/zenodo.10144972",
+        ] {
+            assert!(
+                attribution.contains(required),
+                "attribution is missing {required:?}: {attribution}"
+            );
+        }
+    }
+
+    /// All seven MatKG classes and the single co-occurrence relationship
+    /// resolve through the manifest mappings to declared IRIs, exactly as
+    /// EMMO's do.
+    #[test]
+    fn every_matkg_manifest_mapping_resolves_to_its_declared_canonical_iri() {
+        let manifest: TestManifest = serde_json::from_slice(MATKG_MANIFEST).unwrap();
+        let graph = load_bundled_matkg().unwrap();
+
+        assert_eq!(manifest.class_mappings.len(), 7, "MatKG declares 7 classes");
+        assert_eq!(manifest.relation_mappings.len(), 1);
+        for mapping in manifest.class_mappings {
+            let declaration = graph
+                .class_for_label(&mapping.extraction_label)
+                .unwrap_or_else(|| panic!("unresolved class alias {}", mapping.extraction_label));
+            assert_eq!(declaration.iri.as_str(), mapping.iri);
+        }
+        for mapping in manifest.relation_mappings {
+            let declaration = graph
+                .property_for_label(&mapping.extraction_label)
+                .unwrap_or_else(|| {
+                    panic!("unresolved relation alias {}", mapping.extraction_label)
+                });
+            assert_eq!(declaration.iri.as_str(), mapping.iri);
+        }
+    }
+
+    #[test]
+    fn corrupt_matkg_artifact_is_rejected_before_rdf_dispatch() {
+        let mut corrupt = MATKG_ARTIFACT.to_vec();
+        let byte = corrupt
+            .iter_mut()
+            .find(|byte| **byte == b'@')
+            .expect("artifact has a prefix declaration");
+        *byte = b'#';
+
+        let error = OntologyGraph::from_bytes(&corrupt, MATKG_MANIFEST).unwrap_err();
+        assert!(matches!(error, OntologyError::HashMismatch { .. }));
     }
 
     #[test]

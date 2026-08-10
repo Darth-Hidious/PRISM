@@ -42,7 +42,7 @@ pub use emmo::{
     GraphNode, LOCAL_TENANT, LocalAssertion, LocalFact, LocalProvenance, MaterialFact,
     MeasurementCondition, OntologyClassification, QudtUnit, RecalledFact, RecalledMaterialFact,
     SemanticEntityHit, StoreBusy, TraversalResult, assertion_id, canonical_key,
-    evidence_for_result,
+    conditioned_assertion_id, evidence_for_result,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
