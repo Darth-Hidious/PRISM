@@ -705,6 +705,97 @@ impl LlmClient {
         Ok(Self::extract_content(&data))
     }
 
+    /// Ask a vision model about an image.
+    ///
+    /// `image_png` is raw PNG bytes; they are base64'd into the OpenAI-style
+    /// `image_url` content part that llama.cpp, vLLM and OpenAI all accept.
+    ///
+    /// The two paths that CANNOT carry an image refuse rather than quietly
+    /// dropping it. That failure is not hypothetical: sending a page image to
+    /// a text-only build returns a fluent, confident description of a
+    /// document the model never saw — the caller has no way to tell that
+    /// answer from a real one, and every fact extracted from it is fabricated.
+    /// An error is recoverable; a hallucinated page is not.
+    /// `max_output_tokens` bounds this ONE call. It is not an operator
+    /// policy cap on what the model may say — it is the size of the thing
+    /// being asked about. A caller transcribing a region of a page knows how
+    /// much text can physically be printed there, and without that bound a
+    /// model that falls into a repetition loop (small VLMs do, on repetitive
+    /// imagery) generates until the context is exhausted: measured at over
+    /// five minutes for a single tile of micrographs before the request even
+    /// returned to be judged degenerate.
+    pub async fn describe_image(
+        &self,
+        prompt: &str,
+        image_png: &[u8],
+        max_output_tokens: u64,
+    ) -> Result<String> {
+        if self.local_backend().is_some() {
+            bail!(
+                "the in-process local backend cannot accept images; point PRISM at a \
+                 vision-capable server (a llama-server started with --mmproj, for \
+                 example) to read pages with a model"
+            );
+        }
+        if self.is_marc27() {
+            bail!(
+                "the hosted platform LLM endpoint does not accept images; configure a \
+                 vision-capable endpoint for document reading"
+            );
+        }
+
+        let body = self.vision_request_body(prompt, image_png, max_output_tokens);
+        let resp = self.post(&self.chat_completions_url(), &body).await?;
+        let data: serde_json::Value = resp.json().await.context("bad vision response")?;
+        Ok(Self::extract_content(&data))
+    }
+
+    /// Build the vision request. Separated from the send so the parts that
+    /// are easy to get silently wrong — that the image is actually attached,
+    /// and that the caller's output bound actually reaches the wire — are
+    /// checkable without a server. Both have been wrong here before.
+    fn vision_request_body(
+        &self,
+        prompt: &str,
+        image_png: &[u8],
+        max_output_tokens: u64,
+    ) -> serde_json::Value {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(image_png);
+        let messages = serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url",
+                 "image_url": {"url": format!("data:image/png;base64,{encoded}")}},
+            ],
+        }]);
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            // Deterministic: the same page must read the same way twice, or
+            // two ingests of one document disagree about what it says.
+            "temperature": 0.0,
+        });
+        // The base64 payload is ~4/3 of the image and would dominate a
+        // token estimate, but it does NOT cost text tokens — a vision
+        // encoder charges a fixed budget per image (256 on Gemma 4,
+        // measured). Estimate from the prompt alone so the output cap is
+        // not throttled by the size of the picture.
+        let mut body =
+            self.with_operator_output_cap(body, Self::estimate_tokens(&serde_json::json!(prompt)));
+        // The caller's bound and the operator's cap both apply; the smaller
+        // wins, so neither can silently widen the other.
+        if let Some(object) = body.as_object_mut() {
+            let bounded = object
+                .get("max_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(max_output_tokens, |cap| cap.min(max_output_tokens));
+            object.insert("max_tokens".to_string(), serde_json::json!(bounded));
+        }
+        body
+    }
+
     /// MARC27 platform LLM: POST /stream with SSE response.
     async fn chat_marc27_simple(&self, messages: &serde_json::Value) -> Result<String> {
         let url = format!("{}/stream", self.config.base_url);
@@ -3068,6 +3159,103 @@ fn strip_tool_call_blocks(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The BUILDER being right is not the same as the CALL SITE using it.
+    /// This drives `describe_image` itself against a real socket and reads
+    /// what actually went out — the check that would have caught the bound
+    /// being built correctly and then never passed through.
+    #[tokio::test]
+    async fn describe_image_sends_the_bound_and_the_image_over_the_wire() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_request(|req| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body().unwrap().to_vec()).unwrap();
+                // The caller's bound, on the wire.
+                body["max_tokens"].as_u64() == Some(1234)
+                    // The image, on the wire — the exact bytes, not merely
+                    // a well-formed data URI (an EMPTY image still produces
+                    // one of those, which is the failure mode that matters).
+                    && body["messages"][0]["content"][1]["image_url"]["url"]
+                        .as_str()
+                        .and_then(|u| u.strip_prefix("data:image/png;base64,"))
+                        .and_then(|b| {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD.decode(b).ok()
+                        })
+                        .is_some_and(|bytes| bytes == b"\x89PNG\r\n\x1a\nbytes")
+            })
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"choices":[{"message":{"content":"transcribed"}}]}"#)
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: format!("{}/v1", server.url()),
+            model: "gemma".into(),
+            ..Default::default()
+        });
+        let text = client
+            .describe_image("read this", b"\x89PNG\r\n\x1a\nbytes", 1234)
+            .await
+            .expect("the mock must match; a mismatch means the request was wrong");
+        assert_eq!(text, "transcribed");
+        mock.assert_async().await;
+    }
+
+    /// The two things that silently broke while this was being written: the
+    /// image not actually being attached (a text-only request comes back with
+    /// a fluent, wholly invented description of a page the model never saw),
+    /// and the caller's output bound not reaching the wire (a looping model
+    /// then generates until the context is exhausted — measured at five
+    /// minutes for one tile before it could even be judged degenerate).
+    #[test]
+    fn vision_request_carries_the_image_and_the_caller_bound() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: "http://localhost:8081/v1".into(),
+            model: "gemma".into(),
+            ..Default::default()
+        });
+        let png = b"\x89PNG\r\n\x1a\nfake image bytes";
+        let body = client.vision_request_body("read this", png, 2048);
+
+        // The image is attached, as a data URI, in the user turn.
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().expect("a url");
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(url.trim_start_matches("data:image/png;base64,"))
+            .expect("decodable");
+        assert_eq!(decoded, png, "the exact bytes must survive to the wire");
+
+        // The caller's bound reaches the request.
+        assert_eq!(body["max_tokens"].as_u64(), Some(2048));
+        // Determinism: the same page must read the same way twice.
+        assert_eq!(body["temperature"].as_f64(), Some(0.0));
+    }
+
+    /// The smaller of the caller's bound and the operator's cap wins, in
+    /// BOTH directions — neither may silently widen the other.
+    #[test]
+    fn the_smaller_of_caller_bound_and_operator_cap_wins() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: "http://localhost:8081/v1".into(),
+            model: "gemma".into(),
+            max_output_tokens: Some(256),
+            ..Default::default()
+        });
+        // Operator cap (256) is tighter than the caller's 2048.
+        let tight = client.vision_request_body("p", b"x", 2048);
+        assert_eq!(tight["max_tokens"].as_u64(), Some(256));
+        // Caller's bound (64) is tighter than the operator cap.
+        let tighter = client.vision_request_body("p", b"x", 64);
+        assert_eq!(tighter["max_tokens"].as_u64(), Some(64));
+    }
     use super::*;
 
     #[test]

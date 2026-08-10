@@ -30,6 +30,7 @@
 
 pub mod batching;
 pub mod connectors;
+pub mod document;
 pub mod extraction_schema;
 pub mod graph_validation;
 pub mod induction;

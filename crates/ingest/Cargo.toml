@@ -24,6 +24,8 @@ hex = { workspace = true }
 sophia = { workspace = true }
 uuid = { workspace = true }
 polars = { workspace = true }
+pdf-extract = { workspace = true }
+image = { workspace = true }
 prism-llm = { path = "../llm" }
 prism-ontology = { path = "../ontology" }
 prism-provenance = { path = "../provenance" }

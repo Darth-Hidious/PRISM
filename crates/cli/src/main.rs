@@ -6649,6 +6649,30 @@ async fn run_platform_ingest_file(
     }))
 }
 
+/// Make the vision document reader available for this process, if a model is
+/// configured at all.
+///
+/// Registered ONCE, alongside the built-in text layer, so escalation has
+/// somewhere to go when a page comes back scanned or with a broken font
+/// encoding. Failure here is deliberately not fatal: an already-registered
+/// reader (a second ingest in one process) must not cost the user the ingest,
+/// and the text layer still works without it. What it must never do is fail
+/// SILENTLY — a missing renderer surfaces as the reason escalation reports
+/// against the page it could not fix.
+fn register_vision_reader(cfg: prism_ingest::LlmConfig) {
+    use std::sync::Arc;
+    if cfg.base_url.trim().is_empty() {
+        return;
+    }
+    let reader = Arc::new(prism_ingest::document::VisionUnderstanding::new(
+        Arc::new(prism_ingest::document::CommandRasteriser::poppler()),
+        Arc::new(prism_ingest::llm::LlmClient::new(cfg)),
+    ));
+    if let Err(error) = prism_ingest::document::register_understanding(reader) {
+        tracing::debug!(%error, "vision document reader was already registered");
+    }
+}
+
 /// Ingest a text document entirely on-device: extract EMMO facts with the
 /// local LLM and write them (with one PROV-O activity) into the bundled
 /// Turso provenance store. Nothing leaves the machine.
@@ -6685,34 +6709,59 @@ async fn run_local_text_ingest_file(
         );
     }
 
-    // PDFs are parsed ON DEVICE, with the same extractor `prism papers
-    // full-text` uses (`prism_retrieval::fulltext::parse_pdf`, pdf-extract
-    // underneath): bytes in, text out, no runtime sidecar and no network.
-    // The parse runs under `spawn_blocking` because PDF extraction is
-    // CPU-bound (it would stall the async runtime) and can PANIC on
-    // malformed input — `spawn_blocking` catches the unwind as a JoinError,
-    // which is reported as an honest per-file error instead of tearing down
-    // the whole ingest run.
+    // The vision reader is built from the configured model and has to exist
+    // BEFORE the read begins, so a page the text layer cannot recover has
+    // somewhere to escalate to. Best-effort on purpose: READING a document
+    // must not start requiring a model just because escalation might want
+    // one. With no model configured there is simply no vision reader, and
+    // escalation reports that against any page it could not fix.
+    if let Ok(cfg) = build_llm_config(project_root, llm_url, model, api_key) {
+        register_vision_reader(cfg);
+    }
+
+    // PDFs are read ON DEVICE through the document-understanding plane: no
+    // runtime sidecar, and no network beyond whatever model the operator
+    // configured. Each reader owns its own blocking, so a `pdf-extract` panic
+    // on one malformed file is an honest per-file error rather than a dead
+    // ingest run.
     let (text, _pages, warning) = if ingest_format(path) == "pdf" {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read PDF {}", path.display()))?;
-        let parsed =
-            tokio::task::spawn_blocking(move || prism_retrieval::fulltext::parse_pdf(&bytes)).await;
-        let fulltext = match parsed {
-            Ok(result) => {
-                result.with_context(|| format!("parsing PDF {} locally", path.display()))?
-            }
-            Err(join_error) if join_error.is_panic() => bail!(
-                "PDF text extraction panicked on {} — the file is likely malformed or \
-                 unsupported; nothing was extracted and nothing was written",
-                path.display()
-            ),
-            Err(join_error) => {
-                return Err(anyhow!(join_error))
-                    .with_context(|| format!("PDF parse task failed for {}", path.display()));
-            }
-        };
-        (fulltext.plain_text, None, None)
+        // Read through the document-understanding plane rather than calling
+        // one extractor directly: the text layer is only one way to read a
+        // PDF, and a page it cannot read (scanned, or a broken font encoding
+        // that drops a whole table) escalates to whichever richer adapter is
+        // registered and available. Which reader actually ran is reported,
+        // never assumed.
+        let label = path.display().to_string();
+        let doc = prism_ingest::document::SourceDocument::whole(&bytes, "pdf", &label);
+        let outcome =
+            prism_ingest::document::read(&doc, &prism_ingest::document::Policy::default())
+                .await
+                .with_context(|| format!("reading PDF {} locally", path.display()))?;
+
+        // Say what could not be read and what could not be tried. A page of a
+        // paper that silently never reached the extractor is exactly the kind
+        // of hole this plane exists to stop being invisible.
+        for skipped in &outcome.skipped {
+            eprintln!("Note: document reader unavailable — {skipped}");
+        }
+        let unrecovered: Vec<String> = outcome
+            .unrecovered()
+            .map(|note| format!("p{} ({})", note.number, note.damage))
+            .collect();
+        let warning = (!unrecovered.is_empty()).then(|| {
+            format!(
+                "{} of {} pages could not be read cleanly: {}",
+                unrecovered.len(),
+                outcome.understanding.pages.len(),
+                unrecovered.join(", "),
+            )
+        });
+        if let Some(warning) = &warning {
+            eprintln!("Warning: {warning}");
+        }
+        (outcome.understanding.plain_text(), None, warning)
     } else {
         // Non-PDF text formats just read the file. Either way the runtime
         // sidecar is never contacted on the local path.

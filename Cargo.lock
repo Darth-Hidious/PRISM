@@ -2779,6 +2779,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5083,6 +5085,8 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "image",
+ "pdf-extract",
  "polars",
  "prism-llm",
  "prism-ontology",
@@ -5116,6 +5120,7 @@ name = "prism-llm"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs",
  "encoding_rs",
  "futures-util",

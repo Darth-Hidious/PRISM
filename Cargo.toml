@@ -70,6 +70,8 @@ url = { version = "2.5.8", features = ["serde"] }
 # Document parsing (retrieval engine: Atom/JATS XML, PDF text)
 quick-xml = "0.41"
 pdf-extract = "0.12"
+# Page cropping for the vision document reader (tiling a rendered page).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 flate2 = "1"
 tar = "0.4"
 
