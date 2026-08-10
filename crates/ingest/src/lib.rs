@@ -37,6 +37,7 @@ pub use prism_llm as llm;
 pub use prism_llm::LlmConfig;
 pub mod local_facts;
 pub mod mapping;
+pub mod matkg;
 pub mod ontologies;
 pub mod ontology;
 pub mod pipeline;

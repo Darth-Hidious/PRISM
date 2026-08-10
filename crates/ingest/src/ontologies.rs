@@ -34,7 +34,7 @@ use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard};
 
 use anyhow::{Result, bail};
 pub use prism_ontology::{ClassDecl, Iri, PropDecl as RelationDecl};
-use prism_ontology::{OntologyGraph, load_bundled_emmo};
+use prism_ontology::{OntologyGraph, load_bundled_emmo, load_bundled_matkg};
 
 use crate::EntitySet;
 use crate::graph_validation::{GraphIssue, GraphSeverity};
@@ -429,6 +429,89 @@ impl Ontology for EmmoOntology {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Built-in: MatKG
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Stable id of the built-in MatKG vocabulary. Composed into the storage
+/// tenant, so MatKG facts land under `storage_tenant(base, "matkg")` —
+/// `"local@matkg"` for local loads — and can never blend with or corroborate
+/// the user's own `"local"` facts (tenant is part of every entity key and
+/// assertion id).
+pub const MATKG_ONTOLOGY_ID: &str = "matkg";
+
+/// Same first-use integrity gate as EMMO's graph: a hash-mismatched or
+/// malformed bundled artifact is a process failure, not a degraded load.
+static MATKG_GRAPH: LazyLock<OntologyGraph> = LazyLock::new(|| {
+    load_bundled_matkg().unwrap_or_else(|error| {
+        panic!("bundled MatKG 1.4 ontology failed integrity validation: {error}")
+    })
+});
+
+static MATKG_CLASSES: LazyLock<Vec<ClassDecl>> = LazyLock::new(|| {
+    MATKG_GRAPH
+        .classes()
+        .iter()
+        .filter(|decl| !decl.extraction_labels.is_empty())
+        .cloned()
+        .collect()
+});
+
+static MATKG_RELATIONS: LazyLock<Vec<RelationDecl>> = LazyLock::new(|| {
+    MATKG_GRAPH
+        .properties()
+        .iter()
+        .filter(|decl| !decl.extraction_labels.is_empty())
+        .cloned()
+        .collect()
+});
+
+/// The built-in MatKG 1.4 vocabulary (Venugopal & Olivetti, Scientific Data
+/// 11:217, 2024; CC BY 4.0): the seven NER entity categories as classes and
+/// the one statistical relationship the SUBRELOBJ distribution actually
+/// carries, `COOCCURS_WITH`. Primarily consumed by the bulk loader in
+/// [`crate::matkg`]; it has no text extractor, and selecting it as the
+/// active ontology for text ingest is refused honestly by that path.
+///
+/// Storage labels are the trait-default identity mapping: every declared
+/// type persists under itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MatKgOntology;
+
+impl Ontology for MatKgOntology {
+    fn id(&self) -> &'static str {
+        MATKG_ONTOLOGY_ID
+    }
+
+    fn version_iri(&self) -> &Iri {
+        MATKG_GRAPH.version_iri()
+    }
+
+    fn artifact_sha256(&self) -> &str {
+        MATKG_GRAPH.sha256()
+    }
+
+    fn classes(&self) -> &[ClassDecl] {
+        MATKG_CLASSES.as_slice()
+    }
+
+    fn relations(&self) -> &[RelationDecl] {
+        MATKG_RELATIONS.as_slice()
+    }
+
+    fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
+        MATKG_GRAPH.class_for_label(label)
+    }
+
+    fn relation_for_label(&self, label: &str) -> Option<&RelationDecl> {
+        MATKG_GRAPH.property_for_label(label)
+    }
+
+    fn is_a(&self, sub: &Iri, sup: &Iri) -> bool {
+        MATKG_GRAPH.is_a(sub, sup)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Registry
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -570,6 +653,8 @@ impl OntologyRegistry {
     pub fn builtin() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(EmmoOntology))
+            .expect("built-in ontology declarations are valid and unique");
+        reg.register(Arc::new(MatKgOntology))
             .expect("built-in ontology declarations are valid and unique");
         reg
     }
@@ -840,7 +925,7 @@ mod tests {
                 .class_for_label("Alloy")
                 .is_some()
         );
-        assert_eq!(reg.ids(), ["emmo"]);
+        assert_eq!(reg.ids(), ["emmo", "matkg"]);
     }
 
     /// The strict half: `replace` refuses a FREE id, and a deliberate
@@ -872,7 +957,7 @@ mod tests {
                 .is_some(),
             "get() must return the replacement"
         );
-        assert_eq!(reg.all().len(), 1, "replaced in place, not appended");
+        assert_eq!(reg.all().len(), 2, "replaced in place, not appended");
     }
 
     #[test]
@@ -1185,6 +1270,67 @@ mod tests {
             ontology.is_a(&material.iri, transitive_ancestor),
             "Material is no longer classified below transitive ancestor '{transitive_ancestor}'"
         );
+    }
+
+    /// MatKG resolves through the SAME production dispatch as EMMO: the
+    /// process-wide registry serves it by id, all seven declared classes and
+    /// the single relationship resolve to artifact IRIs, and its facts land
+    /// under a composed tenant disjoint from both "local" and every mesh
+    /// tenant.
+    #[test]
+    fn active_matkg_resolves_declared_vocabulary_and_composed_tenant() {
+        let ontology = active(Some(MATKG_ONTOLOGY_ID)).expect("matkg is built in");
+        assert_eq!(
+            ontology.version_iri().as_str(),
+            "https://marc27.com/ontology/matkg/1.4"
+        );
+        let labels: Vec<&str> = ontology
+            .classes()
+            .iter()
+            .flat_map(|decl| decl.extraction_labels.iter())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Application",
+                "CharacterisationMethod",
+                "Chemical",
+                "Descriptor",
+                "Property",
+                "SymmetryPhaseLabel",
+                "SynthesisMethod",
+            ],
+            "the seven MatKG NER categories, deterministic order"
+        );
+        for label in &labels {
+            let class = ontology
+                .class_for_label(label)
+                .unwrap_or_else(|| panic!("class label {label} did not resolve"));
+            assert!(
+                class
+                    .iri
+                    .as_str()
+                    .starts_with("https://marc27.com/ontology/matkg#"),
+                "MatKG identities are PRISM-minted, never http://example.com: {}",
+                class.iri
+            );
+            // Storage mapping is identity: what the loader stores is what
+            // the declaration names.
+            assert_eq!(ontology.storage_label(label), Some(*label));
+        }
+        let relation = ontology
+            .relation_for_label("COOCCURS_WITH")
+            .expect("the one MatKG relationship resolves");
+        assert_eq!(
+            relation.iri.as_str(),
+            "https://marc27.com/ontology/matkg#cooccursWith"
+        );
+
+        let tenant = storage_tenant("local", MATKG_ONTOLOGY_ID);
+        assert_eq!(tenant, "local@matkg");
+        assert_ne!(tenant, "local", "MatKG facts must never blend with local");
+        assert!(!tenant.starts_with("mesh"), "and never look like a peer");
     }
 
     /// `HAS_PHASE` is now one declared, IRI-backed object property. It was

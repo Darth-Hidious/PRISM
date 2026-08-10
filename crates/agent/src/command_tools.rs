@@ -306,7 +306,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryLocal,
-        description: "Query the local PRISM knowledge graph with typed fields instead of manual CLI args. Use `semantic=true` for vector search, or plain text for graph-neighbor lookup.",
+        description: "Query the local PRISM knowledge graph with typed fields instead of manual CLI args. Use `semantic=true` for vector search, or plain text for graph-neighbor lookup. Results span the user's own facts plus loaded reference graphs (e.g. MatKG literature co-occurrence, labelled [matkg] with evidence class research) and mesh-peer knowledge, each row attributed to its tenant.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },

@@ -266,6 +266,11 @@ enum Commands {
         #[arg(long)]
         mapping: Option<PathBuf>,
     },
+    /// MatKG reference knowledge graph (Venugopal & Olivetti 2024, CC BY 4.0).
+    Matkg {
+        #[command(subcommand)]
+        command: MatkgCommands,
+    },
     /// Query the knowledge graph.
     Query {
         /// Entity name or search text.
@@ -654,6 +659,35 @@ enum Commands {
     },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Debug, Subcommand)]
+enum MatkgCommands {
+    /// Stream MatKG's reified SUBRELOBJ N-Triples (.nt, .nt.gz, or .tar.gz)
+    /// into the local knowledge graph (`~/.prism/provenance.db`) under the
+    /// isolated `local@matkg` tenant, as evidence class Research (ORANGE),
+    /// PROV-O-attributed to the dataset DOI. Bounded by default; every
+    /// skipped row is reported. Re-running does not inflate anything.
+    Load {
+        /// Path to SUBRELOBJ.nt, SUBRELOBJ.nt.gz, or SUBRELOBJ.nt.tar.gz.
+        path: PathBuf,
+        /// Skip rows whose co-occurrence count is below this. The pinned
+        /// MatKG 1.4 minimum is 25, so the default filters nothing — it
+        /// exists to be raised.
+        #[arg(long, default_value_t = prism_ingest::matkg::DEFAULT_MIN_COUNT)]
+        min_count: u32,
+        /// Load at most this many rows, strongest counts first.
+        #[arg(long, default_value_t = prism_ingest::matkg::DEFAULT_LIMIT)]
+        limit: usize,
+        /// Deliberately load EVERY row passing --min-count. The full file
+        /// is 5.4M rows — millions of store writes; hours on a laptop.
+        #[arg(long, conflicts_with = "limit")]
+        all: bool,
+        /// Output the full load report as JSON (includes the required
+        /// CC-BY attribution).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3701,6 +3735,18 @@ async fn main() -> Result<()> {
                 .await?;
             }
         }
+        Commands::Matkg { command } => match command {
+            MatkgCommands::Load {
+                path,
+                min_count,
+                limit,
+                all,
+                json,
+            } => {
+                handle_matkg_load(&path, min_count, if all { None } else { Some(limit) }, json)
+                    .await?;
+            }
+        },
         Commands::Query {
             text,
             semantic,
@@ -10773,6 +10819,73 @@ async fn handle_platform_query(
     Ok(())
 }
 
+/// Load MatKG into the bundled local store (`~/.prism/provenance.db`) under
+/// the isolated `local@matkg` tenant. `limit: None` is the deliberate
+/// full-load choice (`--all`). The CC-BY attribution is a licence
+/// condition and is surfaced on every load: printed in human output,
+/// carried in the `attribution` field of `--json` output.
+async fn handle_matkg_load(
+    path: &Path,
+    min_count: u32,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let db_path = PathBuf::from(home).join(".prism/provenance.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
+    let report = prism_ingest::matkg::load(
+        path,
+        &store,
+        prism_ingest::matkg::MatkgLoadOptions { min_count, limit },
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("MatKG load complete → {}", db_path.display());
+        println!("  Tenant: {}", report.tenant);
+        println!(
+            "  Facts written: {} (evidence class: research / ORANGE)",
+            report.facts_written
+        );
+        println!("  Entities written: {}", report.entities_written);
+        println!(
+            "  Rows: {} total; skipped {} below --min-count {} and {} beyond --limit; {} selected",
+            report.rows_total,
+            report.rows_below_min_count,
+            min_count,
+            report.rows_beyond_limit,
+            report.rows_selected
+        );
+        println!(
+            "  Of selected: {} merged duplicate pairs, {} self pairs, {} incomplete, {} malformed, {} ambiguous",
+            report.rows_merged_duplicates,
+            report.rows_self_pair,
+            report.rows_incomplete,
+            report.rows_malformed,
+            report.rows_ambiguous
+        );
+        if report.lines_unparsed > 0 {
+            println!(
+                "  Unparsed input lines: {} of {}",
+                report.lines_unparsed, report.lines_total
+            );
+        }
+        println!("  Input SHA-256: {}", report.data_sha256);
+        println!(
+            "  Ontology: {} (artifact sha256 {})",
+            report.ontology_version_iri, report.ontology_artifact_sha256
+        );
+        println!("  PROV-O activity: {}", report.activity_id);
+        println!();
+        println!("{}", report.attribution);
+    }
+    Ok(())
+}
+
 /// Tenant every local single-user write uses (see the ingest pipeline's
 /// `write_local_graph` and `handle_text_ingest` — both stamp `"local"`).
 const LOCAL_ONTOLOGY_TENANT: &str = "local";
@@ -10955,6 +11068,11 @@ async fn local_semantic_lookup(
 fn peer_tag(tenant: &str) -> String {
     if tenant == LOCAL_ONTOLOGY_TENANT || tenant.is_empty() {
         String::new()
+    } else if let Some(ontology) = tenant.strip_prefix("local@") {
+        // Ontology-composed local tenant (`local@matkg`, …): reference
+        // knowledge the user chose to load — labelling it `[peer …]` would
+        // claim a mesh origin it does not have.
+        format!("  [{ontology}]")
     } else {
         format!("  [peer {tenant}]")
     }
@@ -10969,12 +11087,17 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     if !results.nodes.is_empty() {
-        let peers = results
+        let mesh = results
             .nodes
             .iter()
-            .filter(|node| !peer_tag(&node.tenant).is_empty())
+            .filter(|node| node.tenant == "mesh" || node.tenant.starts_with("mesh:"))
             .count();
-        if peers == 0 {
+        let reference = results
+            .nodes
+            .iter()
+            .filter(|node| node.tenant.starts_with("local@"))
+            .count();
+        if mesh == 0 && reference == 0 {
             let _ = writeln!(
                 out,
                 "  Found {} matching entities (local ontology):\n",
@@ -10983,10 +11106,11 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
         } else {
             let _ = writeln!(
                 out,
-                "  Found {} matching entities ({} local, {} from mesh peers):\n",
+                "  Found {} matching entities ({} local, {} reference, {} from mesh peers):\n",
                 results.nodes.len(),
-                results.nodes.len() - peers,
-                peers
+                results.nodes.len() - mesh - reference,
+                reference,
+                mesh
             );
         }
         for node in &results.nodes {
@@ -14673,8 +14797,11 @@ data:\n\
             out.contains("  [Alloy] Ti-6Al-4V  [peer mesh:node-a]\n"),
             "got: {out}"
         );
-        // The header separates local from peer counts.
-        assert!(out.contains("(1 local, 1 from mesh peers)"), "got: {out}");
+        // The header separates local, reference, and peer counts.
+        assert!(
+            out.contains("(1 local, 0 reference, 1 from mesh peers)"),
+            "got: {out}"
+        );
         // Peer relationship and fact lines carry the marker; local fact
         // lines do not.
         assert!(
@@ -14695,6 +14822,32 @@ data:\n\
             ),
             "got: {out}"
         );
+    }
+
+    /// Reference-ontology rows (`local@matkg`, …) are visibly attributed —
+    /// but never as a PEER: labelling loaded reference data `[peer …]`
+    /// would claim a mesh origin it does not have.
+    #[test]
+    fn reference_ontology_rows_are_labelled_but_never_as_peers() {
+        let results = LocalOntologyResults {
+            nodes: vec![
+                test_node("LiFePO4", "local"),
+                test_node("LiFePO4", "local@matkg"),
+            ],
+            edges: vec![],
+            facts: vec![test_recalled_fact("Olivine", "local@matkg")],
+        };
+        let out = format_local_ontology(&results);
+        assert!(out.contains("  [Alloy] LiFePO4  [matkg]\n"), "got: {out}");
+        assert!(
+            out.contains("(1 local, 1 reference, 0 from mesh peers)"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("[peer"),
+            "reference data must never be labelled as a peer: {out}"
+        );
+        assert!(out.contains("evidence research"), "got: {out}");
     }
 
     /// The documented `#[serde(default)]` path: a pre-attribution payload
