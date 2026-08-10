@@ -75,6 +75,50 @@ fn lenient_u32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D:
     })
 }
 
+/// Normalise one extracted name at the extraction boundary — the single
+/// place [`ExtractionOutput`] becomes the internal [`EntitySet`]. Applied to
+/// entity `name` and relationship `from`/`to` by the same function, so both
+/// sides of every later exact-match comparison (referential integrity,
+/// fact-write keying) are produced identically and agree by construction.
+///
+/// The live failure this exists for (2026-08-08, qwen2.5:3b over a 5-row
+/// alloys CSV): the model declared elements bare (`Ti`) and referenced them
+/// QUOTED (`"Ti"`) in relationships — every edge dangled and the stored
+/// graph had 11 nodes and ZERO edges. The raw model JSON really contained
+/// `"name": "\"Ti-6Al-4V\""` for an unquoted CSV cell.
+///
+/// What comes off: surrounding whitespace, and BALANCED surrounding quote
+/// pairs — ASCII `"…"` / `'…'` and the Unicode curly forms `“…”` / `‘…’` —
+/// stripped repeatedly with re-trimming between layers, so `"'Ti'"` fully
+/// unwraps. What is deliberately preserved: interior quotes (`6" pipe`,
+/// `Ni-"free" steel` are data), unbalanced quotes (`"Ti`), and mismatched
+/// ends (`“Ti"`). Idempotent: a normalised name passes through unchanged.
+///
+/// A name that normalises to EMPTY is not repaired here: it flows on and
+/// the graph-write plan rejects it — dropped and reported via
+/// `dropped_entities` — because an empty name is a rejection, not a name
+/// (`pipeline::validate_before_graph_write`).
+fn normalise_extracted_name(raw: &str) -> String {
+    const PAIRS: [(char, char); 4] = [
+        ('"', '"'),
+        ('\'', '\''),
+        ('\u{201C}', '\u{201D}'), // “ … ”
+        ('\u{2018}', '\u{2019}'), // ‘ … ’
+    ];
+    let mut name = raw.trim();
+    loop {
+        let mut chars = name.chars();
+        let (Some(first), Some(last)) = (chars.next(), chars.next_back()) else {
+            break; // zero or one char left — nothing strippable
+        };
+        if !PAIRS.contains(&(first, last)) {
+            break;
+        }
+        name = name[first.len_utf8()..name.len() - last.len_utf8()].trim();
+    }
+    name.to_string()
+}
+
 impl LlmOntologyConstructor {
     pub fn new(config: LlmConfig) -> Self {
         let client = crate::llm::LlmClient::new(config.clone());
@@ -238,6 +282,28 @@ impl OntologyConstructor for LlmOntologyConstructor {
     }
 }
 
+/// One tabular extraction plus the honest record of how it was decoded:
+/// whether the endpoint enforced the ontology-derived schema, why it
+/// degraded when it didn't, and the seed/temperature actually sent
+/// (recorded into the provenance activity by the pipeline).
+#[derive(Debug, Clone)]
+pub struct TracedExtraction {
+    pub entities: EntitySet,
+    pub decoding: prism_llm::JsonDecodingTrace,
+}
+
+/// Whether extraction requests should carry the reasoning kill-switch
+/// (`LLM_NO_THINK=1`/`true` in the environment — the same `LLM_*` surface
+/// the other model knobs use). Opt-in because the kwarg is a
+/// llama-server/vLLM extension OpenAI rejects with 400; needed because a
+/// thinking-mode model can burn ANY output budget on reasoning before the
+/// constrained JSON starts (measured 2026-08-10, Gemma-4-12B: 46.7k chars
+/// of reasoning against a 16384-token budget, zero JSON). The flag is
+/// recorded in the decoding trace and the provenance activity either way.
+fn extraction_no_think() -> bool {
+    std::env::var("LLM_NO_THINK").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Convenience method: extract entities with explicit sample rows (bypasses DataSource).
 impl LlmOntologyConstructor {
     pub async fn extract_entities_with_samples(
@@ -250,6 +316,8 @@ impl LlmOntologyConstructor {
             .await
     }
 
+    /// Source-compatible wrapper over [`Self::extract_entities_traced`] for
+    /// callers that do not consume the decoding trace.
     pub async fn extract_entities_with_mapping(
         &self,
         ontology: &dyn crate::ontologies::Ontology,
@@ -257,6 +325,19 @@ impl LlmOntologyConstructor {
         sample_rows: &[Vec<String>],
         mapping: Option<&crate::mapping::OntologyMapping>,
     ) -> Result<EntitySet> {
+        Ok(self
+            .extract_entities_traced(ontology, schema, sample_rows, mapping)
+            .await?
+            .entities)
+    }
+
+    pub async fn extract_entities_traced(
+        &self,
+        ontology: &dyn crate::ontologies::Ontology,
+        schema: &SchemaAnalysis,
+        sample_rows: &[Vec<String>],
+        mapping: Option<&crate::mapping::OntologyMapping>,
+    ) -> Result<TracedExtraction> {
         // Zero sample rows means there is nothing real to extract from: the
         // prompt would carry only the header names, and the model invents
         // plausible-looking entities from them — the same failure mode the
@@ -302,17 +383,37 @@ impl LlmOntologyConstructor {
         );
 
         let prompt = Self::build_extraction_prompt_with_mapping(ontology, schema, rows, mapping);
-        let response = self.generate(&prompt).await?;
+        // Constrained decoding, derived from the SAME active-ontology
+        // declaration the prompt above and graph validation read: the model
+        // is structurally unable to emit an undeclared class, an undeclared
+        // relation, or a non-QUDT unit. Deterministic knobs (temperature 0,
+        // recorded seed) ride the same request; an endpoint that rejects the
+        // schema degrades honestly and the trace says so.
+        let extraction_schema = crate::extraction_schema::extraction_json_schema(ontology);
+        let constrained = self
+            .client
+            .generate_json_with_schema(
+                &prompt,
+                &extraction_schema,
+                prism_llm::EXTRACTION_SEED,
+                extraction_no_think(),
+            )
+            .await?;
+        let response = constrained.text;
 
         let raw: ExtractionOutput =
             serde_json::from_str(&response).context("LLM returned invalid extraction JSON")?;
 
+        // Names are normalised HERE — the one place raw model output becomes
+        // the internal EntitySet — on entity names AND relationship endpoints
+        // alike, so nothing downstream (aliasing, validation, keying) can see
+        // a name the other side of a comparison was denied.
         let mut entities: Vec<Entity> = raw
             .entities
             .into_iter()
             .map(|e| Entity {
                 entity_type: e.entity_type,
-                name: e.name,
+                name: normalise_extracted_name(&e.name),
                 properties: if e.properties.is_null() {
                     serde_json::Value::Object(Default::default())
                 } else {
@@ -325,9 +426,9 @@ impl LlmOntologyConstructor {
             .relationships
             .into_iter()
             .map(|r| Relationship {
-                from: r.from,
+                from: normalise_extracted_name(&r.from),
                 rel_type: r.rel,
-                to: r.to,
+                to: normalise_extracted_name(&r.to),
                 weight: r.weight,
                 order: r.order,
             })
@@ -348,9 +449,12 @@ impl LlmOntologyConstructor {
             }
         }
 
-        Ok(EntitySet {
-            entities,
-            relationships,
+        Ok(TracedExtraction {
+            entities: EntitySet {
+                entities,
+                relationships,
+            },
+            decoding: constrained.trace,
         })
     }
 }
@@ -705,6 +809,36 @@ entity_rules:
         );
     }
 
+    /// `LLM_NO_THINK` is the documented spellings only — "1"/"true" (any
+    /// case) enable, everything else (including absence) stays off, because
+    /// the kwarg it adds is a vendor extension OpenAI rejects with 400.
+    /// This is the only test in the workspace touching this env var; it
+    /// restores the prior state either way.
+    #[test]
+    fn extraction_no_think_reads_the_documented_spellings_only() {
+        let prior = std::env::var_os("LLM_NO_THINK");
+        // SAFETY: single test-threaded mutation of a var only this test and
+        // the production reader consult; restored below.
+        unsafe { std::env::remove_var("LLM_NO_THINK") };
+        assert!(!extraction_no_think(), "absent must mean OFF");
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("0", false),
+            ("false", false),
+            ("yes", false),
+            ("", false),
+        ] {
+            unsafe { std::env::set_var("LLM_NO_THINK", value) };
+            assert_eq!(extraction_no_think(), expected, "value {value:?}");
+        }
+        match prior {
+            Some(value) => unsafe { std::env::set_var("LLM_NO_THINK", value) },
+            None => unsafe { std::env::remove_var("LLM_NO_THINK") },
+        }
+    }
+
     #[test]
     fn raw_entity_null_properties_defaults_to_null_value() {
         // When "properties" key is absent, serde default gives Value::Null.
@@ -719,5 +853,85 @@ entity_rules:
         let json = r#"{"type": "Element", "name": "Mo", "properties": null}"#;
         let entity: RawEntity = serde_json::from_str(json).unwrap();
         assert!(entity.properties.is_null());
+    }
+
+    // --- normalise_extracted_name: the extraction-boundary name contract ---
+
+    #[test]
+    fn normalisation_strips_balanced_surrounding_quotes_and_whitespace() {
+        for (raw, want) in [
+            ("\"Ti\"", "Ti"),
+            ("'Al'", "Al"),
+            ("\u{201C}316L\u{201D}", "316L"),
+            ("\u{2018}LPBF\u{2019}", "LPBF"),
+            ("  \"Ti-6Al-4V\"  ", "Ti-6Al-4V"),
+            ("\" Ti \"", "Ti"),             // whitespace inside the quotes
+            ("\"'Ti'\"", "Ti"),             // nested layers unwrap fully
+            ("'\u{201C}Fe\u{201D}'", "Fe"), // mixed nesting too
+            ("  bare name  ", "bare name"), // no quotes: trim only
+        ] {
+            assert_eq!(normalise_extracted_name(raw), want, "raw: {raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalisation_preserves_interior_and_unbalanced_quotes() {
+        for keep in [
+            "6\" pipe",          // interior ASCII quote is data
+            "Ni-\"free\" steel", // interior pair is data
+            "d'Arcy alloy",      // interior apostrophe is data
+            "\"Ti",              // leading only — unbalanced
+            "Ti\"",              // trailing only — unbalanced
+            "\u{201C}Ti\"",      // mismatched ends stay
+            "\"",                // a single quote char is not a pair
+        ] {
+            assert_eq!(
+                normalise_extracted_name(keep),
+                keep,
+                "must survive: {keep:?}"
+            );
+        }
+        // A balanced OUTER pair comes off; the interior quote survives.
+        assert_eq!(normalise_extracted_name("\"6\" pipe\""), "6\" pipe");
+    }
+
+    /// The brief's pinned property: normalise(normalise(x)) == normalise(x).
+    #[test]
+    fn normalisation_is_idempotent() {
+        for raw in [
+            "\"Ti\"",
+            "'Al'",
+            "\u{201C}316L\u{201D}",
+            "\"'Ti'\"",
+            "6\" pipe",
+            "Ni-\"free\" steel",
+            "\"Ti",
+            "\u{201C}Ti\"",
+            "\"6\" pipe\"",
+            "\"\"",
+            "''",
+            "  spaced  ",
+            "",
+            "\"",
+        ] {
+            let once = normalise_extracted_name(raw);
+            assert_eq!(
+                normalise_extracted_name(&once),
+                once,
+                "not idempotent for raw: {raw:?}"
+            );
+        }
+    }
+
+    /// Quote-only and whitespace-only names normalise to empty — the value
+    /// is passed through, and the REJECTION happens downstream in the
+    /// graph-write plan (dropped + reported via `dropped_entities`), pinned
+    /// at production dispatch by
+    /// `pipeline::tests::empty_after_normalisation_names_are_dropped_and_reported`.
+    #[test]
+    fn normalisation_can_empty_a_name() {
+        for raw in ["\"\"", "''", "   ", "\u{201C}\u{201D}", "\"  \"", "\"''\""] {
+            assert_eq!(normalise_extracted_name(raw), "", "raw: {raw:?}");
+        }
     }
 }

@@ -155,6 +155,20 @@ async fn doaj_wire_page_size_matches_its_declaration() {
     assert_wire_page_size("doaj", "/q", "pageSize", r#"{"results": [], "total": 0}"#).await;
 }
 
+#[tokio::test]
+async fn ntrs_wire_page_size_matches_its_declaration() {
+    // NTRS pages with `page[size]`/`page[from]` — the bare `size` parameter
+    // is ignored by the live endpoint, so the declaration is only honoured
+    // if the translator emits the bracketed form.
+    assert_wire_page_size(
+        "ntrs",
+        "/citations/search",
+        "page[size]",
+        r#"{"stats": {"total": 0}, "results": []}"#,
+    )
+    .await;
+}
+
 // ── max_offset: the declared paging ceiling versus the successor gate ─────
 
 /// Bare fetch context for driving one adapter directly — the documented
@@ -252,6 +266,21 @@ async fn semantic_scholar_offset_ceiling_matches_its_declaration() {
         r#"{"total": 999999, "data": [
             {"title": "Alpha", "paperId": "p1"},
             {"title": "Beta", "paperId": "p2"}
+        ]}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ntrs_offset_ceiling_matches_its_declaration() {
+    // The live window 400s past `from + size > 10_000`; the declared ceiling
+    // (10_000 − MAX_PAGE_SIZE) keeps every declared-size page inside it.
+    assert_offset_ceiling(
+        "ntrs",
+        "/citations/search",
+        r#"{"stats": {"total": 999999}, "results": [
+            {"id": 1, "title": "Alpha"},
+            {"id": 2, "title": "Beta"}
         ]}"#,
     )
     .await;

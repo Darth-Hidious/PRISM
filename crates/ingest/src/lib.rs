@@ -29,6 +29,7 @@
 //! adapter, so instructing and validating cannot drift apart.
 
 pub mod connectors;
+pub mod extraction_schema;
 pub mod graph_validation;
 /// Re-export LLM client from the standalone `prism-llm` crate.
 /// This keeps backward compatibility — existing code using `prism_ingest::llm::*`
@@ -41,6 +42,7 @@ pub mod matkg;
 pub mod ontologies;
 pub mod ontology;
 pub mod pipeline;
+pub mod qudt_units;
 pub mod schema;
 pub mod text_extract;
 pub mod validation;
@@ -171,11 +173,15 @@ mod tests {
 
     #[test]
     fn llm_config_minimal_json_fills_defaults() {
-        // Only required fields — defaults must fill in max_sample_rows and timeout_secs.
+        // Only required fields — defaults must fill in max_sample_rows and
+        // timeout_secs. timeout_secs defaults to 0, meaning NO read deadline:
+        // extracting facts from a paper with a reasoning model takes minutes,
+        // and a default deadline does not make the science faster, it discards
+        // the run partway through. An operator may still set one.
         let json = r#"{"base_url":"http://localhost:11434","model":"qwen2.5:7b"}"#;
         let cfg: LlmConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.max_sample_rows, 10);
-        assert_eq!(cfg.timeout_secs, 300);
+        assert_eq!(cfg.timeout_secs, 0);
     }
 
     // --- EntitySet edge cases ---

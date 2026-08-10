@@ -53,13 +53,22 @@ fn default_max_sample_rows() -> usize {
     10
 }
 fn default_timeout_secs() -> u64 {
-    300
+    // 0 = no read deadline. Research runs are long by nature; the operator may
+    // impose a deadline, PRISM does not impose one on them.
+    0
 }
 
 /// Tokens kept free between the estimated prompt and the context window, so a
 /// requested `max_tokens` can never overrun the input. Feeds the client-side
 /// output clamp ([`LlmClient::effective_max_tokens`]).
 const CONTEXT_MARGIN_TOKENS: u64 = 1024;
+
+/// Sent as `max_tokens` when the operator has set no ceiling. Not a policy
+/// limit — it is large enough to be irrelevant next to any real context
+/// window, so the effective bound is `context_window - prompt - margin` and,
+/// beyond that, the server's own clamp. Output is metered and billed per
+/// token; counting is the control, not truncation.
+const UNCAPPED_OUTPUT_TOKENS: u64 = 1_000_000;
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -363,13 +372,29 @@ pub fn chat_completions_url(base_url: &str) -> String {
 impl LlmClient {
     pub fn new(mut config: LlmConfig) -> Self {
         let backend = match choose_backend(&config.base_url) {
-            BackendChoice::Http => LlmBackend::Http(
-                reqwest::Client::builder()
-                    .timeout(Duration::from_secs(config.timeout_secs))
-                    .connect_timeout(Duration::from_secs(30))
-                    .build()
-                    .expect("failed to build HTTP client"),
-            ),
+            BackendChoice::Http => LlmBackend::Http({
+                // No read deadline unless the operator sets one.
+                //
+                // PRISM is a materials-research harness, not a web service.
+                // Extracting facts from a paper with a reasoning model takes
+                // minutes; a 12B model on consumer hardware takes minutes on a
+                // single CSV. A default deadline does not make the science
+                // faster, it just fails the run partway through and throws the
+                // work away — and it got worse the moment output stopped being
+                // capped, because a model that thinks longer is now allowed to.
+                //
+                // The CONNECT timeout stays: refusing to hang on an endpoint
+                // that is not there is different from refusing to wait for one
+                // that is working.
+                //
+                // `timeout_secs = 0` means "no deadline" and is the default.
+                let mut builder =
+                    reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
+                if config.timeout_secs > 0 {
+                    builder = builder.timeout(Duration::from_secs(config.timeout_secs));
+                }
+                builder.build().expect("failed to build HTTP client")
+            }),
             BackendChoice::LocalGguf => {
                 let local = local::LocalGguf::new(config.model.clone());
                 if let Some(context_window) = local.context_window() {
@@ -673,8 +698,8 @@ impl LlmClient {
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(&messages)),
         });
+        let body = self.with_operator_output_cap(body, Self::estimate_tokens(&messages));
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
         Ok(Self::extract_content(&data))
@@ -690,8 +715,8 @@ impl LlmClient {
             // unbounded output (thousands of tokens observed) on every call —
             // real, billed credits with no cap. Send the same context-clamped
             // budget every other chat path uses.
-            "max_tokens": self.effective_max_tokens(Self::estimate_tokens(messages)),
         });
+        let body = self.with_operator_output_cap(body, Self::estimate_tokens(messages));
         let resp = self.post(&url, &body).await?;
         let text = resp
             .text()
@@ -770,12 +795,12 @@ impl LlmClient {
 
         let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(est),
         });
+        let mut body = self.with_operator_output_cap(body, est);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
@@ -821,9 +846,54 @@ impl LlmClient {
     /// model needs more (or less) room than a hardcoded 4096. Falls back to
     /// 4096 only when the config doesn't carry a value (e.g. local llama.cpp
     /// with no catalog entry).
+    /// Attach `max_tokens` ONLY when the operator asked for a ceiling.
+    ///
+    /// PRISM sends no output limit of its own. There are millions of models
+    /// and more arriving; deciding how many tokens any of them may emit is not
+    /// PRISM's call. Output is metered and billed per token — on the platform
+    /// side that is exactly how a user is charged against prepaid credits — so
+    /// counting is the control. Truncating just breaks models that reason
+    /// before answering and saves nobody anything.
+    ///
+    /// When `max_output_tokens` is unset the key is absent from the request
+    /// and the server applies its own context-derived bound.
+    fn with_operator_output_cap(
+        &self,
+        mut body: serde_json::Value,
+        est_prompt_tokens: u64,
+    ) -> serde_json::Value {
+        if self.config.max_output_tokens.is_some()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.insert(
+                "max_tokens".to_string(),
+                serde_json::json!(self.effective_max_tokens(est_prompt_tokens)),
+            );
+        }
+        body
+    }
+
     fn effective_max_tokens(&self, est_prompt_tokens: u64) -> u64 {
         const FLOOR: u64 = 256;
-        let model_max = self.config.max_output_tokens.unwrap_or(4096);
+        // PRISM does NOT cap output on the operator's behalf.
+        //
+        // The previous 4096 default was a cost guard, added after unbounded
+        // platform output burned real credits. But output is METERED and
+        // BILLED per token — counting it is the control, not truncating it.
+        // Capping does not save anyone money; it just decides for the user,
+        // and it silently breaks any model that reasons before it answers.
+        // Gemma 4 12B spent ~2.7k tokens of `reasoning_content` against that
+        // default, hit the ceiling, and returned no JSON at all. PRISM's bug,
+        // not the model's — and the next model will reason more, not less.
+        //
+        // What genuinely bounds output: the CONTEXT WINDOW (enforced below and
+        // again by the server), per-token metering, and the solvency check
+        // that fails closed when credits run out. An explicit
+        // `max_output_tokens` is still honoured — the operator may cap.
+        let model_max = self
+            .config
+            .max_output_tokens
+            .unwrap_or(UNCAPPED_OUTPUT_TOKENS);
         // Clamp the requested output so it can never collide with the input:
         // context_window − estimated prompt − margin. When the context window is
         // unknown, only the configured max applies. Embedded local models now
@@ -917,12 +987,214 @@ impl LlmClient {
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(prompt.len() as u64 / 4),
             "response_format": {"type": "json_object"},
         });
+        let body = self.with_operator_output_cap(body, prompt.len() as u64 / 4);
         let resp = self.post(&url, &body).await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
+
+        // Self-heal for thinking-mode budget burn (measured live with Gemma 4
+        // 12B on llama-server: the model spent its entire max_tokens on
+        // `reasoning_content` and produced no JSON, so EVERY extraction
+        // failed). Retry ONCE with thinking disabled via
+        // `chat_template_kwargs` — llama-server honors it, Ollama ignores it
+        // (both verified against live servers), and the field is only ever
+        // sent to a backend that has already exhibited thinking-mode burn,
+        // so providers that reject unknown parameters never see it. If the
+        // retry does not produce usable content either, the ORIGINAL
+        // diagnosis below is what the caller gets.
+        if Self::burned_budget_on_reasoning(&data["choices"][0]) {
+            let mut retry_body = body.clone();
+            retry_body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+            match self.post(&url, &retry_body).await {
+                Ok(retry_resp) => {
+                    if let Ok(retry_data) = retry_resp.json::<serde_json::Value>().await
+                        && let Ok(text) = Self::extract_json_content(&retry_data["choices"][0])
+                    {
+                        return Ok(text);
+                    }
+                    tracing::warn!(
+                        "thinking-disabled retry still produced no JSON; reporting the \
+                         original thinking-mode diagnosis"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "thinking-disabled retry failed ({e:#}); reporting the original \
+                         thinking-mode diagnosis"
+                    );
+                }
+            }
+        }
         Self::extract_json_content(&data["choices"][0])
+    }
+
+    /// Generate JSON under a server-enforced schema (`response_format:
+    /// json_schema`, supported by llama-server, vLLM and OpenAI), with the
+    /// determinism knobs sent explicitly: `temperature: 0` and the caller's
+    /// `seed`. Constrained decoding guarantees FORM (the output parses and
+    /// every enum-locked field holds a declared value), never TRUTH — the
+    /// caller's validation still owns semantic checks.
+    ///
+    /// Degradation is honest, never silent: an endpoint that REJECTS the
+    /// schema (see [`error_rejects_json_schema`]) gets ONE fallback request
+    /// identical except for `response_format: json_object` — same seed, same
+    /// temperature — and the returned [`JsonDecodingTrace`] carries the
+    /// server's rejection so the caller can surface it. Backends with no
+    /// `response_format` at all (embedded GGUF, the MARC27 `/stream` path)
+    /// take the existing prompt-only path and say so the same way. What this
+    /// method CANNOT detect is a server that accepts `json_schema` with 200
+    /// and silently ignores it (old Ollama builds did) — that class is only
+    /// caught downstream, by validating the output against the same
+    /// declarations the schema was built from.
+    ///
+    /// Any other failure propagates as an error — a 401/404/429 is not a
+    /// capability signal, and retrying it without the schema would bury the
+    /// real problem under a second, less informative failure.
+    ///
+    /// `no_think` adds `chat_template_kwargs: {"enable_thinking": false}`
+    /// (llama-server / vLLM) — the reasoning kill-switch for models whose
+    /// thinking mode otherwise consumes the output budget before any JSON
+    /// appears (measured 2026-08-10, Gemma-4-12B on the tabular extraction
+    /// prompt: ~85% of ANY budget went to reasoning_content — 11.1k chars
+    /// at 4096 tokens, 46.7k at 16384 — and the constrained JSON never
+    /// started). It is caller-opt-in and off by default because OpenAI
+    /// rejects unknown request fields with 400. Recorded in the trace so a
+    /// run difference stays attributable.
+    pub async fn generate_json_with_schema(
+        &self,
+        prompt: &str,
+        schema: &JsonSchemaSpec,
+        seed: i64,
+        no_think: bool,
+    ) -> Result<ConstrainedJson> {
+        // Embedded GGUF: the local adapter exposes no grammar surface and no
+        // per-request seed/temperature, so nothing deterministic or
+        // constrained can be claimed. Take the existing prompt-only path.
+        if self.local_backend().is_some() {
+            let text = self.generate_json(prompt).await?;
+            return Ok(ConstrainedJson {
+                text,
+                trace: JsonDecodingTrace {
+                    mode: JsonDecodingMode::PromptOnly,
+                    degraded: Some(
+                        "embedded GGUF inference has no schema-constrained decoding; \
+                         prompt-only JSON extraction was used and no seed or temperature \
+                         was sent"
+                            .to_string(),
+                    ),
+                    seed: None,
+                    temperature: None,
+                    no_think: false,
+                },
+            });
+        }
+        // MARC27 platform: /stream carries no response_format and no sampling
+        // controls — the schema cannot be applied there.
+        if self.is_marc27() {
+            let text = self.generate_json(prompt).await?;
+            return Ok(ConstrainedJson {
+                text,
+                trace: JsonDecodingTrace {
+                    mode: JsonDecodingMode::PromptOnly,
+                    degraded: Some(
+                        "the MARC27 /stream path has no response_format or sampling \
+                         controls; prompt-only JSON extraction was used and no seed or \
+                         temperature was sent"
+                            .to_string(),
+                    ),
+                    seed: None,
+                    temperature: None,
+                    no_think: false,
+                },
+            });
+        }
+        let url = self.chat_completions_url();
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.0,
+            "seed": seed,
+            "max_tokens": self.effective_max_tokens(prompt.len() as u64 / 4),
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.name,
+                    "strict": true,
+                    "schema": schema.schema,
+                },
+            },
+        });
+        if no_think {
+            body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+        }
+        match self.post(&url, &body).await {
+            Ok(resp) => {
+                let data: serde_json::Value = resp.json().await.context("bad chat response")?;
+                let text = Self::extract_json_content(&data["choices"][0])?;
+                Ok(ConstrainedJson {
+                    text,
+                    trace: JsonDecodingTrace {
+                        mode: JsonDecodingMode::JsonSchema,
+                        degraded: None,
+                        seed: Some(seed),
+                        temperature: Some(0.0),
+                        no_think,
+                    },
+                })
+            }
+            Err(err) if error_rejects_json_schema(&err) => {
+                // The endpoint rejected the SCHEMA, not the request: fall
+                // back once, identical except for response_format, and carry
+                // the rejection into the trace so the caller can report it.
+                body["response_format"] = serde_json::json!({"type": "json_object"});
+                let resp = self.post(&url, &body).await.with_context(|| {
+                    format!(
+                        "the endpoint rejected response_format json_schema ({err:#}) \
+                         and the json_object fallback request failed too"
+                    )
+                })?;
+                let data: serde_json::Value = resp.json().await.context("bad chat response")?;
+                let text = Self::extract_json_content(&data["choices"][0])?;
+                Ok(ConstrainedJson {
+                    text,
+                    trace: JsonDecodingTrace {
+                        mode: JsonDecodingMode::JsonObject,
+                        degraded: Some(format!(
+                            "the endpoint rejected schema-constrained decoding \
+                             (response_format json_schema): {err:#}. Extraction fell \
+                             back to prompt-guided JSON, so the model was NOT \
+                             structurally prevented from emitting out-of-vocabulary \
+                             types, relationships, or units — validation still gates \
+                             what is stored"
+                        )),
+                        seed: Some(seed),
+                        temperature: Some(0.0),
+                        no_think,
+                    },
+                })
+            }
+            Err(err) => Err(err.context(
+                "schema-constrained JSON generation failed; the endpoint did not reject \
+                 the schema itself, so this is a request failure, not a capability \
+                 degradation",
+            )),
+        }
+    }
+
+    /// True when a chat choice shows the thinking-mode failure signature:
+    /// no visible content, `finish_reason: "length"`, and a non-empty
+    /// `reasoning_content` — i.e. the whole output budget went to reasoning.
+    fn burned_budget_on_reasoning(choice: &serde_json::Value) -> bool {
+        let msg = &choice["message"];
+        msg["content"].as_str().unwrap_or_default().is_empty()
+            && choice["finish_reason"].as_str() == Some("length")
+            && !msg["reasoning_content"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
     }
 
     /// Strip a Markdown code fence (```json … ``` or ``` … ```) from around
@@ -1133,14 +1405,14 @@ impl LlmClient {
                     } else {
                         0
                     };
-                let mut body = serde_json::json!({
+                let body = serde_json::json!({
                     "model": self.config.model,
                     "messages": msgs,
                     // Same fix as chat_marc27_simple: this path previously sent
                     // no cap at all, so a tool-calling turn could generate an
                     // unbounded (and unbounded-billed) response.
-                    "max_tokens": self.effective_max_tokens(est),
                 });
+                let mut body = self.with_operator_output_cap(body, est);
                 // The tool surface, identical to the OpenAI path below: the
                 // caller's already-token-bounded selection, with FULL schemas.
                 if native && !tools.is_empty() {
@@ -1322,13 +1594,13 @@ impl LlmClient {
 
         let est = Self::estimate_tokens(&serde_json::to_value(messages).unwrap_or_default())
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": self.effective_max_tokens(est),
             "stream": true,
         });
+        let mut body = self.with_operator_output_cap(body, est);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)?;
@@ -1543,6 +1815,113 @@ fn error_rejects_tool_schemas(err: &anyhow::Error) -> bool {
     ["tools.", "tools[", "\"tools\"", "tool_choice"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+// ── Schema-constrained JSON generation ──────────────────────────────
+
+/// The one extraction seed PRISM sends, deliberately a constant rather than
+/// a config knob: reproducibility means every run of the same input against
+/// the same model must sample identically, and a per-run seed would defeat
+/// exactly that. It is recorded in the provenance activity alongside the
+/// model id and temperature, so a difference between two runs is
+/// attributable to input/model/server — never to an unrecorded knob.
+pub const EXTRACTION_SEED: i64 = 42;
+
+/// A named JSON schema for `response_format: {"type": "json_schema", …}`.
+/// The caller owns deriving `schema` from its real declarations (PRISM: the
+/// active ontology) — this crate only carries it to the wire.
+#[derive(Debug, Clone)]
+pub struct JsonSchemaSpec {
+    /// Identifier sent as `json_schema.name` (OpenAI requires one).
+    pub name: String,
+    /// The JSON-Schema document itself.
+    pub schema: serde_json::Value,
+}
+
+/// How one JSON generation was actually decoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonDecodingMode {
+    /// The endpoint accepted `response_format: json_schema` — output is
+    /// grammar-constrained to the supplied schema.
+    JsonSchema,
+    /// The endpoint rejected the schema; `response_format: json_object`
+    /// was used instead (JSON syntax enforced, vocabulary NOT).
+    JsonObject,
+    /// No `response_format` at all (embedded GGUF, MARC27 `/stream`): the
+    /// prompt text is the only thing shaping the output.
+    PromptOnly,
+}
+
+impl JsonDecodingMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JsonSchema => "json_schema",
+            Self::JsonObject => "json_object",
+            Self::PromptOnly => "prompt_only",
+        }
+    }
+}
+
+/// The honest record of one JSON generation: which decoding mode actually
+/// applied, why it degraded when it did, and the determinism knobs that were
+/// really sent (None = the backend offered no such knob — never a guess).
+/// Callers surface `degraded` to the user and record seed/temperature in
+/// provenance; a capability that silently isn't applied is the defect class
+/// this type exists to prevent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonDecodingTrace {
+    pub mode: JsonDecodingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Whether the request carried the reasoning kill-switch
+    /// (`chat_template_kwargs: {"enable_thinking": false}`). Part of the
+    /// reproducibility record: a thinking and a non-thinking run of the
+    /// same seed are different computations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_think: bool,
+}
+
+/// One schema-constrained generation: the raw JSON text plus its trace.
+#[derive(Debug, Clone)]
+pub struct ConstrainedJson {
+    pub text: String,
+    pub trace: JsonDecodingTrace,
+}
+
+/// Whether an LLM error is the endpoint refusing `response_format:
+/// json_schema`, as opposed to anything else that can fail a request.
+///
+/// Same two-axis discipline as [`error_rejects_tool_schemas`]: the error must
+/// BOTH carry a request-shape status (400/422 = provider rejected the
+/// request, 500 = a proxy's wrapper around an upstream 400, 501 = declared
+/// unimplemented) AND name the schema mechanism. Auth (401/403), billing
+/// (402), routing (404) and capacity (429/503) are never a schema problem —
+/// falling back on those would bury the real failure under a second, less
+/// informative one.
+fn error_rejects_json_schema(err: &anyhow::Error) -> bool {
+    let request_shape = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<retry::HttpStatus>())
+        .is_some_and(|h| matches!(h.status, 400 | 422 | 500 | 501));
+    if !request_shape {
+        return false;
+    }
+    let text = format!("{err:#}").to_ascii_lowercase();
+    [
+        "response_format",
+        "json_schema",
+        "json schema",
+        "grammar",
+        "structured output",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 /// Render the SELECTED tools as text, for the fallback path only.
@@ -3014,10 +3393,48 @@ mod tests {
     }
 
     #[test]
-    fn effective_max_tokens_defaults_to_4096() {
-        // No catalog max + unknown context (local model) → conservative 4096.
+    fn prism_imposes_no_output_ceiling_of_its_own() {
+        // Was `effective_max_tokens_defaults_to_4096`, which pinned a cost
+        // guard as if it were a model limit. Output is metered and billed per
+        // token, so counting is the control — truncating is not. A 4096
+        // default silently broke every model that reasons before answering:
+        // Gemma 4 12B spent ~2.7k tokens of reasoning against it and returned
+        // no JSON at all.
         let client = LlmClient::new(LlmConfig::default());
-        assert_eq!(client.effective_max_tokens(0), 4096);
+        assert!(
+            client.effective_max_tokens(0) >= 100_000,
+            "with no operator ceiling and no known context, PRISM must not \
+             impose a limit of its own; got {}",
+            client.effective_max_tokens(0)
+        );
+    }
+
+    #[test]
+    fn the_context_window_is_what_actually_bounds_output() {
+        // The real bound, and the only one PRISM applies unasked: whatever the
+        // context still has room for after the prompt and the margin.
+        let config = LlmConfig {
+            max_output_tokens: None,
+            context_window: Some(32_768),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(
+            client.effective_max_tokens(8_000),
+            32_768 - 8_000 - CONTEXT_MARGIN_TOKENS
+        );
+    }
+
+    #[test]
+    fn an_explicit_operator_ceiling_is_still_honoured() {
+        // The operator may cap. PRISM may not cap on their behalf.
+        let config = LlmConfig {
+            max_output_tokens: Some(2_048),
+            context_window: Some(200_000),
+            ..Default::default()
+        };
+        let client = LlmClient::new(config);
+        assert_eq!(client.effective_max_tokens(1_000), 2_048);
     }
 
     #[test]
@@ -3108,6 +3525,96 @@ mod tests {
         });
         let err = LlmClient::extract_json_content(&choice).unwrap_err();
         assert!(err.to_string().contains("finish_reason=stop"));
+    }
+
+    /// Thinking-mode budget burn self-heals through the PRODUCTION
+    /// `generate_json` dispatch: the first wire response burns the whole
+    /// budget on `reasoning_content`, and the client must retry the same
+    /// endpoint ONCE with `chat_template_kwargs.enable_thinking = false`
+    /// (the mock for the retry only answers a request carrying that field).
+    /// Removing the retry, or breaking the burn predicate, fails this test
+    /// with the thinking-mode diagnosis.
+    #[tokio::test]
+    async fn generate_json_retries_thinking_burn_with_thinking_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let burn = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning_content": "thinking… ".repeat(50)}
+            }]
+        });
+        // Created FIRST so the retry mock (created second) is matched first;
+        // the initial request lacks chat_template_kwargs and falls through
+        // to this one.
+        let first = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(burn.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let retry = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "chat_template_kwargs": {"enable_thinking": false}
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "{\"facts\": []}"}
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: server.url(),
+            model: "test-model".to_string(),
+            ..LlmConfig::default()
+        });
+        let out = client
+            .generate_json("extract facts")
+            .await
+            .expect("the thinking-disabled retry must recover the extraction");
+        assert_eq!(out, "{\"facts\": []}");
+        first.assert_async().await;
+        retry.assert_async().await;
+    }
+
+    /// When the retry ALSO burns its budget on reasoning, the caller gets
+    /// the original actionable diagnosis — not a success, not a generic
+    /// empty-content error.
+    #[tokio::test]
+    async fn generate_json_reports_the_original_diagnosis_when_the_retry_fails_too() {
+        let mut server = mockito::Server::new_async().await;
+        let burn = serde_json::json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning_content": "thinking… ".repeat(50)}
+            }]
+        });
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(burn.to_string())
+            .expect(2) // the original AND the failed retry
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: server.url(),
+            model: "test-model".to_string(),
+            ..LlmConfig::default()
+        });
+        let err = client.generate_json("extract facts").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("thinking"), "message was: {msg}");
+        assert!(msg.contains("max_output_tokens"), "message was: {msg}");
     }
 
     #[test]
@@ -3496,6 +4003,44 @@ mod tests {
             LlmClient::strip_json_fences("```json\n{\"a\":1}"),
             "{\"a\":1}"
         );
+    }
+
+    // ── Schema-rejection classification ───────────────────────────────
+
+    /// The fallback gate must be narrow on BOTH axes: a request-shape status
+    /// alone is not enough (a 400 for a wrong model name must propagate),
+    /// and naming the mechanism alone is not enough (a 402 whose body
+    /// mentions response_format is still a billing failure). Only their
+    /// conjunction may trigger the honest json_object fallback.
+    #[test]
+    fn json_schema_rejection_requires_status_and_mechanism_together() {
+        let rejects = |status: u16, body: &str| {
+            error_rejects_json_schema(
+                &anyhow::Error::new(retry::HttpStatus::new(status))
+                    .context(format!("LLM returned HTTP {status}: {body}")),
+            )
+        };
+        // The real shapes: provider 400/422 naming the mechanism.
+        assert!(rejects(
+            400,
+            "response_format 'json_schema' is not supported"
+        ));
+        assert!(rejects(422, "unknown field json_schema"));
+        assert!(rejects(500, "Failed to convert json schema to grammar"));
+        assert!(rejects(501, "structured output is not implemented"));
+        // Request-shape status, unrelated body: NOT a capability signal.
+        assert!(!rejects(400, "model 'nonexistent' not found"));
+        // Mechanism named, wrong status class: auth/billing/capacity/routing.
+        for status in [401, 402, 403, 404, 429, 503] {
+            assert!(
+                !rejects(status, "response_format json_schema"),
+                "status {status} must never trigger the schema fallback"
+            );
+        }
+        // No HttpStatus in the chain at all (transport error): propagate.
+        assert!(!error_rejects_json_schema(&anyhow::anyhow!(
+            "connection reset while sending response_format json_schema"
+        )));
     }
 
     // ── Hard offline mode ─────────────────────────────────────────────

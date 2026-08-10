@@ -29,6 +29,13 @@ pub struct IngestResult {
     /// Populated when LLM extraction runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entities: Option<EntitySet>,
+    /// How the extraction request was decoded, when extraction ran: whether
+    /// the endpoint enforced the ontology-derived JSON schema, why it
+    /// degraded when it didn't (`degraded` non-None is a capability
+    /// downgrade the caller MUST surface — a constraint that silently
+    /// wasn't applied is a lie), and the seed/temperature actually sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_decoding: Option<prism_llm::JsonDecodingTrace>,
     /// SHACL-lite structural check on the extracted entities/relationships
     /// (orphan rels, unknown types, weight-sum sanity, etc.), run before the
     /// graph write. `None` only when no entities were extracted at all.
@@ -211,6 +218,7 @@ impl IngestPipeline {
             tracing::error!("{msg}");
             errors.push(msg.clone());
         }
+        let mut extraction_decoding: Option<prism_llm::JsonDecodingTrace> = None;
         let entities = if refusal.is_none()
             && let Some(ref llm_config) = self.config.llm
         {
@@ -224,7 +232,7 @@ impl IngestPipeline {
             );
 
             match constructor
-                .extract_entities_with_mapping(
+                .extract_entities_traced(
                     ontology.as_ref(),
                     &schema,
                     &sample_rows,
@@ -232,13 +240,20 @@ impl IngestPipeline {
                 )
                 .await
             {
-                Ok(entities) => {
+                Ok(traced) => {
                     tracing::info!(
-                        entities = entities.entities.len(),
-                        relationships = entities.relationships.len(),
+                        entities = traced.entities.entities.len(),
+                        relationships = traced.entities.relationships.len(),
+                        decoding = traced.decoding.mode.as_str(),
                         "LLM extraction complete"
                     );
-                    Some(entities)
+                    if let Some(reason) = &traced.decoding.degraded {
+                        // Degradation is honest at every layer: logged here,
+                        // carried on the result for the CLI summary.
+                        tracing::warn!("constrained extraction degraded: {reason}");
+                    }
+                    extraction_decoding = Some(traced.decoding);
+                    Some(traced.entities)
                 }
                 Err(e) => {
                     tracing::error!("LLM extraction failed: {e:#}");
@@ -254,13 +269,15 @@ impl IngestPipeline {
         // documented "runs before writing to Neo4j" gate with zero callers
         // (AUDIT_BACKLOG 20 / INGESTION_AUDIT #20), so LLM extraction output
         // went straight to the graph unchecked. Run it whenever entities
-        // exist. Error-severity issues refuse the graph write, with ONE
-        // contained class: a relationship whose endpoint was never declared
-        // (`orphan_rel`) invalidates THAT relationship, not the ingest — it
-        // is dropped and reported (`dropped_relationships`), and everything
-        // valid is still stored. Failing wholesale here is what kept the
-        // graph empty (2026-08-08: 17 orphan errors discarded 13 good
-        // entities); inventing the missing endpoint would fabricate a type.
+        // exist. Error-severity issues refuse the graph write, with TWO
+        // contained classes: a relationship whose endpoint was never declared
+        // (`orphan_rel`) invalidates THAT relationship, and an entity whose
+        // name normalised to nothing invalidates THAT entity — each is
+        // dropped and reported (`dropped_relationships`/`dropped_entities`),
+        // and everything valid is still stored. Failing wholesale here is
+        // what kept the graph empty (2026-08-08: 17 orphan errors discarded
+        // 13 good entities); inventing a missing endpoint would fabricate a
+        // type.
         let mut dropped_relationships: Vec<String> = Vec::new();
         let mut dropped_entities: Vec<String> = Vec::new();
         let mut write_set: Option<EntitySet> = None;
@@ -318,7 +335,13 @@ impl IngestPipeline {
             crate::ontologies::storage_tenant(prism_provenance::LOCAL_TENANT, ontology.id());
         let graph = if let Some(entity_set) = &write_set {
             match self
-                .write_local_graph(ontology.as_ref(), entity_set, &source, &tenant)
+                .write_local_graph(
+                    ontology.as_ref(),
+                    entity_set,
+                    &source,
+                    &tenant,
+                    extraction_decoding.as_ref(),
+                )
                 .await
             {
                 Ok(update) => {
@@ -349,6 +372,7 @@ impl IngestPipeline {
             row_count,
             column_count,
             entities,
+            extraction_decoding,
             graph_validation,
             graph,
             embeddings: None,
@@ -378,6 +402,7 @@ impl IngestPipeline {
         entity_set: &EntitySet,
         source: &DataSource,
         tenant: &str,
+        decoding: Option<&prism_llm::JsonDecodingTrace>,
     ) -> Result<GraphUpdate> {
         // Declared name → ontology classification, from the ONE active
         // declaration. First declaration wins on a (rare)
@@ -459,6 +484,31 @@ impl IngestPipeline {
             origin_source_id: None,
         };
         store.record_activity(&prov).await?;
+        // Reproducibility record, on the SAME activity row: the seed and
+        // temperature the extraction actually sent (None when the backend
+        // offered no such knob) and the decoding mode that really applied —
+        // so a difference between two runs is attributable to input, model,
+        // or an honest capability downgrade, never to an unrecorded knob.
+        if let Some(trace) = decoding {
+            // The reasoning kill-switch is part of the record: a thinking
+            // and a non-thinking run of the same seed are different
+            // computations, and the difference must stay attributable.
+            let mode = if trace.no_think {
+                format!("{}+no_think", trace.mode.as_str())
+            } else {
+                trace.mode.as_str().to_string()
+            };
+            store
+                .record_activity_decoding(
+                    &prov.activity_id,
+                    &prism_provenance::ActivityDecoding {
+                        seed: trace.seed,
+                        temperature: trace.temperature,
+                        mode: Some(&mode),
+                    },
+                )
+                .await?;
+        }
 
         let ontology_classification = OntologyClassification {
             version_iri: ontology.version_iri().as_str(),
@@ -535,9 +585,10 @@ impl Default for IngestPipeline {
 /// What pre-write graph validation decided may be written.
 enum GraphWritePlan {
     /// Write `set` — the extracted set minus entities whose declared type
-    /// the active ontology maps to no storage label, and minus any dangling
-    /// relationships (including ones dangling BECAUSE their endpoint was
-    /// dropped as unmapped). `dropped` carries one reason per dropped
+    /// the active ontology maps to no storage label, minus entities whose
+    /// name normalised to nothing at the extraction boundary, and minus any
+    /// dangling relationships (including ones dangling BECAUSE their
+    /// endpoint was dropped). `dropped` carries one reason per dropped
     /// relationship, `dropped_entities` one per dropped entity. Containment,
     /// not repair: nothing is invented — not a missing endpoint, not a
     /// storage label — and every drop reaches the caller
@@ -556,14 +607,32 @@ enum GraphWritePlan {
 /// Returns the full report on the extraction AS THE MODEL EMITTED IT (the
 /// honest record, orphans included) plus the plan.
 ///
-/// Exactly ONE error class is containable: `orphan_rel`, a relationship
-/// whose `from`/`to` was never declared. Dropping that relationship loses
-/// one claim; inventing the endpoint would require fabricating a type, and
-/// failing the whole ingest discards every valid fact with it (the
-/// pre-containment behaviour that kept the graph empty). Every other
-/// error-severity issue — empty names, zero entities, an ontology's own
-/// domain errors — still blocks the write, proven by RE-validating the
-/// reduced set rather than by trusting issue categories.
+/// Two error classes are containable, both by dropping exactly the claim
+/// they invalidate: `orphan_rel` (a relationship whose `from`/`to` was
+/// never declared — the edge is dropped) and `unit_kind_mismatch` (an
+/// entity whose measurement unit contradicts the quantity its name states,
+/// e.g. a density under `QUDT:GigaPA` — the entity is dropped, and any
+/// relationship referencing it dangles and is dropped with it). Dropping
+/// loses one claim; "repairing" the unit would fabricate a measurement the
+/// extraction never made, and failing the whole ingest discards every
+/// valid fact with it (the pre-containment behaviour that kept the graph
+/// empty — the same wholesale destruction the strict QudtUnit deserialiser
+/// inflicted on text ingest). Every other error-severity issue — empty
+/// names, zero entities, an ontology's own domain errors — still blocks
+/// the write, proven by RE-validating the reduced set rather than by
+/// trusting issue categories.
+/// Two error classes are containable. `orphan_rel`: a relationship whose
+/// `from`/`to` was never declared — dropping it loses one claim; inventing
+/// the endpoint would require fabricating a type, and failing the whole
+/// ingest discards every valid fact with it (the pre-containment behaviour
+/// that kept the graph empty). `empty_name`: an entity whose name
+/// normalised to NOTHING at the extraction boundary (the model emitted only
+/// quote characters or whitespace) — there is nothing to store or key on,
+/// so it is dropped and reported via `dropped_entities`, and anything that
+/// referenced it dangles and is dropped with it. Every other
+/// error-severity issue — zero entities, an ontology's own domain errors —
+/// still blocks the write, proven by RE-validating the reduced set rather
+/// than by trusting issue categories.
 fn validate_before_graph_write(
     ontology: &dyn crate::ontologies::Ontology,
     entity_set: &EntitySet,
@@ -589,12 +658,21 @@ fn validate_before_graph_write(
             .collect::<Vec<_>>()
             .join(", ");
         for e in &entity_set.entities {
+            // A name the extraction boundary normalised to NOTHING (the
+            // model emitted only quote characters or whitespace) is a
+            // rejection, not a storable empty name — there is nothing to
+            // key on. Drop-and-report, like the unmapped-type case below.
+            if e.name.trim().is_empty() {
+                dropped.push(format!(
+                    "entity of type '{}': empty name after normalisation — rejected, not stored",
+                    e.entity_type
+                ));
+                continue;
+            }
             let extraction_label = e.entity_type.trim();
-            if ontology.class_for_label(extraction_label).is_some()
-                && ontology.storage_label(extraction_label).is_some()
+            if ontology.class_for_label(extraction_label).is_none()
+                || ontology.storage_label(extraction_label).is_none()
             {
-                kept.push(e.clone());
-            } else {
                 dropped.push(format!(
                     "entity '{}': type '{}' has no storage label or canonical class IRI in ontology '{}' \
                      (declared: {})",
@@ -603,6 +681,14 @@ fn validate_before_graph_write(
                     ontology.id(),
                     declared
                 ));
+            } else if let Some(reason) = crate::graph_validation::unit_kind_mismatch(e) {
+                // The quantity-kind contradiction (Check 11, Error): the
+                // POISONED claim is dropped and reported, the rest of the
+                // document is stored. The unit is never rewritten — that
+                // would fabricate a measurement the extraction never made.
+                dropped.push(reason);
+            } else {
+                kept.push(e.clone());
             }
         }
         (kept, dropped)
@@ -929,7 +1015,7 @@ mod tests {
 
         let emmo = crate::ontologies::EmmoOntology;
         let update = pipeline
-            .write_local_graph(&emmo, &entity_set, &source, "local")
+            .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 3);
@@ -1028,7 +1114,7 @@ mod tests {
 
         let emmo = crate::ontologies::EmmoOntology;
         let update = pipeline
-            .write_local_graph(&emmo, &entity_set, &source, "local")
+            .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
 
@@ -1155,7 +1241,7 @@ mod tests {
 
         let emmo = crate::ontologies::EmmoOntology;
         let update = pipeline
-            .write_local_graph(&emmo, &entity_set, &source, "local")
+            .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
         assert_eq!(update.nodes_created, 10);
@@ -1378,6 +1464,7 @@ mod tests {
             row_count: 10,
             column_count: 1,
             entities: None,
+            extraction_decoding: None,
             graph_validation: None,
             graph: None,
             embeddings: None,
@@ -1931,19 +2018,219 @@ mod tests {
         );
     }
 
+    // ── Name normalisation at the extraction boundary ──────────────────
+    //
+    // The live defect (2026-08-08, qwen2.5:3b over a 5-row alloys CSV): the
+    // model declared elements bare (`Ti`) and referenced them QUOTED
+    // (`"Ti"`) in relationships. Exact-match referential integrity then
+    // dropped ALL 15 edges — 11 nodes, ZERO edges, a disconnected graph —
+    // and material names landed in the store with literal quote characters
+    // (`"316L"`, `"Ti-6Al-4V"`, `"LPBF"`). These tests drive the REAL
+    // `ingest_file` dispatch through a mock LLM emitting exactly that shape.
+
+    /// Entity names and relationship endpoints are normalised by the SAME
+    /// function at the extraction boundary, so quote-mismatched spellings of
+    /// the same declared thing agree by construction: every edge survives,
+    /// and no stored name carries a surrounding quote character.
+    #[tokio::test]
+    async fn quoted_names_and_endpoints_agree_by_construction_and_edges_survive() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                // Declared bare — referenced ASCII-quoted below.
+                {"type": "Alloy", "name": "Zorblattium", "properties": {}},
+                // Declared ASCII-quoted — referenced bare below.
+                {"type": "Element", "name": "\"Quotium\"", "properties": {}},
+                // Declared curly-quoted — referenced single-quoted below.
+                {"type": "Phase", "name": "\u{201C}omega-quoted\u{201D}", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "\"Zorblattium\"", "rel": "CONTAINS", "to": "Quotium", "weight": 0.5},
+                {"from": "Zorblattium", "rel": "HAS_PHASE", "to": "'omega-quoted'"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // Nothing dangles, nothing is dropped, the run is clean.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            result.dropped_relationships.is_empty(),
+            "quote-mismatched endpoints still dangle: {:?}",
+            result.dropped_relationships
+        );
+        assert!(
+            result.dropped_entities.is_empty(),
+            "{:?}",
+            result.dropped_entities
+        );
+
+        // Both edges survive — the graph is CONNECTED, not nodes-only.
+        let graph = result.graph.expect("the normalised set must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (3, 2));
+
+        // Stored names are the bare spellings, with no quote characters.
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        const QUOTES: &[char] = &['"', '\'', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}'];
+        for name in ["Zorblattium", "Quotium", "omega-quoted"] {
+            let hits = store.graph_search(name, "local", 10).await.unwrap();
+            assert!(
+                hits.iter().any(|n| n.name == name),
+                "{name} not stored bare: {hits:?}"
+            );
+            assert!(
+                hits.iter().all(|n| !n.name.contains(QUOTES)),
+                "a stored name kept its quotes: {hits:?}"
+            );
+        }
+        // Both edges are attached to the bare-named node — endpoints agree.
+        let tr = store
+            .get_neighbors("Zorblattium", None, "local", 10)
+            .await
+            .unwrap();
+        for target in ["Quotium", "omega-quoted"] {
+            assert!(
+                tr.edges.iter().any(|e| e.target == target),
+                "edge to {target} missing: {:?}",
+                tr.edges
+            );
+        }
+    }
+
+    /// Only BALANCED SURROUNDING quotes come off. An interior quote is data
+    /// — `6" nozzle extrusion` is a six-inch nozzle, not a quoting artefact
+    /// — and must reach the store intact on the entity AND on the endpoint
+    /// referencing it.
+    #[tokio::test]
+    async fn interior_quotes_are_data_and_reach_the_store_intact() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Pipium", "properties": {}},
+                {"type": "Process", "name": "6\" nozzle extrusion", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Pipium", "rel": "PROCESSED_BY", "to": "6\" nozzle extrusion", "order": 1}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            result.dropped_relationships.is_empty(),
+            "{:?}",
+            result.dropped_relationships
+        );
+        let graph = result.graph.expect("the set must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("nozzle", "local", 10).await.unwrap();
+        assert!(
+            hits.iter().any(|n| n.name == "6\" nozzle extrusion"),
+            "the interior quote was stripped or the name mangled: {hits:?}"
+        );
+    }
+
+    /// A name that is NOTHING BUT quotes (`""`) normalises to empty — a
+    /// rejection, not an empty name: never stored, dropped and REPORTED via
+    /// `dropped_entities`, while the valid remainder still lands and any
+    /// relationship referencing the rejected entity is dropped with it.
+    /// Nothing is invented to fill the hole.
+    #[tokio::test]
+    async fn empty_after_normalisation_names_are_dropped_and_reported() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "\"\"", "properties": {}},
+                {"type": "Alloy", "name": "Solidium", "properties": {}}
+            ],
+            "relationships": [
+                {"from": "Solidium", "rel": "CONTAINS", "to": "\"\"", "weight": 0.5}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("a,b\nx,y\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // A contained drop is a partial SUCCESS — not a blocked write.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.dropped_entities.len(),
+            1,
+            "{:?}",
+            result.dropped_entities
+        );
+        assert!(
+            result.dropped_entities[0].contains("empty name after normalisation"),
+            "{}",
+            result.dropped_entities[0]
+        );
+        assert_eq!(
+            result.dropped_relationships.len(),
+            1,
+            "{:?}",
+            result.dropped_relationships
+        );
+
+        // Only the real entity landed; no empty-named node, no edge to one.
+        let graph = result.graph.expect("the valid remainder must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (1, 0));
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let hits = store.graph_search("Solidium", "local", 10).await.unwrap();
+        assert!(hits.iter().any(|n| n.name == "Solidium"), "{hits:?}");
+        let tr = store
+            .get_neighbors("Solidium", None, "local", 10)
+            .await
+            .unwrap();
+        assert!(
+            tr.edges.is_empty(),
+            "an edge to a rejected entity reached the store: {:?}",
+            tr.edges
+        );
+    }
+
     /// Containment must not blanket-weaken validation: an error a drop
-    /// cannot repair (here an empty entity name) still blocks the ENTIRE
-    /// write — nothing stored, nothing reported as "dropped and the rest
-    /// written", store never opened.
+    /// cannot repair (here ZERO entities extracted, while relationships
+    /// still reference a world that was never declared) still blocks the
+    /// ENTIRE write — nothing stored, nothing reported as "dropped and the
+    /// rest written", store never opened. (An empty entity NAME was this
+    /// test's original exemplar; since name normalisation it is the
+    /// contained `empty_name` drop instead — pinned by
+    /// `empty_after_normalisation_names_are_dropped_and_reported`.)
     #[tokio::test]
     async fn non_orphan_errors_still_block_the_whole_write() {
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
 
         let server = mock_llm(serde_json::json!({
-            "entities": [
-                {"type": "Alloy", "name": "", "properties": {}},
-                {"type": "Alloy", "name": "Bloopium", "properties": {}}
-            ],
+            "entities": [],
             "relationships": [
                 {"from": "Bloopium", "rel": "MELDS_WITH", "to": "Nowhereium"}
             ]
@@ -1959,7 +2246,7 @@ mod tests {
 
         assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
         assert!(
-            result.errors[0].contains("empty name"),
+            result.errors[0].contains("No entities were extracted"),
             "{}",
             result.errors[0]
         );
@@ -2000,6 +2287,386 @@ mod tests {
             sent.contains("MUST also appear as an entity in"),
             "the extraction prompt no longer states the referential-integrity \
              rule; the validator will refuse what the model was told to emit:\n{sent}"
+        );
+    }
+
+    // ── Constrained decoding, at PRODUCTION dispatch ───────────────────
+    //
+    // These exercise `ingest_file` itself and assert on the REQUEST BODY the
+    // mock endpoint received: they die if the pipeline stops sending the
+    // schema, derives it from anything but the ACTIVE ontology, stops
+    // sending the determinism knobs, or makes the unsupported-endpoint
+    // fallback silent.
+
+    /// The request that actually reaches the model carries (1) the
+    /// ontology-derived JSON schema under `response_format: json_schema`,
+    /// (2) `temperature: 0`, and (3) the recorded extraction seed — and the
+    /// result's decoding trace says the constraint was enforced.
+    #[tokio::test]
+    async fn extraction_request_carries_the_ontology_schema_and_determinism_knobs() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(emmo_extraction()).await;
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,element\nSteel,Fe\n");
+        let pipeline = pipeline_against(server.uri(), scratch.db_path());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["seed"], prism_llm::EXTRACTION_SEED);
+        let schema = &body["response_format"]["json_schema"]["schema"];
+        let entity_enum = schema
+            .pointer("/properties/entities/items/properties/type/enum")
+            .and_then(|v| v.as_array())
+            .expect("entity type enum present");
+        assert!(entity_enum.iter().any(|v| v == "Alloy"), "{entity_enum:?}");
+        let rel_enum = schema
+            .pointer("/properties/relationships/items/properties/rel/enum")
+            .and_then(|v| v.as_array())
+            .expect("relationship enum present");
+        assert!(rel_enum.iter().any(|v| v == "CONTAINS"), "{rel_enum:?}");
+        let unit_enum = schema
+            .pointer(
+                "/properties/entities/items/properties/properties/properties/unit/anyOf/0/enum",
+            )
+            .and_then(|v| v.as_array())
+            .expect("unit enum present");
+        assert!(
+            unit_enum.iter().any(|v| v == "QUDT:MegaPA"),
+            "{unit_enum:?}"
+        );
+        assert!(
+            !unit_enum.iter().any(|v| v == "MPa"),
+            "a bare unit spelling is legal to the schema: {unit_enum:?}"
+        );
+
+        let trace = result
+            .extraction_decoding
+            .expect("an extraction run must carry its decoding trace");
+        assert_eq!(trace.mode, prism_llm::JsonDecodingMode::JsonSchema);
+        assert_eq!(trace.degraded, None);
+        assert_eq!(trace.seed, Some(prism_llm::EXTRACTION_SEED));
+        assert_eq!(trace.temperature, Some(0.0));
+    }
+
+    /// The schema is derived from the ACTIVE ontology, not a frozen EMMO
+    /// list: under a runtime-registered chemistry ontology the request's
+    /// enums carry ITS vocabulary and none of EMMO's.
+    #[tokio::test]
+    async fn extraction_schema_follows_the_active_ontology_not_a_hardcoded_list() {
+        use std::sync::Arc;
+
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        crate::ontologies::register_ontology(Arc::new(ChemOntology {
+            id: "chem-schema-req",
+        }))
+        .expect("a novel ontology must register");
+
+        let server = mock_llm(chem_extraction()).await;
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("molecule,reacts_with\nH2O,O3\n");
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            ontology: Some("chem-schema-req".into()),
+            ..pipeline_against(server.uri(), scratch.db_path()).config
+        });
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+        let schema = &body["response_format"]["json_schema"]["schema"];
+        let entity_enum = schema
+            .pointer("/properties/entities/items/properties/type/enum")
+            .and_then(|v| v.as_array())
+            .expect("entity type enum present");
+        assert!(
+            entity_enum.iter().any(|v| v == "Molecule"),
+            "{entity_enum:?}"
+        );
+        assert!(
+            !entity_enum.iter().any(|v| v == "Alloy"),
+            "EMMO vocabulary leaked into a chem schema: {entity_enum:?}"
+        );
+        let rel_enum = schema
+            .pointer("/properties/relationships/items/properties/rel/enum")
+            .and_then(|v| v.as_array())
+            .expect("relationship enum present");
+        assert!(rel_enum.iter().any(|v| v == "REACTS_WITH"), "{rel_enum:?}");
+        assert!(
+            !rel_enum.iter().any(|v| v == "CONTAINS"),
+            "EMMO relationships leaked into a chem schema: {rel_enum:?}"
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "chem-schema-req_tabular_extraction"
+        );
+    }
+
+    /// Honest degradation: an endpoint that REJECTS `json_schema` gets the
+    /// prompt-only fallback (same seed, same temperature) and the result
+    /// SAYS SO — the trace carries the endpoint's rejection, the run stays
+    /// a success, and the facts land. A silent fallback dies here.
+    #[tokio::test]
+    async fn schema_rejection_degrades_honestly_and_is_reported() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = MockServer::start().await;
+        // The schema attempt: rejected the way servers without the
+        // capability actually reject it (400 naming response_format).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("json_schema"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "{\"error\": \"response_format type json_schema is not supported\"}",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The fallback: json_object accepted.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("json_object"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"content": emmo_extraction().to_string()},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,element\nSteel,Fe\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // Degradation is a reported downgrade, not a failure…
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let trace = result
+            .extraction_decoding
+            .expect("a degraded run must still carry its trace");
+        assert_eq!(trace.mode, prism_llm::JsonDecodingMode::JsonObject);
+        let degraded = trace
+            .degraded
+            .expect("the fallback must NEVER be silent — the trace must say why");
+        assert!(degraded.contains("rejected"), "{degraded}");
+        assert!(degraded.contains("json_schema"), "{degraded}");
+        // …the determinism knobs still rode the fallback request…
+        assert_eq!(trace.seed, Some(prism_llm::EXTRACTION_SEED));
+        assert_eq!(trace.temperature, Some(0.0));
+        // …and the facts still landed.
+        let graph = result.graph.expect("fallback extraction must store");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+        // Both requests really happened, in the declared shapes.
+        server.verify().await;
+
+        let requests = server.received_requests().await.expect("recording on");
+        let fallback: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(fallback["response_format"]["type"], "json_object");
+        assert_eq!(fallback["seed"], prism_llm::EXTRACTION_SEED);
+        assert_eq!(fallback["temperature"], 0.0);
+    }
+
+    /// The reasoning kill-switch is sent EXACTLY when requested: with
+    /// `no_think` the request carries `chat_template_kwargs:
+    /// {"enable_thinking": false}` and the trace records it; without it the
+    /// field is ABSENT (OpenAI rejects unknown request fields with 400, so
+    /// sending it unconditionally would break every OpenAI extraction).
+    #[tokio::test]
+    async fn no_think_kwarg_is_sent_only_when_requested() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"content": "{\"entities\": [], \"relationships\": []}"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = prism_llm::LlmClient::new(crate::LlmConfig {
+            base_url: server.uri(),
+            model: "test-model".into(),
+            ..crate::LlmConfig::default()
+        });
+        let schema =
+            crate::extraction_schema::extraction_json_schema(&crate::ontologies::EmmoOntology);
+
+        let plain = client
+            .generate_json_with_schema("extract", &schema, prism_llm::EXTRACTION_SEED, false)
+            .await
+            .unwrap();
+        assert!(!plain.trace.no_think);
+        let switched = client
+            .generate_json_with_schema("extract", &schema, prism_llm::EXTRACTION_SEED, true)
+            .await
+            .unwrap();
+        assert!(switched.trace.no_think, "the trace must record the switch");
+
+        let requests = server.received_requests().await.expect("recording on");
+        assert_eq!(requests.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            first.get("chat_template_kwargs").is_none(),
+            "no_think=false must not leak a vendor kwarg OpenAI would 400 on"
+        );
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            second.pointer("/chat_template_kwargs/enable_thinking"),
+            Some(&serde_json::Value::Bool(false)),
+            "no_think=true must actually disable thinking on the wire"
+        );
+        server.verify().await;
+    }
+
+    /// The fallback gate must not over-fire: a 400 that has nothing to do
+    /// with the schema (wrong model) propagates as an extraction FAILURE —
+    /// no second request, no fake "degraded but stored" success.
+    #[tokio::test]
+    async fn unrelated_request_failures_do_not_masquerade_as_schema_degradation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("{\"error\": \"model 'wrong-model' not found\"}"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,element\nSteel,Fe\n");
+        let pipeline = pipeline_against(server.uri(), scratch.db_path());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("LLM extraction failed"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(
+            result.extraction_decoding.is_none(),
+            "a failed extraction must not claim a decoding mode"
+        );
+        assert!(result.graph.is_none());
+        server.verify().await;
+    }
+
+    /// The check constrained decoding cannot do, contained at production
+    /// dispatch: a density tagged with a pressure unit (grammar-legal,
+    /// false) is dropped and REPORTED, the rest of the document is stored,
+    /// and the poisoned claim never reaches the store.
+    #[tokio::test]
+    async fn a_density_with_a_pressure_unit_is_dropped_and_reported_not_stored() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Inconel 718", "properties": {}},
+                // The owner's live case: 8.19 g/cm³ tagged as gigapascals.
+                {"type": "Property", "name": "density_g_cm3",
+                 "properties": {"value": 8.19, "unit": "QUDT:GigaPA"}},
+                {"type": "Property", "name": "yield_strength_mpa",
+                 "properties": {"value": 1100.0, "unit": "QUDT:MegaPA"}}
+            ],
+            "relationships": [
+                {"from": "Inconel 718", "rel": "HAS_PROPERTY", "to": "density_g_cm3"},
+                {"from": "Inconel 718", "rel": "HAS_PROPERTY", "to": "yield_strength_mpa"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("material,yield_strength_mpa,density_g_cm3\nInconel 718,1100,8.19\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // Contained, not fatal: the run succeeds and says what it dropped.
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let report = result.graph_validation.expect("validation ran");
+        assert!(!report.passed, "the honest report keeps the contradiction");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.category == "unit_kind_mismatch"),
+            "{:?}",
+            report.issues
+        );
+        assert_eq!(
+            result.dropped_entities.len(),
+            1,
+            "{:?}",
+            result.dropped_entities
+        );
+        assert!(
+            result.dropped_entities[0].contains("QUDT:GigaPA"),
+            "{}",
+            result.dropped_entities[0]
+        );
+        assert_eq!(
+            result.dropped_relationships.len(),
+            1,
+            "the edge to the poisoned property dangles and is dropped: {:?}",
+            result.dropped_relationships
+        );
+
+        // The valid remainder was stored; the falsehood was not.
+        let graph = result.graph.expect("the valid remainder must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .graph_search("yield_strength_mpa", "local", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the clean property must be stored"
+        );
+        assert!(
+            store
+                .graph_search("density_g_cm3", "local", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a density under a pressure unit reached the store"
         );
     }
 
