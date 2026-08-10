@@ -253,6 +253,28 @@ fn convert_fact(mut raw_fact: serde_json::Value) -> Result<MaterialFact, String>
         ));
     }
 
+    // A `measurement` with no numeric value at all: the store's writer
+    // refuses this shape by design (its `write_fact` returns `Ok(())`
+    // having written NOTHING — see the value-less guard in
+    // `prism-provenance`), so a fact accepted here would be counted as
+    // written while never reaching the graph. The claims path already
+    // rejects it (`papers.rs::store_claims`); text ingest must not be
+    // softer. Rejecting it HERE puts the drop on the same reported path as
+    // every other malformed fact.
+    if raw_fact.get("kind").and_then(serde_json::Value::as_str) == Some("measurement")
+        && raw_fact
+            .get("value")
+            .and_then(serde_json::Value::as_f64)
+            .is_none()
+    {
+        return Err(format!(
+            "{identity}: kind is \"measurement\" but no numeric value was extracted — \
+             the store refuses value-less measurements (nothing would be written), \
+             so the fact is dropped here with a reason instead of being counted \
+             as written"
+        ));
+    }
+
     // Condition units, same rule: a measurement whose condition lost its
     // unit (was it measured at 1200 K or 1200 °C?) is dropped whole.
     if let Some(conditions) = raw_fact

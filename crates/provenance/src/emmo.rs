@@ -2337,10 +2337,47 @@ impl ProvenanceStore {
         // Mirror core: a measurement without a value fails schema validation
         // and is dropped (not written half-typed, not recorded as an
         // assertion). Checked before the transaction so a dropped fact never
-        // takes the write lock.
+        // takes the write lock. Defence in depth only: every ingest path
+        // rejects this shape upstream WITH a reported reason, so a caller
+        // whose fact vanishes here has already miscounted.
         if fact.kind.as_deref() == Some("measurement") && fact.value.is_none() {
             return Ok(());
         }
+
+        // Defence in depth for the unit, through the same controlled
+        // vocabulary every ingest path uses (`crate::units::resolve_unit` —
+        // never a second table): a measurement's number is meaningless
+        // without its unit (880 GPa vs 880 MPa), so a missing or
+        // unresolvable unit refuses the write LOUDLY — the old
+        // `unwrap_or_default()` here stored an empty-string unit instead.
+        // Ingest drops and reports this shape before it gets here; reaching
+        // this bail means a caller bypassed that contract. Raw spellings
+        // that DO resolve (`"MPa"`) are canonicalised so the store holds
+        // one unit vocabulary, not one per path.
+        let canonical_unit = match fact.kind.as_deref() {
+            Some("measurement") => match fact.unit.as_deref() {
+                Some(raw) => match crate::units::resolve_unit(raw) {
+                    Some(unit) => Some(unit.as_str().to_string()),
+                    None => bail!(
+                        "refusing to store measurement '{} {} {}': unit {raw:?} is neither \
+                         a QUDT identifier nor a recognised unit spelling — a number stored \
+                         without its unit is a wrong number, never stored unit-less",
+                        fact.subject,
+                        fact.predicate,
+                        fact.object
+                    ),
+                },
+                None => bail!(
+                    "refusing to store measurement '{} {} {}' carrying value {:?} with no \
+                     unit — a unit-less number is a wrong number, never stored unit-less",
+                    fact.subject,
+                    fact.predicate,
+                    fact.object,
+                    fact.value
+                ),
+            },
+            _ => fact.unit.clone(),
+        };
 
         // One fact commits atomically: EMMO entities/edges, the PROV-O
         // activity, the assertion, its evidence contribution, and the
@@ -2375,7 +2412,7 @@ impl ProvenanceStore {
                     },
                     prov,
                     fact.value,
-                    fact.unit.as_deref(),
+                    canonical_unit.as_deref(),
                     &conditions,
                     evidence_class,
                     metadata.and_then(|details| details.ontology),
@@ -2401,7 +2438,9 @@ impl ProvenanceStore {
                     let Some(value) = fact.value else {
                         return Ok(());
                     };
-                    let unit = fact.unit.clone().unwrap_or_default();
+                    let unit = canonical_unit
+                        .clone()
+                        .expect("guarded above: a measurement's unit is resolved or refused");
                     let meas_name = format!(
                         "meas_{}_{}_{value}",
                         canonical_key(&fact.subject),
@@ -4050,6 +4089,89 @@ mod tests {
         );
     }
 
+    /// Defence in depth at the store boundary (F10): a measurement's number
+    /// is meaningless without its unit, so the writer REFUSES — loudly,
+    /// never with a silent `Ok` — a measurement whose unit is missing or
+    /// resolves to no QUDT identifier, and canonicalises raw spellings that
+    /// do resolve so the store holds ONE unit vocabulary. Before this,
+    /// `unwrap_or_default()` stored an empty-string unit: a CSV `880` was
+    /// indistinguishable from 880 MPa or 880 GPa. Every ingest path drops
+    /// and reports these shapes upstream; this guard is for callers that
+    /// bypass that contract.
+    #[tokio::test]
+    async fn measurement_units_are_resolved_or_refused_never_stored_unitless() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        // No unit at all → refused loudly.
+        let mut unitless = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
+        unitless.value = Some(880.0);
+        let err = store
+            .write_fact(&unitless, &prov)
+            .await
+            .expect_err("a unit-less measurement must be refused, never stored");
+        assert!(
+            format!("{err:#}").contains("no unit"),
+            "the refusal must name the cause: {err:#}"
+        );
+
+        // A unit that resolves to nothing → refused loudly, naming it.
+        let mut gibberish = fact("measurement", "Ti-6Al-4V", "has_measurement", "hardness");
+        gibberish.value = Some(349.0);
+        gibberish.unit = Some("banana".into());
+        let err = store
+            .write_fact(&gibberish, &prov)
+            .await
+            .expect_err("an unresolvable unit must be refused, never stored raw");
+        assert!(
+            format!("{err:#}").contains("banana"),
+            "the refusal must name the spelling: {err:#}"
+        );
+
+        // Neither refused fact left a trace in the graph.
+        assert!(
+            store
+                .graph_search("Ti-6Al-4V", "t1", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused measurement must write nothing"
+        );
+
+        // A raw spelling that DOES resolve is canonicalised on the way in:
+        // the stored unit is the QUDT identifier, not the paper spelling.
+        let mut raw_spelling = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
+        raw_spelling.value = Some(880.0);
+        raw_spelling.unit = Some("MPa".into());
+        store.write_fact(&raw_spelling, &prov).await.unwrap();
+        let recalled = store.recall_with_context("UTS", "t1", 10).await.unwrap();
+        assert_eq!(recalled.len(), 1, "{recalled:?}");
+        assert_eq!(recalled[0].value, Some(880.0));
+        assert_eq!(
+            recalled[0].unit.as_deref(),
+            Some("QUDT:MegaPA"),
+            "the store must hold the canonical identifier, not the raw spelling"
+        );
+        // BOTH stored shapes agree: `recall_with_context` reads the
+        // assertion row; the synthetic Measurement NODE keeps its own copy
+        // in `props_json`, written separately — a regression could decouple
+        // them (canonical assertion, raw node) and the recall check alone
+        // would never see it.
+        let props: serde_json::Value = serde_json::from_str(
+            &query_str(
+                &store,
+                "SELECT props_json FROM emmo_entity WHERE label = 'Measurement'",
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(
+            props["unit"], "QUDT:MegaPA",
+            "the Measurement node's props must carry the canonical unit too"
+        );
+    }
+
     /// Caller-supplied node labels govern EVERY fact arm, subject and
     /// object alike — the tabular ingest passes the ACTIVE ontology's
     /// declared storage labels here, so what lands in `emmo_entity.label`
@@ -4098,6 +4220,9 @@ mod tests {
             };
             if *kind == Some("measurement") {
                 f.value = Some(42.0);
+                // The store refuses unit-less measurements (defence in
+                // depth for F10); the labeling under test is orthogonal.
+                f.unit = Some("QUDT:MegaPA".into());
             }
             store
                 .write_fact_with_evidence(
@@ -4136,6 +4261,9 @@ mod tests {
             };
             if *kind == Some("measurement") {
                 f.value = Some(42.0);
+                // The store refuses unit-less measurements (defence in
+                // depth for F10); the labeling under test is orthogonal.
+                f.unit = Some("QUDT:MegaPA".into());
             }
             store.write_fact(&f, &prov).await.unwrap();
             assert_eq!(label_of(&subj).await, "Matter", "legacy arm {kind:?}");

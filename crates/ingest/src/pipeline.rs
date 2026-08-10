@@ -323,12 +323,25 @@ impl IngestPipeline {
                 .write_local_graph(ontology.as_ref(), entity_set, &source, &tenant)
                 .await
             {
-                Ok(update) => {
+                Ok((update, fact_drops)) => {
                     tracing::info!(
                         nodes = update.nodes_created,
                         edges = update.edges_created,
                         "local graph write complete"
                     );
+                    // Facts the fact-mapping refused (a numeric value whose
+                    // unit is missing or unresolvable — never stored
+                    // unit-less) join the same reported drop list as
+                    // referential containment: a PARTIAL result the caller
+                    // must surface, never a silent drop.
+                    if !fact_drops.is_empty() {
+                        tracing::warn!(
+                            dropped = fact_drops.len(),
+                            "numeric facts with unresolvable units were dropped; \
+                             the valid remainder is stored"
+                        );
+                    }
+                    dropped_relationships.extend(fact_drops);
                     Some(update)
                 }
                 Err(e) => {
@@ -374,13 +387,21 @@ impl IngestPipeline {
     /// means a caller bypassed the plan). The one store-owned exception is
     /// the synthetic `Measurement` node a measurement fact mints — a fact
     /// shape, not an extracted entity.
+    ///
+    /// The second return value carries one reason per fact the mapping
+    /// REFUSED to write — a numeric value whose unit is missing or resolves
+    /// to no QUDT identifier is dropped whole, never stored unit-less (see
+    /// `to_local_facts`). The caller must surface these alongside
+    /// `dropped_relationships`. The dropped fact's endpoints still land as
+    /// standalone typed nodes below: the entities exist, only the
+    /// unit-less numeric claim is refused.
     async fn write_local_graph(
         &self,
         ontology: &dyn crate::ontologies::Ontology,
         entity_set: &EntitySet,
         source: &DataSource,
         tenant: &str,
-    ) -> Result<GraphUpdate> {
+    ) -> Result<(GraphUpdate, Vec<String>)> {
         // Declared name → ontology classification, from the ONE active
         // declaration. First declaration wins on a (rare)
         // same-name/different-type collision, matching the standalone-write
@@ -467,7 +488,7 @@ impl IngestPipeline {
             artifact_sha256: ontology.artifact_sha256(),
         };
 
-        let facts = to_local_facts(entity_set);
+        let (facts, dropped_facts) = to_local_facts(entity_set);
         for fact in &facts {
             let nodes = ClassifiedFactNodes {
                 subject: classification_of(&fact.subject)?,
@@ -521,10 +542,13 @@ impl IngestPipeline {
         let names: Vec<String> = written.iter().map(|s| s.to_string()).collect();
         store.embed_names_best_effort(&names, &prov.tenant).await;
 
-        Ok(GraphUpdate {
-            nodes_created: written.len(),
-            edges_created: facts.len(),
-        })
+        Ok((
+            GraphUpdate {
+                nodes_created: written.len(),
+                edges_created: facts.len(),
+            },
+            dropped_facts,
+        ))
     }
 }
 
@@ -946,10 +970,11 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let update = pipeline
+        let (update, dropped) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local")
             .await
             .unwrap();
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(update.nodes_created, 3);
         assert_eq!(update.edges_created, 2);
 
@@ -1045,10 +1070,11 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let update = pipeline
+        let (update, dropped) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local")
             .await
             .unwrap();
+        assert!(dropped.is_empty(), "{dropped:?}");
 
         assert_eq!(
             update.nodes_created, 3,
@@ -1128,6 +1154,10 @@ mod tests {
                 // subjects again (the old behaviour split `Fe` into an
                 // `Element` row and a `Matter` row).
                 entity("Element", "Fe", serde_json::json!({})),
+                // Raw paper spellings on purpose: the write path must
+                // RESOLVE them to QUDT identifiers (asserted below), not
+                // store them verbatim — this fixture once pinned verbatim
+                // storage as expected behaviour (F10).
                 entity(
                     "Property",
                     "density",
@@ -1135,8 +1165,8 @@ mod tests {
                 ),
                 entity(
                     "Property",
-                    "atomic mass",
-                    serde_json::json!({"value": 55.8, "unit": "u"}),
+                    "melting point",
+                    serde_json::json!({"value": 1811.0, "unit": "kelvin"}),
                 ),
                 entity("Phase", "BCC", serde_json::json!({})),
                 // Process → Manufacturing: the store's one label for a step,
@@ -1157,7 +1187,7 @@ mod tests {
                     ..rel("Steel", "CONTAINS", "Fe")
                 },
                 rel("Steel", "HAS_PROPERTY", "density"),
-                rel("Fe", "HAS_PROPERTY", "atomic mass"),
+                rel("Fe", "HAS_PROPERTY", "melting point"),
                 rel("Steel", "HAS_PHASE", "BCC"),
                 Relationship {
                     order: Some(1),
@@ -1172,16 +1202,36 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let update = pipeline
+        let (update, dropped) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local")
             .await
             .unwrap();
+        assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(update.nodes_created, 10);
         assert_eq!(update.edges_created, 6);
 
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .unwrap();
+
+        // The raw fixture spellings landed RESOLVED — one unit vocabulary
+        // in the store, never the paper spelling and never unit-less.
+        for (property, expected_unit) in [
+            ("density", "QUDT:GM-PER-CentiM3"),
+            ("melting point", "QUDT:K"),
+        ] {
+            let recalled = store
+                .recall_with_context(property, "local", 10)
+                .await
+                .unwrap();
+            assert_eq!(recalled.len(), 1, "{property}: {recalled:?}");
+            assert_eq!(
+                recalled[0].unit.as_deref(),
+                Some(expected_unit),
+                "{property} must store the canonical QUDT identifier"
+            );
+        }
+
         for e in &entity_set.entities {
             let expected = emmo
                 .storage_label(&e.entity_type)
@@ -1793,6 +1843,107 @@ mod tests {
             "a dangling relationship reached the store: {:?}",
             tr.edges
         );
+        server.verify().await;
+    }
+
+    /// THE unit rule at PRODUCTION dispatch on the tabular path (F10),
+    /// through `ingest_file` itself: a numeric property whose unit is
+    /// missing or unresolvable is dropped WHOLE and REPORTED in
+    /// `dropped_relationships` (the surface the CLI prints), while a raw
+    /// resolvable spelling lands RESOLVED to its QUDT identifier — never
+    /// verbatim, never unit-less. Before this, the tabular path passed raw
+    /// unit strings through and the store filled missing ones with `""`,
+    /// re-opening the 880 GPa vs 880 MPa hazard the text path had closed.
+    #[tokio::test]
+    async fn tabular_numeric_facts_resolve_units_or_are_dropped_and_reported() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let server = mock_llm(serde_json::json!({
+            "entities": [
+                {"type": "Alloy", "name": "Ti-6Al-4V", "properties": {}},
+                // Numeric value, NO unit — the CSV-shaped `{"value": 880}`.
+                {"type": "Property", "name": "UTS", "properties": {"value": 880}},
+                // Numeric value, unresolvable unit.
+                {"type": "Property", "name": "hardness",
+                 "properties": {"value": 349, "unit": "banana"}},
+                // Numeric value, raw resolvable spelling.
+                {"type": "Property", "name": "density",
+                 "properties": {"value": 4.43, "unit": "g/cm3"}}
+            ],
+            "relationships": [
+                {"from": "Ti-6Al-4V", "rel": "HAS_PROPERTY", "to": "UTS"},
+                {"from": "Ti-6Al-4V", "rel": "HAS_PROPERTY", "to": "hardness"},
+                {"from": "Ti-6Al-4V", "rel": "HAS_PROPERTY", "to": "density"}
+            ]
+        }))
+        .await;
+
+        let scratch = RefusalScratch::new();
+        let csv = scratch.csv("alloy,uts_mpa,hardness,density\nTi-6Al-4V,880,349,4.43\n");
+        let db_path = scratch.db_path();
+        let pipeline = pipeline_against(server.uri(), db_path.clone());
+
+        let result = pipeline.ingest_file(&csv).await.unwrap();
+
+        // A contained drop is a partial SUCCESS: no step failure, exit 0…
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        // …and the drops are REPORTED, naming fact, value and cause.
+        assert_eq!(
+            result.dropped_relationships.len(),
+            2,
+            "{:?}",
+            result.dropped_relationships
+        );
+        let drops = result.dropped_relationships.join("\n");
+        assert!(
+            drops.contains("UTS") && drops.contains("880") && drops.contains("no unit at all"),
+            "{drops}"
+        );
+        assert!(
+            drops.contains("hardness") && drops.contains("banana"),
+            "{drops}"
+        );
+
+        // The count matches what the store received: 4 nodes (the dropped
+        // facts' endpoints still exist as typed nodes), 1 surviving edge.
+        let graph = result.graph.expect("the valid remainder must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (4, 1));
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        // The resolvable measurement landed with the CANONICAL identifier.
+        let density = store
+            .recall_with_context("density", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(density.len(), 1, "{density:?}");
+        assert_eq!(density[0].value, Some(4.43));
+        assert_eq!(
+            density[0].unit.as_deref(),
+            Some("QUDT:GM-PER-CentiM3"),
+            "the stored unit must be the resolved QUDT identifier, not the raw spelling"
+        );
+        // THE rule: neither refused number is anywhere in the store — not
+        // with a raw unit, not with an empty one.
+        for refused in ["UTS", "hardness"] {
+            let facts = store
+                .recall_with_context(refused, "local", 10)
+                .await
+                .unwrap();
+            assert!(
+                facts.is_empty(),
+                "a numeric value without a resolvable unit must never be stored: {facts:?}"
+            );
+            // The entity itself still exists as a typed node — the claim
+            // was refused, not the entity.
+            let hits = store.graph_search(refused, "local", 10).await.unwrap();
+            assert!(
+                hits.iter()
+                    .any(|n| n.name == refused && n.label == "Property"),
+                "the dropped fact's endpoint must still land as a typed node: {hits:?}"
+            );
+        }
         server.verify().await;
     }
 

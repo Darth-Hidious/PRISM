@@ -15580,4 +15580,99 @@ data:\n\
             "a numeric value whose unit could not be resolved must never be stored: {hardness:?}"
         );
     }
+
+    /// F1, at PRODUCTION dispatch (`run_local_text_ingest_file` against a
+    /// mocked OpenAI-shaped LLM): a `measurement` with no value is a shape
+    /// the store REFUSES — its writer returns `Ok(())` having written
+    /// nothing — so a summary that counted it in `facts_written` reported a
+    /// fact that is not in the graph, listed in no drop list, behind no
+    /// warning. The count the user sees must be the count the store
+    /// received: `facts_written` 0, and the drop reported with a reason
+    /// naming the cause.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_valueless_measurement_is_dropped_with_a_reason_not_counted_as_written() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut server = mockito::Server::new_async().await;
+        // Exactly the shape that used to pass every convert_fact rule: kind
+        // "measurement", value null, unit null.
+        let extraction = r#"{"facts":[
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":null,"unit":null,"conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+        ]}"#;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": extraction}}]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = project.path();
+        let md = root.join("vague-datasheet.md");
+        std::fs::write(&md, "Ti-6Al-4V has an ultimate tensile strength.").unwrap();
+
+        let summary = run_local_text_ingest_file(
+            &md,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+        )
+        .await
+        .expect("a document whose one fact is refused must still ingest cleanly");
+
+        // The refused fact is NOT counted as written…
+        assert_eq!(summary["facts_written"], 0, "summary: {summary}");
+        assert_eq!(summary["parse_error"], serde_json::Value::Null);
+        // …and the drop is REPORTED, with a reason naming the cause.
+        let dropped = summary["dropped_facts"]
+            .as_array()
+            .expect("dropped_facts must be in the summary");
+        assert_eq!(dropped.len(), 1, "summary: {summary}");
+        let reason = dropped[0].as_str().unwrap();
+        assert!(
+            reason.contains("measurement") && reason.contains("no numeric value"),
+            "the reason must name the cause: {reason}"
+        );
+        assert!(
+            reason.contains("UTS"),
+            "the reason must identify the fact: {reason}"
+        );
+        // …and the summary printer renders it.
+        let report = dropped_facts_report(&summary).expect("the printer must surface the drop");
+        assert!(report.contains("no numeric value"), "{report}");
+
+        // Nothing about the fact is in the store: no assertion, and no
+        // entity node minted for its subject or object.
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .expect("the store the ingest opened must open");
+        for name in ["UTS", "Ti-6Al-4V"] {
+            let facts = store.recall_with_context(name, "local", 10).await.unwrap();
+            assert!(facts.is_empty(), "{name} must not be recallable: {facts:?}");
+            let hits = store.graph_search(name, "local", 10).await.unwrap();
+            assert!(
+                hits.is_empty(),
+                "no node may be minted for a refused fact's endpoint: {hits:?}"
+            );
+        }
+    }
 }
