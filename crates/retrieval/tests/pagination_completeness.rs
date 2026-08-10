@@ -443,6 +443,43 @@ async fn doaj_one_skipped_record_does_not_end_the_chain() {
     assert_chain_continues(SourceId::Doaj, &server, &page2, 1, Some(2)).await;
 }
 
+#[tokio::test]
+async fn ntrs_one_skipped_record_does_not_end_the_chain() {
+    // Two RAW results, one id-less (skipped by the parser): the gate and the
+    // cursor must advance on the raw count, so page[from]=2 is requested.
+    let page1 = r#"{
+      "stats": {"total": 2},
+      "results": [
+        {"id": 20150002086, "title": "Kept report"},
+        {"title": "record without an id"}
+      ]
+    }"#;
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/citations/search")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "page[from]".into(),
+            "0".into(),
+        ))
+        .with_status(200)
+        .with_body(page1)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let page2 = server
+        .mock("GET", "/citations/search")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "page[from]".into(),
+            "2".into(),
+        ))
+        .with_status(200)
+        .with_body(r#"{"stats": {"total": 2}, "results": []}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    assert_chain_continues(SourceId::Ntrs, &server, &page2, 1, Some(2)).await;
+}
+
 // ── What exists vs what was returned (B) ───────────────────────────────────
 
 /// The server's total must reach `source_status.available` so `count <
