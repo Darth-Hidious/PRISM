@@ -219,6 +219,96 @@ fn crop_tile(
 
 #[cfg(test)]
 mod tests {
+
+    /// A stub renderer: returns a real PNG without needing poppler.
+    struct StubRasteriser {
+        ready: bool,
+    }
+    impl PageRasteriser for StubRasteriser {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+        fn readiness(&self) -> Readiness {
+            if self.ready {
+                Readiness::Ready
+            } else {
+                Readiness::Unavailable("stub is off".into())
+            }
+        }
+        fn render(&self, _pdf: &[u8], _page: u32, _dpi: u32) -> Result<Vec<u8>> {
+            Ok(page_png(400, 300))
+        }
+    }
+
+    async fn vision_against(reply: &str) -> (VisionUnderstanding, wiremock::MockServer) {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": reply}}]
+            })))
+            .mount(&server)
+            .await;
+        let llm = prism_llm::LlmClient::new(prism_llm::LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "stub-vlm".into(),
+            ..Default::default()
+        });
+        (
+            VisionUnderstanding::new(Arc::new(StubRasteriser { ready: true }), Arc::new(llm)),
+            server,
+        )
+    }
+
+    /// Reading a whole paper by sight is a large billable cost, so it must be
+    /// a deliberate request. An audit made `pages: None` default to reading
+    /// pages 1-3 and nothing failed.
+    #[tokio::test]
+    async fn reading_a_whole_document_by_sight_is_refused() {
+        let (reader, _server) = vision_against("some text").await;
+        let err = reader
+            .understand(&SourceDocument::whole(b"%PDF", "pdf", "x.pdf"))
+            .await
+            .expect_err("an unbounded vision read must be refused");
+        assert!(format!("{err:#}").contains("explicit page list"), "{err:#}");
+    }
+
+    /// A looping tile must be DISCARDED, not concatenated into the page. The
+    /// discard lives in `read_page`, which had no test — only `is_degenerate`
+    /// itself did, so the call could be removed silently.
+    #[tokio::test]
+    async fn a_looping_tile_is_discarded_from_the_page() {
+        let (reader, _server) = vision_against(&"10 mm\n".repeat(60)).await;
+        let understanding = reader
+            .understand(&SourceDocument {
+                bytes: b"%PDF",
+                media_type: "pdf",
+                label: "x.pdf",
+                pages: Some(&[1]),
+            })
+            .await
+            .expect("the read itself succeeds");
+        assert_eq!(understanding.pages.len(), 1);
+        assert!(
+            understanding.pages[0].text.trim().is_empty(),
+            "every tile looped, so the page must be empty rather than a loop: {:?}",
+            understanding.pages[0].text,
+        );
+    }
+
+    /// An unavailable rasteriser is reported through the reader's readiness,
+    /// so escalation skips it instead of handing it bytes.
+    #[test]
+    fn an_unavailable_rasteriser_makes_the_reader_unavailable() {
+        let llm = prism_llm::LlmClient::new(prism_llm::LlmConfig::default());
+        let reader =
+            VisionUnderstanding::new(Arc::new(StubRasteriser { ready: false }), Arc::new(llm));
+        match reader.readiness() {
+            Readiness::Unavailable(reason) => assert!(reason.contains("stub is off")),
+            Readiness::Ready => panic!("a dead rasteriser must not report Ready"),
+        }
+    }
     use super::*;
 
     fn page_png(w: u32, h: u32) -> Vec<u8> {
@@ -236,14 +326,27 @@ mod tests {
     /// text on a tile boundary has to be whole somewhere, and no strip of the
     /// page may go unread.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn tiles_overlap_and_cover_the_whole_page() {
         use image::GenericImageView as _;
         let png = page_png(1000, 800);
-        let (cols, rows) = (2u32, 2u32);
+        // The PRODUCTION constants, not literals re-typed here: an audit set
+        // TILES to (1,1) and TILE_OVERLAP to 0.0 — deleting this module's
+        // entire thesis — and this test still passed because it built its own
+        // fixture and queried that.
+        let (cols, rows) = TILES;
+        assert!(
+            cols > 1 || rows > 1,
+            "a page must be read in more than one tile"
+        );
+        assert!(
+            TILE_OVERLAP > 0.0,
+            "tiles must overlap or a wrapped line is lost"
+        );
         let mut total = 0u64;
         for row in 0..rows {
             for col in 0..cols {
-                let tile = crop_tile(&png, col, row, cols, rows, 0.08).expect("crop");
+                let tile = crop_tile(&png, col, row, cols, rows, TILE_OVERLAP).expect("crop");
                 let (tw, th) = image::load_from_memory(&tile).unwrap().dimensions();
                 // Each tile is BIGGER than an exact quarter — that is the overlap.
                 assert!(
@@ -329,14 +432,34 @@ mod tests {
     /// guard against the vision reader quietly becoming a second, unvalidated
     /// fact extractor that bypasses the ontology.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_prompt_asks_only_for_what_is_printed() {
         let p = TRANSCRIBE_PROMPT;
         assert!(p.contains("exactly as printed"));
-        assert!(p.contains("skip"), "unreadable regions must be skipped");
-        for forbidden in ["describe", "explain", "summarise"] {
+        // The PROHIBITION, not the mere presence of the words: an audit
+        // replaced this prompt with "Freely describe ... Invent plausible
+        // values ... always guess" and the old assertions all still passed,
+        // because they only checked that "describe"/"explain" appeared.
+        assert!(
+            p.contains("Do not describe, explain, summarise"),
+            "the prompt must FORBID describing, not merely mention it: {p}",
+        );
+        assert!(
+            p.contains("skip it rather than guessing"),
+            "unreadable regions must be skipped, not guessed: {p}",
+        );
+        for invented in ["Invent", "guess a", "plausible"] {
             assert!(
-                p.contains(forbidden),
-                "the prompt must explicitly forbid '{forbidden}'",
+                !p.contains(invented),
+                "the prompt must never invite invention ('{invented}'): {p}",
+            );
+        }
+        // The per-tile bound must stay a real bound: set to u64::MAX it
+        // reinstates the measured five-minute runaway on a looping tile.
+        {
+            assert!(
+                TILE_TOKEN_BOUND > 0 && TILE_TOKEN_BOUND < 100_000,
+                "a tile transcription must stay bounded",
             );
         }
     }

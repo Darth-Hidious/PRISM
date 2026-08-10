@@ -204,6 +204,16 @@ async fn escalate(
         // BETTER: not damaged, and not a repetition loop. A model that loops
         // on a micrograph must not overwrite the text layer's honest text.
         for page in result.pages {
+            // Only pages this round actually ASKED for may be replaced. The
+            // adapter contract permits returning every page (an adapter that
+            // cannot read selectively is allowed to ignore the request), so
+            // without this a later reader can overwrite a page the first
+            // reader got right — replacing a sound "1000 MPa" with a fluent
+            // "9000 MPa" purely because the new prose passes the syntactic
+            // checks. Sound pages are never up for replacement.
+            if !damaged.iter().any(|(n, _)| *n == page.number) {
+                continue;
+            }
             let sound = text_layer_damage(&page.text, damage_policy).is_none()
                 && !is_degenerate(&page.text, damage_policy);
             if !sound {
@@ -247,6 +257,123 @@ async fn escalate(
 
 #[cfg(test)]
 mod tests {
+
+    /// An adapter is ALLOWED to return pages nobody asked for (the contract
+    /// says a reader that cannot select may return everything). It must not
+    /// be able to overwrite a page the first reader already got right — a
+    /// fluent "9000 MPa" replacing a sound "1000 MPa" purely because the new
+    /// prose is syntactically clean.
+    #[tokio::test]
+    async fn an_unrequested_page_cannot_overwrite_a_sound_one() {
+        let good_page_1 = sound(1);
+        let broken = (2u32, String::new());
+        let text = scripted(
+            "text-layer",
+            Modality::TextLayer,
+            true,
+            vec![good_page_1.clone(), broken],
+        );
+        // An oversharing reader: asked for page 2, answers with 1 AND 2, and
+        // its page 1 is clean prose that contradicts the original.
+        let oversharing = Arc::new(Scripted {
+            id: "vision",
+            modality: Modality::Vision,
+            ready: true,
+            pages: vec![
+                (
+                    1,
+                    "Alloy A exhibits a yield strength of 9000 MPa under all \
+                     conditions, which is a fluent and entirely clean sentence \
+                     that nonetheless contradicts the sound original page."
+                        .to_string(),
+                ),
+                sound(2),
+            ],
+            asked: std::sync::Mutex::new(Vec::new()),
+            // Deliberately ignores the page request, as the contract permits.
+            ignore_page_request: true,
+        });
+
+        let mut reg = UnderstandingRegistry::new();
+        reg.register(text as Arc<dyn DocumentUnderstanding>)
+            .unwrap();
+        reg.register(oversharing as Arc<dyn DocumentUnderstanding>)
+            .unwrap();
+        let candidates = reg.candidates("pdf");
+        let doc = SourceDocument::whole(b"%PDF-1.7", "pdf", "t.pdf");
+        let outcome = escalate(&doc, &candidates, &DamagePolicy::default())
+            .await
+            .expect("escalation reads");
+
+        let page1 = outcome
+            .understanding
+            .pages
+            .iter()
+            .find(|p| p.number == 1)
+            .expect("page 1 present");
+        assert_eq!(
+            page1.text, good_page_1.1,
+            "a sound page must never be replaced by an unrequested rewrite",
+        );
+        // Page 2, which WAS asked for, is still recovered.
+        let page2 = outcome
+            .understanding
+            .pages
+            .iter()
+            .find(|p| p.number == 2)
+            .expect("page 2 present");
+        assert_eq!(page2.text, sound(2).1);
+    }
+
+    /// `read()` had NO test — its only caller is the CLI — so the whole
+    /// `Policy::Only` branch was unguarded. An audit replaced the id lookup
+    /// with "just take the first candidate" and nothing failed: a caller
+    /// asking for vision would silently receive text-layer output, and every
+    /// fact extracted after it would carry the wrong modality in provenance.
+    #[tokio::test]
+    async fn policy_only_never_substitutes_a_different_reader() {
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+        let doc = SourceDocument::whole(b"%PDF-1.7", "pdf", "t.pdf");
+
+        // Only the built-in text layer is registered; asking for vision must
+        // FAIL rather than quietly returning the text layer's output.
+        let err = read(&doc, &Policy::Only("vision".into()))
+            .await
+            .expect_err("an absent reader must not be substituted");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("vision"), "{msg}");
+        assert!(msg.contains("not registered"), "{msg}");
+        // The message names what IS available, so the error is actionable.
+        assert!(msg.contains("text-layer"), "{msg}");
+
+        // And the reader that IS registered can still be asked for by name.
+        let outcome = read(&doc, &Policy::Only("text-layer".into())).await;
+        match outcome {
+            // Either it read, or it failed parsing these 8 bytes — both are
+            // the TEXT-LAYER answering. What must never happen is another
+            // adapter answering in its place.
+            Ok(outcome) => assert_eq!(outcome.understanding.adapter_id, "text-layer"),
+            Err(error) => assert!(
+                format!("{error:#}").contains("t.pdf"),
+                "the failure must come from reading THIS document: {error:#}",
+            ),
+        }
+    }
+
+    /// A media type nothing claims is refused by name, not silently empty.
+    #[tokio::test]
+    async fn an_unclaimed_media_type_is_refused() {
+        let _guard = crate::connectors::connector::GLOBAL_REGISTRY_TEST_LOCK
+            .lock()
+            .await;
+        let doc = SourceDocument::whole(b"...", "zzz-unclaimed", "t.zzz");
+        let err = read(&doc, &Policy::default())
+            .await
+            .expect_err("no reader claims this");
+        assert!(format!("{err:#}").contains("zzz-unclaimed"), "{err:#}");
+    }
     use super::*;
     use std::sync::Arc;
 
@@ -258,6 +385,9 @@ mod tests {
         ready: bool,
         pages: Vec<(u32, String)>,
         asked: std::sync::Mutex<Vec<u32>>,
+        /// Answer with EVERY page regardless of what was requested — which
+        /// the adapter contract explicitly permits.
+        ignore_page_request: bool,
     }
 
     #[async_trait::async_trait]
@@ -279,11 +409,12 @@ mod tests {
             }
         }
         async fn understand(&self, doc: &SourceDocument<'_>) -> Result<Understanding> {
+            let wants = |n: u32| self.ignore_page_request || doc.wants_page(n);
             let wanted: Vec<u32> = self
                 .pages
                 .iter()
                 .map(|(n, _)| *n)
-                .filter(|n| doc.wants_page(*n))
+                .filter(|n| wants(*n))
                 .collect();
             *self.asked.lock().unwrap() = wanted.clone();
             Ok(Understanding {
@@ -292,7 +423,7 @@ mod tests {
                 pages: self
                     .pages
                     .iter()
-                    .filter(|(n, _)| doc.wants_page(*n))
+                    .filter(|(n, _)| wants(*n))
                     .map(|(n, t)| PageText {
                         number: *n,
                         text: t.clone(),
@@ -328,6 +459,7 @@ mod tests {
             ready,
             pages,
             asked: std::sync::Mutex::new(Vec::new()),
+            ignore_page_request: false,
         })
     }
 

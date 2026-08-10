@@ -123,6 +123,19 @@ pub async fn classify_entities(
     let reply: ClassificationReply = serde_json::from_str(strip_fence(&raw))
         .with_context(|| format!("parsing entity classification reply: {raw:.400}"))?;
 
+    if reply.classifications.is_empty() {
+        // Serde treats `{}` and `{"classifications":[]}` as a SUCCESSFUL
+        // empty result, so a model that answers nothing looks identical to a
+        // document with no entities — and every fact silently falls back to
+        // the store's default labels with no warning anywhere.
+        anyhow::bail!(
+            "the model returned no classifications for {} entit{}; facts would be \
+             stored under default labels with no class",
+            names.len(),
+            if names.len() == 1 { "y" } else { "ies" },
+        );
+    }
+
     let mut out = HashMap::new();
     for item in reply.classifications {
         let Some(class) = resolve(ontology, &item.class) else {
@@ -135,13 +148,19 @@ pub async fn classify_entities(
             );
             continue;
         };
-        // Match back to the exact extracted name; the model is asked to echo
-        // terms verbatim, but case and surrounding space are not identity.
-        if let Some(name) = names
+        // Match back to EVERY extracted name the reply covers, not just the
+        // first. The model is asked to echo terms verbatim and case is not
+        // identity, so one reply legitimately answers for `Laser Powder Bed
+        // Fusion` and `laser powder bed fusion` at once. Keying only the
+        // first left the other unclassified, and an unclassified endpoint
+        // falls back to the default storage label — so ONE process became two
+        // nodes under two labels, and the storage label is part of the entity
+        // KEY. Identity must not fork on capitalisation.
+        for name in names
             .iter()
-            .find(|n| n.trim().eq_ignore_ascii_case(item.term.trim()))
+            .filter(|n| n.trim().eq_ignore_ascii_case(item.term.trim()))
         {
-            out.insert((*name).clone(), class);
+            out.insert((*name).clone(), class.clone());
         }
     }
     Ok(out)
@@ -352,6 +371,81 @@ impl ClassPrior for GraphPrior {
 
 #[cfg(test)]
 mod tests {
+
+    /// An empty reply is a silent no-op unless it is refused: serde parses
+    /// `{"classifications":[]}` as SUCCESS, so a model that answers nothing
+    /// looks exactly like a document with no entities, and every fact falls
+    /// back to default labels with no warning anywhere.
+    #[tokio::test]
+    async fn an_empty_classification_reply_is_an_error_not_a_silent_noop() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant",
+                                         "content": "{\"classifications\":[]}"}}]
+            })))
+            .mount(&server)
+            .await;
+        let llm = prism_llm::LlmClient::new(prism_llm::LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "silent".into(),
+            ..Default::default()
+        });
+        let names = ["GRCop-84".to_string()];
+        let err = classify_entities(&llm, emmo().as_ref(), &names, None)
+            .await
+            .expect_err("an empty reply must be reported, not accepted");
+        assert!(format!("{err:#}").contains("no classifications"), "{err:#}");
+    }
+
+    /// `classify_entities` itself — not just `resolve` — must refuse a class
+    /// the ontology does not declare. An audit made the function fall back to
+    /// minting the model's string as entity_type, storage_label AND class_iri,
+    /// and every test passed, because nothing drove this function at all.
+    /// A minted storage label is a fork in the entity KEY space.
+    #[tokio::test]
+    async fn an_invented_class_never_reaches_the_caller() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let reply = serde_json::json!({"classifications": [
+            {"term": "GRCop-84",   "class": "Alloy"},
+            {"term": "Warp Drive", "class": "Spaceship"}
+        ]});
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": reply.to_string()}}]
+            })))
+            .mount(&server)
+            .await;
+        let llm = prism_llm::LlmClient::new(prism_llm::LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "test-classifier".into(),
+            ..Default::default()
+        });
+
+        let ontology = emmo();
+        let names = ["GRCop-84".to_string(), "Warp Drive".to_string()];
+        let classes = classify_entities(&llm, ontology.as_ref(), &names, None)
+            .await
+            .expect("classification succeeds");
+
+        assert!(
+            !classes.contains_key("Warp Drive"),
+            "an undeclared class must never reach the store: {classes:?}",
+        );
+        let alloy = classes.get("GRCop-84").expect("a declared class survives");
+        assert_eq!(alloy.entity_type, "Alloy");
+        // The storage label is the ONTOLOGY's, never the model's string.
+        assert_eq!(
+            alloy.storage_label,
+            ontology.storage_label("Alloy").unwrap_or("Alloy"),
+        );
+        assert!(alloy.class_iri.starts_with("http"), "a real IRI: {alloy:?}");
+    }
 
     /// The storage label is IDENTITY — it is part of `entity_key` — so it must
     /// come from the ontology's own mapping, keyed by the EXTRACTION label.
