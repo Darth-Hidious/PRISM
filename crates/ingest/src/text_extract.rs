@@ -106,9 +106,47 @@ pub async fn extract_facts_from_text(
 /// Dropped facts go to `dropped_facts`, whose contract already is "a PARTIAL
 /// result the caller MUST surface": the user is told what the model made up,
 /// rather than it silently becoming part of their graph.
+/// How hard to work at proving a fact belongs to its subject.
+///
+/// This is a MODEL-COMPENSATION knob, and it is declared rather than compiled
+/// in because the right setting depends entirely on the extractor.
+///
+/// Measured on one polymer tribology paper, same prompt, same text:
+/// `gemma-4-12b` proposed 74 facts of which 4 of the 23 that survived were
+/// misattributions (a value from another author's table, and a load exponent
+/// read as a friction coefficient). `gpt-5.6-sol` proposed 51 and attributed
+/// them correctly unaided — it even split "short glass fibers" into distinct
+/// subjects per matrix, and put the 1.4% deformation on UNREINFORCED
+/// polyamide, which is exactly what the smaller model got wrong.
+///
+/// So `SameSpan` fixes a weak extractor, and PENALISES a strong one: the
+/// correct fact "Nylonplast AVE + 30% GF, 0.2%" is stated as "…to 0.2% for
+/// the reinforced one", where the subject is not in the span. Attribution is
+/// the model's job; this exists for when the model cannot do it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Attribution {
+    /// The subject must appear in the document. Fabrication insurance that
+    /// holds for any model, at any capability. The default.
+    #[default]
+    SubjectInDocument,
+    /// ALSO require the subject and value in one span. Recovers precision
+    /// from a weak extractor at a measured cost in recall — on that paper,
+    /// 23 stored facts fell to 11.
+    SameSpan,
+}
+
 fn retain_grounded(
     facts: Vec<MaterialFact>,
     text: &str,
+    dropped_facts: &mut Vec<String>,
+) -> Vec<MaterialFact> {
+    retain_grounded_with(facts, text, Attribution::default(), dropped_facts)
+}
+
+fn retain_grounded_with(
+    facts: Vec<MaterialFact>,
+    text: &str,
+    attribution: Attribution,
     dropped_facts: &mut Vec<String>,
 ) -> Vec<MaterialFact> {
     // Support is looked for in text whose SOFT WRAPS have been rejoined. The
@@ -146,7 +184,8 @@ fn retain_grounded(
                 // grounded; neither is true.
                 Some(value) => {
                     subject_appears(&fact.subject, text)
-                        && value_shares_a_span_with_subject(&fact.subject, value, text)
+                        && (attribution == Attribution::SubjectInDocument
+                            || value_shares_a_span_with_subject(&fact.subject, value, text))
                         && prism_retrieval::claims::supporting_quote(
                             &fact.subject,
                             &fact.object,
@@ -605,8 +644,25 @@ mod tests {
         };
         let mut dropped = Vec::new();
         assert!(
-            retain_grounded(vec![misattributed], source, &mut dropped).is_empty(),
-            "a value stated for ANOTHER material must not attach to this one",
+            retain_grounded_with(
+                vec![misattributed.clone()],
+                source,
+                Attribution::SameSpan,
+                &mut dropped
+            )
+            .is_empty(),
+            "under SameSpan, a value stated for ANOTHER material must not attach here",
+        );
+
+        // And the DEFAULT lets it through, on purpose: attribution is the
+        // extractor's job, and the span rule that catches this also deletes
+        // correct facts from a capable model. The knob exists so that choice
+        // is made by whoever knows which model is running.
+        let mut permitted = Vec::new();
+        assert_eq!(
+            retain_grounded(vec![misattributed], source, &mut permitted).len(),
+            1,
+            "the default must not silently apply the weak-model compensation",
         );
 
         // The same number, in the same span as its own subject, survives.
@@ -625,9 +681,9 @@ mod tests {
         };
         let mut kept = Vec::new();
         assert_eq!(
-            retain_grounded(vec![real], attributed, &mut kept).len(),
+            retain_grounded_with(vec![real], attributed, Attribution::SameSpan, &mut kept).len(),
             1,
-            "a correctly attributed value must survive: {kept:?}",
+            "a correctly attributed value must survive even under SameSpan: {kept:?}",
         );
     }
 
