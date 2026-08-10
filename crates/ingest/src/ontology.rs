@@ -238,6 +238,28 @@ impl OntologyConstructor for LlmOntologyConstructor {
     }
 }
 
+/// One tabular extraction plus the honest record of how it was decoded:
+/// whether the endpoint enforced the ontology-derived schema, why it
+/// degraded when it didn't, and the seed/temperature actually sent
+/// (recorded into the provenance activity by the pipeline).
+#[derive(Debug, Clone)]
+pub struct TracedExtraction {
+    pub entities: EntitySet,
+    pub decoding: prism_llm::JsonDecodingTrace,
+}
+
+/// Whether extraction requests should carry the reasoning kill-switch
+/// (`LLM_NO_THINK=1`/`true` in the environment — the same `LLM_*` surface
+/// the other model knobs use). Opt-in because the kwarg is a
+/// llama-server/vLLM extension OpenAI rejects with 400; needed because a
+/// thinking-mode model can burn ANY output budget on reasoning before the
+/// constrained JSON starts (measured 2026-08-10, Gemma-4-12B: 46.7k chars
+/// of reasoning against a 16384-token budget, zero JSON). The flag is
+/// recorded in the decoding trace and the provenance activity either way.
+fn extraction_no_think() -> bool {
+    std::env::var("LLM_NO_THINK").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Convenience method: extract entities with explicit sample rows (bypasses DataSource).
 impl LlmOntologyConstructor {
     pub async fn extract_entities_with_samples(
@@ -250,6 +272,8 @@ impl LlmOntologyConstructor {
             .await
     }
 
+    /// Source-compatible wrapper over [`Self::extract_entities_traced`] for
+    /// callers that do not consume the decoding trace.
     pub async fn extract_entities_with_mapping(
         &self,
         ontology: &dyn crate::ontologies::Ontology,
@@ -257,6 +281,19 @@ impl LlmOntologyConstructor {
         sample_rows: &[Vec<String>],
         mapping: Option<&crate::mapping::OntologyMapping>,
     ) -> Result<EntitySet> {
+        Ok(self
+            .extract_entities_traced(ontology, schema, sample_rows, mapping)
+            .await?
+            .entities)
+    }
+
+    pub async fn extract_entities_traced(
+        &self,
+        ontology: &dyn crate::ontologies::Ontology,
+        schema: &SchemaAnalysis,
+        sample_rows: &[Vec<String>],
+        mapping: Option<&crate::mapping::OntologyMapping>,
+    ) -> Result<TracedExtraction> {
         // Zero sample rows means there is nothing real to extract from: the
         // prompt would carry only the header names, and the model invents
         // plausible-looking entities from them — the same failure mode the
@@ -302,7 +339,23 @@ impl LlmOntologyConstructor {
         );
 
         let prompt = Self::build_extraction_prompt_with_mapping(ontology, schema, rows, mapping);
-        let response = self.generate(&prompt).await?;
+        // Constrained decoding, derived from the SAME active-ontology
+        // declaration the prompt above and graph validation read: the model
+        // is structurally unable to emit an undeclared class, an undeclared
+        // relation, or a non-QUDT unit. Deterministic knobs (temperature 0,
+        // recorded seed) ride the same request; an endpoint that rejects the
+        // schema degrades honestly and the trace says so.
+        let extraction_schema = crate::extraction_schema::extraction_json_schema(ontology);
+        let constrained = self
+            .client
+            .generate_json_with_schema(
+                &prompt,
+                &extraction_schema,
+                prism_llm::EXTRACTION_SEED,
+                extraction_no_think(),
+            )
+            .await?;
+        let response = constrained.text;
 
         let raw: ExtractionOutput =
             serde_json::from_str(&response).context("LLM returned invalid extraction JSON")?;
@@ -348,9 +401,12 @@ impl LlmOntologyConstructor {
             }
         }
 
-        Ok(EntitySet {
-            entities,
-            relationships,
+        Ok(TracedExtraction {
+            entities: EntitySet {
+                entities,
+                relationships,
+            },
+            decoding: constrained.trace,
         })
     }
 }
@@ -703,6 +759,36 @@ entity_rules:
             message.contains("unknown entity type \"ImaginaryClass\""),
             "{message}"
         );
+    }
+
+    /// `LLM_NO_THINK` is the documented spellings only — "1"/"true" (any
+    /// case) enable, everything else (including absence) stays off, because
+    /// the kwarg it adds is a vendor extension OpenAI rejects with 400.
+    /// This is the only test in the workspace touching this env var; it
+    /// restores the prior state either way.
+    #[test]
+    fn extraction_no_think_reads_the_documented_spellings_only() {
+        let prior = std::env::var_os("LLM_NO_THINK");
+        // SAFETY: single test-threaded mutation of a var only this test and
+        // the production reader consult; restored below.
+        unsafe { std::env::remove_var("LLM_NO_THINK") };
+        assert!(!extraction_no_think(), "absent must mean OFF");
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("0", false),
+            ("false", false),
+            ("yes", false),
+            ("", false),
+        ] {
+            unsafe { std::env::set_var("LLM_NO_THINK", value) };
+            assert_eq!(extraction_no_think(), expected, "value {value:?}");
+        }
+        match prior {
+            Some(value) => unsafe { std::env::set_var("LLM_NO_THINK", value) },
+            None => unsafe { std::env::remove_var("LLM_NO_THINK") },
+        }
     }
 
     #[test]

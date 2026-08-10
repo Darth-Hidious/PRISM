@@ -154,6 +154,15 @@ pub struct LlmSection {
     /// Request timeout in seconds.
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
+    /// Max output tokens per request. `None` keeps the client's conservative
+    /// default (4096). The extraction-failure diagnostic has ALWAYS told
+    /// users to "raise max_output_tokens in the LLM config" when a
+    /// thinking-mode model burns its whole budget on reasoning_content —
+    /// but no config field existed on this path, so the advice was
+    /// un-actionable (live 2026-08-10: Gemma-4-12B spent 11,100 chars of
+    /// reasoning against the 4096 default and produced zero JSON).
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl std::fmt::Debug for LlmSection {
@@ -168,6 +177,7 @@ impl std::fmt::Debug for LlmSection {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("api_key_env", &self.api_key_env)
             .field("timeout_secs", &self.timeout_secs)
+            .field("max_output_tokens", &self.max_output_tokens)
             .finish()
     }
 }
@@ -182,6 +192,7 @@ impl Default for LlmSection {
             api_key: None,
             api_key_env: default_api_key_env(),
             timeout_secs: default_llm_timeout(),
+            max_output_tokens: None,
         }
     }
 }

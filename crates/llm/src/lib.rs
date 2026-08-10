@@ -925,6 +925,161 @@ impl LlmClient {
         Self::extract_json_content(&data["choices"][0])
     }
 
+    /// Generate JSON under a server-enforced schema (`response_format:
+    /// json_schema`, supported by llama-server, vLLM and OpenAI), with the
+    /// determinism knobs sent explicitly: `temperature: 0` and the caller's
+    /// `seed`. Constrained decoding guarantees FORM (the output parses and
+    /// every enum-locked field holds a declared value), never TRUTH — the
+    /// caller's validation still owns semantic checks.
+    ///
+    /// Degradation is honest, never silent: an endpoint that REJECTS the
+    /// schema (see [`error_rejects_json_schema`]) gets ONE fallback request
+    /// identical except for `response_format: json_object` — same seed, same
+    /// temperature — and the returned [`JsonDecodingTrace`] carries the
+    /// server's rejection so the caller can surface it. Backends with no
+    /// `response_format` at all (embedded GGUF, the MARC27 `/stream` path)
+    /// take the existing prompt-only path and say so the same way. What this
+    /// method CANNOT detect is a server that accepts `json_schema` with 200
+    /// and silently ignores it (old Ollama builds did) — that class is only
+    /// caught downstream, by validating the output against the same
+    /// declarations the schema was built from.
+    ///
+    /// Any other failure propagates as an error — a 401/404/429 is not a
+    /// capability signal, and retrying it without the schema would bury the
+    /// real problem under a second, less informative failure.
+    ///
+    /// `no_think` adds `chat_template_kwargs: {"enable_thinking": false}`
+    /// (llama-server / vLLM) — the reasoning kill-switch for models whose
+    /// thinking mode otherwise consumes the output budget before any JSON
+    /// appears (measured 2026-08-10, Gemma-4-12B on the tabular extraction
+    /// prompt: ~85% of ANY budget went to reasoning_content — 11.1k chars
+    /// at 4096 tokens, 46.7k at 16384 — and the constrained JSON never
+    /// started). It is caller-opt-in and off by default because OpenAI
+    /// rejects unknown request fields with 400. Recorded in the trace so a
+    /// run difference stays attributable.
+    pub async fn generate_json_with_schema(
+        &self,
+        prompt: &str,
+        schema: &JsonSchemaSpec,
+        seed: i64,
+        no_think: bool,
+    ) -> Result<ConstrainedJson> {
+        // Embedded GGUF: the local adapter exposes no grammar surface and no
+        // per-request seed/temperature, so nothing deterministic or
+        // constrained can be claimed. Take the existing prompt-only path.
+        if self.local_backend().is_some() {
+            let text = self.generate_json(prompt).await?;
+            return Ok(ConstrainedJson {
+                text,
+                trace: JsonDecodingTrace {
+                    mode: JsonDecodingMode::PromptOnly,
+                    degraded: Some(
+                        "embedded GGUF inference has no schema-constrained decoding; \
+                         prompt-only JSON extraction was used and no seed or temperature \
+                         was sent"
+                            .to_string(),
+                    ),
+                    seed: None,
+                    temperature: None,
+                    no_think: false,
+                },
+            });
+        }
+        // MARC27 platform: /stream carries no response_format and no sampling
+        // controls — the schema cannot be applied there.
+        if self.is_marc27() {
+            let text = self.generate_json(prompt).await?;
+            return Ok(ConstrainedJson {
+                text,
+                trace: JsonDecodingTrace {
+                    mode: JsonDecodingMode::PromptOnly,
+                    degraded: Some(
+                        "the MARC27 /stream path has no response_format or sampling \
+                         controls; prompt-only JSON extraction was used and no seed or \
+                         temperature was sent"
+                            .to_string(),
+                    ),
+                    seed: None,
+                    temperature: None,
+                    no_think: false,
+                },
+            });
+        }
+        let url = self.chat_completions_url();
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.0,
+            "seed": seed,
+            "max_tokens": self.effective_max_tokens(prompt.len() as u64 / 4),
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.name,
+                    "strict": true,
+                    "schema": schema.schema,
+                },
+            },
+        });
+        if no_think {
+            body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+        }
+        match self.post(&url, &body).await {
+            Ok(resp) => {
+                let data: serde_json::Value = resp.json().await.context("bad chat response")?;
+                let text = Self::extract_json_content(&data["choices"][0])?;
+                Ok(ConstrainedJson {
+                    text,
+                    trace: JsonDecodingTrace {
+                        mode: JsonDecodingMode::JsonSchema,
+                        degraded: None,
+                        seed: Some(seed),
+                        temperature: Some(0.0),
+                        no_think,
+                    },
+                })
+            }
+            Err(err) if error_rejects_json_schema(&err) => {
+                // The endpoint rejected the SCHEMA, not the request: fall
+                // back once, identical except for response_format, and carry
+                // the rejection into the trace so the caller can report it.
+                body["response_format"] = serde_json::json!({"type": "json_object"});
+                let resp = self.post(&url, &body).await.with_context(|| {
+                    format!(
+                        "the endpoint rejected response_format json_schema ({err:#}) \
+                         and the json_object fallback request failed too"
+                    )
+                })?;
+                let data: serde_json::Value = resp.json().await.context("bad chat response")?;
+                let text = Self::extract_json_content(&data["choices"][0])?;
+                Ok(ConstrainedJson {
+                    text,
+                    trace: JsonDecodingTrace {
+                        mode: JsonDecodingMode::JsonObject,
+                        degraded: Some(format!(
+                            "the endpoint rejected schema-constrained decoding \
+                             (response_format json_schema): {err:#}. Extraction fell \
+                             back to prompt-guided JSON, so the model was NOT \
+                             structurally prevented from emitting out-of-vocabulary \
+                             types, relationships, or units — validation still gates \
+                             what is stored"
+                        )),
+                        seed: Some(seed),
+                        temperature: Some(0.0),
+                        no_think,
+                    },
+                })
+            }
+            Err(err) => Err(err.context(
+                "schema-constrained JSON generation failed; the endpoint did not reject \
+                 the schema itself, so this is a request failure, not a capability \
+                 degradation",
+            )),
+        }
+    }
+
     /// Strip a Markdown code fence (```json … ``` or ``` … ```) from around
     /// a JSON payload. Providers without a JSON response mode (the MARC27
     /// `/stream` path) often fence their JSON; the parser downstream wants
@@ -1543,6 +1698,113 @@ fn error_rejects_tool_schemas(err: &anyhow::Error) -> bool {
     ["tools.", "tools[", "\"tools\"", "tool_choice"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+// ── Schema-constrained JSON generation ──────────────────────────────
+
+/// The one extraction seed PRISM sends, deliberately a constant rather than
+/// a config knob: reproducibility means every run of the same input against
+/// the same model must sample identically, and a per-run seed would defeat
+/// exactly that. It is recorded in the provenance activity alongside the
+/// model id and temperature, so a difference between two runs is
+/// attributable to input/model/server — never to an unrecorded knob.
+pub const EXTRACTION_SEED: i64 = 42;
+
+/// A named JSON schema for `response_format: {"type": "json_schema", …}`.
+/// The caller owns deriving `schema` from its real declarations (PRISM: the
+/// active ontology) — this crate only carries it to the wire.
+#[derive(Debug, Clone)]
+pub struct JsonSchemaSpec {
+    /// Identifier sent as `json_schema.name` (OpenAI requires one).
+    pub name: String,
+    /// The JSON-Schema document itself.
+    pub schema: serde_json::Value,
+}
+
+/// How one JSON generation was actually decoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonDecodingMode {
+    /// The endpoint accepted `response_format: json_schema` — output is
+    /// grammar-constrained to the supplied schema.
+    JsonSchema,
+    /// The endpoint rejected the schema; `response_format: json_object`
+    /// was used instead (JSON syntax enforced, vocabulary NOT).
+    JsonObject,
+    /// No `response_format` at all (embedded GGUF, MARC27 `/stream`): the
+    /// prompt text is the only thing shaping the output.
+    PromptOnly,
+}
+
+impl JsonDecodingMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JsonSchema => "json_schema",
+            Self::JsonObject => "json_object",
+            Self::PromptOnly => "prompt_only",
+        }
+    }
+}
+
+/// The honest record of one JSON generation: which decoding mode actually
+/// applied, why it degraded when it did, and the determinism knobs that were
+/// really sent (None = the backend offered no such knob — never a guess).
+/// Callers surface `degraded` to the user and record seed/temperature in
+/// provenance; a capability that silently isn't applied is the defect class
+/// this type exists to prevent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonDecodingTrace {
+    pub mode: JsonDecodingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Whether the request carried the reasoning kill-switch
+    /// (`chat_template_kwargs: {"enable_thinking": false}`). Part of the
+    /// reproducibility record: a thinking and a non-thinking run of the
+    /// same seed are different computations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_think: bool,
+}
+
+/// One schema-constrained generation: the raw JSON text plus its trace.
+#[derive(Debug, Clone)]
+pub struct ConstrainedJson {
+    pub text: String,
+    pub trace: JsonDecodingTrace,
+}
+
+/// Whether an LLM error is the endpoint refusing `response_format:
+/// json_schema`, as opposed to anything else that can fail a request.
+///
+/// Same two-axis discipline as [`error_rejects_tool_schemas`]: the error must
+/// BOTH carry a request-shape status (400/422 = provider rejected the
+/// request, 500 = a proxy's wrapper around an upstream 400, 501 = declared
+/// unimplemented) AND name the schema mechanism. Auth (401/403), billing
+/// (402), routing (404) and capacity (429/503) are never a schema problem —
+/// falling back on those would bury the real failure under a second, less
+/// informative one.
+fn error_rejects_json_schema(err: &anyhow::Error) -> bool {
+    let request_shape = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<retry::HttpStatus>())
+        .is_some_and(|h| matches!(h.status, 400 | 422 | 500 | 501));
+    if !request_shape {
+        return false;
+    }
+    let text = format!("{err:#}").to_ascii_lowercase();
+    [
+        "response_format",
+        "json_schema",
+        "json schema",
+        "grammar",
+        "structured output",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 /// Render the SELECTED tools as text, for the fallback path only.
@@ -3496,6 +3758,44 @@ mod tests {
             LlmClient::strip_json_fences("```json\n{\"a\":1}"),
             "{\"a\":1}"
         );
+    }
+
+    // ── Schema-rejection classification ───────────────────────────────
+
+    /// The fallback gate must be narrow on BOTH axes: a request-shape status
+    /// alone is not enough (a 400 for a wrong model name must propagate),
+    /// and naming the mechanism alone is not enough (a 402 whose body
+    /// mentions response_format is still a billing failure). Only their
+    /// conjunction may trigger the honest json_object fallback.
+    #[test]
+    fn json_schema_rejection_requires_status_and_mechanism_together() {
+        let rejects = |status: u16, body: &str| {
+            error_rejects_json_schema(
+                &anyhow::Error::new(retry::HttpStatus::new(status))
+                    .context(format!("LLM returned HTTP {status}: {body}")),
+            )
+        };
+        // The real shapes: provider 400/422 naming the mechanism.
+        assert!(rejects(
+            400,
+            "response_format 'json_schema' is not supported"
+        ));
+        assert!(rejects(422, "unknown field json_schema"));
+        assert!(rejects(500, "Failed to convert json schema to grammar"));
+        assert!(rejects(501, "structured output is not implemented"));
+        // Request-shape status, unrelated body: NOT a capability signal.
+        assert!(!rejects(400, "model 'nonexistent' not found"));
+        // Mechanism named, wrong status class: auth/billing/capacity/routing.
+        for status in [401, 402, 403, 404, 429, 503] {
+            assert!(
+                !rejects(status, "response_format json_schema"),
+                "status {status} must never trigger the schema fallback"
+            );
+        }
+        // No HttpStatus in the chain at all (transport error): propagate.
+        assert!(!error_rejects_json_schema(&anyhow::anyhow!(
+            "connection reset while sending response_format json_schema"
+        )));
     }
 
     // ── Hard offline mode ─────────────────────────────────────────────

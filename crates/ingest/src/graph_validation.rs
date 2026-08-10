@@ -7,6 +7,11 @@
 //! - Missing required properties (e.g. Alloy without name)
 //! - Invalid relationship types
 //! - Duplicate entities
+//! - Quantity-kind contradictions (a density carrying a pressure unit) —
+//!   the check schema-constrained decoding CANNOT do: the grammar
+//!   guarantees the unit is a declared QUDT identifier, never that it is
+//!   the RIGHT identifier (live 2026-08-08: an enum-locked 12B model
+//!   tagged a density of 8.19 with `QUDT:GigaPA`)
 //! - Domain constraints the active ontology declares (for EMMO:
 //!   weight/order rules on CONTAINS/PROCESSED_BY)
 //!
@@ -20,8 +25,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::EntitySet;
 use crate::ontologies::Ontology;
+use crate::qudt_units;
+use crate::{Entity, EntitySet};
 
 /// A graph validation issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +167,24 @@ pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphVal
         }
     }
 
+    // Check 11: quantity-kind consistency — the semantic half constrained
+    // decoding cannot provide. Error severity: a value stored under a unit
+    // of the wrong quantity kind is a falsehood, not a style issue. The
+    // pipeline CONTAINS this class instead of failing the whole ingest —
+    // it drops exactly the contradicting entity and reports the drop
+    // (`pipeline::validate_before_graph_write`), the same discipline as
+    // `orphan_rel`: failing wholesale would destroy every valid fact in
+    // the document over one bad unit.
+    for e in &entities.entities {
+        if let Some(reason) = unit_kind_mismatch(e) {
+            issues.push(GraphIssue {
+                severity: GraphSeverity::Error,
+                category: "unit_kind_mismatch".into(),
+                message: reason,
+            });
+        }
+    }
+
     // Checks 7–10 moved into the ontology: EMMO's weight/order rules on
     // CONTAINS/PROCESSED_BY live in `EmmoOntology::validate_domain`, emitted
     // here in the position they always ran so reports are unchanged for
@@ -175,6 +199,30 @@ pub fn validate_graph(ontology: &dyn Ontology, entities: &EntitySet) -> GraphVal
         passed: !has_errors,
         issues,
     }
+}
+
+/// The quantity-kind contradiction in ONE entity's measurement claim, or
+/// `None`. Fires only when BOTH sides are known: the entity's `unit`
+/// property is a declared QUDT extraction unit AND its name states a
+/// quantity this codebase can defend (`crate::qudt_units`) — so a bare
+/// `"MPa"` (vocabulary problem) or an unmapped property name (no claim)
+/// never produces a false positive. Shared by Check 11 above and the
+/// pipeline's containment partition, so what is flagged and what is
+/// dropped-and-reported cannot disagree.
+#[must_use]
+pub fn unit_kind_mismatch(entity: &Entity) -> Option<String> {
+    let unit = entity.properties.get("unit")?.as_str()?;
+    let unit_kind = qudt_units::unit_quantity_kind(unit)?;
+    let stated_kind = qudt_units::property_quantity_kind(&entity.name)?;
+    (unit_kind != stated_kind).then(|| {
+        format!(
+            "entity '{}' states a {} but carries unit {unit}, a {} unit — \
+             storing the value under it would store a falsehood",
+            entity.name,
+            stated_kind.label(),
+            unit_kind.label(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -344,6 +392,80 @@ mod tests {
         };
         let report = validate_graph(&EmmoOntology, &es);
         assert!(report.issues.iter().any(|i| i.category == "weight_sum"));
+    }
+
+    /// The owner's live case, mechanically caught: a density tagged with a
+    /// pressure unit is an Error — legal to the decoding grammar, false as
+    /// a fact. And the check must not over-fire: the RIGHT unit, an
+    /// undeclared unit spelling, and a property this codebase makes no
+    /// claim about all pass clean.
+    #[test]
+    fn density_with_a_pressure_unit_is_an_error() {
+        let poisoned = EntitySet {
+            entities: vec![
+                make_entity("Alloy", "Inconel 718"),
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "density_g_cm3".into(),
+                    properties: serde_json::json!({"value": 8.19, "unit": "QUDT:GigaPA"}),
+                },
+            ],
+            relationships: vec![],
+        };
+        let report = validate_graph(&EmmoOntology, &poisoned);
+        assert!(!report.passed, "a quantity-kind contradiction must block");
+        let issue = report
+            .issues
+            .iter()
+            .find(|i| i.category == "unit_kind_mismatch")
+            .expect("the contradiction must be reported");
+        assert_eq!(issue.severity, GraphSeverity::Error);
+        assert!(issue.message.contains("QUDT:GigaPA"), "{}", issue.message);
+        assert!(issue.message.contains("density"), "{}", issue.message);
+    }
+
+    #[test]
+    fn quantity_kind_check_does_not_over_fire() {
+        let clean = EntitySet {
+            entities: vec![
+                // The right unit for the stated quantity.
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "density_g_cm3".into(),
+                    properties: serde_json::json!({"value": 8.19, "unit": "QUDT:GM-PER-CentiM3"}),
+                },
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "Yield Strength".into(),
+                    properties: serde_json::json!({"value": 1100.0, "unit": "QUDT:MegaPA"}),
+                },
+                // A bare spelling is a vocabulary problem, not a
+                // quantity-kind contradiction — normalisation's job.
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "density".into(),
+                    properties: serde_json::json!({"value": 8.19, "unit": "g/cm3"}),
+                },
+                // A property this module makes no claim about.
+                Entity {
+                    entity_type: "Property".into(),
+                    name: "Hardness_HV".into(),
+                    properties: serde_json::json!({"value": 542.0, "unit": "QUDT:MegaPA"}),
+                },
+                // No unit at all.
+                make_entity("Property", "corrosion resistance"),
+            ],
+            relationships: vec![],
+        };
+        let report = validate_graph(&EmmoOntology, &clean);
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| i.category == "unit_kind_mismatch"),
+            "{:?}",
+            report.issues
+        );
     }
 
     #[test]

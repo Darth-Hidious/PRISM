@@ -29,6 +29,7 @@
 //! adapter, so instructing and validating cannot drift apart.
 
 pub mod connectors;
+pub mod extraction_schema;
 pub mod graph_validation;
 /// Re-export LLM client from the standalone `prism-llm` crate.
 /// This keeps backward compatibility — existing code using `prism_ingest::llm::*`
@@ -40,6 +41,7 @@ pub mod mapping;
 pub mod ontologies;
 pub mod ontology;
 pub mod pipeline;
+pub mod qudt_units;
 pub mod schema;
 pub mod text_extract;
 pub mod validation;
