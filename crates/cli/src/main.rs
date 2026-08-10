@@ -5887,10 +5887,9 @@ fn build_llm_config(
         api_key,
         embedding_model: llm.embedding_model.clone(),
         timeout_secs: llm.timeout_secs,
-        // Without this, extraction against a reasoning model is capped at
-        // the client's conservative 4096 and the whole budget goes to
-        // reasoning_content — zero JSON out, and the resulting error told
-        // the user to raise a knob this path never plumbed.
+        // `[llm] max_output_tokens` — the knob the thinking-mode extraction
+        // diagnostic tells users to raise. It existed in the message but not
+        // in the config until 2026-08-10.
         max_output_tokens: llm.max_output_tokens,
         ..Default::default()
     })
@@ -6900,6 +6899,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     "  Graph: {nodes} nodes, {edges} edges written to the local knowledge graph"
                 );
             }
+            if let Some(report) = extraction_decoding_report(result) {
+                println!("{report}");
+            }
             if let Some(report) = dropped_entities_report(result) {
                 println!("{report}");
             }
@@ -7078,6 +7080,35 @@ fn print_ingest_summary(summary: &serde_json::Value) {
         }
         println!("\n  Completed WITH ERRORS — data for the failed steps was NOT stored.");
     }
+}
+
+/// The decoding line for one local-tabular ingest result: whether the LLM
+/// output was grammar-constrained to the active ontology's vocabulary, and
+/// with which determinism knobs. A DEGRADED constraint (the endpoint
+/// rejected `response_format: json_schema`, or the backend has none) is a
+/// warning the user must see — a capability that silently isn't applied is
+/// the exact defect class this pipeline keeps removing. `None` only when
+/// extraction never ran (schema-only mode, refusal).
+fn extraction_decoding_report(result: &serde_json::Value) -> Option<String> {
+    let trace = result.get("extraction_decoding")?;
+    let mode = trace.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+    if let Some(reason) = trace.get("degraded").and_then(|v| v.as_str()) {
+        return Some(format!(
+            "  Warning: extraction was NOT schema-constrained (ran as {mode}): {reason}"
+        ));
+    }
+    let seed = trace
+        .get("seed")
+        .and_then(|v| v.as_i64())
+        .map_or("unset".to_string(), |s| s.to_string());
+    let temperature = trace
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .map_or("unset".to_string(), |t| t.to_string());
+    Some(format!(
+        "  Extraction: schema-constrained to the active ontology's vocabulary \
+         (mode {mode}, seed {seed}, temperature {temperature})"
+    ))
 }
 
 /// The referential-containment drop report for one local-tabular ingest
@@ -12762,6 +12793,51 @@ mod tests {
             None
         );
         assert_eq!(dropped_entities_report(&serde_json::json!({})), None);
+    }
+
+    /// The decoding trace must reach the user's summary in BOTH directions:
+    /// a degraded constraint is a Warning carrying the endpoint's reason
+    /// (never silent), and an enforced one states the recorded determinism
+    /// knobs. A shape without the field (schema-only run, refusal) prints
+    /// nothing.
+    #[test]
+    fn extraction_decoding_reaches_the_ingest_summary() {
+        // Degraded: the endpoint rejected json_schema — the summary must
+        // say so and carry the reason.
+        let degraded = serde_json::json!({
+            "extraction_decoding": {
+                "mode": "json_object",
+                "degraded": "the endpoint rejected schema-constrained decoding \
+                             (response_format json_schema): HTTP 400",
+                "seed": 42,
+                "temperature": 0.0
+            }
+        });
+        let report = extraction_decoding_report(&degraded)
+            .expect("a degraded constraint must produce a warning line");
+        assert!(report.contains("Warning"), "{report}");
+        assert!(report.contains("NOT schema-constrained"), "{report}");
+        assert!(report.contains("json_object"), "{report}");
+        assert!(report.contains("rejected"), "{report}");
+
+        // Enforced: the summary states mode, seed, and temperature — the
+        // reproducibility knobs the provenance activity records.
+        let enforced = serde_json::json!({
+            "extraction_decoding": {
+                "mode": "json_schema",
+                "seed": 42,
+                "temperature": 0.0
+            }
+        });
+        let report = extraction_decoding_report(&enforced)
+            .expect("an enforced constraint must still be stated");
+        assert!(!report.contains("Warning"), "{report}");
+        assert!(report.contains("json_schema"), "{report}");
+        assert!(report.contains("seed 42"), "{report}");
+        assert!(report.contains("temperature 0"), "{report}");
+
+        // No trace ⇒ no line (extraction never ran).
+        assert_eq!(extraction_decoding_report(&serde_json::json!({})), None);
     }
 
     /// Facts the TEXT extractor dropped one by one (unresolvable unit,

@@ -154,6 +154,13 @@ pub struct LlmSection {
     /// Request timeout in seconds.
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
+    /// Max output tokens per request. `None` keeps the client's conservative
+    /// default (4096). The extraction-failure diagnostic has ALWAYS told
+    /// users to "raise max_output_tokens in the LLM config" when a
+    /// thinking-mode model burns its whole budget on reasoning_content —
+    /// but no config field existed on this path, so the advice was
+    /// un-actionable (live 2026-08-10: Gemma-4-12B spent 11,100 chars of
+    /// reasoning against the 4096 default and produced zero JSON).
     /// Max output tokens per response. `None` keeps the client's
     /// conservative default (4096). Reasoning/"thinking" models spend
     /// output budget on reasoning_content BEFORE the answer — gemma-4-12B

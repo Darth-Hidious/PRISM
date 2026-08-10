@@ -342,6 +342,22 @@ pub struct LocalProvenance {
     pub origin_source_id: Option<String>,
 }
 
+/// The decoding/sampling record of one extraction activity, written onto
+/// the SAME `prov_activity` row by
+/// [`ProvenanceStore::record_activity_decoding`]. `None` fields mean the
+/// backend offered no such knob (embedded GGUF, MARC27 `/stream`) — the
+/// honest NULL, never a guessed default.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivityDecoding<'a> {
+    /// Sampling seed the request carried.
+    pub seed: Option<i64>,
+    /// Sampling temperature the request carried.
+    pub temperature: Option<f64>,
+    /// JSON decoding mode that actually applied:
+    /// `json_schema` | `json_object` | `prompt_only`.
+    pub mode: Option<&'a str>,
+}
+
 /// A subject/predicate/object triple to reify as a PROV-O assertion
 /// (mirrors core's `Assertion`; the stable id is derived, not carried).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1454,6 +1470,17 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
         (),
     )
     .await?;
+    // Additive reproducibility columns (NULL on rows written before they
+    // existed, and on runs whose backend offered no such knob): the sampling
+    // seed and temperature an LLM extraction actually sent, plus the JSON
+    // decoding mode that really applied ('json_schema' = grammar-constrained
+    // to the active ontology, 'json_object' / 'prompt_only' = honest
+    // degradation). Alongside `agent_id` (the model id) these make a
+    // difference between two runs attributable — the model id alone cannot
+    // say whether two runs even sampled the same way.
+    crate::add_column_if_absent(conn, "prov_activity", "seed", "INTEGER").await?;
+    crate::add_column_if_absent(conn, "prov_activity", "temperature", "REAL").await?;
+    crate::add_column_if_absent(conn, "prov_activity", "decoding", "TEXT").await?;
 
     // `prov_assertion` is the query-optimized AGGREGATE row: `confidence`,
     // `corroborations`, and `evidence_class` are caches over
@@ -2693,6 +2720,43 @@ impl ProvenanceStore {
                 ],
             )
             .await?;
+        Ok(())
+    }
+
+    /// Record the decoding/sampling parameters of one recorded activity —
+    /// an UPDATE on the SAME `prov_activity` row [`Self::record_activity`]
+    /// wrote (no parallel mechanism, no side table). A missing activity id
+    /// is a loud error: silently recording parameters against nothing would
+    /// fake the reproducibility trail this exists to provide.
+    pub async fn record_activity_decoding(
+        &self,
+        activity_id: &str,
+        decoding: &ActivityDecoding<'_>,
+    ) -> Result<()> {
+        // Same-handle serialization as record_activity — see write_lock.
+        let _same_handle_guard = self.write_lock.lock().await;
+        let affected = self
+            .conn
+            .execute(
+                r#"UPDATE prov_activity
+                   SET seed = ?2, temperature = ?3, decoding = ?4
+                   WHERE id = ?1"#,
+                [
+                    Value::Text(activity_id.to_string()),
+                    decoding.seed.map_or(Value::Null, Value::Integer),
+                    decoding.temperature.map_or(Value::Null, Value::Real),
+                    decoding
+                        .mode
+                        .map_or(Value::Null, |mode| Value::Text(mode.to_string())),
+                ],
+            )
+            .await?;
+        if affected == 0 {
+            bail!(
+                "no prov_activity row '{activity_id}' to record decoding parameters on — \
+                 record_activity must run first"
+            );
+        }
         Ok(())
     }
 
@@ -3979,6 +4043,97 @@ mod tests {
             .ok()
             .and_then(|v| v.as_real().copied())
             .unwrap_or(f64::NAN)
+    }
+
+    /// The reproducibility record lands on the SAME activity row
+    /// `record_activity` wrote — seed, temperature and decoding mode read
+    /// back exactly, NULLs stay NULL (a backend with no knobs must never
+    /// gain invented defaults), and recording against an activity that was
+    /// never recorded is a loud error, not a silent no-op.
+    #[tokio::test]
+    async fn activity_decoding_round_trips_on_the_activity_row() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        store.record_activity(&prov).await.unwrap();
+
+        store
+            .record_activity_decoding(
+                &prov.activity_id,
+                &ActivityDecoding {
+                    seed: Some(42),
+                    temperature: Some(0.0),
+                    mode: Some("json_schema"),
+                },
+            )
+            .await
+            .unwrap();
+
+        let seed = count(
+            &store,
+            "SELECT seed FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert_eq!(seed, 42);
+        let temperature = query_f64(
+            &store,
+            "SELECT temperature FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert!(temperature.abs() < f64::EPSILON, "{temperature}");
+        let mode = query_str(
+            &store,
+            "SELECT decoding FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert_eq!(mode, "json_schema");
+        // The model id it is attributable alongside was already there.
+        let agent = query_str(
+            &store,
+            "SELECT agent_id FROM prov_activity WHERE id = 'act_test_1'",
+        )
+        .await;
+        assert_eq!(agent, "gemma-4-12b");
+
+        // Honest NULLs for a knob-less backend.
+        let bare = prov_from("doc:other", "act_test_2");
+        store.record_activity(&bare).await.unwrap();
+        store
+            .record_activity_decoding(
+                &bare.activity_id,
+                &ActivityDecoding {
+                    seed: None,
+                    temperature: None,
+                    mode: Some("prompt_only"),
+                },
+            )
+            .await
+            .unwrap();
+        let nulls = count(
+            &store,
+            "SELECT COUNT(*) FROM prov_activity \
+             WHERE id = 'act_test_2' AND seed IS NULL AND temperature IS NULL \
+             AND decoding = 'prompt_only'",
+        )
+        .await;
+        assert_eq!(nulls, 1);
+
+        // A phantom activity id is refused loudly.
+        let err = store
+            .record_activity_decoding(
+                "act_never_recorded",
+                &ActivityDecoding {
+                    seed: Some(1),
+                    temperature: Some(0.0),
+                    mode: Some("json_schema"),
+                },
+            )
+            .await
+            .expect_err("recording decoding on a never-recorded activity must fail");
+        assert!(
+            format!("{err:#}").contains("record_activity must run first"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
