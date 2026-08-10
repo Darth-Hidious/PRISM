@@ -310,6 +310,22 @@ fn default_store_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"))
 }
 
+// `test-guard` is an ordinary PUBLIC cargo feature, so nothing about the
+// self dev-dependency stops `cargo build --release --all-features` from
+// switching the abort path on. Refuse to compile instead: a build that would
+// ship `process::abort()` into a user's `prism` must fail loudly at build
+// time, not surprise someone at runtime. `cargo test --release` is caught by
+// the same rule, which is the intended trade — the guard exists to protect a
+// developer's live store, and debug is where the suite runs.
+#[cfg(all(feature = "test-guard", not(debug_assertions)))]
+compile_error!(
+    "prism-agent: the `test-guard` feature aborts the process on a default \
+     store-path resolution and must never be compiled into a release build. \
+     It is armed automatically for test targets by the self dev-dependency; \
+     do not enable it by hand, and do not use --all-features on a release \
+     build."
+);
+
 /// `test-guard` build (every test target of this crate, via the self
 /// dev-dependency; never a production build): resolving the default path
 /// means test code was about to open the user's LIVE provenance store.
