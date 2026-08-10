@@ -1124,6 +1124,10 @@ mod tests {
                     to: (*t).into(),
                     weight: None,
                     order: None,
+                    // Composition links, not measurements: the per-edge value
+                    // and unit channel belongs to HAS_PROPERTY.
+                    value: None,
+                    unit: None,
                 })
                 .collect(),
         };
