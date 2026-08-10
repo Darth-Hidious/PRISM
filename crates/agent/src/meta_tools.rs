@@ -176,10 +176,12 @@ pub fn definitions() -> Vec<LoadedTool> {
             name: "recall".to_string(),
             description: "Retrieve earlier tool results from durable memory. Pass \
                 `id` to fetch one specific result (e.g. the id printed when a large \
-                result was truncated), or `query` to search this session's past \
-                tool calls semantically (by meaning, when the local embedding \
-                model is available) plus by keyword. Use this instead of \
-                re-running a tool whose output you already produced but no \
+                result was truncated), or `query` to search past tool calls \
+                semantically (by meaning, when the local embedding model is \
+                available) plus by keyword. Searches default to the current \
+                session; pass `session_id` for another session or set \
+                `all_sessions` to true to search all sessions. Use this instead \
+                of re-running a tool whose output you already produced but no \
                 longer have in context."
                 .to_string(),
             input_schema: json!({
@@ -187,15 +189,27 @@ pub fn definitions() -> Vec<LoadedTool> {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Exact provenance record id to fetch in full."
+                        "description": "Exact provenance record id to fetch in full; pass its session_id for a result from another session."
                     },
                     "query": {
                         "type": "string",
-                        "description": "Search this session's past tool calls by meaning and keyword."
+                        "description": "Search past tool calls by meaning and keyword."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional session to scope to (defaults to the current session)."
+                    },
+                    // A typed boolean is less error-prone for a model than a
+                    // magic session id such as "*", and cannot collide with a
+                    // legitimate session name.
+                    "all_sessions": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Search across all sessions when using `query`; cannot be combined with `session_id`."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max matches for a keyword search (default 5)."
+                        "description": "Max matches to return (default 5)."
                     }
                 }
             }),
@@ -608,6 +622,21 @@ async fn recall_with_backend(
         return Ok(json!({ "error": "durable memory is unavailable in this session" }));
     };
 
+    let requested_session_id = args
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let all_sessions = args
+        .get("all_sessions")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if all_sessions && requested_session_id.is_some() {
+        return Ok(json!({
+            "error": "`all_sessions` cannot be combined with `session_id`"
+        }));
+    }
+
     // Exact id lookup wins when present.
     if let Some(id) = args
         .get("id")
@@ -615,9 +644,16 @@ async fn recall_with_backend(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        // `query_chain` starts at `id` and walks parents within this session;
-        // the record itself is included, so find it in the returned chain.
-        let chain = store.query_chain(id, session_id).await?;
+        if all_sessions {
+            return Ok(json!({
+                "error": "`all_sessions` is only valid with `query`; pass `session_id` to fetch an id from another session"
+            }));
+        }
+        // `query_chain` starts at `id` and walks parents within the selected
+        // session; the record itself is included, so find it in the chain.
+        let chain = store
+            .query_chain(id, requested_session_id.unwrap_or(session_id))
+            .await?;
         return Ok(match chain.into_iter().find(|r| r.id == id) {
             Some(rec) => json!({
                 "id": rec.id,
@@ -649,6 +685,11 @@ async fn recall_with_backend(
 
     let mut matches = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let search_session_id = if all_sessions {
+        None
+    } else {
+        Some(requested_session_id.unwrap_or(session_id))
+    };
 
     // Semantic pass first — matches by meaning, no shared substring needed.
     // Best-effort: any failure just leaves the keyword pass to fill in.
@@ -657,7 +698,7 @@ async fn recall_with_backend(
             Ok(vectors) => {
                 if let Some(query_vec) = vectors.first() {
                     match store
-                        .semantic_search(query_vec, Some(session_id), limit)
+                        .semantic_search(query_vec, search_session_id, limit)
                         .await
                     {
                         Ok(hits) => {
@@ -671,14 +712,18 @@ async fn recall_with_backend(
                                     .map(ToString::to_string)
                                     .unwrap_or_default();
                                 seen.insert(rec.id.clone());
-                                matches.push(json!({
+                                let mut hit = json!({
                                     "id": rec.id,
                                     "tool_name": rec.tool_name,
                                     "preview": clip_str(&output_str, RECALL_PREVIEW_CHARS),
                                     "status": rec.status,
                                     "exit_code": rec.exit_code,
                                     "score": format!("{score:.3}"),
-                                }));
+                                });
+                                if all_sessions {
+                                    hit["session_id"] = json!(rec.session_id);
+                                }
+                                matches.push(hit);
                             }
                         }
                         Err(e) => tracing::debug!("semantic recall failed: {e:#}"),
@@ -689,10 +734,13 @@ async fn recall_with_backend(
         }
     }
 
-    // Newest-first keyword scan over this session's persisted tool calls —
-    // fills remaining slots; the only pass when no embed backend is ready.
+    // Newest-first keyword scan over the same scope as semantic search — fills
+    // remaining slots; the only pass when no embed backend is ready.
     let needle = query.to_lowercase();
-    let records = store.query_by_session(session_id).await?;
+    let records = match search_session_id {
+        Some(sid) => store.query_by_session(sid).await?,
+        None => store.query_all().await?,
+    };
     for rec in records.into_iter().rev() {
         if matches.len() >= limit {
             break;
@@ -713,13 +761,17 @@ async fn recall_with_backend(
         )
         .to_lowercase();
         if haystack.contains(&needle) {
-            matches.push(json!({
+            let mut hit = json!({
                 "id": rec.id,
                 "tool_name": rec.tool_name,
                 "preview": clip_str(&output_str, RECALL_PREVIEW_CHARS),
                 "status": rec.status,
                 "exit_code": rec.exit_code,
-            }));
+            });
+            if all_sessions {
+                hit["session_id"] = json!(rec.session_id);
+            }
+            matches.push(hit);
         }
     }
     matches.truncate(limit);
@@ -728,7 +780,11 @@ async fn recall_with_backend(
         "query": query,
         "count": matches.len(),
         "matches": matches,
-        "hint": "call recall with a returned id to get that result's full output",
+        "hint": if all_sessions || requested_session_id.is_some() {
+            "call recall with a returned id and session_id to get that result's full output"
+        } else {
+            "call recall with a returned id to get that result's full output"
+        },
     }))
 }
 
@@ -858,6 +914,36 @@ mod tests {
         r2.output_json = Some(json!("a\nb"));
         store.record(&r2).await.unwrap();
         (store, r1.id)
+    }
+
+    async fn cross_session_seeded_store() -> (ProvenanceStore, Vec<String>) {
+        let store = ProvenanceStore::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for session in ["sess-current", "sess-other", "sess-third"] {
+            let mut rec = new_record(
+                session,
+                ActionType::ToolCall,
+                Actor::Agent,
+                Some("file"),
+                None,
+                json!({ "alloy": "Ti-6Al-4V" }),
+            );
+            rec.output_json = Some(json!(format!("shared brief marker for {session}")));
+            store.record(&rec).await.unwrap();
+            ids.push(rec.id);
+        }
+        (store, ids)
+    }
+
+    fn recall_match_ids(output: &Value) -> Vec<String> {
+        output["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_string())
+            .collect()
     }
 
     #[test]
@@ -996,6 +1082,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recall_definition_exposes_session_scopes() {
+        let recall = definitions()
+            .into_iter()
+            .find(|tool| tool.name == "recall")
+            .unwrap();
+        let properties = &recall.input_schema["properties"];
+
+        assert_eq!(properties["session_id"]["type"], json!("string"));
+        assert_eq!(
+            properties["session_id"]["description"],
+            json!("Optional session to scope to (defaults to the current session).")
+        );
+        assert_eq!(properties["all_sessions"]["type"], json!("boolean"));
+        assert_eq!(properties["all_sessions"]["default"], json!(false));
+        assert!(
+            recall.description.contains("all sessions"),
+            "the model-facing description must advertise cross-session recall"
+        );
+        assert!(
+            !recall.description.contains("this session's"),
+            "the description must not claim recall is current-session-only"
+        );
+    }
+
     fn catalog_with(names_and_descs: &[(&str, &str)]) -> ToolCatalog {
         let tools: Vec<Value> = names_and_descs
             .iter()
@@ -1088,6 +1199,99 @@ mod tests {
             .unwrap();
         assert_eq!(out["count"], json!(1));
         assert_eq!(out["matches"][0]["tool_name"], json!("file"));
+    }
+
+    #[tokio::test]
+    async fn recall_scopes_dispatch_through_execute_meta_tool() {
+        let (store, ids) = cross_session_seeded_store().await;
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+
+        let current = execute_meta_tool(
+            "recall",
+            &json!({ "query": "shared brief marker" }),
+            Some(&store),
+            "sess-current",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recall_match_ids(&current), vec![ids[0].clone()]);
+        assert!(
+            current["matches"][0].get("session_id").is_none(),
+            "the default result shape remains unchanged"
+        );
+        assert_eq!(
+            current["hint"],
+            json!("call recall with a returned id to get that result's full output")
+        );
+
+        let other = execute_meta_tool(
+            "recall",
+            &json!({ "query": "shared brief marker", "session_id": "sess-other" }),
+            Some(&store),
+            "sess-current",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recall_match_ids(&other), vec![ids[1].clone()]);
+
+        let all = execute_meta_tool(
+            "recall",
+            &json!({ "query": "shared brief marker", "all_sessions": true }),
+            Some(&store),
+            "sess-current",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        let mut actual = recall_match_ids(&all);
+        actual.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(actual, expected);
+
+        // A cross-session hit remains fetchable in full through the same
+        // dispatcher when its returned session_id is passed back.
+        let returned_other_session = all["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(ids[1].as_str()))
+            .and_then(|entry| entry["session_id"].as_str())
+            .expect("all-session hits must identify their source session")
+            .to_string();
+        assert_eq!(returned_other_session, "sess-other");
+        let fetched = execute_meta_tool(
+            "recall",
+            &json!({ "id": ids[1], "session_id": returned_other_session }),
+            Some(&store),
+            "sess-current",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched["id"], json!(ids[1]));
+
+        let ambiguous = execute_meta_tool(
+            "recall",
+            &json!({
+                "query": "shared brief marker",
+                "session_id": "sess-other",
+                "all_sessions": true
+            }),
+            Some(&store),
+            "sess-current",
+            &catalog,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ambiguous["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be combined")
+        );
     }
 
     #[tokio::test]
@@ -1195,6 +1399,57 @@ mod tests {
         fn id(&self) -> &str {
             "test:titanium-axis"
         }
+    }
+
+    /// This specifically guards the store call site: changing
+    /// `semantic_search(..., search_session_id, ...)` back to
+    /// `semantic_search(..., Some(session_id), ...)` makes the explicit and
+    /// all-session assertions fail. The query has no keyword overlap, so the
+    /// fallback scan cannot mask a disconnected semantic scope.
+    #[tokio::test]
+    async fn recall_semantic_search_honors_resolved_session_scope() {
+        let (store, ids) = cross_session_seeded_store().await;
+        let backend = TitaniumAxis;
+        for rec in store.query_all().await.unwrap() {
+            store
+                .embed_and_store(&rec.id, &prism_provenance::embedding_text(&rec), &backend)
+                .await
+                .unwrap();
+        }
+
+        let current = recall_with_backend(
+            &json!({ "query": "titanium" }),
+            Some(&store),
+            "sess-current",
+            Some(&backend),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recall_match_ids(&current), vec![ids[0].clone()]);
+
+        let other = recall_with_backend(
+            &json!({ "query": "titanium", "session_id": "sess-other" }),
+            Some(&store),
+            "sess-current",
+            Some(&backend),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recall_match_ids(&other), vec![ids[1].clone()]);
+
+        let all = recall_with_backend(
+            &json!({ "query": "titanium", "all_sessions": true }),
+            Some(&store),
+            "sess-current",
+            Some(&backend),
+        )
+        .await
+        .unwrap();
+        let mut actual = recall_match_ids(&all);
+        actual.sort();
+        let mut expected = ids;
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

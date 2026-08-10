@@ -1698,7 +1698,7 @@ pub async fn run_turn(
                         // Open the same Turso store the provenance hook writes to.
                         let db_path = crate::hooks::provenance_db_path();
                         let store = prism_provenance::ProvenanceStore::open(&db_path).await.ok();
-                        // Real session id so `recall` scopes to THIS session
+                        // Real session id supplies `recall`'s default scope
                         // instead of the pre-fix literal "session" bucket.
                         let session_id = crate::hooks::provenance_session_id();
                         crate::meta_tools::execute_meta_tool(

@@ -381,6 +381,23 @@ impl ProvenanceStore {
         Ok(records)
     }
 
+    /// Return records from every session, oldest first.
+    ///
+    /// This materializes the store-wide scope for an explicitly requested
+    /// cross-session keyword scan; callers should not use it as a default.
+    pub async fn query_all(&self) -> Result<Vec<ProvenanceRecord>> {
+        let mut rows = self
+            .conn
+            .query("SELECT * FROM provenance_records ORDER BY timestamp", ())
+            .await?;
+
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await? {
+            records.push(row_to_record(&row)?);
+        }
+        Ok(records)
+    }
+
     pub async fn query_by_material(&self, material_ref: &str) -> Result<Vec<ProvenanceRecord>> {
         let mut rows = self
             .conn
@@ -399,10 +416,10 @@ impl ProvenanceStore {
 
     /// Return a record's parent chain without crossing a session boundary.
     ///
-    /// The session is caller-provided context established by the authenticated
-    /// agent/session path; the record id alone is not an authorization proof.
-    /// A missing record in that session returns an empty chain, so an id from a
-    /// different session is indistinguishable from an unknown id.
+    /// The session is caller-provided scope; the record id alone never crosses
+    /// that boundary. A missing record in the selected session returns an empty
+    /// chain, so an id from a different session is indistinguishable from an
+    /// unknown id.
     pub async fn query_chain(
         &self,
         record_id: &str,
@@ -466,7 +483,9 @@ impl ProvenanceStore {
         Ok(())
     }
 
-    /// Brute-force cosine search over stored vectors (fine at session scale).
+    /// Brute-force cosine search over stored vectors in the selected scope.
+    /// `None` selects every session and can be slower than the default scoped
+    /// search.
     /// Returns up to `limit` records scored in `[-1, 1]`, best first.
     /// Vectors whose dimensionality differs from the query (mixed models)
     /// are skipped.
