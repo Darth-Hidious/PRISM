@@ -50,6 +50,69 @@ const UNIT_SPELLINGS: &[(&str, &str)] = &[
     ("n/a", "QUDT:UNITLESS"),
     ("-", "QUDT:UNITLESS"),
     ("1", "QUDT:UNITLESS"),
+    // Rate / time
+    ("/s", "QUDT:PER-SEC"),
+    ("1/s", "QUDT:PER-SEC"),
+    ("s-1", "QUDT:PER-SEC"),
+    ("persec", "QUDT:PER-SEC"),
+    ("s", "QUDT:SEC"),
+    ("sec", "QUDT:SEC"),
+    ("second", "QUDT:SEC"),
+    ("min", "QUDT:MIN"),
+    ("h", "QUDT:HR"),
+    ("hr", "QUDT:HR"),
+    ("hour", "QUDT:HR"),
+    // Speed — LPBF scan speeds live here
+    ("mm/s", "QUDT:MilliM-PER-SEC"),
+    ("m/s", "QUDT:M-PER-SEC"),
+    // Force / power / electrical
+    ("n", "QUDT:N"),
+    ("newton", "QUDT:N"),
+    ("kn", "QUDT:KiloN"),
+    ("w", "QUDT:W"),
+    ("watt", "QUDT:W"),
+    ("kw", "QUDT:KiloW"),
+    ("v", "QUDT:V"),
+    ("volt", "QUDT:V"),
+    ("kv", "QUDT:KiloV"),
+    ("a", "QUDT:A"),
+    ("ka", "QUDT:KiloA"),
+    ("ampere", "QUDT:A"),
+    // Mass / amount
+    ("g", "QUDT:GM"),
+    ("gram", "QUDT:GM"),
+    ("kg", "QUDT:KiloGM"),
+    ("mg", "QUDT:MilliGM"),
+    ("mol", "QUDT:MOL"),
+    // Length
+    ("m", "QUDT:M"),
+    ("metre", "QUDT:M"),
+    ("meter", "QUDT:M"),
+    ("mm", "QUDT:MilliM"),
+    ("millimetre", "QUDT:MilliM"),
+    ("millimeter", "QUDT:MilliM"),
+    ("um", "QUDT:MicroM"),
+    ("micron", "QUDT:MicroM"),
+    ("micrometre", "QUDT:MicroM"),
+    ("micrometer", "QUDT:MicroM"),
+    ("nm", "QUDT:NanoM"),
+    ("nanometre", "QUDT:NanoM"),
+    ("nanometer", "QUDT:NanoM"),
+    // Energy per mass, molar mass, frequency, charge density
+    ("j/g", "QUDT:J-PER-GM"),
+    ("jperg", "QUDT:J-PER-GM"),
+    ("g/mol", "QUDT:GM-PER-MOL"),
+    ("hz", "QUDT:HZ"),
+    ("hertz", "QUDT:HZ"),
+    ("c/m2", "QUDT:C-PER-M2"),
+    // Electric field strength — the HV-insulation workhorses
+    ("kv/mm", "QUDT:KiloV-PER-MilliM"),
+    ("mv/m", "QUDT:MegaV-PER-M"),
+    ("v/m", "QUDT:V-PER-M"),
+    // Transport
+    ("w/mk", "QUDT:W-PER-M-K"),
+    ("s/m", "QUDT:S-PER-M"),
+    ("ohmm", "QUDT:OHM-M"),
     // Pressure / stress / elastic moduli
     ("pa", "QUDT:PA"),
     ("pascal", "QUDT:PA"),
@@ -115,10 +178,28 @@ pub fn resolve_unit(raw: &str) -> Option<QudtUnit> {
         if let Some(unit) = lookup(local) {
             return Some(unit);
         }
-        return QudtUnit::new(raw).ok();
+        // A `QUDT:` PREFIX IS NOT A QUDT IDENTIFIER. Passing an unknown local
+        // name through meant the gate only ever caught bare spellings, and the
+        // extraction prompt instructs the model to always write the prefix —
+        // so compliance BYPASSED the check. Measured in a live store:
+        // `QUDT:UM` (the real name is `MicroM`, and it arrived because
+        // `Ra = 0.025 µm` lost its µ), `QUDT:HRC` (Rockwell C is not a QUDT
+        // unit at all), and `QUDT:nm` alongside `QUDT:Nanometer` — one unit
+        // under two identities, in the store whose whole purpose is one
+        // identity per unit. Meanwhile the user was told any unresolvable
+        // unit had been dropped.
+        return KNOWN_IDENTIFIERS
+            .contains(&raw)
+            .then(|| QudtUnit::new(raw).expect("KNOWN_IDENTIFIERS holds valid identifiers"));
     }
     lookup(raw)
 }
+
+/// Every identifier the spelling table can produce — the set a `QUDT:` value
+/// is checked against. Derived from `UNIT_SPELLINGS` so the two cannot drift:
+/// adding a spelling adds its identifier automatically.
+static KNOWN_IDENTIFIERS: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| UNIT_SPELLINGS.iter().map(|(_, id)| *id).collect());
 
 /// Table lookup under [`fold`]ing. The identifiers in the table are known
 /// valid, so construction cannot fail.
@@ -253,11 +334,36 @@ mod tests {
         assert_eq!(resolve_unit("QUDT:MPa").unwrap().as_str(), "QUDT:MegaPA");
         assert_eq!(resolve_unit("QUDT:GPa").unwrap().as_str(), "QUDT:GigaPA");
         assert_eq!(resolve_unit("QUDT:kelvin").unwrap().as_str(), "QUDT:K");
-        // Unknown local name: passthrough, not rejection — QUDT's
-        // identifier space stays open.
+        // An unknown local name is REFUSED. This reverses an earlier
+        // decision to pass it through ("QUDT's identifier space stays
+        // open"), because the open space was measured in a live store and
+        // it was carrying wrong data: `QUDT:UM` (the identifier is `MicroM`,
+        // and it arrived because `Ra = 0.025 µm` had lost its µ),
+        // `QUDT:HRC` (Rockwell C is not a QUDT unit at all), and `QUDT:nm`
+        // sitting beside `QUDT:Nanometer` — one unit under two identities.
+        // A prefix is not a namespace check, and the ingest log meanwhile
+        // told users that any unresolvable unit had been dropped.
+        //
+        // The cost is real and accepted: a genuine QUDT unit absent from the
+        // table is refused until it is added. A refused fact is reported
+        // with its reason; a wrongly-typed number is not.
+        assert!(resolve_unit("QUDT:N-PER-M2").is_none());
+        // Rockwell C is a real hardness scale and NOT a QUDT unit; refused
+        // rather than stored under an identifier that does not exist.
+        assert!(resolve_unit("QUDT:HRC").is_none());
+        assert!(resolve_unit("QUDT:Furlong").is_none());
+        // A KNOWN spelling wearing the prefix is canonicalised, not refused —
+        // `QUDT:UM` means micrometre and now lands on the one identifier for
+        // it instead of being stored as its own unit.
+        assert_eq!(resolve_unit("QUDT:UM").unwrap().as_str(), "QUDT:MicroM");
+        // …and the spelling that MEANS micrometre still resolves, to the
+        // one identifier QUDT actually uses.
+        assert_eq!(resolve_unit("um").unwrap().as_str(), "QUDT:MicroM");
+        assert_eq!(resolve_unit("µm").unwrap().as_str(), "QUDT:MicroM");
+        assert_eq!(resolve_unit("nm").unwrap().as_str(), "QUDT:NanoM");
         assert_eq!(
-            resolve_unit("QUDT:N-PER-M2").unwrap().as_str(),
-            "QUDT:N-PER-M2"
+            resolve_unit("QUDT:Nanometer").unwrap().as_str(),
+            "QUDT:NanoM"
         );
     }
 

@@ -134,8 +134,19 @@ fn retain_grounded(
                 // sentence reading "Alloy A had a UTS of 950 MPa" otherwise
                 // supports the fabricated fact "Alloy B has_measurement UTS
                 // 950", because `UTS` and `950` alone satisfy the object arm.
-                Some(_) => {
+                // The subject and the VALUE must sit in the SAME span.
+                //
+                // Requiring only "subject somewhere in the document" plus "a
+                // span holding the value" is what a comparison table defeats:
+                // blind grading of a polymer tribology paper returned 19/23,
+                // and all four failures were the same shape — a real number
+                // from the paper attached to the wrong material. `0.19` was
+                // another author's reinforced-polymer result, and `-0.22` was
+                // a LOAD EXPONENT read as a friction coefficient. Both are
+                // grounded; neither is true.
+                Some(value) => {
                     subject_appears(&fact.subject, text)
+                        && value_shares_a_span_with_subject(&fact.subject, value, text)
                         && prism_retrieval::claims::supporting_quote(
                             &fact.subject,
                             &fact.object,
@@ -207,6 +218,78 @@ fn unwrap_soft_line_breaks(text: &str) -> String {
             out.push_str(trimmed);
         }
     }
+    out
+}
+
+/// Whether some sentence or table row carries BOTH the subject and the value.
+///
+/// Co-occurrence in one span is the weakest evidence of attribution that is
+/// still evidence. It does not prove the pairing (a dense table row can hold
+/// several materials), but it removes the failure that dominates blind
+/// grading: a number lifted from elsewhere in the document and attached to a
+/// material that is merely mentioned nearby.
+///
+/// Spans are lines and sentences, matching how the claims span-finder cuts
+/// text, and the number is matched on its rendered forms so `1.2` is found in
+/// `1.20` and in `1,2` — a true fact must not drop on formatting.
+fn value_shares_a_span_with_subject(subject: &str, value: f64, text: &str) -> bool {
+    let subject = subject.trim().to_lowercase();
+    if subject.is_empty() {
+        return false;
+    }
+    let renderings = value_renderings(value);
+    text.lines().flat_map(sentence_spans).any(|span| {
+        let lower = span.to_lowercase();
+        lower.contains(&subject) && renderings.iter().any(|r| lower.contains(r.as_str()))
+    })
+}
+
+/// Split one line into sentence spans WITHOUT breaking on a decimal point.
+///
+/// Splitting naively on `.` cuts `1.2` into `1` and `2`, so the value can
+/// never be found in the span that states it — the check silently rejects
+/// every decimal measurement, which is most of them.
+fn sentence_spans(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        let decimal_point = *b == b'.'
+            && i > 0
+            && i + 1 < bytes.len()
+            && bytes[i - 1].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit();
+        if matches!(b, b'.' | b';' | b'!' | b'?') && !decimal_point {
+            spans.push(&line[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < line.len() {
+        spans.push(&line[start..]);
+    }
+    spans
+}
+
+/// The strings a number may legitimately be printed as.
+fn value_renderings(value: f64) -> Vec<String> {
+    let mut out = Vec::new();
+    let plain = format!("{value}");
+    out.push(plain.clone());
+    // Trailing-zero forms: 1.2 is printed 1.20, 1.200.
+    if let Some((int, frac)) = plain.split_once('.') {
+        for extra in 1..=2 {
+            out.push(format!("{int}.{frac}{}", "0".repeat(extra)));
+        }
+    } else {
+        out.push(format!("{plain}.0"));
+    }
+    // Decimal comma, as used across most of Europe.
+    out.extend(
+        out.clone()
+            .into_iter()
+            .filter(|r| r.contains('.'))
+            .map(|r| r.replace('.', ",")),
+    );
     out
 }
 
@@ -499,6 +582,73 @@ fn extract_json_block(raw: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// The misattribution the first blind grading found: a real number from
+    /// the paper attached to the wrong material. All four failures of 23 had
+    /// this shape, including a LOAD EXPONENT read as a friction coefficient.
+    #[test]
+    fn a_value_from_another_materials_row_is_not_attributed_here() {
+        let source = "Lancaster reported a friction coefficient of 0.19 for reinforced \
+                      polymers under dry sliding conditions.\n\
+                      The polyamide/metal couple was examined separately in this work \
+                      and showed markedly different behaviour across the load range.";
+        let misattributed = MaterialFact {
+            subject: "polyamide/metal".into(),
+            predicate: "has_measurement".into(),
+            object: "friction coefficient".into(),
+            value: Some(0.19),
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: Default::default(),
+        };
+        let mut dropped = Vec::new();
+        assert!(
+            retain_grounded(vec![misattributed], source, &mut dropped).is_empty(),
+            "a value stated for ANOTHER material must not attach to this one",
+        );
+
+        // The same number, in the same span as its own subject, survives.
+        let attributed = "The polyamide/metal couple showed a friction coefficient of 0.19 \
+                          under dry sliding at room temperature in these experiments.";
+        let real = MaterialFact {
+            subject: "polyamide/metal".into(),
+            predicate: "has_measurement".into(),
+            object: "friction coefficient".into(),
+            value: Some(0.19),
+            unit: None,
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: Default::default(),
+        };
+        let mut kept = Vec::new();
+        assert_eq!(
+            retain_grounded(vec![real], attributed, &mut kept).len(),
+            1,
+            "a correctly attributed value must survive: {kept:?}",
+        );
+    }
+
+    /// Formatting must not cost a true fact: 1.2 is printed 1.20 and 1,2.
+    #[test]
+    fn a_value_is_found_under_its_printed_forms() {
+        for printed in ["1.2", "1.20", "1,2"] {
+            let source = format!(
+                "The PEEK specimen reached a tensile modulus of {printed} GPa in these tests."
+            );
+            assert!(
+                value_shares_a_span_with_subject("PEEK", 1.2, &source),
+                "{printed} must be recognised as 1.2",
+            );
+        }
+        assert!(!value_shares_a_span_with_subject(
+            "PEEK",
+            9.9,
+            "PEEK reached 1.2 GPa"
+        ));
+    }
 
     /// A dimensionless quantity is not a MISSING unit — it is a specific one.
     /// Measured on a polymer tribology paper: 33 of 74 extracted facts were
