@@ -2147,9 +2147,15 @@ impl ProvenanceStore {
     ///
     /// @req REQ-OWL-1.4 - Persist canonical class identity without re-keying.
     /// @req REQ-OWL-1.5 - Record version IRI and artifact SHA transactionally.
-    pub async fn write_classified_fact_with_evidence(
+    /// Generic over [`FactPayload`] like its sibling
+    /// [`Self::write_fact_with_classification`]: the underlying
+    /// `write_fact_as` always was, and pinning this one to `LocalFact` only
+    /// meant the DOCUMENT path (which carries `MaterialFact`) could not reach
+    /// the classified write at all, and silently fell back to the default
+    /// `Matter` label for every subject it stored.
+    pub async fn write_classified_fact_with_evidence<F: FactPayload>(
         &self,
-        fact: &LocalFact,
+        fact: &F,
         prov: &LocalProvenance,
         evidence_class: EvidenceClass,
         nodes: ClassifiedFactNodes<'_>,

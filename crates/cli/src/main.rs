@@ -6649,6 +6649,45 @@ async fn run_platform_ingest_file(
     }))
 }
 
+/// Classify a chunk's entities, using whatever prior corpus is already loaded.
+///
+/// The prior is looked up in the store's own graph — `local@matkg` when MatKG
+/// has been loaded (`prism matkg load`), nothing otherwise. Absence is not an
+/// error: with no prior the model classifies unaided, which it does well; the
+/// prior's job is to supply corpus evidence the model can weigh and, where the
+/// corpus is wrong, override.
+async fn classify_ingested_entities(
+    store: &prism_provenance::ProvenanceStore,
+    llm: &prism_ingest::llm::LlmClient,
+    ontology: &dyn prism_ingest::ontologies::Ontology,
+    names: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, prism_ingest::classify::EntityClass>> {
+    // The prior tenant is DERIVED from the ontology registry, never spelled
+    // out here, so a renamed or replaced prior ontology cannot leave this
+    // lookup pointing at a tenant nothing writes to.
+    let tenant = prism_ingest::ontologies::storage_tenant(
+        prism_provenance::LOCAL_TENANT,
+        prism_ingest::ontologies::MATKG_ONTOLOGY_ID,
+    );
+    let prior = prism_ingest::classify::GraphPrior::fetch(store, &tenant, names).await;
+    let prior = match prior {
+        Ok(prior) => Some(prior),
+        Err(error) => {
+            tracing::debug!(%error, "no class prior available");
+            None
+        }
+    };
+    prism_ingest::classify::classify_entities(
+        llm,
+        ontology,
+        names,
+        prior
+            .as_ref()
+            .map(|p| p as &dyn prism_ingest::classify::ClassPrior),
+    )
+    .await
+}
+
 /// Make the vision document reader available for this process, if a model is
 /// configured at all.
 ///
@@ -6972,13 +7011,75 @@ async fn run_local_text_ingest_file(
         peer_echoes.extend(echoes);
         peer_echo_check_errors.extend(check_errors);
 
+        // Ask the model what each entity IS, before writing any of them.
+        //
+        // Without this every subject is written under the store's default
+        // `Matter` (`EntityWrite::legacy`), which recorded `Laser Powder Bed
+        // Fusion` as a MATERIAL in a real NASA rocket-engine ingest. The
+        // tabular and MatKG paths have always classified their entities; this
+        // is the document path joining them.
+        //
+        // ONE call for the chunk's distinct names, informed by whatever prior
+        // corpus is loaded (MatKG under `local@matkg`). A classification
+        // failure is NOT fatal: the facts are still written under the
+        // established shape, exactly as before, and the reason is reported.
+        let names: Vec<String> = new_facts
+            .iter()
+            .flat_map(|f| [f.subject.clone(), f.object.clone()])
+            .collect();
+        let classes = classify_ingested_entities(&store, &llm, ontology.as_ref(), &names).await;
+        let classes = match classes {
+            Ok(classes) => classes,
+            Err(error) => {
+                eprintln!(
+                    "  Note: entity classification unavailable ({error:#}); facts are stored \
+                     under the default shape and their classes may be wrong."
+                );
+                Default::default()
+            }
+        };
+
         let mut chunk_written = 0usize;
         let mut write_error = None;
         for fact in new_facts {
-            match store
-                .write_fact_with_classification(&fact, &prov, classification)
-                .await
-            {
+            let nodes = classes
+                .get(&fact.subject)
+                .zip(classes.get(&fact.object))
+                .map(|(subject, object)| prism_provenance::ClassifiedFactNodes {
+                    subject: prism_provenance::ClassifiedNode {
+                        entity_type: &subject.entity_type,
+                        storage_label: &subject.storage_label,
+                        class_iri: &subject.class_iri,
+                    },
+                    object: prism_provenance::ClassifiedNode {
+                        entity_type: &object.entity_type,
+                        storage_label: &object.storage_label,
+                        class_iri: &object.class_iri,
+                    },
+                });
+            let write = match nodes {
+                // Both endpoints classified: the fact carries real classes.
+                Some(nodes) => {
+                    store
+                        .write_classified_fact_with_evidence(
+                            &fact,
+                            &prov,
+                            fact.evidence_class,
+                            nodes,
+                            classification,
+                        )
+                        .await
+                }
+                // Either endpoint unclassified — fall back rather than
+                // half-classify, so a fact's two endpoints never disagree
+                // about which vocabulary they were written under.
+                None => {
+                    store
+                        .write_fact_with_classification(&fact, &prov, classification)
+                        .await
+                }
+            };
+            match write {
                 Ok(()) => {
                     written_facts.push(fact);
                     chunk_written += 1;
