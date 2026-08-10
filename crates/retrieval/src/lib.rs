@@ -22,12 +22,14 @@ pub mod fulltext;
 pub mod http;
 pub mod model;
 pub mod ratelimit;
+pub mod relevance;
 pub mod sources;
 pub mod sweep;
 
 pub use engine::{EngineConfig, RetrievalEngine, default_cache_dir};
 pub use fulltext::{BlockKind, Fulltext, Locator, TextBlock};
 pub use model::{FulltextFormat, Paper, SearchOutcome, SourcePage, SourceStatus};
+pub use relevance::{OffTopicExample, RelevancePolicy, RelevanceReport, RelevanceStatus};
 pub use sources::{
     FailureKind, FetchCtx, Source, SourceCaps, SourceError, SourceId, SourceRegistry, all_sources,
 };

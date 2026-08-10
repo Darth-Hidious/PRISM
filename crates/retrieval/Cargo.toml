@@ -7,7 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-# Hard-offline policy. `get_with_retry` is this crate's only outbound call.
+# Hard-offline policy covers both source retrieval and embedding adapters.
+prism-embed = { path = "../embed" }
 prism-runtime = { path = "../runtime" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -29,3 +30,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 mockito = { workspace = true }
 tempfile = { workspace = true }
+wiremock = "0.6"
