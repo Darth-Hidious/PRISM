@@ -4307,13 +4307,20 @@ pub(crate) fn strip_platform_credentials(cmd: &mut TokioCommand) {
     // and write campaign checkpoints where the rest of PRISM expects them.
     // Empty values also stop the CLI's dotenv bootstrap from repopulating a
     // removed credential from a project .env file.
+    // Every platform setting under BOTH names. Listing the company-scoped
+    // spellings by hand meant the neutral names this codebase now tells
+    // operators to prefer (`PRISM_API_KEY`, `PRISM_TOKEN`,
+    // `PRISM_PLATFORM_URL`) were NOT stripped — so following the documented
+    // advice silently removed the credential boundary, and a live platform
+    // key reached an untrusted LocalOnly child. Derived from
+    // `PlatformVar::ALL` so a variable added there can never again be missed
+    // here.
+    for var in prism_runtime::platform_env::PlatformVar::ALL {
+        cmd.env(var.preferred, "");
+        cmd.env(var.alias, "");
+    }
     for key in [
-        "MARC27_API_KEY",
-        "MARC27_TOKEN",
-        "MARC27_API_TOKEN",
         "PRISM_LOGIN_TOKEN",
-        "MARC27_API_URL",
-        "MARC27_PROJECT_ID",
         // LLM/provider credentials are node-held credentials too. A
         // LocalOnly child may receive a caller-selected endpoint, so none of
         // these process credentials may cross that boundary.
@@ -5164,6 +5171,38 @@ pub fn to_definitions() -> Vec<ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A LocalOnly child must not inherit a platform credential under EITHER
+    /// spelling. The strip list was hand-written with only the company-scoped
+    /// names, so an operator who followed this codebase's own advice and moved
+    /// to `PRISM_API_KEY` lost the boundary silently — the credential reached
+    /// the untrusted child. Derived from `PlatformVar::ALL` now, and this test
+    /// is derived from it too, so a new variable cannot be added in one place
+    /// and forgotten in the other.
+    #[test]
+    fn local_only_strips_platform_credentials_under_both_names() {
+        let mut cmd = TokioCommand::new("true");
+        strip_platform_credentials(&mut cmd);
+        let cleared: std::collections::HashSet<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.map(|v| v.is_empty()).unwrap_or(false))
+            .map(|(key, _)| key.to_string_lossy().to_string())
+            .collect();
+
+        for var in prism_runtime::platform_env::PlatformVar::ALL {
+            assert!(
+                cleared.contains(var.preferred),
+                "preferred name {} must be stripped",
+                var.preferred,
+            );
+            assert!(
+                cleared.contains(var.alias),
+                "alias {} must be stripped",
+                var.alias,
+            );
+        }
+    }
     use super::*;
 
     #[tokio::test]
