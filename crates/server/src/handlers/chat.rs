@@ -150,6 +150,7 @@ pub async fn chat(
                 "session_id": outcome.session_id,
                 "answer": outcome.answer,
                 "approvals_required": outcome.approvals_required,
+                "context_priming": outcome.context_priming,
             }))
             .into_response(),
             Err(ChatError::SessionNotFound(sid)) => error_json(

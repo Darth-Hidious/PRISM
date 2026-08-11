@@ -805,6 +805,75 @@ fn routing_query(user_message: &str, history: &[ChatMessage]) -> String {
     q
 }
 
+#[allow(clippy::too_many_arguments)]
+fn iteration_messages(
+    system_prompt: &str,
+    task_block: Option<&str>,
+    capability_menu: Option<&str>,
+    discovery_prompt: Option<&str>,
+    session_memory: Option<&str>,
+    traj_steps: &[String],
+    history: &[ChatMessage],
+    selected_prompt: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some(system_prompt.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+    if let Some(block) = task_block {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(block.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    if let Some(menu) = capability_menu {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(menu.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    if let Some(skills_menu) = discovery_prompt {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(skills_menu.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    if let Some(memory) = session_memory {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(memory.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    if let Some(trajectory) = trajectory_block(traj_steps) {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(trajectory),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    messages.extend(history.iter().cloned());
+    if let Some(selection) = selected_prompt {
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(selection.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    messages
+}
+
 /// Given capability names in relevance order, produce the request tool list:
 /// selected defs + always-on meta-tools (recall + find_tools) + pinned tools,
 /// deduped, with FULL definitions so a discovered tool is actually callable.
@@ -992,6 +1061,33 @@ fn tier_to_core(
         .collect()
 }
 
+fn apply_tool_tier(
+    tools: Vec<ToolDefinition>,
+    pinned: &std::collections::HashSet<String>,
+    core_tools_only: bool,
+) -> Vec<ToolDefinition> {
+    if core_tools_only {
+        tier_to_core(tools, pinned)
+    } else {
+        tools
+    }
+}
+
+fn capability_menu_for_request(
+    catalog: &ToolCatalog,
+    relevant_tools: &[ToolDefinition],
+) -> Option<String> {
+    if !neural_tools_enabled() {
+        return None;
+    }
+    let included = relevant_tools
+        .iter()
+        .map(|definition| definition.function.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let entries = catalog_entries(catalog);
+    crate::capability::capability_menu(&entries, &included, 150, 80)
+}
+
 /// Keyword selection (fallback path): the catalog ranked by keyword match on
 /// `route`, filled until `token_budget` is spent, then meta-tools + pinned.
 fn assemble_request_tools(
@@ -1004,11 +1100,29 @@ fn assemble_request_tools(
     finalize_tools(catalog, &selected, pinned, token_budget)
 }
 
+struct RequestToolSelection {
+    definitions: Vec<ToolDefinition>,
+    applied: crate::influence::ToolSelectionMethod,
+}
+
+fn assemble_request_tools_with_status(
+    catalog: &ToolCatalog,
+    route: &str,
+    pinned: &std::collections::HashSet<String>,
+    token_budget: usize,
+) -> RequestToolSelection {
+    RequestToolSelection {
+        definitions: assemble_request_tools(catalog, route, pinned, token_budget),
+        applied: crate::influence::ToolSelectionMethod::Keyword,
+    }
+}
+
 /// Neural selection (`PRISM_NEURAL_TOOLS`): embedding retrieval over the
 /// capability index ranks the WHOLE catalog for `route`; the token budget then
 /// decides how far down that ranking the request can afford to go. Falls back
 /// to keyword selection when retrieval yields nothing (no embeddings ready /
 /// backend error) — so it can never do worse than today.
+#[cfg(test)]
 async fn assemble_request_tools_neural(
     catalog: &ToolCatalog,
     route: &str,
@@ -1016,6 +1130,18 @@ async fn assemble_request_tools_neural(
     token_budget: usize,
     backend: &dyn EmbedBackend,
 ) -> Vec<ToolDefinition> {
+    assemble_request_tools_neural_with_status(catalog, route, pinned, token_budget, backend)
+        .await
+        .definitions
+}
+
+async fn assemble_request_tools_neural_with_status(
+    catalog: &ToolCatalog,
+    route: &str,
+    pinned: &std::collections::HashSet<String>,
+    token_budget: usize,
+    backend: &dyn EmbedBackend,
+) -> RequestToolSelection {
     let entries: Vec<(String, String)> = catalog
         .iter()
         .map(|t| (t.name.clone(), format!("{}: {}", t.name, t.description)))
@@ -1026,13 +1152,16 @@ async fn assemble_request_tools_neural(
         tracing::debug!(
             "tool selection: neural retrieval empty (embeddings not ready) — keyword fallback"
         );
-        return assemble_request_tools(catalog, route, pinned, token_budget);
+        return assemble_request_tools_with_status(catalog, route, pinned, token_budget);
     }
     tracing::debug!(
         retrieved = selected.len(),
         "tool selection: neural embedding retrieval used"
     );
-    finalize_tools(catalog, &selected, pinned, token_budget)
+    RequestToolSelection {
+        definitions: finalize_tools(catalog, &selected, pinned, token_budget),
+        applied: crate::influence::ToolSelectionMethod::Cosine,
+    }
 }
 
 /// Whether neural (embedding) tool selection is enabled. **ON by default**; set
@@ -1047,6 +1176,298 @@ fn neural_tools_enabled() -> bool {
             !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         }
         Err(_) => true,
+    }
+}
+
+/// Whether experimental inference-context influence routing was explicitly
+/// requested. It is deliberately OFF by default until the paired benchmark
+/// beats cosine at the same final rendered prompt-token budget.
+fn context_influence_enabled() -> bool {
+    context_influence_value_enabled(std::env::var("PRISM_CONTEXT_INFLUENCE").ok().as_deref())
+}
+
+fn context_influence_value_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+    })
+}
+
+#[derive(Debug)]
+struct InfluenceSelectionMeta {
+    index_id: String,
+    ranked_candidates: Vec<String>,
+    scorer_input_tokens: u64,
+    scoring_ms: u64,
+    model_sha256: String,
+    template_sha256: String,
+}
+
+/// Build the immutable prompt baseline for influence interventions: native
+/// meta-tools first, followed by the pinned full definitions that really fit
+/// this request's definition budget. This exact order is reused for final
+/// generation so a candidate's measured insertion site and deployed insertion
+/// site do not drift.
+#[cfg(any(feature = "local-inference", test))]
+fn influence_fixed_tools(
+    catalog: &ToolCatalog,
+    pinned: &std::collections::HashSet<String>,
+    token_budget: usize,
+) -> Vec<ToolDefinition> {
+    finalize_tools(catalog, &[], pinned, token_budget)
+}
+
+/// Snapshot the full candidate pool in catalog order. Meta-tools and pinned
+/// tools are fixed context, not interventions, and therefore cannot also be
+/// candidates.
+#[cfg(any(feature = "local-inference", test))]
+fn influence_candidates(
+    catalog: &ToolCatalog,
+    pinned: &std::collections::HashSet<String>,
+) -> Vec<ToolDefinition> {
+    catalog
+        .iter()
+        .filter(|tool| !crate::meta_tools::is_meta_tool(&tool.name) && !pinned.contains(&tool.name))
+        .map(|tool| tool.to_definition())
+        .collect()
+}
+
+/// Reorder the approximate-budget result to match the scorer intervention:
+/// fixed baseline tools first, then influence-ranked candidates. Names are
+/// unique within the callable surface; any unexpected remainder is sorted so
+/// request construction stays deterministic rather than inheriting HashMap
+/// iteration order.
+#[cfg(any(feature = "local-inference", test))]
+fn order_influence_request(
+    packed: Vec<ToolDefinition>,
+    fixed: &[ToolDefinition],
+    ranked_candidates: &[String],
+) -> Vec<ToolDefinition> {
+    let mut by_name = packed
+        .into_iter()
+        .map(|definition| (definition.function.name.clone(), definition))
+        .collect::<HashMap<_, _>>();
+    let mut ordered = Vec::with_capacity(by_name.len());
+    for definition in fixed {
+        if let Some(definition) = by_name.remove(&definition.function.name) {
+            ordered.push(definition);
+        }
+    }
+    for name in ranked_candidates {
+        if let Some(definition) = by_name.remove(name) {
+            ordered.push(definition);
+        }
+    }
+    let mut remainder = by_name.into_values().collect::<Vec<_>>();
+    remainder.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+    ordered.extend(remainder);
+    ordered
+}
+
+/// Score and pack one exact local-GGUF influence request. Errors collapse to
+/// stable machine-readable reason codes at the caller while their diagnostics
+/// remain in logs. This function never substitutes another model or backend.
+#[cfg(not(feature = "local-inference"))]
+async fn influence_tool_selection(
+    _llm: &LlmClient,
+    _catalog: &ToolCatalog,
+    _messages: &[ChatMessage],
+    _pinned: &std::collections::HashSet<String>,
+    _token_budget: usize,
+) -> std::result::Result<(RequestToolSelection, InfluenceSelectionMeta), &'static str> {
+    // Refuse before touching the artifact. Besides preserving the precise
+    // status, this prevents a non-local build from hashing a multi-gigabyte
+    // GGUF that it cannot use.
+    Err("local_inference_feature_disabled")
+}
+
+#[cfg(feature = "local-inference")]
+async fn influence_tool_selection(
+    llm: &LlmClient,
+    catalog: &ToolCatalog,
+    messages: &[ChatMessage],
+    pinned: &std::collections::HashSet<String>,
+    token_budget: usize,
+) -> std::result::Result<(RequestToolSelection, InfluenceSelectionMeta), &'static str> {
+    if !prism_ingest::llm::is_local_gguf_url(&llm.config().base_url) {
+        return Err("target_model_unsupported");
+    }
+
+    let model_identity = match llm.local_model_identity().await {
+        Ok(prism_ingest::llm::LocalModelIdentityOutcome::Verified { identity }) => identity,
+        Ok(prism_ingest::llm::LocalModelIdentityOutcome::Unavailable { code, detail }) => {
+            tracing::debug!(?code, detail, "local model identity unavailable");
+            return Err(match code {
+                prism_ingest::llm::LocalPromptInfluenceUnavailableCode::HostedBackend => {
+                    "target_model_unsupported"
+                }
+                prism_ingest::llm::LocalPromptInfluenceUnavailableCode::LocalInferenceFeatureDisabled => {
+                    "local_inference_feature_disabled"
+                }
+                prism_ingest::llm::LocalPromptInfluenceUnavailableCode::DescriptorBackedIdentityUnavailable => {
+                    "descriptor_backed_identity_unavailable"
+                }
+            });
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "influence routing could not bind target-model identity");
+            return Err("target_model_unverified");
+        }
+    };
+    if model_identity.sha256 != prism_ingest::llm::BUNDLED_GEMMA.sha256
+        || model_identity.size_bytes != prism_ingest::llm::BUNDLED_GEMMA.size_bytes
+    {
+        tracing::warn!(
+            actual_sha256 = model_identity.sha256,
+            actual_size_bytes = model_identity.size_bytes,
+            expected_sha256 = prism_ingest::llm::BUNDLED_GEMMA.sha256,
+            expected_size_bytes = prism_ingest::llm::BUNDLED_GEMMA.size_bytes,
+            "influence routing refused a local model other than the pinned Gemma artifact"
+        );
+        return Err("target_model_unverified");
+    }
+    let fixed = influence_fixed_tools(catalog, pinned, token_budget);
+    let candidates = influence_candidates(catalog, pinned);
+    if candidates.is_empty() {
+        return Err("candidate_pool_empty");
+    }
+
+    let outcome = match llm
+        .score_local_tool_influence(messages, &fixed, &candidates)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(error = %error, "local prompt-influence scoring failed");
+            return Err("influence_scoring_failed");
+        }
+    };
+    let report = match outcome {
+        prism_ingest::llm::LocalPromptInfluenceOutcome::Scored { report } => report,
+        prism_ingest::llm::LocalPromptInfluenceOutcome::Unavailable { code, detail } => {
+            tracing::debug!(?code, detail, "local prompt-influence scoring unavailable");
+            return Err(match code {
+                prism_ingest::llm::LocalPromptInfluenceUnavailableCode::HostedBackend => {
+                    "target_model_unsupported"
+                }
+                prism_ingest::llm::LocalPromptInfluenceUnavailableCode::LocalInferenceFeatureDisabled => {
+                    "local_inference_feature_disabled"
+                }
+                prism_ingest::llm::LocalPromptInfluenceUnavailableCode::DescriptorBackedIdentityUnavailable => {
+                    "descriptor_backed_identity_unavailable"
+                }
+            });
+        }
+    };
+    if report.model_sha256 != model_identity.sha256
+        || report.model_size_bytes != model_identity.size_bytes
+    {
+        tracing::warn!(
+            identity_sha256 = model_identity.sha256,
+            report_sha256 = report.model_sha256,
+            "local model identity changed between the target gate and influence scoring"
+        );
+        return Err("target_model_identity_changed");
+    }
+    if report.candidates.len() != candidates.len()
+        || report.candidates.iter().any(|score| {
+            candidates
+                .get(score.candidate_index)
+                .is_none_or(|definition| definition.function.name != score.tool_name)
+        })
+    {
+        tracing::warn!(
+            expected = candidates.len(),
+            actual = report.candidates.len(),
+            "local prompt-influence scorer returned a misaligned candidate pool"
+        );
+        return Err("influence_scores_misaligned");
+    }
+
+    let scores = report
+        .candidates
+        .iter()
+        .filter_map(|score| {
+            score
+                .normalized_js_divergence_per_added_prompt_token
+                .filter(|value| value.is_finite())
+                .map(
+                    |score_per_added_token| crate::influence::CandidateInfluence {
+                        name: score.tool_name.clone(),
+                        score_per_added_token,
+                    },
+                )
+        })
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        return Err("influence_scores_unusable");
+    }
+    if let Some(reason) = crate::influence::classify_score_discrimination(&scores).refusal_reason()
+    {
+        return Err(reason);
+    }
+
+    let index =
+        crate::influence::global_index(candidates, &model_identity.sha256, &report.template_sha256);
+    let ranked_candidates = index.rank(&scores);
+    let packed = finalize_tools(catalog, &ranked_candidates, pinned, token_budget);
+    let definitions = order_influence_request(packed, &fixed, &ranked_candidates);
+    let scorer_input_tokens = report
+        .candidates
+        .iter()
+        .fold(report.baseline_prompt_tokens, |total, score| {
+            total.saturating_add(score.candidate_prompt_tokens)
+        });
+    let scoring_ms = report.total_scoring_wall_time_micros.saturating_add(999) / 1_000;
+    let metadata = InfluenceSelectionMeta {
+        index_id: index.identity().to_string(),
+        ranked_candidates,
+        scorer_input_tokens,
+        scoring_ms,
+        model_sha256: index.model_sha256().to_string(),
+        template_sha256: index.template_sha256().to_string(),
+    };
+    Ok((
+        RequestToolSelection {
+            definitions,
+            applied: crate::influence::ToolSelectionMethod::Influence,
+        },
+        metadata,
+    ))
+}
+
+async fn baseline_tool_selection(
+    catalog: &ToolCatalog,
+    route: &str,
+    pinned: &std::collections::HashSet<String>,
+    token_budget: usize,
+) -> RequestToolSelection {
+    if neural_tools_enabled() {
+        let entries = catalog_entries(catalog);
+        match crate::capability::global_index_if_ready(&entries)
+            .and(crate::embeddings::backend_if_ready())
+        {
+            Some(backend) => {
+                tracing::debug!("tool selection: neural path (model + index ready)");
+                assemble_request_tools_neural_with_status(
+                    catalog,
+                    route,
+                    pinned,
+                    token_budget,
+                    backend.as_ref(),
+                )
+                .await
+            }
+            None => {
+                tracing::debug!(
+                    "tool selection: keyword path (neural model/index warming in background)"
+                );
+                spawn_neural_warm(entries);
+                assemble_request_tools_with_status(catalog, route, pinned, token_budget)
+            }
+        }
+    } else {
+        assemble_request_tools_with_status(catalog, route, pinned, token_budget)
     }
 }
 
@@ -1388,142 +1809,170 @@ pub(crate) async fn run_turn_inner(
         // the working set follows the task. Done before message assembly so the
         // L1 capability menu can reflect what's already callable.
         let route = routing_query(user_message, history);
-        // Neural selection needs BOTH the embed model and the embedded capability
-        // index warm. Building that index embeds the whole catalog (seconds on
-        // CPU), so we NEVER build it on the turn path: if it isn't ready we kick a
-        // one-time background warm (model → index) and serve the fast keyword path
-        // this turn. Neural then engages a turn or two later with no stall.
-        let relevant_tools = if neural_tools_enabled() {
-            let entries = catalog_entries(tool_catalog);
-            match crate::capability::global_index_if_ready(&entries)
-                .and(crate::embeddings::backend_if_ready())
+        let influence_requested = context_influence_enabled();
+        // Influence scoring and successful generation deliberately omit the L1
+        // capability menu: otherwise the scorer would measure one prompt while
+        // deployment used another. Baseline/fallback requests preserve the
+        // existing menu behavior.
+        let influence_messages = iteration_messages(
+            &config.system_prompt,
+            task_block.as_deref(),
+            None,
+            turn_skill_context.discovery_prompt.as_deref(),
+            session_memory.as_deref(),
+            &traj_steps,
+            history,
+            turn_skill_context.selected_prompt.as_deref(),
+        );
+        let (selection, mut influence_meta, mut fallback_reason) = if influence_requested {
+            match influence_tool_selection(
+                llm,
+                tool_catalog,
+                &influence_messages,
+                &pinned_tools,
+                tool_token_budget,
+            )
+            .await
             {
-                Some(backend) => {
-                    tracing::debug!("tool selection: neural path (model + index ready)");
-                    assemble_request_tools_neural(
-                        tool_catalog,
-                        &route,
-                        &pinned_tools,
-                        tool_token_budget,
-                        backend.as_ref(),
-                    )
-                    .await
-                }
-                None => {
-                    tracing::debug!(
-                        "tool selection: keyword path (neural model/index warming in background)"
-                    );
-                    spawn_neural_warm(entries);
-                    assemble_request_tools(tool_catalog, &route, &pinned_tools, tool_token_budget)
-                }
+                Ok((selection, metadata)) => (selection, Some(metadata), None),
+                Err(reason) => (
+                    baseline_tool_selection(tool_catalog, &route, &pinned_tools, tool_token_budget)
+                        .await,
+                    None,
+                    Some(reason.to_string()),
+                ),
             }
         } else {
-            assemble_request_tools(tool_catalog, &route, &pinned_tools, tool_token_budget)
+            (
+                baseline_tool_selection(tool_catalog, &route, &pinned_tools, tool_token_budget)
+                    .await,
+                None,
+                None,
+            )
         };
-        // Core-set tiering (weak/unknown models via their PromptProfile): keep
-        // only the curated core tools, but ALWAYS keep the meta-tools
-        // (find_tools + recall) and anything the model pinned via discovery — so
-        // the model can still reach the full catalog through find_tools. Capable
-        // models keep the full relevance-ranked selection.
-        let relevant_tools = if config.core_tools_only {
-            tier_to_core(relevant_tools, &pinned_tools)
+        let mut applied_method = selection.applied;
+        let mut relevant_tools =
+            apply_tool_tier(selection.definitions, &pinned_tools, config.core_tools_only);
+
+        // A ready scorer/index is not enough to claim priming. At least one
+        // influence-ranked candidate must survive both final packing and the
+        // model's core-tier filter and actually reach generation.
+        if let Some(metadata) = influence_meta.as_ref()
+            && crate::influence::applied_candidates(&metadata.ranked_candidates, &relevant_tools)
+                .is_empty()
+        {
+            fallback_reason = Some("influence_candidates_evicted".to_string());
+            influence_meta = None;
+            let fallback =
+                baseline_tool_selection(tool_catalog, &route, &pinned_tools, tool_token_budget)
+                    .await;
+            applied_method = fallback.applied;
+            relevant_tools =
+                apply_tool_tier(fallback.definitions, &pinned_tools, config.core_tools_only);
+        }
+
+        let mut capability_menu = influence_meta
+            .is_none()
+            .then(|| capability_menu_for_request(tool_catalog, &relevant_tools))
+            .flatten();
+        let mut messages = if influence_meta.is_some() {
+            influence_messages
         } else {
-            relevant_tools
+            iteration_messages(
+                &config.system_prompt,
+                task_block.as_deref(),
+                capability_menu.as_deref(),
+                turn_skill_context.discovery_prompt.as_deref(),
+                session_memory.as_deref(),
+                &traj_steps,
+                history,
+                turn_skill_context.selected_prompt.as_deref(),
+            )
         };
+
+        let mut priming_status = if influence_requested {
+            crate::influence::ContextPrimingStatus::Fallback {
+                requested: crate::influence::ToolSelectionMethod::Influence,
+                applied: applied_method,
+                reason: fallback_reason
+                    .clone()
+                    .unwrap_or_else(|| "influence_status_unresolved".to_string()),
+            }
+        } else {
+            crate::influence::ContextPrimingStatus::NotRequested {
+                applied: applied_method,
+            }
+        };
+
+        if let Some(metadata) = influence_meta {
+            let selected_candidates =
+                crate::influence::applied_candidates(&metadata.ranked_candidates, &relevant_tools);
+            match llm.render_local_prompt(&messages, &relevant_tools).await {
+                Ok(rendered) if rendered.template_sha256 == metadata.template_sha256 => {
+                    priming_status = crate::influence::ContextPrimingStatus::Primed {
+                        index_id: metadata.index_id,
+                        selected_candidates,
+                        exact_context_tokens: rendered.token_count,
+                        scorer_input_tokens: metadata.scorer_input_tokens,
+                        scoring_ms: metadata.scoring_ms,
+                        model_sha256: metadata.model_sha256,
+                        template_sha256: metadata.template_sha256,
+                    };
+                }
+                Ok(rendered) => {
+                    tracing::warn!(
+                        scored_template = metadata.template_sha256,
+                        rendered_template = rendered.template_sha256,
+                        "influence routing template changed before generation"
+                    );
+                    fallback_reason = Some("template_identity_changed".to_string());
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "exact influence prompt render failed");
+                    fallback_reason = Some("exact_prompt_render_failed".to_string());
+                }
+            }
+
+            // Rendering/template identity is the last truth gate. If it fails,
+            // rebuild the complete baseline request and report the method that
+            // really reached the LLM; never reuse influence-ranked tools under
+            // a fallback label.
+            if let Some(reason) = fallback_reason.as_ref() {
+                let fallback =
+                    baseline_tool_selection(tool_catalog, &route, &pinned_tools, tool_token_budget)
+                        .await;
+                applied_method = fallback.applied;
+                relevant_tools =
+                    apply_tool_tier(fallback.definitions, &pinned_tools, config.core_tools_only);
+                capability_menu = capability_menu_for_request(tool_catalog, &relevant_tools);
+                messages = iteration_messages(
+                    &config.system_prompt,
+                    task_block.as_deref(),
+                    capability_menu.as_deref(),
+                    turn_skill_context.discovery_prompt.as_deref(),
+                    session_memory.as_deref(),
+                    &traj_steps,
+                    history,
+                    turn_skill_context.selected_prompt.as_deref(),
+                );
+                priming_status = crate::influence::ContextPrimingStatus::Fallback {
+                    requested: crate::influence::ToolSelectionMethod::Influence,
+                    applied: applied_method,
+                    reason: reason.clone(),
+                };
+            }
+        }
+
         tracing::debug!(
             total_tools = tool_catalog.len(),
             selected_tools = relevant_tools.len(),
             token_budget = tool_token_budget,
             core_only = config.core_tools_only,
+            primed = priming_status.is_primed(),
             "tool selection for LLM call"
         );
 
         // ── 2c. Build messages ────────────────────────────────────
-        // L1 progressive disclosure (neural mode only): a compact metadata menu
-        // of capabilities beyond the callable top-K, so the model is AWARE of
-        // the wider catalog without paying the full-schema token cost. Off by
-        // default → messages are byte-identical to before.
-        let capability_menu = if neural_tools_enabled() {
-            let included: std::collections::HashSet<String> = relevant_tools
-                .iter()
-                .map(|d| d.function.name.clone())
-                .collect();
-            let entries = catalog_entries(tool_catalog);
-            crate::capability::capability_menu(&entries, &included, 150, 80)
-        } else {
-            None
-        };
-
-        let mut messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: Some(config.system_prompt.clone()),
-            tool_calls: None,
-            tool_call_id: None,
-        }];
-        // Task-driven context goes first (highest priority for a research task):
-        // goal + plan position + artifact handles + working notes, every turn.
-        if let Some(block) = &task_block {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(block.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        if let Some(menu) = &capability_menu {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(menu.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        // Unified progressive disclosure for Voyager JSON skills, human
-        // Markdown procedures, and declared workflows. Explicit-only human
-        // procedures are deliberately absent; the resolver can still attach
-        // one after a user `$name` selection.
-        if let Some(skills_menu) = &turn_skill_context.discovery_prompt {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(skills_menu.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        // Trajectory v2: durable pointers from previous turns/sessions —
-        // injected before the current turn's trajectory so the model reads
-        // past→present in order.
-        if let Some(mem) = &session_memory {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(mem.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        // Deterministic trajectory: the harness (not the model's memory) keeps
-        // the last executed steps in front of the model every iteration.
-        if let Some(traj) = trajectory_block(&traj_steps) {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(traj),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-        messages.extend(history.iter().cloned());
-        if let Some(selection) = &turn_skill_context.selected_prompt {
-            // Human-authored skill text is untrusted user material. Keep the
-            // resolver directive at user priority; `run_skill` then returns
-            // Markdown only after the ordinary policy/approval path has run.
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(selection.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-        }
-
         // Stream tokens incrementally — collect deltas from the
         // streaming callback and emit them after the call completes.
         // Reasoning tokens (is_reasoning=true) are emitted as a separate
@@ -1549,6 +1998,32 @@ pub(crate) async fn run_turn_inner(
                 e
             })
             .context("LLM call failed")?;
+
+        if let crate::influence::ContextPrimingStatus::Primed {
+            exact_context_tokens,
+            ..
+        } = &mut priming_status
+            && let Some(usage) = response.usage.as_ref()
+        {
+            if *exact_context_tokens != usage.prompt_tokens {
+                tracing::warn!(
+                    rendered_prompt_tokens = *exact_context_tokens,
+                    generated_prompt_tokens = usage.prompt_tokens,
+                    "local generation token count differed from the preflight render"
+                );
+            }
+            // Generation usage is the final authority for what was really
+            // prefetched; the earlier render remains the template/hash gate.
+            *exact_context_tokens = usage.prompt_tokens;
+        }
+
+        // Only a successful generation proves the prompt made it through
+        // grammar construction and prefill. Emitting `Primed` before this
+        // point would let a failed, never-prefilled request claim priming.
+        emit(AgentEvent::ContextPriming {
+            iteration,
+            status: priming_status,
+        });
 
         // ── 2d. Track usage ───────────────────────────────────────
         if let Some(usage) = &response.usage {
@@ -3081,6 +3556,118 @@ mod tests {
             1,
             "recall must appear exactly once"
         );
+    }
+
+    #[test]
+    fn influence_flag_is_explicit_and_off_by_default() {
+        for disabled in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("yes"),
+        ] {
+            assert!(!context_influence_value_enabled(disabled));
+        }
+        for enabled in [
+            Some("1"),
+            Some(" true "),
+            Some("TRUE"),
+            Some("on"),
+            Some("ON"),
+        ] {
+            assert!(context_influence_value_enabled(enabled));
+        }
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    #[tokio::test]
+    async fn influence_refuses_feature_disabled_before_artifact_verification() {
+        let llm = LlmClient::new(prism_ingest::llm::LlmConfig {
+            base_url: prism_ingest::llm::LOCAL_GGUF_URL.to_string(),
+            model: "/definitely/not/an/installed/model.gguf".to_string(),
+            ..Default::default()
+        });
+        let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({"tools": []}));
+        let result = influence_tool_selection(
+            &llm,
+            &catalog,
+            &[],
+            &std::collections::HashSet::new(),
+            4_096,
+        )
+        .await;
+        assert!(matches!(result, Err("local_inference_feature_disabled")));
+    }
+
+    #[test]
+    fn influence_pool_uses_full_definitions_and_separates_fixed_tools() {
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [
+                {
+                    "name": "alpha",
+                    "description": "first candidate",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"composition": {"type": "string"}},
+                        "required": ["composition"],
+                        "additionalProperties": false
+                    }
+                },
+                tool_json("pinned", "fixed discovered tool"),
+                tool_json("gamma", "second candidate"),
+                tool_json("recall", "shadowed catalog meta-tool")
+            ]
+        }));
+        let pinned = std::collections::HashSet::from(["pinned".to_string()]);
+        let candidates = influence_candidates(&catalog, &pinned);
+        let names = candidates
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "gamma"]);
+        assert_eq!(
+            candidates[0].function.parameters["required"],
+            serde_json::json!(["composition"]),
+            "the intervention must retain the complete callable schema"
+        );
+
+        let fixed = influence_fixed_tools(&catalog, &pinned, 8_192);
+        let fixed_names = fixed
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(fixed_names.contains(&"recall"));
+        assert!(fixed_names.contains(&"pinned"));
+        assert!(!fixed_names.contains(&"alpha"));
+        assert!(!fixed_names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn influence_generation_order_matches_fixed_plus_ranked_intervention() {
+        let catalog = crate::tool_catalog::ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [
+                tool_json("alpha", "first candidate"),
+                tool_json("pinned", "fixed discovered tool"),
+                tool_json("gamma", "second candidate")
+            ]
+        }));
+        let pinned = std::collections::HashSet::from(["pinned".to_string()]);
+        let ranked = vec!["gamma".to_string(), "alpha".to_string()];
+        let fixed = influence_fixed_tools(&catalog, &pinned, 8_192);
+        let packed = finalize_tools(&catalog, &ranked, &pinned, 8_192);
+        let ordered = order_influence_request(packed, &fixed, &ranked);
+        let names = ordered
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        let expected_fixed = fixed
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(&names[..expected_fixed.len()], expected_fixed);
+        assert_eq!(&names[expected_fixed.len()..], ["gamma", "alpha"]);
     }
 
     #[test]

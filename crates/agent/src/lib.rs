@@ -6,6 +6,7 @@ pub mod commands;
 pub mod embeddings;
 pub mod execution_contract;
 pub mod hooks;
+pub mod influence;
 pub mod mcp;
 pub mod meta_tools;
 pub mod models;

@@ -71,6 +71,14 @@ impl AgentResponse {
     }
 }
 
+/// Truthful context-selection outcome for one LLM request, retaining the
+/// agent-loop iteration that produced it.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextPrimingRecord {
+    pub iteration: usize,
+    pub status: crate::influence::ContextPrimingStatus,
+}
+
 // ---------------------------------------------------------------------------
 // AgentEvent — streaming events for the UI layer (tagged enum)
 // ---------------------------------------------------------------------------
@@ -88,6 +96,12 @@ pub enum AgentEvent {
     },
     /// Signal the frontend to flush accumulated streaming text into chat history.
     TextFlush,
+    /// Truthful per-request report of whether influence-ranked context was
+    /// actually injected, or which fallback handled the request instead.
+    ContextPriming {
+        iteration: usize,
+        status: crate::influence::ContextPrimingStatus,
+    },
     ToolCallStart {
         tool_name: String,
         call_id: String,

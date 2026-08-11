@@ -40,13 +40,14 @@ use crate::command_tools::{
     CommandToolPlatformAccess, CommandToolRuntime, PLATFORM_ACCESS_REFUSAL,
 };
 use crate::hooks::HookRegistry;
+use crate::influence::ContextPrimingStatus;
 use crate::permissions::ToolPermissionContext;
 use crate::protocol::{AgentSeed, build_agent_seed, restore_history_and_transcript_from_messages};
 use crate::scratchpad::Scratchpad;
 use crate::session::{SessionInfo, SessionStore};
 use crate::tool_catalog::ToolCatalog;
 use crate::transcript::TranscriptStore;
-use crate::types::{AgentConfig, AgentEvent};
+use crate::types::{AgentConfig, AgentEvent, ContextPrimingRecord};
 
 /// Stable principal prefix used by the standalone HTTP seam when no account
 /// session exists. HTTP handlers append the validated transport session token
@@ -65,8 +66,9 @@ pub fn anonymous_caller_id(transport_token: &str) -> String {
 // ── Wire types ───────────────────────────────────────────────────────
 
 /// Typed event stream for chat clients. Serialized with a `type` tag so
-/// SSE/JSON consumers can switch on it: `thinking`, `answer`, `tool_call`,
-/// `tool_result`, `approval_required`, `done`, `error`.
+/// SSE/JSON consumers can switch on it: `thinking`, `answer`,
+/// `context_priming`, `tool_call`, `tool_result`, `approval_required`, `done`,
+/// `error`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatEvent {
@@ -75,6 +77,12 @@ pub enum ChatEvent {
     /// Response text delta (streamed). The complete answer is repeated in
     /// the final `done` event.
     Answer { text: String },
+    /// Per-LLM-request context-selection status. Only the `primed` status
+    /// means an influence-ranked definition actually reached the prompt.
+    ContextPriming {
+        iteration: usize,
+        status: ContextPrimingStatus,
+    },
     /// A tool call is starting.
     ToolCall {
         tool_name: String,
@@ -110,6 +118,9 @@ pub enum ChatEvent {
         answer: String,
         /// Tools that were skipped pending approval this turn.
         approvals_required: Vec<String>,
+        /// One truthful, iteration-addressable status for every LLM request
+        /// made during the turn.
+        context_priming: Vec<ContextPrimingRecord>,
     },
     /// Turn failed.
     Error { message: String },
@@ -121,6 +132,7 @@ impl ChatEvent {
         match self {
             Self::Thinking { .. } => "thinking",
             Self::Answer { .. } => "answer",
+            Self::ContextPriming { .. } => "context_priming",
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::ApprovalRequired { .. } => "approval_required",
@@ -168,6 +180,7 @@ pub struct ChatOutcome {
     pub session_id: String,
     pub answer: String,
     pub approvals_required: Vec<String>,
+    pub context_priming: Vec<ContextPrimingRecord>,
 }
 
 /// Errors the HTTP layer maps to status codes.
@@ -641,6 +654,7 @@ impl ChatService {
 
         let mut answer = String::new();
         let mut approvals_required: Vec<String> = Vec::new();
+        let mut context_priming: Vec<ContextPrimingRecord> = Vec::new();
 
         // Split borrows: run_turn needs &mut tool_server while the emit
         // callback appends to the session store.
@@ -671,6 +685,13 @@ impl ChatService {
                 let _ = events.send(ChatEvent::Answer { text });
             }
             AgentEvent::TextFlush => {}
+            AgentEvent::ContextPriming { iteration, status } => {
+                context_priming.push(ContextPrimingRecord {
+                    iteration,
+                    status: status.clone(),
+                });
+                let _ = events.send(ChatEvent::ContextPriming { iteration, status });
+            }
             AgentEvent::ToolCallStart {
                 tool_name,
                 call_id,
@@ -754,11 +775,13 @@ impl ChatService {
             session_id,
             answer,
             approvals_required,
+            context_priming,
         };
         let _ = events.send(ChatEvent::Done {
             session_id: outcome.session_id.clone(),
             answer: outcome.answer.clone(),
             approvals_required: outcome.approvals_required.clone(),
+            context_priming: outcome.context_priming.clone(),
         });
         Ok(outcome)
     }
@@ -881,6 +904,12 @@ mod tests {
             ChatEvent::Answer {
                 text: "hello".into(),
             },
+            ChatEvent::ContextPriming {
+                iteration: 0,
+                status: ContextPrimingStatus::NotRequested {
+                    applied: crate::influence::ToolSelectionMethod::Keyword,
+                },
+            },
             ChatEvent::ToolCall {
                 tool_name: "query".into(),
                 call_id: "c1".into(),
@@ -898,15 +927,17 @@ mod tests {
                 session_id: "s1".into(),
                 answer: "hello".into(),
                 approvals_required: vec![],
+                context_priming: vec![],
             },
             ChatEvent::Error {
                 message: "boom".into(),
             },
         ];
-        assert_eq!(events.len(), 7, "cover every ChatEvent variant");
+        assert_eq!(events.len(), 8, "cover every ChatEvent variant");
         let expected = [
             "thinking",
             "answer",
+            "context_priming",
             "tool_call",
             "tool_result",
             "approval_required",
@@ -920,6 +951,62 @@ mod tests {
                 json.get("type").and_then(|t| t.as_str()),
                 Some(expected_kind),
                 "serde type tag must match SSE event name"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_context_priming_records_retain_iteration_and_status() {
+        let records = vec![
+            ContextPrimingRecord {
+                iteration: 2,
+                status: ContextPrimingStatus::Fallback {
+                    requested: crate::influence::ToolSelectionMethod::Influence,
+                    applied: crate::influence::ToolSelectionMethod::Cosine,
+                    reason: "influence_no_signal".to_string(),
+                },
+            },
+            ContextPrimingRecord {
+                iteration: 7,
+                status: ContextPrimingStatus::Primed {
+                    index_id: "index-v1".to_string(),
+                    selected_candidates: vec!["query_platform".to_string()],
+                    exact_context_tokens: 42,
+                    scorer_input_tokens: 120,
+                    scoring_ms: 8,
+                    model_sha256: "model-sha".to_string(),
+                    template_sha256: "template-sha".to_string(),
+                },
+            },
+        ];
+        let outcome = ChatOutcome {
+            session_id: "session-1".to_string(),
+            answer: "done".to_string(),
+            approvals_required: Vec::new(),
+            context_priming: records.clone(),
+        };
+        let done = ChatEvent::Done {
+            session_id: "session-1".to_string(),
+            answer: "done".to_string(),
+            approvals_required: Vec::new(),
+            context_priming: records,
+        };
+
+        for payload in [
+            serde_json::to_value(outcome).expect("serialize outcome"),
+            serde_json::to_value(done).expect("serialize done event"),
+        ] {
+            let records = &payload["context_priming"];
+            assert_eq!(records[0]["iteration"], 2);
+            assert_eq!(records[0]["status"]["status"], "fallback");
+            assert_eq!(records[0]["status"]["requested"], "influence");
+            assert_eq!(records[0]["status"]["applied"], "cosine");
+            assert_eq!(records[0]["status"]["reason"], "influence_no_signal");
+            assert_eq!(records[1]["iteration"], 7);
+            assert_eq!(records[1]["status"]["status"], "primed");
+            assert_eq!(
+                records[1]["status"]["selected_candidates"][0],
+                "query_platform"
             );
         }
     }

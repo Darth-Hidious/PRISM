@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "case_001",
+      "user": "Search only the knowledge graph on this machine for Ti-6Al-4V fatigue, use semantic matching, and return at most 5 results."
+    },
+    {
+      "id": "case_002",
+      "user": "Search PRISM's hosted knowledge base by meaning for oxygen-rich preburner alloy compatibility, at most 5 results."
+    },
+    {
+      "id": "case_003",
+      "user": "Fan out the question 'nickel superalloy creep' from the running node to its known mesh peers."
+    },
+    {
+      "id": "case_004",
+      "user": "List only running deployments."
+    },
+    {
+      "id": "case_005",
+      "user": "Show the current lifecycle state for deployment dep-bench-005."
+    },
+    {
+      "id": "case_006",
+      "user": "Trigger and inspect a fresh health check for deployment dep-bench-006."
+    },
+    {
+      "id": "case_007",
+      "user": "Stop deployment dep-bench-007."
+    },
+    {
+      "id": "case_008",
+      "user": "List the available workflow recipes."
+    },
+    {
+      "id": "case_009",
+      "user": "Show the specification for the forge workflow."
+    },
+    {
+      "id": "case_010",
+      "user": "Dry-run the forge workflow with paper set to alpha; do not execute it."
+    },
+    {
+      "id": "case_011",
+      "user": "List hosted language models from Google."
+    },
+    {
+      "id": "case_012",
+      "user": "Search Google's hosted model catalog for Gemma."
+    },
+    {
+      "id": "case_013",
+      "user": "Fetch full metadata for exact hosted model ID gemini-3.1-pro-preview."
+    },
+    {
+      "id": "case_014",
+      "user": "List purchasable GPU offers."
+    },
+    {
+      "id": "case_015",
+      "user": "List registered compute broker providers."
+    },
+    {
+      "id": "case_016",
+      "user": "Poll compute job job-bench-016 and show its status."
+    }
+  ]
+}

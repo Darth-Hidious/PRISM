@@ -2,10 +2,9 @@
 
 #![cfg(feature = "local-inference")]
 
-use prism_llm::{
-    BUNDLED_GEMMA, ChatMessage, FunctionDef, LOCAL_GGUF_URL, LlmClient, LlmConfig, ToolDefinition,
-    verify_model_artifact,
-};
+#[cfg(unix)]
+use prism_llm::{BUNDLED_GEMMA, LocalModelIdentityOutcome};
+use prism_llm::{ChatMessage, FunctionDef, LOCAL_GGUF_URL, LlmClient, LlmConfig, ToolDefinition};
 
 fn meta_tool(name: &str, description: &str, parameters: serde_json::Value) -> ToolDefinition {
     ToolDefinition {
@@ -140,11 +139,11 @@ async fn embedded_gguf_streams_real_token_pieces() {
 /// exact artifact, exact embedded template, canonical Minja render, and greedy
 /// generation all use one warm model. It never downloads weights.
 #[tokio::test]
+#[cfg(unix)]
 #[ignore = "requires PRISM_TEST_GGUF to name the pinned Gemma artifact"]
 async fn pinned_gemma_manifest_template_and_generation_proof() {
     let path =
         std::path::PathBuf::from(std::env::var("PRISM_TEST_GGUF").expect("set PRISM_TEST_GGUF"));
-    verify_model_artifact(&path, &BUNDLED_GEMMA).expect("GGUF does not match pinned manifest");
     let client = LlmClient::new(LlmConfig {
         base_url: LOCAL_GGUF_URL.to_string(),
         model: path.display().to_string(),
@@ -158,8 +157,17 @@ async fn pinned_gemma_manifest_template_and_generation_proof() {
         tool_call_id: None,
     }];
 
-    // `render_local_prompt` and generation share the client's OnceLock model,
-    // so the proof loads once and exercises the production preparation path.
+    let identity = match client.local_model_identity().await.unwrap() {
+        LocalModelIdentityOutcome::Verified { identity } => identity,
+        LocalModelIdentityOutcome::Unavailable { code, detail } => {
+            panic!("local model identity unexpectedly unavailable ({code:?}): {detail}")
+        }
+    };
+    assert_eq!(identity.sha256, BUNDLED_GEMMA.sha256);
+    assert_eq!(identity.size_bytes, BUNDLED_GEMMA.size_bytes);
+
+    // Identity, rendering, and generation share the client's loaded model and
+    // receipt, so the proof hashes and loads once through the production path.
     let rendered = client.render_local_prompt(&messages, &[]).await.unwrap();
     assert_eq!(
         rendered.template_sha256,
