@@ -85,7 +85,7 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
         OntologyCommands::Validate { path } => {
             let ontology = induction::load_validated(&path)?;
             println!(
-                "OK: {} — status {}, {} classes, {} relations (model {}, prompt v{}, corpus {})",
+                "OK: {} — status {}, {} classes, {} relations (model {}, prompt v{}, corpus {}; semantic {})",
                 path.display(),
                 ontology.status.as_str(),
                 ontology.classes.len(),
@@ -93,6 +93,12 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
                 ontology.provenance.model,
                 ontology.provenance.prompt_version,
                 ontology.provenance.corpus_hash,
+                ontology
+                    .provenance
+                    .semantic_validation
+                    .near_duplicates
+                    .status
+                    .as_str(),
             );
             Ok(())
         }
@@ -107,6 +113,15 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
                     .promoted_at
                     .as_deref()
                     .unwrap_or("unknown"),
+            );
+            println!(
+                "  semantic near-duplicate check: {}",
+                ontology
+                    .provenance
+                    .semantic_validation
+                    .near_duplicates
+                    .status
+                    .as_str()
             );
             println!(
                 "It is now eligible for registration as an extraction vocabulary \
@@ -171,6 +186,18 @@ async fn induce(
         );
     }
 
+    // Retain and measure the RAW model surfaces before the builder's
+    // established lexical merge can hide variants such as `HeatTreatment`
+    // and `Heat Treatment`. This is report-only: neither findings nor an
+    // unavailable backend can alter or block the draft artifact.
+    let semantic_labels = ontology.provenance.semantic_validation.proposals.clone();
+    ontology.provenance.semantic_validation =
+        prism_ingest::semantic_validation::validate_ontology_labels_best_effort(
+            &semantic_labels,
+            &config.semantic_validation,
+        )
+        .await;
+
     // The strict gate: a generated ontology that fails validation is
     // rejected LOUDLY with the specific violations — no artifact is written.
     let violations = validate::validate(&ontology);
@@ -204,6 +231,26 @@ async fn induce(
         p.documents_total,
         p.corpus_hash
     );
+    println!(
+        "  semantic near-duplicate check: {} ({} raw labels, {} finding(s))",
+        p.semantic_validation.near_duplicates.status.as_str(),
+        p.semantic_validation.near_duplicates.candidates,
+        p.semantic_validation.near_duplicates.findings.len(),
+    );
+    if let Some(message) = &p.semantic_validation.near_duplicates.message {
+        println!("    {message}");
+    }
+    for finding in &p.semantic_validation.near_duplicates.findings {
+        println!(
+            "    collision: {} {:?} vs {} {:?} (cosine distance {:.4}, edit {:.4})",
+            finding.proposed_type,
+            finding.proposed_name,
+            finding.colliding_type,
+            finding.colliding_name,
+            finding.cosine_distance,
+            finding.normalized_edit_distance,
+        );
+    }
     if p.documents_failed > 0 {
         println!(
             "  {} document(s) produced no usable proposal",

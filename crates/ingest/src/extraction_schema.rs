@@ -40,7 +40,8 @@ use crate::qudt_units;
 /// Build the tabular-extraction JSON schema for the ACTIVE ontology. The
 /// shape mirrors the wire format `crate::ontology`'s parser expects
 /// (`entities` / `relationships`, `rel` for the relationship type,
-/// string-tolerant `weight`/`order`).
+/// string-tolerant `weight`/`order`, and optional bounded relationship
+/// `confidence`).
 #[must_use]
 pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
     let entity_types: Vec<&str> = ontology
@@ -133,18 +134,20 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
     // relations (`Ontology::measurement_relations`) become two dedicated
     // variants — a measured edge whose typed `value` and enum-locked `unit`
     // are REQUIRED and which has NO `weight`/`order` members at all, and a
-    // bare property link with endpoints only — while every other relation
-    // keeps the historical shape (weight/order, no value/unit). Each
+    // bare property link with endpoints plus optional confidence — while
+    // every other relation keeps its historical data fields (weight/order,
+    // no value/unit) plus optional confidence. Each
     // exclusion is a measured escape hatch, closed: with `unit` merely
     // optional the live 12B model emitted every per-row value and not one
     // unit (2026-08-10 run 2 — all ten numeric facts honestly dropped
     // unit-less), and with `weight` available on the same edge it put every
     // number THERE and satisfied the grammar without ever entering the
     // measured variant (run 3 — all ten values silently unmappable). A
-    // number on a measured edge has exactly one place to go, and that place
-    // demands its unit from the ONE declared vocabulary; a quantity with no
-    // unit in the vocabulary is stated as a bare link — no number, never a
-    // guessed unit.
+    // measured quantity on an edge has exactly one domain-value channel, and
+    // that channel demands its unit from the ONE declared vocabulary; the
+    // separately named probability field is bounded to `[0, 1]`. A quantity
+    // with no unit in the vocabulary is stated as a bare link — no measured
+    // value, never a guessed unit.
     let measurement_rels: Vec<&str> = ontology.measurement_relations();
     let plain_rels: Vec<&str> = relationship_types
         .iter()
@@ -164,6 +167,14 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
                 // values like a remainder fraction.
                 "weight": {"type": ["number", "string", "null"]},
                 "order": {"type": ["integer", "string", "null"]},
+                // Optional model judgement, never a required invented score.
+                // Degraded prompt-only endpoints may still return numeric
+                // strings; the raw parser accepts those, but constrained
+                // decoding emits an actual probability or null.
+                "confidence": {"anyOf": [
+                    {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    {"type": "null"}
+                ]},
             },
             "required": ["from", "rel", "to"],
             "additionalProperties": false,
@@ -182,6 +193,10 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
                 "to": {"type": "string"},
                 "value": {"type": ["number", "string"]},
                 "unit": {"type": "string", "enum": units},
+                "confidence": {"anyOf": [
+                    {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    {"type": "null"}
+                ]},
             },
             "required": ["from", "rel", "to", "value", "unit"],
             "additionalProperties": false,
@@ -192,6 +207,10 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
                 "from": {"type": "string"},
                 "rel": {"type": "string", "enum": measurement_rels},
                 "to": {"type": "string"},
+                "confidence": {"anyOf": [
+                    {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    {"type": "null"}
+                ]},
             },
             "required": ["from", "rel", "to"],
             "additionalProperties": false,
@@ -460,7 +479,7 @@ mod tests {
         );
     }
 
-    /// The per-edge measurement channel is on the wire, and every measured
+    /// The per-edge measurement channel is on the wire, and every measured-value
     /// escape hatch is CLOSED: the measured-edge variant carries the
     /// declared measurement relations only and REQUIRES a non-null `value`
     /// with a non-null, enum-locked `unit` (with `unit` optional, the live
@@ -468,9 +487,10 @@ mod tests {
     /// neither the measured edge nor the bare property link declares
     /// `weight`/`order` at all (with `weight` available, the same model put
     /// every number there and never entered the measured variant — run 3);
-    /// and ordinary relations keep the historical weight/order shape with
-    /// no value/unit. Weakening any of these is the mutation this test
-    /// exists to kill.
+    /// and ordinary relations keep the historical weight/order data fields
+    /// with no value/unit. All variants additionally expose the independently
+    /// tested optional bounded confidence field. Weakening any of these is
+    /// the mutation this test exists to kill.
     #[test]
     fn measured_edges_couple_value_to_unit_and_offer_no_numeric_escape() {
         let declared_units: Vec<String> = qudt_units::EXTRACTION_UNITS
@@ -536,7 +556,8 @@ mod tests {
         );
 
         // An ontology declaring no measurement relations keeps ONE
-        // historical edge shape — no variants, no value/unit anywhere.
+        // historical data-field shape — no variants, no value/unit anywhere;
+        // the universal optional confidence member is independently tested.
         let chem = extraction_json_schema(&Chem::new(&["REACTS_WITH"]));
         let chem_items = chem
             .schema
@@ -545,6 +566,57 @@ mod tests {
         assert!(chem_items.pointer("/oneOf").is_none());
         assert!(chem_items.pointer("/properties/value").is_none());
         assert!(chem_items.pointer("/properties/weight").is_some());
+    }
+
+    #[test]
+    fn relationship_confidence_is_optional_and_bounded_on_every_edge_shape() {
+        fn assert_confidence_contract(edge: &serde_json::Value) {
+            let confidence = edge
+                .pointer("/properties/confidence")
+                .expect("every relationship shape must expose confidence");
+            assert_eq!(
+                confidence.pointer("/anyOf/0/type"),
+                Some(&serde_json::json!("number"))
+            );
+            assert_eq!(
+                confidence.pointer("/anyOf/0/minimum"),
+                Some(&serde_json::json!(0.0))
+            );
+            assert_eq!(
+                confidence.pointer("/anyOf/0/maximum"),
+                Some(&serde_json::json!(1.0))
+            );
+            assert_eq!(
+                confidence.pointer("/anyOf/1/type"),
+                Some(&serde_json::json!("null"))
+            );
+            let required = edge
+                .pointer("/required")
+                .and_then(serde_json::Value::as_array)
+                .expect("relationship required list");
+            assert!(
+                !required.iter().any(|member| member == "confidence"),
+                "confidence must stay optional: {edge}"
+            );
+        }
+
+        let emmo = extraction_json_schema(&EmmoOntology);
+        let variants = emmo
+            .schema
+            .pointer("/properties/relationships/items/oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("EMMO relationship variants");
+        assert_eq!(variants.len(), 3);
+        for variant in variants {
+            assert_confidence_contract(variant);
+        }
+
+        let chem = extraction_json_schema(&Chem::new(&["REACTS_WITH"]));
+        let plain = chem
+            .schema
+            .pointer("/properties/relationships/items")
+            .expect("single ordinary relationship shape");
+        assert_confidence_contract(plain);
     }
 
     /// An ontology declaring NO quantitative classes keeps the single item

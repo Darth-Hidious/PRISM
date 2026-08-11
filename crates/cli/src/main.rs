@@ -6754,6 +6754,8 @@ async fn run_local_ingest_file(
             mapping: None,
             provenance_db: None,
             ontology,
+            semantic_validation:
+                prism_ingest::semantic_validation::SemanticValidationPolicy::default(),
             on_progress: None,
         }
     } else {
@@ -6764,6 +6766,8 @@ async fn run_local_ingest_file(
             mapping,
             provenance_db: None,
             ontology,
+            semantic_validation:
+                prism_ingest::semantic_validation::SemanticValidationPolicy::default(),
             // Progress goes to STDERR as it happens: these runs are minutes
             // per batch on a local 12B model, a silent terminal is a bug,
             // and `--json` stdout must stay parseable.
@@ -6872,6 +6876,78 @@ async fn classify_ingested_entities(
             .map(|p| p as &dyn prism_ingest::classify::ClassPrior),
     )
     .await
+}
+
+/// Describe the exact subject/object identities the text writer is about to
+/// persist, so advisory semantic validation measures the proposal rather than
+/// reconstructing it after the graph has changed.
+fn semantic_entities_for_text_facts(
+    facts: &[prism_provenance::MaterialFact],
+    classes: &std::collections::HashMap<String, prism_ingest::classify::EntityClass>,
+) -> Vec<prism_ingest::semantic_validation::SemanticEntityProposal> {
+    use prism_ingest::semantic_validation::SemanticEntityProposal;
+
+    let mut entities = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for fact in facts {
+        let classified = classes.get(&fact.subject).zip(classes.get(&fact.object));
+        match classified {
+            Some((subject, object)) => {
+                for (name, class) in [(&fact.subject, subject), (&fact.object, object)] {
+                    let proposal = SemanticEntityProposal {
+                        name: name.clone(),
+                        entity_type: class.entity_type.clone(),
+                        storage_label: class.storage_label.clone(),
+                        class_iri: Some(class.class_iri.clone()),
+                    };
+                    let identity = (
+                        proposal.name.clone(),
+                        proposal.entity_type.clone(),
+                        proposal.storage_label.clone(),
+                        proposal.class_iri.clone(),
+                    );
+                    if seen.insert(identity) {
+                        entities.push(proposal);
+                    }
+                }
+            }
+            None => {
+                // This mirrors `write_fact_as`: when either endpoint lacks a
+                // model class the writer deliberately falls back for BOTH.
+                // No class IRI is invented, so typing remains unavailable for
+                // these nodes instead of presenting a legacy label as an
+                // ontology judgement.
+                let object_label = match fact.kind.as_deref() {
+                    Some("measurement") => "Property",
+                    Some("phase") => "Phase",
+                    Some("composition") => "Composition",
+                    Some("contains") => "Element",
+                    Some("processing") => "Manufacturing",
+                    Some("structure") => "CrystalStructure",
+                    Some("application") => "Application",
+                    _ => "Entity",
+                };
+                for (name, label) in [(&fact.subject, "Matter"), (&fact.object, object_label)] {
+                    let proposal = SemanticEntityProposal {
+                        name: name.clone(),
+                        entity_type: label.to_string(),
+                        storage_label: label.to_string(),
+                        class_iri: None,
+                    };
+                    let identity = (
+                        proposal.name.clone(),
+                        proposal.entity_type.clone(),
+                        proposal.storage_label.clone(),
+                        proposal.class_iri.clone(),
+                    );
+                    if seen.insert(identity) {
+                        entities.push(proposal);
+                    }
+                }
+            }
+        }
+    }
+    entities
 }
 
 /// Make the vision document reader available for this process, if a model is
@@ -7106,8 +7182,10 @@ async fn run_local_text_ingest_file(
     let mut errors: Vec<String> = Vec::new();
     let mut peer_echoes: Vec<serde_json::Value> = Vec::new();
     let mut peer_echo_check_errors: Vec<String> = Vec::new();
+    let mut semantic_validation = Vec::new();
     let mut chunks_processed = 0usize;
     let mut llm_usage: Option<prism_ingest::llm::UsageInfo> = None;
+    let semantic_policy = prism_ingest::semantic_validation::SemanticValidationPolicy::default();
 
     for (index, (start, end)) in windows.iter().enumerate() {
         let chunk_no = index + 1;
@@ -7225,6 +7303,23 @@ async fn run_local_text_ingest_file(
             }
         };
 
+        // The model proposes; geometry measures. This runs once for the
+        // chunk's whole batch BEFORE its first fact write. Its report cannot
+        // alter, merge, drop, or block a proposal, and unavailable geometry
+        // remains an explicit status in the returned ingest summary.
+        use prism_provenance::FactPayload as _;
+        let local_facts: Vec<_> = new_facts.iter().map(|fact| fact.to_local_fact()).collect();
+        let semantic_entities = semantic_entities_for_text_facts(&new_facts, &classes);
+        let semantic = prism_ingest::semantic_validation::validate_write_best_effort(
+            &store,
+            &semantic_entities,
+            &local_facts,
+            &prov.tenant,
+            &semantic_policy,
+        )
+        .await;
+        semantic_validation.push(semantic.report.clone());
+
         let mut chunk_written = 0usize;
         let mut write_error = None;
         for fact in new_facts {
@@ -7280,6 +7375,25 @@ async fn run_local_text_ingest_file(
                 }
             }
         }
+
+        // Reuse the validation batch's one model call after the unchanged
+        // graph writes. The storage query joins through existing entities,
+        // so endpoints from a refused/unwritten fact cannot be minted here.
+        if let Some(model) = semantic.embedding_model()
+            && let Err(error) = store
+                .store_precomputed_name_embeddings(
+                    semantic.embedding_names(),
+                    semantic.embedding_vectors(),
+                    &prov.tenant,
+                    model,
+                )
+                .await
+        {
+            tracing::warn!(
+                %error,
+                "storing semantic validation vectors failed — graph write unaffected"
+            );
+        }
         match write_error {
             Some(message) => {
                 errors.push(message);
@@ -7301,13 +7415,6 @@ async fn run_local_text_ingest_file(
             usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
         );
     }
-
-    // Best-effort: vectorize every written entity name into the same Turso
-    // store so `prism query --semantic` works without Qdrant. Failures are
-    // logged inside and never fail the ingest.
-    store
-        .embed_entities_best_effort(&written_facts, &prov.tenant)
-        .await;
 
     // Zero facts because the model returned garbage is a different outcome
     // from zero facts because the document held none. Only `parse_error`
@@ -7355,6 +7462,10 @@ async fn run_local_text_ingest_file(
         "peer_echoes": peer_echoes,
         // Facts whose echo check FAILED: unknown status, not clean.
         "peer_echo_check_errors": peer_echo_check_errors,
+        // One report per write-bearing extraction chunk. A status of
+        // `unavailable` or `failed` has `passed: null`; an unchecked write
+        // can therefore never pose as validated in machine-readable output.
+        "semantic_validation": semantic_validation,
     }))
 }
 
@@ -16391,15 +16502,39 @@ data:\n\
     /// precisely NOT to bypass that derivation with an injected path.
     // Same contract as the other ENV_LOCK tests here: the guard must span
     // the awaits so no parallel test observes the overridden HOME.
-    /// Restores the prior `$HOME` on drop. Only construct while holding
-    /// `boot_checks::ENV_LOCK` — HOME is process-global.
-    struct HomeGuard(Option<std::ffi::OsString>);
+    /// Restores the prior `$HOME` and embedding-backend choice on drop. Only
+    /// construct while holding `boot_checks::ENV_LOCK` — both are
+    /// process-global. Text-ingest tests force embeddings off so their mocked
+    /// LLM is the only endpoint they can contact.
+    struct HomeGuard {
+        home: Option<std::ffi::OsString>,
+        embed_backend: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn isolated(home: &Path) -> Self {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                embed_backend: std::env::var_os("PRISM_EMBED_BACKEND"),
+            };
+            unsafe {
+                std::env::set_var("HOME", home);
+                std::env::set_var("PRISM_EMBED_BACKEND", "off");
+            }
+            guard
+        }
+    }
+
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             unsafe {
-                match self.0.take() {
+                match self.home.take() {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
+                }
+                match self.embed_backend.take() {
+                    Some(v) => std::env::set_var("PRISM_EMBED_BACKEND", v),
+                    None => std::env::remove_var("PRISM_EMBED_BACKEND"),
                 }
             }
         }
@@ -16416,8 +16551,7 @@ data:\n\
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = tempfile::tempdir().expect("home tempdir");
-        let _restore_home = HomeGuard(std::env::var_os("HOME"));
-        unsafe { std::env::set_var("HOME", home.path()) };
+        let _restore_home = HomeGuard::isolated(home.path());
 
         let dir = project_with_ontology_config("[llm]\nmax_output_tokens = 8192\n");
         let cfg = build_llm_config(dir.path(), Some("http://127.0.0.1:9"), Some("m"), None)
@@ -16459,8 +16593,7 @@ data:\n\
 
         let home = tempfile::tempdir().expect("home tempdir");
         std::fs::create_dir_all(home.path().join(".prism")).unwrap();
-        let _restore_home = HomeGuard(std::env::var_os("HOME"));
-        unsafe { std::env::set_var("HOME", home.path()) };
+        let _restore_home = HomeGuard::isolated(home.path());
 
         let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
         let root = project.path();
@@ -16488,6 +16621,21 @@ data:\n\
         // old "could not be parsed as JSON" misreport must be gone.
         assert_eq!(summary["facts_written"], 2, "summary: {summary}");
         assert_eq!(summary["parse_error"], serde_json::Value::Null);
+        let semantic = summary["semantic_validation"]
+            .as_array()
+            .expect("semantic validation reports must be machine-readable");
+        assert_eq!(semantic.len(), 1, "one write-bearing chunk: {summary}");
+        for check in ["near_duplicates", "typing", "triple_plausibility"] {
+            assert_eq!(
+                semantic[0][check]["status"], "unavailable",
+                "an absent embedding backend cannot pose as an applied check: {summary}"
+            );
+            assert_eq!(
+                semantic[0][check]["passed"],
+                serde_json::Value::Null,
+                "an unavailable check cannot pose as passed: {summary}"
+            );
+        }
         // The drop is REPORTED, with a reason a human can act on…
         let dropped = summary["dropped_facts"]
             .as_array()
@@ -16575,8 +16723,7 @@ data:\n\
 
         let home = tempfile::tempdir().expect("home tempdir");
         std::fs::create_dir_all(home.path().join(".prism")).unwrap();
-        let _restore_home = HomeGuard(std::env::var_os("HOME"));
-        unsafe { std::env::set_var("HOME", home.path()) };
+        let _restore_home = HomeGuard::isolated(home.path());
 
         let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
         let root = project.path();
@@ -16725,8 +16872,7 @@ data:\n\
 
         let home = tempfile::tempdir().expect("home tempdir");
         std::fs::create_dir_all(home.path().join(".prism")).unwrap();
-        let _restore_home = HomeGuard(std::env::var_os("HOME"));
-        unsafe { std::env::set_var("HOME", home.path()) };
+        let _restore_home = HomeGuard::isolated(home.path());
 
         // The `[ingest] chunk_bytes` knob is exercised here too: unread, the
         // whole text is one window and chunks_total collapses to 1.
@@ -16856,8 +17002,7 @@ data:\n\
 
         let home = tempfile::tempdir().expect("home tempdir");
         std::fs::create_dir_all(home.path().join(".prism")).unwrap();
-        let _restore_home = HomeGuard(std::env::var_os("HOME"));
-        unsafe { std::env::set_var("HOME", home.path()) };
+        let _restore_home = HomeGuard::isolated(home.path());
 
         let project = project_with_ontology_config(
             "[ontology]\nid = \"emmo\"\n\n[ingest]\nchunk_bytes = 2000\n",
@@ -16939,8 +17084,7 @@ data:\n\
 
         let home = tempfile::tempdir().expect("home tempdir");
         std::fs::create_dir_all(home.path().join(".prism")).unwrap();
-        let _restore_home = HomeGuard(std::env::var_os("HOME"));
-        unsafe { std::env::set_var("HOME", home.path()) };
+        let _restore_home = HomeGuard::isolated(home.path());
 
         let project =
             project_with_ontology_config("[ontology]\nid = \"emmo\"\n\n[ingest]\nbatch_rows = 1\n");

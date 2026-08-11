@@ -495,6 +495,55 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
 /// Evidence class is re-capped through `evidence_for_result` on the way in.
 /// `validate_and_stamp` already caps at literature, but this store call is a
 /// separate entry point and must not depend on an upstream promise.
+fn semantic_entities_for_claim_facts(
+    facts: &[prism_provenance::LocalFact],
+) -> Vec<prism_ingest::semantic_validation::SemanticEntityProposal> {
+    use prism_ingest::semantic_validation::SemanticEntityProposal;
+
+    // `write_fact_with_classification` stamps the assertion with the active
+    // ontology artifact but deliberately writes the established legacy node
+    // shapes; the claim payload proposes no endpoint class. Mirror those
+    // exact labels and keep every class IRI absent. This makes typing
+    // explicitly unavailable instead of inventing a model judgement from a
+    // fact kind or confusing an ontology provenance stamp with node typing.
+    let proposal = |name: &str, legacy_label: &str| SemanticEntityProposal {
+        name: name.to_string(),
+        entity_type: legacy_label.to_string(),
+        storage_label: legacy_label.to_string(),
+        class_iri: None,
+    };
+
+    let mut entities = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for fact in facts {
+        let subject = proposal(&fact.subject, "Matter");
+        let object_label = match fact.kind.as_deref() {
+            Some("measurement") => "Property",
+            Some("phase") => "Phase",
+            Some("composition") => "Composition",
+            Some("contains") => "Element",
+            Some("processing") => "Manufacturing",
+            Some("structure") => "CrystalStructure",
+            Some("application") => "Application",
+            _ => "Entity",
+        };
+        let object = proposal(&fact.object, object_label);
+
+        for entity in [subject, object] {
+            let identity = (
+                entity.name.clone(),
+                entity.entity_type.clone(),
+                entity.storage_label.clone(),
+                entity.class_iri.clone(),
+            );
+            if seen.insert(identity) {
+                entities.push(entity);
+            }
+        }
+    }
+    entities
+}
+
 async fn store_claims(
     claims: &[prism_retrieval::claims::ExtractedClaim],
     document_url: &str,
@@ -502,12 +551,17 @@ async fn store_claims(
     db_path: &std::path::Path,
 ) -> Result<serde_json::Value> {
     use prism_provenance::{
-        EvidenceSource, LocalProvenance, MaterialFact, MeasurementCondition, ProvenanceStore,
-        QudtUnit, evidence_for_result,
+        EvidenceSource, FactPayload as _, LocalProvenance, MaterialFact, MeasurementCondition,
+        ProvenanceStore, QudtUnit, evidence_for_result,
     };
 
     if claims.is_empty() {
-        return Ok(json!({ "written": 0, "rejected": 0, "store": null }));
+        return Ok(json!({
+            "written": 0,
+            "rejected": 0,
+            "store": null,
+            "semantic_validation": null,
+        }));
     }
 
     let store = ProvenanceStore::open(db_path).await?;
@@ -535,10 +589,8 @@ async fn store_claims(
         // Local extraction reads the document itself — not a relay.
         origin_source_id: None,
     };
-    store.record_activity(&prov).await?;
-
-    let mut written = 0usize;
     let mut rejected: Vec<serde_json::Value> = Vec::new();
+    let mut prepared = Vec::with_capacity(claims.len());
 
     for claim in claims {
         let unit = match claim.unit.as_deref() {
@@ -626,9 +678,37 @@ async fn store_claims(
             kind: claim.kind.clone(),
         };
 
+        prepared.push((claim, fact));
+    }
+
+    // The model proposes; geometry measures. Every structurally accepted
+    // claim is prepared before the first activity/fact write. Cost per paper:
+    // one embedding-model batch for all distinct endpoints, plus the
+    // validator's batched graph scans -- never one model/SQL round trip per
+    // claim. The advisory report is never consulted to merge, drop, rewrite,
+    // or block a claim.
+    let local_facts: Vec<_> = prepared
+        .iter()
+        .map(|(_, fact)| fact.to_local_fact())
+        .collect();
+    let semantic_entities = semantic_entities_for_claim_facts(&local_facts);
+    let semantic_policy = prism_ingest::semantic_validation::SemanticValidationPolicy::default();
+    let semantic = prism_ingest::semantic_validation::validate_write_best_effort(
+        &store,
+        &semantic_entities,
+        &local_facts,
+        &prov.tenant,
+        &semantic_policy,
+    )
+    .await;
+
+    store.record_activity(&prov).await?;
+
+    let mut written = 0usize;
+    for (claim, fact) in &prepared {
         match store
             .write_fact_with_classification(
-                &fact,
+                fact,
                 &prov,
                 prism_provenance::OntologyClassification {
                     version_iri: ontology.version_iri().as_str(),
@@ -646,12 +726,29 @@ async fn store_claims(
         }
     }
 
+    // Reuse the validator's one model batch for semantic search indexing.
+    // This remains best-effort and happens only after the unchanged writes,
+    // so vector storage can neither block nor alter graph persistence.
+    if let Some(embedding_model) = semantic.embedding_model()
+        && let Err(error) = store
+            .store_precomputed_name_embeddings(
+                semantic.embedding_names(),
+                semantic.embedding_vectors(),
+                &prov.tenant,
+                embedding_model,
+            )
+            .await
+    {
+        tracing::warn!(%error, "papers claim embeddings were not stored");
+    }
+
     Ok(json!({
         "written": written,
         "rejected": rejected.len(),
         "rejections": rejected,
         "store": db_path.display().to_string(),
         "tenant": "local",
+        "semantic_validation": semantic.report,
     }))
 }
 
@@ -918,6 +1015,58 @@ mod store_tests {
         }
     }
 
+    #[test]
+    fn claim_endpoints_mirror_legacy_write_labels_without_inventing_types() {
+        let facts = vec![
+            prism_provenance::LocalFact {
+                subject: "Ti-6Al-4V".into(),
+                predicate: "has_measurement".into(),
+                object: "UTS".into(),
+                value: Some(1140.0),
+                unit: Some("QUDT:MegaPA".into()),
+                confidence: Some(0.9),
+                kind: Some("measurement".into()),
+            },
+            prism_provenance::LocalFact {
+                subject: "Ti-6Al-4V".into(),
+                predicate: "used_in".into(),
+                object: "turbine blade".into(),
+                value: None,
+                unit: None,
+                confidence: Some(0.8),
+                kind: Some("application".into()),
+            },
+        ];
+
+        let entities = semantic_entities_for_claim_facts(&facts);
+        let subject = entities
+            .iter()
+            .find(|entity| entity.name == "Ti-6Al-4V")
+            .expect("subject proposal");
+        assert_eq!(subject.entity_type, "Matter");
+        assert_eq!(subject.storage_label, "Matter");
+        assert_eq!(subject.class_iri, None);
+
+        let object = entities
+            .iter()
+            .find(|entity| entity.name == "UTS")
+            .expect("object proposal");
+        assert_eq!(object.entity_type, "Property");
+        assert_eq!(object.storage_label, "Property");
+        assert_eq!(object.class_iri, None);
+
+        let legacy = entities
+            .iter()
+            .find(|entity| entity.name == "turbine blade")
+            .expect("legacy object proposal");
+        assert_eq!(legacy.entity_type, "Application");
+        assert_eq!(legacy.storage_label, "Application");
+        assert_eq!(
+            legacy.class_iri, None,
+            "the active EMMO subset declares no Application IRI"
+        );
+    }
+
     /// The gap this exists to close: extracted literature claims must land in
     /// the graph, not just be printed.
     #[tokio::test]
@@ -936,6 +1085,17 @@ mod store_tests {
 
         assert_eq!(out["written"], 1, "claim was not written: {out}");
         assert_eq!(out["rejected"], 0);
+        for check in ["near_duplicates", "typing", "triple_plausibility"] {
+            assert_eq!(
+                out["semantic_validation"][check]["status"], "unavailable",
+                "an absent embedding backend cannot pose as applied: {out}"
+            );
+            assert_eq!(
+                out["semantic_validation"][check]["passed"],
+                serde_json::Value::Null,
+                "an unavailable check cannot pose as passed: {out}"
+            );
+        }
 
         let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
         let facts = store
@@ -1027,6 +1187,7 @@ mod store_tests {
             .await
             .expect("store");
         assert_eq!(out["written"], 0);
+        assert_eq!(out["semantic_validation"], serde_json::Value::Null);
         assert!(!db.exists(), "an empty claim set created a database anyway");
     }
 }

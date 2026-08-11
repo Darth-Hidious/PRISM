@@ -5090,6 +5090,7 @@ dependencies = [
  "image",
  "pdf-extract",
  "polars",
+ "prism-embed",
  "prism-llm",
  "prism-ontology",
  "prism-provenance",

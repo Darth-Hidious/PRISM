@@ -41,6 +41,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+use crate::semantic_validation::{
+    NearDuplicatePolicy, OntologyLabelProposal, OntologySemanticValidationReport,
+};
 use corpus::Corpus;
 
 /// Version of the induction prompt. Bump on ANY change to
@@ -154,6 +157,10 @@ pub struct InductionProvenance {
     /// Human-readable notes about merges the builder had to arbitrate
     /// (e.g. conflicting domain/range for one relation label).
     pub merge_notes: Vec<String>,
+    /// Advisory geometry report over raw model-proposed class/relation
+    /// labels, captured before deterministic lexical merging. Legacy
+    /// artifacts default explicitly to `Unavailable`, never `Applied`.
+    pub semantic_validation: OntologySemanticValidationReport,
 }
 
 /// A finished induced ontology — what [`ttl::to_turtle`] serialises and
@@ -576,6 +583,10 @@ pub struct InductionConfig {
     pub max_doc_chars: usize,
     /// Cap on already-known class labels restated per prompt.
     pub max_known_labels: usize,
+    /// Advisory near-duplicate policy for raw ontology labels. Typing and
+    /// triple checks are intentionally not applied to class-label batches;
+    /// instance/assertion geometry is not a reliable ontology-label prior.
+    pub semantic_validation: NearDuplicatePolicy,
 }
 
 impl InductionConfig {
@@ -585,6 +596,7 @@ impl InductionConfig {
             domain: domain.to_string(),
             max_doc_chars: 4000,
             max_known_labels: 60,
+            semantic_validation: NearDuplicatePolicy::default(),
         })
     }
 }
@@ -647,6 +659,7 @@ pub async fn induce(
     let mut builder = OntologyBuilder::new(&config.domain)?;
     let mut failed = 0usize;
     let mut last_error: Option<String> = None;
+    let mut semantic_labels = Vec::new();
 
     for doc in &corpus.docs {
         let text: String = doc.text.chars().take(config.max_doc_chars).collect();
@@ -677,7 +690,27 @@ pub async fn induce(
             }
         }
         match proposal {
-            Some(p) => builder.absorb(p),
+            Some(p) => {
+                semantic_labels.extend(
+                    p.classes
+                        .iter()
+                        .filter(|class| !class.label.trim().is_empty())
+                        .map(|class| OntologyLabelProposal {
+                            label: class.label.clone(),
+                            kind: "class".to_string(),
+                        }),
+                );
+                semantic_labels.extend(
+                    p.relations
+                        .iter()
+                        .filter(|relation| !relation.label.trim().is_empty())
+                        .map(|relation| OntologyLabelProposal {
+                            label: relation.label.clone(),
+                            kind: "relation".to_string(),
+                        }),
+                );
+                builder.absorb(p);
+            }
             None => failed += 1,
         }
     }
@@ -702,15 +735,22 @@ pub async fn induce(
         promoted_at: None,
         dropped_parent_links: Vec::new(),
         merge_notes: Vec::new(),
+        semantic_validation: OntologySemanticValidationReport {
+            policy: config.semantic_validation.clone(),
+            proposals: semantic_labels,
+            ..OntologySemanticValidationReport::default()
+        },
     };
     Ok(builder.finish(provenance))
 }
 
-/// Parse + validate an artifact file — the ONE production gate every
+/// Parse + structurally validate an artifact file — the ONE production gate every
 /// consumer goes through ([`ttl::promote_artifact`], the CLI `ontology
 /// validate` surface, [`register::register_induced_from_path`]). A file
 /// that parses but fails validation is REJECTED loudly with every specific
-/// violation; nothing downstream ever sees it.
+/// violation; nothing downstream ever sees it. Semantic status is preserved
+/// verbatim in provenance and remains advisory; `Unavailable` is never
+/// rewritten to `Applied` by this structural gate.
 pub fn load_validated(path: &std::path::Path) -> Result<InducedOntology> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read ontology artifact {}", path.display()))?;

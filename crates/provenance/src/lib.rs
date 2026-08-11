@@ -37,12 +37,14 @@ use uuid::Uuid;
 pub mod emmo;
 pub mod units;
 pub use emmo::{
-    ActivityDecoding, AssertionClassification, ClassifiedFactNodes, ClassifiedNode, ConditionValue,
-    EvidenceClass, EvidenceContribution, EvidenceSource, FactNodeLabels, FactPayload, GraphEdge,
-    GraphNode, LOCAL_TENANT, LocalAssertion, LocalFact, LocalProvenance, MaterialFact,
-    MeasurementCondition, OntologyClassification, QudtUnit, RecalledFact, RecalledMaterialFact,
-    SemanticEntityHit, StoreBusy, TraversalResult, assertion_id, canonical_key,
-    conditioned_assertion_id, evidence_for_result,
+    ActivityDecoding, AssertionClassification, ClassRegionDistance, ClassifiedFactNodes,
+    ClassifiedNode, ConditionValue, EmbeddingPartition, EntityGeometryCoverage,
+    EntityGeometryNeighbor, EntityGeometryProbe, EvidenceClass, EvidenceContribution,
+    EvidenceSource, FactNodeLabels, FactPayload, GraphEdge, GraphNode, LOCAL_TENANT,
+    LocalAssertion, LocalFact, LocalProvenance, MaterialFact, MeasurementCondition,
+    OntologyClassification, QudtUnit, RecalledFact, RecalledMaterialFact, SemanticEntityHit,
+    StoreBusy, TraversalResult, TripleGeometryNeighbor, TripleGeometryProbe, assertion_id,
+    canonical_key, conditioned_assertion_id, evidence_for_result,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

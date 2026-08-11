@@ -48,6 +48,7 @@ pub mod ontology;
 pub mod pipeline;
 pub mod qudt_units;
 pub mod schema;
+pub mod semantic_validation;
 pub mod text_extract;
 pub mod validation;
 
@@ -116,6 +117,49 @@ pub struct Relationship {
     /// mapping — never stored raw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// Extractor-estimated probability that this relationship is correct.
+    ///
+    /// Only finite values in the closed interval `[0, 1]` are usable. The
+    /// wire parser normalises missing, non-numeric and out-of-range values to
+    /// `None`; the fact mapper applies its documented unverified-extraction
+    /// fallback to `None` (and defensively to invalid values constructed by
+    /// Rust callers). Keeping absence distinct prevents the fallback from
+    /// masquerading as a confidence the model actually supplied.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_relationship_confidence",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub confidence: Option<f64>,
+}
+
+/// Parse an optional model confidence leniently, then retain it only when it
+/// is a finite probability. Unconstrained model endpoints sometimes return
+/// numeric strings; accepting those preserves compatibility, while every
+/// malformed or out-of-domain value remains honestly absent.
+pub(crate) fn deserialize_relationship_confidence<'de, D>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let confidence = match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    Ok(normalize_relationship_confidence(confidence))
+}
+
+/// Retain a relationship confidence only when it is a finite probability.
+///
+/// This is also applied at the graph-write boundary because public Rust
+/// callers can construct [`Relationship`] values without going through
+/// Serde.
+#[must_use]
+pub(crate) fn normalize_relationship_confidence(confidence: Option<f64>) -> Option<f64> {
+    confidence.filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,12 +196,14 @@ mod tests {
                 order: None,
                 value: None,
                 unit: None,
+                confidence: Some(0.91),
             }],
         };
         let json = serde_json::to_string(&set).unwrap();
         let parsed: EntitySet = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.entities.len(), 1);
         assert_eq!(parsed.relationships[0].weight, Some(0.25));
+        assert_eq!(parsed.relationships[0].confidence, Some(0.91));
     }
 
     #[test]
@@ -231,6 +277,7 @@ mod tests {
             order: None,
             value: None,
             unit: None,
+            confidence: None,
         };
         let json = serde_json::to_string(&rel).unwrap();
         assert!(!json.contains("\"weight\""));
@@ -247,6 +294,7 @@ mod tests {
             order: None,
             value: None,
             unit: None,
+            confidence: None,
         };
         let json = serde_json::to_string(&rel).unwrap();
         assert!(!json.contains("\"order\""));
@@ -262,11 +310,29 @@ mod tests {
             order: Some(2),
             value: None,
             unit: None,
+            confidence: Some(0.75),
         };
         let json = serde_json::to_string(&rel).unwrap();
         let parsed: Relationship = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.weight, Some(1.0));
         assert_eq!(parsed.order, Some(2));
+        assert_eq!(parsed.confidence, Some(0.75));
+    }
+
+    #[test]
+    fn relationship_confidence_deserialization_is_honest() {
+        for (input, expected) in [
+            ("0.73", Some(0.73)),
+            (r#""0.42""#, Some(0.42)),
+            ("null", None),
+            ("-0.01", None),
+            ("1.01", None),
+            (r#""not-a-number""#, None),
+        ] {
+            let json = format!(r#"{{"from":"A","rel_type":"R","to":"B","confidence":{input}}}"#);
+            let parsed: Relationship = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.confidence, expected, "input: {input}");
+        }
     }
 
     // --- EmbeddingBatch serde ---

@@ -27,6 +27,7 @@ polars = { workspace = true }
 pdf-extract = { workspace = true }
 image = { workspace = true }
 prism-llm = { path = "../llm" }
+prism-embed = { path = "../embed" }
 prism-ontology = { path = "../ontology" }
 prism-provenance = { path = "../provenance" }
 # The span finder that decides whether a fact is actually IN the document.

@@ -467,6 +467,96 @@ pub struct SemanticEntityHit {
     pub similarity: f32,
 }
 
+/// One physically comparable partition of the local entity-vector store.
+///
+/// `model = None` is a legacy vector written before model identity was
+/// recorded. It remains readable and visible here, but callers must not
+/// silently treat it as belonging to their current embedding model.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingPartition {
+    pub model: Option<String>,
+    pub dimensions: usize,
+    pub count: usize,
+}
+
+/// One caller-computed entity vector to compare with the stored geometry.
+/// `probe_id` is returned unchanged so one batched query can be joined back
+/// to the caller's proposed graph writes without relying on result order.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct EntityGeometryProbe {
+    pub probe_id: usize,
+    /// Proposed display name, used to prioritize trivial lexical variants
+    /// before the per-probe result cap is applied.
+    pub name: String,
+    /// Persisted label/key partition, when the caller knows it. Typing uses
+    /// this with `name` for leave-one-out class-region measurements.
+    pub storage_label: Option<String>,
+    pub vector: Vec<f32>,
+}
+
+/// A raw cosine-distance observation for one stored entity.
+///
+/// These rows are measurements only: this API never merges, rewrites, or
+/// deletes graph data. Nullable type identity preserves legacy rows honestly.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct EntityGeometryNeighbor {
+    pub probe_id: usize,
+    pub name: String,
+    pub storage_label: String,
+    pub entity_type: Option<String>,
+    pub class_iri: Option<String>,
+    pub distance: f64,
+}
+
+/// The mean cosine distance from a probe to the nearest stored exemplars of
+/// one ontology class. `exemplars` is the class's full compatible population;
+/// the mean itself includes at most the caller's `neighbors_per_class` rows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ClassRegionDistance {
+    pub probe_id: usize,
+    pub entity_type: Option<String>,
+    pub class_iri: String,
+    pub exemplars: usize,
+    pub mean_distance: f64,
+}
+
+/// One caller-computed triple geometry probe. Subject and object embeddings
+/// must come from the model named in the corresponding read call.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TripleGeometryProbe {
+    pub probe_id: usize,
+    pub predicate: String,
+    pub subject_vector: Vec<f32>,
+    pub object_vector: Vec<f32>,
+}
+
+/// A same-predicate assertion neighboring a proposed triple in joint
+/// subject/object embedding space. `distance` is the larger endpoint cosine
+/// distance, so one exact endpoint cannot hide a distant other endpoint. It
+/// is a raw prior, never an instruction to mutate.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TripleGeometryNeighbor {
+    pub probe_id: usize,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub value: Option<f64>,
+    pub unit: Option<String>,
+    pub confidence: Option<f64>,
+    pub subject_distance: f64,
+    pub object_distance: f64,
+    /// Maximum endpoint distance. A pair is close only when both endpoints
+    /// satisfy the caller's cutoff.
+    pub distance: f64,
+}
+
+/// Coverage of graph entities by one physically compatible vector partition.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EntityGeometryCoverage {
+    pub entities: usize,
+    pub compatible_embeddings: usize,
+}
+
 /// One stored per-source evidence contribution for an assertion.
 ///
 /// `recall` reports only the immutable FIRST attribution on the parent row;
@@ -516,6 +606,15 @@ pub fn canonical_key(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Lowercase alphanumeric-only surface used solely to prioritize trivial
+/// punctuation/spacing variants in bounded geometry result sets.
+fn lexical_key(name: &str) -> String {
+    name.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|ch| ch.is_alphanumeric())
+        .collect()
 }
 
 /// Tenant- and label-qualified entity key
@@ -1421,6 +1520,8 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS emmo_entity (
             key TEXT PRIMARY KEY,
             name TEXT,
+            canonical_name TEXT,
+            lexical_name TEXT,
             label TEXT,
             entity_type TEXT,
             class_iri TEXT,
@@ -1435,6 +1536,33 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // row remains NULL: inventing an IRI from an old display label would be
     // less honest than recording that its canonical class is unknown.
     crate::add_column_if_absent(conn, "emmo_entity", "class_iri", "TEXT").await?;
+    // The stable key already carries `canonical_key(name)`. Materialize that
+    // identity for indexed batch resolution so harmless spelling drift (for
+    // example `Ti` -> `Ti `) cannot orphan an otherwise valid embedding.
+    crate::add_column_if_absent(conn, "emmo_entity", "canonical_name", "TEXT").await?;
+    crate::add_column_if_absent(conn, "emmo_entity", "lexical_name", "TEXT").await?;
+    conn.execute(
+        r#"UPDATE emmo_entity
+           SET canonical_name = SUBSTR(
+               SUBSTR(key, INSTR(key, '|') + 1),
+               INSTR(SUBSTR(key, INSTR(key, '|') + 1), ':') + 1
+           )
+           WHERE canonical_name IS NULL"#,
+        (),
+    )
+    .await?;
+    // One-statement legacy approximation for the common trivial variants;
+    // all new writes use Rust's Unicode alphanumeric normalization below.
+    conn.execute(
+        r#"UPDATE emmo_entity
+           SET lexical_name = LOWER(
+               REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                   COALESCE(name, ''), ' ', ''), '"', ''), '''', ''), '-', ''), '_', '')
+           )
+           WHERE lexical_name IS NULL"#,
+        (),
+    )
+    .await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_emmo_entity_tenant ON emmo_entity(tenant)",
         (),
@@ -1447,6 +1575,18 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     .await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_emmo_entity_name ON emmo_entity(name)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emmo_entity_canonical_name \
+         ON emmo_entity(tenant, canonical_name)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emmo_entity_lexical_name \
+         ON emmo_entity(tenant, lexical_name)",
         (),
     )
     .await?;
@@ -1524,8 +1664,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
         r#"CREATE TABLE IF NOT EXISTS prov_assertion (
             id TEXT PRIMARY KEY,
             subject TEXT,
+            subject_canonical TEXT,
             predicate TEXT,
             object TEXT,
+            object_canonical TEXT,
             value REAL,
             unit TEXT,
             conditions_json TEXT NOT NULL DEFAULT '[]',
@@ -1587,6 +1729,26 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // the re-key reads it. The migrations themselves run at the end of this
     // function, once every table they touch exists.
     crate::add_column_if_absent(conn, "prov_assertion", "tenant", "TEXT").await?;
+    crate::add_column_if_absent(conn, "prov_assertion", "subject_canonical", "TEXT").await?;
+    crate::add_column_if_absent(conn, "prov_assertion", "object_canonical", "TEXT").await?;
+    conn.execute(
+        "UPDATE prov_assertion SET subject_canonical = LOWER(TRIM(subject)) \
+         WHERE subject_canonical IS NULL",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "UPDATE prov_assertion SET object_canonical = LOWER(TRIM(object)) \
+         WHERE object_canonical IS NULL",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prov_assertion_geometry \
+         ON prov_assertion(tenant, predicate, subject_canonical, object_canonical)",
+        (),
+    )
+    .await?;
     crate::add_column_if_absent(
         conn,
         "prov_assertion",
@@ -1725,20 +1887,34 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // `semantic_search_entities` has to stay honest about when the backend
     // changes. There is likewise no vector index: `libsql_vector_idx` does
     // not exist in this engine, whose only index method is an experimental
-    // sparse-only one, so ranking is a scan — correct, and fine at
-    // local-ingest scale.
+    // sparse-only one, so ranking is a full scan. The validation APIs batch
+    // all document probes into constant SQL round trips, but compute remains
+    // O(probes × stored vectors); this is the explicit million-paper scaling
+    // limit until Turso exposes a compatible dense-vector index.
     conn.execute(
         r#"CREATE TABLE IF NOT EXISTS emmo_embedding (
             key TEXT PRIMARY KEY,
             tenant TEXT,
+            model TEXT,
             dim INTEGER,
             vector BLOB
         )"#,
         (),
     )
     .await?;
+    // Additive model identity for databases created before geometry-backed
+    // validation. Existing rows deliberately remain NULL: attributing an old
+    // vector to whichever backend happens to be configured today would make
+    // an unvalidated model partition pose as a compatible one.
+    crate::add_column_if_absent(conn, "emmo_embedding", "model", "TEXT").await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_emmo_embedding_tenant ON emmo_embedding(tenant)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emmo_embedding_partition \
+         ON emmo_embedding(tenant, model, dim)",
         (),
     )
     .await?;
@@ -2001,21 +2177,26 @@ impl ProvenanceStore {
         self.conn
             .execute(
                 r#"INSERT INTO emmo_entity
-                   (key, name, label, entity_type, class_iri, tenant, props_json, created_at)
-                   VALUES (?1, ?2, ?3, COALESCE(?4, ?3), ?5, ?6, ?7, ?8)
+                   (key, name, canonical_name, lexical_name, label, entity_type, class_iri,
+                    tenant, props_json, created_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, ?5), ?7, ?8, ?9, ?10)
                    ON CONFLICT(key) DO UPDATE SET
                        name = excluded.name,
+                       canonical_name = excluded.canonical_name,
+                       lexical_name = excluded.lexical_name,
                        label = excluded.label,
                        entity_type = CASE
-                           WHEN ?4 IS NULL
+                           WHEN ?6 IS NULL
                                THEN COALESCE(emmo_entity.entity_type, excluded.entity_type)
-                           ELSE ?4
+                           ELSE ?6
                        END,
-                       class_iri = COALESCE(?5, emmo_entity.class_iri),
+                       class_iri = COALESCE(?7, emmo_entity.class_iri),
                        props_json = COALESCE(excluded.props_json, emmo_entity.props_json)"#,
                 [
                     Value::Text(key.clone()),
                     Value::Text(name.to_string()),
+                    Value::Text(canonical_key(name)),
+                    Value::Text(lexical_key(name)),
                     Value::Text(entity.storage_label.to_string()),
                     entity
                         .entity_type
@@ -2897,18 +3078,20 @@ impl ProvenanceStore {
         self.conn
             .execute(
                 r#"INSERT INTO prov_assertion
-                   (id, subject, predicate, object, value, unit,
+                   (id, subject, subject_canonical, predicate, object, object_canonical, value, unit,
                     conditions_json, evidence_class, confidence, corroborations,
                     confidence_basis, activity_id, source, agent, tenant)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                            0.0, 0, 'native',
-                           ?9, ?10, ?11, ?12)
+                           ?11, ?12, ?13, ?14)
                    ON CONFLICT(id) DO NOTHING"#,
                 [
                     Value::Text(id.clone()),
                     Value::Text(a.subject.clone()),
+                    Value::Text(canonical_key(&a.subject)),
                     Value::Text(a.predicate.clone()),
                     Value::Text(a.object.clone()),
+                    Value::Text(canonical_key(&a.object)),
                     value.map_or(Value::Null, Value::Real),
                     unit.map_or(Value::Null, |unit| Value::Text(unit.to_string())),
                     Value::Text(conditions_json),
@@ -3609,7 +3792,27 @@ impl ProvenanceStore {
         // join (and be rolled back with) a raw transaction some other task
         // has open on the one shared connection.
         let _same_handle_guard = self.write_lock.lock().await;
-        self.store_entity_embedding_locked(key, tenant, vector)
+        self.store_entity_embedding_locked(key, tenant, None, vector)
+            .await
+    }
+
+    /// UPSERT one entity vector with the stable embedding backend/model id
+    /// that produced it. New semantic-validation code should use this form;
+    /// [`Self::store_entity_embedding`] remains the legacy, unattributed API
+    /// and deliberately stores `model = NULL`.
+    pub async fn store_entity_embedding_with_model(
+        &self,
+        key: &str,
+        tenant: &str,
+        model: &str,
+        vector: &[f32],
+    ) -> Result<()> {
+        if model.trim().is_empty() {
+            bail!("embedding model id must not be empty");
+        }
+        validate_model_vector(vector, model, key)?;
+        let _same_handle_guard = self.write_lock.lock().await;
+        self.store_entity_embedding_locked(key, tenant, Some(model), vector)
             .await
     }
 
@@ -3618,21 +3821,108 @@ impl ProvenanceStore {
         &self,
         key: &str,
         tenant: &str,
+        model: Option<&str>,
         vector: &[f32],
     ) -> Result<()> {
         self.conn
             .execute(
                 r#"INSERT OR REPLACE INTO emmo_embedding
-                   (key, tenant, dim, vector) VALUES (?1, ?2, ?3, ?4)"#,
+                   (key, tenant, model, dim, vector)
+                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
                 [
                     Value::Text(key.to_string()),
                     Value::Text(tenant.to_string()),
+                    model.map_or(Value::Null, |model| Value::Text(model.to_string())),
                     Value::Integer(vector.len() as i64),
                     Value::Blob(prism_embed::vec_to_le_bytes(vector)),
                 ],
             )
             .await?;
         Ok(())
+    }
+
+    /// Store a caller-precomputed model batch, resolving each display name
+    /// to every matching typed entity row in `tenant`.
+    ///
+    /// The vectors and names are positional peers and must have equal length.
+    /// Canonical duplicate names keep their first vector, matching
+    /// [`Self::embed_and_store_names`]. The whole document costs one SQL
+    /// `INSERT .. SELECT` round trip after the caller's one model batch; it
+    /// never performs one embedding or one database query per name.
+    pub async fn store_precomputed_name_embeddings(
+        &self,
+        names: &[String],
+        vectors: &[Vec<f32>],
+        tenant: &str,
+        model: &str,
+    ) -> Result<usize> {
+        if names.len() != vectors.len() {
+            bail!(
+                "embedding backend returned {} vectors for {} names",
+                vectors.len(),
+                names.len()
+            );
+        }
+        if model.trim().is_empty() {
+            bail!("embedding model id must not be empty");
+        }
+        if names.is_empty() {
+            return Ok(0);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let inputs: Vec<(&String, &Vec<f32>)> = names
+            .iter()
+            .zip(vectors)
+            .filter(|(name, _)| seen.insert(canonical_key(name)))
+            .collect();
+        let dimensions = inputs[0].1.len();
+        for (name, vector) in &inputs {
+            validate_model_vector(vector, model, name)?;
+        }
+        if let Some((name, vector)) = inputs.iter().find(|(_, vector)| vector.len() != dimensions) {
+            bail!(
+                "embedding model `{model}` returned mixed dimensions in one batch: \
+                 expected {dimensions}, got {} for `{name}`",
+                vector.len()
+            );
+        }
+
+        let _same_handle_guard = self.write_lock.lock().await;
+        let mut params = Vec::with_capacity(inputs.len() * 4 + 2);
+        let mut value_rows = Vec::with_capacity(inputs.len());
+        for (name, vector) in inputs {
+            let start = params.len() + 1;
+            value_rows.push(format!(
+                "(?{start}, ?{}, ?{}, ?{})",
+                start + 1,
+                start + 2,
+                start + 3
+            ));
+            params.push(Value::Text(name.clone()));
+            params.push(Value::Text(canonical_key(name)));
+            params.push(Value::Integer(vector.len() as i64));
+            params.push(Value::Blob(prism_embed::vec_to_le_bytes(vector)));
+        }
+        let tenant_param = params.len() + 1;
+        params.push(Value::Text(tenant.to_string()));
+        let model_param = params.len() + 1;
+        params.push(Value::Text(model.to_string()));
+        let sql = format!(
+            "WITH inputs(name, canonical_name, dim, vector) AS (VALUES {}) \
+             INSERT INTO emmo_embedding(key, tenant, model, dim, vector) \
+             SELECT entity.key, ?{tenant_param}, ?{model_param}, inputs.dim, inputs.vector \
+             FROM inputs \
+             JOIN emmo_entity entity \
+               ON entity.tenant = ?{tenant_param} \
+              AND entity.canonical_name = inputs.canonical_name \
+             ON CONFLICT(key) DO UPDATE SET \
+               tenant = excluded.tenant, model = excluded.model, \
+               dim = excluded.dim, vector = excluded.vector",
+            value_rows.join(", ")
+        );
+        let stored = self.conn.execute(&sql, params).await?;
+        Ok(stored as usize)
     }
 
     /// Embed the distinct subject/object names of `facts` with `backend`
@@ -3677,38 +3967,10 @@ impl ProvenanceStore {
             return Ok(0);
         }
         let vectors = backend.embed(&names).await?;
-
-        // Locked AFTER the embedding call (a model pass must never hold the
-        // store's write lock) and across the whole key-resolve/UPSERT loop,
-        // so no vector write can join another task's open raw transaction on
-        // the shared connection.
-        let _same_handle_guard = self.write_lock.lock().await;
-        let mut stored = 0usize;
-        for (name, vector) in names.iter().zip(&vectors) {
-            // The read cursor is fully drained BEFORE the writes below
-            // (turso pre-release mishandles interleaved open statements —
-            // see `record_assertion`).
-            let keys = {
-                let mut rows = self
-                    .conn
-                    .query(
-                        "SELECT key FROM emmo_entity WHERE tenant = ?1 AND name = ?2",
-                        [Value::Text(tenant.to_string()), Value::Text(name.clone())],
-                    )
-                    .await?;
-                let mut keys = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    keys.push(get_str(&row, 0)?);
-                }
-                keys
-            };
-            for key in keys {
-                self.store_entity_embedding_locked(&key, tenant, vector)
-                    .await?;
-                stored += 1;
-            }
-        }
-        Ok(stored)
+        // The write lock is acquired inside this call, AFTER the model pass;
+        // model inference must never hold the store's shared write lock.
+        self.store_precomputed_name_embeddings(&names, &vectors, tenant, backend.id())
+            .await
     }
 
     /// Best-effort entity embedding for freshly written facts: builds the
@@ -3772,6 +4034,400 @@ impl ProvenanceStore {
                 .unwrap_or(0),
             None => 0,
         })
+    }
+
+    /// Inventory the physically comparable embedding partitions stored for
+    /// `tenant`. Dimensions are read from the vector blobs themselves, not
+    /// trusted from the advisory `dim` column. A `None` model is an explicit
+    /// legacy/unattributed partition and must not be used as the current
+    /// model's validation geometry.
+    pub async fn entity_embedding_partitions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<EmbeddingPartition>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT model, LENGTH(vector), COUNT(*) \
+                 FROM emmo_embedding WHERE tenant = ?1 \
+                 GROUP BY model, LENGTH(vector) \
+                 ORDER BY model IS NOT NULL, model, LENGTH(vector)",
+                [Value::Text(tenant.to_string())],
+            )
+            .await?;
+        let mut partitions = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let model = get_opt_str(&row, 0)?;
+            let bytes = row
+                .get_value(1)?
+                .as_integer()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("stored embedding vector has no byte length"))?;
+            if bytes < 0 || bytes % 4 != 0 {
+                bail!("stored embedding vector has invalid byte length {bytes}");
+            }
+            let count =
+                row.get_value(2)?.as_integer().copied().ok_or_else(|| {
+                    anyhow::anyhow!("embedding partition count is not an integer")
+                })?;
+            if count < 0 {
+                bail!("embedding partition count is negative: {count}");
+            }
+            partitions.push(EmbeddingPartition {
+                model,
+                dimensions: (bytes / 4) as usize,
+                count: count as usize,
+            });
+        }
+        Ok(partitions)
+    }
+
+    /// Count how much of a tenant's semantically embeddable entity graph is
+    /// represented in one model/dimension partition. Store-owned synthetic
+    /// `Measurement` reification nodes are excluded from both sides only when
+    /// they have no class IRI and participate in the generated
+    /// `HAS_MEASUREMENT`/`OF_PROPERTY` edge shape. A real ontology may
+    /// legitimately declare a class stored under label `Measurement`; label
+    /// alone must never hide that instance from coverage.
+    pub async fn entity_geometry_coverage(
+        &self,
+        tenant: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> Result<EntityGeometryCoverage> {
+        if model.trim().is_empty() {
+            bail!("embedding model id must not be empty");
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT \
+                    (SELECT COUNT(*) FROM emmo_entity candidate \
+                     WHERE candidate.tenant = ?1 AND NOT ( \
+                       candidate.label = 'Measurement' \
+                       AND candidate.class_iri IS NULL \
+                       AND EXISTS (SELECT 1 FROM emmo_edge incoming \
+                         WHERE incoming.tenant = ?1 \
+                           AND incoming.target_key = candidate.key \
+                           AND incoming.rel_type = 'HAS_MEASUREMENT') \
+                       AND EXISTS (SELECT 1 FROM emmo_edge outgoing \
+                         WHERE outgoing.tenant = ?1 \
+                           AND outgoing.source_key = candidate.key \
+                           AND outgoing.rel_type = 'OF_PROPERTY') \
+                     )), \
+                    (SELECT COUNT(DISTINCT embedding.key) \
+                     FROM emmo_embedding embedding \
+                     JOIN emmo_entity entity ON entity.key = embedding.key \
+                     WHERE embedding.tenant = ?1 AND entity.tenant = ?1 \
+                       AND NOT ( \
+                         entity.label = 'Measurement' \
+                         AND entity.class_iri IS NULL \
+                         AND EXISTS (SELECT 1 FROM emmo_edge incoming \
+                           WHERE incoming.tenant = ?1 \
+                             AND incoming.target_key = entity.key \
+                             AND incoming.rel_type = 'HAS_MEASUREMENT') \
+                         AND EXISTS (SELECT 1 FROM emmo_edge outgoing \
+                           WHERE outgoing.tenant = ?1 \
+                             AND outgoing.source_key = entity.key \
+                             AND outgoing.rel_type = 'OF_PROPERTY') \
+                       ) \
+                       AND embedding.model = ?2 \
+                       AND LENGTH(embedding.vector) = ?3 * 4)",
+                [
+                    Value::Text(tenant.to_string()),
+                    Value::Text(model.to_string()),
+                    Value::Integer(dimensions as i64),
+                ],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("entity geometry coverage query returned no row"))?;
+        let count_at = |index, field: &str| -> Result<usize> {
+            let count = row
+                .get_value(index)?
+                .as_integer()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("{field} is not an integer"))?;
+            usize::try_from(count).map_err(|_| anyhow::anyhow!("{field} is negative: {count}"))
+        };
+        Ok(EntityGeometryCoverage {
+            entities: count_at(0, "entity count")?,
+            compatible_embeddings: count_at(1, "compatible embedding count")?,
+        })
+    }
+
+    /// Compare a batch of proposed entity vectors with the matching stored
+    /// model partition, returning raw cosine distances only.
+    ///
+    /// One `WITH probes .. VALUES` statement handles the whole document.
+    /// `max_distance` and the per-probe result cap are caller policy; this
+    /// storage layer has no semantic threshold and performs no graph writes.
+    pub async fn entity_geometry_neighbors(
+        &self,
+        probes: &[EntityGeometryProbe],
+        tenant: &str,
+        model: &str,
+        max_distance: f64,
+        max_neighbors_per_probe: usize,
+    ) -> Result<Vec<EntityGeometryNeighbor>> {
+        validate_geometry_request(
+            probes.iter().map(|probe| probe.probe_id),
+            model,
+            max_distance,
+        )?;
+        if probes.is_empty() || max_neighbors_per_probe == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (probe_values, mut params) = entity_geometry_probe_values(probes);
+        let tenant_param = params.len() + 1;
+        params.push(Value::Text(tenant.to_string()));
+        let model_param = params.len() + 1;
+        params.push(Value::Text(model.to_string()));
+        let distance_param = params.len() + 1;
+        params.push(Value::Real(max_distance));
+        let limit_param = params.len() + 1;
+        params.push(Value::Integer(max_neighbors_per_probe as i64));
+        let sql = format!(
+            "WITH probes( \
+                probe_id, canonical_name, lexical_name, storage_label, dim, vector \
+             ) AS (VALUES {probe_values}), \
+             candidates AS ( \
+               SELECT probes.probe_id, entity.key, entity.name, entity.label, \
+                      entity.entity_type, entity.class_iri, \
+                      entity.lexical_name = probes.lexical_name AS exact_lexical, \
+                      vector_distance_cos(embedding.vector, probes.vector) AS distance \
+               FROM probes \
+               JOIN emmo_embedding embedding \
+                ON embedding.tenant = ?{tenant_param} \
+                AND embedding.model = ?{model_param} \
+                AND LENGTH(embedding.vector) = probes.dim * 4 \
+               JOIN emmo_entity entity \
+                 ON entity.key = embedding.key \
+                AND entity.tenant = ?{tenant_param} \
+             ), ranked AS ( \
+               SELECT probe_id, key, name, label, entity_type, class_iri, distance, \
+                      ROW_NUMBER() OVER ( \
+                        PARTITION BY probe_id ORDER BY exact_lexical DESC, distance, key \
+                      ) AS neighbor_rank \
+               FROM candidates WHERE distance <= ?{distance_param} \
+             ) \
+             SELECT probe_id, name, label, entity_type, class_iri, distance \
+             FROM ranked WHERE neighbor_rank <= ?{limit_param} \
+             ORDER BY probe_id, distance, key"
+        );
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut neighbors = Vec::new();
+        while let Some(row) = rows.next().await? {
+            neighbors.push(EntityGeometryNeighbor {
+                probe_id: geometry_probe_id(&row, 0)?,
+                name: get_str(&row, 1)?,
+                storage_label: get_str(&row, 2)?,
+                entity_type: get_opt_str(&row, 3)?,
+                class_iri: get_opt_str(&row, 4)?,
+                distance: geometry_number(&row, 5, "entity cosine distance")?,
+            });
+        }
+        Ok(neighbors)
+    }
+
+    /// Measure each probe against every non-NULL ontology class region.
+    /// For each class the result averages its nearest
+    /// `neighbors_per_class` stored exemplars, a caller-selected robustness
+    /// parameter. This is one batched SQL statement and never changes type
+    /// assignments or any other graph state.
+    pub async fn class_region_distances(
+        &self,
+        probes: &[EntityGeometryProbe],
+        tenant: &str,
+        model: &str,
+        neighbors_per_class: usize,
+    ) -> Result<Vec<ClassRegionDistance>> {
+        validate_geometry_request(
+            probes.iter().map(|probe| probe.probe_id),
+            model,
+            f64::INFINITY,
+        )?;
+        if probes.is_empty() || neighbors_per_class == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (probe_values, mut params) = entity_geometry_probe_values(probes);
+        let tenant_param = params.len() + 1;
+        params.push(Value::Text(tenant.to_string()));
+        let model_param = params.len() + 1;
+        params.push(Value::Text(model.to_string()));
+        let neighbors_param = params.len() + 1;
+        params.push(Value::Integer(neighbors_per_class as i64));
+        let sql = format!(
+            "WITH probes( \
+                probe_id, canonical_name, lexical_name, storage_label, dim, vector \
+             ) AS (VALUES {probe_values}), \
+             raw_distances AS ( \
+               SELECT probes.probe_id, entity.key, entity.entity_type, \
+                      entity.class_iri, \
+                      vector_distance_cos(embedding.vector, probes.vector) AS distance \
+               FROM probes \
+               JOIN emmo_embedding embedding \
+                ON embedding.tenant = ?{tenant_param} \
+                AND embedding.model = ?{model_param} \
+                AND LENGTH(embedding.vector) = probes.dim * 4 \
+               JOIN emmo_entity entity \
+                 ON entity.key = embedding.key \
+                AND entity.tenant = ?{tenant_param} \
+                AND entity.class_iri IS NOT NULL \
+                AND NOT ( \
+                    probes.storage_label IS NOT NULL \
+                    AND entity.canonical_name = probes.canonical_name \
+                    AND entity.label = probes.storage_label \
+                ) \
+             ), ranked AS ( \
+               SELECT probe_id, key, entity_type, class_iri, distance, \
+                      COUNT(*) OVER ( \
+                        PARTITION BY probe_id, class_iri \
+                      ) AS exemplar_count, \
+                      ROW_NUMBER() OVER ( \
+                        PARTITION BY probe_id, class_iri ORDER BY distance, key \
+                      ) AS exemplar_rank \
+               FROM raw_distances \
+             ) \
+             SELECT probe_id, MIN(entity_type), class_iri, \
+                    MAX(exemplar_count), AVG(distance) \
+             FROM ranked WHERE exemplar_rank <= ?{neighbors_param} \
+             GROUP BY probe_id, class_iri \
+             ORDER BY probe_id, AVG(distance), class_iri"
+        );
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut distances = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let exemplars = row
+                .get_value(3)?
+                .as_integer()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("class exemplar count is not an integer"))?;
+            if exemplars < 0 {
+                bail!("class exemplar count is negative: {exemplars}");
+            }
+            distances.push(ClassRegionDistance {
+                probe_id: geometry_probe_id(&row, 0)?,
+                entity_type: get_opt_str(&row, 1)?,
+                class_iri: get_str(&row, 2)?,
+                exemplars: exemplars as usize,
+                mean_distance: geometry_number(&row, 4, "class-region mean distance")?,
+            });
+        }
+        Ok(distances)
+    }
+
+    /// Find same-predicate assertions near a batch of proposed triples in
+    /// joint subject/object space. Both endpoint distances must satisfy the
+    /// cutoff independently, and results are bounded per probe before they
+    /// leave Turso. The method reports raw prior evidence and never writes.
+    pub async fn triple_geometry_neighbors(
+        &self,
+        probes: &[TripleGeometryProbe],
+        tenant: &str,
+        model: &str,
+        max_distance: f64,
+        max_neighbors_per_probe: usize,
+    ) -> Result<Vec<TripleGeometryNeighbor>> {
+        validate_geometry_request(
+            probes.iter().map(|probe| probe.probe_id),
+            model,
+            max_distance,
+        )?;
+        if probes.is_empty() || max_neighbors_per_probe == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (probe_values, mut params) = triple_geometry_probe_values(probes);
+        let tenant_param = params.len() + 1;
+        params.push(Value::Text(tenant.to_string()));
+        let model_param = params.len() + 1;
+        params.push(Value::Text(model.to_string()));
+        let distance_param = params.len() + 1;
+        params.push(Value::Real(max_distance));
+        let limit_param = params.len() + 1;
+        params.push(Value::Integer(max_neighbors_per_probe as i64));
+        let sql = format!(
+            "WITH probes( \
+                probe_id, predicate, subject_dim, subject_vector, \
+                object_dim, object_vector \
+             ) AS (VALUES {probe_values}), endpoint_distances AS ( \
+               SELECT probes.probe_id, assertion.id, assertion.subject, \
+                      assertion.predicate, assertion.object, assertion.value, \
+                      assertion.unit, assertion.confidence, \
+                      vector_distance_cos( \
+                          subject_embedding.vector, probes.subject_vector \
+                      ) AS subject_distance, \
+                      vector_distance_cos( \
+                          object_embedding.vector, probes.object_vector \
+                      ) AS object_distance \
+               FROM probes \
+               JOIN prov_assertion assertion \
+                 ON assertion.tenant = ?{tenant_param} \
+                AND assertion.predicate = probes.predicate \
+                AND assertion.conditions_json = '[]' \
+               JOIN emmo_entity subject_entity \
+                 ON subject_entity.tenant = ?{tenant_param} \
+                AND subject_entity.canonical_name = assertion.subject_canonical \
+               JOIN emmo_embedding subject_embedding \
+                 ON subject_embedding.key = subject_entity.key \
+                AND subject_embedding.tenant = ?{tenant_param} \
+                AND subject_embedding.model = ?{model_param} \
+                AND LENGTH(subject_embedding.vector) = probes.subject_dim * 4 \
+               JOIN emmo_entity object_entity \
+                 ON object_entity.tenant = ?{tenant_param} \
+                AND object_entity.canonical_name = assertion.object_canonical \
+               JOIN emmo_embedding object_embedding \
+                 ON object_embedding.key = object_entity.key \
+                AND object_embedding.tenant = ?{tenant_param} \
+                AND object_embedding.model = ?{model_param} \
+                AND LENGTH(object_embedding.vector) = probes.object_dim * 4 \
+             ), deduplicated AS ( \
+               SELECT probe_id, id, subject, predicate, object, value, unit, \
+                      confidence, MIN(subject_distance) AS subject_distance, \
+                      MIN(object_distance) AS object_distance \
+               FROM endpoint_distances \
+               GROUP BY probe_id, id, subject, predicate, object, value, unit, confidence \
+             ), scored AS ( \
+               SELECT *, CASE \
+                   WHEN subject_distance >= object_distance THEN subject_distance \
+                   ELSE object_distance \
+               END AS distance \
+               FROM deduplicated \
+               WHERE subject_distance <= ?{distance_param} \
+                 AND object_distance <= ?{distance_param} \
+             ), ranked AS ( \
+               SELECT *, ROW_NUMBER() OVER ( \
+                   PARTITION BY probe_id ORDER BY distance, id \
+               ) AS neighbor_rank \
+               FROM scored \
+             ) \
+             SELECT probe_id, subject, predicate, object, value, unit, confidence, \
+                    subject_distance, object_distance, distance \
+             FROM ranked WHERE neighbor_rank <= ?{limit_param} \
+             ORDER BY probe_id, distance, id"
+        );
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut neighbors = Vec::new();
+        while let Some(row) = rows.next().await? {
+            neighbors.push(TripleGeometryNeighbor {
+                probe_id: geometry_probe_id(&row, 0)?,
+                subject: get_str(&row, 1)?,
+                predicate: get_str(&row, 2)?,
+                object: get_str(&row, 3)?,
+                value: geometry_optional_number(&row, 4, "assertion value")?,
+                unit: get_opt_str(&row, 5)?,
+                confidence: geometry_optional_number(&row, 6, "assertion confidence")?,
+                subject_distance: geometry_number(&row, 7, "triple subject distance")?,
+                object_distance: geometry_number(&row, 8, "triple object distance")?,
+                distance: geometry_number(&row, 9, "triple pair distance")?,
+            });
+        }
+        Ok(neighbors)
     }
 
     /// Distinct stored `(tenant, vector width in bytes)` pairs across
@@ -4014,10 +4670,135 @@ impl ProvenanceStore {
     }
 }
 
+fn validate_model_vector(vector: &[f32], model: &str, identity: &str) -> Result<()> {
+    if vector.is_empty() {
+        bail!("embedding model `{model}` returned a zero-dimensional vector for `{identity}`");
+    }
+    if vector.iter().any(|component| !component.is_finite()) {
+        bail!("embedding model `{model}` returned a non-finite vector for `{identity}`");
+    }
+    if vector.iter().all(|component| *component == 0.0) {
+        bail!("embedding model `{model}` returned the zero vector for `{identity}`");
+    }
+    Ok(())
+}
+
 /// Tenant every local single-user write uses, and the tenant a default
 /// read scope always includes (see
 /// [`ProvenanceStore::default_read_tenants`]).
 pub const LOCAL_TENANT: &str = "local";
+
+fn validate_geometry_request(
+    probe_ids: impl IntoIterator<Item = usize>,
+    model: &str,
+    max_distance: f64,
+) -> Result<()> {
+    if model.trim().is_empty() {
+        bail!("embedding model id must not be empty");
+    }
+    if max_distance.is_nan() || max_distance < 0.0 {
+        bail!("geometry distance cutoff must be non-negative, got {max_distance}");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for probe_id in probe_ids {
+        if !seen.insert(probe_id) {
+            bail!("duplicate geometry probe id {probe_id}");
+        }
+    }
+    Ok(())
+}
+
+/// Build the VALUES clause and its parameters once for a whole entity-probe
+/// batch. Each vector is exactly one BLOB parameter; dimensions are carried
+/// separately so incompatible stored partitions are filtered before Turso's
+/// vector function is evaluated.
+fn entity_geometry_probe_values(probes: &[EntityGeometryProbe]) -> (String, Vec<Value>) {
+    let mut params = Vec::with_capacity(probes.len() * 6);
+    let mut rows = Vec::with_capacity(probes.len());
+    for probe in probes {
+        let start = params.len() + 1;
+        rows.push(format!(
+            "(?{start}, ?{}, ?{}, ?{}, ?{}, ?{})",
+            start + 1,
+            start + 2,
+            start + 3,
+            start + 4,
+            start + 5
+        ));
+        params.push(Value::Integer(probe.probe_id as i64));
+        params.push(Value::Text(canonical_key(&probe.name)));
+        params.push(Value::Text(lexical_key(&probe.name)));
+        params.push(
+            probe
+                .storage_label
+                .as_ref()
+                .map_or(Value::Null, |label| Value::Text(label.clone())),
+        );
+        params.push(Value::Integer(probe.vector.len() as i64));
+        params.push(Value::Blob(prism_embed::vec_to_le_bytes(&probe.vector)));
+    }
+    (rows.join(", "), params)
+}
+
+/// Triple-probe counterpart of [`entity_geometry_probe_values`]. Subject and
+/// object are independent BLOB parameters because they are compared with
+/// different stored entity roles in the same SQL statement.
+fn triple_geometry_probe_values(probes: &[TripleGeometryProbe]) -> (String, Vec<Value>) {
+    let mut params = Vec::with_capacity(probes.len() * 6);
+    let mut rows = Vec::with_capacity(probes.len());
+    for probe in probes {
+        let start = params.len() + 1;
+        rows.push(format!(
+            "(?{start}, ?{}, ?{}, ?{}, ?{}, ?{})",
+            start + 1,
+            start + 2,
+            start + 3,
+            start + 4,
+            start + 5
+        ));
+        params.push(Value::Integer(probe.probe_id as i64));
+        params.push(Value::Text(probe.predicate.clone()));
+        params.push(Value::Integer(probe.subject_vector.len() as i64));
+        params.push(Value::Blob(prism_embed::vec_to_le_bytes(
+            &probe.subject_vector,
+        )));
+        params.push(Value::Integer(probe.object_vector.len() as i64));
+        params.push(Value::Blob(prism_embed::vec_to_le_bytes(
+            &probe.object_vector,
+        )));
+    }
+    (rows.join(", "), params)
+}
+
+fn geometry_probe_id(row: &turso::Row, index: usize) -> Result<usize> {
+    let id = row
+        .get_value(index)?
+        .as_integer()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("geometry probe id is not an integer"))?;
+    usize::try_from(id).map_err(|_| anyhow::anyhow!("geometry probe id is negative: {id}"))
+}
+
+fn geometry_number(row: &turso::Row, index: usize, field: &str) -> Result<f64> {
+    let value = match row.get_value(index)? {
+        Value::Real(value) => value,
+        Value::Integer(value) => value as f64,
+        value => bail!("{field} is not numeric: {value:?}"),
+    };
+    if !value.is_finite() {
+        bail!("{field} is not finite: {value}");
+    }
+    Ok(value)
+}
+
+fn geometry_optional_number(row: &turso::Row, index: usize, field: &str) -> Result<Option<f64>> {
+    match row.get_value(index)? {
+        Value::Null => Ok(None),
+        Value::Real(value) if value.is_finite() => Ok(Some(value)),
+        Value::Integer(value) => Ok(Some(value as f64)),
+        value => bail!("{field} is not a finite number or NULL: {value:?}"),
+    }
+}
 
 /// `?start, ?start+1, …` — one numbered placeholder per tenant, for
 /// `tenant IN (…)` filters over a caller-chosen tenant set.
@@ -7505,6 +8286,336 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn embedding_partition_inventory_distinguishes_legacy_and_model_vectors() {
+        let db = TempDb::new();
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"CREATE TABLE emmo_embedding (
+                    key TEXT PRIMARY KEY,
+                    tenant TEXT,
+                    dim INTEGER,
+                    vector BLOB
+                )"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO emmo_embedding(key, tenant, dim, vector) \
+                 VALUES (?1, 't1', 3, ?2)",
+                [
+                    Value::Text("legacy-key".into()),
+                    Value::Blob(prism_embed::vec_to_le_bytes(&[1.0, 0.0, 0.0])),
+                ],
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                &format!("PRAGMA user_version = {PROV_EVIDENCE_VERSION}"),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store
+            .store_entity_embedding_with_model("model-key", "t1", "test:model-v2", &[0.0, 1.0, 0.0])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.entity_embedding_partitions("t1").await.unwrap(),
+            [
+                EmbeddingPartition {
+                    model: None,
+                    dimensions: 3,
+                    count: 1,
+                },
+                EmbeddingPartition {
+                    model: Some("test:model-v2".into()),
+                    dimensions: 3,
+                    count: 1,
+                },
+            ],
+            "the migrated NULL partition must stay distinct from attributed vectors"
+        );
+    }
+
+    #[tokio::test]
+    async fn geometry_coverage_excludes_store_owned_measurement_nodes() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let mut measurement = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
+        measurement.value = Some(880.0);
+        measurement.unit = Some("QUDT:MegaPA".into());
+        store.write_fact(&measurement, &test_prov()).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity").await,
+            3,
+            "the storage shape must include its synthetic Measurement node"
+        );
+
+        store
+            .store_precomputed_name_embeddings(
+                &["Ti-6Al-4V".into(), "UTS".into()],
+                &[vec![1.0, 0.0], vec![0.0, 1.0]],
+                "t1",
+                "test:coverage",
+            )
+            .await
+            .unwrap();
+
+        // A user ontology can legitimately persist an extracted class under
+        // this same display label. Its class IRI and absence from the
+        // generated two-edge reification shape keep it in the denominator.
+        store
+            .write_classified_entity(
+                "reported measurement",
+                ClassifiedNode {
+                    entity_type: "Measurement",
+                    storage_label: "Measurement",
+                    class_iri: "https://example.test/Measurement",
+                },
+                None,
+                "t1",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .entity_geometry_coverage("t1", "test:coverage", 2)
+                .await
+                .unwrap(),
+            EntityGeometryCoverage {
+                entities: 3,
+                compatible_embeddings: 2,
+            },
+            "only the generated node is excluded; a real Measurement class stays visible"
+        );
+
+        store
+            .store_precomputed_name_embeddings(
+                &["reported measurement".into()],
+                &[vec![0.7, 0.3]],
+                "t1",
+                "test:coverage",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .entity_geometry_coverage("t1", "test:coverage", 2)
+                .await
+                .unwrap(),
+            EntityGeometryCoverage {
+                entities: 3,
+                compatible_embeddings: 3,
+            },
+            "complete endpoint/class geometry must not be poisoned by reification"
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_entity_and_class_geometry_are_model_scoped_and_canonical() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        for (name, entity_type, class_iri) in [
+            ("Ti ", "Element", "https://example.test/Element"),
+            ("Al", "Element", "https://example.test/Element"),
+            ("LPBF", "Process", "https://example.test/Process"),
+        ] {
+            store
+                .write_classified_entity(
+                    name,
+                    ClassifiedNode {
+                        entity_type,
+                        storage_label: entity_type,
+                        class_iri,
+                    },
+                    None,
+                    "t1",
+                )
+                .await
+                .unwrap();
+        }
+        let names = vec!["Ti".into(), "Al".into(), "LPBF".into()];
+        let vectors = vec![vec![1.0, 0.0], vec![0.8, 0.2], vec![0.0, 1.0]];
+        assert_eq!(
+            store
+                .store_precomputed_name_embeddings(&names, &vectors, "t1", "test:geometry")
+                .await
+                .unwrap(),
+            3,
+            "canonical name resolution must find the stored `Ti ` row from input `Ti`"
+        );
+
+        let probes = vec![
+            EntityGeometryProbe {
+                probe_id: 7,
+                name: "Ti".into(),
+                storage_label: None,
+                vector: vec![1.0, 0.0],
+            },
+            EntityGeometryProbe {
+                probe_id: 9,
+                name: "LPBF".into(),
+                storage_label: None,
+                vector: vec![0.0, 1.0],
+            },
+        ];
+        let neighbors = store
+            .entity_geometry_neighbors(&probes, "t1", "test:geometry", 2.0, 1)
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 2, "one ranked neighbor per batched probe");
+        assert_eq!(
+            (neighbors[0].probe_id, neighbors[0].name.as_str()),
+            (7, "Ti ")
+        );
+        assert_eq!(
+            (neighbors[1].probe_id, neighbors[1].name.as_str()),
+            (9, "LPBF")
+        );
+        assert!(
+            neighbors
+                .iter()
+                .all(|neighbor| neighbor.distance.abs() < 1e-6)
+        );
+
+        let regions = store
+            .class_region_distances(&probes, "t1", "test:geometry", 1)
+            .await
+            .unwrap();
+        for probe_id in [7, 9] {
+            assert!(
+                regions.iter().any(|region| {
+                    region.probe_id == probe_id
+                        && region.class_iri == "https://example.test/Element"
+                        && region.exemplars == 2
+                }),
+                "the class population must remain two when the mean uses one neighbor: {regions:?}"
+            );
+            assert!(
+                regions.iter().any(|region| {
+                    region.probe_id == probe_id
+                        && region.class_iri == "https://example.test/Process"
+                        && region.exemplars == 1
+                }),
+                "the batched class query omitted the Process region: {regions:?}"
+            );
+        }
+
+        assert!(
+            store
+                .entity_geometry_neighbors(&probes, "t1", "other:model", 2.0, 4)
+                .await
+                .unwrap()
+                .is_empty(),
+            "geometry from another model partition must never be mixed in"
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_triple_geometry_reports_prior_without_mutating_graph() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        for assertion in [
+            fact("contains", "Alloy A", "contains", "Ti"),
+            fact("contains", "Alloy B", "contains", "Al"),
+        ] {
+            store.write_fact(&assertion, &prov).await.unwrap();
+        }
+        // Re-ingest updates the entity display spelling while the immutable
+        // assertion keeps its first spelling. Geometry must join canonical
+        // identity, not orphan the assertion on exact display text.
+        store
+            .write_classified_entity(
+                " alloy a ",
+                ClassifiedNode {
+                    entity_type: "Alloy",
+                    storage_label: "Matter",
+                    class_iri: "https://example.test/Alloy",
+                },
+                None,
+                "t1",
+            )
+            .await
+            .unwrap();
+        let names = vec!["Alloy A".into(), "Ti".into(), "Alloy B".into(), "Al".into()];
+        let vectors = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        store
+            .store_precomputed_name_embeddings(&names, &vectors, "t1", "test:triples")
+            .await
+            .unwrap();
+        let assertions_before = count(&store, "SELECT COUNT(*) FROM prov_assertion").await;
+        let entities_before = count(&store, "SELECT COUNT(*) FROM emmo_entity").await;
+
+        let probes = vec![
+            TripleGeometryProbe {
+                probe_id: 2,
+                predicate: "contains".into(),
+                subject_vector: vectors[0].clone(),
+                object_vector: vectors[1].clone(),
+            },
+            TripleGeometryProbe {
+                probe_id: 4,
+                predicate: "contains".into(),
+                subject_vector: vectors[2].clone(),
+                object_vector: vectors[3].clone(),
+            },
+        ];
+        let neighbors = store
+            .triple_geometry_neighbors(&probes, "t1", "test:triples", 1e-6, 4)
+            .await
+            .unwrap();
+        assert_eq!(
+            neighbors.len(),
+            2,
+            "each exact batched probe needs one prior"
+        );
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.probe_id == 2
+                && neighbor.subject == "Alloy A"
+                && neighbor.object == "Ti"
+                && neighbor.confidence == Some(0.8)
+        }));
+        assert!(neighbors.iter().any(|neighbor| {
+            neighbor.probe_id == 4
+                && neighbor.subject == "Alloy B"
+                && neighbor.object == "Al"
+                && neighbor.confidence == Some(0.8)
+        }));
+        assert!(
+            neighbors
+                .iter()
+                .all(|neighbor| neighbor.distance.abs() < 1e-6)
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM prov_assertion").await,
+            assertions_before,
+            "a geometric signal must never drop or rewrite an assertion"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM emmo_entity").await,
+            entities_before,
+            "a geometric signal must never merge or rewrite an entity"
+        );
+    }
+
     /// An empty index is a legitimate empty ANSWER, not a failure — and it
     /// is the only condition allowed to produce `Ok(vec![])`.
     #[tokio::test]
@@ -7540,6 +8651,15 @@ mod tests {
             .unwrap();
         assert_eq!(stored, 4);
         assert_eq!(store.entity_embedding_count("t1").await.unwrap(), 4);
+        assert_eq!(
+            store.entity_embedding_partitions("t1").await.unwrap(),
+            [EmbeddingPartition {
+                model: Some(prism_embed::EmbedBackend::id(&MockEmbed).into()),
+                dimensions: 3,
+                count: 4,
+            }],
+            "embed_and_store_entities must persist EmbedBackend::id()"
+        );
 
         // Query near the Ti-6Al-4V axis → ranked best-first.
         let hits = store

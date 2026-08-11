@@ -54,6 +54,15 @@ pub const DEFAULT_ONTOLOGY_ID: &str = "emmo";
 const REFERENTIAL_INTEGRITY_RULE: &str =
     "Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".";
 
+/// One confidence instruction shared by every ontology prompt. Confidence is
+/// explicitly optional: forcing a number when the extractor cannot assess an
+/// edge would manufacture certainty. The parser retains only finite values in
+/// `[0, 1]`; absence reaches the fact mapper's documented fallback without
+/// being represented as a model-supplied score.
+const RELATIONSHIP_CONFIDENCE_RULE: &str = "For each relationship, optionally set \"confidence\" to your estimated probability that \
+     the relationship is correct, as a finite number from 0 to 1. Omit it when you cannot \
+     assess the relationship; never invent a score just to fill the field.";
+
 /// The typed-measurement rule for the prompt, derived from the SAME
 /// [`Ontology::quantitative_labels`] declaration the extraction schema's
 /// per-type variant enforces structurally. The schema locks the SHAPE;
@@ -227,12 +236,13 @@ pub trait Ontology: Send + Sync {
     /// extraction schema builds these as dedicated variants: a measured
     /// edge (typed `value` + enum-locked `unit` REQUIRED, and NO
     /// `weight`/`order` members at all) or a bare property link (endpoints
-    /// only). The exclusions are measured necessity: given any optional
-    /// numeric slot on the edge, the live 12B model put every per-row
+    /// plus the universal optional bounded confidence field). The exclusions
+    /// are measured necessity: given any optional DOMAIN-VALUE slot on the
+    /// edge, the live 12B model put every per-row
     /// number there and stated no unit (2026-08-10 run 3: all ten values
     /// landed in `weight` on the plain variant, silently unmappable) — a
-    /// number on a measured edge must have exactly one place to go, and
-    /// that place demands its unit.
+    /// measured quantity must have exactly one domain-value channel, and
+    /// that channel demands its unit.
     ///
     /// Default: none — an ontology without measurement relations keeps the
     /// single historical edge shape.
@@ -270,11 +280,12 @@ pub trait Ontology: Send + Sync {
              Every entity \"type\" MUST be one of: {}.\n\
              Every relationship \"rel\" MUST be one of: {}.\n\
              {REFERENTIAL_INTEGRITY_RULE}\n\
+             {RELATIONSHIP_CONFIDENCE_RULE}\n\
              {typed_rule}\
              Return ONLY valid JSON with this structure:\n\
              {{\n\
              \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
-             \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}}]\n\
+             \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null, \"confidence\": null}}]\n\
              }}\n",
             self.classes()
                 .iter()
@@ -469,13 +480,15 @@ impl Ontology for EmmoOntology {
             .to_string()
     }
 
-    /// The legacy `## Instructions` block, verbatim EXCEPT for two added
-    /// lines — deliberate byte-identity breaks documented on
+    /// The legacy `## Instructions` block, verbatim EXCEPT for three added
+    /// rules — deliberate byte-identity breaks documented on
     /// [`EmmoOntology`]: the [`REFERENTIAL_INTEGRITY_RULE`] (the verbatim
     /// text produced extractions the validator refused wholesale) and the
     /// [`typed_value_rule`] (the verbatim text let the model satisfy the
     /// schema by naming a Property `"1100 MPa"`, storing the number as
-    /// unqueryable text — live 2026-08-08).
+    /// unqueryable text — live 2026-08-08), and the
+    /// [`RELATIONSHIP_CONFIDENCE_RULE`] that asks for an optional bounded
+    /// model judgement without forcing fabricated certainty.
     fn extraction_instructions(&self) -> String {
         let typed_rule = typed_value_rule(&self.quantitative_labels());
         format!(
@@ -492,11 +505,12 @@ impl Ontology for EmmoOntology {
              - HAS_PROPERTY (material → property)\n\
              - HAS_PHASE (material → phase)\n\n\
              {REFERENTIAL_INTEGRITY_RULE}\n\
+             {RELATIONSHIP_CONFIDENCE_RULE}\n\
              {typed_rule}\n\n\
              Return ONLY valid JSON with this structure:\n\
              {{\n\
                \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
-               \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}}]\n\
+               \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null, \"confidence\": null}}]\n\
              }}\n"
         )
     }
@@ -1516,6 +1530,25 @@ mod tests {
             !none.contains("NEVER the measured value"),
             "an ontology with no quantitative classes must not gain the rule:\n{none}"
         );
+    }
+
+    #[test]
+    fn every_instruction_builder_requests_optional_bounded_relationship_confidence() {
+        let emmo = EmmoOntology.extraction_instructions();
+        let default =
+            Fake::new("chem-confidence", &["Molecule"], &["REACTS_WITH"]).extraction_instructions();
+        for instructions in [emmo, default] {
+            assert!(
+                instructions.contains("optionally set \"confidence\"")
+                    && instructions.contains("finite number from 0 to 1")
+                    && instructions.contains("Omit it when you cannot assess"),
+                "relationship confidence instruction drifted:\n{instructions}"
+            );
+            assert!(
+                instructions.contains("\"confidence\": null"),
+                "the output example must expose the optional field:\n{instructions}"
+            );
+        }
     }
 
     /// `HAS_PHASE` is now one declared, IRI-backed object property. It was

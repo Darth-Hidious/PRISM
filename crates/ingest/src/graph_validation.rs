@@ -309,6 +309,7 @@ mod tests {
             order: None,
             value: None,
             unit: None,
+            confidence: None,
         }
     }
 
@@ -329,6 +330,7 @@ mod tests {
                     order: None,
                     value: None,
                     unit: None,
+                    confidence: None,
                 },
                 Relationship {
                     from: "NbMoTaW".into(),
@@ -338,6 +340,7 @@ mod tests {
                     order: None,
                     value: None,
                     unit: None,
+                    confidence: None,
                 },
             ],
         };
@@ -428,6 +431,7 @@ mod tests {
                 order: None,
                 value: None,
                 unit: None,
+                confidence: None,
             }],
         };
         let report = validate_graph(&EmmoOntology, &es);
@@ -451,6 +455,7 @@ mod tests {
                     order: None,
                     value: None,
                     unit: None,
+                    confidence: None,
                 },
                 Relationship {
                     from: "ABC".into(),
@@ -460,6 +465,7 @@ mod tests {
                     order: None,
                     value: None,
                     unit: None,
+                    confidence: None,
                 },
             ],
         };

@@ -23,6 +23,7 @@ use super::{
     InducedClass, InducedOntology, InducedRelation, InductionProvenance, OntologyStatus,
     PRISM_META_NS, class_slug, domain_namespace, ontology_iri, relation_slug,
 };
+use crate::semantic_validation::{OntologySemanticValidationReport, SemanticValidationStatus};
 
 const OWL_NS: &str = "http://www.w3.org/2002/07/owl#";
 const SKOS_NS: &str = "http://www.w3.org/2004/02/skos/core#";
@@ -44,6 +45,17 @@ fn escape_literal(s: &str) -> String {
         }
     }
     out
+}
+
+fn semantic_report_json(report: &OntologySemanticValidationReport) -> String {
+    serde_json::to_string(report).unwrap_or_else(|error| {
+        let mut fallback = OntologySemanticValidationReport::default();
+        fallback.near_duplicates.status = SemanticValidationStatus::Failed;
+        fallback.near_duplicates.message = Some(format!(
+            "semantic validation report serialization failed ({error})"
+        ));
+        serde_json::to_string(&fallback).expect("the static failed semantic report must serialize")
+    })
 }
 
 /// Serialise deterministically. Classes/relations are emitted in their
@@ -117,6 +129,10 @@ pub fn to_turtle(o: &InducedOntology) -> String {
         p.documents_failed
     ));
     out.push_str(&format!("    prism:malformedItems {} ", p.malformed_items));
+    out.push_str(&format!(
+        ";\n    prism:semanticValidation \"{}\" ",
+        escape_literal(&semantic_report_json(&p.semantic_validation))
+    ));
     let mut links = p.dropped_parent_links.clone();
     links.sort();
     for link in &links {
@@ -320,6 +336,11 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
         provenance.dropped_parent_links =
             literals_of(&graph, act, &prism.get_unchecked("droppedParentLink"));
         provenance.merge_notes = literals_of(&graph, act, &prism.get_unchecked("mergeNote"));
+        provenance.semantic_validation = match get("semanticValidation") {
+            Some(json) => serde_json::from_str(&json)
+                .context("prism:semanticValidation is not a valid semantic report")?,
+            None => OntologySemanticValidationReport::default(),
+        };
     }
 
     // IRI → prefLabel for every declared class, so subClassOf / domain /
@@ -439,6 +460,9 @@ pub fn promote_artifact(path: &Path) -> Result<InducedOntology> {
 mod tests {
     use super::super::{InductionProvenance, OntologyStatus};
     use super::*;
+    use crate::semantic_validation::{
+        OntologyLabelProposal, SemanticCheckReport, SemanticValidationStatus,
+    };
 
     fn sample() -> InducedOntology {
         InducedOntology {
@@ -485,6 +509,22 @@ mod tests {
                 promoted_at: None,
                 dropped_parent_links: vec!["Material -> Alloy".into()],
                 merge_notes: vec!["relation 'has property': kept domain/range".into()],
+                semantic_validation: OntologySemanticValidationReport {
+                    policy: Default::default(),
+                    proposals: vec![OntologyLabelProposal {
+                        label: "Alloy".into(),
+                        kind: "class".into(),
+                    }],
+                    backend: Some("test:ontology-v1".into()),
+                    near_duplicates: SemanticCheckReport {
+                        status: SemanticValidationStatus::Applied,
+                        candidates: 1,
+                        evaluated: 1,
+                        passed: Some(true),
+                        findings: Vec::new(),
+                        message: None,
+                    },
+                },
             },
         }
     }
@@ -573,6 +613,22 @@ mod tests {
         "#;
         let err = parse_turtle(ttl).unwrap_err();
         assert!(format!("{err:#}").contains("probably-fine"), "{err:#}");
+    }
+
+    #[test]
+    fn legacy_artifact_without_semantic_report_is_explicitly_unavailable() {
+        let ttl = r#"
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            @prefix prism: <https://prism.marc27.com/ontology/meta#> .
+            <https://prism.marc27.com/ontology/x> a owl:Ontology ;
+                prism:domain "x" ;
+                prism:status "draft" .
+        "#;
+        let parsed = parse_turtle(ttl).unwrap();
+        let semantic = parsed.provenance.semantic_validation.near_duplicates;
+        assert_eq!(semantic.status, SemanticValidationStatus::Unavailable);
+        assert_eq!(semantic.evaluated, 0);
+        assert_eq!(semantic.passed, None);
     }
 
     #[test]
