@@ -702,7 +702,7 @@ impl IngestPipeline {
         };
         let store = ProvenanceStore::open(&db_path).await?;
 
-        let (facts, dropped_facts) = to_local_facts(entity_set);
+        let (facts, mut dropped_facts) = to_local_facts(entity_set);
         // The persisted facts keep the historical 0.8 fallback. Semantic
         // fusion uses the same mapper with raw optional confidence retained,
         // so repeated endpoint triples with different values/confidences
@@ -858,14 +858,40 @@ impl IngestPipeline {
             //
             // Writing again is safe and is not a second node: the label comes
             // from the same `classification_of` the fact writes above used, so
-            // the key is identical, and `upsert_entity` merges props with
-            // COALESCE — a later write with no props cannot erase stored ones.
+            // the key is identical.
+            //
+            // But `props_json = COALESCE(excluded.props_json, …)` replaces the
+            // WHOLE column — it is not a per-key JSON merge. `classifications`
+            // is keyed by NAME ALONE (first declaration wins), and Check 2 in
+            // graph_validation keys duplicate detection on (type, name), so two
+            // entities sharing a name under DIFFERENT types reach here
+            // unflagged and both resolve to the first-won class. Letting the
+            // second one write would overwrite the first's properties with a
+            // set the extractor itself attributed to another class — the
+            // alloy's composition replaced by a phase's crystal structure,
+            // unrecoverable, and then served as that alloy's properties.
+            //
+            // So: only the entity whose own declared type produced the winning
+            // classification may write properties for that name. A loser is
+            // dropped and REPORTED, never silently merged into the winner.
             let is_new_node = written.insert(e.name.as_str());
             if !is_new_node && props.is_none() {
                 continue; // a fact wrote the node and there is nothing to add
             }
+            let class = classification_of(&e.name)?;
+            if props.is_some() && class.entity_type != e.entity_type.trim() {
+                dropped_facts.push(format!(
+                    "entity '{}' declared type '{}' collides with '{}' — another entity of that \
+                     name was declared first and owns the stored identity, so these properties \
+                     are dropped rather than overwriting a different class's properties",
+                    e.name,
+                    e.entity_type.trim(),
+                    class.entity_type
+                ));
+                continue;
+            }
             store
-                .write_classified_entity(&e.name, classification_of(&e.name)?, props, &prov.tenant)
+                .write_classified_entity(&e.name, class, props, &prov.tenant)
                 .await?;
         }
 
@@ -1758,6 +1784,108 @@ mod tests {
             hits.iter()
                 .any(|n| n.name == "Nickel" && n.label == "Element"),
             "the relationship-less entity is missing from the store (or mislabeled): {hits:?}",
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = db_path.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Two entities sharing a NAME under DIFFERENT types reach the write loop
+    /// unflagged: `classifications` is keyed by name alone (first wins) and
+    /// graph_validation's duplicate check keys on (type, name). Both then
+    /// resolve to the SAME storage key, and `props_json = COALESCE(excluded, …)`
+    /// replaces the whole column rather than merging keys — so the loser's
+    /// properties would overwrite the winner's with a set the extractor
+    /// attributed to a different class.
+    ///
+    /// Adversarial review caught this as a regression introduced by the
+    /// connected-entity properties fix; the original mutation test only ever
+    /// used one entity per name, where the collision cannot occur.
+    #[tokio::test]
+    async fn a_same_name_different_type_entity_cannot_overwrite_the_winners_properties() {
+        use crate::{Entity, Relationship};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let db_path =
+            std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            llm: None,
+            batch_rows: None,
+            mapping: None,
+            provenance_db: Some(db_path.clone()),
+            ontology: None,
+            on_progress: None,
+            semantic_validation: Default::default(),
+        });
+
+        let entity_set = EntitySet {
+            entities: vec![
+                Entity {
+                    entity_type: "Alloy".into(),
+                    name: "Steel".into(),
+                    properties: serde_json::json!({"composition": "Fe-C"}),
+                },
+                Entity {
+                    entity_type: "Element".into(),
+                    name: "Fe".into(),
+                    properties: serde_json::json!({}),
+                },
+                // Same NAME, different TYPE, declared second.
+                Entity {
+                    entity_type: "Phase".into(),
+                    name: "Steel".into(),
+                    properties: serde_json::json!({"crystal_structure": "bcc"}),
+                },
+            ],
+            relationships: vec![Relationship {
+                from: "Steel".into(),
+                rel_type: "CONTAINS".into(),
+                to: "Fe".into(),
+                weight: Some(0.98),
+                order: None,
+                value: None,
+                unit: None,
+                confidence: None,
+            }],
+        };
+        let source = DataSource {
+            path: "/tmp/alloys.csv".into(),
+            format: "csv".into(),
+        };
+
+        let emmo = crate::ontologies::EmmoOntology;
+        let (_, dropped, _) = pipeline
+            .write_local_graph(&emmo, &entity_set, &source, "local", None)
+            .await
+            .unwrap();
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let props = store
+            .entity_props_json("Steel", "local")
+            .await
+            .unwrap()
+            .expect("the first-declared entity keeps its properties");
+        let props: serde_json::Value = serde_json::from_str(&props).unwrap();
+        assert_eq!(
+            props["composition"].as_str(),
+            Some("Fe-C"),
+            "the winner's properties must survive the colliding write: {props}"
+        );
+        assert!(
+            props.get("crystal_structure").is_none(),
+            "a different class's properties must never land on this node: {props}"
+        );
+        assert!(
+            dropped
+                .iter()
+                .any(|d| d.contains("Steel") && d.contains("collides")),
+            "the dropped properties must be reported, not silently discarded: {dropped:?}"
         );
 
         for suffix in ["", "-wal", "-shm"] {
