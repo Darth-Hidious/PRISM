@@ -13,9 +13,10 @@ pub mod marketplace;
 pub mod node_registry;
 pub mod node_session;
 pub mod platform_error;
+pub mod supabase_auth;
 
 pub use api::PlatformClient;
-pub use auth::DeviceFlowAuth;
+pub use auth::{DeviceFlowAuth, IdentityProviderAdapter, identity_provider_for};
 pub use knowledge::KnowledgeExt;
 pub use platform_error::{PlatformError, PlatformResponseExt};
 

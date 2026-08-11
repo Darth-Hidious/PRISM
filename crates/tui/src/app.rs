@@ -2913,11 +2913,9 @@ impl App {
             return "(unreadable credentials)".to_string();
         };
         let mut v = v;
-        for key in ["access_token", "refresh_token"] {
-            if let Some(t) = v.get(key).and_then(|x| x.as_str())
-                && t.len() > 8
-            {
-                v[key] = Value::String(format!("{}…", &t[..8]));
+        for key in ["access_token", "refresh_token", "identity_provider_key"] {
+            if v.get(key).is_some_and(Value::is_string) {
+                v[key] = Value::String("[REDACTED]".into());
             }
         }
         serde_json::to_string_pretty(&v).unwrap_or_else(|_| "(unreadable)".into())
@@ -4495,6 +4493,18 @@ pub fn clamp_scroll(offset: u16, content_height: u16, viewport: u16) -> u16 {
 mod tests {
     use super::*;
     use crate::backend::FakeScenario;
+
+    #[test]
+    fn credential_viewer_fully_redacts_identity_secrets() {
+        let rendered = App::redact_credentials(
+            r#"{"access_token":"access-secret","refresh_token":"refresh-secret","identity_provider_key":"anon-secret","platform_url":"https://provider.example"}"#,
+        );
+        for secret in ["access-secret", "refresh-secret", "anon-secret"] {
+            assert!(!rendered.contains(secret), "credential leaked: {rendered}");
+        }
+        assert_eq!(rendered.matches("[REDACTED]").count(), 3, "{rendered}");
+        assert!(rendered.contains("https://provider.example"));
+    }
 
     #[test]
     fn clamp_scroll_bounds_are_saturating() {

@@ -106,6 +106,14 @@ async fn spawn_node_b(
     state.provenance_db_path = Some(dir.join("provenance-b.db"));
     state.platform_client =
         Some(prism_client::PlatformClient::new(platform_base).with_token("node-owner-cred"));
+    state.identity_verifier = Some(
+        prism_client::auth::IdentityVerifierConfig::new(
+            Some(prism_client::auth::MARC27_IDENTITY_PROVIDER),
+            platform_base,
+            None,
+        )
+        .expect("configure MARC27 identity verifier"),
+    );
     *state.mesh.write().unwrap() = prism_mesh::init_mesh_with_id(
         prism_mesh::MeshConfig {
             node_name: "machine-b".into(),
@@ -207,14 +215,18 @@ async fn a_pull_lands_bs_facts_under_bs_tenant_with_bs_origin() {
         .expect("publish");
     assert!(publish.status().is_success(), "publish must succeed");
 
-    // ── The arrival: A pulls from B with the OWNER's platform token,
-    // over an operator-named address (`prism mesh sync --peer <url>`) —
-    // the trust level that permits presenting the credential. ──
+    // ── The arrival: A pulls from B with the OWNER's platform token over an
+    // address vouched for by the authenticated platform registry. Merely
+    // typing a peer URL is not identity proof and deliberately gets a
+    // tokenless mint. ──
     let a_store = dir.path().join("provenance-a.db");
     let cfg = Some(prism_mesh::sync::SyncConfig {
         provenance_db: a_store.clone(),
     });
-    let b_peer = prism_mesh::peer_session::PeerAddress::operator_named(&b_base);
+    let b_peer = prism_mesh::peer_session::PeerAddress {
+        url: b_base.clone(),
+        trust: prism_mesh::PeerTrust::PlatformRegistry,
+    };
     let sessions = prism_mesh::peer_session::PeerSessions::new(Some(OWNER_TOKEN.into()));
     let synced = prism_mesh::sync::sync_dataset_from_peer(
         &http,

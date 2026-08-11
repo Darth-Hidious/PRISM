@@ -131,7 +131,7 @@ impl Default for ParallelExecutionPolicy {
 /// follow that endpoint. Launchers that resolved an endpoint from trusted node
 /// configuration provide it separately here. The default is deliberately
 /// credential-free.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct WorkflowExecutionOptions {
     /// Endpoint resolved from trusted node/chat configuration.
     pub trusted_llm_base_url: Option<String>,
@@ -151,6 +151,49 @@ pub struct WorkflowExecutionOptions {
     /// Session credential resolved by a trusted launcher for the local node.
     /// It is deliberately kept out of the caller-controlled values map.
     pub trusted_node_token: Option<String>,
+}
+
+impl std::fmt::Debug for WorkflowExecutionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowExecutionOptions")
+            .field("trusted_llm_base_url", &self.trusted_llm_base_url)
+            .field(
+                "trusted_llm_api_key",
+                &self.trusted_llm_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "trusted_llm_credential_kind",
+                &self.trusted_llm_credential_kind,
+            )
+            .field(
+                "caller_supplied_llm_base_url",
+                &self.caller_supplied_llm_base_url,
+            )
+            .field("trusted_node_port", &self.trusted_node_port)
+            .field(
+                "trusted_node_token",
+                &self.trusted_node_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_options_debug_redacts_both_credentials() {
+        let options = WorkflowExecutionOptions {
+            trusted_llm_api_key: Some("workflow-llm-secret-marker".into()),
+            trusted_node_token: Some("workflow-node-secret-marker".into()),
+            ..WorkflowExecutionOptions::default()
+        };
+        let rendered = format!("{options:?}");
+        assert_eq!(rendered.matches("[REDACTED]").count(), 2, "{rendered}");
+        assert!(!rendered.contains("workflow-llm-secret-marker"));
+        assert!(!rendered.contains("workflow-node-secret-marker"));
+    }
 }
 
 #[derive(Debug, Clone)]

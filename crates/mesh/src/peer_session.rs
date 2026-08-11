@@ -17,9 +17,10 @@
 //! by how the peer's address was learned ([`PeerTrust`]), carried on every
 //! address as a type ([`PeerAddress`]) rather than a convention:
 //!
-//! - [`PeerTrust::OperatorNamed`] / [`PeerTrust::PlatformRegistry`] — the
-//!   human typed it, or the authenticated platform registry vouched for
-//!   it. The token may be presented.
+//! - [`PeerTrust::PlatformRegistry`] — the authenticated platform registry
+//!   vouched for it, so the token may be presented.
+//! - [`PeerTrust::OperatorNamed`] — an arbitrary typed URL is not identity
+//!   proof, so the platform credential is withheld.
 //! - [`PeerTrust::Announced`] — the address arrived over mDNS or a Kafka
 //!   `Announce`, channels any LAN/broker participant can forge. The token
 //!   is NEVER attached; the mint is attempted tokenless (a loopback peer
@@ -70,7 +71,6 @@ impl PeerAddress {
 }
 
 /// Mints and caches one session token per peer.
-#[derive(Debug)]
 pub struct PeerSessions {
     /// Owner's platform credential (`cli-state.json` access token or a
     /// `m27_…` API key). `None` still works against a LOOPBACK peer, which
@@ -79,6 +79,30 @@ pub struct PeerSessions {
     platform_token: Option<String>,
     client: reqwest::Client,
     cache: Mutex<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for PeerSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerSessions")
+            .field(
+                "platform_token",
+                &self.platform_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn peer_session_debug_redacts_platform_token() {
+        let sessions = PeerSessions::new(Some("peer-access-secret-marker".into()));
+        let rendered = format!("{sessions:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("peer-access-secret-marker"));
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -168,24 +192,21 @@ impl PeerSessions {
             .with_context(|| format!("failed to reach {url}"))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            // Do not reflect an untrusted body. A peer can echo the request
+            // credential into its response and make PRISM leak it in output.
             // Degrade honestly: when the credential exists but was WITHHELD
             // because of the channel, say so and name the deliberate path —
             // never silently do nothing, never silently send the token.
             let withheld = platform_token.is_none() && self.platform_token.is_some();
             if withheld {
                 anyhow::bail!(
-                    "peer session mint at {url} returned HTTP {status}: {body}\n\
-                     peer {} was discovered over an unauthenticated channel \
-                     (mDNS/Kafka announce), so your platform credential was \
-                     withheld from it. To pull from this peer deliberately, run \
-                     `prism mesh sync <dataset> --peer {}` — or register both \
-                     nodes with the platform so discovery can vouch for it.",
-                    peer.url,
-                    peer.url
+                    "peer session mint at {url} returned HTTP {status}\n\
+                     the peer destination was not authenticated by the platform \
+                     registry, so your platform credential was withheld. Register \
+                     both nodes with the platform so discovery can vouch for it."
                 );
             }
-            anyhow::bail!("peer session mint at {url} returned HTTP {status}: {body}");
+            anyhow::bail!("peer session mint at {url} returned HTTP {status}");
         }
         let session: SessionResponse = resp
             .json()
@@ -264,8 +285,8 @@ mod tests {
         );
         let first_request = rx.recv().expect("one request reached the peer");
         assert!(
-            first_request.contains("\"platform_token\":\"tok\""),
-            "the mint must present the platform token: {first_request}"
+            first_request.contains("\"platform_token\":null"),
+            "an operator URL must get a tokenless mint: {first_request}"
         );
         assert!(rx.try_recv().is_err(), "a cached session must not re-mint");
 
@@ -273,12 +294,14 @@ mod tests {
         assert_eq!(sessions.session_for(&peer).await.unwrap(), "sess-2");
     }
 
-    /// Trusted channels DO carry the credential: the operator typed the
-    /// address, or the authenticated platform registry vouched for it.
-    /// Asserted on the request the peer actually received.
+    /// Only authenticated registry discovery carries the credential. Merely
+    /// typing a URL does not authenticate its owner.
     #[tokio::test]
-    async fn the_token_is_minted_for_operator_named_and_registry_peers() {
-        for trust in [PeerTrust::OperatorNamed, PeerTrust::PlatformRegistry] {
+    async fn only_registry_peers_receive_the_platform_token() {
+        for (trust, carries_token) in [
+            (PeerTrust::OperatorNamed, false),
+            (PeerTrust::PlatformRegistry, true),
+        ] {
             let (base, rx) = serve_responses(vec![http("200 OK", r#"{"session_id":"sess-t"}"#)]);
             let sessions = PeerSessions::new(Some("owner-secret".into()));
             let peer = PeerAddress { url: base, trust };
@@ -287,10 +310,7 @@ mod tests {
                 .await
                 .expect("trusted mint succeeds");
             let request = rx.recv().expect("request reached the peer");
-            assert!(
-                request.contains(r#""platform_token":"owner-secret""#),
-                "{trust:?} must present the platform token: {request}"
-            );
+            assert_eq!(request.contains("owner-secret"), carries_token, "{request}");
         }
     }
 
@@ -320,9 +340,8 @@ mod tests {
         );
     }
 
-    /// An announced peer that refuses the tokenless mint degrades with the
-    /// remedy — the deliberate `mesh sync --peer` path or platform
-    /// registration — never silence, never the token.
+    /// An announced peer that refuses the tokenless mint names the safe
+    /// platform-registration remedy, never silence and never the token.
     #[tokio::test]
     async fn an_announced_refusal_names_the_remedy() {
         let (base, _rx) = serve_responses(vec![http(
@@ -340,16 +359,35 @@ mod tests {
             .expect_err("the refused mint must surface");
         let msg = err.to_string();
         assert!(
-            msg.contains("unauthenticated channel"),
-            "the refusal must explain WHY the credential was withheld: {msg}"
-        );
-        assert!(
-            msg.contains(&format!("--peer {base}")),
-            "the refusal must name the deliberate path: {msg}"
+            msg.contains("not authenticated by the platform registry"),
+            "{msg}"
         );
         assert!(
             !msg.contains("owner-secret"),
             "the error text must not leak the credential: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_error_body_cannot_reflect_a_secret() {
+        let marker = "reflected-platform-secret-marker";
+        let (base, _rx) = serve_responses(vec![http(
+            "401 Unauthorized",
+            &format!(r#"{{"error":"{marker}"}}"#),
+        )]);
+        let sessions = PeerSessions::new(Some(marker.into()));
+        let err = sessions
+            .session_for(&PeerAddress {
+                url: base,
+                trust: PeerTrust::PlatformRegistry,
+            })
+            .await
+            .expect_err("a 401 must be reported");
+        let message = err.to_string();
+        assert!(message.contains("401"), "{message}");
+        assert!(
+            !message.contains(marker),
+            "reflected secret leaked: {message}"
         );
     }
 }

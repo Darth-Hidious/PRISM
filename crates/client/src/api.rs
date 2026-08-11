@@ -107,11 +107,20 @@ pub struct OrgInfo {
 ///
 /// The base URL should include the API version prefix,
 /// e.g. `https://provider.example/api/v1`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PlatformClient {
     base_url: String,
     client: reqwest::Client,
     credential: Option<PlatformAuth>,
+}
+
+impl std::fmt::Debug for PlatformClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformClient")
+            .field("base_url", &self.base_url)
+            .field("credential", &self.credential)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PlatformClient {
@@ -508,6 +517,31 @@ impl std::fmt::Debug for LlmKeyEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_client_debug_redacts_every_credential_family() {
+        for (credential, kind, secret) in [
+            (
+                PlatformAuth::ApiKey("client-api-key-secret-marker".into()),
+                "ApiKey",
+                "client-api-key-secret-marker",
+            ),
+            (
+                PlatformAuth::Bearer("client-bearer-secret-marker".into()),
+                "Bearer",
+                "client-bearer-secret-marker",
+            ),
+        ] {
+            let client =
+                PlatformClient::new("https://provider.example/api/v1").with_auth(credential);
+            let rendered = format!("{client:?}");
+
+            assert!(rendered.contains("https://provider.example/api/v1"));
+            assert!(rendered.contains(kind), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+    }
 
     #[test]
     fn explicit_api_key_kind_does_not_depend_on_marc27_prefix() {

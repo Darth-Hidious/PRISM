@@ -117,6 +117,7 @@ tonic = { version = "0.14.5", features = ["tls-webpki-roots"] }
 aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4.3"
+jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust_crypto"] }
 rand = "0.8"
 sha2 = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -183,6 +184,7 @@ syn = { version = "2.0.117", features = ["derive", "parsing"] }
 insta = { version = "1.47.2", features = ["json", "yaml"] }
 mockito = "1.7.2"
 pretty_assertions = "1.4.1"
+wiremock = "0.6"
 
 # AI / Agent
 async-openai = { version = "0.34.0", default-features = false, features = ["response-types"] }

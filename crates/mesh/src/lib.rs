@@ -33,12 +33,25 @@ use uuid::Uuid;
 // ── Configuration ──────────────────────────────────────────────────
 
 /// How a node discovers peers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum DiscoveryMethod {
     /// Local network mDNS broadcast/scan.
     Mdns,
     /// MARC27 platform-mediated discovery.
     Platform { url: String, token: String },
+}
+
+impl std::fmt::Debug for DiscoveryMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mdns => f.write_str("Mdns"),
+            Self::Platform { url, .. } => f
+                .debug_struct("Platform")
+                .field("url", url)
+                .field("token", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// Configuration for joining the mesh.
@@ -67,7 +80,7 @@ pub struct MeshConfig {
 /// announced address hands the attacker the owner's MARC27 account.
 ///
 /// This is a TYPE, not a convention: [`peer_session::PeerSessions`]
-/// refuses to attach the platform token for [`PeerTrust::Announced`],
+/// attaches the platform token only for [`PeerTrust::PlatformRegistry`],
 /// so "only call this with a trusted URL" can never decay into a
 /// forgotten comment. The eventual fix is cryptographic peer
 /// verification (`federation::verify_peer`), but nothing issues a
@@ -76,7 +89,8 @@ pub struct MeshConfig {
 /// channel the address came from IS the trust decision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerTrust {
-    /// The operator typed the address (`prism mesh sync --peer <url>`).
+    /// The operator typed the address (`prism mesh sync --peer <url>`). This
+    /// records intent, not remote identity, so provider tokens stay withheld.
     OperatorNamed,
     /// The authenticated platform node registry vouched for the address
     /// (`platform_discovery` — both machines registered it at `node up`).
@@ -93,7 +107,7 @@ impl PeerTrust {
     /// credential during session minting.
     #[must_use]
     pub fn may_carry_platform_token(self) -> bool {
-        matches!(self, Self::OperatorNamed | Self::PlatformRegistry)
+        matches!(self, Self::PlatformRegistry)
     }
 }
 
@@ -269,7 +283,7 @@ pub fn load_or_create_node_id(state_dir: &std::path::Path) -> Result<Uuid> {
 }
 
 /// Options for [`start_mesh`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MeshStartOptions {
     /// Node name (used in mDNS TXT records).
     pub node_name: String,
@@ -296,6 +310,54 @@ pub struct MeshStartOptions {
     /// this field, a flag-only `--offline` fell through to the auth check
     /// and the refusal was mis-reported as "not authenticated".
     pub offline: bool,
+}
+
+impl std::fmt::Debug for MeshStartOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshStartOptions")
+            .field("node_name", &self.node_name)
+            .field("publish_port", &self.publish_port)
+            .field("broadcast", &self.broadcast)
+            .field("capabilities", &self.capabilities)
+            .field("discovery_interval_secs", &self.discovery_interval_secs)
+            .field("event_tx", &self.event_tx.as_ref().map(|_| "configured"))
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("offline", &self.offline)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_debug_redacts_platform_credentials() {
+        let discovery = DiscoveryMethod::Platform {
+            url: "https://provider.example/api/v1".into(),
+            token: "discovery-access-secret-marker".into(),
+        };
+        let options = MeshStartOptions {
+            node_name: "test-node".into(),
+            publish_port: 0,
+            broadcast: false,
+            capabilities: vec![],
+            discovery_interval_secs: 30,
+            event_tx: None,
+            auth_token: Some("mesh-access-secret-marker".into()),
+            offline: false,
+        };
+
+        let discovery_debug = format!("{discovery:?}");
+        let options_debug = format!("{options:?}");
+        assert!(discovery_debug.contains("[REDACTED]"));
+        assert!(options_debug.contains("[REDACTED]"));
+        assert!(!discovery_debug.contains("discovery-access-secret-marker"));
+        assert!(!options_debug.contains("mesh-access-secret-marker"));
+    }
 }
 
 /// Start mesh networking as a background task.

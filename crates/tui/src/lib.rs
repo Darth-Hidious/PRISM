@@ -81,10 +81,38 @@ pub enum BackendMode {
 /// Platform base URL (`…/api/v1`) + bearer token for cheap billing/credits
 /// polling at turn boundaries. Absent for offline / fake backends, in which
 /// case no credits are shown.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PlatformAuth {
     pub base_url: String,
     pub token: String,
+}
+
+impl std::fmt::Debug for PlatformAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformAuth")
+            .field("base_url", &self.base_url)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod platform_auth_debug_tests {
+    use super::*;
+
+    #[test]
+    fn run_config_debug_redacts_platform_access_token() {
+        let config = RunConfig {
+            platform: Some(PlatformAuth {
+                base_url: "https://provider.example/api/v1".into(),
+                token: "tui-access-token-secret-marker".into(),
+            }),
+            ..RunConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("tui-access-token-secret-marker"));
+    }
 }
 
 /// Configuration for [`run_with_config`].

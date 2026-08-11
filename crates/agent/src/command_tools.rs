@@ -69,7 +69,7 @@ pub(crate) fn current_platform_access() -> CommandToolPlatformAccess {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CommandToolRuntime {
     pub current_exe: PathBuf,
     pub project_root: PathBuf,
@@ -87,6 +87,39 @@ pub struct CommandToolRuntime {
     pub llm_api_key: Option<String>,
     /// Explicit wire semantics paired with `llm_api_key`.
     pub llm_credential_kind: Option<prism_llm::LlmCredentialKind>,
+}
+
+impl std::fmt::Debug for CommandToolRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandToolRuntime")
+            .field("current_exe", &self.current_exe)
+            .field("project_root", &self.project_root)
+            .field("python_bin", &self.python_bin)
+            .field("llm_base_url", &self.llm_base_url)
+            .field("llm_model", &self.llm_model)
+            .field(
+                "llm_api_key",
+                &self.llm_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("llm_credential_kind", &self.llm_credential_kind)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn command_runtime_debug_redacts_llm_credential() {
+        let runtime = CommandToolRuntime {
+            llm_api_key: Some("agent-access-secret-marker".into()),
+            ..CommandToolRuntime::default()
+        };
+        let rendered = format!("{runtime:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("agent-access-secret-marker"));
+    }
 }
 
 /// Which of a subcommand's OWN flags a free-form-argv tool may hand to clap.

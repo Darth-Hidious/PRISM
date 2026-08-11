@@ -178,7 +178,7 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
     let platform_checks = boot_checks::run_boot_checks_with_node_token(
         state.credentials.as_ref(),
         endpoints.as_ref(),
-        node_token.as_ref().map(|token| token.key.as_str()),
+        node_token.as_ref(),
     )
     .await;
     print_check_lines(&platform_checks);

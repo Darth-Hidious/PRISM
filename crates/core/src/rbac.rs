@@ -108,51 +108,6 @@ pub enum Permission {
     ViewAudit,
 }
 
-// ---------------------------------------------------------------------------
-// Legacy compatibility
-// ---------------------------------------------------------------------------
-
-/// Legacy hosted-platform role type retained for source and wire compatibility.
-///
-/// New production integrations must define a provider adapter outside
-/// `prism-core` and map directly into [`LocalRole`].
-#[deprecated(
-    note = "provider roles are external inputs; map them into prism_core::rbac::LocalRole in a provider adapter"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlatformRole {
-    Owner,
-    Admin,
-    Member,
-    Viewer,
-}
-
-#[allow(deprecated)]
-impl PlatformRole {
-    /// Convert a platform role string (from API) to the enum.
-    pub fn from_api_str(s: &str) -> Option<Self> {
-        match s {
-            "owner" => Some(PlatformRole::Owner),
-            "admin" => Some(PlatformRole::Admin),
-            "member" => Some(PlatformRole::Member),
-            "viewer" => Some(PlatformRole::Viewer),
-            _ => None,
-        }
-    }
-
-    /// Map a platform role to the corresponding local role.
-    ///
-    /// Owner/Admin → NodeAdmin, Member → Engineer, Viewer → Viewer.
-    pub fn to_local_role(self) -> LocalRole {
-        match self {
-            PlatformRole::Owner | PlatformRole::Admin => LocalRole::NodeAdmin,
-            PlatformRole::Member => LocalRole::Engineer,
-            PlatformRole::Viewer => LocalRole::Viewer,
-        }
-    }
-}
-
 /// Result of atomically replacing one provider's external role assignments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExternalRoleReconciliation {
@@ -441,6 +396,38 @@ impl RbacEngine {
             .optional()?
             .and_then(|role| LocalRole::from_str(&role));
         Ok(role)
+    }
+
+    /// Revoke one external assignment identified by its provider and subject.
+    ///
+    /// The compound key is intentional: revoking a Supabase subject, for
+    /// example, can never remove a same-looking subject owned by another
+    /// provider or a role assigned directly by a PRISM administrator.
+    /// Returns `true` when an assignment existed and was removed.
+    pub fn revoke_external_role(&self, provider: &str, subject_id: &str) -> Result<bool> {
+        ensure!(
+            !provider.trim().is_empty(),
+            "external role provider must not be empty"
+        );
+        ensure!(
+            !subject_id.trim().is_empty(),
+            "external role subject must not be empty"
+        );
+
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM external_role_assignments
+                 WHERE provider = ?1 AND subject_id = ?2",
+                params![provider, subject_id],
+            )
+            .with_context(|| {
+                format!("failed to revoke external role for subject {subject_id} from {provider}")
+            })?;
+        if removed > 0 {
+            tracing::info!(provider, subject_id, "external role revoked");
+        }
+        Ok(removed > 0)
     }
 
     /// List one provider's mapped PRISM role assignments.
@@ -748,6 +735,74 @@ mod tests {
         assert_eq!(e.get_role("shared-subject").unwrap(), None);
     }
 
+    #[test]
+    fn external_role_revocation_is_scoped_to_provider_and_subject() {
+        let e = engine();
+        e.assign_role("local-alice", LocalRole::Engineer).unwrap();
+        e.assign_external_role(
+            "provider-a",
+            "shared-subject",
+            "provider-a-alice",
+            LocalRole::NodeAdmin,
+        )
+        .unwrap();
+        e.assign_external_role(
+            "provider-b",
+            "shared-subject",
+            "provider-b-alice",
+            LocalRole::Analyst,
+        )
+        .unwrap();
+        e.assign_external_role(
+            "provider-a",
+            "another-subject",
+            "provider-a-bob",
+            LocalRole::Viewer,
+        )
+        .unwrap();
+
+        assert!(
+            e.revoke_external_role("provider-a", "shared-subject")
+                .unwrap()
+        );
+        assert!(
+            !e.revoke_external_role("provider-a", "shared-subject")
+                .unwrap()
+        );
+
+        assert_eq!(
+            e.get_external_role("provider-a", "shared-subject").unwrap(),
+            None
+        );
+        assert_eq!(
+            e.get_external_role("provider-b", "shared-subject").unwrap(),
+            Some(LocalRole::Analyst)
+        );
+        assert_eq!(
+            e.get_external_role("provider-a", "another-subject")
+                .unwrap(),
+            Some(LocalRole::Viewer)
+        );
+        assert_eq!(
+            e.get_local_role("local-alice").unwrap(),
+            Some(LocalRole::Engineer)
+        );
+    }
+
+    #[test]
+    fn external_role_revocation_rejects_ambiguous_keys() {
+        let e = engine();
+        e.assign_external_role("provider-a", "alice", "alice", LocalRole::NodeAdmin)
+            .unwrap();
+
+        assert!(e.revoke_external_role("", "alice").is_err());
+        assert!(e.revoke_external_role("provider-a", " ").is_err());
+        assert_eq!(
+            e.get_external_role("provider-a", "alice").unwrap(),
+            Some(LocalRole::NodeAdmin)
+        );
+    }
+
     // -- Permission checks per role ------------------------------------------
 
     #[test]
@@ -953,53 +1008,6 @@ mod tests {
             let parsed: Permission = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, perm);
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn platform_role_serde_roundtrip() {
-        for role in [
-            PlatformRole::Owner,
-            PlatformRole::Admin,
-            PlatformRole::Member,
-            PlatformRole::Viewer,
-        ] {
-            let json = serde_json::to_string(&role).unwrap();
-            let parsed: PlatformRole = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, role);
-        }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn platform_role_from_api_str() {
-        assert_eq!(
-            PlatformRole::from_api_str("owner"),
-            Some(PlatformRole::Owner)
-        );
-        assert_eq!(
-            PlatformRole::from_api_str("admin"),
-            Some(PlatformRole::Admin)
-        );
-        assert_eq!(
-            PlatformRole::from_api_str("member"),
-            Some(PlatformRole::Member)
-        );
-        assert_eq!(
-            PlatformRole::from_api_str("viewer"),
-            Some(PlatformRole::Viewer)
-        );
-        assert_eq!(PlatformRole::from_api_str("superadmin"), None);
-        assert_eq!(PlatformRole::from_api_str(""), None);
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn platform_to_local_role_mapping() {
-        assert_eq!(PlatformRole::Owner.to_local_role(), LocalRole::NodeAdmin);
-        assert_eq!(PlatformRole::Admin.to_local_role(), LocalRole::NodeAdmin);
-        assert_eq!(PlatformRole::Member.to_local_role(), LocalRole::Engineer);
-        assert_eq!(PlatformRole::Viewer.to_local_role(), LocalRole::Viewer);
     }
 
     #[test]

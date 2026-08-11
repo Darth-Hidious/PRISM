@@ -12,9 +12,12 @@
 use std::time::Duration;
 
 use prism_client::PlatformError;
-use prism_runtime::auth::{PlatformAuth, resolve_environment_credential};
+use prism_runtime::auth::{
+    PlatformAuth, resolve_environment_credential, stored_bearer_for_endpoints,
+    stored_node_bearer_for_endpoints,
+};
 use prism_runtime::platform_env::PlatformVar;
-use prism_runtime::{PlatformEndpoints, StoredCredentials};
+use prism_runtime::{PlatformEndpoints, StoredCredentials, StoredNodeToken};
 
 use crate::boot;
 
@@ -106,7 +109,7 @@ pub async fn run_boot_checks(
     if prism_runtime::offline::enabled() {
         return offline_checks().await;
     }
-    let credential = boot_credential(creds);
+    let credential = boot_credential(creds, endpoints);
     let Some(endpoints) = endpoints else {
         return endpoint_not_configured_checks(!matches!(credential, BootCredential::Absent)).await;
     };
@@ -119,12 +122,12 @@ pub async fn run_boot_checks(
 pub async fn run_boot_checks_with_node_token(
     creds: Option<&StoredCredentials>,
     endpoints: Option<&PlatformEndpoints>,
-    node_token: Option<&str>,
+    node_token: Option<&StoredNodeToken>,
 ) -> Vec<boot::BootCheck> {
     if prism_runtime::offline::enabled() {
         return offline_checks().await;
     }
-    let credential = boot_credential_with_node_token(creds, node_token);
+    let credential = boot_credential_with_node_token(creds, endpoints, node_token);
     let Some(endpoints) = endpoints else {
         return endpoint_not_configured_checks(!matches!(credential, BootCredential::Absent)).await;
     };
@@ -176,6 +179,9 @@ async fn offline_checks() -> Vec<boot::BootCheck> {
 pub(crate) enum BootCredential {
     /// Usable. Attach it and run the checks.
     Ready(PlatformAuth),
+    /// A stored bearer exists but does not belong to the selected endpoint.
+    /// The message contains configuration metadata only, never the token.
+    Refused(String),
     /// Nothing configured.
     Absent,
 }
@@ -203,29 +209,66 @@ pub(crate) enum BootCredential {
 /// fine; we simply never sent a credential. That is a lying check, and it hit
 /// exactly the headless/agent install this module documents as supported.
 ///
-fn boot_credential(creds: Option<&StoredCredentials>) -> BootCredential {
-    boot_credential_with_node_token(creds, None)
+fn boot_credential(
+    creds: Option<&StoredCredentials>,
+    endpoints: Option<&PlatformEndpoints>,
+) -> BootCredential {
+    boot_credential_with_node_token(creds, endpoints, None)
 }
 
 fn boot_credential_with_node_token(
     creds: Option<&StoredCredentials>,
-    node_token: Option<&str>,
+    endpoints: Option<&PlatformEndpoints>,
+    node_token: Option<&StoredNodeToken>,
 ) -> BootCredential {
     // PRISM defines the API-key variable's wire shape. Providers define their
     // own key contents; the frozen `m27_` prefix remains accepted but is not a
     // requirement for an independent provider.
-    if let Some(credential) = resolve_environment_credential() {
+    // The endpoint owns the credential vocabulary. In particular,
+    // PRISM_API_KEY is Supabase's public project key, not a user credential,
+    // and must never displace the verified session Bearer. With no endpoint
+    // there is no provider to classify against; retain the generic check only
+    // so the boot row can explain that a credential lacks its endpoint.
+    let environment_credential = endpoints
+        .and_then(PlatformEndpoints::environment_credential)
+        .or_else(|| {
+            endpoints
+                .is_none()
+                .then(resolve_environment_credential)
+                .flatten()
+        });
+    if let Some(credential) = environment_credential {
         return BootCredential::Ready(credential);
     }
-    if let Some(value) = node_token.map(str::trim).filter(|value| !value.is_empty()) {
-        return BootCredential::Ready(PlatformAuth::classify(value));
+    if let Some(token) = node_token {
+        let Some(endpoints) = endpoints else {
+            return BootCredential::Refused(
+                "stored node credential binding refused: no platform endpoint is configured".into(),
+            );
+        };
+        return match stored_node_bearer_for_endpoints(endpoints, token) {
+            Ok(Some(credential)) => BootCredential::Ready(credential),
+            Ok(None) => BootCredential::Absent,
+            Err(error) => BootCredential::Refused(error.to_string()),
+        };
     }
-    // The stored session is LAST, matching the resolver.
-    creds
-        .map(|c| c.access_token.trim())
-        .filter(|t| !t.is_empty())
-        .map(|t| BootCredential::Ready(PlatformAuth::Bearer(t.to_string())))
-        .unwrap_or(BootCredential::Absent)
+    // The stored session is LAST, matching the resolver, and is usable only
+    // with the provider + normalized URL recorded at login.
+    match (endpoints, creds) {
+        (Some(endpoints), Some(credentials)) => {
+            match stored_bearer_for_endpoints(endpoints, credentials) {
+                Ok(Some(credential)) => BootCredential::Ready(credential),
+                Ok(None) => BootCredential::Absent,
+                Err(error) => BootCredential::Refused(error.to_string()),
+            }
+        }
+        (None, Some(credentials)) if !credentials.access_token.trim().is_empty() => {
+            BootCredential::Refused(
+                "stored session binding refused: no platform endpoint is configured".to_string(),
+            )
+        }
+        _ => BootCredential::Absent,
+    }
 }
 
 /// The project scope the boot checks should use.
@@ -291,6 +334,17 @@ async fn run_boot_checks_with(
     // 1. Platform connection — use /agent/capabilities (always 200 with auth)
     let credential = match credential {
         BootCredential::Ready(credential) => credential,
+        BootCredential::Refused(reason) => {
+            checks.push(boot::BootCheck {
+                name: "Platform".into(),
+                result: reason,
+                ok: false,
+                dots: 8,
+                delay_ms: 30,
+            });
+            push_local_checks(&client, &mut checks).await;
+            return checks;
+        }
         // The absent arm states the real condition rather than firing an
         // unauthenticated request and blaming the host for the resulting 401.
         // A malformed credential names ITS OWN defect: "unreachable" would
@@ -630,7 +684,13 @@ mod tests {
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
             provider: None,
         };
-        let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
+        let checks = run_boot_checks_with(
+            None,
+            &endpoints,
+            true,
+            boot_credential(None, Some(&endpoints)),
+        )
+        .await;
         unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
         clear_platform_env();
 
@@ -689,7 +749,7 @@ mod tests {
         clear_platform_env();
         unsafe { std::env::set_var("PRISM_API_KEY", "provider-defined-key") };
         assert_eq!(
-            boot_credential(None),
+            boot_credential(None, None),
             BootCredential::Ready(PlatformAuth::ApiKey("provider-defined-key".into()))
         );
         clear_platform_env();
@@ -790,21 +850,22 @@ mod tests {
         // The env API key OUTRANKS a stored session, as in the resolver.
         unsafe { std::env::set_var("PRISM_API_KEY", "m27_env") };
         assert_eq!(
-            boot_credential(Some(&creds_with("session-jwt"))),
+            boot_credential(Some(&creds_with("session-jwt")), None),
             BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string())),
             "an env API key must win over a stored session"
         );
 
         // Same with no session at all: classified by shape, not assumed Bearer.
         assert_eq!(
-            boot_credential(None),
+            boot_credential(None, None),
             BootCredential::Ready(PlatformAuth::ApiKey("m27_env".to_string()))
         );
 
         // The stored session is the LAST resort, not the first.
         clear_platform_env();
+        let marc27 = PlatformEndpoints::marc27();
         assert_eq!(
-            boot_credential(Some(&creds_with("session-jwt"))),
+            boot_credential(Some(&creds_with("session-jwt")), Some(&marc27)),
             BootCredential::Ready(PlatformAuth::Bearer("session-jwt".to_string())),
             "with nothing in the env, the session is used"
         );
@@ -813,17 +874,95 @@ mod tests {
         clear_platform_env();
         unsafe { std::env::set_var("MARC27_TOKEN", "jwt-shaped") };
         assert_eq!(
-            boot_credential(None),
+            boot_credential(None, None),
             BootCredential::Ready(PlatformAuth::Bearer("jwt-shaped".to_string()))
         );
 
         clear_platform_env();
-        assert_eq!(boot_credential(None), BootCredential::Absent);
+        assert_eq!(boot_credential(None, None), BootCredential::Absent);
+    }
+
+    #[test]
+    fn supabase_anon_key_is_not_a_boot_bearer_credential() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        unsafe { std::env::set_var("PRISM_API_KEY", "supabase-public-anon-key") };
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://project.supabase.co",
+            Some("supabase".to_string()),
+        );
+        let stored = StoredCredentials {
+            access_token: "verified-user-session".into(),
+            platform_url: "https://project.supabase.co".into(),
+            platform_provider: Some("supabase".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            boot_credential(Some(&stored), Some(&endpoints)),
+            BootCredential::Ready(PlatformAuth::Bearer("verified-user-session".into())),
+            "the public Supabase anon key must not displace a verified session"
+        );
+
+        unsafe { std::env::set_var("PRISM_TOKEN", "explicit-user-token") };
+        assert_eq!(
+            boot_credential(Some(&stored), Some(&endpoints)),
+            BootCredential::Ready(PlatformAuth::Bearer("explicit-user-token".into())),
+            "explicit token variables retain precedence for Supabase"
+        );
+        clear_platform_env();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn unrelated_endpoint_refuses_stored_supabase_bearer_without_a_request() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_env();
+        let _offline = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let server = wiremock::MockServer::start().await;
+        let endpoints =
+            PlatformEndpoints::from_url_with_provider(&server.uri(), Some("supabase".to_string()));
+        let credentials = StoredCredentials {
+            access_token: "stored-access-token-must-not-leak".to_string(),
+            platform_url: "https://trusted.example".to_string(),
+            platform_provider: Some("supabase".to_string()),
+            ..Default::default()
+        };
+
+        let checks = run_boot_checks(Some(&credentials), Some(&endpoints)).await;
+
+        let platform = checks
+            .iter()
+            .find(|check| check.name == "Platform")
+            .expect("binding refusal is visible");
+        assert!(!platform.ok);
+        assert!(
+            platform.result.contains("stored session binding refused"),
+            "{}",
+            platform.result
+        );
+        assert!(
+            !platform
+                .result
+                .contains("stored-access-token-must-not-leak")
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock request recording")
+                .len(),
+            0,
+            "boot binding refusal must happen before any request"
+        );
+        clear_platform_env();
     }
 
     fn creds_with(token: &str) -> StoredCredentials {
         StoredCredentials {
             access_token: token.to_string(),
+            platform_url: "https://api.marc27.com".into(),
+            platform_provider: Some("marc27".into()),
             ..Default::default()
         }
     }

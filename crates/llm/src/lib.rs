@@ -32,7 +32,7 @@ pub enum LlmCredentialKind {
 }
 
 /// Configuration for connecting to an LLM backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     /// Base URL of the LLM API.
     pub base_url: String,
@@ -64,6 +64,41 @@ pub struct LlmConfig {
     /// reserve room for the response when budgeting input context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+}
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("credential_kind", &self.credential_kind)
+            .field("embedding_model", &self.embedding_model)
+            .field("max_sample_rows", &self.max_sample_rows)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("context_window", &self.context_window)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn llm_config_debug_redacts_bearer_or_api_key() {
+        let config = LlmConfig {
+            base_url: "https://provider.example/api/v1/projects/p/llm".into(),
+            model: "model".into(),
+            api_key: Some("llm-access-secret-marker".into()),
+            credential_kind: Some(LlmCredentialKind::Bearer),
+            ..LlmConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        assert!(!rendered.contains("llm-access-secret-marker"));
+    }
 }
 
 fn default_max_sample_rows() -> usize {

@@ -19,9 +19,10 @@ pub struct CreateSessionRequest {
     pub user_id: Option<String>,
     pub display_name: Option<String>,
     pub platform_role: Option<String>,
-    /// MARC27 platform token (from `prism login` / the platform device flow).
-    /// The node verifies it against the platform and mints the session for the
-    /// VERIFIED identity — a caller can never just claim a user_id.
+    /// Access token issued by the identity provider selected when this node
+    /// was configured. The node verifies it through that exact adapter and
+    /// mints the session for the verified identity; a caller can never just
+    /// claim a `user_id`.
     #[serde(default)]
     pub platform_token: Option<String>,
 }
@@ -63,73 +64,156 @@ fn session_gate(is_loopback: bool, platform_token: Option<&str>) -> SessionGate 
     }
 }
 
+/// Apply claims that affect PRISM authorization only after provider identity
+/// verification has completed. MARC27 roles continue to arrive through its
+/// organization-membership reconciliation; Supabase carries a signed role
+/// claim on each access token and must update or revoke that subject here.
+fn sync_verified_provider_role(
+    state: &NodeState,
+    identity: &prism_client::auth::VerifiedIdentity,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    match identity.provider {
+        prism_client::auth::IdentityProviderAdapter::Marc27 => Ok(()),
+        prism_client::auth::IdentityProviderAdapter::Supabase => {
+            let Some(rbac_db_path) = state.rbac_db_path.as_deref() else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "Supabase role verification is unavailable because this node's \
+                                authorization store is not configured."
+                            .into(),
+                    }),
+                ));
+            };
+            let Some(project_scope) = identity.provider_scope.as_deref() else {
+                tracing::error!(
+                    provider = identity.provider.as_str(),
+                    "verified identity is missing its provider scope"
+                );
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Verified identity could not be mapped into PRISM authorization."
+                            .into(),
+                    }),
+                ));
+            };
+            let engine = prism_core::rbac::RbacEngine::new(rbac_db_path).map_err(|error| {
+                tracing::error!(error = %error, "failed to open RBAC database for verified identity");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Verified identity could not be mapped into PRISM authorization."
+                            .into(),
+                    }),
+                )
+            })?;
+            let role_sync = prism_node::provider_roles::sync_supabase_login_role(
+                &engine,
+                project_scope,
+                &identity.subject_id,
+                identity.role_claim.as_deref().unwrap_or(""),
+            )
+            .map_err(|error| {
+                tracing::error!(error = %error, "failed to synchronize verified provider role");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Verified identity could not be mapped into PRISM authorization."
+                            .into(),
+                    }),
+                )
+            })?;
+            if role_sync.principal_id != identity.principal_id {
+                tracing::error!(
+                    provider = identity.provider.as_str(),
+                    "provider role mapping changed the verified principal"
+                );
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Verified identity could not be mapped into PRISM authorization."
+                            .into(),
+                    }),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// POST /api/sessions — create a new session (login).
 ///
 /// Loopback callers keep local capability access without an account, but the
 /// submitted `user_id` is ignored. Any caller that needs an authenticated
-/// account session must present a MARC27 platform token (device flow via
-/// `prism login`); the node verifies it against the platform and mints the
-/// session for the VERIFIED identity.
+/// account session must present an access token from the node's explicitly
+/// configured identity provider. Unknown or missing verifier configuration
+/// fails closed before a session is written.
 pub async fn create_session(
     State(state): State<Arc<NodeState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let verified_user_id: String = match session_gate(
-        addr.ip().is_loopback(),
-        body.platform_token.as_deref(),
-    ) {
-        SessionGate::AnonymousLocal => ANONYMOUS_LOCAL_USER_ID.to_string(),
-        SessionGate::Refuse => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: "Remote session creation requires a `platform_token` \
-                            issued by the platform device flow; a bare user_id \
-                            never establishes identity."
-                        .into(),
-                }),
-            ));
-        }
-        SessionGate::VerifyPlatformToken => {
-            let token = body.platform_token.clone().unwrap_or_default();
-            // The node's own platform link supplies the API base; without one
-            // this node cannot verify anybody — refuse honestly.
-            let Some(api_base) = state
-                .platform_client
-                .as_ref()
-                .map(|c| c.base_url().to_string())
-            else {
+    let (verified_user_id, verified_provider) =
+        match session_gate(addr.ip().is_loopback(), body.platform_token.as_deref()) {
+            SessionGate::AnonymousLocal => (ANONYMOUS_LOCAL_USER_ID.to_string(), None),
+            SessionGate::Refuse => {
                 return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::UNAUTHORIZED,
                     Json(ErrorResponse {
-                        error: "This node is not linked to a hosted platform, so it \
-                                cannot verify remote identities. Remote sessions are \
-                                unavailable until the node owner authenticates."
+                        error: "Remote session creation requires a `platform_token` \
+                            issued by the configured identity provider; a bare user_id \
+                            never establishes identity."
                             .into(),
                     }),
                 ));
-            };
-            let verifier = prism_client::PlatformClient::new(&api_base).with_token(&token);
-            match verifier.fetch_current_user().await {
-                Ok(user) => {
-                    tracing::info!(user_id = %user.id, remote = %addr, "remote session platform-verified");
-                    user.id
-                }
-                Err(e) => {
-                    tracing::warn!(remote = %addr, error = %e, "remote session token verification failed");
+            }
+            SessionGate::VerifyPlatformToken => {
+                let token = body.platform_token.clone().unwrap_or_default();
+                // Provider selection is never inferred from a platform URL. A
+                // missing verifier cannot silently fall back to MARC27.
+                let Some(verifier) = state.identity_verifier.as_ref() else {
                     return Err((
-                        StatusCode::UNAUTHORIZED,
+                        StatusCode::SERVICE_UNAVAILABLE,
                         Json(ErrorResponse {
-                            error: "platform_token verification failed — the platform \
-                                    did not recognise this token."
+                            error: "Identity verification is not configured for this node. \
+                                Remote sessions are unavailable until the node owner \
+                                configures a recognized identity provider."
                                 .into(),
                         }),
                     ));
+                };
+                match verifier.verify_access_token(&token).await {
+                    Ok(identity) => {
+                        sync_verified_provider_role(&state, &identity)?;
+                        tracing::info!(
+                            user_id = %identity.principal_id,
+                            provider = identity.provider.as_str(),
+                            remote = %addr,
+                            "remote session identity-provider-verified"
+                        );
+                        (identity.principal_id, Some(identity.provider))
+                    }
+                    Err(_) => {
+                        // Do not log the provider error body: an untrusted remote
+                        // verifier could reflect the bearer token in its response.
+                        tracing::warn!(
+                            remote = %addr,
+                            provider = verifier.provider().as_str(),
+                            "remote session token verification failed"
+                        );
+                        return Err((
+                            StatusCode::UNAUTHORIZED,
+                            Json(ErrorResponse {
+                                error: "platform_token verification failed — the configured \
+                                    identity provider did not accept this token."
+                                    .into(),
+                            }),
+                        ));
+                    }
                 }
             }
-        }
-    };
+        };
 
     // Input validation
     if verified_user_id.is_empty() || verified_user_id.len() > 256 {
@@ -210,7 +294,12 @@ pub async fn create_session(
         detail: Some(if verified_user_id == ANONYMOUS_LOCAL_USER_ID {
             "anonymous-local session; submitted identity ignored".into()
         } else {
-            format!("platform-verified remote session from {addr}")
+            format!(
+                "{}-verified remote session from {addr}",
+                verified_provider
+                    .map(prism_client::auth::IdentityProviderAdapter::as_str)
+                    .unwrap_or("identity-provider")
+            )
         }),
         outcome: prism_core::audit::AuditOutcome::Success,
     });
@@ -282,6 +371,86 @@ mod tests {
     use crate::NodeState;
     use crate::middleware::ANONYMOUS_LOCAL_USER_ID;
     use axum::Json;
+    use axum::Router;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const TEST_SUPABASE_ANON_KEY: &str = "test-supabase-anon-key";
+    const TEST_SUPABASE_KID: &str = "test-signing-key";
+
+    async fn spawn_supabase_jwks(signing_key: &SigningKey) -> String {
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
+                "kid": TEST_SUPABASE_KID,
+                "alg": "EdDSA",
+                "use": "sig"
+            }]
+        });
+        let app = Router::new().route(
+            "/auth/v1/.well-known/jwks.json",
+            get(move |headers: HeaderMap| {
+                let jwks = jwks.clone();
+                async move {
+                    let authorized = headers.get("apikey").and_then(|value| value.to_str().ok())
+                        == Some(TEST_SUPABASE_ANON_KEY);
+                    if authorized {
+                        (StatusCode::OK, Json(jwks))
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({ "error": "missing anon key" })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Supabase JWKS stub");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        base
+    }
+
+    fn signed_supabase_token(
+        signing_key: &SigningKey,
+        issuer: &str,
+        subject: &str,
+        role: &str,
+    ) -> String {
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "alg": "EdDSA",
+                "kid": TEST_SUPABASE_KID,
+                "typ": "JWT"
+            }))
+            .expect("serialize JWT header"),
+        );
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "sub": subject,
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "iss": issuer,
+                "aud": "authenticated",
+                "role": role
+            }))
+            .expect("serialize JWT payload"),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
 
     #[test]
     fn loopback_without_token_is_anonymous_local() {
@@ -310,6 +479,320 @@ mod tests {
         assert_eq!(
             session_gate(false, Some("m27_realtoken")),
             SessionGate::VerifyPlatformToken
+        );
+    }
+
+    #[tokio::test]
+    async fn token_with_no_configured_identity_verifier_fails_closed() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut node = NodeState::new("unconfigured-node".into());
+        let db = tempfile::NamedTempFile::new().unwrap();
+        node.session_db_path = Some(db.path().to_path_buf());
+        let response = create_session(
+            State(std::sync::Arc::new(node)),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+            Json(CreateSessionRequest {
+                user_id: Some("caller-selected-user".into()),
+                display_name: None,
+                platform_role: None,
+                platform_token: Some("must-not-leak".into()),
+            }),
+        )
+        .await;
+
+        let (status, Json(error)) = match response {
+            Err(error) => error,
+            Ok(_) => panic!("missing verifier accepted a token"),
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.error.contains("not configured"), "{}", error.error);
+        assert!(!error.error.contains("must-not-leak"), "{}", error.error);
+    }
+
+    #[tokio::test]
+    async fn verified_supabase_token_mints_for_project_scoped_principal() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let project_url = spawn_supabase_jwks(&signing_key).await;
+        let issuer = format!("{project_url}/auth/v1");
+        let subject = "supabase-user-123";
+        let token = signed_supabase_token(&signing_key, &issuer, subject, "authenticated");
+        let expected_principal =
+            prism_client::auth::canonical_supabase_principal(&issuer, subject).unwrap();
+
+        let mut node = NodeState::new("supabase-node".into());
+        let session_db = tempfile::NamedTempFile::new().unwrap();
+        let rbac_db = tempfile::NamedTempFile::new().unwrap();
+        node.session_db_path = Some(session_db.path().to_path_buf());
+        node.rbac_db_path = Some(rbac_db.path().to_path_buf());
+        node.identity_verifier = Some(
+            prism_client::auth::IdentityVerifierConfig::new(
+                Some(prism_client::auth::SUPABASE_IDENTITY_PROVIDER),
+                &project_url,
+                Some(TEST_SUPABASE_ANON_KEY),
+            )
+            .unwrap(),
+        );
+        let response = create_session(
+            State(std::sync::Arc::new(node)),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+            Json(CreateSessionRequest {
+                user_id: Some("attacker-selected-user".into()),
+                display_name: None,
+                platform_role: Some("node_admin".into()),
+                platform_token: Some(token),
+            }),
+        )
+        .await;
+        let Json(response) = match response {
+            Ok(response) => response,
+            Err((status, Json(error))) => {
+                panic!(
+                    "verified Supabase token was refused ({status}): {}",
+                    error.error
+                )
+            }
+        };
+
+        assert_eq!(response.user_id, expected_principal);
+        let stored = prism_core::session::SessionManager::new(
+            session_db.path(),
+            chrono::Duration::hours(24),
+        )
+        .unwrap()
+        .validate_session(&response.session_id)
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            stored.user_id,
+            format!(
+                "{}{}",
+                crate::middleware::VERIFIED_SESSION_PREFIX,
+                expected_principal
+            )
+        );
+        let engine = prism_core::rbac::RbacEngine::new(rbac_db.path()).unwrap();
+        assert_eq!(
+            engine
+                .get_external_role(
+                    prism_node::provider_roles::SUPABASE_ROLE_PROVIDER,
+                    &expected_principal,
+                )
+                .unwrap(),
+            Some(prism_core::rbac::LocalRole::Viewer)
+        );
+        assert!(
+            !engine
+                .check_permission(
+                    &expected_principal,
+                    prism_core::rbac::Permission::ManageNode,
+                )
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_supabase_role_revokes_stale_privilege_before_session_use() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let project_url = spawn_supabase_jwks(&signing_key).await;
+        let issuer = format!("{project_url}/auth/v1");
+        let subject = "supabase-user-with-stale-role";
+        let token = signed_supabase_token(&signing_key, &issuer, subject, "service_role");
+        let principal = prism_client::auth::canonical_supabase_principal(&issuer, subject).unwrap();
+
+        let session_db = tempfile::NamedTempFile::new().unwrap();
+        let rbac_db = tempfile::NamedTempFile::new().unwrap();
+        let engine = prism_core::rbac::RbacEngine::new(rbac_db.path()).unwrap();
+        engine
+            .assign_external_role(
+                prism_node::provider_roles::SUPABASE_ROLE_PROVIDER,
+                &principal,
+                &principal,
+                prism_core::rbac::LocalRole::NodeAdmin,
+            )
+            .unwrap();
+
+        let mut node = NodeState::new("supabase-node".into());
+        node.session_db_path = Some(session_db.path().to_path_buf());
+        node.rbac_db_path = Some(rbac_db.path().to_path_buf());
+        node.identity_verifier = Some(
+            prism_client::auth::IdentityVerifierConfig::new(
+                Some(prism_client::auth::SUPABASE_IDENTITY_PROVIDER),
+                &project_url,
+                Some(TEST_SUPABASE_ANON_KEY),
+            )
+            .unwrap(),
+        );
+        let response = create_session(
+            State(std::sync::Arc::new(node)),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+            Json(CreateSessionRequest {
+                user_id: None,
+                display_name: None,
+                platform_role: Some("node_admin".into()),
+                platform_token: Some(token),
+            }),
+        )
+        .await;
+
+        let Json(response) = match response {
+            Ok(response) => response,
+            Err((status, Json(error))) => {
+                panic!(
+                    "verified token with a non-privileged role was refused ({status}): {}",
+                    error.error
+                )
+            }
+        };
+        assert_eq!(response.user_id, principal);
+        assert_eq!(
+            engine
+                .get_external_role(
+                    prism_node::provider_roles::SUPABASE_ROLE_PROVIDER,
+                    &principal,
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(engine.get_role(&principal).unwrap(), None);
+        assert!(
+            !engine
+                .check_permission(&principal, prism_core::rbac::Permission::ManageNode)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_supabase_token_without_rbac_store_fails_closed() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let project_url = spawn_supabase_jwks(&signing_key).await;
+        let issuer = format!("{project_url}/auth/v1");
+        let token =
+            signed_supabase_token(&signing_key, &issuer, "supabase-user-123", "authenticated");
+
+        let mut node = NodeState::new("supabase-node".into());
+        let session_db = tempfile::NamedTempFile::new().unwrap();
+        node.session_db_path = Some(session_db.path().to_path_buf());
+        node.identity_verifier = Some(
+            prism_client::auth::IdentityVerifierConfig::new(
+                Some(prism_client::auth::SUPABASE_IDENTITY_PROVIDER),
+                &project_url,
+                Some(TEST_SUPABASE_ANON_KEY),
+            )
+            .unwrap(),
+        );
+        let response = create_session(
+            State(std::sync::Arc::new(node)),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+            Json(CreateSessionRequest {
+                user_id: None,
+                display_name: None,
+                platform_role: None,
+                platform_token: Some(token),
+            }),
+        )
+        .await;
+
+        let (status, Json(error)) = match response {
+            Err(error) => error,
+            Ok(_) => panic!("Supabase session minted without an authorization store"),
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error
+                .error
+                .contains("authorization store is not configured"),
+            "{}",
+            error.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_supabase_signature_is_refused_by_real_session_path() {
+        use axum::extract::{ConnectInfo, State};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let advertised_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let wrong_key = SigningKey::from_bytes(&[8_u8; 32]);
+        let project_url = spawn_supabase_jwks(&advertised_key).await;
+        let issuer = format!("{project_url}/auth/v1");
+        let subject = "supabase-user-123";
+        let token = signed_supabase_token(&wrong_key, &issuer, subject, "authenticated");
+        let principal = prism_client::auth::canonical_supabase_principal(&issuer, subject).unwrap();
+
+        let mut node = NodeState::new("supabase-node".into());
+        let session_db = tempfile::NamedTempFile::new().unwrap();
+        let rbac_db = tempfile::NamedTempFile::new().unwrap();
+        let engine = prism_core::rbac::RbacEngine::new(rbac_db.path()).unwrap();
+        engine
+            .assign_external_role(
+                prism_node::provider_roles::SUPABASE_ROLE_PROVIDER,
+                &principal,
+                &principal,
+                prism_core::rbac::LocalRole::NodeAdmin,
+            )
+            .unwrap();
+        node.session_db_path = Some(session_db.path().to_path_buf());
+        node.rbac_db_path = Some(rbac_db.path().to_path_buf());
+        node.identity_verifier = Some(
+            prism_client::auth::IdentityVerifierConfig::new(
+                Some(prism_client::auth::SUPABASE_IDENTITY_PROVIDER),
+                &project_url,
+                Some(TEST_SUPABASE_ANON_KEY),
+            )
+            .unwrap(),
+        );
+        let response = create_session(
+            State(std::sync::Arc::new(node)),
+            ConnectInfo(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234)),
+            Json(CreateSessionRequest {
+                user_id: None,
+                display_name: None,
+                platform_role: None,
+                platform_token: Some(token.clone()),
+            }),
+        )
+        .await;
+
+        let (status, Json(error)) = match response {
+            Err(error) => error,
+            Ok(_) => panic!("wrong signature minted a session"),
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            error.error.contains("verification failed"),
+            "{}",
+            error.error
+        );
+        assert!(
+            !error.error.contains(&token),
+            "token leaked: {}",
+            error.error
+        );
+        assert!(
+            !error.error.contains(TEST_SUPABASE_ANON_KEY),
+            "anon key leaked: {}",
+            error.error
+        );
+        assert_eq!(
+            engine
+                .get_external_role(
+                    prism_node::provider_roles::SUPABASE_ROLE_PROVIDER,
+                    &principal,
+                )
+                .unwrap(),
+            Some(prism_core::rbac::LocalRole::NodeAdmin),
+            "an unverified token must not mutate role assignments"
         );
     }
 

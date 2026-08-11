@@ -413,6 +413,8 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
     const KEYS: &[&str] = &[
         PlatformVar::TOKEN.preferred,
         PlatformVar::TOKEN.alias,
+        PlatformVar::API_URL.preferred,
+        PlatformVar::API_URL.alias,
         PlatformVar::PLATFORM_URL.preferred,
         PlatformVar::PLATFORM_URL.alias,
         PlatformVar::PROJECT_ID.preferred,
@@ -446,6 +448,7 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
     if let Some(creds) = creds {
         let is_marc27 = creds.platform_provider.as_deref() == Some("marc27");
         set_platform_value(PlatformVar::TOKEN, &creds.access_token, is_marc27);
+        set_platform_value(PlatformVar::API_URL, &creds.platform_url, is_marc27);
         set_platform_value(PlatformVar::PLATFORM_URL, &creds.platform_url, is_marc27);
         if let Some(provider) = &creds.platform_provider {
             set_platform_value(PlatformVar::PROVIDER, provider, is_marc27);
@@ -3767,25 +3770,16 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
     if let Some(node_id) = args.get(1) {
         let body = match &creds {
             None => "Not signed in — log in from the account view to inspect nodes.".to_string(),
-            Some(creds) => {
-                let Some(endpoints) = PlatformEndpoints::resolve(None, Some(creds)) else {
-                    emit_view(
-                        "node",
-                        "Node detail",
-                        prism_runtime::auth::PLATFORM_NOT_CONFIGURED,
-                        "info",
-                    );
-                    emit_notification("ui.turn.complete", serde_json::json!({}));
-                    return Ok(true);
-                };
-                let platform =
-                    PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
-                let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
-                match registry.get_node(node_id).await {
-                    Ok(node) => node_detail_body(&node),
-                    Err(error) => format!("Node lookup failed: {error:#}"),
+            Some(creds) => match platform_client_for_stored_session(creds) {
+                Ok(platform) => {
+                    let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                    match registry.get_node(node_id).await {
+                        Ok(node) => node_detail_body(&node),
+                        Err(error) => format!("Node lookup failed: {error:#}"),
+                    }
                 }
-            }
+                Err(error) => format!("Node lookup refused: {error:#}"),
+            },
         };
         emit_view("node", "Node detail", &body, "info");
         emit_notification("ui.turn.complete", serde_json::json!({}));
@@ -3797,25 +3791,16 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
             Vec::new(),
             Some("Not signed in — log in from the account view to see your nodes.".to_string()),
         ),
-        Some(creds) => {
-            let Some(endpoints) = PlatformEndpoints::resolve(None, Some(&creds)) else {
-                emit_notification(
-                    "ui.nodes.list",
-                    serde_json::json!({
-                        "nodes": [],
-                        "error": prism_runtime::auth::PLATFORM_NOT_CONFIGURED,
-                    }),
-                );
-                emit_notification("ui.turn.complete", serde_json::json!({}));
-                return Ok(true);
-            };
-            let platform = PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
-            let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
-            match registry.list_nodes(None).await {
-                Ok(nodes) => (nodes, None),
-                Err(error) => (Vec::new(), Some(format!("{error}"))),
+        Some(creds) => match platform_client_for_stored_session(&creds) {
+            Ok(platform) => {
+                let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
+                match registry.list_nodes(None).await {
+                    Ok(nodes) => (nodes, None),
+                    Err(error) => (Vec::new(), Some(format!("{error}"))),
+                }
             }
-        }
+            Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+        },
     };
 
     // Re-key `last_seen` → `last_seen_at` so the payload matches the /nodes
@@ -3839,6 +3824,17 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
     );
     emit_notification("ui.turn.complete", serde_json::json!({}));
     Ok(true)
+}
+
+/// Construct a platform client only after the stored bearer is proven to be
+/// paired with the selected URL and provider. Environment/config overrides
+/// may select an endpoint, but cannot redirect a durable login token.
+fn platform_client_for_stored_session(creds: &StoredCredentials) -> Result<PlatformClient> {
+    let endpoints = PlatformEndpoints::resolve(None, Some(creds))
+        .ok_or_else(|| anyhow::anyhow!(prism_runtime::auth::PLATFORM_NOT_CONFIGURED))?;
+    let credential = auth::stored_bearer_for_endpoints(&endpoints, creds)?
+        .context("stored platform session has no access token")?;
+    Ok(PlatformClient::new(&endpoints.api_base).with_auth(credential))
 }
 
 /// Human-readable body for a single platform node record.
@@ -3966,14 +3962,13 @@ async fn node_status_body() -> String {
         lines.push("  Not signed in — log in from the account view.".to_string());
         return lines.join("\n");
     };
-    let Some(endpoints) = PlatformEndpoints::resolve(None, Some(&creds)) else {
-        lines.push(format!(
-            "  {}",
-            prism_runtime::auth::PLATFORM_NOT_CONFIGURED
-        ));
-        return lines.join("\n");
+    let platform = match platform_client_for_stored_session(&creds) {
+        Ok(platform) => platform,
+        Err(error) => {
+            lines.push(format!("  Platform lookup refused: {error:#}"));
+            return lines.join("\n");
+        }
     };
-    let platform = PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
     let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
     match snapshot.and_then(|snap| snap.node_id) {
         Some(node_id) => match registry.get_node(&node_id).await {
