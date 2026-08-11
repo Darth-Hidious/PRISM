@@ -63,6 +63,15 @@ struct RawRelationship {
     /// vocabulary at fact mapping, never trusted raw.
     #[serde(default)]
     unit: Option<String>,
+    /// Optional extractor judgement. The shared deserializer accepts the
+    /// numeric-string shape seen from prompt-only backends, but retains only
+    /// finite probabilities in `[0, 1]`; invalid input becomes honest
+    /// absence and receives the fact mapper's documented fallback later.
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_relationship_confidence"
+    )]
+    confidence: Option<f64>,
 }
 
 /// Accept a number, a numeric string ("3.5"), or anything else → None.
@@ -133,6 +142,62 @@ fn normalise_extracted_name(raw: &str) -> String {
         name = name[first.len_utf8()..name.len() - last.len_utf8()].trim();
     }
     name.to_string()
+}
+
+/// Convert the extractor wire shape into the public graph shape at one
+/// auditable boundary. Name and confidence normalisation both happen here
+/// before validation or fact mapping can observe the proposal.
+fn materialise_extraction_output(
+    raw: ExtractionOutput,
+    mapping: Option<&crate::mapping::OntologyMapping>,
+) -> EntitySet {
+    let mut entities: Vec<Entity> = raw
+        .entities
+        .into_iter()
+        .map(|entity| Entity {
+            entity_type: entity.entity_type,
+            name: normalise_extracted_name(&entity.name),
+            properties: if entity.properties.is_null() {
+                serde_json::Value::Object(Default::default())
+            } else {
+                entity.properties
+            },
+        })
+        .collect();
+
+    let mut relationships: Vec<Relationship> = raw
+        .relationships
+        .into_iter()
+        .map(|relationship| Relationship {
+            from: normalise_extracted_name(&relationship.from),
+            rel_type: relationship.rel,
+            to: normalise_extracted_name(&relationship.to),
+            weight: relationship.weight,
+            order: relationship.order,
+            value: relationship.value,
+            unit: relationship.unit,
+            confidence: relationship.confidence,
+        })
+        .collect();
+
+    // Apply alias expansion (e.g. "Nb" -> "Niobium") to entity names and
+    // to every relationship endpoint referencing those names, so the two
+    // stay consistent — expanding only one side would silently turn a real
+    // relationship into an orphan.
+    if let Some(mapping) = mapping {
+        for entity in &mut entities {
+            entity.name = mapping.expand_alias(&entity.name);
+        }
+        for relationship in &mut relationships {
+            relationship.from = mapping.expand_alias(&relationship.from);
+            relationship.to = mapping.expand_alias(&relationship.to);
+        }
+    }
+
+    EntitySet {
+        entities,
+        relationships,
+    }
 }
 
 impl LlmOntologyConstructor {
@@ -460,58 +525,13 @@ impl LlmOntologyConstructor {
         let raw: ExtractionOutput =
             serde_json::from_str(&response).context("LLM returned invalid extraction JSON")?;
 
-        // Names are normalised HERE — the one place raw model output becomes
-        // the internal EntitySet — on entity names AND relationship endpoints
-        // alike, so nothing downstream (aliasing, validation, keying) can see
-        // a name the other side of a comparison was denied.
-        let mut entities: Vec<Entity> = raw
-            .entities
-            .into_iter()
-            .map(|e| Entity {
-                entity_type: e.entity_type,
-                name: normalise_extracted_name(&e.name),
-                properties: if e.properties.is_null() {
-                    serde_json::Value::Object(Default::default())
-                } else {
-                    e.properties
-                },
-            })
-            .collect();
-
-        let mut relationships: Vec<Relationship> = raw
-            .relationships
-            .into_iter()
-            .map(|r| Relationship {
-                from: normalise_extracted_name(&r.from),
-                rel_type: r.rel,
-                to: normalise_extracted_name(&r.to),
-                weight: r.weight,
-                order: r.order,
-                value: r.value,
-                unit: r.unit,
-            })
-            .collect();
-
-        // Apply alias expansion (e.g. "Nb" -> "Niobium") to entity names and
-        // to every relationship endpoint referencing those names, so the two
-        // stay consistent — expanding only one side would silently turn a
-        // real relationship into an orphan (AUDIT_BACKLOG 21 / INGESTION_AUDIT
-        // #21 — `expand_alias` had zero production callers).
-        if let Some(m) = mapping {
-            for entity in &mut entities {
-                entity.name = m.expand_alias(&entity.name);
-            }
-            for rel in &mut relationships {
-                rel.from = m.expand_alias(&rel.from);
-                rel.to = m.expand_alias(&rel.to);
-            }
-        }
+        // Names and confidence are normalised HERE — the one place raw model
+        // output becomes the internal EntitySet — before graph validation or
+        // fact mapping can mistake malformed model output for a judgement.
+        let entities = materialise_extraction_output(raw, mapping);
 
         Ok(TracedExtraction {
-            entities: EntitySet {
-                entities,
-                relationships,
-            },
+            entities,
             decoding: constrained.trace,
         })
     }
@@ -542,12 +562,13 @@ mod tests {
         assert!(prompt.contains("PROCESSED_BY"));
     }
 
-    /// The byte-identity contract, amended TWICE: with the built-in EMMO
+    /// The byte-identity contract, amended for explicit ingest invariants:
     /// ontology active, the extraction prompt is EXACTLY the string the
     /// pre-trait hardcoded builder produced PLUS the referential-integrity
     /// line ("Every name used in \"from\" or \"to\" MUST also appear…")
     /// PLUS the typed-value rule ("For \"Property\" entities: \"name\" is
-    /// the property NAME…"). Both divergences are deliberate: the verbatim
+    /// the property NAME…") and the optional bounded relationship-confidence
+    /// rule. These divergences are deliberate: the verbatim
     /// legacy text told the model nothing about declaring relationship
     /// endpoints, while graph validation refuses undeclared endpoints
     /// (`orphan_rel`, Error severity) — so the byte-identical prompt
@@ -559,7 +580,7 @@ mod tests {
     /// an entity name, `prov_assertion.value` null, nothing queryable as a
     /// number). Everything else must still not shift by a byte.
     #[test]
-    fn emmo_prompt_is_the_legacy_prompt_plus_only_the_two_added_rules() {
+    fn emmo_prompt_is_the_legacy_prompt_plus_only_the_declared_ingest_rules() {
         let schema = SchemaAnalysis {
             columns: vec!["Composition".into(), "Hardness_HV".into()],
             detected_types: vec!["string".into(), "float".into()],
@@ -593,6 +614,7 @@ mod tests {
              - HAS_PROPERTY (material → property)\n\
              - HAS_PHASE (material → phase)\n\n\
              Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".\n\
+             For each relationship, optionally set \"confidence\" to your estimated probability that the relationship is correct, as a finite number from 0 to 1. Omit it when you cannot assess the relationship; never invent a score just to fill the field.\n\
              For \"Property\" entities: \"name\" is the property NAME (e.g. \"yield strength\"), \
              NEVER the measured value — an entity named like \"1100 MPa\" is rejected, not \
              stored. Each material's measured number goes on that material's OWN relationship \
@@ -608,7 +630,7 @@ mod tests {
              Return ONLY valid JSON with this structure:\n\
              {\n\
                \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\
-               \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null}]\n\
+               \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null, \"confidence\": null}]\n\
              }\n",
         );
         assert_eq!(prompt, expected);
@@ -653,12 +675,44 @@ mod tests {
                 {"type": "Element", "name": "Nb"}
             ],
             "relationships": [
-                {"from": "NbMoTaW", "rel": "CONTAINS", "to": "Nb", "weight": 0.25}
+                {"from": "NbMoTaW", "rel": "CONTAINS", "to": "Nb", "weight": 0.25,
+                 "confidence": 0.93}
             ]
         }"#;
         let parsed: ExtractionOutput = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.entities.len(), 2);
         assert_eq!(parsed.relationships[0].weight, Some(0.25));
+        assert_eq!(parsed.relationships[0].confidence, Some(0.93));
+    }
+
+    #[test]
+    fn extractor_confidence_reaches_local_fact_and_invalid_or_missing_uses_fallback() {
+        let json = r#"{
+            "entities": [],
+            "relationships": [
+                {"from": "A", "rel": "RELATED_TO", "to": "B", "confidence": "0.36"},
+                {"from": "C", "rel": "RELATED_TO", "to": "D", "confidence": 2.0},
+                {"from": "E", "rel": "RELATED_TO", "to": "F"}
+            ]
+        }"#;
+        let raw: ExtractionOutput = serde_json::from_str(json).unwrap();
+        let set = materialise_extraction_output(raw, None);
+
+        assert_eq!(set.relationships[0].confidence, Some(0.36));
+        assert_eq!(set.relationships[1].confidence, None);
+        assert_eq!(set.relationships[2].confidence, None);
+
+        let (facts, dropped) = crate::local_facts::to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(facts[0].confidence, Some(0.36));
+        assert_eq!(
+            facts[1].confidence,
+            Some(crate::local_facts::DEFAULT_CONFIDENCE)
+        );
+        assert_eq!(
+            facts[2].confidence,
+            Some(crate::local_facts::DEFAULT_CONFIDENCE)
+        );
     }
 
     // --- build_extraction_prompt edge cases ---

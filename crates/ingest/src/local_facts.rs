@@ -8,12 +8,15 @@ use prism_provenance::LocalFact;
 
 use crate::{Entity, EntitySet};
 
-/// Default evidence confidence for facts mapped from tabular extraction.
-/// `Relationship.weight` is never usable as confidence here — the extractor
-/// emits it as a composition fraction on `CONTAINS` and leaves it unset
-/// elsewhere — so every mapped fact carries this flat "LLM-extracted from
-/// structured data, unverified" prior.
-const DEFAULT_CONFIDENCE: f64 = 0.8;
+/// Default evidence confidence for a tabular relationship whose extractor
+/// confidence is missing or invalid.
+///
+/// `Relationship.weight` is never usable as confidence — it is a composition
+/// fraction on `CONTAINS`. `0.8` preserves the historical
+/// "LLM-extracted from structured data, unverified" prior. The raw absence
+/// remains `None` on `Relationship`; this fallback is applied only while
+/// building the write fact, so it cannot masquerade as a model judgement.
+pub const DEFAULT_CONFIDENCE: f64 = 0.8;
 
 /// Split a leading decimal number off a string: `"1100 MPa"` → `(1100.0,
 /// "MPa")`, `"8.19g/cm3"` → `(8.19, "g/cm3")`, `"1100"` → `(1100.0, "")`.
@@ -91,6 +94,23 @@ fn numeric_claim(value: &serde_json::Value) -> Option<(f64, Option<&str>)> {
 /// same contract as the pipeline's `dropped_relationships`: NON-EMPTY is a
 /// PARTIAL result the caller must surface, never a silent drop.
 pub fn to_local_facts(entity_set: &EntitySet) -> (Vec<LocalFact>, Vec<String>) {
+    map_local_facts(entity_set, Some(DEFAULT_CONFIDENCE))
+}
+
+/// Map the same write set while preserving missing extractor confidence as
+/// `None` for semantic fusion. This shares the complete relationship mapper
+/// with [`to_local_facts`], so duplicate endpoint triples with distinct
+/// values/confidences remain positional peers and cannot inherit one
+/// another's score. The returned facts are validation inputs only; the
+/// persisted write still uses [`to_local_facts`] and its historical fallback.
+pub(crate) fn to_semantic_local_facts(entity_set: &EntitySet) -> (Vec<LocalFact>, Vec<String>) {
+    map_local_facts(entity_set, None)
+}
+
+fn map_local_facts(
+    entity_set: &EntitySet,
+    missing_confidence: Option<f64>,
+) -> (Vec<LocalFact>, Vec<String>) {
     let by_name: std::collections::HashMap<&str, &Entity> = entity_set
         .entities
         .iter()
@@ -117,6 +137,8 @@ pub fn to_local_facts(entity_set: &EntitySet) -> (Vec<LocalFact>, Vec<String>) {
     let mut facts = Vec::with_capacity(entity_set.relationships.len());
     let mut dropped = Vec::new();
     for rel in &entity_set.relationships {
+        let confidence =
+            crate::normalize_relationship_confidence(rel.confidence).or(missing_confidence);
         let (kind, value, unit) = match rel.rel_type.as_str() {
             "HAS_PROPERTY" => {
                 let target = by_name.get(rel.to.as_str());
@@ -171,7 +193,7 @@ pub fn to_local_facts(entity_set: &EntitySet) -> (Vec<LocalFact>, Vec<String>) {
                                 object: rel.to.clone(),
                                 value: Some(v),
                                 unit: Some(unit.as_str().to_string()),
-                                confidence: Some(DEFAULT_CONFIDENCE),
+                                confidence,
                                 kind: Some("measurement".into()),
                             });
                             continue;
@@ -321,7 +343,7 @@ pub fn to_local_facts(entity_set: &EntitySet) -> (Vec<LocalFact>, Vec<String>) {
             object: rel.to.clone(),
             value,
             unit,
-            confidence: Some(DEFAULT_CONFIDENCE),
+            confidence,
             kind: kind.map(str::to_string),
         });
     }
@@ -350,7 +372,85 @@ mod tests {
             order: None,
             value: None,
             unit: None,
+            confidence: None,
         }
+    }
+
+    #[test]
+    fn parsed_relationship_confidence_reaches_local_facts_and_absence_falls_back() {
+        let set: EntitySet = serde_json::from_value(serde_json::json!({
+            "entities": [],
+            "relationships": [
+                {"from": "A", "rel_type": "RELATED_TO", "to": "B", "confidence": 0.37},
+                {"from": "C", "rel_type": "RELATED_TO", "to": "D"},
+                {"from": "E", "rel_type": "RELATED_TO", "to": "F", "confidence": 1.7},
+                {"from": "G", "rel_type": "RELATED_TO", "to": "H", "confidence": "unknown"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(set.relationships[0].confidence, Some(0.37));
+        assert_eq!(set.relationships[1].confidence, None);
+        assert_eq!(set.relationships[2].confidence, None);
+        assert_eq!(set.relationships[3].confidence, None);
+
+        let (facts, dropped) = to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(facts.len(), 4);
+        assert_eq!(facts[0].confidence, Some(0.37));
+        for fact in &facts[1..] {
+            assert_eq!(
+                fact.confidence,
+                Some(DEFAULT_CONFIDENCE),
+                "missing or invalid model confidence must use the explicit fallback: {fact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn programmatically_invalid_confidence_also_falls_back_at_the_write_boundary() {
+        let set = EntitySet {
+            entities: vec![],
+            relationships: vec![Relationship {
+                confidence: Some(f64::NAN),
+                ..rel("A", "RELATED_TO", "B")
+            }],
+        };
+
+        let (facts, dropped) = to_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(facts[0].confidence, Some(DEFAULT_CONFIDENCE));
+    }
+
+    #[test]
+    fn semantic_mapping_keeps_confidence_attached_to_duplicate_endpoint_assertions() {
+        let set = EntitySet {
+            entities: vec![],
+            relationships: vec![
+                Relationship {
+                    weight: Some(0.10),
+                    confidence: Some(0.21),
+                    ..rel("alloy", "CONTAINS", "Ti")
+                },
+                Relationship {
+                    weight: Some(0.90),
+                    confidence: Some(0.87),
+                    ..rel("alloy", "CONTAINS", "Ti")
+                },
+            ],
+        };
+
+        let (facts, dropped) = to_semantic_local_facts(&set);
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(facts.len(), 2);
+        assert_eq!(
+            (facts[0].value, facts[0].confidence),
+            (Some(0.10), Some(0.21))
+        );
+        assert_eq!(
+            (facts[1].value, facts[1].confidence),
+            (Some(0.90), Some(0.87))
+        );
     }
 
     /// THE anti-smearing contract, at the mapper: per-edge values attribute

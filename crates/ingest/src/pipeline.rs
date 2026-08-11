@@ -9,9 +9,13 @@ use prism_provenance::{
 use serde::{Deserialize, Serialize};
 use tracing;
 
-use crate::local_facts::to_local_facts;
+use crate::local_facts::{to_local_facts, to_semantic_local_facts};
 use crate::ontology::LlmOntologyConstructor;
 use crate::schema::SchemaDetector;
+use crate::semantic_validation::{
+    SemanticEntityProposal, SemanticValidationPolicy, SemanticValidationReport,
+    validate_write_best_effort, validate_write_with_backend,
+};
 use crate::validation::{self, Severity, ValidationReport};
 use crate::{
     DataSource, EmbeddingBatch, Entity, EntitySet, GraphUpdate, LlmConfig, Relationship,
@@ -41,6 +45,11 @@ pub struct IngestResult {
     /// graph write. `None` only when no entities were extracted at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_validation: Option<crate::graph_validation::GraphValidationReport>,
+    /// Advisory geometry reports for each graph batch that reached the write
+    /// boundary. Every check carries an explicit applied/unavailable/
+    /// disabled/failed status; findings never mutate or block the write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_validation: Vec<SemanticValidationReport>,
     /// Populated when the local EMMO graph write (bundled Turso store) runs.
     /// Counts are upsert attempts, not net-new rows.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +143,10 @@ pub struct PipelineConfig {
     /// the built-in default (EMMO). An id nothing registered fails the run
     /// loudly — never a silent EMMO fallback.
     pub ontology: Option<String>,
+    /// Advisory geometry policy applied before each graph write. Every
+    /// threshold is declared here through a serializable policy object;
+    /// callers may tune or disable checks without changing write semantics.
+    pub semantic_validation: SemanticValidationPolicy,
     /// Progress sink; `None` = silent (library callers, tests).
     pub on_progress: Option<ProgressFn>,
 }
@@ -146,6 +159,7 @@ impl std::fmt::Debug for PipelineConfig {
             .field("mapping", &self.mapping.is_some())
             .field("provenance_db", &self.provenance_db)
             .field("ontology", &self.ontology)
+            .field("semantic_validation", &self.semantic_validation)
             .field("on_progress", &self.on_progress.is_some())
             .finish()
     }
@@ -159,6 +173,7 @@ impl Default for PipelineConfig {
             mapping: None,
             provenance_db: None,
             ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
             on_progress: None,
         }
     }
@@ -187,6 +202,7 @@ impl IngestPipeline {
                 mapping: None,
                 provenance_db: None,
                 ontology: None,
+                semantic_validation: SemanticValidationPolicy::default(),
                 on_progress: None,
             },
         }
@@ -296,6 +312,7 @@ impl IngestPipeline {
         let mut dropped_relationships: Vec<String> = Vec::new();
         let mut dropped_entities: Vec<String> = Vec::new();
         let mut graph: Option<GraphUpdate> = None;
+        let mut semantic_validation = Vec::new();
         let mut rows_processed = 0usize;
         let mut batches = 0usize;
         let mut batches_failed = 0usize;
@@ -486,7 +503,7 @@ impl IngestPipeline {
                             )
                             .await
                         {
-                            Ok((update, fact_drops)) => {
+                            Ok((update, fact_drops, semantic_report)) => {
                                 // Facts the fact-mapping refused (a numeric
                                 // value whose unit is missing or
                                 // unresolvable — never stored unit-less)
@@ -502,6 +519,7 @@ impl IngestPipeline {
                                     );
                                 }
                                 dropped_relationships.extend(fact_drops);
+                                semantic_validation.push(semantic_report);
                                 rows_processed += end - start;
                                 self.progress(&format!(
                                     "batch {batch_no}/{batches}: {} entities, {} \
@@ -553,7 +571,7 @@ impl IngestPipeline {
             .map(|set| crate::graph_validation::validate_graph(ontology.as_ref(), set));
 
         // Entity vectors are written to the bundled Turso store by
-        // `write_local_graph` (embed_names_best_effort); the old Qdrant
+        // `write_local_graph`, reusing the validation batch; the old Qdrant
         // upsert step was redundant and has been removed.
         Ok(IngestResult {
             source,
@@ -564,6 +582,7 @@ impl IngestPipeline {
             entities: merged,
             extraction_decoding,
             graph_validation,
+            semantic_validation,
             graph,
             embeddings: None,
             dropped_relationships,
@@ -605,7 +624,27 @@ impl IngestPipeline {
         source: &DataSource,
         tenant: &str,
         decoding: Option<&prism_llm::JsonDecodingTrace>,
-    ) -> Result<(GraphUpdate, Vec<String>)> {
+    ) -> Result<(GraphUpdate, Vec<String>, SemanticValidationReport)> {
+        self.write_local_graph_with_semantic_backend(
+            ontology, entity_set, source, tenant, decoding, None,
+        )
+        .await
+    }
+
+    /// Shared write implementation with a deterministic embedding seam for
+    /// integration tests. Production passes `None` and constructs the
+    /// configured backend; tests may inject a backend so a real geometric
+    /// finding crosses the complete pre-write/write boundary without network
+    /// access or model downloads.
+    async fn write_local_graph_with_semantic_backend(
+        &self,
+        ontology: &dyn crate::ontologies::Ontology,
+        entity_set: &EntitySet,
+        source: &DataSource,
+        tenant: &str,
+        decoding: Option<&prism_llm::JsonDecodingTrace>,
+        semantic_backend: Option<&dyn prism_embed::EmbedBackend>,
+    ) -> Result<(GraphUpdate, Vec<String>, SemanticValidationReport)> {
         // Declared name → ontology classification, from the ONE active
         // declaration. First declaration wins on a (rare)
         // same-name/different-type collision, matching the standalone-write
@@ -663,6 +702,61 @@ impl IngestPipeline {
         };
         let store = ProvenanceStore::open(&db_path).await?;
 
+        let (facts, dropped_facts) = to_local_facts(entity_set);
+        // The persisted facts keep the historical 0.8 fallback. Semantic
+        // fusion uses the same mapper with raw optional confidence retained,
+        // so repeated endpoint triples with different values/confidences
+        // remain correctly paired and an omitted score stays honest.
+        let (semantic_facts, semantic_dropped_facts) = to_semantic_local_facts(entity_set);
+        debug_assert_eq!(
+            dropped_facts, semantic_dropped_facts,
+            "confidence handling cannot change the mapped write set"
+        );
+        let semantic_entities: Vec<SemanticEntityProposal> = entity_set
+            .entities
+            .iter()
+            .map(|entity| {
+                let class = ontology
+                    .class_for_label(entity.entity_type.trim())
+                    .expect("write plan retained only ontology-declared entity types");
+                let storage_label = ontology
+                    .storage_label(entity.entity_type.trim())
+                    .expect("write plan retained only entity types with storage labels");
+                SemanticEntityProposal {
+                    name: entity.name.clone(),
+                    entity_type: entity.entity_type.clone(),
+                    storage_label: storage_label.to_string(),
+                    class_iri: Some(class.iri.to_string()),
+                }
+            })
+            .collect();
+        // Geometry reads the PRE-WRITE graph. It is deliberately kept out of
+        // `GraphWritePlan`: no distance or fused score below can merge, drop,
+        // rewrite, or block model-proposed data.
+        let semantic = match semantic_backend {
+            Some(backend) => {
+                validate_write_with_backend(
+                    &store,
+                    &semantic_entities,
+                    &semantic_facts,
+                    tenant,
+                    &self.config.semantic_validation,
+                    Some(backend),
+                )
+                .await
+            }
+            None => {
+                validate_write_best_effort(
+                    &store,
+                    &semantic_entities,
+                    &semantic_facts,
+                    tenant,
+                    &self.config.semantic_validation,
+                )
+                .await
+            }
+        };
+
         let now = chrono::Utc::now().to_rfc3339();
         let prov = LocalProvenance {
             activity_id: uuid::Uuid::new_v4().to_string(),
@@ -717,7 +811,6 @@ impl IngestPipeline {
             artifact_sha256: ontology.artifact_sha256(),
         };
 
-        let (facts, dropped_facts) = to_local_facts(entity_set);
         for fact in &facts {
             let nodes = ClassifiedFactNodes {
                 subject: classification_of(&fact.subject)?,
@@ -776,12 +869,27 @@ impl IngestPipeline {
                 .await?;
         }
 
-        // Best-effort: vectorize every node name this write landed (endpoint
-        // AND standalone) into the same Turso store so `prism query
-        // --semantic` works without Qdrant. Failures are logged inside and
-        // never fail the ingest.
-        let names: Vec<String> = written.iter().map(|s| s.to_string()).collect();
-        store.embed_names_best_effort(&names, &prov.tenant).await;
+        // Reuse the exact one-pass vectors semantic validation prepared. The
+        // model is never called a second time after the write; storage remains
+        // best-effort and cannot turn a successful graph write into failure.
+        if let Some(model) = semantic.embedding_model() {
+            match store
+                .store_precomputed_name_embeddings(
+                    semantic.embedding_names(),
+                    semantic.embedding_vectors(),
+                    &prov.tenant,
+                    model,
+                )
+                .await
+            {
+                Ok(stored) => {
+                    tracing::debug!(stored, tenant = %prov.tenant, model, "entity vectors stored in Turso")
+                }
+                Err(error) => tracing::warn!(
+                    "entity embedding storage failed: {error:#} — graph write unaffected"
+                ),
+            }
+        }
 
         Ok((
             GraphUpdate {
@@ -789,6 +897,7 @@ impl IngestPipeline {
                 edges_created: facts.len(),
             },
             dropped_facts,
+            semantic.report,
         ))
     }
 }
@@ -1095,6 +1204,23 @@ fn merge_extraction(merged: &mut Option<EntitySet>, batch: &EntitySet) {
 mod tests {
     use super::*;
 
+    struct DeterministicPipelineEmbed;
+
+    #[async_trait::async_trait]
+    impl prism_embed::EmbedBackend for DeterministicPipelineEmbed {
+        async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn id(&self) -> &str {
+            "test:pipeline-semantic-v1"
+        }
+    }
+
     #[test]
     fn extract_all_rows_reads_every_row() {
         let df = df!(
@@ -1140,6 +1266,7 @@ mod tests {
                     // and unit channel belongs to HAS_PROPERTY.
                     value: None,
                     unit: None,
+                    confidence: None,
                 })
                 .collect(),
         };
@@ -1175,6 +1302,7 @@ mod tests {
                 order: None,
                 value: None,
                 unit: None,
+                confidence: None,
             }],
         };
         let (report, plan) =
@@ -1251,6 +1379,7 @@ mod tests {
             order: None,
             value: None,
             unit: None,
+            confidence: None,
         };
         let entity_set = EntitySet {
             entities: vec![
@@ -1338,6 +1467,7 @@ mod tests {
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
             on_progress: None,
         });
 
@@ -1368,6 +1498,7 @@ mod tests {
                     order: None,
                     value: None,
                     unit: None,
+                    confidence: None,
                 },
                 Relationship {
                     from: "Steel".into(),
@@ -1377,6 +1508,7 @@ mod tests {
                     order: None,
                     value: None,
                     unit: None,
+                    confidence: None,
                 },
             ],
         };
@@ -1386,7 +1518,7 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let (update, dropped) = pipeline
+        let (update, dropped, _) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
@@ -1431,6 +1563,119 @@ mod tests {
         }
     }
 
+    /// A real geometric collision crosses the production write boundary and
+    /// remains advisory: both proposed nodes and their fact must still land.
+    /// This fails if a future change turns the semantic report into an
+    /// auto-merge, auto-drop, or write gate.
+    #[tokio::test]
+    async fn geometric_collision_never_mutates_the_pipeline_write_set() {
+        use crate::{Entity, Relationship};
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("semantic-write.db");
+        let store = ProvenanceStore::open(&db_path).await.unwrap();
+        store
+            .write_classified_entity(
+                "Ti ",
+                ClassifiedNode {
+                    entity_type: "Process",
+                    storage_label: "Manufacturing",
+                    class_iri: "https://w3id.org/emmo#Process",
+                },
+                None,
+                "local",
+            )
+            .await
+            .unwrap();
+        store
+            .store_precomputed_name_embeddings(
+                &["Ti ".to_string()],
+                &[vec![1.0, 0.0, 0.0]],
+                "local",
+                "test:pipeline-semantic-v1",
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            llm: None,
+            batch_rows: None,
+            mapping: None,
+            provenance_db: Some(db_path.clone()),
+            ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
+            on_progress: None,
+        });
+        let entity_set = EntitySet {
+            entities: vec![
+                Entity {
+                    entity_type: "Alloy".into(),
+                    name: "test alloy".into(),
+                    properties: serde_json::json!({}),
+                },
+                Entity {
+                    entity_type: "Element".into(),
+                    name: "Ti".into(),
+                    properties: serde_json::json!({}),
+                },
+            ],
+            relationships: vec![Relationship {
+                from: "test alloy".into(),
+                rel_type: "CONTAINS".into(),
+                to: "Ti".into(),
+                weight: Some(1.0),
+                order: None,
+                value: None,
+                unit: None,
+                confidence: Some(0.9),
+            }],
+        };
+        let source = DataSource {
+            path: "/tmp/semantic.csv".into(),
+            format: "csv".into(),
+        };
+
+        let (update, dropped, report) = pipeline
+            .write_local_graph_with_semantic_backend(
+                &crate::ontologies::EmmoOntology,
+                &entity_set,
+                &source,
+                "local",
+                None,
+                Some(&DeterministicPipelineEmbed),
+            )
+            .await
+            .unwrap();
+
+        assert!(dropped.is_empty(), "semantic findings cannot create drops");
+        assert_eq!(update.nodes_created, 2);
+        assert_eq!(update.edges_created, 1);
+        assert_eq!(
+            report.near_duplicates.status,
+            crate::semantic_validation::SemanticValidationStatus::Applied
+        );
+        assert!(
+            report
+                .near_duplicates
+                .findings
+                .iter()
+                .any(|finding| finding.proposed_name == "Ti" && finding.colliding_name == "Ti "),
+            "expected an auditable Ti/Ti-space collision: {report:?}"
+        );
+
+        let store = ProvenanceStore::open(&db_path).await.unwrap();
+        let ti_hits = store.graph_search("Ti", "local", 10).await.unwrap();
+        assert!(ti_hits.iter().any(|hit| hit.label == "Manufacturing"));
+        assert!(ti_hits.iter().any(|hit| hit.label == "Element"));
+        let facts = store
+            .recall_with_context("test alloy", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1, "the reported triple must still be stored");
+        assert_eq!(facts[0].object, "Ti");
+    }
+
     /// An entity in no relationship still lands — as a standalone node under
     /// its DECLARED type — and `nodes_created` keeps counting what the store
     /// actually received, which now includes it. (History: these entities
@@ -1451,6 +1696,7 @@ mod tests {
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
             on_progress: None,
         });
 
@@ -1481,6 +1727,7 @@ mod tests {
                 order: None,
                 value: None,
                 unit: None,
+                confidence: None,
             }],
         };
         let source = DataSource {
@@ -1489,7 +1736,7 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let (update, dropped) = pipeline
+        let (update, dropped, _) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
@@ -1542,6 +1789,7 @@ mod tests {
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
             on_progress: None,
         });
 
@@ -1567,6 +1815,7 @@ mod tests {
                 order: None,
                 value: None,
                 unit: None,
+                confidence: None,
             }],
         };
         let source = DataSource {
@@ -1575,7 +1824,7 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let (_, dropped) = pipeline
+        let (_, dropped, _) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
@@ -1631,6 +1880,7 @@ mod tests {
             mapping: None,
             provenance_db: Some(db_path.clone()),
             ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
             on_progress: None,
         });
 
@@ -1647,6 +1897,7 @@ mod tests {
             order: None,
             value: None,
             unit: None,
+            confidence: None,
         };
 
         let entity_set = EntitySet {
@@ -1707,7 +1958,7 @@ mod tests {
         };
 
         let emmo = crate::ontologies::EmmoOntology;
-        let (update, dropped) = pipeline
+        let (update, dropped, _) = pipeline
             .write_local_graph(&emmo, &entity_set, &source, "local", None)
             .await
             .unwrap();
@@ -1953,6 +2204,7 @@ mod tests {
             entities: None,
             extraction_decoding: None,
             graph_validation: None,
+            semantic_validation: Vec::new(),
             graph: None,
             embeddings: None,
             dropped_relationships: Vec::new(),
@@ -1971,6 +2223,7 @@ mod tests {
         // None fields should not appear in JSON.
         assert!(!json.contains("entities"));
         assert!(!json.contains("graph_validation"));
+        assert!(!json.contains("semantic_validation"));
         assert!(!json.contains("graph"));
         assert!(!json.contains("embeddings"));
         // No drops ⇒ no dropped_relationships key (clean stays clean)…
@@ -2057,6 +2310,7 @@ mod tests {
             mapping: None,
             provenance_db: Some(db_path),
             ontology: None,
+            semantic_validation: SemanticValidationPolicy::default(),
             on_progress: None,
         })
     }
