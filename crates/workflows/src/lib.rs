@@ -1956,6 +1956,13 @@ async fn run_parallel_step(
         }
     }
 
+    if completed == 0 && failures.is_empty() {
+        bail!(
+            "parallel step '{}' failed: no branches were configured",
+            step.id
+        );
+    }
+
     if failures.is_empty() {
         // Preserve the established all-success contract exactly: callers see
         // the same status, summary, context fields, and `sub_steps` shape.
@@ -1986,6 +1993,15 @@ async fn run_parallel_step(
         .collect::<Vec<_>>()
         .join("; ");
 
+    if completed == 0 {
+        bail!(
+            "parallel step '{}' failed: 0 of {} branches completed; {} failed: {failure_summary}",
+            step.id,
+            sub_results.len(),
+            failures.len()
+        );
+    }
+
     context.insert(
         step.id.clone(),
         serde_json::json!({
@@ -1996,7 +2012,7 @@ async fn run_parallel_step(
         }),
     );
 
-    // A branch failure is a partial result, not a parent-step error: returning
+    // A mixed outcome is a partial result, not a parent-step error: returning
     // `Err` here would discard valid sibling outputs. `partial` is carried in
     // the workflow's ordered step results, so API and CLI callers receive it
     // without the run becoming either a silent success or a whole-run error.

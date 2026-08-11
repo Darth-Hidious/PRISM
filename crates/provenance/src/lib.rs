@@ -217,6 +217,76 @@ impl Default for AgentRunFilter {
     }
 }
 
+/// Rebuildable search metadata for one durable agent session.
+///
+/// The session JSONL remains the source of truth. This row is only a mirror
+/// that can be discarded and reconstructed from `source_path`; consequently
+/// it deliberately contains no foreign key into the provenance ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionIndexEntry {
+    pub session_id: String,
+    /// Directory containing the source session JSONL files.
+    pub source_path: String,
+    /// Full path to this session's JSONL file.
+    pub file_path: String,
+    /// Durable project scope captured by the agent when it is known.
+    pub project_cwd: Option<String>,
+    pub created_at: f64,
+    pub updated_at: f64,
+    pub model: String,
+    pub turn_count: u64,
+    pub compaction_count: u64,
+    pub parent_session_id: Option<String>,
+    pub branch_name: Option<String>,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub title_source: Option<String>,
+    pub title_turn: u64,
+    pub models: Vec<String>,
+    /// Short derived excerpt used by the history UI and token search.
+    pub preview: Option<String>,
+    pub size_bytes: u64,
+}
+
+/// Filters for [`ProvenanceStore::list_session_metadata`].
+#[derive(Debug, Clone)]
+pub struct SessionIndexQuery {
+    pub source_path: Option<String>,
+    pub project_cwd: Option<String>,
+    /// Exact token query over title, summary, and preview. All normalized
+    /// tokens must be present in a matching session. Oversized input is
+    /// rejected rather than truncated so the all-token contract stays true.
+    pub text: Option<String>,
+    pub updated_after: Option<f64>,
+    pub updated_before: Option<f64>,
+    /// Maximum rows returned, clamped by the store to a safe upper bound.
+    pub limit: usize,
+    /// Number of rows to skip after applying filters and stable ordering.
+    pub offset: usize,
+}
+
+const DEFAULT_SESSION_INDEX_QUERY_LIMIT: usize = 100;
+/// Global cap applied to indexed and JSONL-fallback session queries.
+pub const MAX_SESSION_INDEX_QUERY_LIMIT: usize = 1_000;
+/// Maximum accepted UTF-8 byte length for one session text query.
+pub const MAX_SESSION_INDEX_SEARCH_BYTES: usize = 8 * 1024;
+/// Maximum accepted number of distinct normalized session search terms.
+pub const MAX_SESSION_INDEX_SEARCH_TERMS: usize = 32;
+
+impl Default for SessionIndexQuery {
+    fn default() -> Self {
+        Self {
+            source_path: None,
+            project_cwd: None,
+            text: None,
+            updated_after: None,
+            updated_before: None,
+            limit: DEFAULT_SESSION_INDEX_QUERY_LIMIT,
+            offset: 0,
+        }
+    }
+}
+
 /// Policy for deriving which running agents are stale.
 ///
 /// Staleness is an operator policy, not a lifecycle state. The default treats
@@ -302,6 +372,110 @@ async fn add_column_if_absent(
     }
 }
 
+fn normalized_session_terms(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn entry_search_terms(entry: &SessionIndexEntry) -> std::collections::BTreeSet<String> {
+    let mut terms = std::collections::BTreeSet::new();
+    for text in [&entry.title, &entry.summary, &entry.preview]
+        .into_iter()
+        .flatten()
+    {
+        terms.extend(normalized_session_terms(text));
+    }
+    terms
+}
+
+fn session_index_timestamp() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn validate_session_source_path(source_path: &str) -> Result<()> {
+    anyhow::ensure!(
+        !source_path.trim().is_empty(),
+        "session metadata source_path must not be empty"
+    );
+    Ok(())
+}
+
+fn validate_session_index_entry(
+    entry: &SessionIndexEntry,
+    expected_source_path: Option<&str>,
+) -> Result<()> {
+    validate_session_source_path(&entry.source_path)?;
+    if let Some(expected) = expected_source_path {
+        anyhow::ensure!(
+            entry.source_path == expected,
+            "session {} belongs to source_path {:?}, expected {:?}",
+            entry.session_id,
+            entry.source_path,
+            expected
+        );
+    }
+    anyhow::ensure!(
+        !entry.session_id.trim().is_empty(),
+        "session metadata session_id must not be empty"
+    );
+    anyhow::ensure!(
+        !entry.file_path.trim().is_empty(),
+        "session metadata file_path must not be empty"
+    );
+    anyhow::ensure!(
+        entry.created_at.is_finite(),
+        "session metadata created_at must be finite"
+    );
+    anyhow::ensure!(
+        entry.updated_at.is_finite(),
+        "session metadata updated_at must be finite"
+    );
+    for (field, value) in [
+        ("turn_count", entry.turn_count),
+        ("compaction_count", entry.compaction_count),
+        ("title_turn", entry.title_turn),
+        ("size_bytes", entry.size_bytes),
+    ] {
+        anyhow::ensure!(
+            i64::try_from(value).is_ok(),
+            "session metadata {field} exceeds i64"
+        );
+    }
+    Ok(())
+}
+
+async fn begin_session_index_txn(
+    conn: &turso::Connection,
+) -> Result<turso::transaction::Transaction<'_>> {
+    turso::transaction::Transaction::new_unchecked(
+        conn,
+        turso::transaction::TransactionBehavior::Immediate,
+    )
+    .await
+    .context("failed to begin session metadata transaction")
+}
+
+async fn finish_session_index_txn(
+    txn: turso::transaction::Transaction<'_>,
+    result: Result<()>,
+) -> Result<()> {
+    match result {
+        Ok(()) => txn
+            .commit()
+            .await
+            .context("failed to commit session metadata transaction"),
+        Err(error) => {
+            let _ = txn.rollback().await;
+            Err(error)
+        }
+    }
+}
+
 /// Turso's local pager cannot initialize the same brand-new SQLite file from
 /// two independent `Database` handles concurrently. Agent turns can start in
 /// parallel, so serialize the short open/schema phase within this process;
@@ -325,11 +499,13 @@ pub struct ProvenanceStore {
     ///    back, the bystander's row vanishes even though its caller was
     ///    already told `Ok(())` — a silent lost write.
     ///
-    /// Read paths deliberately do NOT take the lock: a read joins an open
-    /// transaction harmlessly (it sees the writer's uncommitted rows, same
-    /// as SQLite on one connection) and holds nothing that a rollback could
-    /// destroy. SEPARATE handles need no help either: they serialize via
-    /// the database busy wait, which is what the concurrency tests exercise.
+    /// Most single-table read paths deliberately do NOT take the lock: a read
+    /// joins an open transaction harmlessly and holds nothing that a rollback
+    /// could destroy. The session-metadata list and reconciliation reads are
+    /// the exception because they must not observe a partially staged
+    /// multi-table source rebuild. SEPARATE handles need no help either: they
+    /// serialize via the database busy wait, which is what the concurrency
+    /// tests exercise.
     write_lock: tokio::sync::Mutex<()>,
 }
 
@@ -366,14 +542,12 @@ impl ProvenanceStore {
         let mut busy = conn.query("PRAGMA busy_timeout=5000", ()).await?;
         while busy.next().await?.is_some() {}
 
-        // Enforce the evidence-table foreign key (`prov_assertion_evidence`
-        // → `prov_assertion`). Like SQLite, Turso leaves foreign keys OFF
-        // unless each connection opts in, and an unenforced FK is a lie in
-        // the schema. This is the only declared FK in the store, so turning
-        // enforcement on changes nothing else. Set before `init_schema` so
-        // the migrations run under the same rules as ordinary writes
-        // (`ON UPDATE CASCADE` keeps evidence rows attached across id
-        // re-keys).
+        // Enforce the store's declared foreign keys (provenance assertion
+        // evidence and the rebuildable session search terms). Like SQLite,
+        // Turso leaves foreign keys OFF unless each connection opts in, and
+        // an unenforced FK is a lie in the schema. Set before `init_schema` so
+        // migrations run under the same rules as ordinary writes (`ON UPDATE
+        // CASCADE` keeps evidence rows attached across assertion id re-keys).
         let mut foreign_keys = conn.query("PRAGMA foreign_keys=ON", ()).await?;
         while foreign_keys.next().await?.is_some() {}
 
@@ -478,6 +652,103 @@ impl ProvenanceStore {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_runs_parent_started \
              ON agent_runs(parent_run_id, started_at)",
+            (),
+        )
+        .await?;
+
+        // Rebuildable mirror of agent session metadata. Session ids are only
+        // unique within a source directory: tests and alternate profiles may
+        // legitimately point at independent session collections.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS session_metadata (
+                source_path TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                project_cwd TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                model TEXT NOT NULL,
+                turn_count INTEGER NOT NULL CHECK (turn_count >= 0),
+                compaction_count INTEGER NOT NULL CHECK (compaction_count >= 0),
+                parent_session_id TEXT,
+                branch_name TEXT,
+                title TEXT,
+                summary TEXT,
+                title_source TEXT,
+                title_turn INTEGER NOT NULL CHECK (title_turn >= 0),
+                models TEXT NOT NULL,
+                preview TEXT,
+                size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+                indexed_at REAL NOT NULL,
+                PRIMARY KEY (source_path, session_id)
+            )"#,
+            (),
+        )
+        .await?;
+        // Early development builds created this disposable table before the
+        // observation boundary was added. Keep those local mirrors openable;
+        // rows with the default are safely eligible for the next rebuild.
+        add_column_if_absent(
+            conn,
+            "session_metadata",
+            "indexed_at",
+            "REAL NOT NULL DEFAULT 0",
+        )
+        .await?;
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS session_metadata_reconciliation (
+                source_path TEXT PRIMARY KEY,
+                reconciled_at REAL NOT NULL
+            )"#,
+            (),
+        )
+        .await?;
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS session_search_terms (
+                source_path TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                term TEXT NOT NULL,
+                PRIMARY KEY (source_path, session_id, term),
+                FOREIGN KEY (source_path, session_id)
+                    REFERENCES session_metadata(source_path, session_id)
+                    ON DELETE CASCADE
+            )"#,
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_updated_at \
+             ON session_metadata(updated_at DESC)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_source_updated \
+             ON session_metadata(source_path, updated_at DESC)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_project_updated \
+             ON session_metadata(project_cwd, updated_at DESC)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_parent \
+             ON session_metadata(parent_session_id)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_source_indexed \
+             ON session_metadata(source_path, indexed_at)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_search_terms_term_session \
+             ON session_search_terms(term, session_id, source_path)",
             (),
         )
         .await?;
@@ -736,6 +1007,376 @@ impl ProvenanceStore {
             runs.push(row_to_agent_run(&row)?);
         }
         Ok(runs)
+    }
+
+    /// Insert or refresh one row in the rebuildable session metadata mirror.
+    ///
+    /// The metadata row and its normalized search terms are replaced in one
+    /// transaction. This incremental path intentionally does not advance the
+    /// source reconciliation timestamp; only a complete source rebuild can do
+    /// that honestly.
+    pub async fn upsert_session_metadata(&self, entry: &SessionIndexEntry) -> Result<()> {
+        validate_session_index_entry(entry, None)?;
+        let indexed_at = session_index_timestamp();
+        let _same_handle_guard = self.write_lock.lock().await;
+        let txn = begin_session_index_txn(&self.conn).await?;
+        let result = self
+            .upsert_session_metadata_in_open_txn(entry, indexed_at)
+            .await;
+        finish_session_index_txn(txn, result).await
+    }
+
+    /// Atomically replace every mirrored row for `source_path` and record the
+    /// time at which that full filesystem reconciliation completed.
+    ///
+    /// All entries are validated before the existing source is purged, so a
+    /// mixed-source or otherwise malformed rebuild cannot destroy a good
+    /// mirror. Rows incrementally observed after `scan_started_at` are kept,
+    /// preventing a concurrent write-through from being erased by a stale
+    /// filesystem snapshot. An empty slice is a valid reconciliation of an
+    /// empty source.
+    pub async fn replace_session_metadata_source(
+        &self,
+        source_path: &str,
+        entries: &[SessionIndexEntry],
+        preserve_session_ids: &[String],
+        scan_started_at: f64,
+        reconciled_at: f64,
+    ) -> Result<()> {
+        validate_session_source_path(source_path)?;
+        anyhow::ensure!(
+            scan_started_at.is_finite() && reconciled_at.is_finite(),
+            "session metadata reconciliation timestamps must be finite"
+        );
+        anyhow::ensure!(
+            reconciled_at >= scan_started_at,
+            "session metadata reconciled_at precedes scan_started_at"
+        );
+        let mut session_ids = std::collections::HashSet::new();
+        for entry in entries {
+            validate_session_index_entry(entry, Some(source_path))?;
+            anyhow::ensure!(
+                session_ids.insert(entry.session_id.as_str()),
+                "duplicate session_id {:?} in source replacement",
+                entry.session_id
+            );
+        }
+        let mut preserved_ids = std::collections::HashSet::new();
+        for session_id in preserve_session_ids {
+            anyhow::ensure!(
+                !session_id.trim().is_empty(),
+                "preserved session_id must not be empty"
+            );
+            anyhow::ensure!(
+                preserved_ids.insert(session_id.as_str()),
+                "duplicate preserved session_id {session_id:?}"
+            );
+            anyhow::ensure!(
+                !session_ids.contains(session_id.as_str()),
+                "session_id {session_id:?} is both rebuilt and preserved"
+            );
+        }
+
+        let _same_handle_guard = self.write_lock.lock().await;
+        let txn = begin_session_index_txn(&self.conn).await?;
+        let result: Result<()> = async {
+            // An unreadable or actively-written JSONL candidate is
+            // indeterminate, not absent. Keep its last good row and advance
+            // the observation boundary so the source-wide delete skips it.
+            for session_id in preserve_session_ids {
+                self.conn
+                    .execute(
+                        "UPDATE session_metadata SET indexed_at = \
+                         CASE WHEN indexed_at < ?1 THEN ?1 ELSE indexed_at END \
+                         WHERE source_path = ?2 AND session_id = ?3",
+                        [
+                            Value::Real(reconciled_at),
+                            Value::Text(source_path.to_string()),
+                            Value::Text(session_id.clone()),
+                        ],
+                    )
+                    .await?;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM session_search_terms \
+                     WHERE source_path = ?1 AND session_id IN (\
+                         SELECT session_id FROM session_metadata \
+                         WHERE source_path = ?1 AND indexed_at < ?2\
+                     )",
+                    [
+                        Value::Text(source_path.to_string()),
+                        Value::Real(scan_started_at),
+                    ],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM session_metadata \
+                     WHERE source_path = ?1 AND indexed_at < ?2",
+                    [
+                        Value::Text(source_path.to_string()),
+                        Value::Real(scan_started_at),
+                    ],
+                )
+                .await?;
+            for entry in entries {
+                self.upsert_session_metadata_in_open_txn(entry, scan_started_at)
+                    .await?;
+            }
+            self.conn
+                .execute(
+                    r#"INSERT INTO session_metadata_reconciliation
+                       (source_path, reconciled_at) VALUES (?1, ?2)
+                       ON CONFLICT(source_path) DO UPDATE SET
+                           reconciled_at = excluded.reconciled_at"#,
+                    [
+                        Value::Text(source_path.to_string()),
+                        Value::Real(reconciled_at),
+                    ],
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish_session_index_txn(txn, result).await
+    }
+
+    /// Return the last successful full-rebuild timestamp for a source.
+    pub async fn session_metadata_reconciled_at(&self, source_path: &str) -> Result<Option<f64>> {
+        validate_session_source_path(source_path)?;
+        let _same_handle_guard = self.write_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT reconciled_at FROM session_metadata_reconciliation \
+                 WHERE source_path = ?1",
+                [Value::Text(source_path.to_string())],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(get_f64(&row, 0, "reconciled_at")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List mirrored sessions newest first, with indexed project/source/time
+    /// filters and exact-token AND search over title, summary, and preview.
+    pub async fn list_session_metadata(
+        &self,
+        query: &SessionIndexQuery,
+    ) -> Result<Vec<SessionIndexEntry>> {
+        if let Some(source_path) = &query.source_path {
+            validate_session_source_path(source_path)?;
+        }
+        if let Some(updated_after) = query.updated_after {
+            anyhow::ensure!(
+                updated_after.is_finite(),
+                "session metadata updated_after must be finite"
+            );
+        }
+        if let Some(updated_before) = query.updated_before {
+            anyhow::ensure!(
+                updated_before.is_finite(),
+                "session metadata updated_before must be finite"
+            );
+        }
+        let search_terms = match &query.text {
+            Some(text) => {
+                anyhow::ensure!(
+                    text.len() <= MAX_SESSION_INDEX_SEARCH_BYTES,
+                    "session metadata search text exceeds {} bytes",
+                    MAX_SESSION_INDEX_SEARCH_BYTES
+                );
+                let terms = normalized_session_terms(text);
+                anyhow::ensure!(
+                    terms.len() <= MAX_SESSION_INDEX_SEARCH_TERMS,
+                    "session metadata search has more than {} distinct terms",
+                    MAX_SESSION_INDEX_SEARCH_TERMS
+                );
+                terms
+            }
+            None => std::collections::BTreeSet::new(),
+        };
+        // Unlike independent ledger reads, this joins metadata to its derived
+        // terms. Wait for any same-handle rebuild so callers cannot observe an
+        // uncommitted purge or only part of the replacement inserts.
+        let _same_handle_guard = self.write_lock.lock().await;
+
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        if let Some(source_path) = &query.source_path {
+            params.push(Value::Text(source_path.clone()));
+            clauses.push(format!("m.source_path = ?{}", params.len()));
+        }
+        if let Some(project_cwd) = &query.project_cwd {
+            params.push(Value::Text(project_cwd.clone()));
+            clauses.push(format!("m.project_cwd = ?{}", params.len()));
+        }
+        if let Some(updated_after) = query.updated_after {
+            params.push(Value::Real(updated_after));
+            clauses.push(format!("m.updated_at >= ?{}", params.len()));
+        }
+        if let Some(updated_before) = query.updated_before {
+            params.push(Value::Real(updated_before));
+            clauses.push(format!("m.updated_at <= ?{}", params.len()));
+        }
+        for term in search_terms {
+            params.push(Value::Text(term));
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM session_search_terms AS search_term \
+                 WHERE search_term.term = ?{} \
+                   AND search_term.session_id = m.session_id \
+                   AND search_term.source_path = m.source_path)",
+                params.len()
+            ));
+        }
+
+        let mut sql = format!("SELECT {SESSION_INDEX_COLUMNS} FROM session_metadata AS m");
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        params.push(Value::Integer(
+            query.limit.min(MAX_SESSION_INDEX_QUERY_LIMIT) as i64,
+        ));
+        params.push(Value::Integer(
+            i64::try_from(query.offset).unwrap_or(i64::MAX),
+        ));
+        sql.push_str(&format!(
+            " ORDER BY m.updated_at DESC, m.session_id ASC, m.source_path ASC \
+             LIMIT ?{} OFFSET ?{}",
+            params.len() - 1,
+            params.len(),
+        ));
+
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            entries.push(row_to_session_index_entry(&row)?);
+        }
+        Ok(entries)
+    }
+
+    /// Purge one rebuildable source, including its reconciliation marker.
+    pub async fn delete_session_metadata_source(&self, source_path: &str) -> Result<()> {
+        validate_session_source_path(source_path)?;
+        let _same_handle_guard = self.write_lock.lock().await;
+        let txn = begin_session_index_txn(&self.conn).await?;
+        let result: Result<()> = async {
+            self.conn
+                .execute(
+                    "DELETE FROM session_search_terms WHERE source_path = ?1",
+                    [Value::Text(source_path.to_string())],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM session_metadata WHERE source_path = ?1",
+                    [Value::Text(source_path.to_string())],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM session_metadata_reconciliation WHERE source_path = ?1",
+                    [Value::Text(source_path.to_string())],
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish_session_index_txn(txn, result).await
+    }
+
+    /// Write one row and rebuild its token set. The caller must hold
+    /// `write_lock` and an open session metadata transaction.
+    async fn upsert_session_metadata_in_open_txn(
+        &self,
+        entry: &SessionIndexEntry,
+        indexed_at: f64,
+    ) -> Result<()> {
+        let models = serde_json::to_string(&entry.models)?;
+        let changed = self
+            .conn
+            .execute(
+                r#"INSERT INTO session_metadata
+                   (source_path, session_id, file_path, project_cwd,
+                    created_at, updated_at, model, turn_count,
+                    compaction_count, parent_session_id, branch_name, title,
+                    summary, title_source, title_turn, models, preview,
+                    size_bytes, indexed_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                           ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                   ON CONFLICT(source_path, session_id) DO UPDATE SET
+                       file_path = excluded.file_path,
+                       project_cwd = excluded.project_cwd,
+                       created_at = excluded.created_at,
+                       updated_at = excluded.updated_at,
+                       model = excluded.model,
+                       turn_count = excluded.turn_count,
+                       compaction_count = excluded.compaction_count,
+                       parent_session_id = excluded.parent_session_id,
+                       branch_name = excluded.branch_name,
+                       title = excluded.title,
+                       summary = excluded.summary,
+                       title_source = excluded.title_source,
+                       title_turn = excluded.title_turn,
+                       models = excluded.models,
+                       preview = excluded.preview,
+                       size_bytes = excluded.size_bytes,
+                       indexed_at = excluded.indexed_at
+                   WHERE excluded.indexed_at > session_metadata.indexed_at
+                     AND excluded.updated_at >= session_metadata.updated_at"#,
+                [
+                    Value::Text(entry.source_path.clone()),
+                    Value::Text(entry.session_id.clone()),
+                    Value::Text(entry.file_path.clone()),
+                    opt_to_value(&entry.project_cwd),
+                    Value::Real(entry.created_at),
+                    Value::Real(entry.updated_at),
+                    Value::Text(entry.model.clone()),
+                    Value::Integer(entry.turn_count as i64),
+                    Value::Integer(entry.compaction_count as i64),
+                    opt_to_value(&entry.parent_session_id),
+                    opt_to_value(&entry.branch_name),
+                    opt_to_value(&entry.title),
+                    opt_to_value(&entry.summary),
+                    opt_to_value(&entry.title_source),
+                    Value::Integer(entry.title_turn as i64),
+                    Value::Text(models),
+                    opt_to_value(&entry.preview),
+                    Value::Integer(entry.size_bytes as i64),
+                    Value::Real(indexed_at),
+                ],
+            )
+            .await?;
+        if changed == 0 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "DELETE FROM session_search_terms \
+                 WHERE source_path = ?1 AND session_id = ?2",
+                [
+                    Value::Text(entry.source_path.clone()),
+                    Value::Text(entry.session_id.clone()),
+                ],
+            )
+            .await?;
+        for term in entry_search_terms(entry) {
+            self.conn
+                .execute(
+                    r#"INSERT INTO session_search_terms
+                       (source_path, session_id, term) VALUES (?1, ?2, ?3)"#,
+                    [
+                        Value::Text(entry.source_path.clone()),
+                        Value::Text(entry.session_id.clone()),
+                        Value::Text(term),
+                    ],
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn query_by_session(&self, session_id: &str) -> Result<Vec<ProvenanceRecord>> {
@@ -1044,6 +1685,53 @@ fn get_opt_str(row: &turso::Row, idx: usize) -> Result<Option<String>> {
         Value::Text(s) => Some(s),
         Value::Null => None,
         _ => None,
+    })
+}
+
+fn get_f64(row: &turso::Row, idx: usize, field: &str) -> Result<f64> {
+    match row.get_value(idx)? {
+        Value::Real(value) => Ok(value),
+        Value::Integer(value) => Ok(value as f64),
+        value => anyhow::bail!("session metadata {field} is not numeric: {value:?}"),
+    }
+}
+
+fn get_session_u64(row: &turso::Row, idx: usize, field: &str) -> Result<u64> {
+    match row.get_value(idx)? {
+        Value::Integer(value) => {
+            u64::try_from(value).with_context(|| format!("session metadata {field} is negative"))
+        }
+        value => anyhow::bail!("session metadata {field} is not an integer: {value:?}"),
+    }
+}
+
+const SESSION_INDEX_COLUMNS: &str = "m.source_path, m.session_id, m.file_path, m.project_cwd, \
+    m.created_at, m.updated_at, m.model, m.turn_count, m.compaction_count, \
+    m.parent_session_id, m.branch_name, m.title, m.summary, m.title_source, \
+    m.title_turn, m.models, m.preview, m.size_bytes";
+
+fn row_to_session_index_entry(row: &turso::Row) -> Result<SessionIndexEntry> {
+    let models = serde_json::from_str(&get_str(row, 15)?)
+        .context("session metadata models contains invalid JSON")?;
+    Ok(SessionIndexEntry {
+        session_id: get_str(row, 1)?,
+        source_path: get_str(row, 0)?,
+        file_path: get_str(row, 2)?,
+        project_cwd: get_opt_str(row, 3)?,
+        created_at: get_f64(row, 4, "created_at")?,
+        updated_at: get_f64(row, 5, "updated_at")?,
+        model: get_str(row, 6)?,
+        turn_count: get_session_u64(row, 7, "turn_count")?,
+        compaction_count: get_session_u64(row, 8, "compaction_count")?,
+        parent_session_id: get_opt_str(row, 9)?,
+        branch_name: get_opt_str(row, 10)?,
+        title: get_opt_str(row, 11)?,
+        summary: get_opt_str(row, 12)?,
+        title_source: get_opt_str(row, 13)?,
+        title_turn: get_session_u64(row, 14, "title_turn")?,
+        models,
+        preview: get_opt_str(row, 16)?,
+        size_bytes: get_session_u64(row, 17, "size_bytes")?,
     })
 }
 
@@ -1917,5 +2605,458 @@ mod tests {
         );
         // A modest limit still works through the same clamp (it's a min()).
         assert_eq!(store.query_failures(None, 5).await.unwrap().len(), 5);
+    }
+
+    fn session_index_entry(
+        session_id: &str,
+        source_path: &str,
+        project_cwd: Option<&str>,
+        updated_at: f64,
+    ) -> SessionIndexEntry {
+        SessionIndexEntry {
+            session_id: session_id.to_string(),
+            source_path: source_path.to_string(),
+            file_path: format!("{source_path}/{session_id}.jsonl"),
+            project_cwd: project_cwd.map(str::to_string),
+            created_at: updated_at - 10.0,
+            updated_at,
+            model: "gpt-5.6".to_string(),
+            turn_count: 12,
+            compaction_count: 2,
+            parent_session_id: Some("parent-session".to_string()),
+            branch_name: Some("candidate-branch".to_string()),
+            title: Some("Nickel nickel Alloy".to_string()),
+            summary: Some("Creep-resistant screening".to_string()),
+            title_source: Some("model".to_string()),
+            title_turn: 8,
+            models: vec!["gpt-5.5".to_string(), "gpt-5.6".to_string()],
+            preview: Some("Turbine blade candidates".to_string()),
+            size_bytes: 4_096,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_metadata_schema_declares_all_query_indexes() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND \
+                 tbl_name IN ('session_metadata', 'session_search_terms')",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut names = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            names.insert(get_str(&row, 0).unwrap());
+        }
+        for (index, expected_columns) in [
+            ("idx_session_metadata_updated_at", vec!["updated_at"]),
+            (
+                "idx_session_metadata_source_updated",
+                vec!["source_path", "updated_at"],
+            ),
+            (
+                "idx_session_metadata_project_updated",
+                vec!["project_cwd", "updated_at"],
+            ),
+            ("idx_session_metadata_parent", vec!["parent_session_id"]),
+            (
+                "idx_session_metadata_source_indexed",
+                vec!["source_path", "indexed_at"],
+            ),
+            (
+                "idx_session_search_terms_term_session",
+                vec!["term", "session_id", "source_path"],
+            ),
+        ] {
+            assert!(names.contains(index), "missing index {index}");
+            let mut column_rows = store
+                .conn
+                .query(&format!("PRAGMA index_info({index})"), ())
+                .await
+                .unwrap();
+            let mut actual_columns = Vec::new();
+            while let Some(row) = column_rows.next().await.unwrap() {
+                actual_columns.push(get_str(&row, 2).unwrap());
+            }
+            assert_eq!(
+                actual_columns, expected_columns,
+                "wrong columns for {index}"
+            );
+        }
+
+        let mut tables = store
+            .conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND \
+                 name IN ('session_metadata', 'session_metadata_reconciliation', \
+                          'session_search_terms')",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut table_names = std::collections::HashSet::new();
+        while let Some(row) = tables.next().await.unwrap() {
+            table_names.insert(get_str(&row, 0).unwrap());
+        }
+        assert_eq!(table_names.len(), 3, "all session mirror tables exist");
+    }
+
+    #[tokio::test]
+    async fn session_metadata_round_trips_and_filters_with_exact_and_search() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let alpha = session_index_entry("alpha", "/sessions/main", Some("/work/alloys"), 150.0);
+        let mut beta = session_index_entry("beta", "/sessions/main", Some("/work/alloys"), 220.0);
+        beta.title = Some("Nickel phase diagram".to_string());
+        beta.summary = Some("Equilibrium calculations".to_string());
+        beta.preview = None;
+        let mut gamma = session_index_entry("gamma", "/sessions/other", None, 310.0);
+        gamma.title = Some("Ceramic toughness".to_string());
+        gamma.summary = None;
+        gamma.preview = Some("Fracture test".to_string());
+
+        for entry in [&alpha, &beta, &gamma] {
+            store.upsert_session_metadata(entry).await.unwrap();
+        }
+
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    limit: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![gamma.clone()],
+            "limit applies after newest-first ordering"
+        );
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    limit: 1,
+                    offset: 1,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![beta.clone()],
+            "offset pages through the stable newest-first ordering"
+        );
+
+        let alpha_rows = store
+            .list_session_metadata(&SessionIndexQuery {
+                source_path: Some("/sessions/main".to_string()),
+                project_cwd: Some("/work/alloys".to_string()),
+                updated_after: Some(100.0),
+                updated_before: Some(200.0),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alpha_rows, vec![alpha.clone()]);
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    updated_after: Some(alpha.updated_at),
+                    updated_before: Some(alpha.updated_at),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![alpha.clone()],
+            "update-window bounds are inclusive"
+        );
+
+        let searched = store
+            .list_session_metadata(&SessionIndexQuery {
+                text: Some("NICKEL creep nickel".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(searched, vec![alpha.clone()]);
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    text: Some("turbine candidates".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![alpha.clone()],
+            "preview tokens are searchable"
+        );
+        assert!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    text: Some("nickel missing".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "every search token is required"
+        );
+        assert!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    text: Some("nick".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "search is exact-token rather than substring matching"
+        );
+
+        let excessive_terms = (0..=MAX_SESSION_INDEX_SEARCH_TERMS)
+            .map(|index| format!("term{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error = store
+            .list_session_metadata(&SessionIndexQuery {
+                text: Some(excessive_terms),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("distinct terms"));
+        let error = store
+            .list_session_metadata(&SessionIndexQuery {
+                text: Some("x".repeat(MAX_SESSION_INDEX_SEARCH_BYTES + 1)),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+
+        let mut term_count = store
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM session_search_terms \
+                 WHERE source_path = ?1 AND session_id = ?2",
+                [
+                    Value::Text(alpha.source_path.clone()),
+                    Value::Text(alpha.session_id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        let count = term_count
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get_value(0)
+            .unwrap()
+            .as_integer()
+            .copied();
+        assert_eq!(count, Some(8), "repeated title tokens are deduplicated");
+
+        let mut refreshed = alpha.clone();
+        refreshed.title = Some("Cobalt study".to_string());
+        refreshed.summary = None;
+        refreshed.preview = None;
+        refreshed.updated_at = 400.0;
+        store.upsert_session_metadata(&refreshed).await.unwrap();
+        assert!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    text: Some("creep".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "upsert removes stale terms"
+        );
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    text: Some("cobalt".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![refreshed]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_metadata_source_replacement_and_purge_are_isolated() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let old = session_index_entry("old", "/sessions/main", Some("/work/old"), 100.0);
+        let other = session_index_entry("other", "/sessions/other", Some("/work/other"), 200.0);
+        store.upsert_session_metadata(&old).await.unwrap();
+        store.upsert_session_metadata(&other).await.unwrap();
+
+        let mut replacement =
+            session_index_entry("new", "/sessions/main", Some("/work/new"), 300.0);
+        replacement.title = Some("Replacement marker".to_string());
+        replacement.summary = None;
+        replacement.preview = None;
+        let scan_started_at = session_index_timestamp();
+        let reconciled_at = scan_started_at + 0.001;
+        store
+            .replace_session_metadata_source(
+                "/sessions/main",
+                std::slice::from_ref(&replacement),
+                &[],
+                scan_started_at,
+                reconciled_at,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .session_metadata_reconciled_at("/sessions/main")
+                .await
+                .unwrap(),
+            Some(reconciled_at)
+        );
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    source_path: Some("/sessions/main".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![replacement.clone()]
+        );
+        assert!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    text: Some("creep".to_string()),
+                    source_path: Some("/sessions/main".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "replacement removes the old source's search terms"
+        );
+
+        let mut wrong_source = replacement.clone();
+        wrong_source.source_path = "/sessions/other".to_string();
+        let error = store
+            .replace_session_metadata_source(
+                "/sessions/main",
+                std::slice::from_ref(&wrong_source),
+                &[],
+                reconciled_at + 1.0,
+                reconciled_at + 2.0,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expected"));
+        assert_eq!(
+            store
+                .session_metadata_reconciled_at("/sessions/main")
+                .await
+                .unwrap(),
+            Some(reconciled_at),
+            "validation happens before the purge transaction"
+        );
+
+        store
+            .delete_session_metadata_source("/sessions/main")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    source_path: Some("/sessions/main".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .session_metadata_reconciled_at("/sessions/main")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .list_session_metadata(&SessionIndexQuery {
+                    source_path: Some("/sessions/other".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            vec![other],
+            "purging one source does not touch another"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rebuild_preserves_rows_indexed_after_its_scan_started() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let mut scanned = session_index_entry("scanned", "/sessions/main", None, 100.0);
+        scanned.title = Some("Stale snapshot".to_string());
+        let concurrent = session_index_entry("concurrent", "/sessions/main", None, 200.0);
+        store.upsert_session_metadata(&scanned).await.unwrap();
+        store.upsert_session_metadata(&concurrent).await.unwrap();
+        let mut updated_while_scanning = scanned.clone();
+        updated_while_scanning.updated_at = 300.0;
+        updated_while_scanning.title = Some("Concurrent update".to_string());
+        store
+            .upsert_session_metadata(&updated_while_scanning)
+            .await
+            .unwrap();
+
+        // Pin deterministic observation times: both rows changed after the
+        // snapshot began. The missing row and the newer same-id row must both
+        // survive the stale replacement input.
+        store
+            .conn
+            .execute(
+                "UPDATE session_metadata SET indexed_at = 150.0 \
+                 WHERE source_path = '/sessions/main'",
+                (),
+            )
+            .await
+            .unwrap();
+        store
+            .replace_session_metadata_source(
+                "/sessions/main",
+                std::slice::from_ref(&scanned),
+                &[],
+                100.0,
+                200.0,
+            )
+            .await
+            .unwrap();
+
+        let listed = store
+            .list_session_metadata(&SessionIndexQuery {
+                source_path: Some("/sessions/main".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ids = listed
+            .iter()
+            .map(|entry| entry.session_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["concurrent", "scanned"])
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .find(|entry| entry.session_id == "scanned")
+                .and_then(|entry| entry.title.as_deref()),
+            Some("Concurrent update"),
+            "a stale rebuild snapshot must not overwrite a newer same-id row"
+        );
     }
 }

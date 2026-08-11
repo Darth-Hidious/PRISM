@@ -258,7 +258,8 @@ impl ChatService {
             }
         };
 
-        let store = SessionStore::new(sessions_dir);
+        let mut store = SessionStore::new(sessions_dir);
+        store.set_project_cwd(Some(&tool_server_config.project_root));
         let sessions_dir = store.dir().to_path_buf();
         let owners_path = sessions_dir.join("http_chat_owners.json");
         let owners = std::fs::read_to_string(&owners_path)

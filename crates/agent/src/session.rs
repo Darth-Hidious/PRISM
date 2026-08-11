@@ -4,23 +4,34 @@
 //! Each line is a message or metadata event. Sessions can be:
 //! - Resumed: auto-loads last session, or by explicit ID
 //! - Forked: branch the current conversation with parent tracking
-//! - Listed: scan dir, parse first line of each JSONL
+//! - Listed: query a rebuildable Turso metadata mirror
 //! - Rotated: files rotate at 256KB (max 3 backups)
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
 use chrono::Local;
 use directories::UserDirs;
+use prism_provenance::{
+    MAX_SESSION_INDEX_QUERY_LIMIT, MAX_SESSION_INDEX_SEARCH_BYTES, MAX_SESSION_INDEX_SEARCH_TERMS,
+    SessionIndexEntry, SessionIndexQuery,
+};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use crate::session_index::SessionIndexWorker;
 
 // ── Constants ────────────────────────────────────────────────────────
 
 const MAX_FILE_SIZE: u64 = 256 * 1024; // 256KB
 const MAX_ROTATIONS: usize = 3;
 const LATEST_FILE: &str = ".latest";
+const SESSION_CONTEXT_ENTRY_TYPE: &str = "session_context";
+const DEFAULT_SESSION_QUERY_LIMIT: usize = 100;
+const SESSION_PREVIEW_MAX_CHARS: usize = 240;
 
 /// Every this-many turns, `append_message` flushes a fresh `meta` line so the
 /// file alone carries near-current counters (rotation moves old lines into
@@ -110,6 +121,7 @@ pub struct SessionEntry {
 pub struct SessionInfo {
     pub session_id: String,
     pub created_at: f64,
+    pub updated_at: f64,
     pub turn_count: usize,
     /// The model currently serving the session (tracks `/model` switches).
     pub model: String,
@@ -126,6 +138,67 @@ pub struct SessionInfo {
     /// `model` is set (falls back to `[model]` for legacy sessions).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// Main JSONL path. Rotated segments share this path plus `.1` ... `.3`.
+    #[serde(default, skip_serializing)]
+    pub path: String,
+    /// Working directory captured by a separate rebuildable context event.
+    /// Kept available to trusted in-process query callers but omitted from
+    /// HTTP/TUI serialization to avoid exposing host filesystem layout.
+    #[serde(default, skip_serializing)]
+    pub project_cwd: Option<String>,
+    /// First user message, clipped for history search and rebuilt from JSONL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// Filters for indexed session history queries.
+#[derive(Debug, Clone)]
+pub struct SessionQuery {
+    /// Match normalized terms in the session title, summary, or preview.
+    pub text: Option<String>,
+    /// Restrict results to the working directory captured at session creation.
+    pub project_cwd: Option<PathBuf>,
+    /// Inclusive lower bound for the session's last update time (Unix seconds).
+    pub updated_after: Option<f64>,
+    /// Inclusive upper bound for the session's last update time (Unix seconds).
+    pub updated_before: Option<f64>,
+    /// Maximum number of rows returned; the SQL layer applies its global cap.
+    pub limit: usize,
+    /// Number of matching rows to skip after stable update-time ordering.
+    pub offset: usize,
+}
+
+impl Default for SessionQuery {
+    fn default() -> Self {
+        Self {
+            text: None,
+            project_cwd: None,
+            updated_after: None,
+            updated_before: None,
+            limit: DEFAULT_SESSION_QUERY_LIMIT,
+            offset: 0,
+        }
+    }
+}
+
+/// Policy for periodic JSONL-to-SQL drift repair.
+///
+/// A source is scanned on first indexed use and again only after this interval.
+/// Between reconciliations, `list_sessions` is a pure SQL query: a file removed
+/// externally may remain visible until the next repair, and a file copied in
+/// externally is discovered by that repair or an explicit rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionIndexPolicy {
+    /// Maximum age of the last complete source reconciliation.
+    pub reconcile_after: Duration,
+}
+
+impl Default for SessionIndexPolicy {
+    fn default() -> Self {
+        Self {
+            reconcile_after: Duration::from_secs(5 * 60),
+        }
+    }
 }
 
 /// Non-transcript runtime state that should survive resume/fork flows.
@@ -151,18 +224,51 @@ pub struct SessionStore {
     current_id: Option<String>,
     current_path: Option<PathBuf>,
     meta: Option<SessionMeta>,
+    creation_project_cwd: Option<String>,
+    project_cwd: Option<String>,
+    preview: Option<String>,
+    current_log_authoritative: bool,
+    index: SessionIndexWorker,
+    index_policy: SessionIndexPolicy,
 }
 
 impl SessionStore {
     /// Create a new store. Creates the sessions directory if it doesn't exist.
     pub fn new(sessions_dir: Option<PathBuf>) -> Self {
         let dir = sessions_dir.unwrap_or_else(default_sessions_dir);
+        Self::new_with_index(
+            dir,
+            crate::hooks::provenance_db_path(),
+            SessionIndexPolicy::default(),
+        )
+    }
+
+    /// Create a store with an explicit SQL mirror path and repair policy.
+    ///
+    /// This is primarily useful to isolate tests and recovery tools. The JSONL
+    /// directory remains authoritative regardless of whether the database can
+    /// be opened.
+    pub fn new_with_index(
+        sessions_dir: PathBuf,
+        index_path: PathBuf,
+        index_policy: SessionIndexPolicy,
+    ) -> Self {
+        let dir = sessions_dir;
         let _ = fs::create_dir_all(&dir);
+        let project_cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
         Self {
             sessions_dir: dir,
             current_id: None,
             current_path: None,
             meta: None,
+            creation_project_cwd: project_cwd.clone(),
+            project_cwd,
+            preview: None,
+            current_log_authoritative: false,
+            index: SessionIndexWorker::start(index_path),
+            index_policy,
         }
     }
 
@@ -177,6 +283,9 @@ impl SessionStore {
 
         self.current_id = Some(sid.clone());
         self.current_path = Some(self.sessions_dir.join(format!("{sid}.jsonl")));
+        self.project_cwd = self.creation_project_cwd.clone();
+        self.preview = None;
+        self.current_log_authoritative = false;
 
         let now = unix_now();
         self.meta = Some(SessionMeta {
@@ -204,8 +313,16 @@ impl SessionStore {
             timestamp: now,
             data: serde_json::to_value(self.meta.as_ref().unwrap()).ok(),
         };
-        self.write_entry(&meta_entry);
+        let meta_written = self.write_entry(&meta_entry);
+        let context_entry =
+            session_context_entry(now, Some(sid.clone()), self.project_cwd.clone(), None);
+        let context_written = self.write_entry(&context_entry);
+        if !context_written {
+            self.project_cwd = None;
+        }
+        self.current_log_authoritative = meta_written;
         self.update_latest(&sid);
+        self.index_current_session();
         sid
     }
 
@@ -213,15 +330,19 @@ impl SessionStore {
     pub fn resume_session(&mut self, reference: &str) -> Option<(String, Vec<serde_json::Value>)> {
         let sid = self.resolve_ref(reference)?;
         let path = self.sessions_dir.join(format!("{sid}.jsonl"));
-        let (messages, loaded_meta) = parse_session_file(&path)?;
+        let parsed = scan_session_log(&path)?;
 
         self.current_id = Some(sid.clone());
         self.current_path = Some(path);
-        if let Some(m) = loaded_meta {
+        self.project_cwd = parsed.project_cwd;
+        self.preview = parsed.preview;
+        self.current_log_authoritative = parsed.meta.is_some();
+        if let Some(m) = parsed.meta {
             self.meta = Some(m);
         }
         self.update_latest(&sid);
-        Some((sid, messages))
+        self.index_current_session();
+        Some((sid, parsed.messages))
     }
 
     /// Read a session's messages WITHOUT switching the store's current
@@ -237,6 +358,14 @@ impl SessionStore {
         &self.sessions_dir
     }
 
+    /// Set the trusted project root captured for subsequently created sessions.
+    pub fn set_project_cwd(&mut self, project_cwd: Option<&Path>) {
+        self.creation_project_cwd = project_cwd.and_then(Path::to_str).map(str::to_string);
+        if self.current_id.is_none() {
+            self.project_cwd = self.creation_project_cwd.clone();
+        }
+    }
+
     /// Fork the current session into a new one with parent tracking.
     pub fn fork_session(&mut self, branch_name: &str) -> String {
         let old_id = self.current_id.clone();
@@ -246,11 +375,16 @@ impl SessionStore {
             .as_ref()
             .map(|m| m.model.clone())
             .unwrap_or_default();
+        let old_turn_count = self.meta.as_ref().map_or(0, |m| m.turn_count);
+        let old_compaction_count = self.meta.as_ref().map_or(0, |m| m.compaction_count);
+        let old_preview = self.preview.clone();
 
         let new_id = self.new_session(&old_model);
 
         if let Some(meta) = self.meta.as_mut() {
             meta.parent_session_id = old_id.clone();
+            meta.turn_count = old_turn_count;
+            meta.compaction_count = old_compaction_count;
             let name = if branch_name.is_empty() {
                 format!("fork-{}", &new_id[..new_id.len().min(8)])
             } else {
@@ -259,22 +393,30 @@ impl SessionStore {
             meta.branch_name = Some(name);
         }
 
-        // Copy non-meta entries from old session
-        if let Some(old) = old_path
-            && let Ok(text) = fs::read_to_string(&old)
-        {
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
-                    && entry.get("type").and_then(|t| t.as_str()) != Some("meta")
-                {
-                    self.write_raw(line);
+        // Copy retained non-meta entries oldest-to-newest. Rotated segments
+        // are part of the authoritative retained log, not disposable index
+        // state, so a fork must not silently omit them.
+        if let Some(old) = old_path {
+            for segment in session_log_paths(&old) {
+                if let Ok(text) = fs::read_to_string(segment) {
+                    for line in text.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line)
+                            && !matches!(
+                                entry.get("type").and_then(|t| t.as_str()),
+                                Some("meta") | Some(SESSION_CONTEXT_ENTRY_TYPE)
+                            )
+                        {
+                            self.write_raw(line);
+                        }
+                    }
                 }
             }
         }
+        self.preview = old_preview;
 
         if let Some(parent_id) = self
             .meta
@@ -288,6 +430,11 @@ impl SessionStore {
                 let _ = fs::copy(old_state_path, new_state_path);
             }
         }
+
+        // Persist the fork relationship and inherited counters after copying
+        // the authoritative transcript. `new_session`'s initial meta line
+        // intentionally remains the immutable creation record; last meta wins.
+        self.update_session_meta(&new_id, |_meta| {});
 
         new_id
     }
@@ -315,14 +462,23 @@ impl SessionStore {
             timestamp: unix_now(),
             data,
         };
-        self.write_entry(&entry);
+        if !self.write_entry(&entry) {
+            return;
+        }
 
         if let Some(meta) = self.meta.as_mut() {
-            meta.updated_at = unix_now();
+            meta.updated_at = entry.timestamp;
             if role == "user" || role == "assistant" {
                 meta.turn_count += 1;
             }
         }
+        if role == "user" && self.preview.is_none() {
+            self.preview = session_preview(content);
+        }
+
+        // Repeat rebuild-only context after every durable message. This keeps
+        // project/preview data present even after old rotated segments expire.
+        self.append_current_context(entry.timestamp);
 
         // Keep the persisted meta close to the live counters so a fresh store
         // (history rail, resume) sees near-current state from the file alone.
@@ -333,6 +489,8 @@ impl SessionStore {
                 .is_some_and(|m| m.turn_count > 0 && m.turn_count % META_FLUSH_EVERY_TURNS == 0);
         if flush_due && let Some(sid) = self.current_id().map(str::to_string) {
             self.update_session_meta(&sid, |_meta| {});
+        } else {
+            self.index_current_session();
         }
     }
 
@@ -380,7 +538,8 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let disk_meta = last_meta_in_file(&path);
+        let disk = scan_session_log(&path);
+        let disk_meta = disk.as_ref().and_then(|parsed| parsed.meta.clone());
         let is_current = self.current_id == Some(session_id.to_string());
         let mut merged = if is_current {
             self.meta.clone()
@@ -416,10 +575,32 @@ impl SessionStore {
             timestamp: meta.updated_at,
             data: serde_json::to_value(&*meta).ok(),
         };
-        Self::append_entry(&path, &entry);
+        let meta_written = Self::append_entry(&path, &entry);
+        if !meta_written {
+            return;
+        }
+
+        let (project_cwd, preview) = if is_current {
+            (self.project_cwd.clone(), self.preview.clone())
+        } else {
+            disk.as_ref()
+                .map(|parsed| (parsed.project_cwd.clone(), parsed.preview.clone()))
+                .unwrap_or_default()
+        };
+        let context = session_context_entry(
+            meta.updated_at,
+            Some(session_id.to_string()),
+            project_cwd,
+            preview,
+        );
+        Self::append_entry(&path, &context);
 
         if is_current {
             self.meta = merged;
+            self.current_log_authoritative = true;
+            self.index_current_session();
+        } else if let Some(entry) = index_entry_from_log(&self.sessions_dir, &path) {
+            self.index.upsert_best_effort(entry);
         }
     }
 
@@ -434,92 +615,221 @@ impl SessionStore {
             timestamp: unix_now(),
             data: None,
         };
-        self.write_entry(&entry);
+        if !self.write_entry(&entry) {
+            return;
+        }
 
         if let Some(meta) = self.meta.as_mut() {
             meta.compaction_count += 1;
+            meta.updated_at = entry.timestamp;
+        }
+        self.append_current_context(entry.timestamp);
+        if let Some(sid) = self.current_id().map(str::to_string) {
+            self.update_session_meta(&sid, |_meta| {});
         }
     }
 
     // ── Query ────────────────────────────────────────────────────────
 
-    /// List sessions, most recent first, up to `limit`.
+    /// List sessions from the SQL mirror, most recently updated first.
+    ///
+    /// On first use (and periodically according to [`SessionIndexPolicy`]),
+    /// the mirror is reconciled against the authoritative JSONL directory.
     pub fn list_sessions(&self, limit: usize) -> Vec<SessionInfo> {
-        let latest_id = self.resolve_ref("latest");
-
-        let mut paths: Vec<PathBuf> = fs::read_dir(&self.sessions_dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .collect();
-
-        // Sort by filename descending (timestamp-prefixed IDs sort chronologically)
-        paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-
         let mut sessions = Vec::new();
-        for path in paths.into_iter().take(limit) {
-            // Meta is append-only: the first `meta` line was written at
-            // creation, later ones (model switches, titles, counter flushes)
-            // are appended. Last one wins for current state; the first still
-            // owns `created_at`.
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let mut first_meta: Option<SessionMeta> = None;
-            let mut last_meta: Option<SessionMeta> = None;
-            for line in text.lines() {
-                let line = line.trim();
-                if !line.starts_with("{\"type\":\"meta\"") {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_str::<SessionEntry>(line) else {
-                    continue;
-                };
-                let Some(data) = entry.data else { continue };
-                let Ok(meta) = serde_json::from_value::<SessionMeta>(data) else {
-                    continue;
-                };
-                if first_meta.is_none() {
-                    first_meta = Some(meta.clone());
-                }
-                last_meta = Some(meta);
+        while sessions.len() < limit {
+            let page_limit = limit
+                .saturating_sub(sessions.len())
+                .min(MAX_SESSION_INDEX_QUERY_LIMIT);
+            if page_limit == 0 {
+                break;
             }
-            let Some(meta) = last_meta else { continue };
-
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let size_kb = path
-                .metadata()
-                .map(|m| m.len() as f64 / 1024.0)
-                .unwrap_or(0.0);
-            let models = if meta.models.is_empty() && !meta.model.is_empty() {
-                vec![meta.model.clone()]
-            } else {
-                meta.models.clone()
-            };
-
-            sessions.push(SessionInfo {
-                session_id: stem.clone(),
-                created_at: first_meta
-                    .as_ref()
-                    .map(|m| m.created_at)
-                    .unwrap_or(meta.created_at),
-                turn_count: meta.turn_count,
-                model: meta.model.clone(),
-                size_kb,
-                is_latest: latest_id.as_deref() == Some(stem.as_str()),
-                title: meta.title.clone(),
-                summary: meta.summary.clone(),
-                title_source: meta.title_source.clone(),
-                models,
+            let page = self.query_sessions(&SessionQuery {
+                limit: page_limit,
+                offset: sessions.len(),
+                ..SessionQuery::default()
             });
+            let page_len = page.len();
+            sessions.extend(page);
+            if page_len < page_limit {
+                break;
+            }
         }
         sessions
+    }
+
+    /// Query indexed session history by text, project, and update window.
+    pub fn query_sessions(&self, query: &SessionQuery) -> Vec<SessionInfo> {
+        self.reconcile_index_if_due();
+        let latest_id = self.resolve_ref("latest");
+        let source_path = self.source_path();
+        let index_query = SessionIndexQuery {
+            source_path: Some(source_path),
+            project_cwd: query
+                .project_cwd
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            text: query.text.clone(),
+            updated_after: query.updated_after,
+            updated_before: query.updated_before,
+            limit: query.limit,
+            offset: query.offset,
+        };
+
+        match self.index.list(index_query) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|entry| session_info_from_index(entry, latest_id.as_deref()))
+                .collect(),
+            Err(error) => {
+                warn!(%error, "failed to query session metadata index; reading authoritative JSONL");
+                self.query_sessions_from_logs(query, latest_id.as_deref())
+            }
+        }
+    }
+
+    /// Rebuild this directory's disposable SQL mirror from authoritative logs.
+    ///
+    /// Rows whose files disappeared are removed; valid files without rows are
+    /// inserted. Other session directories sharing the provenance database are
+    /// untouched.
+    pub fn rebuild_session_index(&self) -> Result<usize> {
+        // The scan-start boundary lets SQL preserve an incremental upsert from
+        // another store that lands while this filesystem snapshot is built.
+        let scan_started_at = unix_now();
+        let scan = self.scan_session_index_entries()?;
+        let count = scan.entries.len();
+        self.index
+            .replace_source(
+                self.source_path(),
+                scan.entries,
+                scan.preserve_session_ids,
+                scan_started_at,
+                unix_now(),
+            )
+            .context("failed to replace the session metadata index")?;
+        Ok(count)
+    }
+
+    fn reconcile_index_if_due(&self) {
+        let source_path = self.source_path();
+        let due = match self.index.reconciled_at(source_path) {
+            Ok(None) => true,
+            Ok(Some(last_reconciled_at)) => {
+                last_reconciled_at + self.index_policy.reconcile_after.as_secs_f64() <= unix_now()
+            }
+            Err(error) => {
+                warn!(%error, "failed to read session-index reconciliation state");
+                return;
+            }
+        };
+        if due && let Err(error) = self.rebuild_session_index() {
+            warn!(%error, "failed to reconcile session metadata from JSONL");
+        }
+    }
+
+    fn scan_session_index_entries(&self) -> Result<SessionIndexScan> {
+        let directory = fs::read_dir(&self.sessions_dir).with_context(|| {
+            format!(
+                "failed to read session directory {}",
+                self.sessions_dir.display()
+            )
+        })?;
+        let mut base_paths = std::collections::BTreeSet::new();
+        for entry in directory {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to enumerate session directory {}",
+                    self.sessions_dir.display()
+                )
+            })?;
+            if let Some(base_path) = session_base_path(&entry.path()) {
+                base_paths.insert(base_path);
+            }
+        }
+
+        let mut entries = Vec::new();
+        let mut preserve_session_ids = Vec::new();
+        for path in base_paths {
+            if !session_log_is_complete_for_index(&path) {
+                if let Some(session_id) = session_id_from_base_path(&path) {
+                    preserve_session_ids.push(session_id);
+                }
+                continue;
+            }
+            if let Some(index_entry) = index_entry_from_log(&self.sessions_dir, &path) {
+                entries.push(index_entry);
+            } else if let Some(session_id) = session_id_from_base_path(&path) {
+                preserve_session_ids.push(session_id);
+            }
+        }
+        Ok(SessionIndexScan {
+            entries,
+            preserve_session_ids,
+        })
+    }
+
+    fn query_sessions_from_logs(
+        &self,
+        query: &SessionQuery,
+        latest_id: Option<&str>,
+    ) -> Vec<SessionInfo> {
+        let search_terms = match query.text.as_deref() {
+            Some(text) if text.len() > MAX_SESSION_INDEX_SEARCH_BYTES => {
+                warn!(
+                    bytes = text.len(),
+                    "session search text exceeds the fallback query limit"
+                );
+                return Vec::new();
+            }
+            Some(text) => {
+                let terms = normalized_session_terms(text);
+                if terms.len() > MAX_SESSION_INDEX_SEARCH_TERMS {
+                    warn!(
+                        terms = terms.len(),
+                        "session search has too many terms for fallback"
+                    );
+                    return Vec::new();
+                }
+                terms
+            }
+            None => std::collections::BTreeSet::new(),
+        };
+        let project_cwd = query
+            .project_cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let mut entries = match self.scan_session_index_entries() {
+            Ok(scan) => scan.entries,
+            Err(error) => {
+                warn!(%error, "failed to read authoritative session JSONL");
+                return Vec::new();
+            }
+        };
+        entries.retain(|entry| {
+            project_cwd
+                .as_ref()
+                .is_none_or(|project| entry.project_cwd.as_ref() == Some(project))
+                && query
+                    .updated_after
+                    .is_none_or(|after| entry.updated_at >= after)
+                && query
+                    .updated_before
+                    .is_none_or(|before| entry.updated_at <= before)
+                && search_terms.is_subset(&entry_search_terms(entry))
+        });
+        entries.sort_by(|left, right| {
+            right
+                .updated_at
+                .total_cmp(&left.updated_at)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        entries
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit.min(MAX_SESSION_INDEX_QUERY_LIMIT))
+            .map(|entry| session_info_from_index(entry, latest_id))
+            .collect()
     }
 
     // ── Accessors ────────────────────────────────────────────────────
@@ -527,6 +837,11 @@ impl SessionStore {
     /// Current session ID, if any.
     pub fn current_id(&self) -> Option<&str> {
         self.current_id.as_deref()
+    }
+
+    /// Session ID recorded by the durable `latest` pointer, if present.
+    pub fn latest_session_id(&self) -> Option<String> {
+        self.resolve_ref("latest")
     }
 
     /// Current session metadata, if any.
@@ -559,54 +874,128 @@ impl SessionStore {
 
     // ── Internal ─────────────────────────────────────────────────────
 
-    fn write_entry(&self, entry: &SessionEntry) {
-        if let Some(path) = &self.current_path {
-            Self::append_entry(path, entry);
+    fn append_current_context(&self, timestamp: f64) -> bool {
+        let entry = session_context_entry(
+            timestamp,
+            self.current_id.clone(),
+            self.project_cwd.clone(),
+            self.preview.clone(),
+        );
+        self.write_entry(&entry)
+    }
+
+    fn index_current_session(&self) {
+        if !self.current_log_authoritative {
+            return;
         }
+        let (Some(path), Some(meta)) = (&self.current_path, &self.meta) else {
+            return;
+        };
+        self.index.upsert_best_effort(index_entry_from_meta(
+            &self.sessions_dir,
+            path,
+            meta,
+            self.project_cwd.clone(),
+            self.preview.clone(),
+        ));
+    }
+
+    fn source_path(&self) -> String {
+        self.sessions_dir.to_string_lossy().into_owned()
+    }
+
+    fn write_entry(&self, entry: &SessionEntry) -> bool {
+        let Some(path) = &self.current_path else {
+            return false;
+        };
+        if Self::maybe_rotate(path) {
+            if self.current_log_authoritative
+                && let Some(meta) = &self.meta
+            {
+                let seed = meta_entry(meta);
+                if !Self::append_entry_without_rotation(path, &seed) {
+                    return false;
+                }
+            }
+            let context = session_context_entry(
+                entry.timestamp,
+                self.current_id.clone(),
+                self.project_cwd.clone(),
+                self.preview.clone(),
+            );
+            if !Self::append_entry_without_rotation(path, &context) {
+                return false;
+            }
+        }
+        Self::append_entry_without_rotation(path, entry)
     }
 
     /// Rotate if needed, then append one serialized entry to `path`.
-    fn append_entry(path: &Path, entry: &SessionEntry) {
+    fn append_entry(path: &Path, entry: &SessionEntry) -> bool {
         Self::maybe_rotate(path);
-        if let Ok(line) = serde_json::to_string(entry) {
-            let _ = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut f| writeln!(f, "{line}"));
-        }
+        Self::append_entry_without_rotation(path, entry)
     }
 
-    fn write_raw(&self, line: &str) {
-        if let Some(path) = &self.current_path {
-            let _ = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .and_then(|mut f| writeln!(f, "{line}"));
-        }
+    fn append_entry_without_rotation(path: &Path, entry: &SessionEntry) -> bool {
+        let Ok(line) = serde_json::to_string(entry) else {
+            return false;
+        };
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .is_ok()
     }
 
-    fn maybe_rotate(path: &Path) {
-        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+    fn write_raw(&self, line: &str) -> bool {
+        let Some(path) = &self.current_path else {
+            return false;
+        };
+        if Self::maybe_rotate(path) {
+            if self.current_log_authoritative
+                && let Some(meta) = &self.meta
+                && !Self::append_entry_without_rotation(path, &meta_entry(meta))
+            {
+                return false;
+            }
+            let context = session_context_entry(
+                unix_now(),
+                self.current_id.clone(),
+                self.project_cwd.clone(),
+                self.preview.clone(),
+            );
+            if !Self::append_entry_without_rotation(path, &context) {
+                return false;
+            }
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .is_ok()
+    }
+
+    fn maybe_rotate(path: &Path) -> bool {
+        let size = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         if size < MAX_FILE_SIZE {
-            return;
+            return false;
         }
 
-        // Rotate: .3 is deleted, .2 → .3, .1 → .2, current → .1
+        // Delete old .3 before shifting .2 → .3, .1 → .2, current → .1.
+        // Removing it after the shift deleted the newly moved `.3` instead.
         let base = path.to_string_lossy().to_string();
-        for i in (1..MAX_ROTATIONS).rev() {
-            let from = format!("{base}.{i}");
-            let to = format!("{base}.{}", i + 1);
+        let oldest = format!("{base}.{}", MAX_ROTATIONS);
+        let _ = fs::remove_file(&oldest);
+        for index in (1..MAX_ROTATIONS).rev() {
+            let from = format!("{base}.{index}");
+            let to = format!("{base}.{}", index + 1);
             if Path::new(&from).exists() {
                 let _ = fs::rename(&from, &to);
             }
         }
-        // Delete the oldest if it exists
-        let oldest = format!("{base}.{}", MAX_ROTATIONS);
-        let _ = fs::remove_file(&oldest);
-        // Current → .1
-        let _ = fs::rename(path, format!("{base}.1"));
+        fs::rename(path, format!("{base}.1")).is_ok()
     }
 
     fn resolve_ref(&self, reference: &str) -> Option<String> {
@@ -699,80 +1088,347 @@ pub fn deterministic_title(first_user_message: &str) -> String {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// The last `meta` entry persisted in a session file, if any. Meta updates
-/// are appended, so the last line is current.
-fn last_meta_in_file(path: &Path) -> Option<SessionMeta> {
-    let text = fs::read_to_string(path).ok()?;
-    let mut last = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with("{\"type\":\"meta\"") {
-            continue;
-        }
-        if let Ok(entry) = serde_json::from_str::<SessionEntry>(line)
-            && let Some(data) = entry.data
-            && let Ok(meta) = serde_json::from_value::<SessionMeta>(data)
-        {
-            last = Some(meta);
-        }
-    }
-    last
+struct ParsedSessionLog {
+    messages: Vec<serde_json::Value>,
+    meta: Option<SessionMeta>,
+    project_cwd: Option<String>,
+    preview: Option<String>,
 }
 
-/// Parse a session JSONL file into (messages, meta). Shared by
-/// [`SessionStore::resume_session`] (which also switches the current
-/// session) and [`SessionStore::load_messages`] (read-only).
-fn parse_session_file(path: &Path) -> Option<(Vec<serde_json::Value>, Option<SessionMeta>)> {
-    if !path.exists() {
+struct SessionIndexScan {
+    entries: Vec<SessionIndexEntry>,
+    /// Existing rows to retain because a source candidate was present but
+    /// could not be read as a complete JSONL snapshot.
+    preserve_session_ids: Vec<String>,
+}
+
+fn meta_entry(meta: &SessionMeta) -> SessionEntry {
+    SessionEntry {
+        entry_type: "meta".to_string(),
+        role: String::new(),
+        content: String::new(),
+        tool_name: String::new(),
+        call_id: String::new(),
+        timestamp: meta.updated_at,
+        data: serde_json::to_value(meta).ok(),
+    }
+}
+
+fn session_context_entry(
+    timestamp: f64,
+    session_id: Option<String>,
+    project_cwd: Option<String>,
+    preview: Option<String>,
+) -> SessionEntry {
+    SessionEntry {
+        entry_type: SESSION_CONTEXT_ENTRY_TYPE.to_string(),
+        role: String::new(),
+        content: String::new(),
+        tool_name: String::new(),
+        call_id: String::new(),
+        timestamp,
+        data: Some(serde_json::json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "project_cwd": project_cwd,
+            "preview": preview,
+        })),
+    }
+}
+
+fn session_preview(content: &str) -> Option<String> {
+    let cleaned = content
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
         return None;
     }
-    let text = fs::read_to_string(path).ok()?;
-    let mut messages = Vec::new();
-    let mut loaded_meta: Option<SessionMeta> = None;
+    Some(normalized.chars().take(SESSION_PREVIEW_MAX_CHARS).collect())
+}
 
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+fn normalized_session_terms(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn entry_search_terms(entry: &SessionIndexEntry) -> std::collections::BTreeSet<String> {
+    let mut terms = std::collections::BTreeSet::new();
+    for text in [&entry.title, &entry.summary, &entry.preview]
+        .into_iter()
+        .flatten()
+    {
+        terms.extend(normalized_session_terms(text));
+    }
+    terms
+}
+
+fn rotated_path(path: &Path, rotation: usize) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(format!(".{rotation}"));
+    PathBuf::from(value)
+}
+
+fn session_base_path(candidate: &Path) -> Option<PathBuf> {
+    let file_name = candidate.file_name()?.to_str()?;
+    if file_name.ends_with(".jsonl") {
+        return Some(candidate.to_path_buf());
+    }
+    for rotation in 1..=MAX_ROTATIONS {
+        let suffix = format!(".jsonl.{rotation}");
+        if let Some(stem) = file_name.strip_suffix(&suffix) {
+            return Some(candidate.parent()?.join(format!("{stem}.jsonl")));
         }
-        let entry: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
+    }
+    None
+}
+
+fn session_id_from_base_path(path: &Path) -> Option<String> {
+    path.file_name()?
+        .to_str()?
+        .strip_suffix(".jsonl")
+        .map(str::to_string)
+}
+
+fn session_log_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = (1..=MAX_ROTATIONS)
+        .rev()
+        .map(|rotation| rotated_path(path, rotation))
+        .filter(|candidate| candidate.exists())
+        .collect::<Vec<_>>();
+    if path.exists() {
+        paths.push(path.to_path_buf());
+    }
+    paths
+}
+
+/// Require a fully readable snapshot before replacing an existing SQL row.
+/// A malformed trailing append is indeterminate and must preserve the last
+/// good mirror entry until a later repair can read the file cleanly.
+fn session_log_is_complete_for_index(path: &Path) -> bool {
+    let paths = session_log_paths(path);
+    if paths.is_empty() {
+        return false;
+    }
+    let mut saw_meta = false;
+    for segment in paths {
+        let Ok(text) = fs::read_to_string(segment) else {
+            return false;
         };
-
-        if entry.get("type").and_then(|t| t.as_str()) == Some("meta") {
-            if let Some(data) = entry.get("data") {
-                loaded_meta = serde_json::from_value(data.clone()).ok();
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Ok(entry) = serde_json::from_str::<SessionEntry>(line) else {
+                return false;
+            };
+            if entry.entry_type == "meta" {
+                let Some(data) = entry.data else {
+                    return false;
+                };
+                if serde_json::from_value::<SessionMeta>(data).is_err() {
+                    return false;
+                }
+                saw_meta = true;
             }
-            continue;
         }
+    }
+    saw_meta
+}
 
-        let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        if !role.is_empty() && !content.is_empty() {
-            let mut msg = serde_json::json!({ "role": role, "content": content });
-            if let Some(cid) = entry.get("call_id").and_then(|v| v.as_str())
-                && !cid.is_empty()
-            {
-                msg["tool_call_id"] = serde_json::Value::String(cid.to_string());
+/// Parse retained segments oldest-to-newest. Seed metadata/context written on
+/// rotation keeps the index fully rebuildable even after early segments expire.
+fn scan_session_log(path: &Path) -> Option<ParsedSessionLog> {
+    let paths = session_log_paths(path);
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut messages = Vec::new();
+    let mut first_created_at = None;
+    let mut loaded_meta: Option<SessionMeta> = None;
+    let mut project_cwd = None;
+    let mut preview = None;
+    let mut turn_count = 0usize;
+    let mut compaction_count = 0usize;
+    let mut latest_timestamp = 0.0_f64;
+
+    for segment in paths {
+        let Ok(text) = fs::read_to_string(segment) else {
+            continue;
+        };
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Ok(entry) = serde_json::from_str::<SessionEntry>(line) else {
+                continue;
+            };
+            latest_timestamp = latest_timestamp.max(entry.timestamp);
+
+            if entry.entry_type == "meta" {
+                let Some(data) = entry.data else { continue };
+                let Ok(meta) = serde_json::from_value::<SessionMeta>(data) else {
+                    continue;
+                };
+                first_created_at.get_or_insert(meta.created_at);
+                // Metadata counters are cumulative as of this point in the
+                // log. Taking the maximum here, then counting later events,
+                // preserves post-seed activity after older rotations expire
+                // without double-counting events covered by a later flush.
+                turn_count = turn_count.max(meta.turn_count);
+                compaction_count = compaction_count.max(meta.compaction_count);
+                loaded_meta = Some(meta);
+                continue;
             }
-            if let Some(tn) = entry.get("tool_name").and_then(|v| v.as_str())
-                && !tn.is_empty()
-            {
-                msg["tool_name"] = serde_json::Value::String(tn.to_string());
+
+            if entry.entry_type == SESSION_CONTEXT_ENTRY_TYPE {
+                if let Some(data) = entry.data {
+                    if let Some(value) = data.get("project_cwd") {
+                        project_cwd = value.as_str().map(str::to_string);
+                    }
+                    if let Some(value) = data.get("preview") {
+                        preview = value.as_str().and_then(session_preview);
+                    }
+                }
+                continue;
             }
-            if let Some(data) = entry.get("data")
-                && let Some(obj) = data.as_object()
-            {
-                for (k, v) in obj {
-                    msg[k] = v.clone();
+
+            if entry.entry_type == "compaction" {
+                compaction_count = compaction_count.saturating_add(1);
+            }
+            if matches!(entry.role.as_str(), "user" | "assistant") {
+                turn_count = turn_count.saturating_add(1);
+            }
+            if entry.role == "user" && preview.is_none() {
+                preview = session_preview(&entry.content);
+            }
+            if entry.role.is_empty() || entry.content.is_empty() {
+                continue;
+            }
+
+            let mut message = serde_json::json!({
+                "role": entry.role,
+                "content": entry.content,
+            });
+            if !entry.call_id.is_empty() {
+                message["tool_call_id"] = serde_json::Value::String(entry.call_id);
+            }
+            if !entry.tool_name.is_empty() {
+                message["tool_name"] = serde_json::Value::String(entry.tool_name);
+            }
+            if let Some(data) = entry.data.and_then(|value| value.as_object().cloned()) {
+                for (key, value) in data {
+                    message[key] = value;
                 }
             }
-            messages.push(msg);
+            messages.push(message);
         }
     }
 
-    Some((messages, loaded_meta))
+    if let Some(meta) = loaded_meta.as_mut() {
+        if let Some(created_at) = first_created_at {
+            meta.created_at = created_at;
+        }
+        meta.updated_at = meta.updated_at.max(latest_timestamp);
+        meta.turn_count = meta.turn_count.max(turn_count);
+        meta.compaction_count = meta.compaction_count.max(compaction_count);
+    }
+
+    Some(ParsedSessionLog {
+        messages,
+        meta: loaded_meta,
+        project_cwd,
+        preview,
+    })
+}
+
+/// The last durable metadata state across the active and rotated segments.
+#[cfg(test)]
+fn last_meta_in_file(path: &Path) -> Option<SessionMeta> {
+    scan_session_log(path)?.meta
+}
+
+/// Parse a session JSONL log into (messages, meta). Shared by resume and HTTP.
+fn parse_session_file(path: &Path) -> Option<(Vec<serde_json::Value>, Option<SessionMeta>)> {
+    let parsed = scan_session_log(path)?;
+    Some((parsed.messages, parsed.meta))
+}
+
+fn session_log_size(path: &Path) -> u64 {
+    session_log_paths(path)
+        .into_iter()
+        .fold(0_u64, |total, path| {
+            total.saturating_add(path.metadata().map(|metadata| metadata.len()).unwrap_or(0))
+        })
+}
+
+fn index_entry_from_meta(
+    sessions_dir: &Path,
+    path: &Path,
+    meta: &SessionMeta,
+    project_cwd: Option<String>,
+    preview: Option<String>,
+) -> SessionIndexEntry {
+    SessionIndexEntry {
+        session_id: meta.session_id.clone(),
+        source_path: sessions_dir.to_string_lossy().into_owned(),
+        file_path: path.to_string_lossy().into_owned(),
+        project_cwd,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        model: meta.model.clone(),
+        turn_count: u64::try_from(meta.turn_count).unwrap_or(u64::MAX),
+        compaction_count: u64::try_from(meta.compaction_count).unwrap_or(u64::MAX),
+        parent_session_id: meta.parent_session_id.clone(),
+        branch_name: meta.branch_name.clone(),
+        title: meta.title.clone(),
+        summary: meta.summary.clone(),
+        title_source: meta.title_source.clone(),
+        title_turn: u64::try_from(meta.title_turn).unwrap_or(u64::MAX),
+        models: meta.models.clone(),
+        preview,
+        size_bytes: session_log_size(path),
+    }
+}
+
+fn index_entry_from_log(sessions_dir: &Path, path: &Path) -> Option<SessionIndexEntry> {
+    let parsed = scan_session_log(path)?;
+    let meta = parsed.meta?;
+    Some(index_entry_from_meta(
+        sessions_dir,
+        path,
+        &meta,
+        parsed.project_cwd,
+        parsed.preview,
+    ))
+}
+
+fn session_info_from_index(entry: SessionIndexEntry, latest_id: Option<&str>) -> SessionInfo {
+    let models = if entry.models.is_empty() && !entry.model.is_empty() {
+        vec![entry.model.clone()]
+    } else {
+        entry.models.clone()
+    };
+    SessionInfo {
+        is_latest: latest_id == Some(entry.session_id.as_str()),
+        session_id: entry.session_id,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        turn_count: usize::try_from(entry.turn_count).unwrap_or(usize::MAX),
+        model: entry.model,
+        size_kb: entry.size_bytes as f64 / 1024.0,
+        title: entry.title,
+        summary: entry.summary,
+        title_source: entry.title_source,
+        models,
+        path: entry.file_path,
+        project_cwd: entry.project_cwd,
+        preview: entry.preview,
+    }
 }
 
 fn unix_now() -> f64 {
@@ -803,8 +1459,16 @@ mod tests {
 
     fn make_store() -> (SessionStore, TempDir) {
         let tmp = TempDir::new().expect("temp dir");
-        let store = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let store = reopen_store(&tmp);
         (store, tmp)
+    }
+
+    fn reopen_store(tmp: &TempDir) -> SessionStore {
+        SessionStore::new_with_index(
+            tmp.path().to_path_buf(),
+            tmp.path().join("session-index.db"),
+            SessionIndexPolicy::default(),
+        )
     }
 
     #[test]
@@ -830,7 +1494,7 @@ mod tests {
         store.append_message("assistant", "Hi there!", "", "", None);
 
         // New store, resume by ID
-        let mut store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let mut store2 = reopen_store(&tmp);
         let result = store2.resume_session(&sid);
         assert!(result.is_some());
 
@@ -847,7 +1511,7 @@ mod tests {
         let _first = store.new_session("m1");
         let second = store.new_session("m2");
 
-        let mut store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let mut store2 = reopen_store(&tmp);
         let result = store2.resume_session("latest");
         assert!(result.is_some());
         assert_eq!(result.unwrap().0, second);
@@ -865,6 +1529,34 @@ mod tests {
         let meta = store.meta().unwrap();
         assert_eq!(meta.parent_session_id.as_deref(), Some(parent_id.as_str()));
         assert_eq!(meta.branch_name.as_deref(), Some("experiment-a"));
+        let disk_meta = last_meta_in_file(
+            store
+                .current_path
+                .as_deref()
+                .expect("fork has a current path"),
+        )
+        .expect("fork metadata is durable");
+        assert_eq!(
+            disk_meta.parent_session_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        assert_eq!(disk_meta.branch_name.as_deref(), Some("experiment-a"));
+    }
+
+    #[test]
+    fn fork_copies_messages_from_retained_rotations() {
+        let (mut store, _tmp) = make_store();
+        let parent_id = store.new_session("m1");
+        store.append_message("user", "message from the oldest segment", "", "", None);
+        store.append_message("assistant", &"x".repeat(300 * 1024), "", "", None);
+        let parent_path = store.sessions_dir.join(format!("{parent_id}.jsonl"));
+        assert!(rotated_path(&parent_path, 1).exists());
+
+        let fork_id = store.fork_session("retained-history");
+        let messages = store.load_messages(&fork_id).expect("fork log loads");
+        assert!(messages.iter().any(|message| {
+            message["content"].as_str() == Some("message from the oldest segment")
+        }));
     }
 
     #[test]
@@ -882,12 +1574,265 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_reads_index_until_reconciliation_repairs_a_missing_file() {
+        let tmp = TempDir::new().expect("temp dir");
+        let mut store = SessionStore::new_with_index(
+            tmp.path().to_path_buf(),
+            tmp.path().join("session-index.db"),
+            SessionIndexPolicy {
+                reconcile_after: Duration::MAX,
+            },
+        );
+        let sid = store.new_session("m1");
+        assert_eq!(store.list_sessions(10).len(), 1);
+
+        fs::remove_file(tmp.path().join(format!("{sid}.jsonl"))).unwrap();
+
+        let indexed = store.list_sessions(10);
+        assert_eq!(indexed.len(), 1, "listing must come from SQL, not read_dir");
+        assert_eq!(indexed[0].session_id, sid);
+
+        assert_eq!(store.rebuild_session_index().unwrap(), 0);
+        assert!(
+            store.list_sessions(10).is_empty(),
+            "an explicit repair must purge an index row whose log is gone"
+        );
+    }
+
+    #[test]
+    fn separate_stores_observe_queued_writes_in_order() {
+        let tmp = TempDir::new().expect("temp dir");
+        let index_path = tmp.path().join("session-index.db");
+        let policy = SessionIndexPolicy {
+            reconcile_after: Duration::MAX,
+        };
+        let mut writer =
+            SessionStore::new_with_index(tmp.path().to_path_buf(), index_path.clone(), policy);
+        let reader = SessionStore::new_with_index(tmp.path().to_path_buf(), index_path, policy);
+        assert!(reader.list_sessions(100).is_empty());
+
+        let mut expected = std::collections::BTreeSet::new();
+        for index in 0..32 {
+            expected.insert(writer.new_session(&format!("model-{index}")));
+        }
+        let actual = reader
+            .list_sessions(100)
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn deleted_index_rebuilds_the_same_sessions_from_jsonl() {
+        let tmp = TempDir::new().expect("temp dir");
+        let index_path = tmp.path().join("session-index.db");
+        let expected = {
+            let mut store = SessionStore::new_with_index(
+                tmp.path().to_path_buf(),
+                index_path.clone(),
+                SessionIndexPolicy::default(),
+            );
+            let first = store.new_session("m1");
+            store.append_message("user", "screen nickel alloys", "", "", None);
+            let second = store.new_session("m2");
+            store.append_message("user", "compare ceramic phases", "", "", None);
+            let listed = store.list_sessions(10);
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().any(|session| session.session_id == first));
+            assert!(listed.iter().any(|session| session.session_id == second));
+            listed
+                .into_iter()
+                .map(|session| (session.session_id, session.preview))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        fs::remove_file(&index_path).expect("delete disposable SQL index");
+
+        let store = SessionStore::new_with_index(
+            tmp.path().to_path_buf(),
+            index_path,
+            SessionIndexPolicy::default(),
+        );
+        assert_eq!(store.rebuild_session_index().unwrap(), expected.len());
+        let rebuilt = store
+            .list_sessions(10)
+            .into_iter()
+            .map(|session| (session.session_id, session.preview))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(rebuilt, expected);
+    }
+
+    #[test]
+    fn first_index_use_backfills_an_existing_unindexed_log() {
+        let tmp = TempDir::new().expect("temp dir");
+        let sid = "20260101_000000_backfill";
+        let meta = SessionMeta {
+            session_id: sid.to_string(),
+            created_at: 100.0,
+            updated_at: 200.0,
+            model: "legacy-model".to_string(),
+            turn_count: 0,
+            compaction_count: 0,
+            parent_session_id: None,
+            branch_name: None,
+            title: Some("Imported log".to_string()),
+            summary: None,
+            title_source: Some("heuristic".to_string()),
+            title_turn: 0,
+            models: vec!["legacy-model".to_string()],
+        };
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            format!("{}\n", serde_json::to_string(&meta_entry(&meta)).unwrap()),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_index(
+            tmp.path().to_path_buf(),
+            tmp.path().join("session-index.db"),
+            SessionIndexPolicy::default(),
+        );
+
+        let listed = store.list_sessions(10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, sid);
+        assert_eq!(listed[0].title.as_deref(), Some("Imported log"));
+        assert!(listed[0].project_cwd.is_none());
+    }
+
+    #[test]
+    fn first_index_use_backfills_an_orphaned_rotation() {
+        let tmp = TempDir::new().expect("temp dir");
+        let sid = "20260101_000000_orphaned";
+        let meta = SessionMeta {
+            session_id: sid.to_string(),
+            created_at: 100.0,
+            updated_at: 200.0,
+            model: "legacy-model".to_string(),
+            turn_count: 0,
+            compaction_count: 0,
+            parent_session_id: None,
+            branch_name: None,
+            title: Some("Orphaned rotation".to_string()),
+            summary: None,
+            title_source: Some("heuristic".to_string()),
+            title_turn: 0,
+            models: vec!["legacy-model".to_string()],
+        };
+        let base = tmp.path().join(format!("{sid}.jsonl"));
+        fs::write(
+            &base,
+            format!("{}\n", serde_json::to_string(&meta_entry(&meta)).unwrap()),
+        )
+        .unwrap();
+        fs::rename(&base, rotated_path(&base, 1)).unwrap();
+        let store = reopen_store(&tmp);
+
+        let listed = store.list_sessions(10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, sid);
+        assert_eq!(listed[0].title.as_deref(), Some("Orphaned rotation"));
+    }
+
+    #[test]
+    fn rebuild_preserves_last_good_row_for_an_incomplete_log() {
+        let (mut store, _tmp) = make_store();
+        let sid = store.new_session("m1");
+        store.append_message("user", "durable indexed preview", "", "", None);
+        assert_eq!(store.list_sessions(10).len(), 1);
+
+        let path = store.sessions_dir.join(format!("{sid}.jsonl"));
+        writeln!(
+            OpenOptions::new().append(true).open(path).unwrap(),
+            "{{\"type\":"
+        )
+        .unwrap();
+
+        assert_eq!(store.rebuild_session_index().unwrap(), 0);
+        let listed = store.list_sessions(10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, sid);
+        assert_eq!(
+            listed[0].preview.as_deref(),
+            Some("durable indexed preview")
+        );
+    }
+
+    #[test]
+    fn session_write_survives_an_unopenable_index() {
+        let tmp = TempDir::new().expect("temp dir");
+        let sessions_dir = tmp.path().join("sessions");
+        let mut store = SessionStore::new_with_index(
+            sessions_dir.clone(),
+            tmp.path().to_path_buf(),
+            SessionIndexPolicy::default(),
+        );
+
+        let sid = store.new_session("m1");
+        store.append_message("user", "JSONL must win", "", "", None);
+
+        assert!(sessions_dir.join(format!("{sid}.jsonl")).exists());
+        assert_eq!(store.meta().map(|meta| meta.turn_count), Some(1));
+        let listed = store.list_sessions(10);
+        assert_eq!(listed.len(), 1, "JSONL listing must survive index failure");
+        assert_eq!(listed[0].session_id, sid);
+        assert_eq!(listed[0].preview.as_deref(), Some("JSONL must win"));
+    }
+
+    #[test]
+    fn text_and_project_queries_use_rebuildable_context() {
+        let (mut store, tmp) = make_store();
+        let project = tmp.path().join("alloy-project");
+        store.set_project_cwd(Some(&project));
+        let sid = store.new_session("m1");
+        store.append_message(
+            "user",
+            "Investigate nickel superalloys for turbine blades",
+            "",
+            "",
+            None,
+        );
+        store.update_session_meta(&sid, |meta| {
+            meta.title = Some("Nickel superalloy screen".to_string());
+            meta.summary = Some("Candidate ranking for turbine service".to_string());
+        });
+
+        let matches = store.query_sessions(&SessionQuery {
+            text: Some("nickel turbine".to_string()),
+            project_cwd: Some(project.clone()),
+            ..SessionQuery::default()
+        });
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session_id, sid);
+        assert_eq!(matches[0].project_cwd.as_deref(), project.to_str());
+        assert_eq!(
+            matches[0].preview.as_deref(),
+            Some("Investigate nickel superalloys for turbine blades")
+        );
+        assert!(
+            store
+                .query_sessions(&SessionQuery {
+                    text: Some("nickel".to_string()),
+                    project_cwd: Some(tmp.path().join("other-project")),
+                    ..SessionQuery::default()
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn compaction_increments_count() {
         let (mut store, _tmp) = make_store();
         store.new_session("m1");
         store.append_compaction("Summary of conversation so far.");
 
         assert_eq!(store.meta().unwrap().compaction_count, 1);
+        assert_eq!(
+            last_meta_in_file(store.current_path.as_deref().unwrap())
+                .unwrap()
+                .compaction_count,
+            1
+        );
     }
 
     #[test]
@@ -942,7 +1887,7 @@ mod tests {
         });
 
         // Fresh eyes — no shared memory, disk only.
-        let store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let store2 = reopen_store(&tmp);
         let info = store2
             .list_sessions(10)
             .into_iter()
@@ -956,7 +1901,7 @@ mod tests {
         assert_eq!(info.title_source.as_deref(), Some("model"));
 
         // Resume also picks the persisted meta up.
-        let mut store3 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let mut store3 = reopen_store(&tmp);
         store3.resume_session(&sid);
         assert_eq!(
             store3.meta().and_then(|m| m.title.as_deref()),
@@ -975,7 +1920,7 @@ mod tests {
         }
 
         // Detached-task side: sets a title from an outside store.
-        let mut task_store = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let mut task_store = reopen_store(&tmp);
         task_store.update_session_meta(&sid.clone(), |meta| {
             meta.title = Some("From the task".to_string());
             meta.title_source = Some("heuristic".to_string());
@@ -1012,7 +1957,7 @@ mod tests {
         assert_eq!(meta.models, want);
 
         // SessionInfo — what the history rail renders — must agree.
-        let store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let store2 = reopen_store(&tmp);
         let info = store2
             .list_sessions(10)
             .into_iter()
@@ -1032,7 +1977,7 @@ mod tests {
         }
 
         // File alone must carry the counters — no shared memory.
-        let store2 = SessionStore::new(Some(tmp.path().to_path_buf()));
+        let store2 = reopen_store(&tmp);
         let info = store2
             .list_sessions(10)
             .into_iter()
@@ -1144,5 +2089,32 @@ mod tests {
         // Either the current file was rotated (rotated exists) or file is still there
         // Both are valid — rotation happens when file exceeds limit before next write
         assert!(base.exists() || rotated.exists());
+    }
+
+    #[test]
+    fn rebuild_preserves_project_and_preview_after_old_rotations_expire() {
+        let (mut store, tmp) = make_store();
+        let project = tmp.path().join("durable-project");
+        store.set_project_cwd(Some(&project));
+        let sid = store.new_session("m1");
+        store.append_message("user", "durable preview", "", "", None);
+
+        let large = "x".repeat(300 * 1024);
+        for _ in 0..(MAX_ROTATIONS + 2) {
+            store.append_message("assistant", &large, "", "", None);
+        }
+        // This message lands after the final rotation seed. A rebuild must
+        // add it to that cumulative seed instead of taking either count alone.
+        store.append_message("assistant", "after final rotation", "", "", None);
+
+        assert_eq!(store.rebuild_session_index().unwrap(), 1);
+        let info = store
+            .list_sessions(10)
+            .into_iter()
+            .find(|session| session.session_id == sid)
+            .expect("rotated session rebuilt");
+        assert_eq!(info.project_cwd.as_deref(), project.to_str());
+        assert_eq!(info.preview.as_deref(), Some("durable preview"));
+        assert_eq!(info.turn_count, MAX_ROTATIONS + 4);
     }
 }
