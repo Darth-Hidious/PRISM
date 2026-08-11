@@ -848,10 +848,13 @@ fn local_only_tool_server_config(config: &ToolServer) -> ToolServer {
 /// Build the tool-server env for an embedded chat service the same way the
 /// `prism backend` arm does (MCP marker + platform URL + user API keys; the
 /// session JWT is deliberately NOT exported — see the backend arm comment).
-pub fn default_tool_server_env(api_base: &str) -> BTreeMap<String, String> {
+pub fn default_tool_server_env(api_base: Option<&str>) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
-    env.insert("MARC27_API_URL".to_string(), api_base.to_string());
+    if let Some(api_base) = api_base {
+        env.insert("PRISM_API_URL".to_string(), api_base.to_string());
+        env.insert("MARC27_API_URL".to_string(), api_base.to_string());
+    }
     for key in &[
         "MP_API_KEY",
         "LENS_API_TOKEN",

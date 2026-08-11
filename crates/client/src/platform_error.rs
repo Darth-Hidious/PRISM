@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Honest translation of a failed platform HTTP response into a CLI error.
 //!
-//! The MARC27 platform already returns a precise, machine-readable reason for
+//! A configured provider can return a precise, machine-readable reason for
 //! every failure. Its documented shape (`GET /api/v1/agent/capabilities` →
 //! `error_handling`) is:
 //!
@@ -286,7 +286,7 @@ fn redact_secrets(text: &str) -> String {
 
 /// `.error_for_status()`, but it keeps the reason the platform gave.
 ///
-/// Drop-in replacement on any call against the MARC27 platform: swap
+/// Drop-in replacement on any call against a configured provider: swap
 /// `.error_for_status()?` for `.platform_error_for_status().await?`. The
 /// success path returns the response untouched, so the body is still
 /// available to `.json()` / `.text()`.

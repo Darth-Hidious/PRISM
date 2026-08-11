@@ -301,9 +301,9 @@ pub struct AccountStatus {
     pub project: String,
 }
 
-/// Account dialog — MARC27 logout and local status. Login is deliberately
+/// Account dialog — provider logout and local status. Login is deliberately
 /// non-interactive: callers must run `prism login --token <PAT>` or configure
-/// `MARC27_API_KEY` outside the TUI.
+/// `PRISM_API_KEY` outside the TUI.
 #[derive(Debug, Clone, Default)]
 pub struct AccountDialog {
     pub open: bool,
@@ -654,7 +654,7 @@ pub struct App {
     pub gpu_picker: GpuPicker,
     /// Nodes view state (the user's connected platform nodes).
     pub node_picker: NodePicker,
-    /// Account dialog (MARC27 login/logout + status).
+    /// Account dialog (provider login/logout + status).
     pub account: AccountDialog,
     /// Session picker (list/resume).
     pub session_picker: SessionPicker,
@@ -2493,7 +2493,7 @@ impl App {
         }
     }
 
-    // ── Account (MARC27 login/logout) ───────────────────────────────
+    // ── Account (provider login/logout) ─────────────────────────────
 
     /// Read `~/.prism/credentials.json` for the current login status.
     pub fn read_account_status() -> AccountStatus {
@@ -4555,7 +4555,7 @@ mod tests {
         assert!(!app.account.busy, "TUI login must not start a backend turn");
         let last = app.messages.last().expect("login failure is visible");
         assert!(last.text.contains("prism login --token <PAT>"));
-        assert!(last.text.contains("MARC27_API_KEY"));
+        assert!(last.text.contains("PRISM_API_KEY"));
     }
 
     #[test]

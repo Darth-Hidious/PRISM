@@ -213,6 +213,12 @@ pub async fn run_workflow(
         )
         .then(|| llm_config.api_key.clone())
         .flatten(),
+        trusted_llm_credential_kind: matches!(
+            platform_access,
+            prism_agent::command_tools::CommandToolPlatformAccess::VerifiedNodeOwner
+        )
+        .then_some(llm_config.credential_kind)
+        .flatten(),
         caller_supplied_llm_base_url,
         trusted_node_port: node_token.as_ref().map(|_| 7327),
         trusted_node_token: node_token,

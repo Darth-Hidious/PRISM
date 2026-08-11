@@ -1,6 +1,6 @@
 //! Mint a session token against the *local* PRISM node's HTTP API.
 //!
-//! This is distinct from [`crate::PlatformClient`], which talks to the MARC27
+//! This is distinct from [`crate::PlatformClient`], which talks to the configured
 //! platform. Here we hit a node's own `POST /api/sessions` endpoint on
 //! loopback. The node grants same-machine (loopback) callers local trust, so a
 //! bare `user_id` is accepted — no platform token needed. Used by in-process

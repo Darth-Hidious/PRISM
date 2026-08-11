@@ -24,6 +24,7 @@ mod use_command;
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 // std::process::Stdio removed — old Ink TUI launcher no longer needed
 use std::time::Duration;
 
@@ -50,6 +51,11 @@ use prism_workflows::{
     parse_workflow_command_args,
 };
 use tracing_subscriber::EnvFilter;
+
+/// Project selected by the top-level `--project-root`. Platform auth helpers
+/// are called from many command handlers; retaining the parsed root here keeps
+/// every one on the same config instead of silently reloading the cwd.
+static CLI_PROJECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "prism")]
@@ -113,7 +119,7 @@ enum Commands {
     /// Authenticate against the configured hosted platform.
     ///
     /// Non-interactive by default: use `--token <PAT>` or configure
-    /// `MARC27_API_KEY`. The retained device flow requires the explicit
+    /// `PRISM_API_KEY`. The retained device flow requires the explicit
     /// `--interactive-auth` opt-in and a real TTY; PRISM never opens a browser.
     Login {
         /// Use a pre-issued Personal Access Token from the platform website.
@@ -327,10 +333,10 @@ enum Commands {
         /// Backend: local, marc27, or byoc.
         #[arg(long, default_value = "local")]
         backend: String,
-        /// Platform API URL (for the `marc27` backend). Defaults to the public
-        /// gateway; override only to point at a staging/self-hosted control plane.
-        #[arg(long, default_value = "https://api.marc27.com/api/v1")]
-        platform_url: String,
+        /// Platform API URL (for the `marc27` backend). When omitted, resolve
+        /// PRISM_API_URL, config, or the endpoint stored by `prism login`.
+        #[arg(long)]
+        platform_url: Option<String>,
         /// BYOC SSH target: user@host (enables SSH backend).
         #[arg(long)]
         ssh: Option<String>,
@@ -1279,7 +1285,7 @@ enum MarketplaceCommands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Publish PRISM's own materials tools to the MARC27 marketplace so
+    /// Publish PRISM's own materials tools to the configured provider marketplace so
     /// they are discoverable without installing all of PRISM.
     ///
     /// The catalog is `app/tools/marketplace_catalog.json`, held to account
@@ -1565,7 +1571,7 @@ struct SelectedContext {
 /// `true` and provisions the venv exactly as before. The worst case of a
 /// stale list is therefore the old (slow) behaviour, never a command handed
 /// a path to an interpreter nobody built.
-fn preflight_command_auth(command: Option<&Commands>) -> Result<()> {
+fn preflight_command_auth(command: Option<&Commands>, project_root: &Path) -> Result<()> {
     if let Some(Commands::Node {
         command: NodeCommands::Up { offline, .. },
     }) = command
@@ -1573,7 +1579,8 @@ fn preflight_command_auth(command: Option<&Commands>) -> Result<()> {
     {
         // `node up` needs Python later, but missing auth must be reported
         // before venv provisioning can block or touch the network.
-        let _ = resolve_agent_auth()?;
+        let config = prism_core::config::NodeConfig::load(Some(project_root));
+        let _ = resolve_agent_auth_with_url(config.platform.url.as_deref())?;
     }
     Ok(())
 }
@@ -1700,10 +1707,20 @@ async fn main() -> Result<()> {
             std::env::set_var(prism_runtime::offline::ENV, "1");
         }
     }
-    preflight_command_auth(cli.command.as_ref())?;
     let project_root = cli.project_root.clone();
-    let endpoints = PlatformEndpoints::from_env();
+    let _ = CLI_PROJECT_ROOT.set(project_root.clone());
+    preflight_command_auth(cli.command.as_ref(), &project_root)?;
     let paths = PrismPaths::discover()?;
+    let platform_config = prism_core::config::NodeConfig::load(Some(&project_root));
+    let startup_state = paths.load_cli_state().ok();
+    let endpoints = PlatformEndpoints::resolve_for_paths(
+        platform_config.platform.url.as_deref(),
+        platform_config.platform.provider.as_deref(),
+        startup_state
+            .as_ref()
+            .and_then(|state| state.credentials.as_ref()),
+        &paths,
+    );
 
     // Resolve Python: explicit --python wins; then the PRISM_PYTHON env
     // override (used by CI/the smoke harness to point at a pre-seeded
@@ -1775,7 +1792,7 @@ async fn main() -> Result<()> {
     }
 
     // Tool auto-sync: on every prism invocation, kick off a background
-    // task that pulls tool updates from the MARC27 marketplace. This is
+    // task that pulls tool updates from the configured provider marketplace. This is
     // non-blocking — the actual sync happens in a detached tokio task
     // so startup (TUI/backend/CLI) isn't delayed by network I/O. If the
     // marketplace is unreachable, the task fails silently. The full
@@ -1787,13 +1804,11 @@ async fn main() -> Result<()> {
     // avoid a network call on every trivial invocation.
     if let Ok(state) = paths.load_cli_state()
         && should_sync_tools(cli.command.as_ref(), state.credentials.as_ref())
+        && let Some(endpoints) = endpoints.as_ref()
+        && let Ok((_, credential)) = resolve_agent_auth_with_url(Some(endpoints.api_base.as_str()))
     {
-        let token = state.credentials.as_ref().map(|c| c.access_token.clone());
-        let platform = if let Some(t) = &token {
-            prism_client::api::PlatformClient::new(&endpoints.api_base).with_token(t)
-        } else {
-            prism_client::api::PlatformClient::new(&endpoints.api_base)
-        };
+        let platform =
+            prism_client::api::PlatformClient::new(&endpoints.api_base).with_auth(credential);
         crate::tool_sync::spawn_background_sync_owned(platform);
     }
 
@@ -1802,10 +1817,11 @@ async fn main() -> Result<()> {
         scenario: "basic_chat".to_string(),
     }) {
         Commands::Setup { interactive_auth } => {
+            let endpoints = require_platform_endpoints(endpoints.as_ref())?;
             let mut state = paths.load_cli_state()?;
             state.preferred_python = Some(python.display().to_string());
             if state.credentials.is_none() {
-                let credentials = run_device_login(&endpoints, interactive_auth).await?;
+                let credentials = run_device_login(endpoints, interactive_auth).await?;
                 let platform =
                     PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
                 let profile = platform.fetch_current_user().await.ok();
@@ -1821,6 +1837,7 @@ async fn main() -> Result<()> {
                     access_token: credentials.access_token,
                     refresh_token: credentials.refresh_token,
                     platform_url: credentials.platform_url,
+                    platform_provider: credentials.platform_provider,
                     user_id: profile.as_ref().map(|p| p.id.clone()),
                     display_name: profile.and_then(|p| p.display_name),
                     org_id: selected.org_id,
@@ -1876,7 +1893,7 @@ async fn main() -> Result<()> {
                     .expires_at
                     .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
-                match refresh_access_token(&paths, &endpoints, creds).await {
+                match refresh_access_token(&paths, endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
                         tracing::info!("access token refreshed proactively");
@@ -1894,7 +1911,7 @@ async fn main() -> Result<()> {
             // expires_at said fresh but server disagreed → server-side
             // rotation), try one more refresh + redo the check.
             let mut boot_checks =
-                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks::run_boot_checks(state.credentials.as_ref(), Some(endpoints)).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
@@ -1902,14 +1919,16 @@ async fn main() -> Result<()> {
                 && let Some(creds) = state.credentials.as_ref()
                 && !creds.refresh_token.is_empty()
             {
-                match refresh_access_token(&paths, &endpoints, creds).await {
+                match refresh_access_token(&paths, endpoints, creds).await {
                     Ok(new_creds) => {
                         tracing::info!("access token refreshed after server-side rejection");
                         state.credentials = Some(new_creds);
                         // Redo the boot checks with the new token.
-                        boot_checks =
-                            boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints)
-                                .await;
+                        boot_checks = boot_checks::run_boot_checks(
+                            state.credentials.as_ref(),
+                            Some(endpoints),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1946,6 +1965,7 @@ async fn main() -> Result<()> {
             no_browser,
             interactive_auth,
         } => {
+            let endpoints = require_platform_endpoints(endpoints.as_ref())?;
             let mode = match token {
                 Some(pat) => LoginMode::Token(pat),
                 None => LoginMode::Device {
@@ -1953,17 +1973,33 @@ async fn main() -> Result<()> {
                     no_browser,
                 },
             };
-            perform_full_login(&paths, &endpoints, &python, mode).await?;
+            perform_full_login(&paths, endpoints, &python, mode).await?;
             println!("Login complete.");
         }
         Commands::Status => {
             let state = paths.load_cli_state()?;
+            // Resolve the credential once so a historical alias that would
+            // actually supply it emits its one-time migration notice.
+            let env_credential_present = PlatformVar::get_preferred_then_alias(&[
+                PlatformVar::API_KEY,
+                PlatformVar::TOKEN,
+                PlatformVar::API_TOKEN,
+            ])
+            .is_some();
+            let stored_credential_present = state
+                .credentials
+                .as_ref()
+                .is_some_and(|credentials| !credentials.access_token.trim().is_empty());
+            let node_credential_present = paths
+                .load_node_token()
+                .is_some_and(|token| !token.key.trim().is_empty());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "paths": paths,
-                    "platform": endpoints,
-                    "credentials_present": state.credentials.is_some(),
+                    "platform": endpoints.as_ref(),
+                    "platform_status": if endpoints.is_some() { "configured" } else { "not configured" },
+                    "credentials_present": stored_credential_present || env_credential_present || node_credential_present,
                     "user_id": state.credentials.as_ref().and_then(|c| c.user_id.clone()),
                     "display_name": state.credentials.as_ref().and_then(|c| c.display_name.clone()),
                     "project_id": state.credentials.as_ref().and_then(|c| c.project_id.clone()),
@@ -2321,6 +2357,17 @@ async fn main() -> Result<()> {
             // Load from prism.toml [llm] section, env vars as overrides
             let node_config = prism_core::config::NodeConfig::load(Some(&backend_pr));
             let cfg_llm = &node_config.llm;
+            // `backend` has its own project root. Resolve the platform from
+            // that project's config rather than the top-level default root.
+            let backend_state = paths.load_cli_state().ok();
+            let endpoints = PlatformEndpoints::resolve_for_paths(
+                node_config.platform.url.as_deref(),
+                node_config.platform.provider.as_deref(),
+                backend_state
+                    .as_ref()
+                    .and_then(|state| state.credentials.as_ref()),
+                &paths,
+            );
 
             // Also load ~/.prism/config.toml [chat] — the user-visible
             // chat target set by `prism use local/provider/marc27`.
@@ -2345,7 +2392,12 @@ async fn main() -> Result<()> {
             // platform JWT and 401 every platform LLM call.
             let api_key = std::env::var("LLM_API_KEY")
                 .ok()
-                .or_else(|| PlatformVar::TOKEN.get())
+                .or_else(|| {
+                    PlatformVar::get_preferred_then_alias(&[
+                        PlatformVar::TOKEN,
+                        PlatformVar::API_TOKEN,
+                    ])
+                })
                 .ok_or(std::env::VarError::NotPresent)
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
@@ -2360,12 +2412,17 @@ async fn main() -> Result<()> {
 
             // Resolve base_url, model, and api_key from the chat target
             // when it overrides the prism.toml [llm] defaults.
-            let (base_url, model, api_key) = match &chat_target {
+            let (base_url, model, api_key, credential_kind) = match &chat_target {
                 crate::chat_config::ChatTarget::Local {
                     url,
                     model,
                     api_key: local_key,
-                } => (url.clone(), model.clone(), local_key.clone().or(api_key)),
+                } => (
+                    url.clone(),
+                    model.clone(),
+                    local_key.clone().or(api_key),
+                    None,
+                ),
                 crate::chat_config::ChatTarget::Provider {
                     provider,
                     model,
@@ -2380,6 +2437,7 @@ async fn main() -> Result<()> {
                         provider_endpoint(&registry, provider),
                         model.clone(),
                         provider_key.or(api_key),
+                        None,
                     )
                 }
                 // Marc27 cloud. Two bugs were hiding here:
@@ -2413,6 +2471,7 @@ async fn main() -> Result<()> {
                 crate::chat_config::ChatTarget::Marc27 {
                     model: target_model,
                 } => {
+                    let endpoints = require_platform_endpoints(endpoints.as_ref())?;
                     let preference = resolve_marc27_model(
                         std::env::var("LLM_MODEL").ok(),
                         target_model.as_deref(),
@@ -2430,20 +2489,36 @@ async fn main() -> Result<()> {
                             });
                     // Credential for the platform LLM proxy, in precedence
                     // order: explicit LLM_API_KEY override → the stable
-                    // `m27_*` API key (MARC27_API_KEY — no login, no expiry,
-                    // the headless-server/agent path) → MARC27_TOKEN → the
-                    // logged-in session JWT. The LLM client routes an `m27_*`
-                    // value onto X-API-Key and a JWT onto Bearer automatically.
+                    // provider API key (PRISM_API_KEY — no login, no expiry)
+                    // → PRISM_TOKEN → the logged-in session JWT.
                     // Provider keys are NOT platform credentials.
-                    let marc27_key = std::env::var("LLM_API_KEY")
-                        .ok()
-                        .or_else(|| PlatformVar::API_KEY.get())
-                        .or_else(|| PlatformVar::TOKEN.get())
-                        .or_else(|| platform_token.clone());
+                    let (marc27_key, credential_kind) =
+                        if let Ok(raw_override) = std::env::var("LLM_API_KEY") {
+                            (Some(raw_override), None)
+                        } else if let Some(credential) = auth::resolve_environment_credential() {
+                            match credential {
+                                PlatformAuth::ApiKey(key) => (
+                                    Some(key),
+                                    Some(prism_ingest::llm::LlmCredentialKind::ApiKey),
+                                ),
+                                PlatformAuth::Bearer(token) => (
+                                    Some(token),
+                                    Some(prism_ingest::llm::LlmCredentialKind::Bearer),
+                                ),
+                            }
+                        } else {
+                            (
+                                platform_token.clone(),
+                                platform_token
+                                    .as_ref()
+                                    .map(|_| prism_ingest::llm::LlmCredentialKind::Bearer),
+                            )
+                        };
                     (
                         marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url)?,
                         model,
                         marc27_key,
+                        credential_kind,
                     )
                 }
             };
@@ -2460,6 +2535,7 @@ async fn main() -> Result<()> {
                 base_url,
                 model,
                 api_key,
+                credential_kind,
                 embedding_model: cfg_llm.embedding_model.clone(),
                 context_window,
                 max_output_tokens,
@@ -2489,7 +2565,10 @@ async fn main() -> Result<()> {
             // login/refresh) and re-reads it on 401, which a frozen env
             // snapshot can never do. A genuine user-set MARC27_API_KEY still
             // reaches the tool server through normal env inheritance.
-            tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
+            if let Some(endpoints) = endpoints.as_ref() {
+                tool_server_env.insert("PRISM_API_URL".to_string(), endpoints.api_base.clone());
+                tool_server_env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
+            }
 
             // Pass through any API keys the user has set
             for key in &[
@@ -2872,12 +2951,12 @@ async fn main() -> Result<()> {
                 // falling back to prism.toml [indexer], then defaults.
                 {
                     let chat_target = crate::chat_config::load().unwrap_or_default().chat;
-                    let (base_url, model, api_key) = match &chat_target {
+                    let resolved_llm = match &chat_target {
                         crate::chat_config::ChatTarget::Local {
                             url,
                             model,
                             api_key: local_key,
-                        } => (
+                        } => Some((
                             url.clone(),
                             model.clone(),
                             local_key.clone().or_else(|| {
@@ -2885,7 +2964,8 @@ async fn main() -> Result<()> {
                                     &node_config.indexer,
                                 )
                             }),
-                        ),
+                            None,
+                        )),
                         crate::chat_config::ChatTarget::Provider {
                             provider,
                             model,
@@ -2895,7 +2975,7 @@ async fn main() -> Result<()> {
                             let env_name = api_key_env.clone().unwrap_or_else(|| {
                                 crate::providers::default_api_key_env(&registry, provider)
                             });
-                            (
+                            Some((
                                 provider_endpoint(&registry, provider),
                                 model.clone(),
                                 std::env::var(&env_name).ok().or_else(|| {
@@ -2903,36 +2983,70 @@ async fn main() -> Result<()> {
                                         &node_config.indexer,
                                     )
                                 }),
-                            )
+                                None,
+                            ))
                         }
                         crate::chat_config::ChatTarget::Marc27 { .. } => {
-                            let api_key = prism_core::config::NodeConfig::resolve_api_key(
-                                &node_config.indexer,
-                            );
-                            let base_url =
-                                node_config.indexer.uri.clone().unwrap_or_else(
-                                    || match node_config.indexer.mode.as_str() {
-                                        "platform" | "marc27" | "external" => {
-                                            node_config.platform.url.clone() + "/llm"
-                                        }
-                                        _ => "http://localhost:8080".into(),
-                                    },
-                                );
+                            let stored_token = paths
+                                .load_cli_state()
+                                .ok()
+                                .and_then(|state| state.credentials)
+                                .map(|credentials| credentials.access_token);
+                            let (api_key, credential_kind) =
+                                if let Some(credential) = auth::resolve_environment_credential() {
+                                    match credential {
+                                        PlatformAuth::ApiKey(key) => (
+                                            Some(key),
+                                            Some(prism_ingest::llm::LlmCredentialKind::ApiKey),
+                                        ),
+                                        PlatformAuth::Bearer(token) => (
+                                            Some(token),
+                                            Some(prism_ingest::llm::LlmCredentialKind::Bearer),
+                                        ),
+                                    }
+                                } else if stored_token.is_some() {
+                                    (
+                                        stored_token,
+                                        Some(prism_ingest::llm::LlmCredentialKind::Bearer),
+                                    )
+                                } else {
+                                    (
+                                        prism_core::config::NodeConfig::resolve_api_key(
+                                            &node_config.indexer,
+                                        ),
+                                        None,
+                                    )
+                                };
+                            let base_url = node_config.indexer.uri.clone().or_else(|| {
+                                match node_config.indexer.mode.as_str() {
+                                    "platform" | "marc27" | "external" => endpoints
+                                        .as_ref()
+                                        .map(|endpoints| format!("{}/llm", endpoints.api_base)),
+                                    _ => Some("http://localhost:8080".into()),
+                                }
+                            });
                             let model = node_config
                                 .indexer
                                 .model
                                 .clone()
                                 .unwrap_or_else(|| "gemma-3-27b".into());
-                            (base_url, model, api_key)
+                            base_url.map(|base_url| (base_url, model, api_key, credential_kind))
                         }
                     };
-                    server_node_state.llm = Some(prism_ingest::LlmConfig {
-                        base_url,
-                        model,
-                        api_key,
-                        embedding_model: node_config.indexer.embedding_model.clone(),
-                        ..Default::default()
-                    });
+                    if let Some((base_url, model, api_key, credential_kind)) = resolved_llm {
+                        server_node_state.llm = Some(prism_ingest::LlmConfig {
+                            base_url,
+                            model,
+                            api_key,
+                            credential_kind,
+                            embedding_model: node_config.indexer.embedding_model.clone(),
+                            ..Default::default()
+                        });
+                    } else {
+                        tracing::info!(
+                            "no platform configured; node chat service starts without a hosted LLM"
+                        );
+                    }
                 }
 
                 // ── Platform registration (unless --offline) ──
@@ -2965,18 +3079,14 @@ async fn main() -> Result<()> {
                 let mesh_has_auth = mesh_auth_token.is_some();
 
                 if !offline {
+                    let endpoints = require_platform_endpoints(endpoints.as_ref())?;
                     let (resolved_api_base, resolved_auth) = resolved_platform_auth
                         .as_ref()
                         .expect("non-offline node auth was preflighted");
                     let creds = cli_state.credentials.as_ref();
                     daemon_org_id = creds.and_then(|value| value.org_id.clone());
-                    let (token, maybe_refreshed) = if resolved_auth.is_api_key() {
-                        (resolved_auth.secret().to_string(), None)
-                    } else if let Some(creds) = creds {
-                        resolve_node_token(&paths, &endpoints, creds).await?
-                    } else {
-                        (resolved_auth.secret().to_string(), None)
-                    };
+                    let (client_auth, maybe_refreshed) =
+                        resolve_node_auth(&paths, endpoints, creds, resolved_auth).await?;
                     let effective_creds = maybe_refreshed.or_else(|| creds.cloned());
 
                     // Resolve the platform token through the SAME priority
@@ -3008,7 +3118,9 @@ async fn main() -> Result<()> {
                     // stale client and the daemon then heartbeat/role-sync/
                     // deregister'd on the dead token → all 401 → stale
                     // "online" record).
-                    let mut platform = PlatformClient::new(resolved_api_base).with_token(&token);
+                    let client_uses_api_key = client_auth.is_api_key();
+                    let mut platform =
+                        PlatformClient::new(resolved_api_base).with_auth(client_auth);
                     let mut caps = serde_json::json!({
                         "compute": !no_compute,
                         "storage": !no_storage,
@@ -3035,9 +3147,7 @@ async fn main() -> Result<()> {
                             prism_client::node_registry::NodeRegistryClient::new(&platform);
                         match registry.register_node_inspect(&node_name, &caps).await {
                             Ok(reg) => reg,
-                            Err(api_err)
-                                if api_err.is_token_expired() && !resolved_auth.is_api_key() =>
-                            {
+                            Err(api_err) if api_err.is_token_expired() && !client_uses_api_key => {
                                 tracing::info!(
                                     "node register rejected with token_expired — refreshing and retrying once"
                                 );
@@ -3046,11 +3156,11 @@ async fn main() -> Result<()> {
                                 // refreshed), never the stale startup
                                 // binding.
                                 let effective_creds = effective_creds.as_ref().ok_or_else(|| {
-                                        anyhow!("token expired without a stored session; re-authentication or MARC27_API_KEY is required")
+                                        anyhow!("token expired without a stored session; re-authentication or PRISM_API_KEY is required")
                                     })?;
                                 let refreshed = refresh_access_token(
                                     &paths,
-                                    &endpoints,
+                                    endpoints,
                                     effective_creds,
                                 )
                                 .await
@@ -3059,8 +3169,9 @@ async fn main() -> Result<()> {
                                 )?;
                                 // Reassign the OUTER client so the daemon
                                 // state (stored below) carries the live token.
-                                platform = PlatformClient::new(resolved_api_base)
-                                    .with_token(&refreshed.access_token);
+                                platform = PlatformClient::new(resolved_api_base).with_auth(
+                                    PlatformAuth::Bearer(refreshed.access_token.clone()),
+                                );
                                 let registry =
                                     prism_client::node_registry::NodeRegistryClient::new(&platform);
                                 registry
@@ -3189,14 +3300,14 @@ async fn main() -> Result<()> {
                     let chat_state = server_state.clone();
                     let chat_python = python.clone();
                     let chat_project_root = project_root.clone();
-                    let chat_api_base = endpoints.api_base.clone();
+                    let chat_api_base = endpoints.as_ref().map(|value| value.api_base.clone());
                     tokio::spawn(async move {
                         let llm_config = chat_state
                             .llm
                             .clone()
                             .expect("checked is_some before spawn");
                         let mut tool_server_env =
-                            prism_agent::service::default_tool_server_env(&chat_api_base);
+                            prism_agent::service::default_tool_server_env(chat_api_base.as_deref());
                         if let Ok(binary) = std::env::current_exe() {
                             tool_server_env.insert(
                                 "PRISM_BINARY".to_string(),
@@ -3533,7 +3644,8 @@ async fn main() -> Result<()> {
 
                 // Run daemon until Ctrl+C — on shutdown, stop Docker containers
                 let result =
-                    prism_node::daemon::run_daemon(&endpoints, &paths, daemon_options).await;
+                    prism_node::daemon::run_daemon(endpoints.as_ref(), &paths, daemon_options)
+                        .await;
 
                 // Send Goodbye via Kafka before shutting down
                 if let (Some(producer), Some(&nid)) = (
@@ -3571,7 +3683,7 @@ async fn main() -> Result<()> {
             }
             NodeCommands::Status => {
                 let caps = prism_node::detect::probe_local_capabilities_async().await;
-                print_node_status(&caps, &endpoints);
+                print_node_status(&caps, endpoints.as_ref());
             }
             NodeCommands::Probe => {
                 let caps = prism_node::detect::probe_local_capabilities_async().await;
@@ -3775,7 +3887,7 @@ async fn main() -> Result<()> {
             dashboard_url,
         } => {
             if platform {
-                // Route through MARC27 platform API
+                // Route through the configured provider API.
                 handle_platform_query(&text, semantic, json_output, limit).await?;
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
@@ -3817,7 +3929,7 @@ async fn main() -> Result<()> {
                 &image,
                 &input,
                 &backend,
-                &platform_url,
+                platform_url.as_deref(),
                 ssh.as_deref(),
                 &ssh_key,
                 ssh_port,
@@ -3846,16 +3958,17 @@ async fn main() -> Result<()> {
             handle_mesh_command(command, &paths).await?;
         }
         Commands::Federation { command } => {
-            handle_federation_command(command, &paths).await?;
+            handle_federation_command(command, &paths, endpoints.as_ref()).await?;
         }
         Commands::Report {
             description,
             log_file,
             no_github,
         } => {
+            let endpoints = require_platform_endpoints(endpoints.as_ref())?;
             handle_report(
                 &paths,
-                &endpoints,
+                endpoints,
                 &description,
                 log_file.as_deref(),
                 no_github,
@@ -3865,13 +3978,15 @@ async fn main() -> Result<()> {
         Commands::Marketplace { command } => {
             use prism_client::marketplace::MarketplaceClient;
 
-            let state = paths.load_cli_state()?;
-            let token = state.credentials.as_ref().map(|c| c.access_token.clone());
-            let platform = if let Some(t) = &token {
-                PlatformClient::new(&endpoints.api_base).with_token(t)
-            } else {
-                PlatformClient::new(&endpoints.api_base)
-            };
+            let endpoints = require_platform_endpoints(endpoints.as_ref())?;
+            // Marketplace listing can be public, but when any supported
+            // credential exists it must retain its X-API-Key/Bearer kind.
+            let platform = resolve_agent_auth_with_url(Some(&endpoints.api_base))
+                .map(|(_, credential)| {
+                    PlatformClient::new(&endpoints.api_base).with_auth(credential)
+                })
+                .unwrap_or_else(|_| PlatformClient::new(&endpoints.api_base));
+            let marketplace_authenticated = platform.access_token().is_some();
             let marketplace = MarketplaceClient::new(&platform);
 
             match command {
@@ -4125,7 +4240,7 @@ async fn main() -> Result<()> {
                             catalog.bundled.len()
                         );
                     } else {
-                        if token.is_none() {
+                        if !marketplace_authenticated {
                             anyhow::bail!("publishing requires authentication");
                         }
                         for entry in &selected {
@@ -4654,7 +4769,9 @@ async fn main() -> Result<()> {
             // dropped into the TUI on silent defaults — the reason a
             // fresh install used to show `gpt-5.5` with nobody logged in.
             // No-ops on repeat launches and in non-interactive contexts.
-            onboarding::run_if_first_launch(&paths, &endpoints, &python).await?;
+            if let Some(endpoints) = endpoints.as_ref() {
+                onboarding::run_if_first_launch(&paths, endpoints, &python).await?;
+            }
 
             // Auto-refresh + refresh-on-rejection. Mirrors the `prism
             // setup` path — see comments there for design notes.
@@ -4662,12 +4779,13 @@ async fn main() -> Result<()> {
             // users out of the "log in again every session" loop.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
             if let Some(creds) = state.credentials.as_ref()
+                && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
                 && creds
                     .expires_at
                     .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
-                match refresh_access_token(&paths, &endpoints, creds).await {
+                match refresh_access_token(&paths, endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
                         tracing::info!("access token refreshed proactively");
@@ -4678,19 +4796,20 @@ async fn main() -> Result<()> {
                 }
             }
             let mut boot_checks =
-                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks::run_boot_checks(state.credentials.as_ref(), endpoints.as_ref()).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
             if auth_rejected
                 && let Some(creds) = state.credentials.as_ref()
+                && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
-                && let Ok(new_creds) = refresh_access_token(&paths, &endpoints, creds).await
+                && let Ok(new_creds) = refresh_access_token(&paths, endpoints, creds).await
             {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
                 boot_checks =
-                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), Some(endpoints)).await;
             }
             // Both proactive AND reactive refresh have failed → the
             // refresh token itself is expired. Run the full Login
@@ -4701,12 +4820,13 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
+                let endpoints = require_platform_endpoints(endpoints.as_ref())?;
                 eprintln!();
                 eprintln!("\x1b[33mYour platform session has expired — re-authenticating…\x1b[0m");
                 eprintln!();
                 if let Err(e) = perform_full_login(
                     &paths,
-                    &endpoints,
+                    endpoints,
                     &python,
                     LoginMode::Device {
                         interactive_auth: false,
@@ -4725,7 +4845,7 @@ async fn main() -> Result<()> {
                 }
                 state = paths.load_cli_state().ok().unwrap_or_default();
                 boot_checks =
-                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), Some(endpoints)).await;
             }
             boot::boot_sequence(&boot_checks);
             let _ = &python;
@@ -4735,10 +4855,12 @@ async fn main() -> Result<()> {
                 std::env::current_exe().context("failed to locate current prism executable")?;
             // Give the TUI the platform bearer so it can poll the org credit
             // balance at turn boundaries (status bar). None → no credits shown.
-            let platform = state.credentials.as_ref().map(|c| prism_tui::PlatformAuth {
-                base_url: endpoints.api_base.clone(),
-                token: c.access_token.clone(),
-            });
+            let platform = state.credentials.as_ref().zip(endpoints.as_ref()).map(
+                |(credentials, endpoints)| prism_tui::PlatformAuth {
+                    base_url: endpoints.api_base.clone(),
+                    token: credentials.access_token.clone(),
+                },
+            );
             let config = prism_tui::RunConfig {
                 backend_mode: prism_tui::BackendMode::Real {
                     prism_binary: prism_bin.to_str().unwrap().to_string(),
@@ -4759,12 +4881,13 @@ async fn main() -> Result<()> {
             // Same auth-refresh + boot-check flow as the Tui branch.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
             if let Some(creds) = state.credentials.as_ref()
+                && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
                 && creds
                     .expires_at
                     .is_some_and(|exp| chrono::Utc::now() + chrono::Duration::minutes(5) >= exp)
             {
-                match refresh_access_token(&paths, &endpoints, creds).await {
+                match refresh_access_token(&paths, endpoints, creds).await {
                     Ok(new_creds) => {
                         state.credentials = Some(new_creds);
                         tracing::info!("access token refreshed proactively");
@@ -4775,19 +4898,20 @@ async fn main() -> Result<()> {
                 }
             }
             let mut boot_checks =
-                boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                boot_checks::run_boot_checks(state.credentials.as_ref(), endpoints.as_ref()).await;
             let auth_rejected = boot_checks
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
             if auth_rejected
                 && let Some(creds) = state.credentials.as_ref()
+                && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
-                && let Ok(new_creds) = refresh_access_token(&paths, &endpoints, creds).await
+                && let Ok(new_creds) = refresh_access_token(&paths, endpoints, creds).await
             {
                 tracing::info!("access token refreshed after server-side rejection");
                 state.credentials = Some(new_creds);
                 boot_checks =
-                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), Some(endpoints)).await;
             }
             // Same inline re-login as the Tui branch — see comment
             // there. Resuming on dead creds is even more confusing
@@ -4796,12 +4920,13 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"))
             {
+                let endpoints = require_platform_endpoints(endpoints.as_ref())?;
                 eprintln!();
                 eprintln!("\x1b[33mYour platform session has expired — re-authenticating…\x1b[0m");
                 eprintln!();
                 if let Err(e) = perform_full_login(
                     &paths,
-                    &endpoints,
+                    endpoints,
                     &python,
                     LoginMode::Device {
                         interactive_auth: false,
@@ -4822,15 +4947,17 @@ async fn main() -> Result<()> {
                 }
                 state = paths.load_cli_state().ok().unwrap_or_default();
                 boot_checks =
-                    boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+                    boot_checks::run_boot_checks(state.credentials.as_ref(), Some(endpoints)).await;
             }
             boot::boot_sequence(&boot_checks);
             let prism_bin =
                 std::env::current_exe().context("failed to locate current prism executable")?;
-            let platform = state.credentials.as_ref().map(|c| prism_tui::PlatformAuth {
-                base_url: endpoints.api_base.clone(),
-                token: c.access_token.clone(),
-            });
+            let platform = state.credentials.as_ref().zip(endpoints.as_ref()).map(
+                |(credentials, endpoints)| prism_tui::PlatformAuth {
+                    base_url: endpoints.api_base.clone(),
+                    token: credentials.access_token.clone(),
+                },
+            );
             let config = prism_tui::RunConfig {
                 backend_mode: prism_tui::BackendMode::Real {
                     prism_binary: prism_bin.to_str().unwrap().to_string(),
@@ -5065,6 +5192,7 @@ async fn handle_workflow_command(
             }
             // Point `llm_*` steps at the resolved chat endpoint.
             inject_workflow_llm_endpoint(&mut values, project_root, paths);
+            inject_workflow_platform_endpoint(&mut values, project_root, paths);
             let options = resolve_workflow_llm_options(
                 project_root,
                 paths,
@@ -5107,6 +5235,7 @@ async fn try_run_workflow_alias(
     }
     // Point `llm_*` steps at the resolved chat endpoint.
     inject_workflow_llm_endpoint(&mut values, project_root, paths);
+    inject_workflow_platform_endpoint(&mut values, project_root, paths);
     let options = resolve_workflow_llm_options(
         project_root,
         paths,
@@ -5249,6 +5378,7 @@ fn render_workflow_result(spec: &WorkflowSpec, result: &WorkflowRunResult) {
 async fn handle_federation_command(
     command: FederationCommands,
     paths: &prism_runtime::PrismPaths,
+    endpoints: Option<&PlatformEndpoints>,
 ) -> Result<()> {
     match command {
         FederationCommands::Whoami { json } => {
@@ -5257,11 +5387,15 @@ async fn handle_federation_command(
             // identity report instead of an invented login requirement.
             let state = paths.load_cli_state().ok().unwrap_or_default();
             let creds = state.credentials.as_ref();
-            let endpoints = PlatformEndpoints::from_env();
             // Report the name that actually supplied the key, not a fixed
             // string -- an operator with both spellings set otherwise cannot
             // tell which one the process read.
-            let credential_source = if let Some(name) = PlatformVar::API_KEY.source() {
+            let env_credential = PlatformVar::get_with_source_preferred_then_alias(&[
+                PlatformVar::API_KEY,
+                PlatformVar::TOKEN,
+                PlatformVar::API_TOKEN,
+            ]);
+            let credential_source = if let Some((_, name)) = env_credential {
                 name
             } else if creds.is_some() {
                 "cli-state session"
@@ -5274,7 +5408,8 @@ async fn handle_federation_command(
             let platform_url = creds
                 .map(|value| value.platform_url.as_str())
                 .filter(|value| !value.is_empty())
-                .unwrap_or(&endpoints.api_base);
+                .or_else(|| endpoints.map(|value| value.api_base.as_str()))
+                .unwrap_or("not configured");
 
             if json {
                 let out = serde_json::json!({
@@ -6012,8 +6147,14 @@ fn resolve_workflow_llm_pair(project_root: &Path, paths: &PrismPaths) -> Option<
     // turns the honest #132 error (unauthenticated + no explicit endpoint)
     // into "skip injection" rather than a dead localhost default.
     let marc27_base_url = if matches!(chat_target, crate::chat_config::ChatTarget::Marc27 { .. }) {
-        let endpoints = PlatformEndpoints::from_env();
-        marc27_llm_base_url(paths, &endpoints.api_base, &cfg_llm.url).ok()
+        let state = paths.load_cli_state().ok();
+        PlatformEndpoints::resolve_for_paths(
+            node_config.platform.url.as_deref(),
+            node_config.platform.provider.as_deref(),
+            state.as_ref().and_then(|value| value.credentials.as_ref()),
+            paths,
+        )
+        .and_then(|endpoints| marc27_llm_base_url(paths, &endpoints.api_base, &cfg_llm.url).ok())
     } else {
         None
     };
@@ -6037,19 +6178,25 @@ fn resolve_workflow_llm_options(
     node_token: Option<String>,
 ) -> WorkflowExecutionOptions {
     let resolved = resolve_workflow_llm_pair(project_root, paths);
-    let trusted_llm_api_key = resolved
+    let trusted_llm_credential = resolved
         .as_ref()
         .and_then(|_| resolve_workflow_llm_api_key(project_root, paths));
     WorkflowExecutionOptions {
         trusted_llm_base_url: resolved.as_ref().map(|(base_url, _)| base_url.clone()),
-        trusted_llm_api_key,
+        trusted_llm_api_key: trusted_llm_credential
+            .as_ref()
+            .map(|(value, _)| value.clone()),
+        trusted_llm_credential_kind: trusted_llm_credential.and_then(|(_, kind)| kind),
         caller_supplied_llm_base_url,
         trusted_node_port: node_token.as_ref().map(|_| 7327),
         trusted_node_token: node_token,
     }
 }
 
-fn resolve_workflow_llm_api_key(project_root: &Path, paths: &PrismPaths) -> Option<String> {
+fn resolve_workflow_llm_api_key(
+    project_root: &Path,
+    paths: &PrismPaths,
+) -> Option<(String, Option<prism_ingest::llm::LlmCredentialKind>)> {
     let node_config = prism_core::config::NodeConfig::load(Some(project_root));
     let chat_target = crate::chat_config::load().unwrap_or_default().chat;
     let platform_token = paths
@@ -6064,13 +6211,13 @@ fn resolve_workflow_llm_api_key_for_target(
     chat_target: &crate::chat_config::ChatTarget,
     cfg_llm: &prism_core::config::LlmSection,
     platform_token: Option<String>,
-) -> Option<String> {
+) -> Option<(String, Option<prism_ingest::llm::LlmCredentialKind>)> {
     let non_empty = |key: Option<String>| key.filter(|value| !value.trim().is_empty());
 
     match chat_target {
-        crate::chat_config::ChatTarget::Local { api_key, .. } => {
-            non_empty(api_key.clone()).or_else(|| non_empty(cfg_llm.resolve_api_key()))
-        }
+        crate::chat_config::ChatTarget::Local { api_key, .. } => non_empty(api_key.clone())
+            .or_else(|| non_empty(cfg_llm.resolve_api_key()))
+            .map(|value| (value, None)),
         crate::chat_config::ChatTarget::Provider {
             provider,
             api_key_env,
@@ -6080,16 +6227,32 @@ fn resolve_workflow_llm_api_key_for_target(
             let env_name = api_key_env
                 .clone()
                 .unwrap_or_else(|| crate::providers::default_api_key_env(&registry, provider));
-            non_empty(std::env::var(env_name).ok()).or_else(|| non_empty(cfg_llm.resolve_api_key()))
+            non_empty(std::env::var(env_name).ok())
+                .or_else(|| non_empty(cfg_llm.resolve_api_key()))
+                .map(|value| (value, None))
         }
-        crate::chat_config::ChatTarget::Marc27 { .. } => non_empty(
-            std::env::var("LLM_API_KEY")
-                .ok()
-                .or_else(|| PlatformVar::API_KEY.get())
-                .or_else(|| PlatformVar::TOKEN.get())
-                .or_else(|| cfg_llm.resolve_api_key())
-                .or(platform_token),
-        ),
+        crate::chat_config::ChatTarget::Marc27 { .. } => {
+            if let Some(value) = non_empty(std::env::var("LLM_API_KEY").ok()) {
+                return Some((value, None));
+            }
+            if let Some(credential) = auth::resolve_environment_credential() {
+                let (value, kind) = match credential {
+                    PlatformAuth::ApiKey(value) => {
+                        (value, prism_ingest::llm::LlmCredentialKind::ApiKey)
+                    }
+                    PlatformAuth::Bearer(value) => {
+                        (value, prism_ingest::llm::LlmCredentialKind::Bearer)
+                    }
+                };
+                return Some((value, Some(kind)));
+            }
+            non_empty(cfg_llm.resolve_api_key())
+                .map(|value| (value, None))
+                .or_else(|| {
+                    non_empty(platform_token)
+                        .map(|value| (value, Some(prism_ingest::llm::LlmCredentialKind::Bearer)))
+                })
+        }
     }
 }
 
@@ -6108,6 +6271,29 @@ fn inject_workflow_llm_endpoint(
     }
     if !model.is_empty() {
         values.entry("llm_model".to_string()).or_insert(model);
+    }
+}
+
+/// Inject the already-resolved platform endpoint for built-in workflows.
+/// Config and stored-login endpoints must work without duplicating them into
+/// an environment variable; an explicit `--set platform_api_base=...` wins.
+fn inject_workflow_platform_endpoint(
+    values: &mut BTreeMap<String, String>,
+    project_root: &Path,
+    paths: &PrismPaths,
+) {
+    if values.contains_key("platform_api_base") {
+        return;
+    }
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    let state = paths.load_cli_state().ok();
+    if let Some(endpoints) = PlatformEndpoints::resolve_for_paths(
+        config.platform.url.as_deref(),
+        config.platform.provider.as_deref(),
+        state.as_ref().and_then(|state| state.credentials.as_ref()),
+        paths,
+    ) {
+        values.insert("platform_api_base".to_string(), endpoints.api_base);
     }
 }
 
@@ -7741,7 +7927,7 @@ async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> 
     Ok(summary)
 }
 
-/// Upload a document to the MARC27 platform's holistic ingest pipeline.
+/// Upload a document to the configured provider's holistic ingest pipeline.
 ///
 /// The local pipeline (`prism ingest` with no flags) needs a local LLM and a
 /// local runtime and writes to the local Turso store. This is the other half:
@@ -8282,16 +8468,18 @@ AUTH (two paths — decoupled):
   prism status                                         # show auth + config
 
   # For agents (no login needed):
-  export MARC27_API_KEY=m27_your_key_here              # set once, works forever
-  prism query --platform "titanium"                    # just works
+  export PRISM_API_URL=https://provider.example/api/v1 # choose a platform provider
+  export PRISM_API_KEY=your_provider_key               # provider-defined, non-expiring key
+  prism query --platform "titanium"
 
 OUTPUT:
   Default: human-readable, one result per line (grep-friendly)
   --json:  JSON array (pipe to jq/python)
   --platform: route through the hosted API instead of the local graph
 
-AGENT SETUP (one line):
-  export MARC27_API_KEY=m27_...                        # that's it. no login, no refresh, no expiry.
+AGENT SETUP:
+  export PRISM_API_URL=https://provider.example/api/v1
+  export PRISM_API_KEY=your_provider_key               # no login, refresh, or expiry
 
 EXAMPLES:
   prism query --platform --semantic "creep resistant superalloy" --json | jq '.[].content'
@@ -8302,11 +8490,6 @@ EXAMPLES:
     );
 }
 
-/// Default `--platform-url` for `prism run --backend marc27`. Kept as a const so
-/// `handle_run` can tell an explicit override from the default and pick the
-/// agent-resolved base otherwise.
-const DEFAULT_RUN_PLATFORM_URL: &str = "https://api.marc27.com/api/v1";
-
 /// Map the shared auth seam onto the compute crate's decoupled `Marc27Auth`.
 fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
     match auth {
@@ -8315,10 +8498,14 @@ fn marc27_auth_from(auth: PlatformAuth) -> prism_compute::Marc27Auth {
     }
 }
 
-/// Resolve platform auth for every CLI command that reaches MARC27. This is
+/// Resolve platform auth for every CLI command that reaches a hosted provider. This is
 /// the single CLI auth chokepoint: it accepts API-key-only users, stored
 /// sessions, and legacy credentials, and never starts interactive auth.
 fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
+    resolve_agent_auth_with_url(None)
+}
+
+fn resolve_agent_auth_with_url(configured_url: Option<&str>) -> Result<(String, PlatformAuth)> {
     // `offline::enabled()`, not a re-derived `== "1"`. This function is the
     // gate ~25 platform commands rely on, and it trimmed nothing — so
     // `PRISM_OFFLINE=" 1"` (a routine shell/CI artifact) was honoured by every
@@ -8333,12 +8520,19 @@ fn resolve_agent_auth() -> Result<(String, PlatformAuth)> {
         );
     }
 
-    let default_api_base = PlatformVar::API_URL
-        .get()
-        .unwrap_or_else(|| "https://api.marc27.com/api/v1".to_string());
     let paths = PrismPaths::discover().ok();
-    let resolved = auth::resolve_from_environment(paths.as_ref(), &default_api_base)?;
+    let config = prism_core::config::NodeConfig::load(CLI_PROJECT_ROOT.get().map(PathBuf::as_path));
+    let configured_url = configured_url.or(config.platform.url.as_deref());
+    let resolved = auth::resolve_from_environment_with_provider(
+        paths.as_ref(),
+        configured_url,
+        config.platform.provider.as_deref(),
+    )?;
     Ok((resolved.api_base, resolved.credential))
+}
+
+fn require_platform_endpoints(endpoints: Option<&PlatformEndpoints>) -> Result<&PlatformEndpoints> {
+    endpoints.ok_or_else(|| anyhow!(prism_runtime::auth::PLATFORM_NOT_CONFIGURED))
 }
 
 fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
@@ -8351,9 +8545,7 @@ fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
         .credentials
         .as_ref()
         .and_then(|creds| creds.project_id.clone())
-        .ok_or_else(|| {
-            anyhow!("No active project selected; authenticate or set MARC27_PROJECT_ID.")
-        })
+        .ok_or_else(|| anyhow!("No active project selected; authenticate or set PRISM_PROJECT_ID."))
 }
 
 /// Mint a durable node token (a node-scoped API key) and store it locally so
@@ -11245,7 +11437,7 @@ async fn mint_workflow_node_token(paths: &prism_runtime::PrismPaths) -> Option<S
     }
 }
 
-/// Query the MARC27 platform API (graph search or semantic search).
+/// Query the configured provider API (graph search or semantic search).
 async fn handle_platform_query(
     text: &str,
     semantic: bool,
@@ -11767,6 +11959,7 @@ async fn perform_full_login(
         access_token: credentials.access_token,
         refresh_token: credentials.refresh_token,
         platform_url: credentials.platform_url,
+        platform_provider: credentials.platform_provider,
         user_id: profile.as_ref().map(|p| p.id.clone()),
         display_name: profile.and_then(|p| p.display_name),
         org_id: selected.org_id,
@@ -11789,6 +11982,7 @@ async fn perform_full_login(
             "access_token": creds.access_token,
             "refresh_token": creds.refresh_token,
             "platform_url": creds.platform_url,
+            "platform_provider": creds.platform_provider,
             "user_id": creds.user_id,
             "org_id": creds.org_id,
             "project_id": creds.project_id,
@@ -11920,6 +12114,7 @@ async fn run_device_login_with_opts(
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
+        platform_provider: endpoints.provider.clone(),
         user_id: None,
         display_name: None,
         org_id: None,
@@ -11931,11 +12126,11 @@ async fn run_device_login_with_opts(
 }
 
 /// Headless / CI / SSH-only login path. Skips the device flow and
-/// validates a Personal Access Token (PAT) the user issued on the
-/// MARC27 website. The token is the only credential needed; org +
+/// validates a Personal Access Token (PAT) the user issued with the
+/// configured provider. The token is the only credential needed; org +
 /// project selection is deferred to the post-login interactive step
 /// (Commands::Login handler), which prompts only if multiple orgs/
-/// projects are visible — and falls back to env var `MARC27_PROJECT_ID`
+/// projects are visible — and falls back to env var `PRISM_PROJECT_ID`
 /// when the prompt isn't appropriate (CI, scripted setup).
 ///
 /// Validation: we hit `GET /api/v1/me` (or whatever `fetch_current_user`
@@ -11976,7 +12171,7 @@ async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<S
     // PATs don't have a refresh token (long-lived by design) and
     // expires_at depends on when the user issued it; the website tells
     // them. Leaving expires_at = None means PRISM treats it as
-    // never-expiring locally; on a 401 from MARC27 we fall through
+    // never-expiring locally; on a provider 401 we fall through
     // to the existing visible-failure detector with a clear message.
     println!();
     println!(
@@ -11994,6 +12189,7 @@ async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<S
         // `prism login --token …`.
         refresh_token: String::new(),
         platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
+        platform_provider: endpoints.provider.clone(),
         user_id: Some(profile.id.clone()),
         display_name: profile.display_name,
         org_id: None,
@@ -12018,7 +12214,7 @@ async fn select_project(
                         .map(|org| org.name)
                 });
                 println!(
-                    "Using project from MARC27_PROJECT_ID: {} ({})",
+                    "Using project from PRISM_PROJECT_ID: {} ({})",
                     project.name, project.id
                 );
                 return Ok(SelectedContext {
@@ -12030,7 +12226,7 @@ async fn select_project(
             }
             Err(err) => {
                 eprintln!(
-                    "warning: MARC27_PROJECT_ID={} could not be resolved: {err}",
+                    "warning: PRISM_PROJECT_ID={} could not be resolved: {err}",
                     project_id
                 );
             }
@@ -12061,7 +12257,7 @@ async fn select_project(
         })?
     } else {
         bail!(
-            "multiple organizations require a selection; set MARC27_PROJECT_ID=<project_id>, then re-authenticate"
+            "multiple organizations require a selection; set PRISM_PROJECT_ID=<project_id>, then re-authenticate"
         );
     };
 
@@ -12099,7 +12295,7 @@ async fn select_project(
         })?
     } else {
         bail!(
-            "multiple projects require a selection; set MARC27_PROJECT_ID=<project_id>, then re-authenticate"
+            "multiple projects require a selection; set PRISM_PROJECT_ID=<project_id>, then re-authenticate"
         );
     };
 
@@ -12198,47 +12394,46 @@ async fn refresh_access_token(
     Ok(new_creds)
 }
 
-/// Resolve the platform credential for the node-up register call, mirroring the
-/// priority order of `daemon::load_access_token` so the REST register path
-/// never sends an expired session token:
+/// Resolve the typed platform credential for the node-up register call.
 ///
 /// 1. durable node token (`prism node token mint`) — non-rotating, no expiry;
-/// 2. `MARC27_API_KEY` env — headless/agent path, no expiry;
-/// 3. cli-state creds, refreshed once if `expires_at` has passed.
+/// 2. the already-resolved native-first environment/stored credential;
+/// 3. refresh only when that selected credential is the expiring stored
+///    session.
 ///
-/// Returns `(token, refreshed_creds)`:
-/// - `token` is the string to attach to the `PlatformClient`;
+/// Returns `(credential, refreshed_creds)`:
+/// - `credential` retains its API-key-versus-bearer wire semantics;
 /// - `refreshed_creds` is `Some(...)` ONLY when this call refreshed (rotating
 ///   the single-use refresh token). The caller MUST use these refreshed creds
 ///   for any later refresh (e.g. the 401-retry) — never the stale startup
 ///   binding — or it will replay a now-REVOKED refresh token and trip the
 ///   server's token-family invalidation (forcing re-login + potentially
 ///   revoking the good tokens just issued).
-async fn resolve_node_token(
+async fn resolve_node_auth(
     paths: &PrismPaths,
     endpoints: &PlatformEndpoints,
-    creds: &StoredCredentials,
-) -> Result<(String, Option<StoredCredentials>)> {
+    creds: Option<&StoredCredentials>,
+    resolved: &PlatformAuth,
+) -> Result<(PlatformAuth, Option<StoredCredentials>)> {
     if let Some(node_token) = paths.load_node_token() {
         tracing::debug!("using durable node token (does not rotate)");
-        return Ok((node_token.key, None));
+        return Ok((PlatformAuth::classify(&node_token.key), None));
     }
-    if let Some(key) = PlatformVar::API_KEY.get() {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return Ok((key, None));
-        }
-    }
-    if let Some(expires_at) = creds.expires_at
+    if let Some(creds) = creds
+        && matches!(resolved, PlatformAuth::Bearer(value) if value == &creds.access_token)
+        && let Some(expires_at) = creds.expires_at
         && chrono::Utc::now() >= expires_at
     {
         tracing::info!("access token expired before node register, refreshing");
         let refreshed = refresh_access_token(paths, endpoints, creds).await?;
         // Thread the rotated creds out so the caller doesn't replay the
         // single-use refresh_token that `refresh_access_token` just consumed.
-        return Ok((refreshed.access_token.clone(), Some(refreshed)));
+        return Ok((
+            PlatformAuth::Bearer(refreshed.access_token.clone()),
+            Some(refreshed),
+        ));
     }
-    Ok((creds.access_token.clone(), None))
+    Ok((resolved.clone(), None))
 }
 
 // Old Ink/TypeScript TUI launcher removed — native Ratatui TUI is in crates/cli/src/tui/
@@ -12268,11 +12463,14 @@ async fn check_ollama_model(model: &str) -> Result<bool> {
     Ok(has_model)
 }
 
-fn print_node_status(caps: &NodeCapabilities, endpoints: &PlatformEndpoints) {
+fn print_node_status(caps: &NodeCapabilities, endpoints: Option<&PlatformEndpoints>) {
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
     println!("Node: {hostname}");
     println!("Visibility: {}", caps.visibility);
-    println!("Platform: {}", endpoints.node_ws);
+    match endpoints {
+        Some(endpoints) => println!("Platform: {}", endpoints.node_ws),
+        None => println!("Platform: not configured (set PRISM_API_URL)"),
+    }
     println!();
 
     println!("Compute:");
@@ -12539,7 +12737,7 @@ async fn handle_run(
     image: &str,
     inputs: &[String],
     backend: &str,
-    platform_url: &str,
+    platform_url: Option<&str>,
     ssh: Option<&str>,
     ssh_key: &str,
     ssh_port: u16,
@@ -12655,18 +12853,14 @@ async fn handle_run(
         match backend {
             "marc27" | "platform" => {
                 // Resolve auth exactly like `prism compute` does: API key first
-                // (MARC27_API_KEY → X-API-Key), else a Bearer session/token. The
+                // (PRISM_API_KEY → X-API-Key), else a Bearer session/token. The
                 // old code read only MARC27_API_TOKEN and sent it as Bearer, which
                 // 401'd for API-key agents.
-                let (resolved_base, platform_auth) = resolve_agent_auth()?;
+                let (resolved_base, platform_auth) = resolve_agent_auth_with_url(platform_url)?;
                 let auth = marc27_auth_from(platform_auth);
-                // Honor an explicit --platform-url override; otherwise use the
-                // agent-resolved base (api.marc27.com/api/v1).
-                let api_base = if platform_url == DEFAULT_RUN_PLATFORM_URL {
-                    resolved_base
-                } else {
-                    platform_url.to_string()
-                };
+                let api_base = platform_url
+                    .map(|url| PlatformEndpoints::from_url(url).api_base)
+                    .unwrap_or(resolved_base);
                 (
                     ComputeRouter::with_marc27_persistent(&api_base, auth, data_dir)?,
                     "marc27",
@@ -13796,6 +13990,7 @@ mod tests {
             access_token: "fresh-untouched".to_string(),
             refresh_token: "unused-in-this-branch".to_string(),
             platform_url: "https://api.marc27.com".to_string(),
+            platform_provider: Some("marc27".to_string()),
             user_id: None,
             display_name: None,
             org_id: None,
@@ -13804,30 +13999,52 @@ mod tests {
             project_name: None,
             expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
         };
-        // env mutation is process-global + unsafe in edition 2024; avoid it.
-        // If MARC27_API_KEY happens to be set in the test env, the function's
-        // API-key branch short-circuits and this contract isn't exercisable —
-        // skip gracefully rather than racing the global env.
-        if PlatformVar::API_KEY.get().is_some() {
-            eprintln!(
-                "skipping resolve_node_token_fresh_creds_returns_no_rotation: \
-                 MARC27_API_KEY is set in the env"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
         let endpoints = PlatformEndpoints {
             api_base: "https://api.marc27.com/api/v1".to_string(),
             node_ws: "wss://api.marc27.com/api/v1/nodes/connect".to_string(),
+            provider: Some("marc27".to_string()),
         };
-        let (token, rotated) = resolve_node_token(&paths, &endpoints, &creds)
+        let selected = PlatformAuth::Bearer(creds.access_token.clone());
+        let (credential, rotated) = resolve_node_auth(&paths, &endpoints, Some(&creds), &selected)
             .await
             .expect("fresh creds resolve without network");
-        assert_eq!(token, "fresh-untouched");
+        assert_eq!(credential, selected);
         assert!(
             rotated.is_none(),
             "non-expired creds must NOT signal a rotation"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn node_register_keeps_the_native_first_typed_credential() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "prism-node-auth-precedence-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let paths = PrismPaths {
+            config_dir: dir.join("cfg"),
+            cache_dir: dir.join("cache"),
+            data_dir: dir.join("data"),
+            state_dir: dir.join("state"),
+        };
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let endpoints = PlatformEndpoints {
+            api_base: "https://provider.example/api/v1".to_string(),
+            node_ws: "wss://provider.example/api/v1/nodes/connect".to_string(),
+            provider: None,
+        };
+        let selected = PlatformAuth::Bearer("native-session".to_string());
+
+        let (credential, rotated) = resolve_node_auth(&paths, &endpoints, None, &selected)
+            .await
+            .expect("typed environment credential resolves without rereading aliases");
+
+        assert_eq!(credential, selected);
+        assert!(rotated.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13924,7 +14141,35 @@ mod tests {
             &prism_core::config::LlmSection::default(),
             None,
         );
-        assert_eq!(key.as_deref(), Some("config-resolved-key"));
+        assert_eq!(key, Some(("config-resolved-key".to_string(), None)));
+    }
+
+    #[test]
+    fn workflow_platform_credential_prefers_every_native_name_over_legacy_aliases() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        boot_checks::clear_platform_env();
+        unsafe {
+            std::env::remove_var("LLM_API_KEY");
+            std::env::set_var("PRISM_TOKEN", "native-session");
+            std::env::set_var("MARC27_API_KEY", "m27_shadowed-key");
+        }
+
+        let resolved = resolve_workflow_llm_api_key_for_target(
+            &crate::chat_config::ChatTarget::Marc27 { model: None },
+            &prism_core::config::LlmSection::default(),
+            Some("stored-session".into()),
+        );
+
+        assert_eq!(
+            resolved,
+            Some((
+                "native-session".to_string(),
+                Some(prism_ingest::llm::LlmCredentialKind::Bearer)
+            ))
+        );
+        boot_checks::clear_platform_env();
     }
 
     #[test]

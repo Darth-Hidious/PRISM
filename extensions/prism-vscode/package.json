@@ -85,10 +85,13 @@
           "default": false,
           "description": "Show the PRISM welcome tab when the window opens."
         },
+        "prism.apiBaseUrl": {
+          "type": "string",
+          "description": "Base URL for the configured provider API. No provider is selected by default."
+        },
         "prism.marc27ApiBaseUrl": {
           "type": "string",
-          "default": "https://api.marc27.com/api/v1",
-          "description": "Base URL for the hosted platform API."
+          "description": "Deprecated alias for prism.apiBaseUrl."
         },
         "prism.maxStreamingBufferChars": {
           "type": "number",

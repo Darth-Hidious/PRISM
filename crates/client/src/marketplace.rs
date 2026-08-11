@@ -19,7 +19,7 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// A resource listing from the MARC27 marketplace.
+/// A resource listing from the configured provider marketplace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketplaceTool {
     pub name: String,
@@ -103,7 +103,7 @@ pub struct MarketplaceFindHit {
     pub score: f32,
 }
 
-/// Client for the MARC27 marketplace endpoints.
+/// Client for provider marketplace endpoints.
 #[derive(Debug)]
 pub struct MarketplaceClient<'a> {
     platform: &'a PlatformClient,

@@ -109,6 +109,25 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("MACE_MCP_ENV_FILE", str(tmp_path / "nonexistent.env"))
     # No real token
     monkeypatch.delenv("HF_TOKEN", raising=False)
+    # Platform identity tests and tool tests must never inherit a developer's
+    # real provider configuration. Individual tests opt in explicitly.
+    for name in (
+        "PRISM_API_KEY",
+        "PRISM_API_URL",
+        "PRISM_PLATFORM_URL",
+        "PRISM_TOKEN",
+        "PRISM_API_TOKEN",
+        "PRISM_PROJECT_ID",
+        "PRISM_PLATFORM_PROVIDER",
+        "MARC27_API_KEY",
+        "MARC27_API_URL",
+        "MARC27_PLATFORM_URL",
+        "MARC27_TOKEN",
+        "MARC27_API_TOKEN",
+        "MARC27_PROJECT_ID",
+        "MARC27_PLATFORM_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
     # Reset the auth module's cache after the env change
     from app.tools.simulation.mace import auth
 
@@ -136,13 +155,16 @@ NOT_CONNECTED = "not connected to the platform"
 
 
 def assert_not_connected(result):
-    """Assert the shared unauthenticated contract: name the cause AND the fix.
+    """Assert the shared disconnected contract: name the cause AND the fix.
 
     One place to update if the message changes again.
     """
     assert "error" in result, f"expected an error dict, got {result!r}"
-    assert NOT_CONNECTED in result["error"], result["error"]
-    assert "prism login" in result["error"], result["error"]
+    if "no platform configured" in result["error"]:
+        assert "PRISM_API_URL" in result["error"], result["error"]
+    else:
+        assert NOT_CONNECTED in result["error"], result["error"]
+        assert "prism login" in result["error"], result["error"]
 
 
 class _StubResponse:
@@ -210,11 +232,13 @@ def _reset_platform_client():
     """`platform()` memoises ONE client per process and resolves credentials
     in its constructor, so a client built under a previous test's environment
     would leak into the next. Reset the singleton around every test."""
-    from app.tools import _platform_client
+    from app.tools import _platform_client, _platform_creds
 
     _platform_client._CLIENT = None
+    _platform_creds._WARNED_ALIASES.clear()
     yield
     _platform_client._CLIENT = None
+    _platform_creds._WARNED_ALIASES.clear()
 
 
 @pytest.fixture

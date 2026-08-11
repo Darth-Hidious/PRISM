@@ -53,6 +53,7 @@ pub async fn run(project_root: PathBuf, python_bin: PathBuf) -> Result<()> {
         // endpoint has no paired key, and a caller-supplied `--llm-url` can
         // therefore never receive a node credential.
         llm_api_key: None,
+        llm_credential_kind: None,
     };
 
     // OPA policy engine for `tools/call` — the same gate the agent loop (h4)

@@ -275,9 +275,12 @@ fi
 # --- Done ---
 echo ""
 echo "  prism            Launch the interactive chat"
-echo "  prism login      Authenticate with MARC27"
+echo "  prism login      Authenticate with your configured platform"
 echo "  prism doctor     Re-check local + platform health"
 echo "  prism --help     See all commands"
+echo ""
+echo "  Hosted use is opt-in: set PRISM_API_URL and PRISM_API_KEY."
+echo "  MARC27_* spellings remain deprecated compatibility aliases."
 echo ""
 
 if ! command -v prism >/dev/null 2>&1; then

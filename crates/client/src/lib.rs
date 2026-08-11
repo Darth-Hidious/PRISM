@@ -1,5 +1,5 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
-//! Typed HTTP client for the MARC27 platform API.
+//! Typed HTTP client for a configured PRISM-compatible provider API.
 //!
 //! Provides [`PlatformClient`] for authenticated REST calls and [`DeviceFlowAuth`]
 //! for GitHub CLI-style device-code OAuth. Also covers marketplace browsing

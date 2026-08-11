@@ -113,7 +113,13 @@ pub fn ensure_fresh_credentials() {
     if !near_expiry {
         return;
     }
-    let endpoints = prism_runtime::PlatformEndpoints::from_env();
+    let Some(endpoints) = prism_runtime::PlatformEndpoints::resolve(None, Some(&creds)) else {
+        tracing::warn!(
+            "credential refresh skipped: {}",
+            prism_runtime::auth::PLATFORM_NOT_CONFIGURED
+        );
+        return;
+    };
     let creds_clone = creds.clone();
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -177,6 +183,14 @@ pub fn spawn_native_session_with(
         base_url: inputs.llm.base_url,
         model: inputs.llm.model,
         api_key: inputs.llm.api_key,
+        credential_kind: inputs.llm.credential_kind.map(|kind| match kind {
+            prism_runtime::llm_resolve::ResolvedCredentialKind::ApiKey => {
+                prism_llm::LlmCredentialKind::ApiKey
+            }
+            prism_runtime::llm_resolve::ResolvedCredentialKind::Bearer => {
+                prism_llm::LlmCredentialKind::Bearer
+            }
+        }),
         embedding_model: inputs.llm.embedding_model,
         context_window: inputs.llm.context_window,
         max_output_tokens: inputs.llm.max_output_tokens,

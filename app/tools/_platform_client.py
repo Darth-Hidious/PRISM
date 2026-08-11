@@ -1,7 +1,7 @@
 # Copyright (c) 2025-2026 Mirdyne. Licensed under MIT License.
 """THE platform HTTP client for PRISM agent tools.
 
-Every tool that talks to api.marc27.com goes through this module — no tool
+Every tool that talks to a configured hosted provider goes through this module — no tool
 hand-rolls ``requests`` + auth headers. That rule exists because the hand-
 rolled copies kept getting auth wrong (``m27_*`` API keys were sent as
 ``Bearer``, which the server rejects; ``X-API-Key`` is required — see
@@ -45,7 +45,7 @@ class PlatformClient:
 
     @property
     def api_url(self) -> str:
-        return self._api_url
+        return self._api_url or ""
 
     def request(
         self,
@@ -62,6 +62,11 @@ class PlatformClient:
             # the network behind the user's back.
             return {
                 "error": "offline mode: platform call blocked by --offline",
+                "path": path,
+            }
+        if not self._api_url:
+            return {
+                "error": "no platform configured — set PRISM_API_URL",
                 "path": path,
             }
         if not self._headers:

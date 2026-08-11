@@ -59,10 +59,16 @@ pub struct ServicesSection {
     pub kafka_uri: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlatformSection {
-    #[serde(default = "default_platform_url")]
-    pub url: String,
+    /// Hosted-provider root or API base. There is no implicit provider:
+    /// absence means this PRISM install is local-only.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional external adapter identity (for example `marc27`). PRISM owns
+    /// authorization; this only selects how a provider's data is translated.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,9 +386,6 @@ fn default_data_dir() -> String {
 fn default_managed() -> String {
     "managed".into()
 }
-fn default_platform_url() -> String {
-    "https://platform.marc27.com".into()
-}
 fn default_discovery() -> Vec<String> {
     vec!["mdns".into(), "platform".into()]
 }
@@ -448,14 +451,6 @@ impl Default for ServicesSection {
         Self {
             mode: default_managed(),
             kafka_uri: None,
-        }
-    }
-}
-
-impl Default for PlatformSection {
-    fn default() -> Self {
-        Self {
-            url: default_platform_url(),
         }
     }
 }
@@ -601,7 +596,8 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.node.port, 7327);
         assert_eq!(config.services.mode, "managed");
-        assert_eq!(config.platform.url, "https://platform.marc27.com");
+        assert_eq!(config.platform.url, None);
+        assert_eq!(config.platform.provider, None);
         assert_eq!(config.ontology.engine, "llm");
         assert_eq!(config.ontology.id, "emmo");
         assert_eq!(config.ontology.llm_provider, "platform");
@@ -636,7 +632,8 @@ port = 8000
         assert_eq!(config.node.port, 8000);
         // Other sections get defaults
         assert_eq!(config.services.mode, "managed");
-        assert_eq!(config.platform.url, "https://platform.marc27.com");
+        assert_eq!(config.platform.url, None);
+        assert_eq!(config.platform.provider, None);
     }
 
     #[test]
@@ -653,6 +650,7 @@ kafka_uri = "kafka://broker.internal:9092"
 
 [platform]
 url = "https://platform.marc27.com"
+provider = "marc27"
 
 [mesh]
 discovery = ["mdns", "platform"]
@@ -701,8 +699,23 @@ api_key_env = "ANTHROPIC_API_KEY"
             config.ontology.mapping_file.as_deref(),
             Some("mappings/materials.yaml")
         );
+        assert_eq!(
+            config.platform.url.as_deref(),
+            Some("https://platform.marc27.com")
+        );
+        assert_eq!(config.platform.provider.as_deref(), Some("marc27"));
         // No `id` in the [ontology] block above → the default ontology.
         assert_eq!(config.ontology.id, "emmo");
+    }
+
+    /// Corporate-separation guard: a fresh PRISM install does not silently
+    /// select another company's service. This fails if any hosted default is
+    /// reintroduced, including under a different hostname.
+    #[test]
+    fn default_platform_is_explicitly_unconfigured() {
+        let config = NodeConfig::default();
+        assert!(config.platform.url.is_none());
+        assert!(config.platform.provider.is_none());
     }
 
     /// The `[ontology] id` knob parses, and its absence means the built-in

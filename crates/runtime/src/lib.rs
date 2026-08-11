@@ -160,10 +160,17 @@ fn migrate_dir(from: &Path, to: &Path) {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct StoredCredentials {
     pub access_token: String,
     pub refresh_token: String,
     pub platform_url: String,
+    /// Adapter that issued these credentials. Old credential files predate
+    /// this field and came exclusively from MARC27, so their missing value is
+    /// migrated to that provider. Newly written provider-neutral credentials
+    /// serialize an explicit `null` and remain provider-neutral on reload.
+    #[serde(default = "legacy_stored_platform_provider")]
+    pub platform_provider: Option<String>,
     pub user_id: Option<String>,
     pub display_name: Option<String>,
     pub org_id: Option<String>,
@@ -179,6 +186,7 @@ impl std::fmt::Debug for StoredCredentials {
             .field("access_token", &"[REDACTED]")
             .field("refresh_token", &"[REDACTED]")
             .field("platform_url", &self.platform_url)
+            .field("platform_provider", &self.platform_provider)
             .field("user_id", &self.user_id)
             .field("display_name", &self.display_name)
             .field("org_id", &self.org_id)
@@ -310,6 +318,7 @@ impl PrismPaths {
             "access_token": creds.access_token,
             "refresh_token": creds.refresh_token,
             "platform_url": creds.platform_url,
+            "platform_provider": creds.platform_provider,
             "user_id": creds.user_id,
             "org_id": creds.org_id,
             "project_id": creds.project_id,
@@ -401,30 +410,204 @@ impl PrismPaths {
 pub struct PlatformEndpoints {
     pub api_base: String,
     pub node_ws: String,
+    /// External adapter identity. `None` is a valid provider-neutral endpoint
+    /// and must never be guessed from a PRISM-native environment variable.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 impl PlatformEndpoints {
-    pub fn from_env() -> Self {
-        let default_root = "https://api.marc27.com".to_string();
-        let root = PlatformVar::PLATFORM_URL
-            .get()
-            .unwrap_or(default_root)
-            .trim_end_matches('/')
-            .to_string();
+    /// Resolve an explicitly configured platform from the environment.
+    ///
+    /// `PRISM_API_URL` is canonical. `PRISM_PLATFORM_URL` remains supported,
+    /// as do both historical `MARC27_*` aliases, but all PRISM-native names
+    /// outrank all provider aliases. There is deliberately no hosted default:
+    /// `None` means this PRISM install is local-only until an operator points
+    /// it at a provider.
+    pub fn from_env() -> Option<Self> {
+        Self::resolve_with_provider(None, None, None)
+    }
 
-        let ws_root = if let Some(rest) = root.strip_prefix("https://") {
+    /// Resolve endpoints from all durable configuration surfaces.
+    ///
+    /// Environment is the explicit process override, then `[platform].url`,
+    /// then the endpoint stored with an existing login. The stored endpoint is
+    /// what preserves already-installed sessions after removing the implicit
+    /// MARC27 default.
+    pub fn resolve(
+        configured_url: Option<&str>,
+        credentials: Option<&StoredCredentials>,
+    ) -> Option<Self> {
+        Self::resolve_with_provider(configured_url, None, credentials)
+    }
+
+    /// Resolve an endpoint together with the adapter that owns its external
+    /// protocol. Endpoint and provider are deliberately separate: PRISM roles
+    /// remain PRISM roles, and a provider merely supplies a mapping adapter.
+    pub fn resolve_with_provider(
+        configured_url: Option<&str>,
+        configured_provider: Option<&str>,
+        credentials: Option<&StoredCredentials>,
+    ) -> Option<Self> {
+        const URL_VARS: [PlatformVar; 2] = [PlatformVar::API_URL, PlatformVar::PLATFORM_URL];
+        const CREDENTIAL_VARS: [PlatformVar; 3] = [
+            PlatformVar::API_KEY,
+            PlatformVar::TOKEN,
+            PlatformVar::API_TOKEN,
+        ];
+
+        let env_url = PlatformVar::get_with_source_preferred_then_alias(&URL_VARS);
+        let env_provider = PlatformVar::PROVIDER.get();
+        let selected_credential =
+            PlatformVar::get_with_source_preferred_then_alias(&CREDENTIAL_VARS);
+
+        let url = env_url
+            .as_ref()
+            .map(|(value, _)| value.as_str())
+            .or_else(|| configured_url.and_then(non_blank_value))
+            .or_else(|| {
+                credentials
+                    .map(|value| value.platform_url.as_str())
+                    .and_then(non_blank_value)
+            });
+
+        let configured_provider = configured_provider.and_then(non_blank_value);
+        let stored_provider = credentials
+            .and_then(|value| value.platform_provider.as_deref())
+            .and_then(non_blank_value);
+        let alias_url_selected = env_url
+            .as_ref()
+            .is_some_and(|(_, source)| source.starts_with("MARC27_"));
+        let alias_credential_selected = selected_credential
+            .as_ref()
+            .is_some_and(|(_, source)| source.starts_with("MARC27_"));
+        let explicit_provider = env_provider
+            .as_deref()
+            .and_then(non_blank_value)
+            .or(configured_provider)
+            .map(normalize_provider);
+        let inferred_provider = if env_url.is_some() {
+            // A PRISM-native URL is provider-neutral. A MARC27-named URL is
+            // explicit legacy adapter evidence. Stored login metadata never
+            // relabels a newer process override.
+            alias_url_selected.then(|| MARC27_PROVIDER.to_string())
+        } else if let Some(configured_url) = configured_url.and_then(non_blank_value) {
+            // Pre-stage config had no provider field. Preserve an explicitly
+            // configured historical host, but do not carry a stored MARC27
+            // identity onto an unrelated configured endpoint.
+            is_marc27_endpoint(configured_url).then(|| MARC27_PROVIDER.to_string())
+        } else if url.is_some() {
+            // The selected URL came from the stored login, so its provider
+            // metadata travels with it.
+            stored_provider.map(normalize_provider)
+        } else if alias_credential_selected {
+            // Key-only legacy installs explicitly selected MARC27 through the
+            // company-scoped credential name.
+            Some(MARC27_PROVIDER.to_string())
+        } else {
+            stored_provider.map(normalize_provider)
+        };
+        let provider = explicit_provider.or(inferred_provider);
+
+        match url {
+            Some(url) => Some(Self::from_url_with_provider(url, provider)),
+            None if provider.as_deref() == Some(MARC27_PROVIDER) => Some(Self::marc27()),
+            None => None,
+        }
+    }
+
+    /// Resolve all configuration plus a durable node credential. A frozen
+    /// `m27_` node key is explicit legacy-provider evidence, so old nodes keep
+    /// connecting without restoring an unconditional global endpoint.
+    pub fn resolve_for_paths(
+        configured_url: Option<&str>,
+        configured_provider: Option<&str>,
+        credentials: Option<&StoredCredentials>,
+        paths: &PrismPaths,
+    ) -> Option<Self> {
+        let endpoints =
+            Self::resolve_with_provider(configured_url, configured_provider, credentials);
+        let has_marc27_node_key = paths
+            .load_node_token()
+            .is_some_and(|token| token.key.starts_with("m27_"));
+        match endpoints {
+            Some(endpoints) => Some(endpoints),
+            None if has_marc27_node_key => Some(Self::marc27()),
+            None => None,
+        }
+    }
+
+    /// Build the API and node-WebSocket endpoints from either a bare platform
+    /// root or a full `/api/v1` API base.
+    pub fn from_url(url: &str) -> Self {
+        Self::from_url_with_provider(url, None)
+    }
+
+    /// Build endpoints while retaining an explicitly selected provider.
+    pub fn from_url_with_provider(url: &str, provider: Option<String>) -> Self {
+        let root = url.trim().trim_end_matches('/');
+        let api_base = if root.ends_with("/api/v1") {
+            root.to_string()
+        } else {
+            format!("{root}/api/v1")
+        };
+
+        let ws_root = if let Some(rest) = api_base.strip_prefix("https://") {
             format!("wss://{rest}")
-        } else if let Some(rest) = root.strip_prefix("http://") {
+        } else if let Some(rest) = api_base.strip_prefix("http://") {
             format!("ws://{rest}")
         } else {
-            root.clone()
+            api_base.clone()
         };
 
         Self {
-            api_base: format!("{root}/api/v1"),
-            node_ws: format!("{ws_root}/api/v1/nodes/connect"),
+            api_base,
+            node_ws: format!("{ws_root}/nodes/connect"),
+            provider,
         }
     }
+
+    /// Compatibility endpoint for an explicitly selected MARC27 provider.
+    /// This is never a default: it is reachable only from provider metadata,
+    /// a selected `MARC27_*` alias, or a frozen `m27_` durable node key.
+    pub fn marc27() -> Self {
+        Self::from_url_with_provider(MARC27_PROVIDER_API_BASE, Some(MARC27_PROVIDER.to_string()))
+    }
+}
+
+/// Stable adapter id used at provider boundaries.
+pub const MARC27_PROVIDER: &str = "marc27";
+/// Endpoint belonging to the optional MARC27 adapter. It is selected only by
+/// explicit legacy/provider evidence; it is not PRISM's default endpoint.
+pub const MARC27_PROVIDER_API_BASE: &str = "https://api.marc27.com/api/v1";
+
+fn legacy_stored_platform_provider() -> Option<String> {
+    Some(MARC27_PROVIDER.to_string())
+}
+
+fn normalize_provider(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn is_marc27_endpoint(value: &str) -> bool {
+    let host = value
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .or_else(|| value.trim().trim_end_matches('/').strip_prefix("http://"))
+        .unwrap_or_default()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    host == "marc27.com" || host.ends_with(".marc27.com")
+}
+
+fn non_blank_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(test)]
@@ -435,13 +618,16 @@ mod tests {
     // `env::set_var` mutates the process-global environment, which is not
     // thread-safe against concurrent env access on any variable. Serialize
     // every env-touching test through this guard.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
+    pub(crate) static ENV_GUARD: Mutex<()> = Mutex::new(());
 
-    /// Clear both spellings so a test starts from a known environment.
+    /// Clear the full platform surface so endpoint tests cannot accidentally
+    /// inherit a credential/provider from the developer's shell.
     fn clear_platform_url() {
         unsafe {
-            env::remove_var("PRISM_PLATFORM_URL");
-            env::remove_var("MARC27_PLATFORM_URL");
+            for var in PlatformVar::ALL {
+                env::remove_var(var.preferred);
+                env::remove_var(var.alias);
+            }
         }
     }
 
@@ -461,7 +647,7 @@ mod tests {
         unsafe {
             env::set_var("MARC27_PLATFORM_URL", "https://legacy.example.test/");
         }
-        let endpoints = PlatformEndpoints::from_env();
+        let endpoints = PlatformEndpoints::from_env().expect("legacy alias should configure it");
         assert_eq!(endpoints.api_base, "https://legacy.example.test/api/v1");
         assert_eq!(
             endpoints.node_ws,
@@ -480,7 +666,7 @@ mod tests {
         unsafe {
             env::set_var("PRISM_PLATFORM_URL", "https://self-hosted.example.test/");
         }
-        let endpoints = PlatformEndpoints::from_env();
+        let endpoints = PlatformEndpoints::from_env().expect("native URL should configure it");
         assert_eq!(
             endpoints.api_base,
             "https://self-hosted.example.test/api/v1"
@@ -504,19 +690,176 @@ mod tests {
             env::set_var("PRISM_PLATFORM_URL", "https://new.example.test/");
             env::set_var("MARC27_PLATFORM_URL", "https://old.example.test/");
         }
-        let endpoints = PlatformEndpoints::from_env();
+        let endpoints = PlatformEndpoints::from_env().expect("native URL should configure it");
         assert_eq!(endpoints.api_base, "https://new.example.test/api/v1");
         clear_platform_url();
     }
 
-    /// With neither name set, the built-in default still applies. Pins the
-    /// fallback the three tests above deliberately avoid touching.
+    /// With no explicit URL there is no provider. This must fail if a future
+    /// change reintroduces any implicit hosted endpoint, MARC27 or otherwise.
     #[test]
-    fn unset_platform_url_falls_back_to_the_builtin_default() {
+    fn unset_platform_url_is_unconfigured() {
         let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         clear_platform_url();
+        assert_eq!(PlatformEndpoints::from_env(), None);
+    }
+
+    /// A provider-neutral key carries no endpoint identity. This is the
+    /// falsifiable guard against silently restoring another company's host.
+    #[test]
+    fn native_key_without_endpoint_or_provider_is_unconfigured() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe { env::set_var("PRISM_API_KEY", "provider-defined-shape") };
         let endpoints = PlatformEndpoints::from_env();
-        assert_eq!(endpoints.api_base, "https://api.marc27.com/api/v1");
+        assert_eq!(endpoints, None);
+        clear_platform_url();
+    }
+
+    /// A historical company-scoped credential explicitly selects the legacy
+    /// adapter. Existing key-only installs keep working, but no unconfigured
+    /// install inherits this endpoint.
+    #[test]
+    fn legacy_key_only_selects_the_optional_marc27_provider() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe { env::set_var("MARC27_API_KEY", "m27_legacy") };
+        let endpoints = PlatformEndpoints::from_env().expect("legacy key selects its provider");
+        assert_eq!(endpoints.api_base, MARC27_PROVIDER_API_BASE);
+        assert_eq!(endpoints.provider.as_deref(), Some(MARC27_PROVIDER));
+        clear_platform_url();
+    }
+
+    #[test]
+    fn native_credential_family_shadows_legacy_api_key_provider_evidence() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("PRISM_TOKEN", "native-session");
+            env::set_var("MARC27_API_KEY", "m27_shadowed");
+        }
+        assert_eq!(PlatformEndpoints::from_env(), None);
+        clear_platform_url();
+    }
+
+    #[test]
+    fn explicit_provider_can_supply_its_known_endpoint() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("PRISM_PLATFORM_PROVIDER", "MARC27");
+            env::set_var("PRISM_API_KEY", "provider-defined-shape");
+        }
+        let endpoints = PlatformEndpoints::from_env().expect("provider is explicit");
+        assert_eq!(endpoints.api_base, MARC27_PROVIDER_API_BASE);
+        assert_eq!(endpoints.provider.as_deref(), Some(MARC27_PROVIDER));
+        clear_platform_url();
+    }
+
+    #[test]
+    fn native_url_never_infers_provider_from_its_hostname() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe { env::set_var("PRISM_API_URL", "https://api.marc27.com") };
+        let endpoints = PlatformEndpoints::from_env().expect("URL is configured");
+        assert_eq!(endpoints.provider, None);
+        clear_platform_url();
+    }
+
+    #[test]
+    fn native_url_does_not_inherit_stale_stored_provider_identity() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("PRISM_API_URL", "https://independent.example");
+            env::set_var("PRISM_API_KEY", "independent-key");
+        }
+        let credentials = StoredCredentials {
+            access_token: "old-session".into(),
+            platform_url: "https://api.marc27.com".into(),
+            platform_provider: Some(MARC27_PROVIDER.into()),
+            ..Default::default()
+        };
+
+        let endpoints = PlatformEndpoints::resolve(None, Some(&credentials)).unwrap();
+        assert_eq!(endpoints.api_base, "https://independent.example/api/v1");
+        assert_eq!(endpoints.provider, None);
+        clear_platform_url();
+    }
+
+    #[test]
+    fn native_url_is_not_relabelled_by_an_old_node_key() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe { env::set_var("PRISM_API_URL", "https://independent.example") };
+        let dir = env::temp_dir().join(format!("prism-provider-source-{}", std::process::id()));
+        let paths = PrismPaths {
+            config_dir: dir.join("config"),
+            cache_dir: dir.join("cache"),
+            data_dir: dir.join("data"),
+            state_dir: dir.join("state"),
+        };
+        paths
+            .save_node_token(&StoredNodeToken {
+                key: "m27_old-node-key".into(),
+                id: "legacy".into(),
+                prefix: "m27_old".into(),
+            })
+            .unwrap();
+
+        let endpoints = PlatformEndpoints::resolve_for_paths(None, None, None, &paths).unwrap();
+        assert_eq!(endpoints.api_base, "https://independent.example/api/v1");
+        assert_eq!(endpoints.provider, None);
+
+        clear_platform_url();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_api_base_is_not_double_suffixed() {
+        let endpoints = PlatformEndpoints::from_url("https://provider.test/api/v1/");
+        assert_eq!(endpoints.api_base, "https://provider.test/api/v1");
+        assert_eq!(
+            endpoints.node_ws,
+            "wss://provider.test/api/v1/nodes/connect"
+        );
+    }
+
+    #[test]
+    fn stored_login_preserves_existing_install_without_a_default() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        let credentials = StoredCredentials {
+            platform_url: "https://existing-provider.test".into(),
+            access_token: "session".into(),
+            ..Default::default()
+        };
+        let endpoints = PlatformEndpoints::resolve(None, Some(&credentials))
+            .expect("stored login endpoint should be retained");
+        assert_eq!(endpoints.api_base, "https://existing-provider.test/api/v1");
+    }
+
+    #[test]
+    fn old_stored_session_migrates_to_its_historical_provider() {
+        let old_json = r#"{
+            "access_token": "session",
+            "refresh_token": "refresh",
+            "platform_url": "https://api.marc27.com"
+        }"#;
+        let credentials: StoredCredentials = serde_json::from_str(old_json).unwrap();
+        assert_eq!(
+            credentials.platform_provider.as_deref(),
+            Some(MARC27_PROVIDER)
+        );
+
+        let new_json = r#"{
+            "access_token": "session",
+            "refresh_token": "refresh",
+            "platform_url": "https://provider.example",
+            "platform_provider": null
+        }"#;
+        let credentials: StoredCredentials = serde_json::from_str(new_json).unwrap();
+        assert_eq!(credentials.platform_provider, None);
     }
 
     // The regression guard for the "re-login every ~24h" dance: a refresh must

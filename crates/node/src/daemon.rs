@@ -167,7 +167,7 @@ struct SignedServiceClaim<'a> {
 
 /// Run the node daemon with reconnection logic.
 pub async fn run_daemon(
-    endpoints: &PlatformEndpoints,
+    endpoints: Option<&PlatformEndpoints>,
     paths: &PrismPaths,
     options: DaemonOptions,
 ) -> Result<()> {
@@ -265,6 +265,8 @@ pub async fn run_daemon(
         let _ = tokio::signal::ctrl_c().await;
         return Ok(());
     }
+
+    let endpoints = endpoints.context(prism_runtime::auth::PLATFORM_NOT_CONFIGURED)?;
 
     let mut delay_secs: u64 = 1;
 
@@ -469,11 +471,34 @@ async fn sync_llm_keys(client: &prism_client::PlatformClient, org_id: &str, stat
     }
 }
 
-/// Sync organisation roles from the platform into the local RBAC database.
+/// Dispatch role synchronization only to an adapter selected by explicit
+/// provider identity. Unknown providers are skipped without fetching roles or
+/// changing any external assignments.
+async fn sync_roles_from_provider(
+    endpoints: &PlatformEndpoints,
+    client: &prism_client::PlatformClient,
+    org_id: &str,
+    rbac_db_path: &Path,
+) {
+    match crate::provider_roles::role_adapter_for(endpoints.provider.as_deref()) {
+        Some(crate::provider_roles::RoleProviderAdapter::Marc27) => {
+            sync_roles_from_marc27(client, org_id, rbac_db_path).await;
+        }
+        None => {
+            tracing::debug!(
+                provider = endpoints.provider.as_deref().unwrap_or("unconfigured"),
+                "role sync skipped: no provider adapter configured"
+            );
+        }
+    }
+}
+
+/// Sync organisation roles from the optional MARC27 provider into PRISM RBAC.
 ///
-/// Fetches member roles from the platform API and writes them to the local
-/// SQLite RBAC engine. Non-fatal — logs warnings on failure.
-async fn sync_roles_from_platform(
+/// The provider adapter maps MARC27's role vocabulary into PRISM roles and
+/// reconciles only assignments whose provenance is MARC27. Non-fatal — logs
+/// warnings on failure.
+async fn sync_roles_from_marc27(
     client: &prism_client::PlatformClient,
     org_id: &str,
     rbac_db_path: &Path,
@@ -481,7 +506,7 @@ async fn sync_roles_from_platform(
     let members = match client.fetch_org_roles(org_id).await {
         Ok(m) => m,
         Err(e) => {
-            tracing::debug!(error = %e, "role sync: platform endpoint unavailable");
+            tracing::debug!(error = %e, provider = crate::provider_roles::MARC27_ROLE_PROVIDER, "role sync: provider endpoint unavailable");
             return;
         }
     };
@@ -494,39 +519,25 @@ async fn sync_roles_from_platform(
         }
     };
 
-    let mut synced = 0u32;
-    for member in &members {
-        let platform_role = match prism_core::rbac::PlatformRole::from_api_str(&member.role) {
-            Some(r) => r,
-            None => {
-                tracing::debug!(user_id = %member.user_id, role = %member.role, "role sync: unknown platform role, skipping");
-                continue;
-            }
-        };
-        let local_role = platform_role.to_local_role();
-        if let Err(e) = engine.assign_role(&member.user_id, local_role) {
-            tracing::warn!(user_id = %member.user_id, error = %e, "role sync: failed to assign role");
-        } else {
-            synced += 1;
+    match crate::provider_roles::reconcile_marc27_roles(&engine, &members) {
+        Ok(result) => {
+            tracing::info!(
+                provider = crate::provider_roles::MARC27_ROLE_PROVIDER,
+                synced = result.synced,
+                revoked = result.revoked,
+                ignored = result.ignored,
+                total = members.len(),
+                "role sync complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                provider = crate::provider_roles::MARC27_ROLE_PROVIDER,
+                error = %e,
+                "role sync: failed to reconcile provider assignments"
+            );
         }
     }
-    // Revoke roles for users no longer on the platform
-    let platform_ids: std::collections::HashSet<&str> =
-        members.iter().map(|m| m.user_id.as_str()).collect();
-    let mut revoked = 0u32;
-    if let Ok(local_users) = engine.list_users() {
-        for (uid, _role) in &local_users {
-            if !platform_ids.contains(uid.as_str()) {
-                if let Err(e) = engine.remove_role(uid) {
-                    tracing::warn!(user_id = %uid, error = %e, "role sync: failed to revoke stale role");
-                } else {
-                    revoked += 1;
-                }
-            }
-        }
-    }
-
-    tracing::info!(synced, revoked, total = members.len(), "role sync complete");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -607,14 +618,14 @@ async fn connect_and_run(
     // REST heartbeat to platform (every 60s, independent of WS heartbeat).
     let mut rest_heartbeat_timer = tokio::time::interval(Duration::from_secs(60));
     rest_heartbeat_timer.tick().await;
-    // Role sync from platform (every 5 min).
+    // Role sync from the optional MARC27 provider (every 5 min).
     let mut role_sync_timer = tokio::time::interval(Duration::from_secs(300));
     role_sync_timer.tick().await;
 
     // Initial sync on startup: roles + LLM keys.
     if let (Some(client), Some(oid)) = (platform_client, rbac_org_id) {
         if let Some(db_path) = rbac_db_path {
-            sync_roles_from_platform(client, oid, db_path).await;
+            sync_roles_from_provider(endpoints, client, oid, db_path).await;
         }
         sync_llm_keys(client, oid, &paths.state_dir).await;
     }
@@ -655,7 +666,7 @@ async fn connect_and_run(
             _ = role_sync_timer.tick() => {
                 if let (Some(client), Some(oid)) = (platform_client, rbac_org_id) {
                     if let Some(db_path) = rbac_db_path {
-                        sync_roles_from_platform(client, oid, db_path).await;
+                        sync_roles_from_provider(endpoints, client, oid, db_path).await;
                     }
                     sync_llm_keys(client, oid, &paths.state_dir).await;
                 }
@@ -2000,22 +2011,22 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
         return Ok(node_token.key);
     }
 
-    // Headless/agent path: a stable `m27_*` API key needs no login and never
-    // expires. The platform's node-WS handshake validates the `?token=` param
-    // as a JWT first, then as an API key, so hand the key straight through —
-    // no cli-state, no refresh, no 24h re-login.
-    if let Some(key) = PlatformVar::API_KEY.get() {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return Ok(key);
-        }
+    // Headless path. Resolve the whole credential family in one pass so every
+    // PRISM-native spelling wins over every deprecated MARC27 alias. The WS
+    // handshake accepts both session tokens and API keys in its token field.
+    if let Some(credential) = PlatformVar::get_preferred_then_alias(&[
+        PlatformVar::API_KEY,
+        PlatformVar::TOKEN,
+        PlatformVar::API_TOKEN,
+    ]) {
+        return Ok(credential);
     }
 
     let state = paths.load_cli_state()?;
     let creds = state
         .credentials
         .as_ref()
-        .context("not logged in — run `prism login`, set MARC27_API_KEY, or `prism node token mint` for a stable node token")?;
+        .context("not logged in — run `prism login`, set PRISM_API_KEY or PRISM_TOKEN, or `prism node token mint` for a stable node token")?;
 
     if let Some(expires_at) = creds.expires_at
         && chrono::Utc::now() >= expires_at
@@ -2219,6 +2230,7 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+            provider: None,
         };
         let creds = StoredCredentials {
             refresh_token: "refresh-secret".to_string(),
@@ -2240,6 +2252,34 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn durable_node_token_has_documented_priority() {
+        let dir = TempDir::new().unwrap();
+        let paths = PrismPaths {
+            config_dir: dir.path().join("config"),
+            cache_dir: dir.path().join("cache"),
+            data_dir: dir.path().join("data"),
+            state_dir: dir.path().join("state"),
+        };
+        paths
+            .save_node_token(&prism_runtime::StoredNodeToken {
+                key: "m27_durable-node".into(),
+                id: "key-id".into(),
+                prefix: "m27_durable".into(),
+            })
+            .unwrap();
+        let endpoints = PlatformEndpoints {
+            api_base: "https://provider.example/api/v1".into(),
+            node_ws: "wss://provider.example/api/v1/nodes/connect".into(),
+            provider: None,
+        };
+
+        assert_eq!(
+            load_access_token(&paths, &endpoints).await.unwrap(),
+            "m27_durable-node"
+        );
+    }
 
     #[test]
     fn strip_paths_for_wire_redacts_dataset_and_model_paths() {

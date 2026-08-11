@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use prism_ingest::llm::ToolDefinition;
+use prism_runtime::platform_env::PlatformVar;
 use prism_workflows::{
     WorkflowExecutionOptions, WorkflowRunResult, WorkflowSpec, discover_workflows, find_workflow,
     parse_workflow_command_args,
@@ -84,6 +85,8 @@ pub struct CommandToolRuntime {
     /// Credential paired with the resolved trusted endpoint. It is never
     /// forwarded when a workflow caller overrides `llm_base_url`.
     pub llm_api_key: Option<String>,
+    /// Explicit wire semantics paired with `llm_api_key`.
+    pub llm_credential_kind: Option<prism_llm::LlmCredentialKind>,
 }
 
 /// Which of a subcommand's OWN flags a free-form-argv tool may hand to clap.
@@ -695,7 +698,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "research",
         aliases: &[],
         kind: CommandToolKind::ResearchQuery,
-        description: "Start the PRISM research loop from a typed request body. This may trigger iterative retrieval and synthesis rather than a single search call. Supports the same platform auth path as `query`: MARC27_API_KEY if present, otherwise the logged-in PRISM session.",
+        description: "Start the PRISM research loop from a typed request body. This may trigger iterative retrieval and synthesis rather than a single search call. Supports the same platform auth path as `query`: PRISM_API_KEY if present, otherwise the logged-in PRISM session.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -4307,13 +4310,15 @@ pub(crate) fn strip_platform_credentials(cmd: &mut TokioCommand) {
     // and write campaign checkpoints where the rest of PRISM expects them.
     // Empty values also stop the CLI's dotenv bootstrap from repopulating a
     // removed credential from a project .env file.
+    // Scrub the canonical PRISM surface and every frozen MARC27 alias. This
+    // is also a regression guard against adding a native credential that can
+    // leak into LocalOnly children while only its legacy spelling is scrubbed.
+    for var in PlatformVar::ALL {
+        cmd.env(var.preferred, "");
+        cmd.env(var.alias, "");
+    }
     for key in [
-        "MARC27_API_KEY",
-        "MARC27_TOKEN",
-        "MARC27_API_TOKEN",
         "PRISM_LOGIN_TOKEN",
-        "MARC27_API_URL",
-        "MARC27_PROJECT_ID",
         // LLM/provider credentials are node-held credentials too. A
         // LocalOnly child may receive a caller-selected endpoint, so none of
         // these process credentials may cross that boundary.
@@ -4588,6 +4593,12 @@ async fn execute_workflow_command(
                     CommandToolPlatformAccess::VerifiedNodeOwner
                 )
                 .then(|| runtime.llm_api_key.clone())
+                .flatten(),
+                trusted_llm_credential_kind: matches!(
+                    platform_access,
+                    CommandToolPlatformAccess::VerifiedNodeOwner
+                )
+                .then_some(runtime.llm_credential_kind)
                 .flatten(),
                 caller_supplied_llm_base_url,
                 trusted_node_port: node_token.as_ref().map(|_| 7327),
@@ -5308,16 +5319,17 @@ mod tests {
         let mut command = TokioCommand::new("sh");
         command
             .arg("-c")
-            .arg("printf '%s|%s|%s' \"$LLM_API_KEY\" \"$MARC27_TOKEN\" \"$OPENAI_API_KEY\"")
+            .arg("printf '%s|%s|%s|%s' \"$LLM_API_KEY\" \"$MARC27_TOKEN\" \"$PRISM_API_KEY\" \"$OPENAI_API_KEY\"")
             .env("LLM_API_KEY", "node-llm-secret")
             .env("MARC27_TOKEN", "node-platform-secret")
+            .env("PRISM_API_KEY", "native-platform-secret")
             .env("OPENAI_API_KEY", "node-provider-secret");
         // This is the same LocalOnly child boundary used for the papers
         // command when its --llm-url comes from the caller.
         strip_platform_credentials(&mut command);
         let output = command.output().await.expect("credential probe child");
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "||");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "|||");
     }
 
     #[cfg(unix)]
@@ -5338,7 +5350,7 @@ if [ -z "$HOME" ] || [ "$HOME" = "/__prism_no_platform_credentials__" ]; then
   echo "real home was not preserved" >&2
   exit 1
 fi
-if [ -n "$MARC27_API_KEY" ] || [ -n "$MARC27_TOKEN" ] || [ -n "$MARC27_API_TOKEN" ] || [ -n "$PRISM_LOGIN_TOKEN" ] || [ -n "$MARC27_API_URL" ] || [ -n "$MARC27_PROJECT_ID" ]; then
+if [ -n "$PRISM_API_KEY" ] || [ -n "$PRISM_TOKEN" ] || [ -n "$PRISM_API_TOKEN" ] || [ -n "$PRISM_API_URL" ] || [ -n "$PRISM_PLATFORM_URL" ] || [ -n "$PRISM_PROJECT_ID" ] || [ -n "$MARC27_API_KEY" ] || [ -n "$MARC27_TOKEN" ] || [ -n "$MARC27_API_TOKEN" ] || [ -n "$PRISM_LOGIN_TOKEN" ] || [ -n "$MARC27_API_URL" ] || [ -n "$MARC27_PLATFORM_URL" ] || [ -n "$MARC27_PROJECT_ID" ]; then
   echo "platform credential inherited" >&2
   exit 1
 fi

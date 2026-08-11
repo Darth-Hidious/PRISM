@@ -13,10 +13,11 @@
 #
 # ── What deliberately does NOT belong here ────────────────────────────
 # WIRE IDENTIFIERS. These are a compatibility surface — shipped clients,
-# existing installs, and on-disk state depend on their exact spelling, so
-# they are FROZEN and stay hardcoded on purpose:
+# existing installs, and on-disk state depend on their exact spelling. PRISM
+# now has canonical PRISM_* environment names; the historical provider names
+# below are FROZEN DEPRECATED ALIASES and stay hardcoded on purpose:
 #
-#   • env vars       MARC27_API_KEY, MARC27_TOKEN, MARC27_API_URL,
+#   • env aliases    MARC27_API_KEY, MARC27_TOKEN, MARC27_API_URL,
 #                    MARC27_PLATFORM_URL, MARC27_PROJECT_ID
 #   • API key prefix `m27_` (the platform routes it to X-API-Key by shape)
 #   • config values  `[chat] mode = "marc27"`, `[indexer] mode = "marc27"`,

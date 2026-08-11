@@ -1,8 +1,8 @@
-//! MARC27 Knowledge Service API client.
+//! Provider knowledge-service API client.
 //!
 //! Mirrors the Python SDK's `client.knowledge.*` namespace, giving Rust code
 //! access to the 200K+ node materials science knowledge graph on
-//! platform.marc27.com.
+//! the configured provider.
 //!
 //! # Endpoints
 //!
@@ -93,7 +93,7 @@ pub struct IngestJobResult {
     pub status: String,
 }
 
-/// Client for the MARC27 Knowledge Service API.
+/// Client for the configured provider's knowledge-service API.
 ///
 /// Wraps `PlatformClient` and adds knowledge-specific methods matching
 /// the Python SDK's `client.knowledge.*` namespace.

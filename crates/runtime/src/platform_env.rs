@@ -2,10 +2,10 @@
 
 //! Provider-neutral names for the hosted-platform environment.
 //!
-//! PRISM is a Mirdyne product. The hosted platform it talks to by default is
-//! operated by MARC27, but that is a *service relationship*, not a property of
-//! the product: PRISM may point at an alternative provider, a corporate
-//! gateway, or a self-hosted backend. `crates/core/providers.toml` already
+//! PRISM is a Mirdyne product. It may be pointed at an independent provider, a
+//! corporate gateway, or a self-hosted backend. MARC27 is one compatible
+//! provider, not an implicit service or part of PRISM's identity.
+//! `crates/core/providers.toml` already
 //! makes that true for LLM routing, where the hosted platform is one row in
 //! the same table as everyone else. This module does the same job for the
 //! platform surface — endpoints, credentials, project scope.
@@ -30,12 +30,14 @@
 //! ## Blank is not set
 //!
 //! A variable set to `""` or to whitespace is treated as absent, and falls
-//! through to the alias and then to the default. Empty env vars are a common
+//! through to the alias. Empty env vars are a common
 //! artifact of shell scripts and CI templates (`FOO=$BAR` with `BAR` unset),
 //! and treating one as a real value produces a request to the empty string —
 //! a failure whose message points nowhere near the cause.
 
+use std::collections::HashSet;
 use std::env;
+use std::sync::{Mutex, OnceLock};
 
 /// One platform setting, addressable under a neutral name with the historical
 /// company-scoped name kept as a permanent alias.
@@ -78,25 +80,84 @@ impl PlatformVar {
         preferred: "PRISM_PROJECT_ID",
         alias: "MARC27_PROJECT_ID",
     };
+    /// External platform adapter identity. `marc27` selects the optional
+    /// MARC27 provider; an unknown value is retained for future adapters.
+    pub const PROVIDER: Self = Self {
+        preferred: "PRISM_PLATFORM_PROVIDER",
+        alias: "MARC27_PLATFORM_PROVIDER",
+    };
 
     /// Every platform variable, for diagnostics (`prism doctor`) and for the
     /// test that pins the alias table against drift.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::PLATFORM_URL,
         Self::API_URL,
         Self::API_KEY,
         Self::TOKEN,
         Self::API_TOKEN,
         Self::PROJECT_ID,
+        Self::PROVIDER,
     ];
 
     /// Resolve this setting: preferred name first, then the historical alias.
     ///
     /// A variable that is unset, empty, or whitespace-only is treated as
     /// absent. Returns `None` when neither name carries a usable value, so the
-    /// caller keeps its own default and its own error message.
+    /// caller can report that no platform is configured.
     pub fn get(&self) -> Option<String> {
-        non_blank(self.preferred).or_else(|| non_blank(self.alias))
+        if let Some(value) = non_blank(self.preferred) {
+            return Some(value);
+        }
+        let value = non_blank(self.alias)?;
+        warn_deprecated_alias_once(*self);
+        Some(value)
+    }
+
+    /// Resolve a family of equivalent settings with every PRISM-native name
+    /// ahead of every historical provider alias.
+    ///
+    /// This is intentionally different from calling [`Self::get`] in a loop:
+    /// doing that for `API_URL` and then `PLATFORM_URL` would let
+    /// `MARC27_API_URL` beat `PRISM_PLATFORM_URL`. The corporate-separation
+    /// contract is stronger: a PRISM-native spelling always wins.
+    pub fn get_preferred_then_alias(vars: &[Self]) -> Option<String> {
+        Self::get_with_source_preferred_then_alias(vars).map(|(value, _)| value)
+    }
+
+    /// Resolve a family and retain the exact environment variable that won.
+    ///
+    /// Keeping the source beside the value is important during the provider
+    /// migration: a selected `MARC27_*` credential is explicit evidence that
+    /// the operator chose the MARC27 adapter, while a shadowed alias is not.
+    pub fn get_with_source_preferred_then_alias(vars: &[Self]) -> Option<(String, &'static str)> {
+        for var in vars {
+            if let Some(value) = non_blank(var.preferred) {
+                return Some((value, var.preferred));
+            }
+        }
+        for var in vars {
+            if let Some(value) = non_blank(var.alias) {
+                warn_deprecated_alias_once(*var);
+                return Some((value, var.alias));
+            }
+        }
+        None
+    }
+
+    /// Name that would supply a family lookup, using the same precedence as
+    /// [`Self::get_preferred_then_alias`] but without emitting a notice.
+    pub fn source_preferred_then_alias(vars: &[Self]) -> Option<&'static str> {
+        for var in vars {
+            if non_blank(var.preferred).is_some() {
+                return Some(var.preferred);
+            }
+        }
+        for var in vars {
+            if non_blank(var.alias).is_some() {
+                return Some(var.alias);
+            }
+        }
+        None
     }
 
     /// Which name supplied the value, for diagnostics. `None` when unset.
@@ -129,10 +190,32 @@ fn non_blank(name: &str) -> Option<String> {
     }
 }
 
+/// Emit one process-wide migration notice for a historical provider alias.
+///
+/// This deliberately writes to stderr instead of tracing: CLI JSON and
+/// protocol stdout remain clean, while an operator sees the notice even when
+/// no tracing filter is configured. The set is keyed by the alias, so repeated
+/// resolution through status, boot checks and a command handler still says it
+/// exactly once.
+fn warn_deprecated_alias_once(var: PlatformVar) {
+    static WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let should_warn = warned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(var.alias);
+    if should_warn {
+        eprintln!(
+            "warning: {} is deprecated; use {} instead.",
+            var.alias, var.preferred
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
     /// Env is process-global; these tests mutate it. Serialize them.
     ///
@@ -140,9 +223,9 @@ mod tests {
     /// convert every later test in this module into a spurious failure that
     /// masks the real one.
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let m = LOCK.get_or_init(|| Mutex::new(()));
-        m.lock().unwrap_or_else(|p| p.into_inner())
+        crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Clear both names so a test starts from a known state.
@@ -193,6 +276,46 @@ mod tests {
         assert_eq!(v.get().as_deref(), Some("new"));
         assert_eq!(v.source(), Some(v.preferred));
         clear(v);
+    }
+
+    #[test]
+    fn prism_api_key_wins_over_marc27_api_key() {
+        let _g = env_lock();
+        let v = PlatformVar::API_KEY;
+        clear(v);
+        unsafe {
+            env::set_var(v.preferred, "prism-native-key");
+            env::set_var(v.alias, "m27_legacy-key");
+        }
+        assert_eq!(v.get().as_deref(), Some("prism-native-key"));
+        assert_eq!(v.source(), Some("PRISM_API_KEY"));
+        clear(v);
+    }
+
+    #[test]
+    fn every_native_url_name_precedes_every_provider_alias() {
+        let _g = env_lock();
+        for var in [PlatformVar::API_URL, PlatformVar::PLATFORM_URL] {
+            clear(var);
+        }
+        unsafe {
+            env::set_var(PlatformVar::API_URL.alias, "https://provider-alias.test");
+            env::set_var(
+                PlatformVar::PLATFORM_URL.preferred,
+                "https://prism-native.test",
+            );
+        }
+        assert_eq!(
+            PlatformVar::get_preferred_then_alias(&[
+                PlatformVar::API_URL,
+                PlatformVar::PLATFORM_URL,
+            ])
+            .as_deref(),
+            Some("https://prism-native.test")
+        );
+        for var in [PlatformVar::API_URL, PlatformVar::PLATFORM_URL] {
+            clear(var);
+        }
     }
 
     /// `FOO=$BAR` with `BAR` unset is a blank, not a value. Falling through to

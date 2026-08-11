@@ -12,8 +12,8 @@ calphad_compute split:
   - `platform_jobs_submit` — submit a new job. MONEY-SPENDING.
                              requires_approval=True.
 
-Auth path mirrors `app/tools/platform_status.py` exactly: `MARC27_API_KEY`
-env var with `~/.prism/credentials.json` access_token fallback.
+Auth path mirrors `app/tools/platform_status.py` exactly: `PRISM_API_KEY`
+(or its deprecated provider alias) with a stored access-token fallback.
 
 Endpoint coverage:
   - POST /jobs                  → platform_jobs_submit
@@ -31,7 +31,7 @@ from typing import Any, Optional
 import requests
 
 from app.tools._platform_client import platform
-from app.tools._platform_creds import resolve_platform_auth
+from app.tools._platform_creds import resolve_credentials, resolve_platform_auth
 
 from app.tools.base import Tool, ToolRegistry
 
@@ -41,27 +41,9 @@ from app.tools.base import Tool, ToolRegistry
 # here so each tool module can evolve its own auth handling later if needed).
 # ---------------------------------------------------------------------------
 
-def _resolve_credentials() -> tuple[str, str]:
-    """Return (api_url, access_token) from env or `~/.prism/credentials.json`."""
-    api_url = os.environ.get(
-        "MARC27_API_URL", "https://api.marc27.com/api/v1"
-    ).rstrip("/")
-    api_key = os.environ.get("MARC27_API_KEY", "")
-
-    if not api_key:
-        try:
-            creds_path = Path.home() / ".prism" / "credentials.json"
-            if creds_path.exists():
-                creds = json.loads(creds_path.read_text())
-                api_key = creds.get("access_token", "")
-                if creds.get("platform_url"):
-                    api_url = creds["platform_url"].rstrip("/")
-                    if not api_url.endswith("/api/v1"):
-                        api_url = api_url + "/api/v1"
-        except Exception:
-            pass
-
-    return api_url, api_key
+def _resolve_credentials():
+    """Compatibility wrapper around PRISM's shared credential resolver."""
+    return resolve_credentials()
 
 
 def _get(path: str) -> dict:
@@ -81,6 +63,11 @@ def _get_sse(path: str, max_events: int = 10, read_timeout: int = 30) -> dict:
     at N events or `read_timeout` seconds, whichever comes first.
     """
     api_url, auth_headers = resolve_platform_auth()
+    if not api_url:
+        return {
+            "error": "No platform configured.",
+            "hint": "Set PRISM_API_URL, then retry.",
+        }
     if not auth_headers:
         return {
             "error": "Not authenticated to the platform.",

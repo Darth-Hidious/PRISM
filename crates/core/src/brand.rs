@@ -11,14 +11,14 @@
 //!
 //! ## What this module deliberately does NOT cover
 //!
-//! **Wire identifiers are frozen.** Env vars (`MARC27_API_KEY`,
-//! `MARC27_TOKEN`, `MARC27_API_URL`, `MARC27_PROJECT_ID`), the `m27_` API
-//! key prefix, serialized config values (`mode = "marc27"`), CLI value
-//! tokens (`prism use marc27`, `--backend marc27`), and on-disk paths are
-//! a compatibility surface: shipped clients and existing installs depend
-//! on their exact spelling. Routing them through this module would turn a
-//! cosmetic rename into a breaking change. They stay hardcoded ON PURPOSE
-//! — see the note in `brand.toml`.
+//! **Wire identifiers are compatibility surfaces.** PRISM-native environment
+//! variables (`PRISM_API_KEY`, `PRISM_API_URL`, and their peers) are canonical.
+//! The historical `MARC27_*` spellings and `m27_` key prefix remain frozen as
+//! deprecated aliases because shipped clients and existing installs depend on
+//! them. Serialized config values (`mode = "marc27"`), CLI value tokens
+//! (`prism use marc27`, `--backend marc27`), and on-disk paths likewise stay
+//! stable. Routing any of these through display branding would turn a
+//! migration into a breaking cosmetic rename — see `brand.toml`.
 //!
 //! Internal symbols (crate names, struct names, module paths) are likewise
 //! out of scope: churning them inflates diffs for no user benefit.

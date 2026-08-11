@@ -19,12 +19,13 @@ arguments:
     help: Compute target, for example runpod:A100 or prism-node:local.
   - name: project_id
     type: string
-    env: MARC27_PROJECT_ID
-    help: MARC27 project id.
+    env: PRISM_PROJECT_ID
+    help: Project id at the configured provider.
   - name: platform_api_base
     type: string
-    default: https://api.marc27.com/api/v1
-    help: Base MARC27 API URL.
+    required: true
+    env: PRISM_API_URL
+    help: Base API URL for the configured provider. Set PRISM_API_URL.
 steps:
   - id: forge_request
     action: set
@@ -46,4 +47,3 @@ steps:
   - id: dispatch_preview
     action: message
     text: "Next execution step should dispatch a compute job for {{target}} under project {{project_id}}."
-

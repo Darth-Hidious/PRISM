@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use prism_client::PlatformError;
-use prism_runtime::auth::PlatformAuth;
+use prism_runtime::auth::{PlatformAuth, resolve_environment_credential};
 use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, StoredCredentials};
 
@@ -28,6 +28,7 @@ use crate::boot;
 /// perfectly on every request path but reported "not configured" at boot and
 /// never ran the marketplace tool sync — the neutral name worked everywhere
 /// except the one check that decides whether the platform exists.
+#[cfg(test)]
 const PLATFORM_TOKEN_VARS: [PlatformVar; 3] = [
     PlatformVar::API_KEY,
     PlatformVar::TOKEN,
@@ -74,7 +75,12 @@ pub fn platform_configured(creds: Option<&StoredCredentials>) -> bool {
     // absent, which is the same rule `blank_env_key_is_not_a_credential`
     // pins below — so the explicit trim check the old list needed is gone,
     // not lost.
-    PLATFORM_TOKEN_VARS.iter().any(|var| var.get().is_some())
+    PlatformVar::get_preferred_then_alias(&[
+        PlatformVar::API_KEY,
+        PlatformVar::TOKEN,
+        PlatformVar::API_TOKEN,
+    ])
+    .is_some()
 }
 
 /// Run the boot checks.
@@ -84,7 +90,7 @@ pub fn platform_configured(creds: Option<&StoredCredentials>) -> bool {
 /// 5s; failures are reported as `[--]` so the boot screen never hangs.
 pub async fn run_boot_checks(
     creds: Option<&StoredCredentials>,
-    endpoints: &PlatformEndpoints,
+    endpoints: Option<&PlatformEndpoints>,
 ) -> Vec<boot::BootCheck> {
     // Hard offline mode is a policy about the process, not about one command.
     // `Commands::Tui` skipped the boot checks itself (main.rs), but `Setup` and
@@ -100,9 +106,49 @@ pub async fn run_boot_checks(
     if prism_runtime::offline::enabled() {
         return offline_checks().await;
     }
-    let configured = platform_configured(creds);
     let credential = boot_credential(creds);
-    run_boot_checks_with(creds, endpoints, configured, credential).await
+    let Some(endpoints) = endpoints else {
+        return endpoint_not_configured_checks(!matches!(credential, BootCredential::Absent)).await;
+    };
+    run_boot_checks_with(creds, endpoints, true, credential).await
+}
+
+/// Boot checks with a durable node key included in the same precedence as the
+/// production resolver. Used by `doctor`, which already has the resolved
+/// [`PrismPaths`] and must not describe a working legacy node as local-only.
+pub async fn run_boot_checks_with_node_token(
+    creds: Option<&StoredCredentials>,
+    endpoints: Option<&PlatformEndpoints>,
+    node_token: Option<&str>,
+) -> Vec<boot::BootCheck> {
+    if prism_runtime::offline::enabled() {
+        return offline_checks().await;
+    }
+    let credential = boot_credential_with_node_token(creds, node_token);
+    let Some(endpoints) = endpoints else {
+        return endpoint_not_configured_checks(!matches!(credential, BootCredential::Absent)).await;
+    };
+    run_boot_checks_with(creds, endpoints, true, credential).await
+}
+
+async fn endpoint_not_configured_checks(credential_present: bool) -> Vec<boot::BootCheck> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    let mut checks = vec![boot::BootCheck {
+        name: "Platform".into(),
+        result: if credential_present {
+            "credential present, but no endpoint configured — set PRISM_API_URL".into()
+        } else {
+            "not configured — running local-only; set PRISM_API_URL to connect".into()
+        },
+        ok: !credential_present,
+        dots: 8,
+        delay_ms: 30,
+    }];
+    push_local_checks(&client, &mut checks).await;
+    checks
 }
 
 /// The check set for hard offline mode: local only, and it says why.
@@ -125,15 +171,11 @@ async fn offline_checks() -> Vec<boot::BootCheck> {
 
 /// What the boot checks have to present as a credential.
 ///
-/// Three outcomes, not two: a malformed credential is NOT the same as no
-/// credential, and collapsing them is what produced the defect this type
-/// exists to prevent.
+/// The credential is either ready for the configured provider or absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootCredential {
     /// Usable. Attach it and run the checks.
     Ready(PlatformAuth),
-    /// Supplied but unusable, with the reason stated for the reader.
-    Rejected(String),
     /// Nothing configured.
     Absent,
 }
@@ -141,7 +183,7 @@ pub(crate) enum BootCredential {
 /// The credential the boot checks should present, in the same precedence the
 /// real resolver uses (`auth::resolve_platform_auth:164-196`):
 ///
-///   1. `*_API_KEY`   (validated: must carry the frozen `m27_` prefix)
+///   1. `*_API_KEY`   (provider-neutral key, sent as `X-API-Key`)
 ///   2. `*_TOKEN` / `*_API_TOKEN`
 ///   3. the stored session
 ///
@@ -161,34 +203,22 @@ pub(crate) enum BootCredential {
 /// fine; we simply never sent a credential. That is a lying check, and it hit
 /// exactly the headless/agent install this module documents as supported.
 ///
-/// The API-key branch mirrors `resolve_platform_auth`'s REJECTION of a key
-/// without the frozen `m27_` prefix (auth.rs:165-170). An earlier version of
-/// this function called `PlatformAuth::classify` here and carried a comment
-/// claiming that was "the same rule the resolver applies". It was not: the
-/// resolver rejects, `classify` merely picks a header. A typo'd
-/// `PRISM_API_KEY=badkey` therefore went out as `Bearer badkey`, earned a 401,
-/// and the row read "<host> unreachable" — the very lying check this module
-/// had just been fixed to stop emitting, reappearing one layer down.
 fn boot_credential(creds: Option<&StoredCredentials>) -> BootCredential {
-    // An API key is a distinct wire shape (`X-API-Key`) AND a validated one.
-    if let Some(key) = PlatformVar::API_KEY.get() {
-        if !key.starts_with("m27_") {
-            let name = PlatformVar::API_KEY.source().unwrap_or("the API key");
-            // Names the condition; never sends the reader out to a command.
-            // Guarded repo-wide by crates/server/tests/no_exit_to_cli.rs.
-            return BootCredential::Rejected(format!(
-                "{name} is not a platform key — keys carry the m27_ prefix"
-            ));
-        }
-        return BootCredential::Ready(PlatformAuth::ApiKey(key));
+    boot_credential_with_node_token(creds, None)
+}
+
+fn boot_credential_with_node_token(
+    creds: Option<&StoredCredentials>,
+    node_token: Option<&str>,
+) -> BootCredential {
+    // PRISM defines the API-key variable's wire shape. Providers define their
+    // own key contents; the frozen `m27_` prefix remains accepted but is not a
+    // requirement for an independent provider.
+    if let Some(credential) = resolve_environment_credential() {
+        return BootCredential::Ready(credential);
     }
-    // The token vars are unvalidated by the resolver too: either shape is
-    // legitimate there, so classify rather than reject.
-    if let Some(value) = PlatformVar::TOKEN
-        .get()
-        .or_else(|| PlatformVar::API_TOKEN.get())
-    {
-        return BootCredential::Ready(PlatformAuth::classify(&value));
+    if let Some(value) = node_token.map(str::trim).filter(|value| !value.is_empty()) {
+        return BootCredential::Ready(PlatformAuth::classify(value));
     }
     // The stored session is LAST, matching the resolver.
     creds
@@ -261,18 +291,14 @@ async fn run_boot_checks_with(
     // 1. Platform connection — use /agent/capabilities (always 200 with auth)
     let credential = match credential {
         BootCredential::Ready(credential) => credential,
-        // Both remaining arms state the real condition rather than firing an
+        // The absent arm states the real condition rather than firing an
         // unauthenticated request and blaming the host for the resulting 401.
         // A malformed credential names ITS OWN defect: "unreachable" would
         // send the reader to look at the network, which is not the problem.
-        other => {
-            let result = match other {
-                BootCredential::Rejected(why) => why,
-                _ => "configured, but no usable credential — checks skipped".to_string(),
-            };
+        BootCredential::Absent => {
             checks.push(boot::BootCheck {
                 name: "Platform".into(),
-                result,
+                result: "configured, but no usable credential — checks skipped".into(),
                 ok: false,
                 dots: 8,
                 delay_ms: 30,
@@ -602,6 +628,7 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+            provider: None,
         };
         let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
         unsafe { std::env::remove_var("PRISM_PROJECT_ID") };
@@ -654,53 +681,18 @@ mod tests {
         assert_eq!(boot_project_id(None), None);
     }
 
-    /// A malformed API key must name ITS OWN defect, not blame the host.
-    ///
-    /// `resolve_platform_auth` rejects a key without the frozen `m27_` prefix
-    /// (auth.rs:165-170). Before this, `boot_credential` classified it instead
-    /// — a typo went out as `Bearer badkey`, 401'd, and the row read
-    /// "<host> unreachable", pointing the reader at the network when the
-    /// problem was the value they pasted.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn a_malformed_api_key_names_itself_instead_of_blaming_the_host() {
+    /// Provider-defined API key shapes remain valid under the PRISM-native
+    /// variable; MARC27's frozen `m27_` prefix is compatibility, not identity.
+    #[test]
+    fn provider_neutral_api_key_shape_is_accepted() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_platform_env();
-        unsafe { std::env::set_var("PRISM_API_KEY", "badkey") };
-
-        let rejected = boot_credential(None);
-        assert!(
-            matches!(rejected, BootCredential::Rejected(_)),
-            "a non-m27_ key is not usable: {rejected:?}"
+        unsafe { std::env::set_var("PRISM_API_KEY", "provider-defined-key") };
+        assert_eq!(
+            boot_credential(None),
+            BootCredential::Ready(PlatformAuth::ApiKey("provider-defined-key".into()))
         );
-        let BootCredential::Rejected(why) = rejected else {
-            unreachable!()
-        };
-        assert!(
-            why.contains("PRISM_API_KEY"),
-            "must name the variable: {why}"
-        );
-        assert!(why.contains("m27_"), "must name the rule: {why}");
-
-        // And it must reach the boot screen as that reason, not "unreachable".
-        let endpoints = PlatformEndpoints {
-            api_base: "http://127.0.0.1:1/api/v1".to_string(),
-            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
-        };
-        let checks = run_boot_checks_with(None, &endpoints, true, boot_credential(None)).await;
         clear_platform_env();
-        let platform = checks.iter().find(|c| c.name == "Platform").unwrap();
-        assert!(platform.result.contains("m27_"), "{}", platform.result);
-        assert!(
-            !platform.result.contains("unreachable"),
-            "never blame the host for a malformed credential: {}",
-            platform.result
-        );
-        // The contradictory green Auth row must not appear either.
-        assert!(
-            !checks.iter().any(|c| c.name == "Auth"),
-            "no green Auth row beside a rejected credential"
-        );
     }
 
     /// Hard offline mode must skip every platform check, from ANY command.
@@ -722,8 +714,9 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+            provider: None,
         };
-        let checks = run_boot_checks(None, &endpoints).await;
+        let checks = run_boot_checks(None, Some(&endpoints)).await;
         unsafe { std::env::remove_var(prism_runtime::offline::ENV) };
         clear_platform_env();
 
@@ -761,6 +754,7 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+            provider: None,
         };
         let checks = run_boot_checks_with(None, &endpoints, true, BootCredential::Absent).await;
         let platform = checks
@@ -898,6 +892,7 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "https://platform.invalid/api/v1".to_string(),
             node_ws: "wss://platform.invalid/api/v1/nodes/connect".to_string(),
+            provider: None,
         };
         let checks = run_boot_checks_with(None, &endpoints, false, BootCredential::Absent).await;
 
@@ -924,6 +919,7 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+            provider: None,
         };
         let checks = run_boot_checks_with(
             None,
