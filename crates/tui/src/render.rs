@@ -7,6 +7,7 @@
 use crate::app::{
     App, Focus, LineKind, Modal, ObjectStatus, Role, WorkspaceTab, evidence_token, first_line,
 };
+use crate::artifact::{ArtifactPromotion, ArtifactStoreState, format_bytes};
 use crate::command;
 use crate::gh;
 use crate::keymap;
@@ -19,6 +20,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, Wrap};
+use unicode_truncate::UnicodeTruncateStr;
+use unicode_width::UnicodeWidthStr;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let t = app.theme();
@@ -555,8 +558,8 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
 //
 // The right-hand panel. Derived purely from the message stream so the
 // render stays a pure function of App state: tool executions, the
-// activity feed, and touched files are all reconstructed from
-// `app.messages`.
+// activity feed, and touched files are reconstructed from `app.messages`;
+// artifact state arrives through the same typed backend event stream.
 
 #[derive(Clone, Copy, PartialEq)]
 enum ToolStatus {
@@ -609,6 +612,10 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, w),
         WorkspaceTab::Files => build_files_lines(app, t, &mut lines, w),
         WorkspaceTab::Objects => build_objects_lines(app, t, &mut lines, w),
+        WorkspaceTab::Artifacts => {
+            let available = usize::from(inner.height).saturating_sub(lines.len());
+            build_artifact_lines(app, t, &mut lines, w, available);
+        }
     }
 
     let para = Paragraph::new(lines)
@@ -618,27 +625,29 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> Line<'static> {
-    // Four full labels are 31 columns. The sidebar is narrower than that on a
+    // Full labels exceed a narrow sidebar. The sidebar is narrower on a
     // small terminal, and the paragraph wraps — "Objects" dropped onto its own
     // line, ate a row of the panel and shoved every entry down (caught at
     // 40x12). Abbreviate instead of wrapping: a cramped strip is legible, a
     // wrapped one silently costs a row of content.
-    const FULL: [(WorkspaceTab, &str); 4] = [
+    const FULL: [(WorkspaceTab, &str); 5] = [
         (WorkspaceTab::Activity, "Activity"),
         (WorkspaceTab::Tools, "Tools"),
         (WorkspaceTab::Files, "Files"),
         (WorkspaceTab::Objects, "Objects"),
+        (WorkspaceTab::Artifacts, "Artifacts"),
     ];
-    const SHORT: [(WorkspaceTab, &str); 4] = [
+    const SHORT: [(WorkspaceTab, &str); 5] = [
         (WorkspaceTab::Activity, "Act"),
         (WorkspaceTab::Tools, "Too"),
         (WorkspaceTab::Files, "Fil"),
         (WorkspaceTab::Objects, "Obj"),
+        (WorkspaceTab::Artifacts, "Art"),
     ];
     // Rendered width: a leading space, a space between each, and the active
     // label gains two brackets.
-    let width_of = |set: &[(WorkspaceTab, &str); 4]| -> usize {
-        1 + set.iter().map(|(_, l)| l.len()).sum::<usize>() + (set.len() - 1) + 2
+    let width_of = |set: &[(WorkspaceTab, &str)]| -> usize {
+        1 + set.iter().map(|(_, label)| label.width()).sum::<usize>() + (set.len() - 1) + 2
     };
     let tabs = if width_of(&FULL) <= w { FULL } else { SHORT };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
@@ -717,11 +726,19 @@ fn workspace_stats_line(app: &App, t: Theme) -> Option<Line<'static>> {
 }
 
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if s.width() <= max {
         return s.to_string();
     }
-    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    if max == 0 {
+        return String::new();
+    }
+    let (head, _) = s.unicode_truncate(max.saturating_sub(1));
     format!("{head}…")
+}
+
+fn pad_right_display(s: &str, minimum_columns: usize) -> String {
+    let padding = minimum_columns.saturating_sub(s.width());
+    format!("{s}{}", " ".repeat(padding))
 }
 
 /// Reconstruct the list of tool executions from the message stream.
@@ -876,7 +893,7 @@ fn build_activity_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: 
         };
         let n = i + 1;
         let lead = format!("{prefix}{n}. {} ", it.kind);
-        let budget = w.saturating_sub(lead.chars().count() + 2).max(3);
+        let budget = w.saturating_sub(lead.width() + 2).max(3);
         let label = clip(&it.label, budget);
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
@@ -971,12 +988,9 @@ fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: u
             Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
             Span::styled(format!("{glyph} "), Style::default().fg(t.dim)),
             Span::styled(
-                // `{:<6}` PADS to six but never truncates. Every variant used
-                // to be a short static string so that was fine; `Other` now
-                // carries an arbitrary backend name, and a long one would run
-                // over the label and shove the tag marker off the row — the
-                // same overflow class as the tab strip in 88b96329. Clip first.
-                format!("{:<6} ", clip(obj.kind.as_str(), 10)),
+                // Unknown kinds can be wide Unicode. Preserve the existing
+                // ten-column cap, then pad short names in display columns.
+                format!("{} ", pad_right_display(&clip(obj.kind.as_str(), 10), 6)),
                 Style::default().fg(t.muted),
             ),
             Span::styled(label, Style::default().fg(t.text)),
@@ -1005,6 +1019,157 @@ fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: u
                     Style::default().fg(t.warn),
                 )));
             }
+        }
+    }
+}
+
+fn build_artifact_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    w: usize,
+    available_lines: usize,
+) {
+    let artifacts = match &app.artifact_store {
+        ArtifactStoreState::Loading => {
+            lines.push(Line::from(Span::styled(
+                "  Loading artifacts…",
+                Style::default().fg(t.warn),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Artifact data is not ready yet.",
+                Style::default().fg(t.dim),
+            )));
+            return;
+        }
+        ArtifactStoreState::Unavailable(reason) => {
+            lines.push(Line::from(Span::styled(
+                "  Artifact store unavailable",
+                Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", clip(reason, w.saturating_sub(2))),
+                Style::default().fg(t.dim),
+            )));
+            return;
+        }
+        ArtifactStoreState::Ready(artifacts) if artifacts.is_empty() => {
+            lines.push(Line::from(Span::styled(
+                "  No artifacts yet",
+                Style::default().fg(t.muted),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  This session has not stored",
+                Style::default().fg(t.dim),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  any artifacts.",
+                Style::default().fg(t.dim),
+            )));
+            return;
+        }
+        ArtifactStoreState::Ready(artifacts) => artifacts,
+    };
+
+    let policy_limited =
+        u64::try_from(artifacts.len()).is_ok_and(|count| count >= app.artifact_policy.list_limit);
+    let mut item_viewport_lines = available_lines;
+    if policy_limited {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Newest {} · policy limit reached",
+                app.artifact_policy.list_limit
+            ),
+            Style::default().fg(t.warn),
+        )));
+        item_viewport_lines = item_viewport_lines.saturating_sub(1);
+    }
+
+    let selected = app
+        .workspace_selected
+        .min(artifacts.len().saturating_sub(1));
+    let expanded_lines = if app.workspace_expanded {
+        app.artifact_policy.expanded_lines
+    } else {
+        0
+    };
+    let visible_items = item_viewport_lines
+        .saturating_sub(expanded_lines)
+        .checked_div(app.artifact_policy.item_lines.max(1))
+        .unwrap_or(0)
+        .max(1);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_items)
+        .min(artifacts.len().saturating_sub(visible_items));
+    let end = start.saturating_add(visible_items).min(artifacts.len());
+
+    for (index, artifact) in artifacts.iter().enumerate().take(end).skip(start) {
+        let focused = app.focus == Focus::Workspace && index == selected;
+        let prefix = if focused { "▸ " } else { "  " };
+        let (badge, badge_color) = match &artifact.promotion {
+            ArtifactPromotion::Promoted => ("◆ KG", t.ok),
+            ArtifactPromotion::NotPromoted => ("◇ local", t.muted),
+            ArtifactPromotion::Unknown(_) => ("? KG", t.warn),
+        };
+        let fixed_width = prefix.width() + badge.width() + 1;
+        let content_width = w.saturating_sub(fixed_width);
+        let suffix_budget = content_width / 2;
+        let suffix = clip(&format!(" · {}", artifact.age), suffix_budget);
+        let tool_budget = content_width.saturating_sub(suffix.width());
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
+            Span::styled(
+                badge.to_string(),
+                Style::default()
+                    .fg(badge_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                clip(&artifact.tool, tool_budget),
+                Style::default().fg(t.text),
+            ),
+            Span::styled(suffix, Style::default().fg(t.muted)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", clip(&artifact.summary, w.saturating_sub(4))),
+            Style::default().fg(t.text),
+        )));
+
+        let records = artifact
+            .record_count
+            .map(|count| format!("{count} records"))
+            .unwrap_or_else(|| "records n/a".to_string());
+        let mut metadata = format!("{records} · {}", format_bytes(artifact.bytes_size));
+        if let ArtifactPromotion::Unknown(raw) = &artifact.promotion {
+            metadata.push_str(" · KG=");
+            metadata.push_str(raw.as_deref().unwrap_or("not reported"));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("    {}", clip(&metadata, w.saturating_sub(4))),
+            Style::default().fg(t.dim),
+        )));
+
+        if focused && app.workspace_expanded {
+            lines.push(Line::from(Span::styled(
+                format!("    id: {}", clip(&artifact.id, w.saturating_sub(8))),
+                Style::default().fg(t.dim),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    created: {}",
+                    clip(&artifact.created_at, w.saturating_sub(13))
+                ),
+                Style::default().fg(t.dim),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    session: {}",
+                    clip(&artifact.session_id, w.saturating_sub(13))
+                ),
+                Style::default().fg(t.dim),
+            )));
         }
     }
 }
@@ -1065,7 +1230,11 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
         kv_row(t, "o", "open a link from the transcript (chat focus)"),
         Line::raw(""),
         section(t, "Workspace sidebar"),
-        kv_row(t, "← / →", "switch Activity / Tools / Files / Objects"),
+        kv_row(
+            t,
+            "← / →",
+            "switch Activity / Tools / Files / Objects / Artifacts",
+        ),
         kv_row(t, "↑ / ↓", "move selection"),
         kv_row(t, "Enter", "open details for the selected item"),
         kv_row(t, "Space", "expand selected item inline"),
@@ -3693,6 +3862,24 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn clip_truncates_wide_text_by_display_columns() {
+        let input = "\u{754c}\u{754c}\u{754c}";
+        let clipped = clip(input, 5);
+
+        assert_eq!(clipped, "\u{754c}\u{754c}…");
+        assert_eq!(clipped.width(), 5);
+    }
+
+    #[test]
+    fn clip_keeps_emoji_graphemes_intact() {
+        let input = "\u{1f469}\u{200d}\u{1f52c}science";
+        let clipped = clip(input, 4);
+
+        assert!(clipped.width() <= 4, "{clipped:?} overflowed");
+        assert!(!clipped.ends_with('\u{200d}'), "split a joined emoji");
+    }
 
     #[test]
     fn wrap_plain_bounds_wide_chars_by_display_width() {

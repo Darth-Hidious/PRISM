@@ -33,7 +33,11 @@ use serde_json::Value;
 pub enum AgentMsg {
     // ── Session lifecycle ────────────────────────────────────────────
     /// `ui.welcome` — sent once on backend startup.
-    Welcome { version: String, tool_count: u64 },
+    Welcome {
+        version: String,
+        tool_count: u64,
+        session_id: Option<String>,
+    },
     /// `ui.permissions` — permission mode update.  The backend sends
     /// this after `init` and whenever the permission mode changes.
     Permissions {
@@ -48,6 +52,38 @@ pub enum AgentMsg {
     /// `/sessions` slash command).  Each session is an opaque JSON
     /// object; the TUI just displays them.
     SessionList { sessions: Vec<Value>, raw: Value },
+    /// `ui.session.changed` — authoritative current session after clear,
+    /// resume, or fork.
+    SessionChanged { session_id: String },
+
+    // ── Workspace artifacts ─────────────────────────────────────────
+    /// Healthy response from the session-scoped artifact store. An empty
+    /// vector is distinct from [`Self::ArtifactStoreUnavailable`].
+    ArtifactsListed {
+        session_id: String,
+        artifacts: Vec<Value>,
+    },
+    /// The active turn still owns the Python worker. The TUI should keep the
+    /// loading state and retry, not claim the store is unavailable.
+    ArtifactsPending { message: String },
+    /// The artifact store could not be queried or returned invalid data.
+    ArtifactStoreUnavailable { message: String },
+    /// Full content returned for an inspected artifact.
+    ArtifactFetched {
+        artifact_id: String,
+        session_id: String,
+        artifact: Value,
+    },
+    /// A fetch is deferred while the active turn owns the worker.
+    ArtifactPending {
+        artifact_id: String,
+        message: String,
+    },
+    /// One artifact could not be fetched.
+    ArtifactFetchError {
+        artifact_id: Option<String>,
+        message: String,
+    },
 
     /// `ui.gh.data` — GitHub data for the in-TUI GitHub panel (response to
     /// `/gh issues|prs|status|bug`). `items` are raw `gh --json` objects;
@@ -265,6 +301,10 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .get("tool_count")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            session_id: params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         },
         "ui.permissions" => AgentMsg::Permissions {
             mode: params
@@ -281,6 +321,86 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .cloned()
                 .unwrap_or_default(),
             raw: params,
+        },
+        "ui.session.changed" => match params.get("session_id").and_then(Value::as_str) {
+            Some(session_id) if !session_id.trim().is_empty() => AgentMsg::SessionChanged {
+                session_id: session_id.to_string(),
+            },
+            _ => AgentMsg::Unknown(msg.clone()),
+        },
+
+        // ── Workspace artifacts ─────────────────────────────────────
+        "ui.artifacts.list" => {
+            let session_id = params.get("session_id").and_then(Value::as_str);
+            let artifacts = params.get("artifacts").and_then(Value::as_array);
+            match (session_id, artifacts) {
+                (Some(session_id), Some(artifacts)) if !session_id.trim().is_empty() => {
+                    AgentMsg::ArtifactsListed {
+                        session_id: session_id.to_string(),
+                        artifacts: artifacts.clone(),
+                    }
+                }
+                _ => AgentMsg::ArtifactStoreUnavailable {
+                    message: "artifact store returned an invalid list response".to_string(),
+                },
+            }
+        }
+        "ui.artifacts.pending" => AgentMsg::ArtifactsPending {
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("artifact data is waiting for the active turn")
+                .to_string(),
+        },
+        "ui.artifacts.unavailable" => AgentMsg::ArtifactStoreUnavailable {
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("artifact store unavailable")
+                .to_string(),
+        },
+        "ui.artifact.fetched" => {
+            let artifact_id = params.get("artifact_id").and_then(Value::as_str);
+            let session_id = params.get("session_id").and_then(Value::as_str);
+            let artifact = params.get("artifact");
+            match (artifact_id, session_id, artifact) {
+                (Some(artifact_id), Some(session_id), Some(artifact))
+                    if !artifact_id.trim().is_empty() && !session_id.trim().is_empty() =>
+                {
+                    AgentMsg::ArtifactFetched {
+                        artifact_id: artifact_id.to_string(),
+                        session_id: session_id.to_string(),
+                        artifact: artifact.clone(),
+                    }
+                }
+                _ => AgentMsg::ArtifactFetchError {
+                    artifact_id: artifact_id.map(str::to_string),
+                    message: "artifact store returned an invalid fetch response".to_string(),
+                },
+            }
+        }
+        "ui.artifact.pending" => AgentMsg::ArtifactPending {
+            artifact_id: params
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("artifact content is waiting for the active turn")
+                .to_string(),
+        },
+        "ui.artifact.error" => AgentMsg::ArtifactFetchError {
+            artifact_id: params
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("artifact could not be fetched")
+                .to_string(),
         },
 
         // ── GitHub panel ─────────────────────────────────────────────

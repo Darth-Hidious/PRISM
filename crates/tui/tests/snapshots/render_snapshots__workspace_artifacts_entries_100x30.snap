@@ -3,14 +3,14 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
-· PRISM ready — 99 tools available                                 │ [Act] Too Fil Obj Art
+· PRISM ready — 99 tools available                                 │ Act Too Fil Obj [Art]
                                                                    │
-                                                                   │  (no activity yet)
-                                                                   │
-                                                                   │
-                                                                   │
-                                                                   │
-                                                                   │
+                                                                   │▸ ◆ KG materials_search · 2m ago
+                                                                   │    24 refractory alloy candida…
+                                                                   │    24 records · 18.0 KiB
+                                                                   │  ◇ local phase_diagr… · 15m ago
+                                                                   │    Calculated binary phase bou…
+                                                                   │    records n/a · 2.0 KiB
                                                                    │
                                                                    │
                                                                    │
@@ -27,8 +27,8 @@ expression: rendered
                                                                    │
                                                                    │
 ┌ Prompt ─────────────────────────────────────────────────────────┐│
-│ Type a message... (Ente▌ theme: forest
+│type a message…  (press i to focus · ↵ send)                     ││
 │                                                                 ││
 │                                                                 ││
 └─────────────────────────────────────────────────────────────────┘│
-  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │
+  Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit          │

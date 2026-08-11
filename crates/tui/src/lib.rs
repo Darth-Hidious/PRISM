@@ -30,6 +30,7 @@
 //! ```
 
 pub mod app;
+pub mod artifact;
 pub mod backend;
 pub mod command;
 pub mod form;
@@ -324,6 +325,10 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // Tracks the terminal's mouse-capture state so copy mode can toggle it.
     let mut mouse_captured = true;
     loop {
+        // Coalesced artifact requests only enqueue JSON messages; the backend
+        // performs all store I/O off the render thread.
+        app.poll_artifact_requests();
+
         // Render every frame
         terminal.draw(|f| render::draw(f, &app))?;
 

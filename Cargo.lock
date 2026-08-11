@@ -5593,6 +5593,7 @@ dependencies = [
  "strip-ansi-escapes",
  "tokio",
  "tracing",
+ "unicode-truncate",
  "unicode-width 0.2.2",
 ]
 

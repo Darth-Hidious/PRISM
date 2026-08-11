@@ -15,6 +15,7 @@
 use serde_json::json;
 
 use prism_tui::app::{App, Focus, LineKind, ObjectStatus, Role, WorkspaceTab};
+use prism_tui::artifact::{ArtifactPromotion, ArtifactStoreState, WorkspaceArtifact};
 use prism_tui::backend::BackendHandle;
 use prism_tui::msg::{AgentMsg, parse_notification};
 
@@ -59,16 +60,22 @@ fn parse_welcome() {
     let msg = json!({
         "jsonrpc": "2.0",
         "method": "ui.welcome",
-        "params": {"version": "2.7.1", "tool_count": 42}
+        "params": {
+            "version": "2.7.1",
+            "tool_count": 42,
+            "session_id": "session-1"
+        }
     });
     let parsed = parse_notification(&msg);
     match parsed {
         AgentMsg::Welcome {
             version,
             tool_count,
+            session_id,
         } => {
             assert_eq!(version, "2.7.1");
             assert_eq!(tool_count, 42);
+            assert_eq!(session_id.as_deref(), Some("session-1"));
         }
         other => panic!("expected Welcome, got {other:?}"),
     }
@@ -271,6 +278,7 @@ fn parse_missing_fields_default_gracefully() {
         AgentMsg::Welcome {
             version,
             tool_count,
+            session_id: _,
         } => {
             assert_eq!(version, "?");
             assert_eq!(tool_count, 0);
@@ -287,6 +295,7 @@ fn welcome_sets_version_and_tool_count() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1".into(),
         tool_count: 99,
+        session_id: None,
     });
     assert_eq!(app.prism_version, "2.7.1");
     assert_eq!(app.tool_count, 99);
@@ -1190,6 +1199,7 @@ fn parse_extra_unknown_fields_ignored_safely() {
         AgentMsg::Welcome {
             version,
             tool_count,
+            session_id: _,
         } => {
             assert_eq!(version, "2.0.0");
             assert_eq!(tool_count, 42);
@@ -1211,6 +1221,7 @@ fn parse_null_params_no_panic() {
         AgentMsg::Welcome {
             version,
             tool_count,
+            session_id: _,
         } => {
             assert_eq!(version, "?");
             assert_eq!(tool_count, 0);
@@ -1464,7 +1475,244 @@ fn workspace_enter_on_empty_tab_toasts_instead_of_opening() {
     assert!(!app.toasts.is_empty(), "user must get feedback via a toast");
 }
 
+#[test]
+fn artifact_list_empty_and_store_unavailable_remain_distinct() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::SessionChanged {
+        session_id: "session-a".into(),
+    });
+    app.apply_agent_msg(AgentMsg::ArtifactsListed {
+        session_id: "session-a".into(),
+        artifacts: Vec::new(),
+    });
+    assert!(matches!(
+        app.artifact_store,
+        ArtifactStoreState::Ready(ref rows) if rows.is_empty()
+    ));
+
+    app.apply_agent_msg(AgentMsg::ArtifactStoreUnavailable {
+        message: "database could not be opened".into(),
+    });
+    assert!(matches!(
+        app.artifact_store,
+        ArtifactStoreState::Unavailable(ref reason)
+            if reason == "database could not be opened"
+    ));
+}
+
+#[test]
+fn malformed_artifact_list_is_unavailable_not_empty() {
+    let parsed = parse_notification(&json!({
+        "method": "ui.artifacts.list",
+        "params": {"session_id": "session-a"}
+    }));
+    assert!(matches!(parsed, AgentMsg::ArtifactStoreUnavailable { .. }));
+}
+
+#[test]
+fn workspace_enter_on_artifact_fetches_into_existing_view_panel() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.artifact_store = ArtifactStoreState::Ready(vec![WorkspaceArtifact {
+        id: "art_123".into(),
+        tool: "materials_search".into(),
+        summary: "two candidates".into(),
+        record_count: Some(2),
+        bytes_size: 512,
+        created_at: "2026-08-11T12:00:00+00:00".into(),
+        age: "now".into(),
+        promotion: ArtifactPromotion::Promoted,
+        session_id: "session-a".into(),
+    }]);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.view.open, "Enter must reuse the existing View panel");
+    assert!(app.view.tabs[0].1.contains("Loading artifact content"));
+
+    app.apply_agent_msg(AgentMsg::ArtifactFetched {
+        artifact_id: "art_123".into(),
+        session_id: "session-a".into(),
+        artifact: json!({
+            "artifact_id": "art_123",
+            "session_id": "session-a",
+            "tool": "materials_search",
+            "args": {"elements": ["W", "Mo"]},
+            "result": {"candidates": [1, 2]},
+            "summary": "two candidates",
+            "record_count": 2,
+            "bytes_size": 512,
+            "created_at": "2026-08-11T12:00:00+00:00",
+            "promoted_to_kg": true
+        }),
+    });
+    let body = &app.view.tabs[0].1;
+    assert!(body.contains("\"args\""), "{body}");
+    assert!(body.contains("\"result\""), "{body}");
+}
+
 // ── Link picker (`o`) ────────────────────────────────────────────────
+
+#[test]
+fn new_session_clears_the_old_artifact_scope_while_backend_changes_session() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.artifact_store = ArtifactStoreState::Ready(Vec::new());
+    app.workspace_selected = 4;
+
+    app.new_session();
+
+    assert!(app.session_id.is_none());
+    assert!(matches!(app.artifact_store, ArtifactStoreState::Loading));
+    assert_eq!(app.workspace_selected, 0);
+    assert!(app.is_waiting);
+    assert_eq!(app.status_text, "Starting new session…");
+}
+
+#[test]
+fn new_session_does_not_clear_state_during_an_active_turn() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.artifact_store = ArtifactStoreState::Ready(Vec::new());
+    app.input.insert_str("work in progress");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.apply_agent_msg(AgentMsg::TextDelta("partial answer".into()));
+    assert!(
+        !app.is_waiting,
+        "streaming clears only the waiting indicator"
+    );
+
+    app.new_session();
+
+    assert_eq!(app.session_id.as_deref(), Some("session-a"));
+    assert!(matches!(app.artifact_store, ArtifactStoreState::Ready(_)));
+    assert!(
+        app.messages
+            .iter()
+            .any(|line| line.text == "work in progress")
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|toast| toast.message.contains("current turn"))
+    );
+}
+
+#[test]
+fn artifact_selection_stops_at_the_last_loaded_row() {
+    let mut app = test_app();
+    app.artifact_store = ArtifactStoreState::Ready(vec![WorkspaceArtifact {
+        id: "art_only".into(),
+        tool: "materials_search".into(),
+        summary: "one candidate".into(),
+        record_count: Some(1),
+        bytes_size: 64,
+        created_at: "2026-08-11T12:00:00+00:00".into(),
+        age: "now".into(),
+        promotion: ArtifactPromotion::NotPromoted,
+        session_id: "session-a".into(),
+    }]);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+
+    assert_eq!(app.workspace_selected, 0);
+}
+
+#[test]
+fn artifact_refresh_clamps_a_selection_past_the_new_end() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.workspace_selected = 999;
+
+    app.apply_agent_msg(AgentMsg::ArtifactsListed {
+        session_id: "session-a".into(),
+        artifacts: vec![json!({
+            "artifact_id": "art_only",
+            "tool": "materials_search",
+            "summary": "one candidate",
+            "record_count": 1,
+            "bytes_size": 64,
+            "created_at": "2026-08-11T12:00:00+00:00",
+            "promoted_to_kg": false,
+            "session_id": "session-a"
+        })],
+    });
+
+    assert_eq!(app.workspace_selected, 0);
+}
+
+#[test]
+fn session_change_closes_an_open_artifact_view() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.artifact_store = ArtifactStoreState::Ready(vec![WorkspaceArtifact {
+        id: "art_123".into(),
+        tool: "materials_search".into(),
+        summary: "two candidates".into(),
+        record_count: Some(2),
+        bytes_size: 512,
+        created_at: "2026-08-11T12:00:00+00:00".into(),
+        age: "now".into(),
+        promotion: ArtifactPromotion::Promoted,
+        session_id: "session-a".into(),
+    }]);
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.view.open);
+
+    app.apply_agent_msg(AgentMsg::SessionChanged {
+        session_id: "session-b".into(),
+    });
+
+    assert!(
+        !app.view.open,
+        "old-session artifact content must be closed"
+    );
+    assert_eq!(app.session_id.as_deref(), Some("session-b"));
+    assert!(matches!(app.artifact_store, ArtifactStoreState::Loading));
+}
+
+#[test]
+fn artifact_list_rejects_a_control_modified_session_id() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+
+    app.apply_agent_msg(AgentMsg::ArtifactsListed {
+        session_id: "session-a\u{1b}[31m".into(),
+        artifacts: Vec::new(),
+    });
+
+    assert!(matches!(
+        app.artifact_store,
+        ArtifactStoreState::Unavailable(ref reason)
+            if reason == "artifact list reported an invalid session id"
+    ));
+}
+
+#[test]
+fn invalid_session_change_cancels_a_scheduled_artifact_refresh() {
+    let mut app = test_app();
+    app.artifact_policy.refresh_debounce = std::time::Duration::ZERO;
+    app.apply_agent_msg(AgentMsg::SessionChanged {
+        session_id: "session-a".into(),
+    });
+    app.apply_agent_msg(AgentMsg::SessionChanged {
+        session_id: "session-a\u{1b}[31m".into(),
+    });
+
+    app.poll_artifact_requests();
+
+    assert!(matches!(
+        app.artifact_store,
+        ArtifactStoreState::Unavailable(ref reason)
+            if reason == "backend reported an invalid artifact session id"
+    ));
+}
 
 #[test]
 fn o_in_chat_focus_opens_link_picker_newest_first() {
@@ -2093,9 +2341,11 @@ async fn fake_backend_events_parse_correctly() {
         AgentMsg::Welcome {
             version,
             tool_count,
+            session_id,
         } => {
             assert_eq!(version, "2.7.1-fake");
             assert_eq!(tool_count, 99);
+            assert_eq!(session_id.as_deref(), Some("fake-session"));
         }
         other => panic!("expected Welcome, got {other:?}"),
     }
@@ -2203,6 +2453,33 @@ async fn fake_backend_send_command_emits_response() {
 // ═══════════════════════════════════════════════════════════════════════
 // Patch 3B tests: scenario library
 // ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn fake_backend_clear_changes_the_artifact_session_scope() {
+    let mut backend = FakeBackend::new(FakeScenario::BasicChat);
+    backend.recv().await.unwrap(); // welcome
+    backend.recv().await.unwrap(); // status
+    backend.recv().await.unwrap(); // tool catalog
+
+    backend.send_command("/clear").unwrap();
+    let changed = backend.recv().await.expect("session change notification");
+    assert_eq!(
+        changed.get("method").and_then(|method| method.as_str()),
+        Some("ui.session.changed")
+    );
+    let session_id = changed["params"]["session_id"]
+        .as_str()
+        .expect("new fake session id")
+        .to_string();
+    let _turn_complete = backend.recv().await.expect("turn complete");
+
+    backend.request_artifacts(10).unwrap();
+    let listed = backend.recv().await.expect("artifact list");
+    assert_eq!(
+        listed["params"]["session_id"].as_str(),
+        Some(session_id.as_str())
+    );
+}
 
 /// Helper: drain startup events (welcome + status) from a fake backend.
 async fn drain_startup(backend: &mut FakeBackend) {

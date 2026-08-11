@@ -3,7 +3,7 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
-· PRISM ready — 99 tools available                                 │ [Activity] Tools Files Objects
+· PRISM ready — 99 tools available                                 │ [Act] Too Fil Obj Art
        ┌────────────────────────────────────────────────────────────────────────────────────┐
        │ Tools   [Native]  MCP                                                              │
        │                                                                                    │

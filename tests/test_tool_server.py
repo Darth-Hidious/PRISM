@@ -93,6 +93,20 @@ def test_call_tool_unknown(server):
     assert "error" in resp
 
 
+def test_set_session_id(server):
+    resp = _send(
+        server,
+        {"method": "set_session_id", "session_id": "session-from-rust"},
+    )
+    assert resp == {"status": "ok", "session_id": "session-from-rust"}
+
+
+@pytest.mark.parametrize("session_id", [None, "", 42])
+def test_set_session_id_rejects_invalid_values(server, session_id):
+    resp = _send(server, {"method": "set_session_id", "session_id": session_id})
+    assert resp == {"error": "'session_id' must be a non-empty string"}
+
+
 def test_missing_method(server):
     resp = _send(server, {"tool": "search", "args": {}})
     assert "error" in resp
