@@ -265,6 +265,10 @@ async fn parallel_step_keeps_successes_reports_failures_and_orders_by_declaratio
     );
     let port = spawn_probe(probe.clone()).await;
     let mut spec = parallel_tool_workflow(&ids);
+    spec.steps[0].config.insert("retries".to_string(), json!(2));
+    spec.steps[0]
+        .config
+        .insert("retry_delay_secs".to_string(), json!(0));
     spec.steps.push(WorkflowStep {
         id: "after-fanout".to_string(),
         action: "message".to_string(),
@@ -294,8 +298,9 @@ async fn parallel_step_keeps_successes_reports_failures_and_orders_by_declaratio
         .expect("released probe should finish");
     }
 
-    let result = run
+    let result = tokio::time::timeout(Duration::from_secs(2), run)
         .await
+        .expect("a partial fan-out must not enter the outer retry loop")
         .expect("workflow task should not panic")
         .expect("one bad document is a partial result, not a whole-run failure");
 
@@ -345,6 +350,74 @@ async fn parallel_step_keeps_successes_reports_failures_and_orders_by_declaratio
     assert_eq!(result.context["fanout"]["steps"], json!(ids));
     assert_eq!(result.steps[1].id, "after-fanout");
     assert_eq!(result.steps[1].status, "completed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_step_retries_and_errors_when_every_branch_fails() {
+    let ids = ["broken-a", "broken-b"];
+    let probe = FanoutProbe::with_plan(
+        HashMap::from([("broken-a".to_string(), 5), ("broken-b".to_string(), 5)]),
+        ids.into_iter().map(str::to_string).collect(),
+    );
+    let port = spawn_probe(probe.clone()).await;
+    let mut spec = parallel_tool_workflow(&ids);
+    spec.steps[0].config.insert("retries".to_string(), json!(1));
+    spec.steps[0]
+        .config
+        .insert("retry_delay_secs".to_string(), json!(0));
+    let values = node_values(port);
+    let options = WorkflowExecutionOptions::default();
+    let policy = parallel_policy(ids.len());
+
+    let run = tokio::spawn(async move {
+        execute_workflow_with_parallel_policy(
+            &spec, &values, true, None, None, None, &options, &policy,
+        )
+        .await
+    });
+
+    for attempt in 1..=2 {
+        tokio::time::timeout(Duration::from_secs(2), probe.wait_for_in_flight(ids.len()))
+            .await
+            .unwrap_or_else(|_| panic!("all branches should enter attempt {attempt}"));
+        probe.release_all(ids);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            probe.wait_for_finished(attempt * ids.len()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("all branches should finish attempt {attempt}"));
+    }
+
+    let error = run
+        .await
+        .expect("workflow task should not panic")
+        .expect_err("an all-failed parallel step must fail the workflow");
+    let error = format!("{error:#}");
+
+    assert!(
+        error.contains("parallel step 'fanout' failed"),
+        "error: {error}"
+    );
+    assert!(
+        error.contains("0 of 2 branches completed; 2 failed"),
+        "error: {error}"
+    );
+    for id in ids {
+        assert!(error.contains(id), "error omitted {id}: {error}");
+        assert_eq!(
+            probe
+                .completed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|completed| completed.as_str() == id)
+                .count(),
+            2,
+            "{id} should run once initially and once on retry"
+        );
+    }
+    assert!(error.contains("HTTP 422"), "error: {error}");
 }
 
 #[tokio::test]

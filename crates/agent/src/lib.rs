@@ -19,6 +19,7 @@ pub mod reprompt;
 pub mod scratchpad;
 pub mod service;
 pub mod session;
+mod session_index;
 pub mod skills;
 pub mod subagent;
 pub mod task;

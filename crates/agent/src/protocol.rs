@@ -7666,11 +7666,8 @@ async fn run_server_core(
 
     // Session persistence
     let mut session_store = SessionStore::new(None);
-    let startup_latest_session = session_store
-        .list_sessions(1)
-        .into_iter()
-        .find(|session| session.is_latest)
-        .map(|session| session.session_id);
+    session_store.set_project_cwd(Some(&tool_server_config.project_root));
+    let startup_latest_session = session_store.latest_session_id();
     let session_id = session_store.new_session(&llm_config.model);
     persist_runtime_state(
         &session_store,
