@@ -143,6 +143,7 @@ async fn tool_step_succeeds_with_node_token() {
     let options = prism_workflows::WorkflowExecutionOptions {
         trusted_llm_base_url: None,
         trusted_llm_api_key: None,
+        trusted_llm_credential_kind: None,
         caller_supplied_llm_base_url: false,
         trusted_node_port: Some(node_port),
         trusted_node_token: Some(EXPECTED_BEARER.to_string()),
@@ -180,6 +181,7 @@ async fn caller_selected_node_port_never_receives_node_token() {
     let options = prism_workflows::WorkflowExecutionOptions {
         trusted_llm_base_url: None,
         trusted_llm_api_key: None,
+        trusted_llm_credential_kind: None,
         caller_supplied_llm_base_url: false,
         trusted_node_port: Some(7327),
         trusted_node_token: Some(EXPECTED_BEARER.to_string()),

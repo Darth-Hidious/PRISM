@@ -1,55 +1,23 @@
 //! Role-Based Access Control engine for PRISM nodes.
 //!
-//! Two-layer model:
-//! - **Platform roles** (`PlatformRole`): synced from platform.marc27.com
-//! - **Local roles** (`LocalRole`): managed by the node admin, persisted in SQLite
+//! [`LocalRole`] is PRISM's canonical authorization model. Roles obtained from
+//! hosted services are mapped into this model by provider adapters and stored
+//! separately from roles assigned by a PRISM node administrator.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
-// Platform roles (synced from platform.marc27.com)
+// PRISM roles
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlatformRole {
-    Owner,
-    Admin,
-    Member,
-    Viewer,
-}
-
-impl PlatformRole {
-    /// Convert a platform role string (from API) to the enum.
-    pub fn from_api_str(s: &str) -> Option<Self> {
-        match s {
-            "owner" => Some(PlatformRole::Owner),
-            "admin" => Some(PlatformRole::Admin),
-            "member" => Some(PlatformRole::Member),
-            "viewer" => Some(PlatformRole::Viewer),
-            _ => None,
-        }
-    }
-
-    /// Map a platform role to the corresponding local role.
-    ///
-    /// Owner/Admin → NodeAdmin, Member → Engineer, Viewer → Viewer.
-    pub fn to_local_role(self) -> LocalRole {
-        match self {
-            PlatformRole::Owner | PlatformRole::Admin => LocalRole::NodeAdmin,
-            PlatformRole::Member => LocalRole::Engineer,
-            PlatformRole::Viewer => LocalRole::Viewer,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Local roles (managed per-node)
-// ---------------------------------------------------------------------------
-
+/// A role defined and enforced by PRISM.
+///
+/// Provider-specific role names must be mapped into this enum at the provider
+/// boundary. They are not part of PRISM's authorization model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalRole {
@@ -107,6 +75,20 @@ impl LocalRole {
             _ => None,
         }
     }
+
+    /// PRISM's explicit conflict policy for multiple provider assignments that
+    /// an adapter linked to one canonical principal.
+    ///
+    /// This tier selects one effective role; it is not inferred from permission
+    /// set inclusion. Locally assigned roles always take precedence.
+    fn effective_role_priority(self) -> u8 {
+        match self {
+            LocalRole::NodeAdmin => 3,
+            LocalRole::Engineer => 2,
+            LocalRole::Analyst => 1,
+            LocalRole::Viewer => 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,10 +109,88 @@ pub enum Permission {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy compatibility
+// ---------------------------------------------------------------------------
+
+/// Legacy hosted-platform role type retained for source and wire compatibility.
+///
+/// New production integrations must define a provider adapter outside
+/// `prism-core` and map directly into [`LocalRole`].
+#[deprecated(
+    note = "provider roles are external inputs; map them into prism_core::rbac::LocalRole in a provider adapter"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformRole {
+    Owner,
+    Admin,
+    Member,
+    Viewer,
+}
+
+#[allow(deprecated)]
+impl PlatformRole {
+    /// Convert a platform role string (from API) to the enum.
+    pub fn from_api_str(s: &str) -> Option<Self> {
+        match s {
+            "owner" => Some(PlatformRole::Owner),
+            "admin" => Some(PlatformRole::Admin),
+            "member" => Some(PlatformRole::Member),
+            "viewer" => Some(PlatformRole::Viewer),
+            _ => None,
+        }
+    }
+
+    /// Map a platform role to the corresponding local role.
+    ///
+    /// Owner/Admin → NodeAdmin, Member → Engineer, Viewer → Viewer.
+    pub fn to_local_role(self) -> LocalRole {
+        match self {
+            PlatformRole::Owner | PlatformRole::Admin => LocalRole::NodeAdmin,
+            PlatformRole::Member => LocalRole::Engineer,
+            PlatformRole::Viewer => LocalRole::Viewer,
+        }
+    }
+}
+
+/// Result of atomically replacing one provider's external role assignments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalRoleReconciliation {
+    pub assigned: usize,
+    pub removed: usize,
+}
+
+/// A provider subject explicitly linked to a canonical PRISM principal.
+///
+/// Provider adapters own this identity mapping. Equal subject strings from
+/// different providers do not collide unless their adapters intentionally link
+/// them to the same `principal_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalRoleAssignment {
+    pub subject_id: String,
+    pub principal_id: String,
+    pub role: LocalRole,
+}
+
+impl ExternalRoleAssignment {
+    pub fn new(
+        subject_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        role: LocalRole,
+    ) -> Self {
+        Self {
+            subject_id: subject_id.into(),
+            principal_id: principal_id.into(),
+            role,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RBAC Engine
 // ---------------------------------------------------------------------------
 
-/// SQLite-backed RBAC engine for local role management.
+/// SQLite-backed engine for PRISM-local and provider-scoped role assignments.
 pub struct RbacEngine {
     conn: Connection,
 }
@@ -155,14 +215,65 @@ impl RbacEngine {
     }
 
     fn init_schema(&self) -> Result<()> {
+        let had_local_role_table = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_roles'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let had_external_role_table = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'external_role_assignments'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let grandfathered_roles = if had_local_role_table && !had_external_role_table {
+            self.conn
+                .query_row("SELECT COUNT(*) FROM user_roles", [], |row| {
+                    row.get::<_, i64>(0)
+                })?
+        } else {
+            0
+        };
+
         self.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS user_roles (
                     user_id  TEXT PRIMARY KEY NOT NULL,
                     role     TEXT NOT NULL
-                );",
+                );
+
+                CREATE TABLE IF NOT EXISTS external_role_assignments (
+                    provider    TEXT NOT NULL,
+                    subject_id  TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    role        TEXT NOT NULL,
+                    PRIMARY KEY (provider, subject_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_external_role_assignments_principal
+                    ON external_role_assignments (principal_id);",
             )
             .context("failed to initialize RBAC schema")?;
+
+        // Before provider provenance was recorded, this table held a mixture
+        // of administrator-created and provider-synced roles. Inferring which
+        // is which could delete a genuine local grant, so every ambiguous row
+        // is deliberately grandfathered as PRISM-local. The new external
+        // table makes all subsequent provider assignments revocable by source.
+        if grandfathered_roles > 0 {
+            tracing::warn!(
+                count = grandfathered_roles,
+                "pre-separation RBAC assignments have unknown provenance; treating them as PRISM-local; review local user roles"
+            );
+        }
         Ok(())
     }
 
@@ -179,8 +290,8 @@ impl RbacEngine {
         Ok(())
     }
 
-    /// Look up the local role for a user, if one is assigned.
-    pub fn get_role(&self, user_id: &str) -> Result<Option<LocalRole>> {
+    /// Look up a role assigned directly by a PRISM node administrator.
+    pub fn get_local_role(&self, user_id: &str) -> Result<Option<LocalRole>> {
         let mut stmt = self
             .conn
             .prepare("SELECT role FROM user_roles WHERE user_id = ?1")?;
@@ -189,6 +300,29 @@ impl RbacEngine {
             .optional()?
             .and_then(|s| LocalRole::from_str(&s));
         Ok(role)
+    }
+
+    /// Look up the effective PRISM role for a user.
+    ///
+    /// A local assignment is authoritative. If no local role exists, the
+    /// highest-priority provider role explicitly linked to this canonical
+    /// PRISM principal is used.
+    pub fn get_role(&self, principal_id: &str) -> Result<Option<LocalRole>> {
+        if let Some(role) = self.get_local_role(principal_id)? {
+            return Ok(Some(role));
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT role FROM external_role_assignments WHERE principal_id = ?1")?;
+        let rows = stmt
+            .query_map(params![principal_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|role| LocalRole::from_str(&role))
+            .max_by_key(|role| role.effective_role_priority()))
     }
 
     /// Remove a user's local role assignment.
@@ -201,8 +335,8 @@ impl RbacEngine {
         Ok(())
     }
 
-    /// List all users and their assigned local roles.
-    pub fn list_users(&self) -> Result<Vec<(String, LocalRole)>> {
+    /// List roles assigned directly by a PRISM node administrator.
+    pub fn list_local_users(&self) -> Result<Vec<(String, LocalRole)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT user_id, role FROM user_roles ORDER BY user_id")?;
@@ -216,6 +350,196 @@ impl RbacEngine {
             .into_iter()
             .filter_map(|(uid, r)| LocalRole::from_str(&r).map(|role| (uid, role)))
             .collect())
+    }
+
+    /// List all users and their effective PRISM roles.
+    pub fn list_users(&self) -> Result<Vec<(String, LocalRole)>> {
+        let mut users = BTreeMap::<String, LocalRole>::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT principal_id, role FROM external_role_assignments
+             ORDER BY principal_id, provider, subject_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for (user_id, raw_role) in rows {
+            let Some(role) = LocalRole::from_str(&raw_role) else {
+                continue;
+            };
+            users
+                .entry(user_id)
+                .and_modify(|current| {
+                    if role.effective_role_priority() > current.effective_role_priority() {
+                        *current = role;
+                    }
+                })
+                .or_insert(role);
+        }
+
+        // Local assignments are authoritative and replace any external result.
+        for (user_id, role) in self.list_local_users()? {
+            users.insert(user_id, role);
+        }
+
+        Ok(users.into_iter().collect())
+    }
+
+    /// Assign or update a role mapped by an external identity provider.
+    pub fn assign_external_role(
+        &self,
+        provider: &str,
+        subject_id: &str,
+        principal_id: &str,
+        role: LocalRole,
+    ) -> Result<()> {
+        ensure!(
+            !provider.trim().is_empty(),
+            "external role provider must not be empty"
+        );
+        ensure!(
+            !subject_id.trim().is_empty(),
+            "external role subject must not be empty"
+        );
+        ensure!(
+            !principal_id.trim().is_empty(),
+            "external role principal must not be empty"
+        );
+        self.conn
+            .execute(
+                "INSERT INTO external_role_assignments
+                    (provider, subject_id, principal_id, role)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider, subject_id) DO UPDATE SET
+                    principal_id = excluded.principal_id,
+                    role = excluded.role",
+                params![provider, subject_id, principal_id, role.as_str()],
+            )
+            .with_context(|| {
+                format!("failed to assign external role for subject {subject_id} from {provider}")
+            })?;
+        tracing::info!(
+            provider,
+            subject_id,
+            principal_id,
+            role = role.as_str(),
+            "external role assigned"
+        );
+        Ok(())
+    }
+
+    /// Look up one provider's mapped PRISM role for a user.
+    pub fn get_external_role(&self, provider: &str, subject_id: &str) -> Result<Option<LocalRole>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT role FROM external_role_assignments
+             WHERE provider = ?1 AND subject_id = ?2",
+        )?;
+        let role = stmt
+            .query_row(params![provider, subject_id], |row| row.get::<_, String>(0))
+            .optional()?
+            .and_then(|role| LocalRole::from_str(&role));
+        Ok(role)
+    }
+
+    /// List one provider's mapped PRISM role assignments.
+    pub fn list_external_roles(&self, provider: &str) -> Result<Vec<ExternalRoleAssignment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT subject_id, principal_id, role FROM external_role_assignments
+             WHERE provider = ?1 ORDER BY subject_id",
+        )?;
+        let rows = stmt
+            .query_map(params![provider], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(subject_id, principal_id, role)| {
+                LocalRole::from_str(&role).map(|role| ExternalRoleAssignment {
+                    subject_id,
+                    principal_id,
+                    role,
+                })
+            })
+            .collect())
+    }
+
+    /// Atomically replace all mapped roles from one external provider.
+    ///
+    /// Assignments from other providers and PRISM-local assignments are never
+    /// modified. Duplicate subjects in `assignments` resolve to the last link.
+    pub fn replace_external_roles(
+        &self,
+        provider: &str,
+        assignments: &[ExternalRoleAssignment],
+    ) -> Result<ExternalRoleReconciliation> {
+        ensure!(
+            !provider.trim().is_empty(),
+            "external role provider must not be empty"
+        );
+
+        for assignment in assignments {
+            ensure!(
+                !assignment.subject_id.trim().is_empty(),
+                "external role subject must not be empty"
+            );
+            ensure!(
+                !assignment.principal_id.trim().is_empty(),
+                "external role principal must not be empty"
+            );
+        }
+        let desired = assignments
+            .iter()
+            .map(|assignment| (assignment.subject_id.as_str(), assignment))
+            .collect::<BTreeMap<_, _>>();
+        let desired_ids = desired
+            .keys()
+            .map(|subject_id| (*subject_id).to_string())
+            .collect::<BTreeSet<_>>();
+        let existing_ids = self
+            .list_external_roles(provider)?
+            .into_iter()
+            .map(|assignment| assignment.subject_id)
+            .collect::<BTreeSet<_>>();
+
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("failed to start external role reconciliation")?;
+        transaction.execute(
+            "DELETE FROM external_role_assignments WHERE provider = ?1",
+            params![provider],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO external_role_assignments
+                    (provider, subject_id, principal_id, role)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (subject_id, assignment) in &desired {
+                insert.execute(params![
+                    provider,
+                    subject_id,
+                    assignment.principal_id,
+                    assignment.role.as_str()
+                ])?;
+            }
+        }
+        transaction
+            .commit()
+            .context("failed to commit external role reconciliation")?;
+
+        Ok(ExternalRoleReconciliation {
+            assigned: desired.len(),
+            removed: existing_ids.difference(&desired_ids).count(),
+        })
     }
 
     /// Check whether a user has a specific permission.
@@ -242,6 +566,10 @@ mod tests {
 
     fn engine() -> RbacEngine {
         RbacEngine::in_memory().expect("in-memory engine")
+    }
+
+    fn external(subject_id: &str, principal_id: &str, role: LocalRole) -> ExternalRoleAssignment {
+        ExternalRoleAssignment::new(subject_id, principal_id, role)
     }
 
     #[test]
@@ -282,6 +610,142 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert!(users.contains(&("alice".into(), LocalRole::Engineer)));
         assert!(users.contains(&("bob".into(), LocalRole::Viewer)));
+    }
+
+    #[test]
+    fn local_assignment_is_authoritative_over_external_role() {
+        let e = engine();
+        e.assign_external_role(
+            "provider-a",
+            "external-alice",
+            "alice",
+            LocalRole::NodeAdmin,
+        )
+        .unwrap();
+        assert_eq!(e.get_role("alice").unwrap(), Some(LocalRole::NodeAdmin));
+
+        e.assign_role("alice", LocalRole::Viewer).unwrap();
+
+        assert_eq!(e.get_role("alice").unwrap(), Some(LocalRole::Viewer));
+        assert!(!e.check_permission("alice", Permission::ManageNode).unwrap());
+    }
+
+    #[test]
+    fn local_assignment_survives_provider_revocation() {
+        let e = engine();
+        e.assign_role("alice", LocalRole::Engineer).unwrap();
+        e.assign_external_role(
+            "provider-a",
+            "external-alice",
+            "alice",
+            LocalRole::NodeAdmin,
+        )
+        .unwrap();
+
+        let result = e.replace_external_roles("provider-a", &[]).unwrap();
+
+        assert_eq!(result.removed, 1);
+        assert_eq!(
+            e.get_local_role("alice").unwrap(),
+            Some(LocalRole::Engineer)
+        );
+        assert_eq!(e.get_role("alice").unwrap(), Some(LocalRole::Engineer));
+        assert_eq!(
+            e.get_external_role("provider-a", "external-alice").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_reconciliation_removes_only_its_stale_assignments() {
+        let e = engine();
+        e.assign_external_role("provider-a", "stale", "stale", LocalRole::Viewer)
+            .unwrap();
+        e.assign_external_role("provider-a", "current", "current", LocalRole::Viewer)
+            .unwrap();
+        e.assign_external_role(
+            "another-provider",
+            "stale",
+            "another-stale",
+            LocalRole::Analyst,
+        )
+        .unwrap();
+
+        let result = e
+            .replace_external_roles(
+                "provider-a",
+                &[external("current", "current", LocalRole::Engineer)],
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            ExternalRoleReconciliation {
+                assigned: 1,
+                removed: 1,
+            }
+        );
+        assert_eq!(e.get_external_role("provider-a", "stale").unwrap(), None);
+        assert_eq!(
+            e.get_external_role("provider-a", "current").unwrap(),
+            Some(LocalRole::Engineer)
+        );
+        assert_eq!(
+            e.get_external_role("another-provider", "stale").unwrap(),
+            Some(LocalRole::Analyst)
+        );
+    }
+
+    #[test]
+    fn highest_external_role_is_effective_without_a_local_assignment() {
+        let e = engine();
+        e.assign_external_role(
+            "provider-a",
+            "provider-a-alice",
+            "alice",
+            LocalRole::Analyst,
+        )
+        .unwrap();
+        e.assign_external_role(
+            "provider-b",
+            "provider-b-alice",
+            "alice",
+            LocalRole::Engineer,
+        )
+        .unwrap();
+
+        assert_eq!(e.get_role("alice").unwrap(), Some(LocalRole::Engineer));
+        assert!(
+            e.check_permission("alice", Permission::ExecuteTools)
+                .unwrap()
+        );
+        assert!(!e.check_permission("alice", Permission::ViewAudit).unwrap());
+    }
+
+    #[test]
+    fn equal_provider_subjects_do_not_collide_without_an_explicit_principal_link() {
+        let e = engine();
+        e.assign_external_role(
+            "provider-a",
+            "shared-subject",
+            "prism-alice",
+            LocalRole::Engineer,
+        )
+        .unwrap();
+        e.assign_external_role(
+            "provider-b",
+            "shared-subject",
+            "prism-bob",
+            LocalRole::NodeAdmin,
+        )
+        .unwrap();
+
+        assert_eq!(
+            e.get_role("prism-alice").unwrap(),
+            Some(LocalRole::Engineer)
+        );
+        assert_eq!(e.get_role("prism-bob").unwrap(), Some(LocalRole::NodeAdmin));
+        assert_eq!(e.get_role("shared-subject").unwrap(), None);
     }
 
     // -- Permission checks per role ------------------------------------------
@@ -492,6 +956,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn platform_role_serde_roundtrip() {
         for role in [
             PlatformRole::Owner,
@@ -506,6 +971,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn platform_role_from_api_str() {
         assert_eq!(
             PlatformRole::from_api_str("owner"),
@@ -528,6 +994,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn platform_to_local_role_mapping() {
         assert_eq!(PlatformRole::Owner.to_local_role(), LocalRole::NodeAdmin);
         assert_eq!(PlatformRole::Admin.to_local_role(), LocalRole::NodeAdmin);
@@ -553,5 +1020,39 @@ mod tests {
         // Re-open from disk.
         let e = RbacEngine::new(path).unwrap();
         assert_eq!(e.get_role("alice").unwrap(), Some(LocalRole::NodeAdmin));
+    }
+
+    #[test]
+    fn pre_stage_one_roles_are_grandfathered_as_local_when_provenance_is_unknowable() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE user_roles (
+                    user_id TEXT PRIMARY KEY NOT NULL,
+                    role TEXT NOT NULL
+                 );
+                 INSERT INTO user_roles (user_id, role) VALUES ('legacy-admin', 'node_admin');",
+            )
+            .unwrap();
+        }
+
+        let e = RbacEngine::new(tmp.path()).unwrap();
+
+        // Provider reconciliation cannot safely infer whether this legacy row
+        // was provider-synced or administrator-created, so it is never deleted.
+        e.replace_external_roles("provider-a", &[]).unwrap();
+        assert_eq!(
+            e.get_local_role("legacy-admin").unwrap(),
+            Some(LocalRole::NodeAdmin)
+        );
+        assert_eq!(
+            e.get_role("legacy-admin").unwrap(),
+            Some(LocalRole::NodeAdmin)
+        );
+
+        e.assign_external_role("provider-a", "external-bob", "bob", LocalRole::Viewer)
+            .unwrap();
+        assert_eq!(e.get_role("bob").unwrap(), Some(LocalRole::Viewer));
     }
 }

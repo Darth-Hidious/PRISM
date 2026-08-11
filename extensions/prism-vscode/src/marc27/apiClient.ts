@@ -49,6 +49,11 @@ export class Marc27ApiClient {
     options: { method?: string; body?: unknown; auth?: boolean } = {}
   ): Promise<T> {
     const baseUrl = this.getBaseUrl().replace(/\/$/, "");
+    if (!baseUrl) {
+      throw new Error(
+        "No platform configured. Set prism.apiBaseUrl to the provider API endpoint."
+      );
+    }
     const url = `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
     const headers: Record<string, string> = {
       Accept: "application/json",

@@ -1,4 +1,4 @@
-//! `prism-node` binary — daemon that registers with the MARC27 platform and
+//! `prism-node` binary — daemon that registers with a configured provider and
 //! executes containerized compute jobs.
 
 use anyhow::Result;
@@ -81,7 +81,6 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let endpoints = PlatformEndpoints::from_env();
 
     match cli.command {
         Command::Down => {
@@ -129,6 +128,14 @@ async fn main() -> Result<()> {
             }
 
             let paths = prism_runtime::PrismPaths::discover()?;
+            let config = prism_core::config::NodeConfig::load(None);
+            let state = paths.load_cli_state().ok();
+            let endpoints = PlatformEndpoints::resolve_for_paths(
+                config.platform.url.as_deref(),
+                config.platform.provider.as_deref(),
+                state.as_ref().and_then(|value| value.credentials.as_ref()),
+                &paths,
+            );
             let options = DaemonOptions {
                 name: name.unwrap_or_else(|| {
                     sysinfo::System::host_name().unwrap_or_else(|| "prism-node".to_string())
@@ -166,7 +173,7 @@ async fn main() -> Result<()> {
                 audit_emitter: None,
             };
 
-            prism_node::daemon::run_daemon(&endpoints, &paths, options).await?;
+            prism_node::daemon::run_daemon(endpoints.as_ref(), &paths, options).await?;
         }
         Command::Key { command } => {
             let paths = prism_runtime::PrismPaths::discover()?;

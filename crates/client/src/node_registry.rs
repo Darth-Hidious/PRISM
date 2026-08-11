@@ -86,7 +86,7 @@ struct NodeListResponse {
     error: Option<String>,
 }
 
-/// Client for the MARC27 node-registry REST endpoints.
+/// Client for provider node-registry REST endpoints.
 ///
 /// The WebSocket node loop is still the primary registration path for active nodes,
 /// but the REST surface is now live and is the source of truth for discovery,

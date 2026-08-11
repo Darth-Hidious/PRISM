@@ -49,7 +49,7 @@ Override the command in VS Code settings when testing local binaries:
   "prism.backendCommand": "/Users/siddharthakovid/Downloads/PRISM/target/debug/prism",
   "prism.backendArgs": ["backend"],
   "prism.pythonPath": "python3",
-  "prism.marc27ApiBaseUrl": "https://api.marc27.com/api/v1"
+  "prism.apiBaseUrl": "https://provider.example/api/v1"
 }
 ```
 

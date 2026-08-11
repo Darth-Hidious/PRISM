@@ -19,14 +19,31 @@ import { ToolsTreeProvider } from "./views/toolsTree";
 import { WelcomePanel } from "./views/welcomePanel";
 
 let capabilities: Marc27Capabilities | undefined;
+let warnedLegacyApiSetting = false;
+
+function configuredPlatformApiBaseUrl(
+  output: vscode.OutputChannel
+): string {
+  const config = vscode.workspace.getConfiguration("prism");
+  const native = config.get<string>("apiBaseUrl")?.trim();
+  if (native) {
+    return native;
+  }
+  const legacy = config.get<string>("marc27ApiBaseUrl")?.trim();
+  if (legacy && !warnedLegacyApiSetting) {
+    warnedLegacyApiSetting = true;
+    output.appendLine(
+      "warning: prism.marc27ApiBaseUrl is deprecated; use prism.apiBaseUrl instead."
+    );
+  }
+  return legacy ?? "";
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("PRISM");
   const backend = new PrismBackend(output);
   const api = new Marc27ApiClient(context.secrets, () =>
-    vscode.workspace
-      .getConfiguration("prism")
-      .get<string>("marc27ApiBaseUrl", "https://api.marc27.com/api/v1")
+    configuredPlatformApiBaseUrl(output)
   );
 
   const status = vscode.window.createStatusBarItem(

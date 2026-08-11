@@ -12,8 +12,8 @@ filled here, all *read-only*:
                                                 (agent had no way to read
                                                  wallet balance or prices)
 
-All three use the same auth path as `research.py` — `MARC27_API_KEY` env
-var or `~/.prism/credentials.json` access_token. None of them mutate
+All three use PRISM's shared auth path — `PRISM_API_KEY` (with a deprecated
+provider alias) or `~/.prism/credentials.json` access_token. None of them mutate
 platform state, so none are `requires_approval=True`.
 
 The matrix in the v2.7.2 endpoint-coverage audit lists more GAP-HIGH
@@ -30,6 +30,7 @@ from typing import Any, Optional
 import requests
 
 from app.tools._platform_client import platform
+from app.tools._platform_creds import resolve_credentials
 
 from app.tools.base import Tool, ToolRegistry
 
@@ -39,27 +40,9 @@ from app.tools.base import Tool, ToolRegistry
 # so each tool module can evolve its own auth handling later if needed).
 # ---------------------------------------------------------------------------
 
-def _resolve_credentials() -> tuple[str, str]:
-    """Return (api_url, access_token) from env or `~/.prism/credentials.json`."""
-    api_url = os.environ.get(
-        "MARC27_API_URL", "https://api.marc27.com/api/v1"
-    ).rstrip("/")
-    api_key = os.environ.get("MARC27_API_KEY", "")
-
-    if not api_key:
-        try:
-            creds_path = Path.home() / ".prism" / "credentials.json"
-            if creds_path.exists():
-                creds = json.loads(creds_path.read_text())
-                api_key = creds.get("access_token", "")
-                if creds.get("platform_url"):
-                    api_url = creds["platform_url"].rstrip("/")
-                    if not api_url.endswith("/api/v1"):
-                        api_url = api_url + "/api/v1"
-        except Exception:
-            pass
-
-    return api_url, api_key
+def _resolve_credentials():
+    """Compatibility wrapper around PRISM's shared credential resolver."""
+    return resolve_credentials()
 
 
 def _get(path: str) -> dict:

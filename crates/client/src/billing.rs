@@ -1,4 +1,4 @@
-//! MARC27 billing / credits API client.
+//! Provider billing / credits API client.
 //!
 //! Mirrors the platform's `/billing/*` namespace. The status bar polls the
 //! org credit balance cheaply at turn boundaries.

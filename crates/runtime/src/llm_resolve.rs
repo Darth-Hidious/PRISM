@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use prism_core::{chat_config, config as core_config, providers};
 
+use crate::auth::{PlatformAuth, resolve_environment_credential};
 use crate::platform_env::PlatformVar;
 use crate::{PlatformEndpoints, PrismPaths};
 
@@ -31,11 +32,38 @@ pub struct ResolvedLlm {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// Explicit platform credential semantics. `None` is reserved for raw
+    /// provider/legacy inputs whose caller did not declare a kind.
+    pub credential_kind: Option<ResolvedCredentialKind>,
     pub embedding_model: Option<String>,
     /// Always `None` from this resolver (no catalog fetch); frontends
     /// fall back to turn-count compaction, same as the offline CLI.
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedCredentialKind {
+    ApiKey,
+    Bearer,
+}
+
+fn resolved_platform_credential(
+    raw_override: Option<String>,
+    api_key: Option<String>,
+    token: Option<String>,
+    stored_token: Option<String>,
+) -> (Option<String>, Option<ResolvedCredentialKind>) {
+    if let Some(value) = raw_override {
+        return (Some(value), None);
+    }
+    if let Some(value) = api_key {
+        return (Some(value), Some(ResolvedCredentialKind::ApiKey));
+    }
+    if let Some(value) = token.or(stored_token) {
+        return (Some(value), Some(ResolvedCredentialKind::Bearer));
+    }
+    (None, None)
 }
 
 /// `{api_base}/projects/{id}/llm` — the MARC27 native LLM proxy endpoint.
@@ -117,15 +145,21 @@ pub fn resolve_llm_with(
             chat_config::load().unwrap_or_default().chat
         }
     };
-    let endpoints = PlatformEndpoints::from_env();
-
-    // The session's platform JWT — the credential the MARC27 LLM proxy
-    // authenticates.
-    let platform_token = paths
+    let stored_credentials = paths
         .load_cli_state()
         .ok()
-        .and_then(|s| s.credentials)
-        .map(|c| c.access_token);
+        .and_then(|state| state.credentials);
+    let endpoints = PlatformEndpoints::resolve_for_paths(
+        node_config.platform.url.as_deref(),
+        node_config.platform.provider.as_deref(),
+        stored_credentials.as_ref(),
+        paths,
+    );
+
+    // The session's provider JWT.
+    let platform_token = stored_credentials
+        .as_ref()
+        .map(|credentials| credentials.access_token.clone());
 
     // Generic key chain for the local/direct-provider targets. Provider
     // keys belong ONLY here — never on the marc27 arm (a project `.env`
@@ -133,8 +167,7 @@ pub fn resolve_llm_with(
     // every platform LLM call).
     let api_key = std::env::var("LLM_API_KEY")
         .or_else(|_| {
-            PlatformVar::TOKEN
-                .get()
+            PlatformVar::get_preferred_then_alias(&[PlatformVar::TOKEN, PlatformVar::API_TOKEN])
                 .ok_or(std::env::VarError::NotPresent)
         })
         .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
@@ -143,12 +176,17 @@ pub fn resolve_llm_with(
         .or_else(|| cfg_llm.resolve_api_key())
         .or_else(|| platform_token.clone());
 
-    let (base_url, model, api_key) = match &chat_target {
+    let (base_url, model, api_key, credential_kind) = match &chat_target {
         chat_config::ChatTarget::Local {
             url,
             model,
             api_key: local_key,
-        } => (url.clone(), model.clone(), local_key.clone().or(api_key)),
+        } => (
+            url.clone(),
+            model.clone(),
+            local_key.clone().or(api_key),
+            None,
+        ),
         chat_config::ChatTarget::Provider {
             provider,
             model,
@@ -163,11 +201,15 @@ pub fn resolve_llm_with(
                 provider_endpoint(&registry, provider),
                 model.clone(),
                 provider_key.or(api_key),
+                None,
             )
         }
         chat_config::ChatTarget::Marc27 {
             model: target_model,
         } => {
+            let endpoints = endpoints
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(crate::auth::PLATFORM_NOT_CONFIGURED))?;
             // LLM_MODEL env → target model → [llm].model; with none, the
             // literal `default` alias — the platform resolves it
             // server-side. (No catalog fetch in native frontends.)
@@ -176,25 +218,24 @@ pub fn resolve_llm_with(
                 .or_else(|| target_model.clone())
                 .or_else(|| cfg_llm.model.clone())
                 .unwrap_or_else(|| "default".to_string());
-            // Explicit LLM_API_KEY → stable m27_* key → MARC27_TOKEN →
-            // session JWT. Provider keys are NOT platform credentials.
-            let marc27_key = std::env::var("LLM_API_KEY")
-                .or_else(|_| {
-                    PlatformVar::API_KEY
-                        .get()
-                        .ok_or(std::env::VarError::NotPresent)
-                })
-                .or_else(|_| {
-                    PlatformVar::TOKEN
-                        .get()
-                        .ok_or(std::env::VarError::NotPresent)
-                })
-                .ok()
-                .or_else(|| platform_token.clone());
+            // Explicit LLM_API_KEY → PRISM_API_KEY → PRISM_TOKEN → session
+            // JWT. Historical MARC27 spellings remain deprecated aliases.
+            let (environment_api_key, environment_token) = match resolve_environment_credential() {
+                Some(PlatformAuth::ApiKey(value)) => (Some(value), None),
+                Some(PlatformAuth::Bearer(value)) => (None, Some(value)),
+                None => (None, None),
+            };
+            let (marc27_key, credential_kind) = resolved_platform_credential(
+                std::env::var("LLM_API_KEY").ok(),
+                environment_api_key,
+                environment_token,
+                platform_token.clone(),
+            );
             (
                 marc27_llm_base_url(paths, &endpoints.api_base, &cfg_llm.url)?,
                 model,
                 marc27_key,
+                credential_kind,
             )
         }
     };
@@ -203,6 +244,7 @@ pub fn resolve_llm_with(
         base_url,
         model,
         api_key,
+        credential_kind,
         embedding_model: cfg_llm.embedding_model.clone(),
         context_window: None,
         max_output_tokens: None,
@@ -215,9 +257,23 @@ pub fn resolve_llm_with(
 /// MARC27_API_KEY still passes through normal env inheritance.
 pub fn tool_server_env() -> BTreeMap<String, String> {
     let endpoints = PlatformEndpoints::from_env();
+    tool_server_env_with_endpoints(endpoints.as_ref())
+}
+
+/// Build tool-server environment from the endpoint already resolved for the
+/// native session. This keeps config/stored-login sessions from splitting:
+/// hosted chat and Python tools always see the same provider endpoint.
+pub fn tool_server_env_with_endpoints(
+    endpoints: Option<&PlatformEndpoints>,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("PRISM_ENABLE_MCP".to_string(), "1".to_string());
-    env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
+    if let Some(endpoints) = endpoints {
+        // Native name is authoritative. The historical spelling is exported
+        // too so older Python sidecars keep working during the migration.
+        env.insert("PRISM_API_URL".to_string(), endpoints.api_base.clone());
+        env.insert("MARC27_API_URL".to_string(), endpoints.api_base.clone());
+    }
     for key in &[
         "MP_API_KEY",
         "LENS_API_TOKEN",
@@ -257,11 +313,22 @@ pub fn native_session_inputs_with(
     target: Option<chat_config::ChatTarget>,
 ) -> Result<NativeSessionInputs> {
     let llm = resolve_llm_with(project_root, paths, target)?;
+    let node_config = core_config::NodeConfig::load(Some(project_root));
+    let stored_credentials = paths
+        .load_cli_state()
+        .ok()
+        .and_then(|state| state.credentials);
+    let endpoints = PlatformEndpoints::resolve_for_paths(
+        node_config.platform.url.as_deref(),
+        node_config.platform.provider.as_deref(),
+        stored_credentials.as_ref(),
+        paths,
+    );
     Ok(NativeSessionInputs {
         llm,
         python_bin,
         project_root: project_root.to_path_buf(),
-        env: tool_server_env(),
+        env: tool_server_env_with_endpoints(endpoints.as_ref()),
     })
 }
 
@@ -284,4 +351,55 @@ pub fn resolve_python_bin() -> PathBuf {
         }
     }
     PathBuf::from("python3")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prism_api_key_preserves_api_key_wire_kind_without_prefix() {
+        let (value, kind) = resolved_platform_credential(
+            None,
+            Some("provider-defined-key".into()),
+            Some("shadowed-token".into()),
+            Some("shadowed-session".into()),
+        );
+        assert_eq!(value.as_deref(), Some("provider-defined-key"));
+        assert_eq!(kind, Some(ResolvedCredentialKind::ApiKey));
+    }
+
+    #[test]
+    fn platform_token_preserves_bearer_kind_even_with_legacy_prefix() {
+        let (value, kind) =
+            resolved_platform_credential(None, None, Some("m27_session-shaped".into()), None);
+        assert_eq!(value.as_deref(), Some("m27_session-shaped"));
+        assert_eq!(kind, Some(ResolvedCredentialKind::Bearer));
+    }
+
+    #[test]
+    fn raw_llm_override_remains_legacy_auto_classified() {
+        let (value, kind) = resolved_platform_credential(
+            Some("m27_old-raw-caller".into()),
+            Some("shadowed-key".into()),
+            None,
+            None,
+        );
+        assert_eq!(value.as_deref(), Some("m27_old-raw-caller"));
+        assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn resolved_session_endpoint_is_forwarded_to_python_tools() {
+        let endpoints = PlatformEndpoints::from_url("https://configured.example");
+        let env = tool_server_env_with_endpoints(Some(&endpoints));
+        assert_eq!(
+            env.get("PRISM_API_URL").map(String::as_str),
+            Some("https://configured.example/api/v1")
+        );
+        assert_eq!(
+            env.get("MARC27_API_URL").map(String::as_str),
+            Some("https://configured.example/api/v1")
+        );
+    }
 }

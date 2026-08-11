@@ -9,7 +9,7 @@
 //!
 //! - [`config`]: Node configuration (`prism.toml` schema).
 //! - [`session`]: Multi-user session management (SQLite-backed).
-//! - [`rbac`]: Role-based access control (platform + local roles, permission checks).
+//! - [`rbac`]: PRISM-owned roles, provider-scoped assignments, and permission checks.
 //! - [`audit`]: Append-only audit log (SQLite-backed, required for ESA/defense compliance).
 //! - [`registry`]: Tool manifest discovery and in-memory tool registry.
 //! - [`execution`]: Harness execution envelope + trace events (who is

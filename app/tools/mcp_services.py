@@ -20,7 +20,7 @@ calphad_compute split:
 
 `project_id` is required for all four actions. Default resolution order:
   1. explicit `project_id` arg
-  2. `MARC27_PROJECT_ID` env var
+  2. `PRISM_PROJECT_ID` env var (or its deprecated provider alias)
   3. `~/.prism/credentials.json` `project_id` field
 
 Endpoint coverage:
@@ -43,6 +43,7 @@ from typing import Any, Optional
 import requests
 
 from app.tools._platform_client import platform
+from app.tools._platform_creds import resolve_credentials, resolve_env_alias
 
 from app.tools.base import Tool, ToolRegistry
 
@@ -51,27 +52,9 @@ from app.tools.base import Tool, ToolRegistry
 # Shared auth (mirror of platform_status.py:_resolve_credentials).
 # ---------------------------------------------------------------------------
 
-def _resolve_credentials() -> tuple[str, str]:
-    """Return (api_url, access_token) from env or `~/.prism/credentials.json`."""
-    api_url = os.environ.get(
-        "MARC27_API_URL", "https://api.marc27.com/api/v1"
-    ).rstrip("/")
-    api_key = os.environ.get("MARC27_API_KEY", "")
-
-    if not api_key:
-        try:
-            creds_path = Path.home() / ".prism" / "credentials.json"
-            if creds_path.exists():
-                creds = json.loads(creds_path.read_text())
-                api_key = creds.get("access_token", "")
-                if creds.get("platform_url"):
-                    api_url = creds["platform_url"].rstrip("/")
-                    if not api_url.endswith("/api/v1"):
-                        api_url = api_url + "/api/v1"
-        except Exception:
-            pass
-
-    return api_url, api_key
+def _resolve_credentials():
+    """Compatibility wrapper around PRISM's shared credential resolver."""
+    return resolve_credentials()
 
 
 def _resolve_project_id(explicit: Optional[str]) -> Optional[str]:
@@ -79,7 +62,7 @@ def _resolve_project_id(explicit: Optional[str]) -> Optional[str]:
     if no source produces a value."""
     if explicit:
         return explicit
-    env_val = os.environ.get("MARC27_PROJECT_ID")
+    env_val = resolve_env_alias("PRISM_PROJECT_ID", "MARC27_PROJECT_ID")
     if env_val:
         return env_val
     try:
@@ -129,7 +112,7 @@ def _mcp_services(**kwargs: Any) -> dict:
         return {
             "error": "No `project_id` resolved.",
             "hint": (
-                "Pass project_id=… explicitly, set MARC27_PROJECT_ID env var, "
+                "Pass project_id=… explicitly, set PRISM_PROJECT_ID env var, "
                 "or run `prism login` so ~/.prism/credentials.json carries it."
             ),
         }
@@ -170,7 +153,7 @@ def _mcp_services_invoke(**kwargs: Any) -> dict:
         return {
             "error": "No `project_id` resolved.",
             "hint": (
-                "Pass project_id=… explicitly, set MARC27_PROJECT_ID env var, "
+                "Pass project_id=… explicitly, set PRISM_PROJECT_ID env var, "
                 "or run `prism login` so ~/.prism/credentials.json carries it."
             ),
         }
@@ -226,7 +209,7 @@ _MCP_SERVICES_DESCRIPTION = (
     "project. Returns id, status, endpoint_url, health info per instance.\n"
     "  • action='get' — fetch a single instance with current health. "
     "Required: `instance_id`.\n"
-    "`project_id` is auto-resolved (env MARC27_PROJECT_ID or "
+    "`project_id` is auto-resolved (env PRISM_PROJECT_ID or "
     "~/.prism/credentials.json) but can be overridden explicitly.\n"
     "To PROXY a request through an instance or SCALE it, use the separate "
     "`mcp_services_invoke` tool — that one is approval-gated because "

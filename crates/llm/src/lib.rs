@@ -19,6 +19,18 @@ pub use local::{LOCAL_GGUF_URL, default_model_dir, is_local_gguf_url, resolve_mo
 
 // ── Configuration ────────────────────────────────────────────────────
 
+/// Wire semantics for a configured LLM credential.
+///
+/// `None` on [`LlmConfig::credential_kind`] is the compatibility mode for
+/// callers that only supplied a raw string: the frozen `m27_` prefix is then
+/// treated as an API key and every other value as a bearer token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmCredentialKind {
+    ApiKey,
+    Bearer,
+}
+
 /// Configuration for connecting to an LLM backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
@@ -29,6 +41,11 @@ pub struct LlmConfig {
     /// API key for authenticated providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Explicit wire semantics for `api_key`. PRISM's native platform
+    /// credential resolver sets this so provider-defined API-key shapes are
+    /// never reclassified by their contents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_kind: Option<LlmCredentialKind>,
     /// Separate embedding model. If not set, uses `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model: Option<String>,
@@ -78,6 +95,7 @@ impl Default for LlmConfig {
             base_url: String::new(), // Must be set from config
             model: String::new(),    // Must be set from config or server default
             api_key: None,
+            credential_kind: None,
             embedding_model: None,
             max_sample_rows: 10,
             timeout_secs: 300,
@@ -1900,17 +1918,16 @@ impl LlmClient {
             .unwrap_or(&self.config.model)
     }
 
-    /// The auth header `(name, value)` for the configured credential, routing
-    /// by shape: `m27_*` MARC27 platform API keys go on `X-API-Key` (the
-    /// platform rejects them on Bearer); session JWTs and provider keys stay on
-    /// `Authorization: Bearer`. This lets a headless chat server reach the
-    /// MARC27 LLM proxy with a non-expiring API key — no login, no refresh.
+    /// The auth header `(name, value)` for the configured credential.
+    /// Explicit kind wins; raw-string callers retain the frozen `m27_`
+    /// compatibility heuristic.
     fn auth_header(&self) -> Option<(&'static str, String)> {
         let key = self.config.api_key.as_ref().filter(|k| !k.is_empty())?;
-        if key.starts_with("m27_") {
-            Some(("X-API-Key", key.clone()))
-        } else {
-            Some(("Authorization", format!("Bearer {key}")))
+        match self.config.credential_kind {
+            Some(LlmCredentialKind::ApiKey) => Some(("X-API-Key", key.clone())),
+            Some(LlmCredentialKind::Bearer) => Some(("Authorization", format!("Bearer {key}"))),
+            None if key.starts_with("m27_") => Some(("X-API-Key", key.clone())),
+            None => Some(("Authorization", format!("Bearer {key}"))),
         }
     }
 
@@ -3667,9 +3684,7 @@ mod tests {
 
     #[test]
     fn auth_header_routes_m27_api_key_to_x_api_key() {
-        // `m27_*` platform keys must go on X-API-Key — the MARC27 backend
-        // rejects them on Bearer. This is what lets a headless chat server
-        // reach the LLM proxy with a non-expiring key.
+        // Old raw callers keep the frozen prefix behavior.
         let config = LlmConfig {
             api_key: Some("m27_live_abc123".into()),
             ..Default::default()
@@ -3679,6 +3694,53 @@ mod tests {
             client.auth_header(),
             Some(("X-API-Key", "m27_live_abc123".to_string()))
         );
+    }
+
+    #[test]
+    fn explicit_api_key_kind_accepts_provider_defined_shape() {
+        let client = LlmClient::new(LlmConfig {
+            api_key: Some("provider-defined-key".into()),
+            credential_kind: Some(LlmCredentialKind::ApiKey),
+            ..Default::default()
+        });
+        assert_eq!(
+            client.auth_header(),
+            Some(("X-API-Key", "provider-defined-key".to_string()))
+        );
+    }
+
+    #[test]
+    fn explicit_bearer_kind_overrides_legacy_prefix_heuristic() {
+        let client = LlmClient::new(LlmConfig {
+            api_key: Some("m27_session-shaped".into()),
+            credential_kind: Some(LlmCredentialKind::Bearer),
+            ..Default::default()
+        });
+        assert_eq!(
+            client.auth_header(),
+            Some(("Authorization", "Bearer m27_session-shaped".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_api_key_reaches_llm_http_as_x_api_key() {
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/v1/models")
+            .match_header("x-api-key", "provider-defined-key")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let client = LlmClient::new(LlmConfig {
+            base_url: server.url(),
+            api_key: Some("provider-defined-key".into()),
+            credential_kind: Some(LlmCredentialKind::ApiKey),
+            ..Default::default()
+        });
+
+        client.health_check().await.unwrap();
+        request.assert_async().await;
     }
 
     #[test]

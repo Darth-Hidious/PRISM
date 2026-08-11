@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! PRISM node runtime — the `prism-node` daemon binary.
 //!
-//! Turns any machine into a MARC27 compute node. Capabilities:
+//! Turns any machine into a PRISM compute node. Capabilities:
 //!
 //! - **Hardware probing** ([`detect`]): CPU, RAM, GPU, disk, container runtimes, services.
 //! - **Job execution** ([`executor`]): Docker/Podman container lifecycle with timeouts and output capture.
@@ -14,5 +14,6 @@ pub mod crypto;
 pub mod daemon;
 pub mod detect;
 pub mod executor;
+pub mod provider_roles;
 pub mod runtime_service;
 pub mod state;

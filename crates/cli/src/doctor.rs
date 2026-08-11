@@ -167,9 +167,20 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
 
     let paths = PrismPaths::discover()?;
     let state = paths.load_cli_state().unwrap_or_default();
-    let endpoints = PlatformEndpoints::from_env();
-    let platform_checks =
-        boot_checks::run_boot_checks(state.credentials.as_ref(), &endpoints).await;
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    let endpoints = PlatformEndpoints::resolve_for_paths(
+        config.platform.url.as_deref(),
+        config.platform.provider.as_deref(),
+        state.credentials.as_ref(),
+        &paths,
+    );
+    let node_token = paths.load_node_token();
+    let platform_checks = boot_checks::run_boot_checks_with_node_token(
+        state.credentials.as_ref(),
+        endpoints.as_ref(),
+        node_token.as_ref().map(|token| token.key.as_str()),
+    )
+    .await;
     print_check_lines(&platform_checks);
 
     // ── Section 3: repairs (`--fix` only) ─────────────────────────────

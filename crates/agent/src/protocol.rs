@@ -329,11 +329,11 @@ async fn select_project_context_automatically(
                         project_id: Some(project.id),
                         project_name: Some(project.name),
                     },
-                    notes: vec![format!("Using MARC27_PROJECT_ID override ({project_id})")],
+                    notes: vec![format!("Using PRISM_PROJECT_ID override ({project_id})")],
                 });
             }
             Err(error) => {
-                tracing::warn!(error = %error, project_id, "failed to resolve MARC27_PROJECT_ID override");
+                tracing::warn!(error = %error, project_id, "failed to resolve PRISM_PROJECT_ID override");
             }
         }
     }
@@ -403,13 +403,9 @@ fn clear_sdk_credentials() {
 /// Publish (or clear) the signed-in account on the process environment, which
 /// every child inherits — including the Python sidecar.
 ///
-/// Each platform value is written under BOTH spellings, neutral and
-/// historical. Not a transitional hedge: the shipped MIT Python tools read the
-/// historical name directly (`app/tools/platform_workflows.py`,
-/// `app/tools/mcp_services.py`), so dropping it would sign those tools out
-/// while Rust stayed authenticated. Writing only the historical name would
-/// work but leave the migration permanently unfinished. Both, same value —
-/// `PlatformVar` prefers the neutral one and they never disagree.
+/// Every account is published under PRISM-native names. Historical spellings
+/// are emitted only for a stored MARC27 provider, preserving old sidecars
+/// without relabelling a generic provider's credential as MARC27-owned.
 ///
 /// The clear path must cover both spellings for the same reason it exists: a
 /// name left behind on sign-out is a live credential surviving a logout.
@@ -421,6 +417,8 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
         PlatformVar::PLATFORM_URL.alias,
         PlatformVar::PROJECT_ID.preferred,
         PlatformVar::PROJECT_ID.alias,
+        PlatformVar::PROVIDER.preferred,
+        PlatformVar::PROVIDER.alias,
         "PRISM_ACCOUNT_USER_ID",
         "PRISM_ACCOUNT_DISPLAY_NAME",
         "PRISM_ACCOUNT_ORG_ID",
@@ -428,19 +426,32 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
         "PRISM_ACCOUNT_PROJECT_NAME",
     ];
 
-    /// Write one platform value under both names.
-    fn set_both(var: PlatformVar, value: &str) {
+    fn set_platform_value(var: PlatformVar, value: &str, include_alias: bool) {
         unsafe {
             std::env::set_var(var.preferred, value);
-            std::env::set_var(var.alias, value);
+            if include_alias {
+                std::env::set_var(var.alias, value);
+            } else {
+                std::env::remove_var(var.alias);
+            }
+        }
+    }
+
+    for key in KEYS {
+        unsafe {
+            std::env::remove_var(key);
         }
     }
 
     if let Some(creds) = creds {
-        set_both(PlatformVar::TOKEN, &creds.access_token);
-        set_both(PlatformVar::PLATFORM_URL, &creds.platform_url);
+        let is_marc27 = creds.platform_provider.as_deref() == Some("marc27");
+        set_platform_value(PlatformVar::TOKEN, &creds.access_token, is_marc27);
+        set_platform_value(PlatformVar::PLATFORM_URL, &creds.platform_url, is_marc27);
+        if let Some(provider) = &creds.platform_provider {
+            set_platform_value(PlatformVar::PROVIDER, provider, is_marc27);
+        }
         if let Some(project_id) = &creds.project_id {
-            set_both(PlatformVar::PROJECT_ID, project_id);
+            set_platform_value(PlatformVar::PROJECT_ID, project_id, is_marc27);
         }
         if let Some(user_id) = &creds.user_id {
             unsafe {
@@ -465,12 +476,6 @@ fn apply_account_env(creds: Option<&StoredCredentials>) {
         if let Some(project_name) = &creds.project_name {
             unsafe {
                 std::env::set_var("PRISM_ACCOUNT_PROJECT_NAME", project_name);
-            }
-        }
-    } else {
-        for key in KEYS {
-            unsafe {
-                std::env::remove_var(key);
             }
         }
     }
@@ -3763,7 +3768,16 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
         let body = match &creds {
             None => "Not signed in — log in from the account view to inspect nodes.".to_string(),
             Some(creds) => {
-                let endpoints = PlatformEndpoints::from_env();
+                let Some(endpoints) = PlatformEndpoints::resolve(None, Some(creds)) else {
+                    emit_view(
+                        "node",
+                        "Node detail",
+                        prism_runtime::auth::PLATFORM_NOT_CONFIGURED,
+                        "info",
+                    );
+                    emit_notification("ui.turn.complete", serde_json::json!({}));
+                    return Ok(true);
+                };
                 let platform =
                     PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
                 let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
@@ -3784,7 +3798,17 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
             Some("Not signed in — log in from the account view to see your nodes.".to_string()),
         ),
         Some(creds) => {
-            let endpoints = PlatformEndpoints::from_env();
+            let Some(endpoints) = PlatformEndpoints::resolve(None, Some(&creds)) else {
+                emit_notification(
+                    "ui.nodes.list",
+                    serde_json::json!({
+                        "nodes": [],
+                        "error": prism_runtime::auth::PLATFORM_NOT_CONFIGURED,
+                    }),
+                );
+                emit_notification("ui.turn.complete", serde_json::json!({}));
+                return Ok(true);
+            };
             let platform = PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
             let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
             match registry.list_nodes(None).await {
@@ -3942,7 +3966,13 @@ async fn node_status_body() -> String {
         lines.push("  Not signed in — log in from the account view.".to_string());
         return lines.join("\n");
     };
-    let endpoints = PlatformEndpoints::from_env();
+    let Some(endpoints) = PlatformEndpoints::resolve(None, Some(&creds)) else {
+        lines.push(format!(
+            "  {}",
+            prism_runtime::auth::PLATFORM_NOT_CONFIGURED
+        ));
+        return lines.join("\n");
+    };
     let platform = PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
     let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
     match snapshot.and_then(|snap| snap.node_id) {
@@ -4822,6 +4852,7 @@ async fn handle_workflow_slash_command(
             let options = WorkflowExecutionOptions {
                 trusted_llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
                 trusted_llm_api_key: llm_config.api_key.clone(),
+                trusted_llm_credential_kind: llm_config.credential_kind,
                 caller_supplied_llm_base_url,
                 trusted_node_port: node_token.as_ref().map(|_| 7327),
                 trusted_node_token: node_token,
@@ -4863,6 +4894,7 @@ async fn handle_workflow_slash_command(
             let options = WorkflowExecutionOptions {
                 trusted_llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
                 trusted_llm_api_key: llm_config.api_key.clone(),
+                trusted_llm_credential_kind: llm_config.credential_kind,
                 caller_supplied_llm_base_url,
                 trusted_node_port: node_token.as_ref().map(|_| 7327),
                 trusted_node_token: node_token,
@@ -7599,6 +7631,7 @@ pub async fn build_agent_seed(
         llm_base_url: Some(llm_config.base_url.clone()).filter(|s| !s.is_empty()),
         llm_model: Some(llm_config.model.clone()).filter(|s| !s.is_empty()),
         llm_api_key: llm_config.api_key.clone(),
+        llm_credential_kind: llm_config.credential_kind,
     };
     let hooks = Arc::new(build_default_hooks());
     let permissions = build_effective_permission_context(

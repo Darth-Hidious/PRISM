@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use prism_runtime::platform_env::PlatformVar;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -137,6 +138,9 @@ pub struct WorkflowExecutionOptions {
     /// Credential resolved alongside the trusted endpoint. It is never used
     /// when the caller supplied an endpoint.
     pub trusted_llm_api_key: Option<String>,
+    /// Wire semantics resolved alongside `trusted_llm_api_key`. `None` keeps
+    /// compatibility for launchers that still provide only a raw secret.
+    pub trusted_llm_credential_kind: Option<prism_llm::LlmCredentialKind>,
     /// Whether the caller supplied `llm_base_url` in the values map. This
     /// remains true even when it happens to equal the trusted endpoint.
     pub caller_supplied_llm_base_url: bool,
@@ -326,10 +330,7 @@ pub fn build_initial_context(
             None => true,
         };
         if missing {
-            if !argument.env.is_empty()
-                && let Ok(value) = env::var(&argument.env)
-                && !value.is_empty()
-            {
+            if let Some(value) = workflow_argument_env(&argument.env) {
                 context.insert(argument.name.clone(), serde_json::Value::String(value));
                 continue;
             }
@@ -361,6 +362,27 @@ pub fn build_initial_context(
         .entry("now_iso".to_string())
         .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
     Ok(context)
+}
+
+/// Resolve a workflow argument's environment value through PRISM's canonical
+/// platform surface where applicable. This keeps built-in workflows compatible
+/// with legacy MARC27 aliases without teaching each YAML file its own alias
+/// order or silently bypassing the shared deprecation notice.
+fn workflow_argument_env(name: &str) -> Option<String> {
+    match name {
+        "PRISM_API_URL" | "MARC27_API_URL" | "PRISM_PLATFORM_URL" | "MARC27_PLATFORM_URL" => {
+            PlatformVar::get_preferred_then_alias(&[
+                PlatformVar::API_URL,
+                PlatformVar::PLATFORM_URL,
+            ])
+        }
+        "PRISM_PROJECT_ID" | "MARC27_PROJECT_ID" => PlatformVar::PROJECT_ID.get(),
+        "" => None,
+        other => env::var(other)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    }
 }
 
 pub async fn execute_workflow(
@@ -1340,17 +1362,23 @@ async fn run_llm_step(
         } else {
             ("http://127.0.0.1:8081/v1".to_string(), false, false)
         };
-    let api_key = if !trusted_destination {
-        None
+    let (api_key, credential_kind) = if !trusted_destination {
+        (None, None)
     } else if trusted_config_selected {
         // The launcher must resolve the endpoint and credential as a pair.
         // In particular, never reattach MARC27_TOKEN merely because a
         // trusted endpoint was supplied without its paired key.
-        options.trusted_llm_api_key.clone()
+        (
+            options.trusted_llm_api_key.clone(),
+            options.trusted_llm_credential_kind,
+        )
     } else {
         // Process-level LLM_BASE_URL and LLM_API_KEY are the only implicit
         // pair. Platform credentials are never an LLM env fallback.
-        env::var("LLM_API_KEY").ok().filter(|key| !key.is_empty())
+        (
+            env::var("LLM_API_KEY").ok().filter(|key| !key.is_empty()),
+            None,
+        )
     };
     // Model resolves with the same precedence as base_url: step config →
     // context (`llm_model`, injected by the agent/CLI from the resolved chat
@@ -1370,6 +1398,7 @@ async fn run_llm_step(
     let config = prism_llm::LlmConfig {
         base_url,
         api_key,
+        credential_kind,
         model,
         embedding_model: None,
         ..Default::default()
@@ -2796,12 +2825,92 @@ fn ssrf_block_reason(url: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    static PLATFORM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PlatformEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl PlatformEnvRestore {
+        fn clear() -> Self {
+            let names = [
+                "PRISM_API_URL",
+                "MARC27_API_URL",
+                "PRISM_PLATFORM_URL",
+                "MARC27_PLATFORM_URL",
+                "PRISM_PROJECT_ID",
+                "MARC27_PROJECT_ID",
+            ];
+            let saved = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect();
+            for name in names {
+                unsafe { std::env::remove_var(name) };
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for PlatformEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_platform_env_uses_native_first_alias_families() {
+        let _lock = PLATFORM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = PlatformEnvRestore::clear();
+        unsafe {
+            std::env::set_var("PRISM_PLATFORM_URL", "https://native.example/api/v1");
+            std::env::set_var("MARC27_API_URL", "https://legacy.example/api/v1");
+            std::env::set_var("PRISM_PROJECT_ID", "native-project");
+            std::env::set_var("MARC27_PROJECT_ID", "legacy-project");
+        }
+
+        assert_eq!(
+            workflow_argument_env("MARC27_API_URL").as_deref(),
+            Some("https://native.example/api/v1")
+        );
+        assert_eq!(
+            workflow_argument_env("MARC27_PROJECT_ID").as_deref(),
+            Some("native-project")
+        );
+
+        unsafe {
+            std::env::remove_var("PRISM_PLATFORM_URL");
+        }
+        assert_eq!(
+            workflow_argument_env("PRISM_API_URL").as_deref(),
+            Some("https://legacy.example/api/v1")
+        );
+    }
+
     #[test]
     fn parses_builtin_forge() {
         let specs = discover_workflows(None).unwrap();
         let forge = find_workflow(&specs, "forge").unwrap();
         assert_eq!(forge.command_name, "forge");
         assert!(!forge.steps.is_empty());
+        let platform = forge
+            .arguments
+            .iter()
+            .find(|argument| argument.name == "platform_api_base")
+            .expect("forge must declare its platform endpoint");
+        assert_eq!(platform.env, "PRISM_API_URL");
+        assert!(platform.required);
+        assert_eq!(
+            platform.default, None,
+            "no provider endpoint may be implicit"
+        );
     }
 
     #[test]
@@ -3231,6 +3340,9 @@ name: kind_test
                     ("dataset", "materials-project"),
                     ("target", "prism-node:local"),
                     ("project_id", "test-project"),
+                    // No default: PRISM does not ship a provider endpoint, so the
+                    // caller must name one. A test value, not a real host.
+                    ("platform_api_base", "https://api.example.invalid/v1"),
                 ],
             ),
         ] {

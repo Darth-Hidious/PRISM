@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 struct Seen {
     requests: Arc<Mutex<Vec<Value>>>,
     auth_headers: Arc<Mutex<Vec<Option<String>>>>,
+    api_key_headers: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 async fn fake_chat_completions(
@@ -37,6 +38,11 @@ async fn fake_chat_completions(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     seen.auth_headers.lock().unwrap().push(auth);
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    seen.api_key_headers.lock().unwrap().push(api_key);
     seen.requests.lock().unwrap().push(body);
     Json(json!({
         "choices": [{ "message": { "content": "ack" } }]
@@ -122,6 +128,7 @@ async fn caller_supplied_llm_endpoint_never_receives_node_credential() {
     let options = prism_workflows::WorkflowExecutionOptions {
         trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
         trusted_llm_api_key: Some("node-secret-token".to_string()),
+        trusted_llm_credential_kind: None,
         caller_supplied_llm_base_url: true,
         trusted_node_port: None,
         trusted_node_token: None,
@@ -147,6 +154,7 @@ async fn trusted_endpoint_without_launcher_key_never_uses_marc27_token() {
     let options = prism_workflows::WorkflowExecutionOptions {
         trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
         trusted_llm_api_key: None,
+        trusted_llm_credential_kind: None,
         caller_supplied_llm_base_url: false,
         trusted_node_port: None,
         trusted_node_token: None,
@@ -178,6 +186,7 @@ async fn trusted_llm_endpoint_keeps_its_paired_credential() {
     let options = prism_workflows::WorkflowExecutionOptions {
         trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
         trusted_llm_api_key: Some("trusted-node-key".to_string()),
+        trusted_llm_credential_kind: None,
         caller_supplied_llm_base_url: false,
         trusted_node_port: None,
         trusted_node_token: None,
@@ -197,6 +206,38 @@ async fn trusted_llm_endpoint_keeps_its_paired_credential() {
     assert_eq!(
         seen.auth_headers.lock().unwrap().as_slice(),
         &[Some("Bearer trusted-node-key".to_string())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trusted_platform_api_key_keeps_explicit_wire_kind() {
+    let seen = Seen::default();
+    let llm_port = spawn_llm(seen.clone()).await;
+    let spec = single_llm_workflow();
+    let options = prism_workflows::WorkflowExecutionOptions {
+        trusted_llm_base_url: Some(format!("http://127.0.0.1:{llm_port}/v1")),
+        trusted_llm_api_key: Some("provider-defined-key".to_string()),
+        trusted_llm_credential_kind: Some(prism_llm::LlmCredentialKind::ApiKey),
+        caller_supplied_llm_base_url: false,
+        trusted_node_port: None,
+        trusted_node_token: None,
+    };
+
+    prism_workflows::execute_workflow_with_policy_and_options(
+        &spec,
+        &BTreeMap::new(),
+        true,
+        None,
+        None,
+        None,
+        &options,
+    )
+    .await
+    .expect("trusted API-key endpoint should remain usable");
+    assert_eq!(seen.auth_headers.lock().unwrap().as_slice(), &[None]);
+    assert_eq!(
+        seen.api_key_headers.lock().unwrap().as_slice(),
+        &[Some("provider-defined-key".to_string())]
     );
 }
 

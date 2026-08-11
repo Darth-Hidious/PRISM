@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use prism_runtime::retry;
+use prism_runtime::{auth::PlatformAuth, retry};
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -103,21 +103,21 @@ pub struct OrgInfo {
     pub slug: String,
 }
 
-/// Typed HTTP client for the MARC27 platform API.
+/// Typed HTTP client for a configured PRISM-compatible provider API.
 ///
 /// The base URL should include the API version prefix,
-/// e.g. `https://api.marc27.com/api/v1`.
+/// e.g. `https://provider.example/api/v1`.
 #[derive(Debug, Clone)]
 pub struct PlatformClient {
     base_url: String,
     client: reqwest::Client,
-    access_token: Option<String>,
+    credential: Option<PlatformAuth>,
 }
 
 impl PlatformClient {
     /// Create a new client pointing at the given API base URL.
     ///
-    /// The URL should include the version prefix (e.g. `https://api.marc27.com/api/v1`).
+    /// The URL should include the version prefix (e.g. `https://provider.example/api/v1`).
     pub fn new(base_url: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -127,13 +127,23 @@ impl PlatformClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client,
-            access_token: None,
+            credential: None,
         }
     }
 
-    /// Attach an access token for authenticated requests.
+    /// Attach a raw legacy credential for authenticated requests.
+    ///
+    /// New callers that know whether they hold an API key or a bearer token
+    /// should use [`Self::with_auth`]. This method retains the frozen `m27_`
+    /// shape heuristic for source compatibility with older callers.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.access_token = Some(token.into());
+        self.credential = Some(PlatformAuth::classify(&token.into()));
+        self
+    }
+
+    /// Attach a credential with its PRISM-defined wire semantics intact.
+    pub fn with_auth(mut self, credential: PlatformAuth) -> Self {
+        self.credential = Some(credential);
         self
     }
 
@@ -147,7 +157,7 @@ impl PlatformClient {
     /// refreshed token after a 401-retry (a previous bug stored the stale,
     /// 401'd client and the daemon then ran all REST calls on the dead token).
     pub fn access_token(&self) -> Option<&str> {
-        self.access_token.as_deref()
+        self.credential.as_ref().map(PlatformAuth::secret)
     }
 
     /// Return a reference to the inner reqwest client.
@@ -157,21 +167,23 @@ impl PlatformClient {
 
     /// Build authorization headers if a credential is set.
     ///
-    /// Routes by credential shape: non-expiring `m27_*` API keys authenticate
-    /// on the `X-API-Key` header, while rotating session JWTs use
-    /// `Authorization: Bearer`. The platform rejects each on the other's
-    /// channel, so a headless server or agent configured with an API key
-    /// (no login, no device flow, no refresh) authenticates correctly here.
+    /// Explicit credential kind is authoritative. The raw [`Self::with_token`]
+    /// compatibility constructor classifies the frozen `m27_` prefix, while
+    /// [`Self::with_auth`] allows provider-defined API-key shapes.
     pub(crate) fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        if let Some(ref token) = self.access_token {
-            if token.starts_with("m27_") {
-                let val = HeaderValue::from_str(token).context("invalid characters in API key")?;
-                headers.insert(HeaderName::from_static("x-api-key"), val);
-            } else {
-                let val = HeaderValue::from_str(&format!("Bearer {token}"))
-                    .context("invalid characters in access token")?;
-                headers.insert(AUTHORIZATION, val);
+        if let Some(credential) = &self.credential {
+            match credential {
+                PlatformAuth::ApiKey(key) => {
+                    let val =
+                        HeaderValue::from_str(key).context("invalid characters in API key")?;
+                    headers.insert(HeaderName::from_static("x-api-key"), val);
+                }
+                PlatformAuth::Bearer(token) => {
+                    let val = HeaderValue::from_str(&format!("Bearer {token}"))
+                        .context("invalid characters in access token")?;
+                    headers.insert(AUTHORIZATION, val);
+                }
             }
         }
         Ok(headers)
@@ -192,7 +204,7 @@ impl PlatformClient {
         if prism_runtime::offline::enabled() {
             anyhow::bail!(
                 "offline mode: {method} {path} blocked by --offline \
-                 (remove the flag to reach the MARC27 platform)"
+                 (remove the flag to reach the configured provider)"
             );
         }
         Ok(())
@@ -496,6 +508,70 @@ impl std::fmt::Debug for LlmKeyEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_api_key_kind_does_not_depend_on_marc27_prefix() {
+        let headers = PlatformClient::new("https://provider.example/api/v1")
+            .with_auth(PlatformAuth::ApiKey("provider-defined-key".into()))
+            .auth_headers()
+            .unwrap();
+
+        assert_eq!(headers.get("x-api-key").unwrap(), "provider-defined-key");
+        assert!(!headers.contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn explicit_bearer_kind_overrides_legacy_prefix_heuristic() {
+        let headers = PlatformClient::new("https://provider.example/api/v1")
+            .with_auth(PlatformAuth::Bearer("m27_session-shaped".into()))
+            .auth_headers()
+            .unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer m27_session-shaped"
+        );
+        assert!(!headers.contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn raw_token_constructor_retains_legacy_marc27_prefix_heuristic() {
+        let headers = PlatformClient::new("https://provider.example/api/v1")
+            .with_token("m27_legacy_key")
+            .auth_headers()
+            .unwrap();
+
+        assert_eq!(headers.get("x-api-key").unwrap(), "m27_legacy_key");
+        assert!(!headers.contains_key(AUTHORIZATION));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn explicit_provider_api_key_reaches_http_as_x_api_key() {
+        // PRISM_OFFLINE is process-global, so a test that needs it UNSET depends
+        // on it exactly as much as the test that sets it. Without this lock the
+        // offline test's `PRISM_OFFLINE=1` refuses this request mid-flight.
+        let _guard = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::capture();
+
+        let mut server = mockito::Server::new_async().await;
+        let request = server
+            .mock("GET", "/api/v1/probe")
+            .match_header("x-api-key", "provider-defined-key")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let response: serde_json::Value = PlatformClient::new(format!("{}/api/v1", server.url()))
+            .with_auth(PlatformAuth::ApiKey("provider-defined-key".into()))
+            .get("/probe")
+            .await
+            .unwrap();
+
+        assert_eq!(response, serde_json::json!({}));
+        request.assert_async().await;
+    }
 
     /// The highest-blast-radius guard on the branch, and it had NO test.
     ///
