@@ -752,13 +752,25 @@ impl IngestPipeline {
         // them from their fact-written selves — `Alloy:X` standalone vs
         // `Matter:X` as a fact subject.)
         for e in &entity_set.entities {
-            if !written.insert(e.name.as_str()) {
-                continue; // already a node via some relationship (or a duplicate name)
-            }
             let props = match &e.properties {
                 serde_json::Value::Object(map) if !map.is_empty() => Some(e.properties.to_string()),
                 _ => None,
             };
+            // An entity a relationship already wrote used to `continue` HERE,
+            // before its properties were passed to the store — so the only
+            // entities that kept their extracted properties were the ones in
+            // no relationship at all. In a real paper the subject of every
+            // fact ("Ti-6Al-4V") is exactly the entity whose properties were
+            // thrown away, and the orphans nobody asked about kept theirs.
+            //
+            // Writing again is safe and is not a second node: the label comes
+            // from the same `classification_of` the fact writes above used, so
+            // the key is identical, and `upsert_entity` merges props with
+            // COALESCE — a later write with no props cannot erase stored ones.
+            let is_new_node = written.insert(e.name.as_str());
+            if !is_new_node && props.is_none() {
+                continue; // a fact wrote the node and there is nothing to add
+            }
             store
                 .write_classified_entity(&e.name, classification_of(&e.name)?, props, &prov.tenant)
                 .await?;
@@ -1499,6 +1511,89 @@ mod tests {
             hits.iter()
                 .any(|n| n.name == "Nickel" && n.label == "Element"),
             "the relationship-less entity is missing from the store (or mislabeled): {hits:?}",
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = db_path.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// An entity in a relationship kept NO extracted properties: the loop
+    /// skipped it as already-written before its props reached the store, so
+    /// the only entities that kept theirs were the ones connected to nothing.
+    /// The subject of every fact in a real paper is exactly the entity whose
+    /// properties were discarded.
+    ///
+    /// Drives the real `write_local_graph`, so restoring the early `continue`
+    /// fails here.
+    #[tokio::test]
+    async fn a_connected_entity_keeps_its_extracted_properties() {
+        use crate::{Entity, Relationship};
+
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+
+        let db_path =
+            std::env::temp_dir().join(format!("prism_pipeline_test_{}.db", uuid::Uuid::new_v4()));
+        let pipeline = IngestPipeline::with_config(PipelineConfig {
+            llm: None,
+            batch_rows: None,
+            mapping: None,
+            provenance_db: Some(db_path.clone()),
+            ontology: None,
+            on_progress: None,
+        });
+
+        let entity_set = EntitySet {
+            entities: vec![
+                Entity {
+                    entity_type: "Alloy".into(),
+                    name: "Steel".into(),
+                    // Steel is a fact subject below — the case that lost props.
+                    properties: serde_json::json!({"crystal_structure": "bcc"}),
+                },
+                Entity {
+                    entity_type: "Element".into(),
+                    name: "Fe".into(),
+                    properties: serde_json::json!({}),
+                },
+            ],
+            relationships: vec![Relationship {
+                from: "Steel".into(),
+                rel_type: "CONTAINS".into(),
+                to: "Fe".into(),
+                weight: Some(0.98),
+                order: None,
+                value: None,
+                unit: None,
+            }],
+        };
+        let source = DataSource {
+            path: "/tmp/alloys.csv".into(),
+            format: "csv".into(),
+        };
+
+        let emmo = crate::ontologies::EmmoOntology;
+        let (_, dropped) = pipeline
+            .write_local_graph(&emmo, &entity_set, &source, "local", None)
+            .await
+            .unwrap();
+        assert!(dropped.is_empty(), "{dropped:?}");
+
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let props = store
+            .entity_props_json("Steel", "local")
+            .await
+            .unwrap()
+            .expect("a connected entity's extracted properties must be stored");
+        let props: serde_json::Value = serde_json::from_str(&props).unwrap();
+        assert_eq!(
+            props["crystal_structure"].as_str(),
+            Some("bcc"),
+            "the property the extraction asserted must survive to the store"
         );
 
         for suffix in ["", "-wal", "-shm"] {

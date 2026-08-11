@@ -3122,6 +3122,33 @@ impl ProvenanceStore {
     // tenant issue per-tenant reads.
     // ─────────────────────────────────────────────────────────────────────
 
+    /// The stored attributes of one entity (`emmo_entity.props_json`).
+    ///
+    /// Ingest has always written these; nothing could read them back, so a
+    /// crystal structure or any other extracted attribute was unreachable the
+    /// moment it landed. Exact name within one tenant — the same pairing every
+    /// other per-tenant read uses, so the same name owned by two tenants stays
+    /// two rows.
+    ///
+    /// `Ok(None)` distinguishes "no such entity" and "entity with no stored
+    /// attributes" from an error; neither is exceptional.
+    pub async fn entity_props_json(&self, name: &str, tenant: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT props_json FROM emmo_entity WHERE tenant = ?1 AND name = ?2",
+                vec![
+                    Value::Text(tenant.to_string()),
+                    Value::Text(name.to_string()),
+                ],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => crate::get_opt_str(&row, 0),
+            None => Ok(None),
+        }
+    }
+
     /// Substring search over entity names (shortest names first, like the
     /// cloud's CONTAINS fallback).
     pub async fn graph_search(
