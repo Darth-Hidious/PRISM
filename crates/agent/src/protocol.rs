@@ -5272,6 +5272,15 @@ fn emit_agent_event(event: AgentEvent) {
         AgentEvent::TextFlush => {
             emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
         }
+        AgentEvent::ContextPriming { iteration, status } => {
+            emit_notification(
+                "ui.context.priming",
+                serde_json::json!({
+                    "iteration": iteration,
+                    "status": status,
+                }),
+            );
+        }
         AgentEvent::ToolCallStart {
             tool_name,
             call_id,

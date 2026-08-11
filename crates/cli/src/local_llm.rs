@@ -347,43 +347,62 @@ pub use prism_runtime::offline::is_loopback_url;
 /// worse than none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnnxEmbedder {
-    /// Weights are already on disk — works offline right now.
+    /// The exact pinned snapshot is verified. Platform usability is a
+    /// separate fact; Intel macOS may cache valid bytes it cannot execute.
     pub cached: bool,
+    pub platform_supported: bool,
+    /// Exact availability, including an actionable reason when unavailable.
+    pub status: prism_embed::NativeModelStatus,
     /// Model identity, as shipped.
     pub model: &'static str,
     pub dimensions: usize,
 }
 
-/// Report the bundled embedder. Pure filesystem check, no model load: this
-/// runs on listing paths where blocking for a 90 MB download would be
-/// indefensible.
+/// Report the bundled embedder. This hashes the pinned files but performs no
+/// model load and no acquisition.
 pub fn onnx_embedder() -> OnnxEmbedder {
-    let cached = prism_embed::default_cache_dir()
-        .ok()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false);
+    let status = prism_embed::native_model_status();
+    let cached = status.is_ready();
     OnnxEmbedder {
         cached,
+        platform_supported: prism_embed::native_backend_supported(),
+        status,
         model: "bge-small-en-v1.5",
         dimensions: 384,
     }
 }
 
 impl OnnxEmbedder {
-    /// One line for `prism use list`. Says what works now, and — when the
-    /// weights are not yet on disk — what the first use will cost, rather
-    /// than implying an offline machine already has them.
+    /// One line for `prism use list`. Says what works now and gives the
+    /// explicit setup action when the pinned snapshot is unavailable.
     pub fn summary(&self) -> String {
-        if self.cached {
+        if !self.platform_supported {
+            let integrity = if self.cached {
+                "snapshot integrity verified"
+            } else {
+                "snapshot not installed or invalid"
+            };
+            format!(
+                "local ONNX · {} ({}-dim), unavailable on Intel macOS ({integrity}) — configure PRISM_EMBED_BACKEND=openai",
+                self.model, self.dimensions
+            )
+        } else if self.cached {
             format!(
                 "local ONNX · {} ({}-dim), cached — offline semantic search, no account",
                 self.model, self.dimensions
             )
         } else {
+            let reason = self
+                .status
+                .unavailable()
+                .map(|reason| reason.code)
+                .map(|code| format!("{code:?}"))
+                .unwrap_or_else(|| "Unavailable".to_string());
             format!(
-                "local ONNX · {} ({}-dim), downloads ~90 MB on first use, then offline",
-                self.model, self.dimensions
+                "local ONNX · {} ({}-dim), unavailable ({reason}) — install explicitly with `{}`",
+                self.model,
+                self.dimensions,
+                prism_embed::BGE_INSTALL_COMMAND
             )
         }
     }
@@ -724,10 +743,12 @@ mod tests {
         assert!(summary.contains("ONNX"), "{summary}");
         assert!(summary.contains("384"), "{summary}");
         // Either state must be honest about offline availability.
-        if onnx.cached {
+        if !onnx.platform_supported {
+            assert!(summary.contains("unavailable on Intel macOS"), "{summary}");
+        } else if onnx.cached {
             assert!(summary.contains("cached"), "{summary}");
         } else {
-            assert!(summary.contains("first use"), "{summary}");
+            assert!(summary.contains("install explicitly"), "{summary}");
         }
     }
 }

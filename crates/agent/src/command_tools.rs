@@ -127,9 +127,11 @@ mod credential_debug_tests {
 /// [`reject_global_flag_override`] only knows PRISM's *global* options, and a
 /// static per-tool denylist structurally cannot know what flags a subcommand
 /// grows later. That is how `{"name":"doctor","args":["--fix"]}` reached
-/// `doctor::run(.., fix = true)` — `remove_dir_all(~/.prism/venv)`, a pip/uv
-/// reprovision and a ~90 MB model download — through a tool declared
-/// `ReadOnly, requires_approval: false`, i.e. with no approval prompt.
+/// `doctor::run(.., fix = true)` — `remove_dir_all(~/.prism/venv)` and a pip/uv
+/// reprovision over the network — through a tool declared
+/// `ReadOnly, requires_approval: false`, i.e. with no approval prompt. Native
+/// model acquisition is now a separate explicit command; it is never reached
+/// through doctor or normal inference.
 ///
 /// So the escape hatch is closed the other way round: a tool that runs
 /// unattended must NAME the flags it may pass, and everything else is denied.
@@ -306,7 +308,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "doctor",
         aliases: &[],
         kind: CommandToolKind::DoctorFix,
-        description: "Run `prism doctor --fix` — REPAIR, not a report. Deletes and rebuilds the managed Python venv at ~/.prism/venv when it cannot be healed in place, reinstalls its dependencies over the network, and re-downloads the local embedding model (~90 MB). Run `doctor` first; only call this for the failures it reported.",
+        description: "Run `prism doctor --fix` — REPAIR, not a report. Deletes and rebuilds the managed Python venv at ~/.prism/venv when it cannot be healed in place and reinstalls its dependencies over the network. It checks the pinned embedding snapshot but never downloads model files; model acquisition is a separate explicit setup action. Run `doctor` first; only call this for the failures it reported.",
         // Deletes a directory outside the project and reaches the network.
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
@@ -6856,7 +6858,7 @@ ValueError: boom\n";
         // `protocol::build_permission_context` auto-approves), so it must not
         // be able to reach `Commands::Doctor { fix: true }` —
         // `remove_dir_all(~/.prism/venv)`, a pip/uv reprovision over the
-        // network, and a ~90 MB model download.
+        // network. Model acquisition is a separate explicit setup action.
         let err = build_execution(
             spec_by_name("doctor").expect("doctor spec"),
             &json!({"args": ["--fix"]}),

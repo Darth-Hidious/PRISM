@@ -1,12 +1,12 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Process-wide embedding backend — lazy, shared, and strictly optional.
 //!
-//! One backend per process (native model init costs seconds and ~100 MB of
-//! RAM; the first ever init downloads ~90 MB). Initialization happens on
-//! first use, inside `spawn_blocking`, from background provenance tasks —
-//! never on the turn path and never at startup. If no backend can be built
-//! (config `off`, offline first run, bad openai config) everything degrades
-//! to the keyword-only paths that existed before.
+//! One backend per process (native model init costs seconds and memory).
+//! Initialization happens on first use, inside `spawn_blocking`, from
+//! background provenance tasks — never on the turn path and never at startup.
+//! Runtime initialization never downloads weights: if the pinned native
+//! snapshot was not installed explicitly (or openai config is bad), everything
+//! degrades to the keyword-only paths that existed before.
 
 use std::sync::{Arc, OnceLock};
 
@@ -16,15 +16,15 @@ use prism_provenance::{ProvenanceRecord, ProvenanceStore};
 static BACKEND: OnceLock<Option<Arc<dyn EmbedBackend>>> = OnceLock::new();
 
 /// The backend if selection + init has already completed (successfully or
-/// not). Never blocks, never downloads — `None` also while a first init is
+/// not). Never blocks or downloads — `None` also while a first init is
 /// still in flight. Use from latency-sensitive paths like `recall`.
 pub fn backend_if_ready() -> Option<Arc<dyn EmbedBackend>> {
     BACKEND.get().cloned().flatten()
 }
 
-/// Get-or-init the process-wide backend. The first call may download the
-/// native model, so the init runs on the blocking pool; concurrent callers
-/// coalesce on the same `OnceLock`. Returns `None` when embedding is
+/// Get-or-init the process-wide backend. Snapshot verification and ONNX load
+/// run on the blocking pool; concurrent callers coalesce on the same
+/// `OnceLock`. No model acquisition occurs. Returns `None` when embedding is
 /// disabled or unavailable.
 pub async fn backend() -> Option<Arc<dyn EmbedBackend>> {
     if let Some(b) = BACKEND.get() {

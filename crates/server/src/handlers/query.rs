@@ -297,7 +297,8 @@ async fn local_semantic_lookup(
         return Ok(Vec::new()); // nothing ingested yet — a real empty answer
     }
 
-    // First ever native init may download the model — blocking pool.
+    // Native snapshot verification and ONNX initialization are blocking;
+    // acquisition is a separate explicit command and never occurs here.
     let backend = tokio::task::spawn_blocking(prism_embed::from_config)
         .await
         .context("embedding backend initialization panicked")?

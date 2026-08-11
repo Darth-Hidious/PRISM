@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "catalog": {
+    "source": "command_tools_filtered",
+    "local_node_online": true
+  },
+  "ordered_names": [
+    "query_local",
+    "query_platform",
+    "query_federated",
+    "deploy_list",
+    "deploy_status",
+    "deploy_health",
+    "deploy_stop",
+    "workflow_list",
+    "workflow_show",
+    "workflow_run",
+    "models_list",
+    "models_search",
+    "models_info",
+    "compute_gpus",
+    "compute_providers",
+    "compute_status"
+  ],
+  "selection_cardinality": 4,
+  "max_final_prompt_tokens": 8192,
+  "expected_definitions_sha256": "caff87b1655e5dc4d3f61bdbb85fd7003b64233719ce3ae24493df5b72a12528"
+}

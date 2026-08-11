@@ -7,7 +7,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use anyhow::{Result, bail};
 
-use crate::{ChatMessage, ToolDefinition};
+#[cfg(not(feature = "local-inference"))]
+use crate::LocalPromptInfluenceUnavailableCode;
+use crate::{
+    ChatMessage, LocalModelIdentityOutcome, LocalPromptInfluenceOutcome, RenderedLocalPrompt,
+    ToolDefinition,
+};
+#[cfg(feature = "local-inference")]
+use crate::{LocalPromptInfluenceReport, LocalToolInfluenceScore};
 
 /// Explicit base URL sentinel selecting embedded GGUF inference.
 pub const LOCAL_GGUF_URL: &str = "gguf://local";
@@ -72,6 +79,19 @@ fn missing_weights_refusal(requested: &str, model_dir: &Path, searched: &[PathBu
         .iter()
         .map(|path| path.display().to_string())
         .collect();
+    let install_hint = if requested == crate::BUNDLED_GEMMA.id
+        || requested == crate::BUNDLED_GEMMA.filename
+    {
+        format!(
+            "Run `{}` explicitly. Normal inference does not download or substitute model weights.",
+            crate::BUNDLED_GEMMA.install_command
+        )
+    } else {
+        format!(
+            "Place a user-obtained .gguf model in {} or configure an explicit .gguf path. PRISM does not download or substitute model weights during inference.",
+            model_dir.display()
+        )
+    };
     let body = serde_json::json!({
         "status": "refused",
         "error": format!("No readable local GGUF weights were found for {requested:?}"),
@@ -83,10 +103,7 @@ fn missing_weights_refusal(requested: &str, model_dir: &Path, searched: &[PathBu
             "searched": searched,
             "expected_format": ".gguf"
         },
-        "install_hint": format!(
-            "Place a user-obtained .gguf model in {} or configure an explicit .gguf path. PRISM does not download or substitute model weights.",
-            model_dir.display()
-        )
+        "install_hint": install_hint
     });
     format!(
         "local GGUF inference refused:\n{}",
@@ -107,6 +124,50 @@ pub fn feature_disabled_error() -> anyhow::Error {
 #[cfg(feature = "local-inference")]
 const FALLBACK_CONTEXT_SIZE: u32 = 4096;
 
+#[cfg(feature = "local-inference")]
+const DESCRIPTOR_IDENTITY_UNAVAILABLE_DETAIL: &str = "this build target cannot make llama.cpp load through a stable descriptor-backed path, so PRISM cannot prove that a model digest identifies the bytes actually loaded; identity and prompt-influence scoring are unavailable, while ordinary local generation remains available. No remote endpoint or model download was attempted.";
+
+#[cfg(feature = "local-inference")]
+fn descriptor_identity_unavailable() -> LocalModelIdentityOutcome {
+    LocalModelIdentityOutcome::Unavailable {
+        code: crate::LocalPromptInfluenceUnavailableCode::DescriptorBackedIdentityUnavailable,
+        detail: DESCRIPTOR_IDENTITY_UNAVAILABLE_DETAIL.to_string(),
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn descriptor_influence_unavailable() -> LocalPromptInfluenceOutcome {
+    LocalPromptInfluenceOutcome::Unavailable {
+        code: crate::LocalPromptInfluenceUnavailableCode::DescriptorBackedIdentityUnavailable,
+        detail: DESCRIPTOR_IDENTITY_UNAVAILABLE_DETAIL.to_string(),
+    }
+}
+
+#[cfg(feature = "local-inference")]
+struct LoadedLocalModel {
+    model: std::sync::Arc<llama_cpp_2::model::LlamaModel>,
+    source: crate::model_artifact::LoadedModelFile,
+    identity: std::sync::OnceLock<std::result::Result<crate::LocalModelIdentity, String>>,
+}
+
+#[cfg(feature = "local-inference")]
+impl LoadedLocalModel {
+    fn verified_identity(&self) -> Result<&crate::LocalModelIdentity> {
+        self.source.ensure_retained_file_unchanged()?;
+        let identity = self
+            .identity
+            .get_or_init(|| {
+                self.source
+                    .verify_identity()
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))?;
+        self.source.ensure_retained_file_unchanged()?;
+        Ok(identity)
+    }
+}
+
 /// Local adapter state. The model is loaded once and shared; every request gets
 /// a fresh context/KV cache so conversation state remains explicit in messages.
 pub(crate) struct LocalGguf {
@@ -115,7 +176,7 @@ pub(crate) struct LocalGguf {
     #[cfg(feature = "local-inference")]
     context_size: u32,
     #[cfg(feature = "local-inference")]
-    model: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<llama_cpp_2::model::LlamaModel>>>,
+    model: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<LoadedLocalModel>>>,
 }
 
 impl LocalGguf {
@@ -145,6 +206,31 @@ impl LocalGguf {
         {
             None
         }
+    }
+
+    #[cfg(feature = "local-inference")]
+    pub(crate) async fn model_identity(&self) -> Result<LocalModelIdentityOutcome> {
+        if !cfg!(unix) {
+            return Ok(descriptor_identity_unavailable());
+        }
+        let model_spec = self.model_spec.clone();
+        let model_cache = std::sync::Arc::clone(&self.model);
+        let identity = tokio::task::spawn_blocking(move || {
+            let loaded = load_model(&model_spec, &model_cache)?;
+            loaded.verified_identity().cloned()
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("local GGUF identity task panicked: {error}"))??;
+        Ok(LocalModelIdentityOutcome::Verified { identity })
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    pub(crate) async fn model_identity(&self) -> Result<LocalModelIdentityOutcome> {
+        Ok(LocalModelIdentityOutcome::Unavailable {
+            code: LocalPromptInfluenceUnavailableCode::LocalInferenceFeatureDisabled,
+            detail: "loaded-model identity requires an embedded GGUF build; rebuild with `cargo build -p prism-cli --features local-inference`. No remote endpoint or model download was attempted."
+                .to_string(),
+        })
     }
 
     #[cfg(feature = "local-inference")]
@@ -219,6 +305,88 @@ impl LocalGguf {
     ) -> Result<LocalGeneration> {
         Err(feature_disabled_error())
     }
+
+    #[cfg(feature = "local-inference")]
+    pub(crate) async fn render_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<RenderedLocalPrompt> {
+        let messages = messages.to_vec();
+        let tools = tools.to_vec();
+        let model_spec = self.model_spec.clone();
+        let model_cache = std::sync::Arc::clone(&self.model);
+        tokio::task::spawn_blocking(move || {
+            let model = load_model(&model_spec, &model_cache)?;
+            prepare_prompt(&model_spec, model.model.as_ref(), &messages, &tools)
+                .map(|prompt| prompt.rendered)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("local GGUF prompt-render task panicked: {error}"))?
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    pub(crate) async fn render_prompt(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> Result<RenderedLocalPrompt> {
+        Err(feature_disabled_error())
+    }
+
+    #[cfg(feature = "local-inference")]
+    pub(crate) async fn score_tool_influence(
+        &self,
+        messages: &[ChatMessage],
+        baseline_tools: &[ToolDefinition],
+        candidates: &[ToolDefinition],
+    ) -> Result<LocalPromptInfluenceOutcome> {
+        if !cfg!(unix) {
+            return Ok(descriptor_influence_unavailable());
+        }
+        let messages = messages.to_vec();
+        let baseline_tools = baseline_tools.to_vec();
+        let candidates = candidates.to_vec();
+        let model_spec = self.model_spec.clone();
+        let model_cache = std::sync::Arc::clone(&self.model);
+        let context_size = self.context_size;
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_guard = CancelOnDrop(std::sync::Arc::clone(&cancelled));
+        let worker = tokio::task::spawn_blocking(move || {
+            // Loading is deliberately outside the scoring timer. OnceLock
+            // keeps this identical model warm for every arm and later calls.
+            let model = load_model(&model_spec, &model_cache)?;
+            score_tool_interventions(
+                &model_spec,
+                &model,
+                &messages,
+                &baseline_tools,
+                &candidates,
+                context_size,
+                &cancelled,
+            )
+            .map(|report| LocalPromptInfluenceOutcome::Scored { report })
+        });
+        let result = worker.await.map_err(|error| {
+            anyhow::anyhow!("local GGUF influence-scoring task panicked: {error}")
+        })?;
+        drop(cancel_guard);
+        result
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    pub(crate) async fn score_tool_influence(
+        &self,
+        _messages: &[ChatMessage],
+        _baseline_tools: &[ToolDefinition],
+        _candidates: &[ToolDefinition],
+    ) -> Result<LocalPromptInfluenceOutcome> {
+        Ok(LocalPromptInfluenceOutcome::Unavailable {
+            code: LocalPromptInfluenceUnavailableCode::LocalInferenceFeatureDisabled,
+            detail: "prompt-intervention influence requires an embedded GGUF build; rebuild with `cargo build -p prism-cli --features local-inference`. No remote endpoint or model download was attempted."
+                .to_string(),
+        })
+    }
 }
 
 #[cfg(feature = "local-inference")]
@@ -272,6 +440,8 @@ pub(crate) struct LocalGeneration {
     pub(crate) text: String,
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,
+    pub(crate) prefill_wall_time_micros: u64,
+    pub(crate) decode_wall_time_micros: u64,
 }
 
 #[cfg(feature = "local-inference")]
@@ -303,8 +473,8 @@ fn llama_backend() -> Result<&'static llama_cpp_2::llama_backend::LlamaBackend> 
 #[cfg(feature = "local-inference")]
 fn load_model(
     model_spec: &str,
-    cache: &std::sync::OnceLock<std::sync::Arc<llama_cpp_2::model::LlamaModel>>,
-) -> Result<std::sync::Arc<llama_cpp_2::model::LlamaModel>> {
+    cache: &std::sync::OnceLock<std::sync::Arc<LoadedLocalModel>>,
+) -> Result<std::sync::Arc<LoadedLocalModel>> {
     if let Some(model) = cache.get() {
         return Ok(std::sync::Arc::clone(model));
     }
@@ -315,16 +485,21 @@ fn load_model(
     {
         params = params.with_n_gpu_layers(u32::MAX);
     }
-    let loaded = std::sync::Arc::new(
-        llama_cpp_2::model::LlamaModel::load_from_file(backend, &path, &params).map_err(
-            |error| {
+    let (model, source) = crate::model_artifact::load_with_stable_identity(&path, |stable_path| {
+        llama_cpp_2::model::LlamaModel::load_from_file(backend, stable_path, &params)
+            .map(std::sync::Arc::new)
+            .map_err(|error| {
                 anyhow::anyhow!(
                     "failed to load local GGUF model {}: {error}",
                     path.display()
                 )
-            },
-        )?,
-    );
+            })
+    })?;
+    let loaded = std::sync::Arc::new(LoadedLocalModel {
+        model,
+        source,
+        identity: std::sync::OnceLock::new(),
+    });
     if cache.set(std::sync::Arc::clone(&loaded)).is_err() {
         return Ok(std::sync::Arc::clone(
             cache
@@ -342,12 +517,19 @@ enum NativeToolProtocol {
     Legacy,
     /// LiquidAI LFM 2.5's embedded Jinja tool-call format.
     Lfm,
+    /// Google Gemma 4's template-native declarations, calls, and responses.
+    Gemma,
 }
 
 #[cfg(feature = "local-inference")]
 fn native_tool_protocol(template: &str) -> Option<NativeToolProtocol> {
     if template.contains("<|tool_call_start|>") && template.contains("<|tool_call_end|>") {
         Some(NativeToolProtocol::Lfm)
+    } else if template.contains("<|tool>")
+        && template.contains("<|tool_call>")
+        && template.contains("<tool_call|>")
+    {
+        Some(NativeToolProtocol::Gemma)
     } else if template.contains("<start_function_declaration>")
         && template.contains("<start_function_call>")
     {
@@ -442,6 +624,10 @@ fn native_tool_declarations(tools: &[ToolDefinition], protocol: NativeToolProtoc
             "List of tools: {}",
             serde_json::to_string(tools).expect("tool definitions are serializable")
         ),
+        // Gemma receives the definitions through the template's `tools`
+        // variable, so injecting a second prose projection would change both
+        // the schema and the intervention being measured.
+        NativeToolProtocol::Gemma => String::new(),
     }
 }
 
@@ -486,9 +672,47 @@ fn native_tool_call_text(
                 }
                 result.push_str(")]<|tool_call_end|>");
             }
+            NativeToolProtocol::Gemma => {
+                result.push_str("<|tool_call>call:");
+                result.push_str(&call.function.name);
+                result.push('{');
+                for (index, (key, value)) in object.iter().enumerate() {
+                    if index > 0 {
+                        result.push(',');
+                    }
+                    result.push_str(key);
+                    result.push(':');
+                    result.push_str(&gemma_native_value(value));
+                }
+                result.push_str("}<tool_call|>");
+            }
         }
     }
     Ok(result)
+}
+
+#[cfg(feature = "local-inference")]
+fn gemma_native_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => format!(r#"<|"|>{value}<|"|>"#),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(gemma_native_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", gemma_native_value(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(feature = "local-inference")]
@@ -529,6 +753,7 @@ fn native_value_rule(schema: &serde_json::Value, protocol: NativeToolProtocol) -
         Some("string") => match protocol {
             NativeToolProtocol::Legacy => "escaped",
             NativeToolProtocol::Lfm => "string",
+            NativeToolProtocol::Gemma => "gemmastring",
         },
         Some("object") => "object",
         Some("array") => "array",
@@ -548,6 +773,7 @@ fn native_tool_call_grammar_for(tools: &[ToolDefinition], protocol: NativeToolPr
     match protocol {
         NativeToolProtocol::Legacy => legacy_tool_call_grammar(tools),
         NativeToolProtocol::Lfm => lfm_tool_call_grammar(tools),
+        NativeToolProtocol::Gemma => gemma_tool_call_grammar(tools),
     }
 }
 
@@ -634,6 +860,44 @@ ws ::= [ \t\n]*
 }
 
 #[cfg(feature = "local-inference")]
+fn gemma_tool_call_grammar(tools: &[ToolDefinition]) -> String {
+    let call_rules = (0..tools.len())
+        .map(|index| format!("call{index}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut grammar = format!("root ::= {call_rules} | final\n");
+    grammar.push_str(
+        r#"final ::= [^<]*
+value ::= gemmastring | object | array | number | boolean | "null"
+gemmastring ::= "<|\"|>" gemmachar* "<|\"|>"
+gemmachar ::= [^<]
+boolean ::= "true" | "false"
+object ::= "{" ws members ws "}"
+array ::= "[" ws (value (ws "," ws value)*)? ws "]"
+members ::= pair (ws "," ws pair)* | ""
+pair ::= key ws ":" ws value
+key ::= [a-zA-Z_] [a-zA-Z0-9_-]*
+number ::= [+-]? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+ws ::= [ \t\n]*
+"#,
+    );
+    for (index, tool) in tools.iter().enumerate() {
+        append_tool_rule(
+            &mut grammar,
+            tool,
+            index,
+            NativeToolProtocol::Gemma,
+            "<|tool_call>call:",
+            "{",
+            "}",
+            ":",
+            "<tool_call|>",
+        );
+    }
+    grammar
+}
+
+#[cfg(feature = "local-inference")]
 #[allow(clippy::too_many_arguments)]
 fn append_tool_rule(
     grammar: &mut String,
@@ -665,7 +929,9 @@ fn append_tool_rule(
         grammar_literal(call_suffix),
     ));
     let separator = match protocol {
-        NativeToolProtocol::Legacy | NativeToolProtocol::Lfm => " ws \",\" ws ",
+        NativeToolProtocol::Legacy | NativeToolProtocol::Lfm | NativeToolProtocol::Gemma => {
+            " ws \",\" ws "
+        }
     };
     let sequence = required
         .iter()
@@ -674,7 +940,7 @@ fn append_tool_rule(
         .collect::<Vec<_>>()
         .join(separator);
     let generic_pair = match protocol {
-        NativeToolProtocol::Legacy => "pair",
+        NativeToolProtocol::Legacy | NativeToolProtocol::Gemma => "pair",
         NativeToolProtocol::Lfm => "lfmpair",
     };
     if required.is_empty() {
@@ -709,13 +975,65 @@ fn grammar_literal(value: &str) -> String {
 }
 
 #[cfg(feature = "local-inference")]
+#[derive(Clone, Debug, serde::Serialize)]
+struct TemplateMessage {
+    role: String,
+    content: String,
+}
+
+#[cfg(feature = "local-inference")]
+fn render_gemma_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::Value>> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut rendered = serde_json::Map::new();
+            rendered.insert("role".to_string(), message.role.clone().into());
+            if let Some(content) = &message.content {
+                rendered.insert("content".to_string(), content.clone().into());
+            }
+            if let Some(tool_call_id) = &message.tool_call_id {
+                rendered.insert("tool_call_id".to_string(), tool_call_id.clone().into());
+            }
+            if let Some(tool_calls) = &message.tool_calls {
+                let tool_calls = tool_calls
+                    .iter()
+                    .map(|call| {
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(&call.function.arguments).with_context(|| {
+                                format!(
+                                    "prior Gemma tool call {} arguments were not valid JSON",
+                                    call.id
+                                )
+                            })?;
+                        if !arguments.is_object() {
+                            bail!(
+                                "prior Gemma tool call {} arguments were not an object",
+                                call.id
+                            );
+                        }
+                        Ok(serde_json::json!({
+                            "id": call.id,
+                            "type": call.call_type,
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": arguments,
+                            }
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rendered.insert("tool_calls".to_string(), tool_calls.into());
+            }
+            Ok(rendered.into())
+        })
+        .collect()
+}
+
+#[cfg(feature = "local-inference")]
 fn render_messages(
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
     native_protocol: Option<NativeToolProtocol>,
-) -> Result<Vec<llama_cpp_2::model::LlamaChatMessage>> {
-    use llama_cpp_2::model::LlamaChatMessage;
-
+) -> Result<Vec<TemplateMessage>> {
     let instructions = if tools.is_empty() {
         None
     } else if let Some(protocol) = native_protocol {
@@ -800,18 +1118,288 @@ fn render_messages(
             injected = true;
         }
 
-        rendered.push(LlamaChatMessage::new(role, content).map_err(anyhow::Error::from)?);
+        rendered.push(TemplateMessage { role, content });
     }
     if let Some(instructions) = instructions
         && !injected
     {
         rendered.insert(
             0,
-            LlamaChatMessage::new("system".to_string(), instructions)
-                .map_err(anyhow::Error::from)?,
+            TemplateMessage {
+                role: "system".to_string(),
+                content: instructions,
+            },
         );
     }
     Ok(rendered)
+}
+
+/// Jensen-Shannon divergence between two complete next-token logit vectors.
+///
+/// Softmax and accumulation use f64 with max subtraction. Negative infinity
+/// is accepted for impossible tokens; NaN and positive infinity are rejected
+/// rather than silently turning an index score into NaN. Natural logarithms
+/// make the result lie in `[0, ln(2)]`.
+#[cfg(any(feature = "local-inference", test))]
+fn jensen_shannon_divergence_from_logits(baseline: &[f32], candidate: &[f32]) -> Result<f64> {
+    if baseline.len() != candidate.len() {
+        bail!(
+            "cannot compare next-token logits with different vocabulary sizes ({} versus {})",
+            baseline.len(),
+            candidate.len()
+        );
+    }
+    let baseline_log_z = logit_log_normalizer(baseline)?;
+    let candidate_log_z = logit_log_normalizer(candidate)?;
+    let mut divergence = 0.0_f64;
+    for (&baseline_logit, &candidate_logit) in baseline.iter().zip(candidate) {
+        let baseline_log_probability = f64::from(baseline_logit) - baseline_log_z;
+        let candidate_log_probability = f64::from(candidate_logit) - candidate_log_z;
+        let baseline_probability = baseline_log_probability.exp();
+        let candidate_probability = candidate_log_probability.exp();
+        let mixture_probability = 0.5 * (baseline_probability + candidate_probability);
+        if mixture_probability == 0.0 {
+            // Both probabilities underflowed in a tail whose contribution is
+            // below f64 resolution.
+            continue;
+        }
+        let mixture_log_probability = mixture_probability.ln();
+        if baseline_probability > 0.0 {
+            divergence +=
+                0.5 * baseline_probability * (baseline_log_probability - mixture_log_probability);
+        }
+        if candidate_probability > 0.0 {
+            divergence +=
+                0.5 * candidate_probability * (candidate_log_probability - mixture_log_probability);
+        }
+    }
+    if !divergence.is_finite() {
+        bail!("next-token Jensen-Shannon divergence was not finite");
+    }
+    // The exact value is bounded; only floating-point accumulation can move
+    // it a few ulps outside that interval.
+    Ok(divergence.clamp(0.0, std::f64::consts::LN_2))
+}
+
+#[cfg(any(feature = "local-inference", test))]
+fn logit_log_normalizer(logits: &[f32]) -> Result<f64> {
+    if logits.is_empty() {
+        bail!("cannot score an empty next-token logit vector");
+    }
+    let mut maximum = f64::NEG_INFINITY;
+    for &logit in logits {
+        if logit.is_nan() || logit == f32::INFINITY {
+            bail!("next-token logits contain NaN or positive infinity");
+        }
+        maximum = maximum.max(f64::from(logit));
+    }
+    if maximum == f64::NEG_INFINITY {
+        bail!("all next-token logits are negative infinity");
+    }
+    let sum = logits
+        .iter()
+        .map(|&logit| (f64::from(logit) - maximum).exp())
+        .sum::<f64>();
+    if !sum.is_finite() || sum <= 0.0 {
+        bail!("next-token softmax normalizer was not finite and positive");
+    }
+    Ok(maximum + sum.ln())
+}
+
+#[cfg(any(feature = "local-inference", test))]
+fn normalized_divergence(raw_divergence: f64, added_prompt_tokens: i64) -> Option<f64> {
+    (added_prompt_tokens > 0).then(|| raw_divergence / added_prompt_tokens as f64)
+}
+
+#[cfg(feature = "local-inference")]
+fn elapsed_micros(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "local-inference")]
+struct PreparedPrompt {
+    rendered: RenderedLocalPrompt,
+    tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    native_protocol: Option<NativeToolProtocol>,
+}
+
+#[cfg(feature = "local-inference")]
+fn special_token_piece(
+    model: &llama_cpp_2::model::LlamaModel,
+    token: llama_cpp_2::token::LlamaToken,
+) -> Result<String> {
+    // llama.cpp represents an absent special token as LLAMA_TOKEN_NULL (-1).
+    // Its own template context exposes that case as an empty string.
+    if token.0 == -1 {
+        return Ok(String::new());
+    }
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    model
+        .token_to_piece(token, &mut decoder, true, None)
+        .map_err(|error| anyhow::anyhow!("failed to decode a GGUF special token: {error}"))
+}
+
+#[cfg(feature = "local-inference")]
+fn prepare_prompt(
+    model_spec: &str,
+    model: &llama_cpp_2::model::LlamaModel,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+) -> Result<PreparedPrompt> {
+    use llama_cpp_2::model::AddBos;
+
+    let template = model.chat_template(None).map_err(|error| {
+        anyhow::anyhow!(
+            "local GGUF model {model_spec:?} has no usable embedded chat template: {error}. Use an instruct/chat GGUF with tokenizer.chat_template metadata. No remote endpoint was tried."
+        )
+    })?;
+    let template_source = template.to_string().map_err(|error| {
+        anyhow::anyhow!(
+            "local GGUF model {model_spec:?} has invalid chat template metadata: {error}. No remote endpoint was tried."
+        )
+    })?;
+    let native_protocol = (!tools.is_empty())
+        .then(|| native_tool_protocol(&template_source))
+        .flatten();
+    let chat = if native_protocol == Some(NativeToolProtocol::Gemma) {
+        render_gemma_messages(messages)?
+    } else {
+        serde_json::to_value(render_messages(messages, tools, native_protocol)?)?
+            .as_array()
+            .cloned()
+            .expect("serializing a message vector produces a JSON array")
+    };
+    let template_tools = if native_protocol == Some(NativeToolProtocol::Gemma) {
+        serde_json::to_value(tools)?
+    } else {
+        serde_json::json!([])
+    };
+    let context = serde_json::json!({
+        "messages": chat,
+        "tools": template_tools,
+        "bos_token": special_token_piece(model, model.token_bos())?,
+        "eos_token": special_token_piece(model, model.token_eos())?,
+        "enable_thinking": false,
+        "preserve_thinking": false,
+        "add_generation_prompt": true,
+    });
+    let text = crate::minja::render(&template_source, &context)
+        .context("failed to render the GGUF chat template with Minja")?;
+    let tokens = model
+        .str_to_token(&text, AddBos::Never)
+        .map_err(|error| anyhow::anyhow!("failed to tokenize the local prompt: {error}"))?;
+    let template_sha256 = crate::model_artifact::sha256_hex(template_source.as_bytes());
+    let token_count = tokens.len() as u64;
+    Ok(PreparedPrompt {
+        rendered: RenderedLocalPrompt {
+            text,
+            token_count,
+            template_sha256,
+        },
+        tokens,
+        native_protocol,
+    })
+}
+
+#[cfg(feature = "local-inference")]
+fn score_tool_interventions(
+    model_spec: &str,
+    loaded_model: &LoadedLocalModel,
+    messages: &[ChatMessage],
+    baseline_tools: &[ToolDefinition],
+    candidates: &[ToolDefinition],
+    requested_context_size: u32,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<LocalPromptInfluenceReport> {
+    // Identity verification can read the entire GGUF and is deliberately
+    // completed before any scoring/prefill timer starts.
+    let model_identity = loaded_model.verified_identity()?;
+    let model = loaded_model.model.as_ref();
+    ensure_influence_scoring_active(cancelled)?;
+    let total_started = std::time::Instant::now();
+    let baseline_started = std::time::Instant::now();
+    let baseline = prepare_prompt(model_spec, model, messages, baseline_tools)?;
+    ensure_influence_scoring_active(cancelled)?;
+    let baseline_logits = prefill_next_token_logits(
+        model,
+        &baseline.tokens,
+        requested_context_size,
+        Some(cancelled),
+    )?;
+    ensure_influence_scoring_active(cancelled)?;
+    let baseline_scoring_wall_time_micros = elapsed_micros(baseline_started);
+    let baseline_prompt_tokens = baseline.rendered.token_count;
+    let template_sha256 = baseline.rendered.template_sha256;
+
+    let mut scores = Vec::with_capacity(candidates.len());
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        // A dropped request detaches its spawn_blocking worker. Check before
+        // every intervention so that worker cannot continue through the rest
+        // of a catalog after its caller has gone away.
+        ensure_influence_scoring_active(cancelled)?;
+        let candidate_started = std::time::Instant::now();
+        let mut intervention_tools = Vec::with_capacity(baseline_tools.len() + 1);
+        intervention_tools.extend_from_slice(baseline_tools);
+        intervention_tools.push(candidate.clone());
+        let intervention = prepare_prompt(model_spec, model, messages, &intervention_tools)?;
+        ensure_influence_scoring_active(cancelled)?;
+        if intervention.rendered.template_sha256 != template_sha256 {
+            bail!(
+                "local GGUF template changed while scoring candidate {} (baseline {}, candidate {})",
+                candidate.function.name,
+                template_sha256,
+                intervention.rendered.template_sha256
+            );
+        }
+        let candidate_logits = prefill_next_token_logits(
+            model,
+            &intervention.tokens,
+            requested_context_size,
+            Some(cancelled),
+        )?;
+        ensure_influence_scoring_active(cancelled)?;
+        let raw_js_divergence_nats =
+            jensen_shannon_divergence_from_logits(&baseline_logits, &candidate_logits)?;
+        let candidate_prompt_tokens = intervention.rendered.token_count;
+        let added_prompt_tokens = i64::try_from(candidate_prompt_tokens)
+            .context("candidate prompt token count exceeds i64")?
+            .checked_sub(
+                i64::try_from(baseline_prompt_tokens)
+                    .context("baseline prompt token count exceeds i64")?,
+            )
+            .context("prompt token delta exceeds i64")?;
+        scores.push(LocalToolInfluenceScore {
+            candidate_index,
+            tool_name: candidate.function.name.clone(),
+            raw_js_divergence_nats,
+            normalized_js_divergence_per_added_prompt_token: normalized_divergence(
+                raw_js_divergence_nats,
+                added_prompt_tokens,
+            ),
+            baseline_prompt_tokens,
+            candidate_prompt_tokens,
+            added_prompt_tokens,
+            scoring_wall_time_micros: elapsed_micros(candidate_started),
+        });
+    }
+
+    Ok(LocalPromptInfluenceReport {
+        model_sha256: model_identity.sha256.clone(),
+        model_size_bytes: model_identity.size_bytes,
+        template_sha256,
+        baseline_prompt_tokens,
+        baseline_scoring_wall_time_micros,
+        total_scoring_wall_time_micros: elapsed_micros(total_started),
+        candidates: scores,
+    })
+}
+
+#[cfg(feature = "local-inference")]
+fn ensure_influence_scoring_active(cancelled: &std::sync::atomic::AtomicBool) -> Result<()> {
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        bail!("local GGUF influence scoring cancelled");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "local-inference")]
@@ -842,76 +1430,27 @@ fn local_tool_response_schema(tools: &[ToolDefinition]) -> serde_json::Value {
     serde_json::json!({"oneOf": alternatives})
 }
 
+/// Build a fresh context and evaluate the complete prompt using the exact
+/// context and batching policy shared by generation and intervention scoring.
 #[cfg(feature = "local-inference")]
-#[allow(clippy::too_many_arguments)]
-fn generate(
-    model_spec: &str,
-    model_cache: &std::sync::OnceLock<std::sync::Arc<llama_cpp_2::model::LlamaModel>>,
-    messages: &[ChatMessage],
-    tools: &[ToolDefinition],
+fn prefill_prompt<'model>(
+    model: &'model llama_cpp_2::model::LlamaModel,
+    tokens: &[llama_cpp_2::token::LlamaToken],
     requested_context_size: u32,
-    requested_max_tokens: u64,
-    cancelled: &std::sync::atomic::AtomicBool,
-    mut emit: impl FnMut(String) -> bool,
-) -> Result<LocalGeneration> {
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(
+    llama_cpp_2::context::LlamaContext<'model>,
+    llama_cpp_2::llama_batch::LlamaBatch<'model>,
+    u32,
+)> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
-    use llama_cpp_2::sampling::LlamaSampler;
     use std::num::NonZeroU32;
     use std::sync::atomic::Ordering;
 
-    if cancelled.load(Ordering::Acquire) {
-        bail!("local GGUF generation cancelled");
+    if tokens.is_empty() {
+        bail!("local GGUF prompt tokenization produced no tokens");
     }
-
-    let model = load_model(model_spec, model_cache)?;
-    let template = model.chat_template(None).map_err(|error| {
-        anyhow::anyhow!(
-            "local GGUF model {model_spec:?} has no usable embedded chat template: {error}. Use an instruct/chat GGUF with tokenizer.chat_template metadata. No remote endpoint was tried."
-        )
-    })?;
-    let template_source = template
-        .to_string()
-        .map_err(|error| anyhow::anyhow!("local GGUF model {model_spec:?} has invalid chat template metadata: {error}. No remote endpoint was tried."))?;
-    let native_protocol = (!tools.is_empty())
-        .then(|| native_tool_protocol(&template_source))
-        .flatten();
-    let chat = render_messages(messages, tools, native_protocol)?;
-    let tool_grammar = if let Some(protocol) = native_protocol {
-        let grammar = native_tool_call_grammar_for(tools, protocol);
-        Some(
-            LlamaSampler::grammar(&model, &grammar, "root").map_err(|error| {
-                anyhow::anyhow!(
-                    "local GGUF model {model_spec:?} cannot initialize its embedded chat-template tool grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
-                )
-            })?,
-        )
-    } else if !tools.is_empty() {
-        let schema = local_tool_response_schema(tools);
-        let schema_json = serde_json::to_string(&schema)?;
-        let grammar = llama_cpp_2::json_schema_to_grammar(&schema_json).map_err(|error| {
-            anyhow::anyhow!(
-                "local GGUF model {model_spec:?} cannot constrain its tool response with llama.cpp JSON grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
-            )
-        })?;
-        Some(
-            LlamaSampler::grammar(&model, &grammar, "root").map_err(|error| {
-                anyhow::anyhow!(
-                    "local GGUF model {model_spec:?} cannot initialize llama.cpp tool grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
-                )
-            })?,
-        )
-    } else {
-        None
-    };
-    let prompt = model
-        .apply_chat_template(&template, &chat, true)
-        .map_err(|error| anyhow::anyhow!("failed to apply the GGUF chat template: {error}"))?;
-    let tokens = model
-        .str_to_token(&prompt, AddBos::Never)
-        .map_err(|error| anyhow::anyhow!("failed to tokenize the local prompt: {error}"))?;
-
     let trained_context = model.n_ctx_train().max(512);
     let context_size = requested_context_size.min(trained_context);
     if tokens.len() >= context_size as usize {
@@ -919,11 +1458,6 @@ fn generate(
             "local GGUF prompt is {} tokens but the active context is {context_size}. Set PRISM_LOCAL_CONTEXT_SIZE to a larger value no greater than the model's trained context ({trained_context}).",
             tokens.len()
         );
-    }
-    let available = u64::from(context_size) - tokens.len() as u64;
-    let max_tokens = requested_max_tokens.min(available);
-    if max_tokens == 0 {
-        bail!("local GGUF context has no room for output tokens");
     }
 
     let batch_size = context_size.min(512);
@@ -935,10 +1469,10 @@ fn generate(
     let mut context = model
         .new_context(backend, params)
         .map_err(|error| anyhow::anyhow!("failed to create local GGUF context: {error}"))?;
-    let mut batch = LlamaBatch::new(batch_size as usize, 1);
+    let mut batch: LlamaBatch<'model> = LlamaBatch::new(batch_size as usize, 1);
 
     for (chunk_index, chunk) in tokens.chunks(batch_size as usize).enumerate() {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             bail!("local GGUF generation cancelled");
         }
         batch.clear();
@@ -958,6 +1492,82 @@ fn generate(
             .map_err(|error| anyhow::anyhow!("failed to evaluate local prompt: {error}"))?;
     }
 
+    Ok((context, batch, context_size))
+}
+
+#[cfg(feature = "local-inference")]
+fn prefill_next_token_logits(
+    model: &llama_cpp_2::model::LlamaModel,
+    tokens: &[llama_cpp_2::token::LlamaToken],
+    requested_context_size: u32,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<f32>> {
+    let (context, batch, _) = prefill_prompt(model, tokens, requested_context_size, cancelled)?;
+    let logits_index = batch.n_tokens() - 1;
+    Ok(context.get_logits_ith(logits_index).to_vec())
+}
+
+#[cfg(feature = "local-inference")]
+#[allow(clippy::too_many_arguments)]
+fn generate(
+    model_spec: &str,
+    model_cache: &std::sync::OnceLock<std::sync::Arc<LoadedLocalModel>>,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    requested_context_size: u32,
+    requested_max_tokens: u64,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut emit: impl FnMut(String) -> bool,
+) -> Result<LocalGeneration> {
+    use llama_cpp_2::sampling::LlamaSampler;
+    use std::sync::atomic::Ordering;
+
+    if cancelled.load(Ordering::Acquire) {
+        bail!("local GGUF generation cancelled");
+    }
+
+    let loaded = load_model(model_spec, model_cache)?;
+    let model = loaded.model.as_ref();
+    let prefill_started = std::time::Instant::now();
+    let prepared = prepare_prompt(model_spec, model, messages, tools)?;
+    let native_protocol = prepared.native_protocol;
+    let tool_grammar = if let Some(protocol) = native_protocol {
+        let grammar = native_tool_call_grammar_for(tools, protocol);
+        Some(
+            LlamaSampler::grammar(model, &grammar, "root").map_err(|error| {
+                anyhow::anyhow!(
+                    "local GGUF model {model_spec:?} cannot initialize its embedded chat-template tool grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
+                )
+            })?,
+        )
+    } else if !tools.is_empty() {
+        let schema = local_tool_response_schema(tools);
+        let schema_json = serde_json::to_string(&schema)?;
+        let grammar = llama_cpp_2::json_schema_to_grammar(&schema_json).map_err(|error| {
+            anyhow::anyhow!(
+                "local GGUF model {model_spec:?} cannot constrain its tool response with llama.cpp JSON grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
+            )
+        })?;
+        Some(
+            LlamaSampler::grammar(model, &grammar, "root").map_err(|error| {
+                anyhow::anyhow!(
+                    "local GGUF model {model_spec:?} cannot initialize llama.cpp tool grammar: {error}. Tool calling was refused before generation. No remote endpoint was tried."
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let tokens = prepared.tokens;
+    let (mut context, mut batch, context_size) =
+        prefill_prompt(model, &tokens, requested_context_size, Some(cancelled))?;
+    let prefill_wall_time_micros = elapsed_micros(prefill_started);
+    let available = u64::from(context_size) - tokens.len() as u64;
+    let max_tokens = requested_max_tokens.min(available);
+    if max_tokens == 0 {
+        bail!("local GGUF context has no room for output tokens");
+    }
+
     let mut sampler = match tool_grammar {
         Some(grammar) => LlamaSampler::chain_simple([grammar, LlamaSampler::greedy()]),
         None => LlamaSampler::greedy(),
@@ -969,6 +1579,7 @@ fn generate(
     let mut position = i32::try_from(tokens.len())
         .map_err(|_| anyhow::anyhow!("local prompt position exceeds i32"))?;
 
+    let decode_started = std::time::Instant::now();
     while completion_tokens < max_tokens {
         if cancelled.load(Ordering::Acquire) {
             bail!("local GGUF generation cancelled");
@@ -1010,12 +1621,91 @@ fn generate(
         text,
         prompt_tokens: tokens.len() as u64,
         completion_tokens,
+        prefill_wall_time_micros,
+        decode_wall_time_micros: elapsed_micros(decode_started),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn descriptor_identity_unavailability_is_typed_and_machine_readable() {
+        let identity = descriptor_identity_unavailable();
+        assert!(matches!(
+            identity,
+            LocalModelIdentityOutcome::Unavailable {
+                code:
+                    crate::LocalPromptInfluenceUnavailableCode::DescriptorBackedIdentityUnavailable,
+                ..
+            }
+        ));
+
+        let influence = descriptor_influence_unavailable();
+        let serialized = serde_json::to_value(influence).unwrap();
+        assert_eq!(serialized["status"], "unavailable");
+        assert_eq!(serialized["code"], "descriptor_backed_identity_unavailable");
+        assert!(
+            serialized["detail"]
+                .as_str()
+                .unwrap()
+                .contains("ordinary local generation remains available")
+        );
+    }
+
+    #[test]
+    fn next_token_js_divergence_is_zero_for_identical_logits() {
+        let logits = [0.25, -1.0, 3.5, f32::NEG_INFINITY];
+        let divergence = jensen_shannon_divergence_from_logits(&logits, &logits).unwrap();
+        assert!(divergence.abs() < 1e-15, "{divergence}");
+    }
+
+    #[test]
+    fn next_token_js_divergence_is_symmetric_and_bounded() {
+        let left = [2.0, -1.0, 0.5];
+        let right = [-3.0, 4.0, 1.0];
+        let left_right = jensen_shannon_divergence_from_logits(&left, &right).unwrap();
+        let right_left = jensen_shannon_divergence_from_logits(&right, &left).unwrap();
+        assert!((left_right - right_left).abs() < 1e-15);
+        assert!(left_right > 0.0);
+        assert!(left_right <= std::f64::consts::LN_2);
+    }
+
+    #[test]
+    fn next_token_js_divergence_approaches_ln_two_for_disjoint_mass() {
+        let left = [80.0, -80.0];
+        let right = [-80.0, 80.0];
+        let divergence = jensen_shannon_divergence_from_logits(&left, &right).unwrap();
+        assert!((divergence - std::f64::consts::LN_2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn next_token_js_divergence_is_invariant_to_independent_logit_offsets() {
+        let baseline = [0.0, 1.0, -2.0];
+        let candidate = [2.0, -1.0, 0.0];
+        let shifted_baseline = [100.0, 101.0, 98.0];
+        let shifted_candidate = [-48.0, -51.0, -50.0];
+        let original = jensen_shannon_divergence_from_logits(&baseline, &candidate).unwrap();
+        let shifted =
+            jensen_shannon_divergence_from_logits(&shifted_baseline, &shifted_candidate).unwrap();
+        assert!((original - shifted).abs() < 1e-15);
+    }
+
+    #[test]
+    fn invalid_logit_vectors_are_refused() {
+        assert!(jensen_shannon_divergence_from_logits(&[0.0], &[0.0, 1.0]).is_err());
+        assert!(jensen_shannon_divergence_from_logits(&[f32::NEG_INFINITY], &[0.0]).is_err());
+        assert!(jensen_shannon_divergence_from_logits(&[f32::NAN], &[0.0]).is_err());
+    }
+
+    #[test]
+    fn divergence_normalization_requires_positive_added_tokens() {
+        assert_eq!(normalized_divergence(0.4, 4), Some(0.1));
+        assert_eq!(normalized_divergence(0.4, 0), None);
+        assert_eq!(normalized_divergence(0.4, -1), None);
+    }
 
     #[test]
     fn resolves_model_name_from_established_directory() {
@@ -1050,6 +1740,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn absent_pinned_gemma_names_the_explicit_installer() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = resolve_model_path_in(crate::BUNDLED_GEMMA.id, temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(crate::BUNDLED_GEMMA.install_command),
+            "{error}"
+        );
+        assert!(
+            error.contains("Normal inference does not download"),
+            "{error}"
+        );
+    }
+
     #[cfg(feature = "local-inference")]
     #[test]
     fn cancellation_guard_signals_the_blocking_worker() {
@@ -1061,6 +1767,21 @@ mod tests {
             assert!(!cancelled.load(Ordering::Acquire));
         }
         assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn influence_scoring_drop_guard_trips_the_worker_check() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelOnDrop(std::sync::Arc::clone(&cancelled));
+        assert!(ensure_influence_scoring_active(&cancelled).is_ok());
+
+        drop(guard);
+
+        let error = ensure_influence_scoring_active(&cancelled)
+            .expect_err("dropping the caller-side guard must stop influence scoring")
+            .to_string();
+        assert!(error.contains("influence scoring cancelled"), "{error}");
     }
 
     #[test]
@@ -1189,5 +1910,45 @@ mod tests {
             grammar.contains("root ::= call0 | call1 | final"),
             "{grammar}"
         );
+    }
+
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn gemma_render_keeps_full_openai_tool_fields_for_minja() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![crate::ToolCallResponse {
+                    id: "call_7".to_string(),
+                    call_type: "function".to_string(),
+                    function: crate::FunctionCall {
+                        name: "lookup".to_string(),
+                        arguments: r#"{"query":"IN718","limit":2}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some("found".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_7".to_string()),
+            },
+        ];
+        let rendered = render_gemma_messages(&messages).unwrap();
+        assert_eq!(rendered[0]["role"], "assistant");
+        assert_eq!(rendered[0]["tool_calls"][0]["id"], "call_7");
+        assert_eq!(
+            rendered[0]["tool_calls"][0]["function"]["arguments"]["query"],
+            "IN718"
+        );
+        assert!(rendered[0]["tool_calls"][0]["function"]["arguments"].is_object());
+        assert_eq!(rendered[1]["role"], "tool");
+        assert_eq!(rendered[1]["tool_call_id"], "call_7");
+
+        let grammar = gemma_tool_call_grammar(&[test_tool("lookup")]);
+        assert!(grammar.contains(r#"<|tool_call>call:"#), "{grammar}");
+        assert!(grammar.contains(r#"gemmastring ::= "<|\"|>""#), "{grammar}");
     }
 }

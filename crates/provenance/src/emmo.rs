@@ -3974,10 +3974,10 @@ impl ProvenanceStore {
     }
 
     /// Best-effort entity embedding for freshly written facts: builds the
-    /// configured `prism-embed` backend (on the blocking pool — the first
-    /// ever native init downloads the model) and stores one vector per
-    /// entity. Failures are logged and swallowed — an ingest must never
-    /// fail because of the embedding model.
+    /// configured `prism-embed` backend (on the blocking pool for snapshot
+    /// verification and ONNX initialization) and stores one vector per
+    /// entity. Runtime never acquires model files. Failures are logged and
+    /// swallowed — an ingest must never fail because of the embedding model.
     pub async fn embed_entities_best_effort<F: FactPayload>(&self, facts: &[F], tenant: &str) {
         self.embed_names_best_effort(&distinct_fact_names(facts), tenant)
             .await
@@ -8821,13 +8821,14 @@ mod tests {
     /// rank the metal-joining entities above the bread-making ones. A
     /// keyword index scores this query 0 against everything.
     ///
-    /// `#[ignore]`d: needs the ~90 MB ONNX model in `~/.prism/models/embed/`.
+    /// `#[ignore]`d: needs the pinned ONNX snapshot to have been explicitly
+    /// installed in `~/.prism/models/embed/`.
     /// Run with `cargo test -p prism-provenance -- --ignored`.
     /// Not compiled on Intel macOS, which has no ONNX Runtime build and so
     /// no `NativeOnnx` (see `prism_embed`).
     #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
     #[tokio::test]
-    #[ignore = "downloads/uses the local ONNX embedding model"]
+    #[ignore = "requires the explicitly installed pinned BGE snapshot"]
     async fn native_embeddings_retrieve_by_meaning_not_keywords() {
         use prism_embed::EmbedBackend as _;
 

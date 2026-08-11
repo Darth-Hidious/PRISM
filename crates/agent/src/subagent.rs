@@ -378,7 +378,9 @@ async fn execute_spawn_subagent_inner(
                         steps.push(summary.clone());
                     }
                 }
-                AgentEvent::ToolCallStart { .. } | AgentEvent::ToolApprovalRequest { .. } => {}
+                AgentEvent::ContextPriming { .. }
+                | AgentEvent::ToolCallStart { .. }
+                | AgentEvent::ToolApprovalRequest { .. } => {}
             }
             emit(event);
         };

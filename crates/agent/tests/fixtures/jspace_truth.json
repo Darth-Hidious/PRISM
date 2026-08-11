@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "case_001",
+      "expected": {
+        "name": "query_local",
+        "arguments": {
+          "text": "Ti-6Al-4V fatigue",
+          "semantic": true,
+          "limit": 5
+        }
+      }
+    },
+    {
+      "id": "case_002",
+      "expected": {
+        "name": "query_platform",
+        "arguments": {
+          "text": "oxygen-rich preburner alloy compatibility",
+          "semantic": true,
+          "limit": 5
+        }
+      }
+    },
+    {
+      "id": "case_003",
+      "expected": {
+        "name": "query_federated",
+        "arguments": {
+          "text": "nickel superalloy creep"
+        }
+      }
+    },
+    {
+      "id": "case_004",
+      "expected": {
+        "name": "deploy_list",
+        "arguments": {
+          "status": "running"
+        }
+      }
+    },
+    {
+      "id": "case_005",
+      "expected": {
+        "name": "deploy_status",
+        "arguments": {
+          "deployment_id": "dep-bench-005"
+        }
+      }
+    },
+    {
+      "id": "case_006",
+      "expected": {
+        "name": "deploy_health",
+        "arguments": {
+          "deployment_id": "dep-bench-006"
+        }
+      }
+    },
+    {
+      "id": "case_007",
+      "expected": {
+        "name": "deploy_stop",
+        "arguments": {
+          "deployment_id": "dep-bench-007"
+        }
+      }
+    },
+    {
+      "id": "case_008",
+      "expected": {
+        "name": "workflow_list",
+        "arguments": {}
+      }
+    },
+    {
+      "id": "case_009",
+      "expected": {
+        "name": "workflow_show",
+        "arguments": {
+          "name": "forge"
+        }
+      }
+    },
+    {
+      "id": "case_010",
+      "expected": {
+        "name": "workflow_run",
+        "arguments": {
+          "name": "forge",
+          "values": {
+            "paper": "alpha"
+          },
+          "execute": false
+        }
+      }
+    },
+    {
+      "id": "case_011",
+      "expected": {
+        "name": "models_list",
+        "arguments": {
+          "provider": "google"
+        }
+      }
+    },
+    {
+      "id": "case_012",
+      "expected": {
+        "name": "models_search",
+        "arguments": {
+          "query": "Gemma",
+          "provider": "google"
+        }
+      }
+    },
+    {
+      "id": "case_013",
+      "expected": {
+        "name": "models_info",
+        "arguments": {
+          "model_id": "gemini-3.1-pro-preview"
+        }
+      }
+    },
+    {
+      "id": "case_014",
+      "expected": {
+        "name": "compute_gpus",
+        "arguments": {}
+      }
+    },
+    {
+      "id": "case_015",
+      "expected": {
+        "name": "compute_providers",
+        "arguments": {}
+      }
+    },
+    {
+      "id": "case_016",
+      "expected": {
+        "name": "compute_status",
+        "arguments": {
+          "job_id": "job-bench-016"
+        }
+      }
+    }
+  ]
+}

@@ -15,7 +15,114 @@ use std::time::Duration;
 use tracing::debug;
 
 mod local;
+mod minja;
+mod model_artifact;
 pub use local::{LOCAL_GGUF_URL, default_model_dir, is_local_gguf_url, resolve_model_path};
+pub use minja::render as render_minja_template;
+pub use model_artifact::{BUNDLED_GEMMA, ModelArtifactManifest, sha256_hex, verify_model_artifact};
+
+/// Canonical text and identity produced by the embedded GGUF's own template.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderedLocalPrompt {
+    pub text: String,
+    pub token_count: u64,
+    pub template_sha256: String,
+}
+
+/// Why prompt-intervention scoring is unavailable without attempting a
+/// different backend or acquiring a model implicitly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPromptInfluenceUnavailableCode {
+    /// Hosted providers own their final prompt template and logits, so the
+    /// inference-context intervention cannot be observed locally.
+    HostedBackend,
+    /// The caller selected `gguf://local`, but this binary has no embedded
+    /// llama.cpp support.
+    LocalInferenceFeatureDisabled,
+    /// This target cannot make llama.cpp load through a stable descriptor path,
+    /// so a digest cannot be proven to describe the bytes actually loaded.
+    DescriptorBackedIdentityUnavailable,
+}
+
+/// Content identity of the exact GGUF file bound to one local client.
+///
+/// On supported Unix targets, this receipt is computed from the descriptor
+/// retained during model initialization. It is never inferred from a
+/// configured path or model name. Targets without descriptor-backed loading
+/// return an explicit unavailable outcome instead of this type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalModelIdentity {
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Result of requesting the identity of this client's loaded local model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LocalModelIdentityOutcome {
+    Verified {
+        identity: LocalModelIdentity,
+    },
+    Unavailable {
+        code: LocalPromptInfluenceUnavailableCode,
+        detail: String,
+    },
+}
+
+/// Result of requesting local prompt-intervention scores.
+///
+/// The tagged status prevents a hosted or feature-disabled run from being
+/// mistaken for a successfully primed local run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LocalPromptInfluenceOutcome {
+    Scored {
+        report: LocalPromptInfluenceReport,
+    },
+    Unavailable {
+        code: LocalPromptInfluenceUnavailableCode,
+        detail: String,
+    },
+}
+
+/// Influence scores for one baseline prompt and an ordered candidate list.
+///
+/// Each candidate is appended to the supplied baseline tools and evaluated in
+/// its own fresh KV context. The divergence is measured over the complete
+/// next-token distribution before grammar filtering or sampling.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocalPromptInfluenceReport {
+    /// SHA-256 of the exact retained file handle used to initialize the model
+    /// that produced these logits.
+    pub model_sha256: String,
+    pub model_size_bytes: u64,
+    pub template_sha256: String,
+    pub baseline_prompt_tokens: u64,
+    pub baseline_scoring_wall_time_micros: u64,
+    pub total_scoring_wall_time_micros: u64,
+    pub candidates: Vec<LocalToolInfluenceScore>,
+}
+
+/// Causal prompt-intervention score for one full tool definition.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LocalToolInfluenceScore {
+    /// Stable position in the caller-provided candidate ordering.
+    pub candidate_index: usize,
+    pub tool_name: String,
+    /// Jensen-Shannon divergence in natural-log units, bounded by `ln(2)`.
+    pub raw_js_divergence_nats: f64,
+    /// Raw divergence divided by the number of final GGUF prompt tokens added
+    /// by this intervention. `None` means the template added no tokens (or
+    /// produced a shorter prompt), so normalization would be misleading.
+    pub normalized_js_divergence_per_added_prompt_token: Option<f64>,
+    pub baseline_prompt_tokens: u64,
+    pub candidate_prompt_tokens: u64,
+    pub added_prompt_tokens: i64,
+    /// Rendering, tokenization, fresh-context prefill, logits extraction, and
+    /// divergence calculation for this candidate. Model loading is excluded.
+    pub scoring_wall_time_micros: u64,
+}
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -241,6 +348,21 @@ pub struct FunctionDef {
 pub struct ChatResponse {
     pub message: ChatMessage,
     pub usage: Option<UsageInfo>,
+    /// Exact embedded-GGUF generation phases. Hosted providers do not expose
+    /// this split and therefore return `None` rather than an estimate.
+    pub generation_metrics: Option<GenerationPhaseMetrics>,
+}
+
+/// Wall-clock split for one embedded-GGUF generation after the model is warm.
+///
+/// Prefill includes canonical template rendering, tokenization, grammar setup,
+/// KV-context creation, and prompt evaluation. Decode begins at the first
+/// greedy sample and ends after the final decoder flush. Model loading is
+/// deliberately excluded from both phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationPhaseMetrics {
+    pub prefill_wall_time_micros: u64,
+    pub decode_wall_time_micros: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +631,7 @@ impl LlmClient {
         tools: &[ToolDefinition],
         model: &str,
         usage: UsageInfo,
+        generation_metrics: GenerationPhaseMetrics,
         call_id: String,
     ) -> Result<ChatResponse> {
         let tool = tools.iter().find(|tool| tool.function.name == name).ok_or_else(|| {
@@ -543,6 +666,7 @@ impl LlmClient {
                 tool_call_id: None,
             },
             usage: Some(usage),
+            generation_metrics: Some(generation_metrics),
         })
     }
 
@@ -558,6 +682,10 @@ impl LlmClient {
             completion_tokens: generation.completion_tokens,
             total_tokens: generation.prompt_tokens + generation.completion_tokens,
         };
+        let generation_metrics = GenerationPhaseMetrics {
+            prefill_wall_time_micros: generation.prefill_wall_time_micros,
+            decode_wall_time_micros: generation.decode_wall_time_micros,
+        };
         if tools.is_empty() {
             return Ok(ChatResponse {
                 message: ChatMessage {
@@ -567,11 +695,15 @@ impl LlmClient {
                     tool_call_id: None,
                 },
                 usage: Some(usage),
+                generation_metrics: Some(generation_metrics),
             });
         }
 
         let text = generation.text.trim();
-        if text.starts_with("<start_function_call>") || text.starts_with("<|tool_call_start|>") {
+        if text.starts_with("<start_function_call>")
+            || text.starts_with("<|tool_call_start|>")
+            || text.starts_with("<|tool_call>")
+        {
             let (name, arguments) = parse_native_tool_call(text).map_err(|error| {
                 anyhow::anyhow!(
                     "local GGUF model {model:?} produced an invalid embedded-template tool call {text:?}: {error}; the call was rejected and no remote endpoint was tried."
@@ -583,6 +715,7 @@ impl LlmClient {
                 tools,
                 model,
                 usage,
+                generation_metrics,
                 Self::next_local_call_id(counter),
             );
         }
@@ -595,6 +728,7 @@ impl LlmClient {
                     tool_call_id: None,
                 },
                 usage: Some(usage),
+                generation_metrics: Some(generation_metrics),
             });
         }
         let value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
@@ -631,6 +765,7 @@ impl LlmClient {
                         tool_call_id: None,
                     },
                     usage: Some(usage),
+                    generation_metrics: Some(generation_metrics),
                 })
             }
             Some("tool_call") => {
@@ -662,6 +797,7 @@ impl LlmClient {
                     tools,
                     model,
                     usage,
+                    generation_metrics,
                     Self::next_local_call_id(counter),
                 )
             }
@@ -933,6 +1069,7 @@ impl LlmClient {
                     tool_call_id: None,
                 },
                 usage: None,
+                generation_metrics: None,
             });
         }
         let url = self.chat_completions_url();
@@ -979,6 +1116,7 @@ impl LlmClient {
                 tool_call_id: None,
             },
             usage,
+            generation_metrics: None,
         })
     }
 
@@ -1442,6 +1580,70 @@ impl LlmClient {
         Ok(embeddings)
     }
 
+    /// Render and tokenize the exact prompt the embedded GGUF path would
+    /// prefill. This loads no remote resource and is unavailable for hosted
+    /// backends, whose provider-owned templates are not observable here.
+    pub async fn render_local_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<RenderedLocalPrompt> {
+        let Some(local) = self.local_backend() else {
+            bail!(
+                "exact prompt rendering is unavailable for hosted backends because their final chat template is provider-owned"
+            );
+        };
+        local.render_prompt(messages, tools).await
+    }
+
+    /// Return a content receipt for the exact GGUF bound to this client.
+    ///
+    /// The first call initializes the model, hashes its retained source file,
+    /// and caches the receipt with that model. Later calls and influence
+    /// scoring reuse the same per-client receipt. No model is downloaded and
+    /// no hosted fallback is attempted. Targets that cannot pass a stable
+    /// descriptor path to llama.cpp return an explicit unavailable outcome;
+    /// path-only checks are never presented as a verified receipt.
+    pub async fn local_model_identity(&self) -> Result<LocalModelIdentityOutcome> {
+        let Some(local) = self.local_backend() else {
+            return Ok(LocalModelIdentityOutcome::Unavailable {
+                code: LocalPromptInfluenceUnavailableCode::HostedBackend,
+                detail: "loaded-model identity is only observable for a local GGUF backend; no hosted request or fallback was attempted"
+                    .to_string(),
+            });
+        };
+        local.model_identity().await
+    }
+
+    /// Score how much each candidate tool changes the local model's complete
+    /// next-token distribution when appended to `baseline_tools`.
+    ///
+    /// This is inference-context influence, not training-data or weight
+    /// influence. Every arm uses this client's one cached GGUF, its embedded
+    /// Minja template, and a fresh prefill context. No grammar or sampler is
+    /// applied. Each full definition is passed to the production renderer
+    /// unchanged; the measured intervention is the representation that the
+    /// model's template actually emits. Candidate order is preserved exactly.
+    /// Scoring is explicitly unavailable when the target cannot prove a
+    /// descriptor-backed loaded-model identity.
+    pub async fn score_local_tool_influence(
+        &self,
+        messages: &[ChatMessage],
+        baseline_tools: &[ToolDefinition],
+        candidates: &[ToolDefinition],
+    ) -> Result<LocalPromptInfluenceOutcome> {
+        let Some(local) = self.local_backend() else {
+            return Ok(LocalPromptInfluenceOutcome::Unavailable {
+                code: LocalPromptInfluenceUnavailableCode::HostedBackend,
+                detail: "prompt-intervention influence requires local GGUF logits; hosted providers own the final template and logits, and no fallback was attempted"
+                    .to_string(),
+            });
+        };
+        local
+            .score_tool_influence(messages, baseline_tools, candidates)
+            .await
+    }
+
     /// Chat with tool-calling support and SSE streaming.
     /// Calls `on_delta` for each text chunk as it arrives.
     /// Returns the final assembled response (same as `chat_with_tools`).
@@ -1777,6 +1979,7 @@ impl LlmClient {
                     tool_call_id: None,
                 },
                 usage: usage_info,
+                generation_metrics: None,
             });
         }
         let url = self.chat_completions_url();
@@ -1878,6 +2081,7 @@ impl LlmClient {
                 tool_call_id: None,
             },
             usage: usage_info,
+            generation_metrics: None,
         })
     }
 
@@ -2439,6 +2643,9 @@ fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
     if text.starts_with("<|tool_call_start|>") {
         return parse_lfm_tool_call(text);
     }
+    if text.starts_with("<|tool_call>") {
+        return parse_gemma_tool_call(text);
+    }
 
     let prefix = "<start_function_call>call:";
     let suffix = "<end_function_call>";
@@ -2455,6 +2662,31 @@ fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
     parser.skip_whitespace();
     if parser.position != parser.input.len() {
         bail!("native argument object has trailing characters");
+    }
+    Ok((name.to_string(), arguments))
+}
+
+fn parse_gemma_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
+    let prefix = "<|tool_call>call:";
+    let suffix = "<tool_call|>";
+    let body = text
+        .strip_prefix(prefix)
+        .context("missing Gemma function-call prefix")?
+        .strip_suffix(suffix)
+        .context("missing Gemma function-call terminator")?;
+    let open = body.find('{').context("missing Gemma argument object")?;
+    let name = body[..open].trim();
+    validate_native_tool_name(name)?;
+    // Gemma's template uses <|"|> as its string delimiter. The legacy
+    // parser already implements the otherwise identical recursive value
+    // syntax, and its grammar excludes literal '<' inside a string, so this
+    // delimiter substitution cannot collide with payload data.
+    let normalized = body[open..].replace(r#"<|"|>"#, "<escape>");
+    let mut parser = NativeValueParser::new(&normalized);
+    let arguments = parser.object()?;
+    parser.skip_whitespace();
+    if parser.position != parser.input.len() {
+        bail!("Gemma argument object has trailing characters");
     }
     Ok((name.to_string(), arguments))
 }
@@ -3330,6 +3562,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn hosted_prompt_influence_is_explicitly_unavailable_without_a_request() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            model: "fixture".to_string(),
+            ..LlmConfig::default()
+        });
+
+        let outcome = client
+            .score_local_tool_influence(&[], &[], &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            LocalPromptInfluenceOutcome::Unavailable {
+                code: LocalPromptInfluenceUnavailableCode::HostedBackend,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn hosted_model_identity_is_explicitly_unavailable_without_a_request() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            model: "fixture".to_string(),
+            ..LlmConfig::default()
+        });
+
+        let outcome = client.local_model_identity().await.unwrap();
+        assert!(matches!(
+            outcome,
+            LocalModelIdentityOutcome::Unavailable {
+                code: LocalPromptInfluenceUnavailableCode::HostedBackend,
+                ..
+            }
+        ));
+    }
+
     #[cfg(feature = "local-inference")]
     fn write_context_only_gguf(path: &std::path::Path, context_window: u32) {
         use std::io::Write as _;
@@ -3382,6 +3653,47 @@ mod tests {
         let error = client.generate("hello").await.unwrap_err().to_string();
         assert!(error.contains("built without embedded inference"));
         assert!(error.contains("No remote endpoint was tried"));
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    #[tokio::test]
+    async fn feature_disabled_prompt_influence_is_explicitly_unavailable() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: LOCAL_GGUF_URL.to_string(),
+            model: "missing.gguf".to_string(),
+            ..LlmConfig::default()
+        });
+
+        let outcome = client
+            .score_local_tool_influence(&[], &[], &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            LocalPromptInfluenceOutcome::Unavailable {
+                code: LocalPromptInfluenceUnavailableCode::LocalInferenceFeatureDisabled,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    #[tokio::test]
+    async fn feature_disabled_model_identity_is_explicitly_unavailable() {
+        let client = LlmClient::new(LlmConfig {
+            base_url: LOCAL_GGUF_URL.to_string(),
+            model: "missing.gguf".to_string(),
+            ..LlmConfig::default()
+        });
+
+        let outcome = client.local_model_identity().await.unwrap();
+        assert!(matches!(
+            outcome,
+            LocalModelIdentityOutcome::Unavailable {
+                code: LocalPromptInfluenceUnavailableCode::LocalInferenceFeatureDisabled,
+                ..
+            }
+        ));
     }
 
     #[cfg(not(feature = "local-inference"))]
@@ -3458,6 +3770,8 @@ mod tests {
                     .to_string(),
                 prompt_tokens: 3,
                 completion_tokens: 4,
+                prefill_wall_time_micros: 5,
+                decode_wall_time_micros: 7,
             },
             std::slice::from_ref(&tool),
             "test-model",
@@ -3468,12 +3782,21 @@ mod tests {
         let call = &response.message.tool_calls.unwrap()[0];
         assert_eq!(call.function.name, "lookup");
         assert_eq!(call.function.arguments, r#"{"query":"titanium"}"#);
+        assert_eq!(
+            response.generation_metrics,
+            Some(GenerationPhaseMetrics {
+                prefill_wall_time_micros: 5,
+                decode_wall_time_micros: 7,
+            })
+        );
 
         let error = LlmClient::local_chat_response(
             local::LocalGeneration {
                 text: r#"{"kind":"tool_call","name":"hallucinated","arguments":{}}"#.to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                prefill_wall_time_micros: 0,
+                decode_wall_time_micros: 0,
             },
             std::slice::from_ref(&tool),
             "test-model",
@@ -3511,6 +3834,8 @@ mod tests {
                 text: r#"{"kind":"tool_call","name":"find_tools","arguments":{"query":"materials","limit":26}}"#.to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                prefill_wall_time_micros: 0,
+                decode_wall_time_micros: 0,
             },
             &[tool],
             "test-model",
@@ -3550,6 +3875,18 @@ mod tests {
         assert_eq!(arguments["limit"], 2);
     }
 
+    #[test]
+    fn gemma_native_tool_call_parser_preserves_nested_types() {
+        let (name, arguments) = parse_native_tool_call(
+            r#"<|tool_call>call:lookup{query:<|"|>titanium<|"|>,filters:{limit:2,exact:true}}<tool_call|>"#,
+        )
+        .unwrap();
+        assert_eq!(name, "lookup");
+        assert_eq!(arguments["query"], "titanium");
+        assert_eq!(arguments["filters"]["limit"], 2);
+        assert_eq!(arguments["filters"]["exact"], true);
+    }
+
     /// The close-delimiter arm had NO test — `grep "mismatched delimiters"`
     /// matched only the `bail!`. Two closers were merged into one arm to clear
     /// a clippy gate, so this pins what the merge must preserve: each closer
@@ -3580,6 +3917,8 @@ mod tests {
                 text: r#"{"kind":"final","content":"done"}"#.to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 2,
+                prefill_wall_time_micros: 0,
+                decode_wall_time_micros: 0,
             },
             &[ToolDefinition {
                 tool_type: "function".to_string(),
@@ -3619,6 +3958,8 @@ mod tests {
                         text: r#"{"kind":"tool_call","name":"lookup","arguments":{}}"#.to_string(),
                         prompt_tokens: 1,
                         completion_tokens: 1,
+                        prefill_wall_time_micros: 0,
+                        decode_wall_time_micros: 0,
                     },
                     std::slice::from_ref(&tool),
                     "test-model",
