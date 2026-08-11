@@ -1112,28 +1112,73 @@ pub async fn run_turn(
     let run_store = start_root_agent_run(&run).await;
     let run_heartbeat = AgentRunHeartbeat::start(run_store.clone(), run.id.clone());
     let mut run_metrics = AgentRunMetrics::default();
-    let result = run_turn_inner(
-        llm,
-        tool_server,
-        command_tool_runtime,
-        history,
-        tool_catalog,
-        config,
+    let surface_policy = crate::skills::SkillSurfacePolicy::default();
+    let turn_skill_context = crate::skills::prepare_turn_skill_context(
         user_message,
-        task,
-        transcript,
-        hooks,
-        permissions,
-        live_permission_overrides,
-        scratchpad,
-        emit,
-        approval_rx,
-        policy,
-        &run.id,
-        &run.session_id,
-        &mut run_metrics,
-    )
-    .await;
+        &command_tool_runtime.project_root,
+        &surface_policy,
+    );
+    let result = match turn_skill_context {
+        Ok(turn_skill_context) => {
+            crate::skills::with_turn_skill_context(
+                turn_skill_context,
+                run_turn_inner(
+                    llm,
+                    tool_server,
+                    command_tool_runtime,
+                    history,
+                    tool_catalog,
+                    config,
+                    user_message,
+                    task,
+                    transcript,
+                    hooks,
+                    permissions,
+                    live_permission_overrides,
+                    scratchpad,
+                    emit,
+                    approval_rx,
+                    policy,
+                    &run.id,
+                    &run.session_id,
+                    &mut run_metrics,
+                ),
+            )
+            .await
+        }
+        Err(error) => {
+            // Refuse before reprompting or model inference. In particular, do
+            // not let an ambiguous `$name` fall through to a model that might
+            // guess the first skill or workflow it sees.
+            let refusal = format!("Skill/workflow selection refused: {error}");
+            history.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(user_message.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            transcript.append(TranscriptEntry::new("user", user_message));
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(refusal.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            transcript.append(TranscriptEntry::new("assistant", &refusal));
+            emit(AgentEvent::TextDelta {
+                text: refusal.clone(),
+            });
+            emit(AgentEvent::TextFlush);
+            emit(AgentEvent::TurnComplete {
+                text: Some(refusal),
+                has_more: false,
+                usage: None,
+                total_usage: Some(UsageInfo::default()),
+                estimated_cost: Some(0.0),
+            });
+            Ok(())
+        }
+    };
     run_heartbeat.stop().await;
     finish_root_agent_run(run_store.as_deref(), &run.id, &result, &run_metrics).await;
     result
@@ -1164,6 +1209,8 @@ pub(crate) async fn run_turn_inner(
     current_session_id: &str,
     run_metrics: &mut AgentRunMetrics,
 ) -> Result<()> {
+    let turn_skill_context = crate::skills::current_turn_skill_context();
+    let skill_surface_policy = crate::skills::SkillSurfacePolicy::default();
     // ── 1. Push user message ──────────────────────────────────────
     history.push(ChatMessage {
         role: "user".to_string(),
@@ -1199,7 +1246,8 @@ pub(crate) async fn run_turn_inner(
     // — those get the routing hint, which carries the same honesty.
     let can_ask = task.is_none() && config.subagent_depth == 0;
     // An exhausted budget must not pay for a classifier call either.
-    let preflight = if transcript.budget_exhausted() {
+    let preflight = if transcript.budget_exhausted() || turn_skill_context.has_explicit_selections()
+    {
         (crate::reprompt::Preflight::Proceed, None)
     } else {
         crate::reprompt::preflight(llm, config, user_message, history, can_ask).await
@@ -1292,7 +1340,8 @@ pub(crate) async fn run_turn_inner(
     // Tools the model discovered via find_tools this turn — pinned so their
     // FULL definitions stay in the request every later iteration. Without this,
     // find_tools returned names the model could never actually call.
-    let mut pinned_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pinned_tools: std::collections::HashSet<String> =
+        turn_skill_context.pinned_tools().cloned().collect();
     // Execution-contract gate state: names of tools that ACTUALLY EXECUTED
     // this turn (recorded at h5, after the permission / policy / approval
     // gates — a blocked call produced no evidence and must not count), and how
@@ -1429,14 +1478,14 @@ pub(crate) async fn run_turn_inner(
                 tool_call_id: None,
             });
         }
-        // Progressive disclosure for the agent's OWN authored skills (P3 slice b):
-        // surfaced every turn (independent of the neural flag) with the correct
-        // `run_skill` call instruction, so a skill written earlier stays visible
-        // without the model having to call list_skills. None when none exist.
-        if let Some(skills_menu) = crate::skills::skills_menu(50) {
+        // Unified progressive disclosure for Voyager JSON skills, human
+        // Markdown procedures, and declared workflows. Explicit-only human
+        // procedures are deliberately absent; the resolver can still attach
+        // one after a user `$name` selection.
+        if let Some(skills_menu) = &turn_skill_context.discovery_prompt {
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: Some(skills_menu),
+                content: Some(skills_menu.clone()),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -1463,6 +1512,17 @@ pub(crate) async fn run_turn_inner(
             });
         }
         messages.extend(history.iter().cloned());
+        if let Some(selection) = &turn_skill_context.selected_prompt {
+            // Human-authored skill text is untrusted user material. Keep the
+            // resolver directive at user priority; `run_skill` then returns
+            // Markdown only after the ordinary policy/approval path has run.
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(selection.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
 
         // Stream tokens incrementally — collect deltas from the
         // streaming callback and emit them after the call completes.
@@ -1761,6 +1821,37 @@ pub(crate) async fn run_turn_inner(
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
                     summary: Some(format!("{tool_name}: blocked by hook")),
+                    preview: preview.clone(),
+                    elapsed_ms: 0,
+                    is_error: true,
+                });
+                history.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(error_msg),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                });
+                continue;
+            }
+
+            // Human Markdown is not an execution bypass. Even a generic
+            // read/bash call that reaches into a skill package must respect
+            // its declared implicit-invocation policy before OPA, approval,
+            // or an executor sees the call. Explicit selection is recorded in
+            // task-local turn context by the deterministic `$name` resolver,
+            // never by a model-supplied flag.
+            if let Err(error) = crate::skills::gate_implicit_human_skill_invocation(
+                tool_name,
+                &args,
+                &command_tool_runtime.project_root,
+                &skill_surface_policy,
+            ) {
+                let error_msg = format!("Skill invocation blocked: {error}");
+                emit(AgentEvent::ToolCallResult {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: error_msg.clone(),
+                    summary: Some(format!("{tool_name}: blocked by skill policy")),
                     preview: preview.clone(),
                     elapsed_ms: 0,
                     is_error: true,

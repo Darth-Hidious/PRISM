@@ -4186,13 +4186,30 @@ fn format_skills_list(result: &Value) -> String {
             for s in items {
                 let name = s.get("name").and_then(Value::as_str).unwrap_or("?");
                 let desc = s.get("description").and_then(Value::as_str).unwrap_or("");
+                let kind = s.get("kind").and_then(Value::as_str).unwrap_or("authored");
                 let lang = s.get("language").and_then(Value::as_str).unwrap_or("shell");
                 let verified = s.get("verified").and_then(Value::as_bool).unwrap_or(false);
-                let mark = if verified { "" } else { " (unverified)" };
+                let mark = if kind == "human" {
+                    if s.get("allow_implicit_invocation")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        " (untrusted, implicit allowed)"
+                    } else {
+                        " (untrusted, explicit selection required)"
+                    }
+                } else if verified {
+                    ""
+                } else {
+                    " (unverified)"
+                };
                 lines.push(format!("  • {name} [{lang}]{mark} — {desc}"));
             }
             lines.push(String::new());
-            lines.push("Run one from the palette (Run skill) or `/skills run <name>`.".to_string());
+            lines.push(
+                "Run authored skills from the palette or `/skills run <name>`; select a human procedure in chat with `$name`."
+                    .to_string(),
+            );
             lines.join("\n")
         }
         _ => "No skills yet. Author one from the palette (Create skill) or `/skills create`."
@@ -4202,6 +4219,16 @@ fn format_skills_list(result: &Value) -> String {
 
 /// Render `run_skill` output honestly — exit status plus any captured streams.
 fn format_skill_run(name: &str, result: &Value) -> String {
+    if result.get("kind").and_then(Value::as_str) == Some("human") {
+        let instructions = result
+            .get("instructions")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return format!(
+            "Loaded human procedure '{name}' as untrusted instructions. Any commands still require normal policy and approval gates.\n\n{}",
+            instructions.trim_end()
+        );
+    }
     let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
