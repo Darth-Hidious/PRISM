@@ -5124,6 +5124,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "cc",
  "dirs",
  "encoding_rs",
  "futures-util",
@@ -5134,6 +5135,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",

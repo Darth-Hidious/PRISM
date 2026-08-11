@@ -2,7 +2,10 @@
 
 #![cfg(feature = "local-inference")]
 
-use prism_llm::{ChatMessage, FunctionDef, LOCAL_GGUF_URL, LlmClient, LlmConfig, ToolDefinition};
+use prism_llm::{
+    BUNDLED_GEMMA, ChatMessage, FunctionDef, LOCAL_GGUF_URL, LlmClient, LlmConfig, ToolDefinition,
+    verify_model_artifact,
+};
 
 fn meta_tool(name: &str, description: &str, parameters: serde_json::Value) -> ToolDefinition {
     ToolDefinition {
@@ -131,6 +134,49 @@ async fn embedded_gguf_streams_real_token_pieces() {
     );
     assert_eq!(response.message.content.as_deref(), Some(streamed.as_str()));
     assert!(response.usage.unwrap().completion_tokens > 0);
+}
+
+/// End-to-end proof for the pinned, manifest-only "bundled Gemma" contract:
+/// exact artifact, exact embedded template, canonical Minja render, and greedy
+/// generation all use one warm model. It never downloads weights.
+#[tokio::test]
+#[ignore = "requires PRISM_TEST_GGUF to name the pinned Gemma artifact"]
+async fn pinned_gemma_manifest_template_and_generation_proof() {
+    let path =
+        std::path::PathBuf::from(std::env::var("PRISM_TEST_GGUF").expect("set PRISM_TEST_GGUF"));
+    verify_model_artifact(&path, &BUNDLED_GEMMA).expect("GGUF does not match pinned manifest");
+    let client = LlmClient::new(LlmConfig {
+        base_url: LOCAL_GGUF_URL.to_string(),
+        model: path.display().to_string(),
+        max_output_tokens: Some(8),
+        ..LlmConfig::default()
+    });
+    let messages = [ChatMessage {
+        role: "user".to_string(),
+        content: Some("Reply with one word: READY".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    // `render_local_prompt` and generation share the client's OnceLock model,
+    // so the proof loads once and exercises the production preparation path.
+    let rendered = client.render_local_prompt(&messages, &[]).await.unwrap();
+    assert_eq!(
+        rendered.template_sha256,
+        "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
+    );
+    assert!(rendered.text.starts_with("<bos><|turn>user\n"));
+    assert!(rendered.token_count > 0);
+
+    let response = client
+        .chat_with_tools_streaming(&messages, &[], |_, is_reasoning| {
+            assert!(!is_reasoning);
+        })
+        .await
+        .unwrap();
+    let usage = response.usage.expect("local generation must report usage");
+    assert_eq!(usage.prompt_tokens, rendered.token_count);
+    assert!(usage.completion_tokens > 0);
 }
 
 /// Live regression H3: tool call -> tool result -> second tool call -> final

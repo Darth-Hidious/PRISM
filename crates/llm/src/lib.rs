@@ -15,7 +15,19 @@ use std::time::Duration;
 use tracing::debug;
 
 mod local;
+mod minja;
+mod model_artifact;
 pub use local::{LOCAL_GGUF_URL, default_model_dir, is_local_gguf_url, resolve_model_path};
+pub use minja::render as render_minja_template;
+pub use model_artifact::{BUNDLED_GEMMA, ModelArtifactManifest, sha256_hex, verify_model_artifact};
+
+/// Canonical text and identity produced by the embedded GGUF's own template.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderedLocalPrompt {
+    pub text: String,
+    pub token_count: u64,
+    pub template_sha256: String,
+}
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -536,7 +548,10 @@ impl LlmClient {
         }
 
         let text = generation.text.trim();
-        if text.starts_with("<start_function_call>") || text.starts_with("<|tool_call_start|>") {
+        if text.starts_with("<start_function_call>")
+            || text.starts_with("<|tool_call_start|>")
+            || text.starts_with("<|tool_call>")
+        {
             let (name, arguments) = parse_native_tool_call(text).map_err(|error| {
                 anyhow::anyhow!(
                     "local GGUF model {model:?} produced an invalid embedded-template tool call {text:?}: {error}; the call was rejected and no remote endpoint was tried."
@@ -1405,6 +1420,22 @@ impl LlmClient {
             embeddings.push(vec);
         }
         Ok(embeddings)
+    }
+
+    /// Render and tokenize the exact prompt the embedded GGUF path would
+    /// prefill. This loads no remote resource and is unavailable for hosted
+    /// backends, whose provider-owned templates are not observable here.
+    pub async fn render_local_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<RenderedLocalPrompt> {
+        let Some(local) = self.local_backend() else {
+            bail!(
+                "exact prompt rendering is unavailable for hosted backends because their final chat template is provider-owned"
+            );
+        };
+        local.render_prompt(messages, tools).await
     }
 
     /// Chat with tool-calling support and SSE streaming.
@@ -2404,6 +2435,9 @@ fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
     if text.starts_with("<|tool_call_start|>") {
         return parse_lfm_tool_call(text);
     }
+    if text.starts_with("<|tool_call>") {
+        return parse_gemma_tool_call(text);
+    }
 
     let prefix = "<start_function_call>call:";
     let suffix = "<end_function_call>";
@@ -2420,6 +2454,31 @@ fn parse_native_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
     parser.skip_whitespace();
     if parser.position != parser.input.len() {
         bail!("native argument object has trailing characters");
+    }
+    Ok((name.to_string(), arguments))
+}
+
+fn parse_gemma_tool_call(text: &str) -> Result<(String, serde_json::Value)> {
+    let prefix = "<|tool_call>call:";
+    let suffix = "<tool_call|>";
+    let body = text
+        .strip_prefix(prefix)
+        .context("missing Gemma function-call prefix")?
+        .strip_suffix(suffix)
+        .context("missing Gemma function-call terminator")?;
+    let open = body.find('{').context("missing Gemma argument object")?;
+    let name = body[..open].trim();
+    validate_native_tool_name(name)?;
+    // Gemma's template uses <|"|> as its string delimiter. The legacy
+    // parser already implements the otherwise identical recursive value
+    // syntax, and its grammar excludes literal '<' inside a string, so this
+    // delimiter substitution cannot collide with payload data.
+    let normalized = body[open..].replace(r#"<|"|>"#, "<escape>");
+    let mut parser = NativeValueParser::new(&normalized);
+    let arguments = parser.object()?;
+    parser.skip_whitespace();
+    if parser.position != parser.input.len() {
+        bail!("Gemma argument object has trailing characters");
     }
     Ok((name.to_string(), arguments))
 }
@@ -3513,6 +3572,18 @@ mod tests {
         assert_eq!(name, "find_tools");
         assert_eq!(arguments["query"], "alpha, {beta} <gamma>");
         assert_eq!(arguments["limit"], 2);
+    }
+
+    #[test]
+    fn gemma_native_tool_call_parser_preserves_nested_types() {
+        let (name, arguments) = parse_native_tool_call(
+            r#"<|tool_call>call:lookup{query:<|"|>titanium<|"|>,filters:{limit:2,exact:true}}<tool_call|>"#,
+        )
+        .unwrap();
+        assert_eq!(name, "lookup");
+        assert_eq!(arguments["query"], "titanium");
+        assert_eq!(arguments["filters"]["limit"], 2);
+        assert_eq!(arguments["filters"]["exact"], true);
     }
 
     /// The close-delimiter arm had NO test — `grep "mismatched delimiters"`

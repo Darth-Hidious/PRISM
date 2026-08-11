@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use anyhow::{Result, bail};
 
-use crate::{ChatMessage, ToolDefinition};
+use crate::{ChatMessage, RenderedLocalPrompt, ToolDefinition};
 
 /// Explicit base URL sentinel selecting embedded GGUF inference.
 pub const LOCAL_GGUF_URL: &str = "gguf://local";
@@ -219,6 +219,33 @@ impl LocalGguf {
     ) -> Result<LocalGeneration> {
         Err(feature_disabled_error())
     }
+
+    #[cfg(feature = "local-inference")]
+    pub(crate) async fn render_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<RenderedLocalPrompt> {
+        let messages = messages.to_vec();
+        let tools = tools.to_vec();
+        let model_spec = self.model_spec.clone();
+        let model_cache = std::sync::Arc::clone(&self.model);
+        tokio::task::spawn_blocking(move || {
+            let model = load_model(&model_spec, &model_cache)?;
+            prepare_prompt(&model_spec, &model, &messages, &tools).map(|prompt| prompt.rendered)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("local GGUF prompt-render task panicked: {error}"))?
+    }
+
+    #[cfg(not(feature = "local-inference"))]
+    pub(crate) async fn render_prompt(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> Result<RenderedLocalPrompt> {
+        Err(feature_disabled_error())
+    }
 }
 
 #[cfg(feature = "local-inference")]
@@ -342,12 +369,19 @@ enum NativeToolProtocol {
     Legacy,
     /// LiquidAI LFM 2.5's embedded Jinja tool-call format.
     Lfm,
+    /// Google Gemma 4's template-native declarations, calls, and responses.
+    Gemma,
 }
 
 #[cfg(feature = "local-inference")]
 fn native_tool_protocol(template: &str) -> Option<NativeToolProtocol> {
     if template.contains("<|tool_call_start|>") && template.contains("<|tool_call_end|>") {
         Some(NativeToolProtocol::Lfm)
+    } else if template.contains("<|tool>")
+        && template.contains("<|tool_call>")
+        && template.contains("<tool_call|>")
+    {
+        Some(NativeToolProtocol::Gemma)
     } else if template.contains("<start_function_declaration>")
         && template.contains("<start_function_call>")
     {
@@ -442,6 +476,10 @@ fn native_tool_declarations(tools: &[ToolDefinition], protocol: NativeToolProtoc
             "List of tools: {}",
             serde_json::to_string(tools).expect("tool definitions are serializable")
         ),
+        // Gemma receives the definitions through the template's `tools`
+        // variable, so injecting a second prose projection would change both
+        // the schema and the intervention being measured.
+        NativeToolProtocol::Gemma => String::new(),
     }
 }
 
@@ -486,9 +524,47 @@ fn native_tool_call_text(
                 }
                 result.push_str(")]<|tool_call_end|>");
             }
+            NativeToolProtocol::Gemma => {
+                result.push_str("<|tool_call>call:");
+                result.push_str(&call.function.name);
+                result.push('{');
+                for (index, (key, value)) in object.iter().enumerate() {
+                    if index > 0 {
+                        result.push(',');
+                    }
+                    result.push_str(key);
+                    result.push(':');
+                    result.push_str(&gemma_native_value(value));
+                }
+                result.push_str("}<tool_call|>");
+            }
         }
     }
     Ok(result)
+}
+
+#[cfg(feature = "local-inference")]
+fn gemma_native_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(value) => format!(r#"<|"|>{value}<|"|>"#),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(gemma_native_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", gemma_native_value(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.to_string(),
+    }
 }
 
 #[cfg(feature = "local-inference")]
@@ -529,6 +605,7 @@ fn native_value_rule(schema: &serde_json::Value, protocol: NativeToolProtocol) -
         Some("string") => match protocol {
             NativeToolProtocol::Legacy => "escaped",
             NativeToolProtocol::Lfm => "string",
+            NativeToolProtocol::Gemma => "gemmastring",
         },
         Some("object") => "object",
         Some("array") => "array",
@@ -548,6 +625,7 @@ fn native_tool_call_grammar_for(tools: &[ToolDefinition], protocol: NativeToolPr
     match protocol {
         NativeToolProtocol::Legacy => legacy_tool_call_grammar(tools),
         NativeToolProtocol::Lfm => lfm_tool_call_grammar(tools),
+        NativeToolProtocol::Gemma => gemma_tool_call_grammar(tools),
     }
 }
 
@@ -634,6 +712,44 @@ ws ::= [ \t\n]*
 }
 
 #[cfg(feature = "local-inference")]
+fn gemma_tool_call_grammar(tools: &[ToolDefinition]) -> String {
+    let call_rules = (0..tools.len())
+        .map(|index| format!("call{index}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut grammar = format!("root ::= {call_rules} | final\n");
+    grammar.push_str(
+        r#"final ::= [^<]*
+value ::= gemmastring | object | array | number | boolean | "null"
+gemmastring ::= "<|\"|>" gemmachar* "<|\"|>"
+gemmachar ::= [^<]
+boolean ::= "true" | "false"
+object ::= "{" ws members ws "}"
+array ::= "[" ws (value (ws "," ws value)*)? ws "]"
+members ::= pair (ws "," ws pair)* | ""
+pair ::= key ws ":" ws value
+key ::= [a-zA-Z_] [a-zA-Z0-9_-]*
+number ::= [+-]? [0-9]+ ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+ws ::= [ \t\n]*
+"#,
+    );
+    for (index, tool) in tools.iter().enumerate() {
+        append_tool_rule(
+            &mut grammar,
+            tool,
+            index,
+            NativeToolProtocol::Gemma,
+            "<|tool_call>call:",
+            "{",
+            "}",
+            ":",
+            "<tool_call|>",
+        );
+    }
+    grammar
+}
+
+#[cfg(feature = "local-inference")]
 #[allow(clippy::too_many_arguments)]
 fn append_tool_rule(
     grammar: &mut String,
@@ -665,7 +781,9 @@ fn append_tool_rule(
         grammar_literal(call_suffix),
     ));
     let separator = match protocol {
-        NativeToolProtocol::Legacy | NativeToolProtocol::Lfm => " ws \",\" ws ",
+        NativeToolProtocol::Legacy | NativeToolProtocol::Lfm | NativeToolProtocol::Gemma => {
+            " ws \",\" ws "
+        }
     };
     let sequence = required
         .iter()
@@ -674,7 +792,7 @@ fn append_tool_rule(
         .collect::<Vec<_>>()
         .join(separator);
     let generic_pair = match protocol {
-        NativeToolProtocol::Legacy => "pair",
+        NativeToolProtocol::Legacy | NativeToolProtocol::Gemma => "pair",
         NativeToolProtocol::Lfm => "lfmpair",
     };
     if required.is_empty() {
@@ -709,13 +827,65 @@ fn grammar_literal(value: &str) -> String {
 }
 
 #[cfg(feature = "local-inference")]
+#[derive(Clone, Debug, serde::Serialize)]
+struct TemplateMessage {
+    role: String,
+    content: String,
+}
+
+#[cfg(feature = "local-inference")]
+fn render_gemma_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::Value>> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut rendered = serde_json::Map::new();
+            rendered.insert("role".to_string(), message.role.clone().into());
+            if let Some(content) = &message.content {
+                rendered.insert("content".to_string(), content.clone().into());
+            }
+            if let Some(tool_call_id) = &message.tool_call_id {
+                rendered.insert("tool_call_id".to_string(), tool_call_id.clone().into());
+            }
+            if let Some(tool_calls) = &message.tool_calls {
+                let tool_calls = tool_calls
+                    .iter()
+                    .map(|call| {
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(&call.function.arguments).with_context(|| {
+                                format!(
+                                    "prior Gemma tool call {} arguments were not valid JSON",
+                                    call.id
+                                )
+                            })?;
+                        if !arguments.is_object() {
+                            bail!(
+                                "prior Gemma tool call {} arguments were not an object",
+                                call.id
+                            );
+                        }
+                        Ok(serde_json::json!({
+                            "id": call.id,
+                            "type": call.call_type,
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": arguments,
+                            }
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                rendered.insert("tool_calls".to_string(), tool_calls.into());
+            }
+            Ok(rendered.into())
+        })
+        .collect()
+}
+
+#[cfg(feature = "local-inference")]
 fn render_messages(
     messages: &[ChatMessage],
     tools: &[ToolDefinition],
     native_protocol: Option<NativeToolProtocol>,
-) -> Result<Vec<llama_cpp_2::model::LlamaChatMessage>> {
-    use llama_cpp_2::model::LlamaChatMessage;
-
+) -> Result<Vec<TemplateMessage>> {
     let instructions = if tools.is_empty() {
         None
     } else if let Some(protocol) = native_protocol {
@@ -800,18 +970,105 @@ fn render_messages(
             injected = true;
         }
 
-        rendered.push(LlamaChatMessage::new(role, content).map_err(anyhow::Error::from)?);
+        rendered.push(TemplateMessage { role, content });
     }
     if let Some(instructions) = instructions
         && !injected
     {
         rendered.insert(
             0,
-            LlamaChatMessage::new("system".to_string(), instructions)
-                .map_err(anyhow::Error::from)?,
+            TemplateMessage {
+                role: "system".to_string(),
+                content: instructions,
+            },
         );
     }
     Ok(rendered)
+}
+
+#[cfg(feature = "local-inference")]
+struct PreparedPrompt {
+    rendered: RenderedLocalPrompt,
+    tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    native_protocol: Option<NativeToolProtocol>,
+}
+
+#[cfg(feature = "local-inference")]
+fn special_token_piece(
+    model: &llama_cpp_2::model::LlamaModel,
+    token: llama_cpp_2::token::LlamaToken,
+) -> Result<String> {
+    // llama.cpp represents an absent special token as LLAMA_TOKEN_NULL (-1).
+    // Its own template context exposes that case as an empty string.
+    if token.0 == -1 {
+        return Ok(String::new());
+    }
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    model
+        .token_to_piece(token, &mut decoder, true, None)
+        .map_err(|error| anyhow::anyhow!("failed to decode a GGUF special token: {error}"))
+}
+
+#[cfg(feature = "local-inference")]
+fn prepare_prompt(
+    model_spec: &str,
+    model: &llama_cpp_2::model::LlamaModel,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+) -> Result<PreparedPrompt> {
+    use llama_cpp_2::model::AddBos;
+
+    let template = model.chat_template(None).map_err(|error| {
+        anyhow::anyhow!(
+            "local GGUF model {model_spec:?} has no usable embedded chat template: {error}. Use an instruct/chat GGUF with tokenizer.chat_template metadata. No remote endpoint was tried."
+        )
+    })?;
+    let template_source = template.to_string().map_err(|error| {
+        anyhow::anyhow!(
+            "local GGUF model {model_spec:?} has invalid chat template metadata: {error}. No remote endpoint was tried."
+        )
+    })?;
+    let native_protocol = (!tools.is_empty())
+        .then(|| native_tool_protocol(&template_source))
+        .flatten();
+    let chat = if native_protocol == Some(NativeToolProtocol::Gemma) {
+        render_gemma_messages(messages)?
+    } else {
+        serde_json::to_value(render_messages(messages, tools, native_protocol)?)?
+            .as_array()
+            .cloned()
+            .expect("serializing a message vector produces a JSON array")
+    };
+    let template_tools = if native_protocol == Some(NativeToolProtocol::Gemma) {
+        serde_json::to_value(tools)?
+    } else {
+        serde_json::json!([])
+    };
+    let context = serde_json::json!({
+        "messages": chat,
+        "tools": template_tools,
+        "bos_token": special_token_piece(model, model.token_bos())?,
+        "eos_token": special_token_piece(model, model.token_eos())?,
+        "enable_thinking": false,
+        "preserve_thinking": false,
+        "add_generation_prompt": true,
+    });
+    let text = crate::minja::render(&template_source, &context)
+        .context("failed to render the GGUF chat template with Minja")?;
+    let tokens = model
+        .str_to_token(&text, AddBos::Never)
+        .map_err(|error| anyhow::anyhow!("failed to tokenize the local prompt: {error}"))?;
+    let template_sha256 = crate::model_artifact::sha256_hex(template_source.as_bytes());
+    let token_count = tokens.len() as u64;
+    Ok(PreparedPrompt {
+        rendered: RenderedLocalPrompt {
+            text,
+            token_count,
+            template_sha256,
+        },
+        tokens,
+        native_protocol,
+    })
 }
 
 #[cfg(feature = "local-inference")]
@@ -856,7 +1113,6 @@ fn generate(
 ) -> Result<LocalGeneration> {
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
-    use llama_cpp_2::model::AddBos;
     use llama_cpp_2::sampling::LlamaSampler;
     use std::num::NonZeroU32;
     use std::sync::atomic::Ordering;
@@ -866,18 +1122,8 @@ fn generate(
     }
 
     let model = load_model(model_spec, model_cache)?;
-    let template = model.chat_template(None).map_err(|error| {
-        anyhow::anyhow!(
-            "local GGUF model {model_spec:?} has no usable embedded chat template: {error}. Use an instruct/chat GGUF with tokenizer.chat_template metadata. No remote endpoint was tried."
-        )
-    })?;
-    let template_source = template
-        .to_string()
-        .map_err(|error| anyhow::anyhow!("local GGUF model {model_spec:?} has invalid chat template metadata: {error}. No remote endpoint was tried."))?;
-    let native_protocol = (!tools.is_empty())
-        .then(|| native_tool_protocol(&template_source))
-        .flatten();
-    let chat = render_messages(messages, tools, native_protocol)?;
+    let prepared = prepare_prompt(model_spec, &model, messages, tools)?;
+    let native_protocol = prepared.native_protocol;
     let tool_grammar = if let Some(protocol) = native_protocol {
         let grammar = native_tool_call_grammar_for(tools, protocol);
         Some(
@@ -905,12 +1151,7 @@ fn generate(
     } else {
         None
     };
-    let prompt = model
-        .apply_chat_template(&template, &chat, true)
-        .map_err(|error| anyhow::anyhow!("failed to apply the GGUF chat template: {error}"))?;
-    let tokens = model
-        .str_to_token(&prompt, AddBos::Never)
-        .map_err(|error| anyhow::anyhow!("failed to tokenize the local prompt: {error}"))?;
+    let tokens = prepared.tokens;
 
     let trained_context = model.n_ctx_train().max(512);
     let context_size = requested_context_size.min(trained_context);
@@ -1189,5 +1430,45 @@ mod tests {
             grammar.contains("root ::= call0 | call1 | final"),
             "{grammar}"
         );
+    }
+
+    #[cfg(feature = "local-inference")]
+    #[test]
+    fn gemma_render_keeps_full_openai_tool_fields_for_minja() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![crate::ToolCallResponse {
+                    id: "call_7".to_string(),
+                    call_type: "function".to_string(),
+                    function: crate::FunctionCall {
+                        name: "lookup".to_string(),
+                        arguments: r#"{"query":"IN718","limit":2}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some("found".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_7".to_string()),
+            },
+        ];
+        let rendered = render_gemma_messages(&messages).unwrap();
+        assert_eq!(rendered[0]["role"], "assistant");
+        assert_eq!(rendered[0]["tool_calls"][0]["id"], "call_7");
+        assert_eq!(
+            rendered[0]["tool_calls"][0]["function"]["arguments"]["query"],
+            "IN718"
+        );
+        assert!(rendered[0]["tool_calls"][0]["function"]["arguments"].is_object());
+        assert_eq!(rendered[1]["role"], "tool");
+        assert_eq!(rendered[1]["tool_call_id"], "call_7");
+
+        let grammar = gemma_tool_call_grammar(&[test_tool("lookup")]);
+        assert!(grammar.contains(r#"<|tool_call>call:"#), "{grammar}");
+        assert!(grammar.contains(r#"gemmastring ::= "<|\"|>""#), "{grammar}");
     }
 }
