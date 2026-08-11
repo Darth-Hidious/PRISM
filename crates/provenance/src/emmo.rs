@@ -397,6 +397,22 @@ pub struct GraphEdge {
     /// read as `""`, which renderers treat as unattributed).
     #[serde(default)]
     pub tenant: String,
+    /// Edge attributes as stored (`emmo_edge.props_json`) — a composition
+    /// fraction, a measurement's value, whatever the writer attached.
+    ///
+    /// These were written on every ingest and read back by NOTHING: the
+    /// traversal that is the only production read path did not select the
+    /// column, so a `CONTAINS_ELEMENT` edge came back without its fraction
+    /// and the number was unreachable from the moment it was stored.
+    /// `#[serde(default)]` for the same reason `tenant` carries it — older
+    /// payloads stay deserializable and read as `None`.
+    #[serde(default)]
+    pub props_json: Option<String>,
+    /// Writer-assigned confidence for this edge, likewise stored and never
+    /// read back. `None` means the row carried SQL NULL, which is NOT the
+    /// same as zero confidence and must not be rendered as such.
+    #[serde(default)]
+    pub confidence: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -3275,10 +3291,13 @@ impl ProvenanceStore {
             }
         }
 
+        // `e.props_json` and `e.confidence` are last so the existing column
+        // indices below keep their meaning. Both were written on every
+        // ingest and selected by nothing.
         const EDGE_COLS: &str = "e.rel_type, \
              s.name, s.entity_type, s.label, s.class_iri, s.tenant, \
              t.name, t.entity_type, t.label, t.class_iri, t.tenant, \
-             e.tenant";
+             e.tenant, e.props_json, e.confidence";
         let mut edges: Vec<GraphEdge> = Vec::new();
         let mut seen_edges: std::collections::HashSet<(String, String, String, String)> =
             std::collections::HashSet::new();
@@ -3353,6 +3372,10 @@ impl ProvenanceStore {
                     rel_type: rel,
                     count: 1,
                     tenant: edge_tenant,
+                    props_json: crate::get_opt_str(&row, 12)?,
+                    // NULL confidence stays None. Defaulting it to 0.0 would
+                    // render an unscored edge as a maximally doubted one.
+                    confidence: row.get_value(13).ok().and_then(|v| v.as_real().copied()),
                 });
                 for node in [source, target] {
                     if seen.insert(node_key(&node)) {
@@ -4826,6 +4849,46 @@ mod tests {
         .await;
         let props: serde_json::Value = serde_json::from_str(&props).unwrap();
         assert_eq!(props["fraction"].as_f64(), Some(0.25));
+    }
+
+    /// The test above proves the fraction is STORED, by reading SQL directly.
+    /// It proves nothing about whether anyone can get it back: the traversal
+    /// that is the only production read path did not select the column, so
+    /// every fraction was unreachable from the moment it was written.
+    ///
+    /// This drives `get_neighbors` — the real dispatch — so removing
+    /// `e.props_json` from `EDGE_COLS` fails here instead of passing quietly.
+    #[tokio::test]
+    async fn traversal_returns_the_edge_attributes_it_stored() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let mut f = fact("contains", "Nb25Mo25Ta25W25", "contains", "Nb");
+        f.value = Some(0.25);
+        store.write_fact(&f, &prov).await.unwrap();
+
+        let tr = store
+            .get_neighbors("Nb25Mo25Ta25W25", Some("CONTAINS_ELEMENT"), "t1", 10)
+            .await
+            .unwrap();
+
+        let edge = tr
+            .edges
+            .iter()
+            .find(|e| e.rel_type == "CONTAINS_ELEMENT")
+            .expect("the composition edge must come back from the traversal");
+        let props: serde_json::Value = serde_json::from_str(
+            edge.props_json
+                .as_deref()
+                .expect("a stored fraction must reach the caller, not stay in the table"),
+        )
+        .unwrap();
+        assert_eq!(
+            props["fraction"].as_f64(),
+            Some(0.25),
+            "the fraction that was stored must be the fraction that is read"
+        );
     }
 
     #[tokio::test]

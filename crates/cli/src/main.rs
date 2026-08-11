@@ -15643,6 +15643,8 @@ data:\n\
                 rel_type: "hasPart".into(),
                 count: 1,
                 tenant: "local".into(),
+                props_json: None,
+                confidence: None,
             }],
             facts: vec![test_recalled_fact("tensile strength", "local")],
         };
@@ -15685,6 +15687,8 @@ data:\n\
                 rel_type: "hasPart".into(),
                 count: 1,
                 tenant: "mesh:node-a".into(),
+                props_json: None,
+                confidence: None,
             }],
             facts: vec![
                 test_recalled_fact("tensile strength", "local"),
