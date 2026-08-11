@@ -18,7 +18,7 @@ use prism_runtime::{PlatformEndpoints, PrismPaths};
 
 use crate::chat_config::{self, ChatTarget};
 use crate::local_llm::{LocalServer, ServerState};
-use crate::{LoginMode, perform_full_login, prompt_select};
+use crate::{perform_full_login, prompt_select, provider_login_mode};
 
 /// One model offered on the onboarding shortlist. `id` is the exact
 /// MARC27 catalog `model_id`; the rest is display only.
@@ -120,10 +120,7 @@ pub async fn run_if_first_launch(
                 paths,
                 endpoints,
                 python,
-                LoginMode::Device {
-                    interactive_auth: false,
-                    no_browser: true,
-                },
+                provider_login_mode(endpoints, false, true)?,
             )
             .await?;
 

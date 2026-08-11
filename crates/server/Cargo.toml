@@ -29,6 +29,7 @@ mime_guess = { workspace = true }
 prism-embed = { path = "../embed" }
 prism-ingest = { path = "../ingest" }
 prism-mesh = { path = "../mesh" }
+prism-node = { path = "../node" }
 prism-provenance = { path = "../provenance" }
 dirs = { workspace = true }
 prism-workflows = { path = "../workflows" }

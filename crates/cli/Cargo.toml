@@ -62,5 +62,8 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 mockito.workspace = true
+wiremock.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
 # Kill/restart durability tests reap real worker processes.
 libc.workspace = true

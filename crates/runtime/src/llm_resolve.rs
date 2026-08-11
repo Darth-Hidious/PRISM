@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use prism_core::{chat_config, config as core_config, providers};
 
-use crate::auth::{PlatformAuth, resolve_environment_credential};
+use crate::auth::PlatformAuth;
 use crate::platform_env::PlatformVar;
 use crate::{PlatformEndpoints, PrismPaths};
 
@@ -27,7 +27,7 @@ pub const DEFAULT_LLM_URL: &str = "http://localhost:8080";
 
 /// Outcome of [`resolve_llm`]: everything a frontend needs to build an
 /// `LlmConfig` without re-implementing target policy.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedLlm {
     pub base_url: String,
     pub model: String,
@@ -40,6 +40,20 @@ pub struct ResolvedLlm {
     /// fall back to turn-count compaction, same as the offline CLI.
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
+}
+
+impl std::fmt::Debug for ResolvedLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedLlm")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("credential_kind", &self.credential_kind)
+            .field("embedding_model", &self.embedding_model)
+            .field("context_window", &self.context_window)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +111,19 @@ pub fn marc27_llm_base_url(
     api_base: &str,
     fallback_url: &str,
 ) -> Result<String> {
+    marc27_llm_base_url_with_source(paths, api_base, fallback_url).map(|(url, _)| url)
+}
+
+/// Resolve the hosted target URL together with whether it was derived from
+/// the bound platform endpoint. Stored platform bearers are permitted only
+/// when the second value is `true`.
+fn marc27_llm_base_url_with_source(
+    paths: &PrismPaths,
+    api_base: &str,
+    fallback_url: &str,
+) -> Result<(String, bool)> {
     if let Ok(explicit) = std::env::var("LLM_BASE_URL") {
-        return Ok(explicit);
+        return Ok((explicit, false));
     }
     if let Some(project_id) = paths
         .load_cli_state()
@@ -106,9 +131,9 @@ pub fn marc27_llm_base_url(
         .and_then(|s| s.credentials)
         .and_then(|c| c.project_id)
     {
-        return Ok(marc27_llm_url_for_project(api_base, &project_id));
+        return Ok((marc27_llm_url_for_project(api_base, &project_id), true));
     }
-    resolve_unauth_llm_url(fallback_url)
+    resolve_unauth_llm_url(fallback_url).map(|url| (url, false))
 }
 
 pub fn provider_endpoint(registry: &providers::Registry, provider: &str) -> String {
@@ -156,11 +181,6 @@ pub fn resolve_llm_with(
         paths,
     );
 
-    // The session's provider JWT.
-    let platform_token = stored_credentials
-        .as_ref()
-        .map(|credentials| credentials.access_token.clone());
-
     // Generic key chain for the local/direct-provider targets. Provider
     // keys belong ONLY here — never on the marc27 arm (a project `.env`
     // ANTHROPIC_API_KEY would otherwise shadow the platform JWT and 401
@@ -173,8 +193,7 @@ pub fn resolve_llm_with(
         .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .ok()
-        .or_else(|| cfg_llm.resolve_api_key())
-        .or_else(|| platform_token.clone());
+        .or_else(|| cfg_llm.resolve_api_key());
 
     let (base_url, model, api_key, credential_kind) = match &chat_target {
         chat_config::ChatTarget::Local {
@@ -210,6 +229,20 @@ pub fn resolve_llm_with(
             let endpoints = endpoints
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!(crate::auth::PLATFORM_NOT_CONFIGURED))?;
+            let (base_url, platform_derived) =
+                marc27_llm_base_url_with_source(paths, &endpoints.api_base, &cfg_llm.url)?;
+            let platform_token = if platform_derived {
+                stored_credentials
+                    .as_ref()
+                    .map(|credentials| {
+                        crate::auth::stored_bearer_for_endpoints(endpoints, credentials)
+                    })
+                    .transpose()?
+                    .flatten()
+                    .map(|credential| credential.secret().to_string())
+            } else {
+                None
+            };
             // LLM_MODEL env → target model → [llm].model; with none, the
             // literal `default` alias — the platform resolves it
             // server-side. (No catalog fetch in native frontends.)
@@ -220,23 +253,29 @@ pub fn resolve_llm_with(
                 .unwrap_or_else(|| "default".to_string());
             // Explicit LLM_API_KEY → PRISM_API_KEY → PRISM_TOKEN → session
             // JWT. Historical MARC27 spellings remain deprecated aliases.
-            let (environment_api_key, environment_token) = match resolve_environment_credential() {
-                Some(PlatformAuth::ApiKey(value)) => (Some(value), None),
-                Some(PlatformAuth::Bearer(value)) => (None, Some(value)),
-                None => (None, None),
+            let (environment_api_key, environment_token) = if platform_derived {
+                match endpoints.environment_credential() {
+                    Some(PlatformAuth::ApiKey(value)) => (Some(value), None),
+                    Some(PlatformAuth::Bearer(value)) => (None, Some(value)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
             };
+            let raw_override = std::env::var("LLM_API_KEY").ok().or_else(|| {
+                if platform_derived {
+                    None
+                } else {
+                    cfg_llm.resolve_api_key()
+                }
+            });
             let (marc27_key, credential_kind) = resolved_platform_credential(
-                std::env::var("LLM_API_KEY").ok(),
+                raw_override,
                 environment_api_key,
                 environment_token,
-                platform_token.clone(),
+                platform_token,
             );
-            (
-                marc27_llm_base_url(paths, &endpoints.api_base, &cfg_llm.url)?,
-                model,
-                marc27_key,
-                credential_kind,
-            )
+            (base_url, model, marc27_key, credential_kind)
         }
     };
 
@@ -357,6 +396,52 @@ pub fn resolve_python_bin() -> PathBuf {
 mod tests {
     use super::*;
 
+    struct PlatformEnvironmentGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl PlatformEnvironmentGuard {
+        fn clear() -> Self {
+            let names = [
+                "PRISM_API_KEY",
+                "PRISM_TOKEN",
+                "PRISM_API_TOKEN",
+                "MARC27_API_KEY",
+                "MARC27_TOKEN",
+                "MARC27_API_TOKEN",
+                "PRISM_API_URL",
+                "MARC27_API_URL",
+                "PRISM_PLATFORM_URL",
+                "MARC27_PLATFORM_URL",
+                "PRISM_PLATFORM_PROVIDER",
+                "MARC27_PLATFORM_PROVIDER",
+                "LLM_API_KEY",
+                "LLM_BASE_URL",
+                "LLM_MODEL",
+                "TEST_DIRECT_PROVIDER_KEY",
+            ];
+            let previous = names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect::<Vec<_>>();
+            for (name, _) in &previous {
+                unsafe { std::env::remove_var(name) };
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for PlatformEnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn prism_api_key_preserves_api_key_wire_kind_without_prefix() {
         let (value, kind) = resolved_platform_credential(
@@ -387,6 +472,178 @@ mod tests {
         );
         assert_eq!(value.as_deref(), Some("m27_old-raw-caller"));
         assert_eq!(kind, None);
+    }
+
+    #[test]
+    fn resolved_llm_debug_redacts_every_api_key_family() {
+        let resolved = ResolvedLlm {
+            base_url: "https://provider.example/v1".to_string(),
+            model: "model".to_string(),
+            api_key: Some("llm-secret-must-not-leak".to_string()),
+            credential_kind: Some(ResolvedCredentialKind::Bearer),
+            embedding_model: None,
+            context_window: None,
+            max_output_tokens: None,
+        };
+
+        let debug = format!("{resolved:?}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        assert!(!debug.contains("llm-secret-must-not-leak"), "{debug}");
+    }
+
+    #[test]
+    fn local_and_direct_provider_targets_never_inherit_a_stored_platform_bearer() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().expect("isolated runtime paths");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        paths
+            .save_cli_state(&crate::PrismCliState {
+                credentials: Some(crate::StoredCredentials {
+                    access_token: "stored-platform-bearer-must-not-leak".into(),
+                    platform_url: "https://trusted.example".into(),
+                    platform_provider: Some(crate::SUPABASE_PROVIDER.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("store test login");
+        unsafe {
+            std::env::set_var("PRISM_API_URL", "https://unrelated.example");
+            std::env::set_var("PRISM_PLATFORM_PROVIDER", "supabase");
+        }
+
+        let targets = [
+            chat_config::ChatTarget::Local {
+                url: "https://local-or-operator.example/v1".to_string(),
+                model: "local-model".to_string(),
+                api_key: None,
+            },
+            chat_config::ChatTarget::Provider {
+                provider: "openai".to_string(),
+                model: "direct-model".to_string(),
+                api_key_env: Some("TEST_DIRECT_PROVIDER_KEY".to_string()),
+            },
+        ];
+        for target in targets {
+            let resolved = resolve_llm_with(directory.path(), &paths, Some(target))
+                .expect("non-platform target resolution");
+            assert_eq!(
+                resolved.api_key, None,
+                "stored platform bearer reached a non-platform LLM target"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_target_never_sends_a_stored_bearer_to_an_explicit_llm_url() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().expect("isolated runtime paths");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        paths
+            .save_cli_state(&crate::PrismCliState {
+                credentials: Some(crate::StoredCredentials {
+                    access_token: "stored-platform-bearer-must-not-leak".into(),
+                    platform_url: "https://trusted.example".into(),
+                    platform_provider: Some(crate::SUPABASE_PROVIDER.into()),
+                    project_id: Some("project-123".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("store test login");
+        unsafe {
+            std::env::set_var("LLM_BASE_URL", "https://arbitrary-llm.example/v1");
+        }
+
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Marc27 { model: None }),
+        )
+        .expect("explicit LLM endpoint resolution");
+        assert_eq!(resolved.base_url, "https://arbitrary-llm.example/v1");
+        assert_eq!(resolved.api_key, None);
+
+        unsafe { std::env::set_var("LLM_API_KEY", "explicit-llm-key") };
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Marc27 { model: None }),
+        )
+        .expect("explicit LLM credential resolution");
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-llm-key"));
+        assert_eq!(resolved.credential_kind, None);
+    }
+
+    #[test]
+    fn real_supabase_llm_resolution_never_uses_the_public_anon_key_as_bearer() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().expect("isolated runtime paths");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        paths
+            .save_cli_state(&crate::PrismCliState {
+                credentials: Some(crate::StoredCredentials {
+                    access_token: "verified-user-session".into(),
+                    platform_url: "https://project.supabase.co".into(),
+                    platform_provider: Some(crate::SUPABASE_PROVIDER.into()),
+                    identity_provider_url: Some("https://project.supabase.co".into()),
+                    identity_provider_key: Some("public-anon-key".into()),
+                    project_id: Some("project-123".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("store test login");
+        unsafe { std::env::set_var("PRISM_API_KEY", "public-anon-key") };
+
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Marc27 { model: None }),
+        )
+        .expect("resolve hosted LLM through the real seam");
+        assert_eq!(resolved.api_key.as_deref(), Some("verified-user-session"));
+        assert_eq!(
+            resolved.credential_kind,
+            Some(ResolvedCredentialKind::Bearer)
+        );
+
+        unsafe { std::env::set_var("PRISM_TOKEN", "explicit-user-token") };
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Marc27 { model: None }),
+        )
+        .expect("explicit user token remains valid");
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-user-token"));
+        assert_eq!(
+            resolved.credential_kind,
+            Some(ResolvedCredentialKind::Bearer)
+        );
     }
 
     #[test]

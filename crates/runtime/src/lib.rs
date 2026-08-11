@@ -47,6 +47,65 @@ pub enum RuntimeError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error(
+        "credential persistence failed ({persist}); restoring the previous state also failed ({rollback})"
+    )]
+    CredentialRollback {
+        persist: Box<RuntimeError>,
+        rollback: Box<RuntimeError>,
+    },
+}
+
+/// Replace one credential-bearing file through a same-directory temporary.
+///
+/// Each individual file replacement is atomic and the temporary is owner-only
+/// before any secret bytes are written. Coordination across the two credential
+/// stores is handled separately by [`PrismPaths::persist_credentials`].
+fn write_restricted_file(path: &Path, contents: &[u8]) -> Result<(), RuntimeError> {
+    use std::io::Write as _;
+
+    let parent = path.parent().ok_or_else(|| RuntimeError::WriteState {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "credential path has no parent directory",
+        ),
+    })?;
+    fs::create_dir_all(parent).map_err(|source| RuntimeError::WriteState {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| RuntimeError::WriteState {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| RuntimeError::WriteState {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    temporary
+        .write_all(contents)
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| RuntimeError::WriteState {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| RuntimeError::WriteState {
+            path: path.to_path_buf(),
+            source: error.error,
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +230,14 @@ pub struct StoredCredentials {
     /// serialize an explicit `null` and remain provider-neutral on reload.
     #[serde(default = "legacy_stored_platform_provider")]
     pub platform_provider: Option<String>,
+    /// Auth-project root when identity is issued by a service separate from
+    /// the PRISM-compatible platform API (for example Supabase Auth).
+    #[serde(default)]
+    pub identity_provider_url: Option<String>,
+    /// Public provider client key needed for login and refresh. It is kept in
+    /// the same restricted credential stores and redacted from `Debug`.
+    #[serde(default)]
+    pub identity_provider_key: Option<String>,
     pub user_id: Option<String>,
     pub display_name: Option<String>,
     pub org_id: Option<String>,
@@ -187,6 +254,11 @@ impl std::fmt::Debug for StoredCredentials {
             .field("refresh_token", &"[REDACTED]")
             .field("platform_url", &self.platform_url)
             .field("platform_provider", &self.platform_provider)
+            .field("identity_provider_url", &self.identity_provider_url)
+            .field(
+                "identity_provider_key",
+                &self.identity_provider_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("user_id", &self.user_id)
             .field("display_name", &self.display_name)
             .field("org_id", &self.org_id)
@@ -217,6 +289,17 @@ pub struct StoredNodeToken {
     pub id: String,
     /// Short prefix for display (`m27_abcd…`).
     pub prefix: String,
+    /// Platform API endpoint this durable key was minted against.
+    ///
+    /// Durable credentials must remain paired with their destination; an
+    /// environment/config override is not authority to send this key to a
+    /// different host. Empty only for legacy files written before endpoint
+    /// binding was introduced.
+    #[serde(default)]
+    pub platform_url: String,
+    /// Provider adapter recorded when this durable key was minted.
+    #[serde(default)]
+    pub platform_provider: Option<String>,
 }
 
 impl std::fmt::Debug for StoredNodeToken {
@@ -225,6 +308,8 @@ impl std::fmt::Debug for StoredNodeToken {
             .field("key", &"[REDACTED]")
             .field("id", &self.id)
             .field("prefix", &self.prefix)
+            .field("platform_url", &self.platform_url)
+            .field("platform_provider", &self.platform_provider)
             .finish()
     }
 }
@@ -247,36 +332,10 @@ impl PrismPaths {
     }
 
     pub fn save_cli_state(&self, state: &PrismCliState) -> Result<(), RuntimeError> {
-        fs::create_dir_all(&self.config_dir).map_err(|source| RuntimeError::WriteState {
-            path: self.config_dir.clone(),
-            source,
-        })?;
         let path = self.cli_state_path();
         let text =
             serde_json::to_string_pretty(state).expect("serializing cli state should not fail");
-        // Write with restricted permissions (0600) — file contains tokens.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|source| RuntimeError::WriteState {
-                    path: path.clone(),
-                    source,
-                })?;
-            file.write_all(format!("{text}\n").as_bytes())
-                .map_err(|source| RuntimeError::WriteState { path, source })
-        }
-        #[cfg(not(unix))]
-        {
-            fs::write(&path, format!("{text}\n"))
-                .map_err(|source| RuntimeError::WriteState { path, source })
-        }
+        write_restricted_file(&path, format!("{text}\n").as_bytes())
     }
 
     /// Path to the SDK credential mirror (`~/.prism/credentials.json`) that the
@@ -293,32 +352,58 @@ impl PrismPaths {
     /// silent-refresh behavior) left the SDK mirror holding a refresh token
     /// that single-use rotation had since REVOKED — replaying it tripped the
     /// server's token-family invalidation and forced a device-flow re-login
-    /// (the "re-login every ~24h" drift). The cli-state write is authoritative
-    /// and returns its error; the mirror is best-effort so a mirror hiccup can
-    /// never fail a refresh.
+    /// (the "re-login every ~24h" drift). Both writes report errors; callers
+    /// must never claim that a rotated pair was persisted while the SDK
+    /// credential file still contains its predecessor.
+    ///
+    /// The two paths may live on different filesystems, so this does not claim
+    /// cross-file crash atomicity. For every error reported in-process, the
+    /// previous CLI state is restored (or the newly created state is removed),
+    /// and each individual file is replaced atomically.
     pub fn persist_credentials(&self, creds: &StoredCredentials) -> Result<(), RuntimeError> {
-        let mut state = self.load_cli_state().unwrap_or_default();
+        let state_path = self.cli_state_path();
+        let state_existed = state_path.exists();
+        let previous_state = self.load_cli_state()?;
+        let mut state = previous_state.clone();
         state.credentials = Some(creds.clone());
         self.save_cli_state(&state)?;
-        Self::save_sdk_credentials(creds);
+        if let Err(persist) = Self::save_sdk_credentials(creds) {
+            let rollback = if state_existed {
+                self.save_cli_state(&previous_state)
+            } else {
+                match fs::remove_file(&state_path) {
+                    Ok(()) => Ok(()),
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(source) => Err(RuntimeError::WriteState {
+                        path: state_path,
+                        source,
+                    }),
+                }
+            };
+            if let Err(rollback) = rollback {
+                return Err(RuntimeError::CredentialRollback {
+                    persist: Box::new(persist),
+                    rollback: Box::new(rollback),
+                });
+            }
+            return Err(persist);
+        }
         Ok(())
     }
 
     /// Write the `~/.prism/credentials.json` SDK mirror (0600 on unix).
-    /// Best-effort: errors are swallowed so a mirror write never fails auth.
     /// The JSON shape MUST stay in sync with the Python `_platform_creds.py`.
-    pub fn save_sdk_credentials(creds: &StoredCredentials) {
+    pub fn save_sdk_credentials(creds: &StoredCredentials) -> Result<(), RuntimeError> {
         let Some(path) = Self::sdk_credentials_path() else {
-            return;
+            return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let mirror = serde_json::json!({
             "access_token": creds.access_token,
             "refresh_token": creds.refresh_token,
             "platform_url": creds.platform_url,
             "platform_provider": creds.platform_provider,
+            "identity_provider_url": creds.identity_provider_url,
+            "identity_provider_key": creds.identity_provider_key,
             "user_id": creds.user_id,
             "org_id": creds.org_id,
             "project_id": creds.project_id,
@@ -330,27 +415,9 @@ impl PrismPaths {
             // emitted as RFC 3339 so it deserializes back into DateTime<Utc>.
             "expires_at": creds.expires_at,
         });
-        let Ok(json) = serde_json::to_string_pretty(&mirror) else {
-            return;
-        };
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-            {
-                let _ = file.write_all(json.as_bytes());
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = fs::write(&path, json);
-        }
+        let json = serde_json::to_string_pretty(&mirror)
+            .expect("serializing SDK credentials should not fail");
+        write_restricted_file(&path, json.as_bytes())
     }
 
     /// Path to the durable node-token file (`{state_dir}/node-token`).
@@ -475,6 +542,15 @@ impl PlatformEndpoints {
         let stored_provider = credentials
             .and_then(|value| value.platform_provider.as_deref())
             .and_then(non_blank_value);
+        let selected_url_matches_stored = url.is_some_and(|selected_url| {
+            credentials
+                .map(|value| value.platform_url.as_str())
+                .and_then(non_blank_value)
+                .is_some_and(|stored_url| same_platform_endpoint(selected_url, stored_url))
+        });
+        let stored_provider_for_selected_url = selected_url_matches_stored
+            .then(|| stored_provider.map(normalize_provider))
+            .flatten();
         let alias_url_selected = env_url
             .as_ref()
             .is_some_and(|(_, source)| source.starts_with("MARC27_"));
@@ -488,14 +564,18 @@ impl PlatformEndpoints {
             .map(normalize_provider);
         let inferred_provider = if env_url.is_some() {
             // A PRISM-native URL is provider-neutral. A MARC27-named URL is
-            // explicit legacy adapter evidence. Stored login metadata never
-            // relabels a newer process override.
-            alias_url_selected.then(|| MARC27_PROVIDER.to_string())
+            // explicit legacy adapter evidence. Provider metadata from a
+            // stored login travels only when the override resolves to that
+            // exact endpoint; an unrelated process override stays neutral.
+            alias_url_selected
+                .then(|| MARC27_PROVIDER.to_string())
+                .or(stored_provider_for_selected_url)
         } else if let Some(configured_url) = configured_url.and_then(non_blank_value) {
             // Pre-stage config had no provider field. Preserve an explicitly
             // configured historical host, but do not carry a stored MARC27
             // identity onto an unrelated configured endpoint.
-            is_marc27_endpoint(configured_url).then(|| MARC27_PROVIDER.to_string())
+            stored_provider_for_selected_url
+                .or_else(|| is_marc27_endpoint(configured_url).then(|| MARC27_PROVIDER.to_string()))
         } else if url.is_some() {
             // The selected URL came from the stored login, so its provider
             // metadata travels with it.
@@ -573,10 +653,37 @@ impl PlatformEndpoints {
     pub fn marc27() -> Self {
         Self::from_url_with_provider(MARC27_PROVIDER_API_BASE, Some(MARC27_PROVIDER.to_string()))
     }
+
+    /// Resolve the process environment's credential for this platform.
+    ///
+    /// A Supabase project's public anon key may be supplied through
+    /// `PRISM_API_KEY` for login configuration. It authenticates PRISM to the
+    /// identity provider, not the user to the PRISM-compatible platform, so it
+    /// must never displace the verified access token stored by login. Explicit
+    /// token variables retain their normal native-first precedence.
+    pub fn environment_credential(&self) -> Option<auth::PlatformAuth> {
+        let variables: &[PlatformVar] = if self.provider.as_deref() == Some(SUPABASE_PROVIDER) {
+            &[PlatformVar::TOKEN, PlatformVar::API_TOKEN]
+        } else {
+            &[
+                PlatformVar::API_KEY,
+                PlatformVar::TOKEN,
+                PlatformVar::API_TOKEN,
+            ]
+        };
+        let (value, source) = PlatformVar::get_with_source_preferred_then_alias(variables)?;
+        if source == PlatformVar::API_KEY.preferred || source == PlatformVar::API_KEY.alias {
+            Some(auth::PlatformAuth::ApiKey(value))
+        } else {
+            Some(auth::PlatformAuth::classify(&value))
+        }
+    }
 }
 
 /// Stable adapter id used at provider boundaries.
 pub const MARC27_PROVIDER: &str = "marc27";
+/// Stable adapter id for Supabase Auth boundaries.
+pub const SUPABASE_PROVIDER: &str = "supabase";
 /// Endpoint belonging to the optional MARC27 adapter. It is selected only by
 /// explicit legacy/provider evidence; it is not PRISM's default endpoint.
 pub const MARC27_PROVIDER_API_BASE: &str = "https://api.marc27.com/api/v1";
@@ -603,6 +710,10 @@ fn is_marc27_endpoint(value: &str) -> bool {
         .next()
         .unwrap_or_default();
     host == "marc27.com" || host.ends_with(".marc27.com")
+}
+
+fn same_platform_endpoint(left: &str, right: &str) -> bool {
+    PlatformEndpoints::from_url(left).api_base == PlatformEndpoints::from_url(right).api_base
 }
 
 fn non_blank_value(value: &str) -> Option<&str> {
@@ -788,6 +899,62 @@ mod tests {
     }
 
     #[test]
+    fn matching_native_url_retains_stored_supabase_provider_identity() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        unsafe {
+            env::set_var("PRISM_API_URL", "https://project.supabase.co/");
+        }
+        let credentials = StoredCredentials {
+            access_token: "verified-session".into(),
+            platform_url: "https://project.supabase.co/api/v1".into(),
+            platform_provider: Some(SUPABASE_PROVIDER.into()),
+            identity_provider_url: Some("https://project.supabase.co".into()),
+            identity_provider_key: Some("public-anon-key".into()),
+            ..Default::default()
+        };
+
+        let endpoints = PlatformEndpoints::resolve(None, Some(&credentials)).unwrap();
+        assert_eq!(endpoints.api_base, "https://project.supabase.co/api/v1");
+        assert_eq!(endpoints.provider.as_deref(), Some(SUPABASE_PROVIDER));
+        clear_platform_url();
+    }
+
+    #[test]
+    fn supabase_anon_key_is_not_resolved_as_a_platform_credential() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        clear_platform_url();
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://project.supabase.co",
+            Some(SUPABASE_PROVIDER.into()),
+        );
+        unsafe {
+            env::set_var("PRISM_API_KEY", "public-anon-key");
+        }
+
+        assert_eq!(endpoints.environment_credential(), None);
+
+        // Native token spellings remain ahead of all deprecated aliases, even
+        // when the alias appears earlier in the logical token family.
+        unsafe {
+            env::set_var("MARC27_TOKEN", "deprecated-session");
+            env::set_var("PRISM_API_TOKEN", "native-api-session");
+        }
+        assert_eq!(
+            endpoints.environment_credential(),
+            Some(auth::PlatformAuth::Bearer("native-api-session".into()))
+        );
+        unsafe {
+            env::set_var("PRISM_TOKEN", "native-primary-session");
+        }
+        assert_eq!(
+            endpoints.environment_credential(),
+            Some(auth::PlatformAuth::Bearer("native-primary-session".into()))
+        );
+        clear_platform_url();
+    }
+
+    #[test]
     fn native_url_is_not_relabelled_by_an_old_node_key() {
         let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         clear_platform_url();
@@ -804,6 +971,7 @@ mod tests {
                 key: "m27_old-node-key".into(),
                 id: "legacy".into(),
                 prefix: "m27_old".into(),
+                ..Default::default()
             })
             .unwrap();
 
@@ -889,10 +1057,26 @@ mod tests {
             data_dir: base.join("data"),
             state_dir: base.join("state"),
         };
+        let mirror_path = home.join(".prism").join("credentials.json");
+        // Regression setup: `mode(0o600)` on OpenOptions does not change an
+        // existing file. Start with permissive legacy files and prove the
+        // credential writer repairs them before storing the new token pair.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::create_dir_all(mirror_path.parent().unwrap()).unwrap();
+            fs::write(paths.cli_state_path(), "{}\n").unwrap();
+            fs::write(&mirror_path, "old-readable-secret\n").unwrap();
+            fs::set_permissions(paths.cli_state_path(), fs::Permissions::from_mode(0o644)).unwrap();
+            fs::set_permissions(&mirror_path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let creds = StoredCredentials {
             access_token: "at-new".into(),
             refresh_token: "rt-rotated".into(),
             platform_url: "https://api.marc27.com".into(),
+            identity_provider_url: Some("https://project.supabase.co".into()),
+            identity_provider_key: Some("public-anon-key".into()),
             user_id: Some("u1".into()),
             org_id: Some("o1".into()),
             project_id: Some("p1".into()),
@@ -921,7 +1105,6 @@ mod tests {
 
         // Store 2: SDK mirror exists with the 6-field Python shape PLUS
         // expires_at (review fix #3).
-        let mirror_path = home.join(".prism").join("credentials.json");
         assert!(
             mirror_path.exists(),
             "SDK mirror must be written on refresh"
@@ -931,6 +1114,11 @@ mod tests {
         assert_eq!(mirror["access_token"], "at-new");
         assert_eq!(mirror["refresh_token"], "rt-rotated");
         assert_eq!(mirror["platform_url"], "https://api.marc27.com");
+        assert_eq!(
+            mirror["identity_provider_url"],
+            "https://project.supabase.co"
+        );
+        assert_eq!(mirror["identity_provider_key"], "public-anon-key");
         assert_eq!(mirror["user_id"], "u1");
         assert_eq!(mirror["org_id"], "o1");
         assert_eq!(mirror["project_id"], "p1");
@@ -952,7 +1140,13 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let cli_state_mode = fs::metadata(paths.cli_state_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             let mode = fs::metadata(&mirror_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(cli_state_mode, 0o600, "CLI state must be repaired to 0600");
             assert_eq!(mode, 0o600, "SDK mirror must be 0600");
         }
 
@@ -966,11 +1160,145 @@ mod tests {
     }
 
     #[test]
+    fn stored_credentials_debug_redacts_every_credential() {
+        let credentials = StoredCredentials {
+            access_token: "access-do-not-log".into(),
+            refresh_token: "refresh-do-not-log".into(),
+            identity_provider_key: Some("provider-key-do-not-log".into()),
+            ..Default::default()
+        };
+
+        let debug = format!("{credentials:?}");
+        for secret in [
+            "access-do-not-log",
+            "refresh-do-not-log",
+            "provider-key-do-not-log",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        assert_eq!(debug.matches("[REDACTED]").count(), 3);
+    }
+
+    #[test]
+    fn persist_credentials_reports_sdk_mirror_write_failure() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let directory = tempfile::tempdir().expect("isolated credential paths");
+        let home = directory.path().join("home");
+        let config = directory.path().join("config");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        // A file where the mirror directory must be makes create_dir_all fail
+        // deterministically without relying on the test runner's uid.
+        fs::write(home.join(".prism"), "not a directory").unwrap();
+        let paths = PrismPaths {
+            config_dir: config,
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let previous_home = env::var_os("HOME");
+        unsafe { env::set_var("HOME", &home) };
+        let result = paths.persist_credentials(&StoredCredentials {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            ..Default::default()
+        });
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+
+        let error = result
+            .expect_err("mirror failure must be reported")
+            .to_string();
+        assert!(error.contains("failed to write state file"), "{error}");
+        assert!(
+            !paths.cli_state_path().exists(),
+            "a failed first persistence must remove the newly created CLI state"
+        );
+    }
+
+    #[test]
+    fn persist_credentials_restores_previous_cli_state_when_mirror_fails() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let directory = tempfile::tempdir().expect("isolated credential paths");
+        let home = directory.path().join("home");
+        let config = directory.path().join("config");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        fs::write(home.join(".prism"), "not a directory").unwrap();
+        let paths = PrismPaths {
+            config_dir: config,
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let previous_state = PrismCliState {
+            credentials: Some(StoredCredentials {
+                access_token: "old-access".into(),
+                refresh_token: "old-refresh".into(),
+                ..Default::default()
+            }),
+            preferred_python: Some("/existing/python".into()),
+        };
+        paths.save_cli_state(&previous_state).unwrap();
+
+        let previous_home = env::var_os("HOME");
+        unsafe { env::set_var("HOME", &home) };
+        let result = paths.persist_credentials(&StoredCredentials {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            ..Default::default()
+        });
+        unsafe {
+            match previous_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+        }
+
+        result.expect_err("mirror failure must be reported");
+        assert_eq!(
+            paths.load_cli_state().unwrap(),
+            previous_state,
+            "the old credential pair and unrelated CLI state must be restored"
+        );
+    }
+
+    #[test]
+    fn persist_credentials_does_not_overwrite_malformed_cli_state() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let directory = tempfile::tempdir().expect("isolated credential paths");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let malformed = b"{ definitely-not-valid-json\n";
+        fs::write(paths.cli_state_path(), malformed).unwrap();
+
+        let result = paths.persist_credentials(&StoredCredentials {
+            access_token: "new-access".into(),
+            refresh_token: "new-refresh".into(),
+            ..Default::default()
+        });
+
+        assert!(matches!(result, Err(RuntimeError::ParseState { .. })));
+        assert_eq!(fs::read(paths.cli_state_path()).unwrap(), malformed);
+    }
+
+    #[test]
     fn stored_node_token_roundtrips() {
         let token = StoredNodeToken {
             key: "m27_secret_key_value".into(),
             id: "00000000-0000-0000-0000-000000000001".into(),
             prefix: "m27_abcd".into(),
+            platform_url: "https://provider.example/api/v1".into(),
+            platform_provider: Some("marc27".into()),
         };
         let json = serde_json::to_string(&token).unwrap();
         let parsed: StoredNodeToken = serde_json::from_str(&json).unwrap();
@@ -983,6 +1311,8 @@ mod tests {
             key: "m27_DO_NOT_LEAK_THIS".into(),
             id: "id-1".into(),
             prefix: "m27_xy".into(),
+            platform_url: "https://provider.example/api/v1".into(),
+            platform_provider: Some("marc27".into()),
         };
         let dbg = format!("{token:?}");
         assert!(
@@ -1036,6 +1366,8 @@ mod tests {
             key: "m27_roundtrip_key".into(),
             id: "id-42".into(),
             prefix: "m27_rt".into(),
+            platform_url: "https://provider.example/api/v1".into(),
+            platform_provider: Some("marc27".into()),
         };
         paths.save_node_token(&token).unwrap();
         assert_eq!(paths.load_node_token().as_ref(), Some(&token));

@@ -8,6 +8,8 @@
 //! Contract:
 //! - `PRISM_API_KEY` is the preferred headless credential and is sent as
 //!   `X-API-Key`; `MARC27_API_KEY` remains a deprecated compatibility alias.
+//!   For an explicitly selected Supabase identity provider, `PRISM_API_KEY`
+//!   configures the public anon key and is not a platform credential.
 //! - `PRISM_TOKEN` / `PRISM_API_TOKEN` and stored credentials are Bearer
 //!   credentials; their `MARC27_*` spellings remain deprecated aliases.
 //! - Stored credentials are read from `cli-state.json`, with the legacy SDK
@@ -25,7 +27,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::platform_env::PlatformVar;
-use crate::{PlatformEndpoints, PrismPaths, StoredCredentials};
+use crate::{MARC27_PROVIDER, PlatformEndpoints, PrismPaths, StoredCredentials, StoredNodeToken};
 
 /// JSON-RPC error code used for a missing platform credential.
 pub const AUTH_REQUIRED_RPC_CODE: i64 = -32001;
@@ -58,12 +60,21 @@ impl AuthSurface {
 }
 
 /// Credential type and its wire-header semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PlatformAuth {
     /// Stable provider API key, sent as `X-API-Key`.
     ApiKey(String),
     /// Rotating login/session credential, sent as a Bearer token.
     Bearer(String),
+}
+
+impl std::fmt::Debug for PlatformAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"[REDACTED]").finish(),
+            Self::Bearer(_) => f.debug_tuple("Bearer").field(&"[REDACTED]").finish(),
+        }
+    }
 }
 
 impl PlatformAuth {
@@ -124,10 +135,19 @@ pub fn resolve_environment_credential() -> Option<PlatformAuth> {
 }
 
 /// Auth result returned by the seam.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedPlatformAuth {
     pub api_base: String,
     pub credential: PlatformAuth,
+}
+
+impl std::fmt::Debug for ResolvedPlatformAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPlatformAuth")
+            .field("api_base", &self.api_base)
+            .field("credential", &self.credential)
+            .finish()
+    }
 }
 
 /// Structured, actionable auth failure for protocol and UI callers.
@@ -177,39 +197,163 @@ impl std::error::Error for AuthFailure {}
 /// environment resolver and makes precedence testable without mutating the
 /// process environment.
 pub fn resolve_platform_auth(
-    api_base: &str,
+    endpoints: &PlatformEndpoints,
     api_key: Option<&str>,
     token: Option<&str>,
-    node_token: Option<&str>,
+    node_token: Option<&StoredNodeToken>,
     stored: Option<&StoredCredentials>,
 ) -> Result<ResolvedPlatformAuth> {
     if let Some(value) = non_empty(api_key) {
         return Ok(ResolvedPlatformAuth {
-            api_base: normalize_api_base(api_base),
+            api_base: normalize_api_base(&endpoints.api_base),
             credential: PlatformAuth::ApiKey(value.to_string()),
         });
     }
 
-    if let Some(value) = non_empty(token).or_else(|| non_empty(node_token)) {
+    if let Some(value) = non_empty(token) {
         return Ok(ResolvedPlatformAuth {
-            api_base: normalize_api_base(api_base),
+            api_base: normalize_api_base(&endpoints.api_base),
             credential: classify_token(value),
         });
     }
 
-    if let Some(credentials) = stored
-        && let Some(value) = non_empty(Some(&credentials.access_token))
+    if let Some(credential) = node_token
+        .map(|token| stored_node_bearer_for_endpoints(endpoints, token))
+        .transpose()?
+        .flatten()
     {
         return Ok(ResolvedPlatformAuth {
-            // Endpoint precedence is resolved before this pure credential
-            // seam. Re-reading `credentials.platform_url` here would let a
-            // stale login override an explicit PRISM_API_URL.
-            api_base: normalize_api_base(api_base),
-            credential: PlatformAuth::Bearer(value.to_string()),
+            api_base: normalize_api_base(&endpoints.api_base),
+            credential,
+        });
+    }
+
+    if let Some(credential) = stored
+        .map(|credentials| stored_bearer_for_endpoints(endpoints, credentials))
+        .transpose()?
+        .flatten()
+    {
+        return Ok(ResolvedPlatformAuth {
+            api_base: normalize_api_base(&endpoints.api_base),
+            credential,
         });
     }
 
     Err(AuthFailure::missing("this command").into())
+}
+
+/// Select a stored session only when it is still paired with the exact
+/// provider and normalized platform URL recorded at login.
+///
+/// Environment/config endpoint overrides are valid for explicit API keys and
+/// token variables. They are not authority to redirect a durable stored
+/// bearer: doing so would disclose the user's access token to an unrelated
+/// host before that host had to prove anything.
+pub fn stored_bearer_for_endpoints(
+    endpoints: &PlatformEndpoints,
+    credentials: &StoredCredentials,
+) -> Result<Option<PlatformAuth>> {
+    let Some(access_token) = non_empty(Some(&credentials.access_token)) else {
+        return Ok(None);
+    };
+
+    validate_stored_session_binding(endpoints, credentials)?;
+    Ok(Some(PlatformAuth::Bearer(access_token.to_string())))
+}
+
+/// Validate the endpoint/provider half of a stored-session binding without
+/// selecting or exposing its bearer. Refresh paths use this before contacting
+/// an identity provider and again before returning the rotated access token.
+pub fn validate_stored_session_binding(
+    endpoints: &PlatformEndpoints,
+    credentials: &StoredCredentials,
+) -> Result<()> {
+    let stored_provider = credentials
+        .platform_provider
+        .as_deref()
+        .and_then(|value| non_empty(Some(value)));
+    let selected_provider = endpoints
+        .provider
+        .as_deref()
+        .and_then(|value| non_empty(Some(value)));
+    if stored_provider != selected_provider {
+        anyhow::bail!(
+            "stored session binding refused: selected platform provider does not match the stored identity"
+        );
+    }
+
+    let stored_url = non_empty(Some(&credentials.platform_url)).ok_or_else(|| {
+        anyhow::anyhow!("stored session binding refused: stored platform URL is missing")
+    })?;
+    let selected_url = non_empty(Some(&endpoints.api_base)).ok_or_else(|| {
+        anyhow::anyhow!("stored session binding refused: selected platform URL is missing")
+    })?;
+    let stored_api_base = PlatformEndpoints::from_url(stored_url).api_base;
+    let selected_api_base = PlatformEndpoints::from_url(selected_url).api_base;
+    if stored_api_base != selected_api_base {
+        anyhow::bail!(
+            "stored session binding refused: selected platform URL does not match the stored login"
+        );
+    }
+
+    Ok(())
+}
+
+/// Select a durable node credential only for the endpoint/provider it was
+/// minted against.
+///
+/// Legacy `m27_` files predate binding metadata. They remain usable only for
+/// the canonical MARC27 endpoint inferred by that provider-specific key
+/// shape; they are refused for every configured override.
+pub fn stored_node_bearer_for_endpoints(
+    endpoints: &PlatformEndpoints,
+    token: &StoredNodeToken,
+) -> Result<Option<PlatformAuth>> {
+    let Some(key) = non_empty(Some(&token.key)) else {
+        return Ok(None);
+    };
+    validate_stored_node_binding(endpoints, token)?;
+    Ok(Some(PlatformAuth::classify(key)))
+}
+
+/// Validate a durable node credential's destination without exposing it.
+pub fn validate_stored_node_binding(
+    endpoints: &PlatformEndpoints,
+    token: &StoredNodeToken,
+) -> Result<()> {
+    let selected_provider = endpoints
+        .provider
+        .as_deref()
+        .and_then(|value| non_empty(Some(value)));
+    let selected_api_base = PlatformEndpoints::from_url(&endpoints.api_base).api_base;
+
+    let Some(stored_url) = non_empty(Some(&token.platform_url)) else {
+        let legacy_marc27 = token.key.starts_with("m27_")
+            && selected_provider == Some(MARC27_PROVIDER)
+            && selected_api_base == PlatformEndpoints::marc27().api_base;
+        if legacy_marc27 {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "stored node credential binding refused: legacy token has no recorded platform URL"
+        );
+    };
+
+    let stored_provider = token
+        .platform_provider
+        .as_deref()
+        .and_then(|value| non_empty(Some(value)));
+    if stored_provider != selected_provider {
+        anyhow::bail!(
+            "stored node credential binding refused: selected platform provider does not match"
+        );
+    }
+    if PlatformEndpoints::from_url(stored_url).api_base != selected_api_base {
+        anyhow::bail!(
+            "stored node credential binding refused: selected platform URL does not match"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve auth using the PRISM-native environment variables, their frozen
@@ -229,14 +373,7 @@ pub fn resolve_from_environment_with_provider(
     configured_api_base: Option<&str>,
     configured_provider: Option<&str>,
 ) -> Result<ResolvedPlatformAuth> {
-    let (api_key, token) = match resolve_environment_credential() {
-        Some(PlatformAuth::ApiKey(value)) => (Some(value), None),
-        Some(PlatformAuth::Bearer(value)) => (None, Some(value)),
-        None => (None, None),
-    };
-    let node_token = paths
-        .and_then(PrismPaths::load_node_token)
-        .map(|token| token.key);
+    let node_token = paths.and_then(PrismPaths::load_node_token);
     let stored = paths
         .and_then(|value| value.load_cli_state().ok())
         .and_then(|state| state.credentials)
@@ -255,12 +392,21 @@ pub fn resolve_from_environment_with_provider(
         ),
     }
     .ok_or_else(|| anyhow::anyhow!(PLATFORM_NOT_CONFIGURED))?;
+    // Provider identity must be known before reading the credential family.
+    // For Supabase, PRISM_API_KEY may be the project's public anon key; the
+    // endpoint-owned resolver therefore excludes it while retaining explicit
+    // token precedence and typed API-key handling for every other provider.
+    let (api_key, token) = match endpoints.environment_credential() {
+        Some(PlatformAuth::ApiKey(value)) => (Some(value), None),
+        Some(PlatformAuth::Bearer(value)) => (None, Some(value)),
+        None => (None, None),
+    };
 
     resolve_platform_auth(
-        &endpoints.api_base,
+        &endpoints,
         api_key.as_deref(),
         token.as_deref(),
-        node_token.as_deref(),
+        node_token.as_ref(),
         stored.as_ref(),
     )
 }
@@ -333,18 +479,101 @@ fn legacy_sdk_credentials_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    struct PlatformEnvironmentGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl PlatformEnvironmentGuard {
+        fn clear() -> Self {
+            let mut previous = Vec::new();
+            unsafe {
+                for variable in PlatformVar::ALL {
+                    for name in [variable.preferred, variable.alias] {
+                        previous.push((name, env::var_os(name)));
+                        env::remove_var(name);
+                    }
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for PlatformEnvironmentGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (name, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
     fn stored(token: &str) -> StoredCredentials {
         StoredCredentials {
             access_token: token.to_string(),
             platform_url: "https://stored.example".to_string(),
+            platform_provider: Some(crate::MARC27_PROVIDER.to_string()),
             ..Default::default()
+        }
+    }
+
+    fn endpoints(url: &str, provider: Option<&str>) -> PlatformEndpoints {
+        PlatformEndpoints::from_url_with_provider(url, provider.map(str::to_string))
+    }
+
+    #[test]
+    fn platform_auth_debug_redacts_bearer_and_api_key_secrets() {
+        for (credential, kind, secret) in [
+            (
+                PlatformAuth::ApiKey("api-key-secret-marker".into()),
+                "ApiKey",
+                "api-key-secret-marker",
+            ),
+            (
+                PlatformAuth::Bearer("bearer-secret-marker".into()),
+                "Bearer",
+                "bearer-secret-marker",
+            ),
+        ] {
+            let rendered = format!("{credential:?}");
+            assert!(rendered.contains(kind), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+    }
+
+    #[test]
+    fn resolved_platform_auth_debug_redacts_every_nested_credential_family() {
+        for (credential, kind, secret) in [
+            (
+                PlatformAuth::ApiKey("nested-api-key-secret-marker".into()),
+                "ApiKey",
+                "nested-api-key-secret-marker",
+            ),
+            (
+                PlatformAuth::Bearer("nested-bearer-secret-marker".into()),
+                "Bearer",
+                "nested-bearer-secret-marker",
+            ),
+        ] {
+            let resolved = ResolvedPlatformAuth {
+                api_base: "https://provider.example/api/v1".into(),
+                credential,
+            };
+            let rendered = format!("{resolved:?}");
+
+            assert!(rendered.contains("https://provider.example/api/v1"));
+            assert!(rendered.contains(kind), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
         }
     }
 
     #[test]
     fn api_key_only_resolution_is_headless_and_uses_x_api_key() {
         let resolved = resolve_platform_auth(
-            "https://api.example/api/v1",
+            &endpoints("https://api.example/api/v1", None),
             Some("m27_test"),
             None,
             None,
@@ -358,7 +587,7 @@ mod tests {
     #[test]
     fn api_key_precedes_stored_session() {
         let resolved = resolve_platform_auth(
-            "https://api.example",
+            &endpoints("https://api.example", None),
             Some("m27_test"),
             None,
             None,
@@ -369,24 +598,103 @@ mod tests {
     }
 
     #[test]
-    fn explicitly_resolved_endpoint_precedes_stored_session_endpoint() {
-        let resolved = resolve_platform_auth(
-            "https://native.example/api/v1",
+    fn unrelated_endpoint_is_refused_for_a_stored_session() {
+        let error = resolve_platform_auth(
+            &endpoints("https://native.example/api/v1", Some("marc27")),
             None,
             None,
             None,
             Some(&stored("jwt")),
         )
-        .unwrap();
-        assert_eq!(resolved.api_base, "https://native.example/api/v1");
+        .expect_err("a stored bearer must remain bound to its login endpoint")
+        .to_string();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("jwt"), "stored token leaked: {error}");
+    }
+
+    #[test]
+    fn matching_endpoint_and_provider_select_the_stored_session() {
+        let resolved = resolve_platform_auth(
+            &endpoints("https://stored.example/api/v1", Some("marc27")),
+            None,
+            None,
+            None,
+            Some(&stored("jwt")),
+        )
+        .expect("the recorded endpoint may use its stored session");
+        assert_eq!(resolved.api_base, "https://stored.example/api/v1");
         assert_eq!(resolved.credential, PlatformAuth::Bearer("jwt".into()));
     }
 
     #[test]
+    fn provider_neutral_and_matching_unknown_sessions_preserve_pat_compatibility() {
+        for provider in [None, Some("custom-idp")] {
+            let credentials = StoredCredentials {
+                access_token: "provider-pat".into(),
+                platform_url: "https://provider.example".into(),
+                platform_provider: provider.map(str::to_string),
+                ..Default::default()
+            };
+            let selected = endpoints("https://provider.example/api/v1", provider);
+            let auth = stored_bearer_for_endpoints(&selected, &credentials)
+                .expect("equal provider options and URLs are a valid binding");
+            assert_eq!(auth, Some(PlatformAuth::Bearer("provider-pat".into())));
+        }
+    }
+
+    #[test]
+    fn durable_node_key_is_refused_for_an_unrelated_endpoint() {
+        let token = StoredNodeToken {
+            key: "m27_node-secret-marker".into(),
+            id: "node-key-id".into(),
+            prefix: "m27_node".into(),
+            platform_url: "https://stored.example".into(),
+            platform_provider: Some("marc27".into()),
+        };
+        let error = stored_node_bearer_for_endpoints(
+            &endpoints("https://unrelated.example", Some("marc27")),
+            &token,
+        )
+        .expect_err("a durable node key must stay bound to its mint endpoint")
+        .to_string();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(
+            !error.contains("node-secret-marker"),
+            "secret leaked: {error}"
+        );
+    }
+
+    #[test]
+    fn legacy_node_key_is_usable_only_at_the_canonical_marc27_endpoint() {
+        let token = StoredNodeToken {
+            key: "m27_legacy-node".into(),
+            ..Default::default()
+        };
+        assert!(
+            stored_node_bearer_for_endpoints(&PlatformEndpoints::marc27(), &token)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            stored_node_bearer_for_endpoints(
+                &endpoints("https://override.example", Some("marc27")),
+                &token,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn missing_credentials_are_actionable() {
-        let error = resolve_platform_auth("https://api.example", None, None, None, None)
-            .unwrap_err()
-            .to_string();
+        let error = resolve_platform_auth(
+            &endpoints("https://api.example", None),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("export PRISM_API_KEY=<key>"));
         assert!(error.contains("prism login --token <PAT>"));
     }
@@ -394,13 +702,145 @@ mod tests {
     #[test]
     fn prism_api_key_is_provider_neutral() {
         let resolved = resolve_platform_auth(
-            "https://provider.example",
+            &endpoints("https://provider.example", None),
             Some("provider-defined-key-shape"),
             None,
             None,
             None,
         )
         .unwrap();
+        assert_eq!(
+            resolved.credential,
+            PlatformAuth::ApiKey("provider-defined-key-shape".into())
+        );
+    }
+
+    #[test]
+    fn supabase_anon_key_does_not_override_a_verified_stored_session() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let credentials = StoredCredentials {
+            access_token: "verified-user-session".into(),
+            platform_url: "https://project.supabase.co".into(),
+            platform_provider: Some(crate::SUPABASE_PROVIDER.into()),
+            identity_provider_url: Some("https://project.supabase.co".into()),
+            identity_provider_key: Some("public-anon-key".into()),
+            ..Default::default()
+        };
+        paths
+            .save_cli_state(&crate::PrismCliState {
+                credentials: Some(credentials),
+                ..Default::default()
+            })
+            .unwrap();
+        unsafe {
+            env::set_var("PRISM_API_URL", "https://project.supabase.co");
+            env::set_var("PRISM_API_KEY", "public-anon-key");
+        }
+
+        let resolved = resolve_from_environment_with_provider(Some(&paths), None, None).unwrap();
+        assert_eq!(
+            resolved.credential,
+            PlatformAuth::Bearer("verified-user-session".into())
+        );
+
+        unsafe {
+            env::set_var("PRISM_TOKEN", "explicit-user-session");
+        }
+        let resolved = resolve_from_environment_with_provider(Some(&paths), None, None).unwrap();
+        assert_eq!(
+            resolved.credential,
+            PlatformAuth::Bearer("explicit-user-session".into())
+        );
+    }
+
+    #[test]
+    fn unrelated_environment_url_cannot_select_a_stored_supabase_bearer() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let credentials = StoredCredentials {
+            access_token: "stored-supabase-access-secret".into(),
+            platform_url: "https://trusted.example".into(),
+            platform_provider: Some(crate::SUPABASE_PROVIDER.into()),
+            identity_provider_url: Some("https://identity.supabase.co".into()),
+            identity_provider_key: Some("public-anon-key".into()),
+            ..Default::default()
+        };
+        paths
+            .save_cli_state(&crate::PrismCliState {
+                credentials: Some(credentials),
+                ..Default::default()
+            })
+            .unwrap();
+        unsafe {
+            env::set_var("PRISM_API_URL", "https://unrelated.example");
+            env::set_var("PRISM_PLATFORM_PROVIDER", "supabase");
+            env::set_var("PRISM_API_KEY", "public-anon-key");
+        }
+
+        let error = resolve_from_environment_with_provider(Some(&paths), None, None)
+            .expect_err("an endpoint override cannot redirect a stored bearer")
+            .to_string();
+        assert!(error.contains("stored session binding refused"), "{error}");
+        assert!(error.contains("does not match"), "{error}");
+        assert!(
+            !error.contains("stored-supabase-access-secret"),
+            "token leaked: {error}"
+        );
+
+        unsafe { env::set_var("PRISM_TOKEN", "explicit-override-token") };
+        let resolved = resolve_from_environment_with_provider(Some(&paths), None, None)
+            .expect("an explicit token may target an explicit endpoint");
+        assert_eq!(resolved.api_base, "https://unrelated.example/api/v1");
+        assert_eq!(
+            resolved.credential,
+            PlatformAuth::Bearer("explicit-override-token".into())
+        );
+    }
+
+    #[test]
+    fn provider_aware_resolution_keeps_non_supabase_api_key_typing() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        paths
+            .save_cli_state(&crate::PrismCliState {
+                credentials: Some(stored("stored-session")),
+                ..Default::default()
+            })
+            .unwrap();
+        unsafe {
+            env::set_var("PRISM_API_URL", "https://independent.example");
+            env::set_var("PRISM_API_KEY", "provider-defined-key-shape");
+        }
+
+        let resolved = resolve_from_environment_with_provider(Some(&paths), None, None).unwrap();
         assert_eq!(
             resolved.credential,
             PlatformAuth::ApiKey("provider-defined-key-shape".into())

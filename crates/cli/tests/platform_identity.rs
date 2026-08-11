@@ -85,6 +85,26 @@ fn native_values_win_and_shadowed_aliases_do_not_warn() {
 }
 
 #[test]
+fn status_does_not_report_a_supabase_anon_key_as_user_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let output = prism(root.path())
+        .env("PRISM_API_URL", "https://project.supabase.co")
+        .env("PRISM_PLATFORM_PROVIDER", "supabase")
+        .env("PRISM_API_KEY", "public-supabase-anon-key")
+        .arg("status")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    let status: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(status["platform"]["provider"], "supabase");
+    assert_eq!(status["credentials_present"], false);
+    assert!(!stdout.contains("public-supabase-anon-key"));
+    assert!(!stderr.contains("public-supabase-anon-key"));
+}
+
+#[test]
 fn used_marc27_aliases_warn_exactly_once_and_still_work() {
     let root = tempfile::tempdir().unwrap();
     let output = prism(root.path())

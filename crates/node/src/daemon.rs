@@ -9,9 +9,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use prism_client::PlatformResponseExt;
+use prism_client::{IdentityProviderAdapter, identity_provider_for};
 use prism_proto::{NodeCapabilities, NodeMessage, PlatformMessage};
-use prism_runtime::platform_env::PlatformVar;
+use prism_runtime::auth::{
+    stored_bearer_for_endpoints, stored_node_bearer_for_endpoints, validate_stored_session_binding,
+};
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
 use serde::Serialize;
 use sysinfo::System;
@@ -483,6 +485,15 @@ async fn sync_roles_from_provider(
     match crate::provider_roles::role_adapter_for(endpoints.provider.as_deref()) {
         Some(crate::provider_roles::RoleProviderAdapter::Marc27) => {
             sync_roles_from_marc27(client, org_id, rbac_db_path).await;
+        }
+        Some(crate::provider_roles::RoleProviderAdapter::Supabase) => {
+            // Supabase has no MARC27-style organisation-membership endpoint.
+            // Its verified role claim is synchronized at login and refresh,
+            // per project-scoped subject.
+            tracing::debug!(
+                provider = crate::provider_roles::SUPABASE_ROLE_PROVIDER,
+                "periodic role sync skipped: provider roles are synchronized from verified tokens"
+            );
         }
         None => {
             tracing::debug!(
@@ -2008,18 +2019,16 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
     // refresh-token rotation (the reason long-running nodes kept dying).
     if let Some(node_token) = paths.load_node_token() {
         tracing::debug!("using durable node token (does not rotate)");
-        return Ok(node_token.key);
+        return stored_node_bearer_for_endpoints(endpoints, &node_token)?
+            .map(|credential| credential.secret().to_string())
+            .context("stored node credential is empty");
     }
 
-    // Headless path. Resolve the whole credential family in one pass so every
-    // PRISM-native spelling wins over every deprecated MARC27 alias. The WS
-    // handshake accepts both session tokens and API keys in its token field.
-    if let Some(credential) = PlatformVar::get_preferred_then_alias(&[
-        PlatformVar::API_KEY,
-        PlatformVar::TOKEN,
-        PlatformVar::API_TOKEN,
-    ]) {
-        return Ok(credential);
+    // Headless path. The runtime resolver retains native-first token
+    // precedence while excluding PRISM_API_KEY for Supabase, where that value
+    // may be the project's public anon key rather than a user credential.
+    if let Some(credential) = endpoints.environment_credential() {
+        return Ok(credential.secret().to_string());
     }
 
     let state = paths.load_cli_state()?;
@@ -2035,7 +2044,9 @@ async fn load_access_token(paths: &PrismPaths, endpoints: &PlatformEndpoints) ->
         return refresh_token(paths, endpoints, creds).await;
     }
 
-    Ok(creds.access_token.clone())
+    stored_bearer_for_endpoints(endpoints, creds)?
+        .map(|credential| credential.secret().to_string())
+        .context("stored platform session has no access token")
 }
 
 async fn refresh_token(
@@ -2045,57 +2056,154 @@ async fn refresh_token(
 ) -> Result<String> {
     // Defence in depth. `run_daemon` returns at :263 before any credential is
     // resolved when offline, so this is unreachable there — but this is a
-    // THIRD hand-rolled copy of the refresh call (the others are
-    // client/src/auth.rs and cli/src/main.rs:10790), it posts the refresh
-    // token, and it is reachable from any future caller that skips that early
-    // return. A duplicated wire call needs its own guard or the next caller
-    // inherits the hole.
+    // reachable from any future caller that skips that early return. Keep a
+    // guard at this boundary as well as the provider adapters' own guards.
     if prism_runtime::offline::enabled() {
         anyhow::bail!(
-            "offline mode: POST {}/auth/refresh blocked by --offline \
-             (remove the flag to reach the platform)",
-            endpoints.api_base
+            "offline mode: identity-provider token refresh blocked by --offline \
+             (remove the flag to reach the provider)"
         );
     }
+
+    validate_stored_session_binding(endpoints, creds)?;
+
+    let provider =
+        identity_provider_for(creds.platform_provider.as_deref()).with_context(|| {
+            match creds.platform_provider.as_deref() {
+                Some(provider) => {
+                    format!("unknown identity provider `{provider}`; refusing refresh")
+                }
+                None => {
+                    "identity provider is missing; refusing to send the refresh token".to_string()
+                }
+            }
+        })?;
+    if endpoints.provider.as_deref() != Some(provider.as_str()) {
+        bail!(
+            "configured platform provider does not match stored identity provider `{}`; \
+             refusing refresh",
+            provider.as_str()
+        );
+    }
+
+    let (provider_url, provider_key) = match provider {
+        IdentityProviderAdapter::Marc27 => (marc27_refresh_url(endpoints, creds)?, None),
+        IdentityProviderAdapter::Supabase => {
+            let provider_url = creds
+                .identity_provider_url
+                .as_deref()
+                .context("Supabase is not configured: missing identity provider URL")?;
+            let provider_key = creds
+                .identity_provider_key
+                .as_deref()
+                .context("Supabase is not configured: missing identity provider anon key")?;
+            (provider_url.to_string(), Some(provider_key))
+        }
+    };
+    let policy = IdentityRefreshPolicy::default();
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(policy.request_timeout)
         .build()?;
 
-    let resp = client
-        .post(format!("{}/auth/refresh", endpoints.api_base))
-        .json(&serde_json::json!({ "refresh_token": creds.refresh_token }))
-        .send()
-        .await
-        .context("failed to refresh token")?
-        .platform_error_for_status()
+    let refreshed = provider
+        .refresh_token(&client, &provider_url, provider_key, &creds.refresh_token)
         .await?;
+    let supabase_claims = refreshed.supabase_claims;
+    let tokens = refreshed.tokens;
 
-    #[derive(serde::Deserialize)]
-    struct RefreshResponse {
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: Option<u64>,
-    }
+    let mut new_credentials = creds.clone();
+    new_credentials.access_token = tokens.access_token;
+    new_credentials.refresh_token = tokens.refresh_token;
+    new_credentials.expires_at = tokens.expires_in.and_then(|secs| {
+        chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
+    });
 
-    let refreshed: RefreshResponse = resp.json().await?;
-    let mut state = paths.load_cli_state()?;
-    if let Some(stored) = state.credentials.as_mut() {
-        stored.access_token = refreshed.access_token.clone();
-        if let Some(rt) = refreshed.refresh_token {
-            stored.refresh_token = rt;
+    match (provider, supabase_claims) {
+        (IdentityProviderAdapter::Supabase, Some(claims)) => {
+            ensure_supabase_refresh_principal(creds, &claims.iss, &claims.sub)?;
+
+            let engine = prism_core::rbac::RbacEngine::new(&paths.state_dir.join("rbac.db"))?;
+            let role_claim = claims.role.as_deref().unwrap_or("");
+            let role_sync = crate::provider_roles::sync_supabase_login_role(
+                &engine,
+                &claims.iss,
+                &claims.sub,
+                role_claim,
+            )?;
+            new_credentials.user_id = Some(role_sync.principal_id);
+            new_credentials.display_name = claims.email;
         }
-        stored.expires_at = refreshed.expires_in.and_then(|secs| {
-            chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
-        });
-        // Persist to BOTH cli-state AND the `~/.prism/credentials.json` SDK
-        // mirror. Writing only cli-state here left the mirror holding the
-        // pre-rotation (now server-revoked) refresh token → forced re-login
-        // (see refresh_access_token in the CLI). persist_credentials keeps the
-        // two stores in lockstep on every node-side refresh.
-        paths.persist_credentials(stored)?;
+        (IdentityProviderAdapter::Supabase, None) => {
+            bail!("Supabase refresh returned no verified claims; refusing refresh")
+        }
+        (IdentityProviderAdapter::Marc27, Some(_)) => {
+            bail!("MARC27 refresh returned claims for the wrong provider; refusing refresh")
+        }
+        (IdentityProviderAdapter::Marc27, None) => {}
     }
 
-    Ok(refreshed.access_token)
+    validate_stored_session_binding(endpoints, &new_credentials)?;
+
+    // Persist to BOTH cli-state AND the `~/.prism/credentials.json` SDK
+    // mirror so a rotated refresh token never leaves either store stale.
+    paths.persist_credentials(&new_credentials).context(
+        "failed to commit the rotated credential pair; do not retry this refresh token, sign in again",
+    )?;
+
+    Ok(new_credentials.access_token)
+}
+
+fn ensure_supabase_refresh_principal(
+    credentials: &StoredCredentials,
+    issuer: &str,
+    subject: &str,
+) -> Result<String> {
+    let principal_id = crate::provider_roles::map_supabase_principal(issuer, subject)
+        .context("verified Supabase token has no canonical PRISM principal")?;
+    let stored_principal = credentials
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("stored Supabase identity is missing its canonical principal; refusing refresh")?;
+    if stored_principal != principal_id {
+        bail!("Supabase refresh returned a different verified subject; refusing refresh");
+    }
+    Ok(principal_id)
+}
+
+/// Return the stored MARC27 API base only when the selected endpoint is the
+/// same normalized URL. Provider labels alone are not sufficient authority to
+/// redirect a long-lived refresh token.
+fn marc27_refresh_url(endpoints: &PlatformEndpoints, creds: &StoredCredentials) -> Result<String> {
+    let stored_url = creds.platform_url.trim();
+    if stored_url.is_empty() {
+        bail!("stored MARC27 identity is missing its platform URL; refusing refresh");
+    }
+    let stored_api_base = PlatformEndpoints::from_url(stored_url).api_base;
+    let selected_api_base = PlatformEndpoints::from_url(&endpoints.api_base).api_base;
+    if stored_api_base != selected_api_base {
+        bail!(
+            "configured platform URL does not match the stored MARC27 identity; refusing refresh"
+        );
+    }
+    Ok(stored_api_base)
+}
+
+/// Network policy for one daemon-side identity refresh.
+#[derive(Debug, Clone, Copy)]
+struct IdentityRefreshPolicy {
+    /// Maximum duration of each HTTP request issued for provider refresh and
+    /// JWKS retrieval.
+    request_timeout: Duration,
+}
+
+impl Default for IdentityRefreshPolicy {
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 fn hostname() -> String {
@@ -2205,9 +2313,8 @@ mod tests {
     /// credential and opened `wss://…?token=<token>` (:525). The guard at
     /// :263 was correct; nothing armed it.
     ///
-    /// This pins the mechanism the fix relies on: the refresh call — a third
-    /// hand-rolled copy of the same wire request — refuses under offline
-    /// rather than posting the refresh token.
+    /// This pins the mechanism the fix relies on: provider-dispatched refresh
+    /// refuses under offline rather than posting the refresh token.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn refresh_token_is_refused_offline() {
@@ -2230,10 +2337,11 @@ mod tests {
         let endpoints = PlatformEndpoints {
             api_base: "http://127.0.0.1:1/api/v1".to_string(),
             node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
-            provider: None,
+            provider: Some("marc27".to_string()),
         };
         let creds = StoredCredentials {
             refresh_token: "refresh-secret".to_string(),
+            platform_provider: Some("marc27".to_string()),
             ..Default::default()
         };
         let err = refresh_token(&paths, &endpoints, &creds).await.unwrap_err();
@@ -2246,12 +2354,207 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_token_refuses_an_unknown_identity_provider_without_network() {
+        let _g = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        let endpoints = PlatformEndpoints {
+            api_base: "http://127.0.0.1:1/api/v1".to_string(),
+            node_ws: "ws://127.0.0.1:1/api/v1/nodes/connect".to_string(),
+            provider: Some("future-provider".to_string()),
+        };
+        let creds = StoredCredentials {
+            refresh_token: "do-not-transmit-or-log".to_string(),
+            platform_url: "http://127.0.0.1:1".to_string(),
+            platform_provider: Some("future-provider".to_string()),
+            ..Default::default()
+        };
+
+        let error = refresh_token(&paths, &endpoints, &creds)
+            .await
+            .expect_err("unknown providers must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("unknown identity provider"), "{message}");
+        assert!(!message.contains("do-not-transmit-or-log"), "{message}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_token_refuses_a_marc27_url_override_before_network() {
+        let _g = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "http://127.0.0.1:1",
+            Some("marc27".to_string()),
+        );
+        let creds = StoredCredentials {
+            refresh_token: "refresh-secret-must-not-leak".to_string(),
+            platform_url: "https://stored.marc27.example".to_string(),
+            platform_provider: Some("marc27".to_string()),
+            ..Default::default()
+        };
+
+        let error = refresh_token(&paths, &endpoints, &creds)
+            .await
+            .expect_err("a MARC27 endpoint override must fail before refresh")
+            .to_string();
+
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("refresh-secret-must-not-leak"), "{error}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn supabase_refresh_refuses_platform_mismatch_before_identity_network() {
+        let _g = prism_runtime::offline::test_support::env_lock();
+        let _restore = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind identity listener");
+        listener.set_nonblocking(true).unwrap();
+        let identity_url = format!("http://{}", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let paths = PrismPaths {
+            config_dir: root.clone(),
+            cache_dir: root.clone(),
+            data_dir: root.clone(),
+            state_dir: root,
+        };
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://unrelated-platform.example",
+            Some("supabase".to_string()),
+        );
+        let creds = StoredCredentials {
+            access_token: "expired-access".into(),
+            refresh_token: "supabase-refresh-secret-marker".into(),
+            platform_url: "https://trusted-platform.example".into(),
+            platform_provider: Some("supabase".into()),
+            identity_provider_url: Some(identity_url),
+            identity_provider_key: Some("public-anon-key".into()),
+            user_id: Some("supabase:bound-user".into()),
+            ..Default::default()
+        };
+
+        let error = refresh_token(&paths, &endpoints, &creds)
+            .await
+            .expect_err("platform mismatch must fail before Supabase refresh")
+            .to_string();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("supabase-refresh-secret-marker"), "{error}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "identity provider received a request before binding validation"
+        );
+    }
+
     use super::*;
     use base64::Engine;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    struct PlatformEnvironmentGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl PlatformEnvironmentGuard {
+        fn clear() -> Self {
+            let mut previous = Vec::new();
+            for variable in prism_runtime::platform_env::PlatformVar::ALL {
+                for name in [variable.preferred, variable.alias] {
+                    previous.push((name, std::env::var_os(name)));
+                    unsafe { std::env::remove_var(name) };
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for PlatformEnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unexpired_stored_bearer_is_refused_for_an_unrelated_endpoint() {
+        let _lock = prism_runtime::offline::test_support::env_lock();
+        let _offline = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().expect("isolated node state");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        paths
+            .save_cli_state(&prism_runtime::PrismCliState {
+                credentials: Some(StoredCredentials {
+                    access_token: "stored-access-token-must-not-leak".to_string(),
+                    platform_url: "https://trusted.example".to_string(),
+                    platform_provider: Some("supabase".to_string()),
+                    expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .expect("store node credentials");
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://unrelated.example",
+            Some("supabase".to_string()),
+        );
+
+        let error = load_access_token(&paths, &endpoints)
+            .await
+            .expect_err("stored session must remain bound to its login endpoint")
+            .to_string();
+
+        assert!(error.contains("stored session binding refused"), "{error}");
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("stored-access-token-must-not-leak"));
+    }
+
+    #[test]
+    fn supabase_refresh_requires_a_stored_canonical_principal() {
+        let issuer = "https://project.supabase.co/auth/v1";
+        let mut credentials = StoredCredentials {
+            platform_provider: Some("supabase".to_string()),
+            user_id: None,
+            ..Default::default()
+        };
+
+        for missing in [None, Some("   ".to_string())] {
+            credentials.user_id = missing;
+            let error = ensure_supabase_refresh_principal(&credentials, issuer, "user-123")
+                .expect_err("refresh must not establish a previously unbound identity")
+                .to_string();
+            assert!(error.contains("missing its canonical principal"), "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn durable_node_token_has_documented_priority() {
@@ -2267,6 +2570,8 @@ mod tests {
                 key: "m27_durable-node".into(),
                 id: "key-id".into(),
                 prefix: "m27_durable".into(),
+                platform_url: "https://provider.example/api/v1".into(),
+                platform_provider: None,
             })
             .unwrap();
         let endpoints = PlatformEndpoints {
@@ -2279,6 +2584,40 @@ mod tests {
             load_access_token(&paths, &endpoints).await.unwrap(),
             "m27_durable-node"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_node_token_is_refused_for_an_endpoint_override() {
+        let dir = TempDir::new().unwrap();
+        let paths = PrismPaths {
+            config_dir: dir.path().join("config"),
+            cache_dir: dir.path().join("cache"),
+            data_dir: dir.path().join("data"),
+            state_dir: dir.path().join("state"),
+        };
+        paths
+            .save_node_token(&prism_runtime::StoredNodeToken {
+                key: "m27_durable-secret-marker".into(),
+                id: "key-id".into(),
+                prefix: "m27_durable".into(),
+                platform_url: "https://trusted.example/api/v1".into(),
+                platform_provider: Some("marc27".into()),
+            })
+            .unwrap();
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://unrelated.example",
+            Some("marc27".into()),
+        );
+
+        let error = load_access_token(&paths, &endpoints)
+            .await
+            .expect_err("durable node token must stay bound to its mint endpoint")
+            .to_string();
+        assert!(
+            error.contains("stored node credential binding refused"),
+            "{error}"
+        );
+        assert!(!error.contains("durable-secret-marker"), "{error}");
     }
 
     #[test]

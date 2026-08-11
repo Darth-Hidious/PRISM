@@ -111,6 +111,11 @@ pub struct NodeState {
     pub llm: Option<prism_ingest::LlmConfig>,
     /// Platform API client (set when node is registered with MARC27 platform).
     pub platform_client: Option<prism_client::PlatformClient>,
+    /// Explicit verifier for bearer credentials presented when minting a
+    /// remote PRISM session. `None` fails closed; it never implies MARC27.
+    /// The configuration's custom `Debug` implementation redacts provider
+    /// keys.
+    pub identity_verifier: Option<prism_client::auth::IdentityVerifierConfig>,
     /// Identity returned by the linked platform credential's `/users/me`.
     /// Cached after the first owner-authorized request; it is never supplied
     /// by an HTTP caller.
@@ -163,6 +168,7 @@ impl NodeState {
             )),
             llm: None,
             platform_client: None,
+            identity_verifier: None,
             platform_owner_id: OnceLock::new(),
             ws_broadcast,
             ws_connections: AtomicUsize::new(0),

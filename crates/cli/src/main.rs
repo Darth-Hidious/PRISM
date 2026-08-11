@@ -34,7 +34,11 @@ use clap::{Parser, Subcommand};
 use prism_client::DeviceFlowAuth;
 use prism_client::PlatformResponseExt;
 use prism_client::api::PlatformClient;
-use prism_client::auth::{DeviceCodeResponse, TokenResponse};
+use prism_client::auth::{
+    DeviceCodeResponse, IdentityProviderAdapter, MARC27_IDENTITY_PROVIDER,
+    SUPABASE_IDENTITY_PROVIDER, TokenResponse, identity_provider_for,
+};
+use prism_client::supabase_auth::{SupabaseAuth, SupabaseAuthPolicy};
 use prism_proto::NodeCapabilities;
 use prism_python_bridge::{ToolServer, ensure_venv};
 use prism_runtime::auth::{self, AuthSurface, PlatformAuth};
@@ -57,7 +61,9 @@ use tracing_subscriber::EnvFilter;
 /// every one on the same config instead of silently reloading the cwd.
 static CLI_PROJECT_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-#[derive(Debug, Parser)]
+// Deliberately no `Debug`: parsed values include login tokens and Supabase
+// anon keys, and a derived formatter would print both verbatim.
+#[derive(Parser)]
 #[command(name = "prism")]
 #[command(about = "PRISM — AI-native materials discovery platform")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
@@ -83,7 +89,8 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Debug, Subcommand)]
+// Deliberately no `Debug`: `Login` owns secret-bearing command/env values.
+#[derive(Subcommand)]
 enum Commands {
     /// Run first-time native setup and platform login.
     Setup {
@@ -118,14 +125,47 @@ enum Commands {
     },
     /// Authenticate against the configured hosted platform.
     ///
-    /// Non-interactive by default: use `--token <PAT>` or configure
-    /// `PRISM_API_KEY`. The retained device flow requires the explicit
-    /// `--interactive-auth` opt-in and a real TTY; PRISM never opens a browser.
+    /// Use `--token <PAT>` for a platform token, `--provider supabase` for
+    /// passwordless email PKCE, or `--provider marc27 --interactive-auth` for
+    /// the retained device flow. PRISM never opens a browser automatically.
     Login {
         /// Use a pre-issued Personal Access Token from the platform website.
         /// This is non-interactive and suitable for headless runs.
-        #[arg(long, value_name = "PAT", env = "PRISM_LOGIN_TOKEN")]
+        #[arg(
+            long,
+            value_name = "PAT",
+            env = "PRISM_LOGIN_TOKEN",
+            hide_env_values = true
+        )]
         token: Option<String>,
+
+        /// Identity provider used for interactive login (`marc27` or
+        /// `supabase`). Unknown values fail closed.
+        #[arg(long, value_name = "PROVIDER", conflicts_with = "token")]
+        provider: Option<String>,
+
+        /// Email address for Supabase's passwordless magic-link PKCE flow.
+        #[arg(long, env = "PRISM_LOGIN_EMAIL", conflicts_with = "token")]
+        email: Option<String>,
+
+        /// Supabase project root. There is deliberately no hosted default.
+        #[arg(
+            long,
+            env = "PRISM_SUPABASE_URL",
+            value_name = "URL",
+            conflicts_with = "token"
+        )]
+        supabase_url: Option<String>,
+
+        /// Supabase anon/publishable key used only with Supabase Auth.
+        #[arg(
+            long,
+            env = "PRISM_SUPABASE_ANON_KEY",
+            value_name = "KEY",
+            hide_env_values = true,
+            conflicts_with = "token"
+        )]
+        supabase_anon_key: Option<String>,
 
         /// Retained compatibility flag. Device auth is always manual; PRISM
         /// never launches a browser.
@@ -1838,6 +1878,8 @@ async fn main() -> Result<()> {
                     refresh_token: credentials.refresh_token,
                     platform_url: credentials.platform_url,
                     platform_provider: credentials.platform_provider,
+                    identity_provider_url: credentials.identity_provider_url,
+                    identity_provider_key: credentials.identity_provider_key,
                     user_id: profile.as_ref().map(|p| p.id.clone()),
                     display_name: profile.and_then(|p| p.display_name),
                     org_id: selected.org_id,
@@ -1848,8 +1890,9 @@ async fn main() -> Result<()> {
                 });
                 paths.save_cli_state(&state)?;
             } else if let Some(creds) = state.credentials.as_mut() {
-                let platform =
-                    PlatformClient::new(&endpoints.api_base).with_token(&creds.access_token);
+                let stored_auth = auth::stored_bearer_for_endpoints(endpoints, creds)?
+                    .context("stored platform session has no access token")?;
+                let platform = PlatformClient::new(&endpoints.api_base).with_auth(stored_auth);
                 if (creds.user_id.is_none() || creds.display_name.is_none())
                     && let Ok(profile) = platform.fetch_current_user().await
                 {
@@ -1887,6 +1930,7 @@ async fn main() -> Result<()> {
             // separately below — if /users/me rejects the token but
             // we have a refresh_token, we try refresh once more before
             // giving up and showing "run prism login".
+            let mut proactive_refresh_failed = false;
             if let Some(creds) = state.credentials.as_ref()
                 && !creds.refresh_token.is_empty()
                 && creds
@@ -1899,6 +1943,7 @@ async fn main() -> Result<()> {
                         tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
+                        proactive_refresh_failed = true;
                         tracing::warn!(error = %e, "proactive token refresh failed");
                         // Don't yell here — the boot check below will
                         // surface a precise message if the token is
@@ -1916,6 +1961,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
             if auth_rejected
+                && !proactive_refresh_failed
                 && let Some(creds) = state.credentials.as_ref()
                 && !creds.refresh_token.is_empty()
             {
@@ -1945,10 +1991,7 @@ async fn main() -> Result<()> {
             // vendored forge chat surface.)
             let prism_bin =
                 std::env::current_exe().context("failed to locate current prism executable")?;
-            let platform = state.credentials.as_ref().map(|c| prism_tui::PlatformAuth {
-                base_url: endpoints.api_base.clone(),
-                token: c.access_token.clone(),
-            });
+            let platform = tui_platform_auth(Some(endpoints), state.credentials.as_ref())?;
             let config = prism_tui::RunConfig {
                 backend_mode: prism_tui::BackendMode::Real {
                     prism_binary: prism_bin.to_str().unwrap().to_string(),
@@ -1962,37 +2005,61 @@ async fn main() -> Result<()> {
         }
         Commands::Login {
             token,
+            provider,
+            email,
+            supabase_url,
+            supabase_anon_key,
             no_browser,
             interactive_auth,
         } => {
-            let endpoints = require_platform_endpoints(endpoints.as_ref())?;
+            let login_endpoints = resolve_login_endpoints(
+                endpoints.as_ref(),
+                provider.as_deref(),
+                supabase_url.as_deref(),
+            )?;
             let mode = match token {
                 Some(pat) => LoginMode::Token(pat),
-                None => LoginMode::Device {
+                None => LoginMode::Provider {
+                    provider: selected_identity_provider(
+                        provider.as_deref(),
+                        login_endpoints.provider.as_deref(),
+                    )?,
                     interactive_auth,
                     no_browser,
+                    email,
+                    supabase_url,
+                    supabase_anon_key,
                 },
             };
-            perform_full_login(&paths, endpoints, &python, mode).await?;
+            perform_full_login(&paths, &login_endpoints, &python, mode).await?;
             println!("Login complete.");
         }
         Commands::Status => {
             let state = paths.load_cli_state()?;
             // Resolve the credential once so a historical alias that would
             // actually supply it emits its one-time migration notice.
-            let env_credential_present = PlatformVar::get_preferred_then_alias(&[
-                PlatformVar::API_KEY,
-                PlatformVar::TOKEN,
-                PlatformVar::API_TOKEN,
-            ])
-            .is_some();
+            let env_credential_present = endpoints
+                .as_ref()
+                .and_then(PlatformEndpoints::environment_credential)
+                .is_some();
             let stored_credential_present = state
                 .credentials
                 .as_ref()
-                .is_some_and(|credentials| !credentials.access_token.trim().is_empty());
-            let node_credential_present = paths
-                .load_node_token()
-                .is_some_and(|token| !token.key.trim().is_empty());
+                .zip(endpoints.as_ref())
+                .and_then(|(credentials, endpoints)| {
+                    auth::stored_bearer_for_endpoints(endpoints, credentials)
+                        .ok()
+                        .flatten()
+                })
+                .is_some();
+            let node_credential_present = paths.load_node_token().is_some_and(|token| {
+                endpoints.as_ref().is_some_and(|endpoints| {
+                    auth::stored_node_bearer_for_endpoints(endpoints, &token)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+            });
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -2377,33 +2444,16 @@ async fn main() -> Result<()> {
             // so `prism use local` actually affects `prism backend`.
             let chat_target = crate::chat_config::load().unwrap_or_default().chat;
 
-            // The session's platform JWT — the credential the MARC27 LLM
-            // proxy authenticates.
-            let platform_token = paths
-                .load_cli_state()
-                .ok()
-                .and_then(|s| s.credentials)
-                .map(|c| c.access_token);
-
             // Generic key chain for the local/direct-provider targets.
             // Provider keys (ANTHROPIC/OPENAI) belong ONLY here — never on
             // the marc27 arm: now that the project `.env` is actually
             // loaded, an ANTHROPIC_API_KEY in it would otherwise shadow the
             // platform JWT and 401 every platform LLM call.
             let api_key = std::env::var("LLM_API_KEY")
-                .ok()
-                .or_else(|| {
-                    PlatformVar::get_preferred_then_alias(&[
-                        PlatformVar::TOKEN,
-                        PlatformVar::API_TOKEN,
-                    ])
-                })
-                .ok_or(std::env::VarError::NotPresent)
                 .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok()
-                .or_else(|| cfg_llm.resolve_api_key())
-                .or_else(|| platform_token.clone());
+                .or_else(|| cfg_llm.resolve_api_key());
 
             // Platform model catalog, fetched ONCE (fail-open: empty when
             // offline). Serves both marc27 model resolution and the limits
@@ -2472,6 +2522,21 @@ async fn main() -> Result<()> {
                     model: target_model,
                 } => {
                     let endpoints = require_platform_endpoints(endpoints.as_ref())?;
+                    let (base_url, platform_derived) =
+                        marc27_llm_base_url_with_source(&paths, &endpoints.api_base, &cfg_llm.url)?;
+                    let platform_token = if platform_derived {
+                        backend_state
+                            .as_ref()
+                            .and_then(|state| state.credentials.as_ref())
+                            .map(|credentials| {
+                                auth::stored_bearer_for_endpoints(endpoints, credentials)
+                            })
+                            .transpose()?
+                            .flatten()
+                            .map(|credential| credential.secret().to_string())
+                    } else {
+                        None
+                    };
                     let preference = resolve_marc27_model(
                         std::env::var("LLM_MODEL").ok(),
                         target_model.as_deref(),
@@ -2495,7 +2560,9 @@ async fn main() -> Result<()> {
                     let (marc27_key, credential_kind) =
                         if let Ok(raw_override) = std::env::var("LLM_API_KEY") {
                             (Some(raw_override), None)
-                        } else if let Some(credential) = auth::resolve_environment_credential() {
+                        } else if !platform_derived {
+                            (cfg_llm.resolve_api_key(), None)
+                        } else if let Some(credential) = endpoints.environment_credential() {
                             match credential {
                                 PlatformAuth::ApiKey(key) => (
                                     Some(key),
@@ -2514,12 +2581,7 @@ async fn main() -> Result<()> {
                                     .map(|_| prism_ingest::llm::LlmCredentialKind::Bearer),
                             )
                         };
-                    (
-                        marc27_llm_base_url(&paths, &endpoints.api_base, &cfg_llm.url)?,
-                        model,
-                        marc27_key,
-                        credential_kind,
-                    )
+                    (base_url, model, marc27_key, credential_kind)
                 }
             };
 
@@ -2987,37 +3049,14 @@ async fn main() -> Result<()> {
                             ))
                         }
                         crate::chat_config::ChatTarget::Marc27 { .. } => {
-                            let stored_token = paths
-                                .load_cli_state()
-                                .ok()
-                                .and_then(|state| state.credentials)
-                                .map(|credentials| credentials.access_token);
-                            let (api_key, credential_kind) =
-                                if let Some(credential) = auth::resolve_environment_credential() {
-                                    match credential {
-                                        PlatformAuth::ApiKey(key) => (
-                                            Some(key),
-                                            Some(prism_ingest::llm::LlmCredentialKind::ApiKey),
-                                        ),
-                                        PlatformAuth::Bearer(token) => (
-                                            Some(token),
-                                            Some(prism_ingest::llm::LlmCredentialKind::Bearer),
-                                        ),
-                                    }
-                                } else if stored_token.is_some() {
-                                    (
-                                        stored_token,
-                                        Some(prism_ingest::llm::LlmCredentialKind::Bearer),
-                                    )
-                                } else {
-                                    (
-                                        prism_core::config::NodeConfig::resolve_api_key(
-                                            &node_config.indexer,
-                                        ),
-                                        None,
-                                    )
-                                };
-                            let base_url = node_config.indexer.uri.clone().or_else(|| {
+                            let configured_base_url = node_config.indexer.uri.clone();
+                            let platform_derived = configured_base_url.is_none()
+                                && matches!(
+                                    node_config.indexer.mode.as_str(),
+                                    "platform" | "marc27" | "external"
+                                )
+                                && endpoints.is_some();
+                            let base_url = configured_base_url.or_else(|| {
                                 match node_config.indexer.mode.as_str() {
                                     "platform" | "marc27" | "external" => endpoints
                                         .as_ref()
@@ -3025,6 +3064,54 @@ async fn main() -> Result<()> {
                                     _ => Some("http://localhost:8080".into()),
                                 }
                             });
+                            let stored_credentials = paths
+                                .load_cli_state()
+                                .ok()
+                                .and_then(|state| state.credentials);
+                            let bound_stored = if platform_derived {
+                                endpoints
+                                    .as_ref()
+                                    .zip(stored_credentials.as_ref())
+                                    .map(|(endpoints, credentials)| {
+                                        auth::stored_bearer_for_endpoints(endpoints, credentials)
+                                    })
+                                    .transpose()?
+                                    .flatten()
+                            } else {
+                                None
+                            };
+                            let (api_key, credential_kind) = if platform_derived
+                                && let Some(credential) = endpoints
+                                    .as_ref()
+                                    .and_then(|value| value.environment_credential())
+                            {
+                                match credential {
+                                    PlatformAuth::ApiKey(key) => (
+                                        Some(key),
+                                        Some(prism_ingest::llm::LlmCredentialKind::ApiKey),
+                                    ),
+                                    PlatformAuth::Bearer(token) => (
+                                        Some(token),
+                                        Some(prism_ingest::llm::LlmCredentialKind::Bearer),
+                                    ),
+                                }
+                            } else if let Some(credential) = bound_stored {
+                                (
+                                    Some(credential.secret().to_string()),
+                                    Some(if credential.is_api_key() {
+                                        prism_ingest::llm::LlmCredentialKind::ApiKey
+                                    } else {
+                                        prism_ingest::llm::LlmCredentialKind::Bearer
+                                    }),
+                                )
+                            } else {
+                                (
+                                    prism_core::config::NodeConfig::resolve_api_key(
+                                        &node_config.indexer,
+                                    ),
+                                    None,
+                                )
+                            };
                             let model = node_config
                                 .indexer
                                 .model
@@ -3084,6 +3171,17 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .expect("non-offline node auth was preflighted");
                     let creds = cli_state.credentials.as_ref();
+                    if let Some(credentials) = creds {
+                        auth::validate_stored_session_binding(endpoints, credentials).with_context(
+                            || {
+                                "stored identity cannot configure remote-session verification for the selected platform"
+                            },
+                        )?;
+                    }
+                    server_node_state.identity_verifier = identity_verifier_for(endpoints, creds)
+                        .with_context(
+                        || "failed to configure identity verification for remote PRISM sessions",
+                    )?;
                     daemon_org_id = creds.and_then(|value| value.org_id.clone());
                     let (client_auth, maybe_refreshed) =
                         resolve_node_auth(&paths, endpoints, creds, resolved_auth).await?;
@@ -4778,6 +4876,7 @@ async fn main() -> Result<()> {
             // The two triggers (proactive expiry + reactive 401) keep
             // users out of the "log in again every session" loop.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
+            let mut proactive_refresh_failed = false;
             if let Some(creds) = state.credentials.as_ref()
                 && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
@@ -4791,6 +4890,7 @@ async fn main() -> Result<()> {
                         tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
+                        proactive_refresh_failed = true;
                         tracing::warn!(error = %e, "proactive token refresh failed");
                     }
                 }
@@ -4801,6 +4901,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
             if auth_rejected
+                && !proactive_refresh_failed
                 && let Some(creds) = state.credentials.as_ref()
                 && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
@@ -4828,10 +4929,7 @@ async fn main() -> Result<()> {
                     &paths,
                     endpoints,
                     &python,
-                    LoginMode::Device {
-                        interactive_auth: false,
-                        no_browser: true,
-                    },
+                    provider_login_mode(endpoints, false, true)?,
                 )
                 .await
                 {
@@ -4855,12 +4953,7 @@ async fn main() -> Result<()> {
                 std::env::current_exe().context("failed to locate current prism executable")?;
             // Give the TUI the platform bearer so it can poll the org credit
             // balance at turn boundaries (status bar). None → no credits shown.
-            let platform = state.credentials.as_ref().zip(endpoints.as_ref()).map(
-                |(credentials, endpoints)| prism_tui::PlatformAuth {
-                    base_url: endpoints.api_base.clone(),
-                    token: credentials.access_token.clone(),
-                },
-            );
+            let platform = tui_platform_auth(endpoints.as_ref(), state.credentials.as_ref())?;
             let config = prism_tui::RunConfig {
                 backend_mode: prism_tui::BackendMode::Real {
                     prism_binary: prism_bin.to_str().unwrap().to_string(),
@@ -4880,6 +4973,7 @@ async fn main() -> Result<()> {
 
             // Same auth-refresh + boot-check flow as the Tui branch.
             let mut state = paths.load_cli_state().ok().unwrap_or_default();
+            let mut proactive_refresh_failed = false;
             if let Some(creds) = state.credentials.as_ref()
                 && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
@@ -4893,6 +4987,7 @@ async fn main() -> Result<()> {
                         tracing::info!("access token refreshed proactively");
                     }
                     Err(e) => {
+                        proactive_refresh_failed = true;
                         tracing::warn!(error = %e, "proactive token refresh failed");
                     }
                 }
@@ -4903,6 +4998,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .any(|c| c.name == "Auth" && c.result.starts_with("token rejected"));
             if auth_rejected
+                && !proactive_refresh_failed
                 && let Some(creds) = state.credentials.as_ref()
                 && let Some(endpoints) = endpoints.as_ref()
                 && !creds.refresh_token.is_empty()
@@ -4928,10 +5024,7 @@ async fn main() -> Result<()> {
                     &paths,
                     endpoints,
                     &python,
-                    LoginMode::Device {
-                        interactive_auth: false,
-                        no_browser: true,
-                    },
+                    provider_login_mode(endpoints, false, true)?,
                 )
                 .await
                 {
@@ -4952,12 +5045,7 @@ async fn main() -> Result<()> {
             boot::boot_sequence(&boot_checks);
             let prism_bin =
                 std::env::current_exe().context("failed to locate current prism executable")?;
-            let platform = state.credentials.as_ref().zip(endpoints.as_ref()).map(
-                |(credentials, endpoints)| prism_tui::PlatformAuth {
-                    base_url: endpoints.api_base.clone(),
-                    token: credentials.access_token.clone(),
-                },
-            );
+            let platform = tui_platform_auth(endpoints.as_ref(), state.credentials.as_ref())?;
             let config = prism_tui::RunConfig {
                 backend_mode: prism_tui::BackendMode::Real {
                     prism_binary: prism_bin.to_str().unwrap().to_string(),
@@ -5198,7 +5286,7 @@ async fn handle_workflow_command(
                 paths,
                 caller_supplied_llm_base_url,
                 node_token,
-            );
+            )?;
             let result = execute_workflow_with_policy_and_options(
                 spec, &values, execute, None, None, None, &options,
             )
@@ -5241,7 +5329,7 @@ async fn try_run_workflow_alias(
         paths,
         caller_supplied_llm_base_url,
         node_token,
-    );
+    )?;
     let result = execute_workflow_with_policy_and_options(
         spec,
         &values,
@@ -5827,21 +5915,10 @@ async fn handle_mesh_command(
                 );
             }
 
-            // The owner's platform token lets the peer VERIFY who is
-            // pulling. Without a login, a loopback peer still works (it
-            // mints an anonymous-local session); a remote peer will refuse.
-            let platform_token = paths
-                .load_cli_state()
-                .ok()
-                .and_then(|s| s.credentials)
-                .map(|c| c.access_token);
-            if platform_token.is_none() {
-                println!(
-                    "  ⚠ Not logged in: a remote peer will refuse this pull. \
-                     Loopback peers still answer."
-                );
-            }
-            let sessions = prism_mesh::peer_session::PeerSessions::new(platform_token);
+            // A manually supplied URL is not cryptographic identity proof.
+            // Never carry a stored provider credential to it; remote peers
+            // must be vouched for through authenticated platform discovery.
+            let sessions = prism_mesh::peer_session::PeerSessions::new(None);
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             let sync_config = Some(prism_mesh::sync::SyncConfig {
                 provenance_db: std::path::PathBuf::from(home).join(".prism/provenance.db"),
@@ -5851,8 +5928,7 @@ async fn handle_mesh_command(
             let client = prism_mesh::sync::sync_http_client();
             let synced = prism_mesh::sync::sync_dataset_from_peer(
                 &client,
-                // The HUMAN typed this address, which is what makes it
-                // eligible to be shown the platform credential.
+                // Operator-named destinations receive only tokenless mints.
                 &prism_mesh::peer_session::PeerAddress::operator_named(&peer),
                 &dataset_name,
                 publisher,
@@ -6176,12 +6252,14 @@ fn resolve_workflow_llm_options(
     paths: &PrismPaths,
     caller_supplied_llm_base_url: bool,
     node_token: Option<String>,
-) -> WorkflowExecutionOptions {
+) -> Result<WorkflowExecutionOptions> {
     let resolved = resolve_workflow_llm_pair(project_root, paths);
     let trusted_llm_credential = resolved
         .as_ref()
-        .and_then(|_| resolve_workflow_llm_api_key(project_root, paths));
-    WorkflowExecutionOptions {
+        .map(|(base_url, _)| resolve_workflow_llm_api_key(project_root, paths, base_url))
+        .transpose()?
+        .flatten();
+    Ok(WorkflowExecutionOptions {
         trusted_llm_base_url: resolved.as_ref().map(|(base_url, _)| base_url.clone()),
         trusted_llm_api_key: trusted_llm_credential
             .as_ref()
@@ -6190,27 +6268,72 @@ fn resolve_workflow_llm_options(
         caller_supplied_llm_base_url,
         trusted_node_port: node_token.as_ref().map(|_| 7327),
         trusted_node_token: node_token,
-    }
+    })
 }
 
 fn resolve_workflow_llm_api_key(
     project_root: &Path,
     paths: &PrismPaths,
-) -> Option<(String, Option<prism_ingest::llm::LlmCredentialKind>)> {
+    selected_base_url: &str,
+) -> Result<Option<(String, Option<prism_ingest::llm::LlmCredentialKind>)>> {
     let node_config = prism_core::config::NodeConfig::load(Some(project_root));
     let chat_target = crate::chat_config::load().unwrap_or_default().chat;
-    let platform_token = paths
+    let stored_credentials = paths
         .load_cli_state()
         .ok()
-        .and_then(|state| state.credentials)
-        .map(|credentials| credentials.access_token);
-    resolve_workflow_llm_api_key_for_target(&chat_target, &node_config.llm, platform_token)
+        .and_then(|state| state.credentials);
+    let endpoints = PlatformEndpoints::resolve_for_paths(
+        node_config.platform.url.as_deref(),
+        node_config.platform.provider.as_deref(),
+        stored_credentials.as_ref(),
+        paths,
+    );
+    let platform_derived = if matches!(chat_target, crate::chat_config::ChatTarget::Marc27 { .. }) {
+        endpoints
+            .as_ref()
+            .and_then(|endpoints| {
+                marc27_llm_base_url_with_source(paths, &endpoints.api_base, &node_config.llm.url)
+                    .ok()
+            })
+            .is_some_and(|(base_url, derived)| {
+                derived && base_url.trim_end_matches('/') == selected_base_url.trim_end_matches('/')
+            })
+    } else {
+        false
+    };
+    let platform_token = if platform_derived {
+        endpoints
+            .as_ref()
+            .zip(stored_credentials.as_ref())
+            .map(|(endpoints, credentials)| {
+                auth::stored_bearer_for_endpoints(endpoints, credentials)
+            })
+            .transpose()?
+            .flatten()
+            .map(|credential| credential.secret().to_string())
+    } else {
+        None
+    };
+    let credential_endpoints = if platform_derived {
+        endpoints.as_ref()
+    } else {
+        None
+    };
+    Ok(resolve_workflow_llm_api_key_for_target(
+        &chat_target,
+        &node_config.llm,
+        credential_endpoints,
+        platform_token,
+        platform_derived,
+    ))
 }
 
 fn resolve_workflow_llm_api_key_for_target(
     chat_target: &crate::chat_config::ChatTarget,
     cfg_llm: &prism_core::config::LlmSection,
+    endpoints: Option<&PlatformEndpoints>,
     platform_token: Option<String>,
+    platform_derived: bool,
 ) -> Option<(String, Option<prism_ingest::llm::LlmCredentialKind>)> {
     let non_empty = |key: Option<String>| key.filter(|value| !value.trim().is_empty());
 
@@ -6235,7 +6358,11 @@ fn resolve_workflow_llm_api_key_for_target(
             if let Some(value) = non_empty(std::env::var("LLM_API_KEY").ok()) {
                 return Some((value, None));
             }
-            if let Some(credential) = auth::resolve_environment_credential() {
+            if !platform_derived {
+                return non_empty(cfg_llm.resolve_api_key()).map(|value| (value, None));
+            }
+            if let Some(credential) = endpoints.and_then(PlatformEndpoints::environment_credential)
+            {
                 let (value, kind) = match credential {
                     PlatformAuth::ApiKey(value) => {
                         (value, prism_ingest::llm::LlmCredentialKind::ApiKey)
@@ -8535,6 +8662,150 @@ fn require_platform_endpoints(endpoints: Option<&PlatformEndpoints>) -> Result<&
     endpoints.ok_or_else(|| anyhow!(prism_runtime::auth::PLATFORM_NOT_CONFIGURED))
 }
 
+/// Build the TUI's platform-credit client only from a stored session that is
+/// still bound to the exact provider and URL recorded at login.
+fn tui_platform_auth(
+    endpoints: Option<&PlatformEndpoints>,
+    credentials: Option<&StoredCredentials>,
+) -> Result<Option<prism_tui::PlatformAuth>> {
+    let (Some(endpoints), Some(credentials)) = (endpoints, credentials) else {
+        return Ok(None);
+    };
+    let Some(credential) = auth::stored_bearer_for_endpoints(endpoints, credentials)? else {
+        return Ok(None);
+    };
+    Ok(Some(prism_tui::PlatformAuth {
+        base_url: endpoints.api_base.clone(),
+        token: credential.secret().to_string(),
+    }))
+}
+
+/// Resolve the transport endpoint for login without inventing a Supabase
+/// project. Selecting MARC27 explicitly retains its compatibility endpoint;
+/// selecting Supabase requires a URL from the CLI, environment, config, or a
+/// stored login.
+fn resolve_login_endpoints(
+    endpoints: Option<&PlatformEndpoints>,
+    provider: Option<&str>,
+    supabase_url: Option<&str>,
+) -> Result<PlatformEndpoints> {
+    if let Some(provider) = provider {
+        identity_provider_for(Some(provider))
+            .with_context(|| format!("unknown identity provider `{provider}`"))?;
+    }
+
+    if provider == Some(SUPABASE_IDENTITY_PROVIDER) {
+        let environment_url = std::env::var("PRISM_SUPABASE_URL")
+            .ok()
+            .and_then(|value| non_blank(&value).map(str::to_string));
+        let provider_neutral_url = std::env::var(PlatformVar::API_URL.preferred)
+            .ok()
+            .and_then(|value| non_blank(&value).map(str::to_string));
+        let already_supabase = endpoints
+            .filter(|endpoints| endpoints.provider.as_deref() == Some(SUPABASE_IDENTITY_PROVIDER))
+            .map(|endpoints| endpoints.api_base.as_str());
+        if let Some(url) = supabase_url
+            .and_then(non_blank)
+            .or(environment_url.as_deref())
+            .or(provider_neutral_url.as_deref())
+            .or(already_supabase)
+        {
+            return Ok(PlatformEndpoints::from_url_with_provider(
+                url,
+                Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+            ));
+        }
+    }
+
+    if provider == Some(MARC27_IDENTITY_PROVIDER) {
+        if let Some(endpoints) = endpoints.filter(|endpoints| {
+            endpoints.provider.is_none()
+                || endpoints.provider.as_deref() == Some(MARC27_IDENTITY_PROVIDER)
+        }) {
+            return Ok(PlatformEndpoints::from_url_with_provider(
+                &endpoints.api_base,
+                Some(MARC27_IDENTITY_PROVIDER.to_string()),
+            ));
+        }
+        return Ok(PlatformEndpoints::marc27());
+    }
+
+    if let Some(endpoints) = endpoints {
+        return Ok(endpoints.clone());
+    }
+
+    match provider {
+        Some(SUPABASE_IDENTITY_PROVIDER) => bail!(
+            "Supabase is not configured. Set PRISM_SUPABASE_URL and \
+             PRISM_SUPABASE_ANON_KEY (or PRISM_API_URL and PRISM_API_KEY)."
+        ),
+        Some(_) | None => bail!(prism_runtime::auth::PLATFORM_NOT_CONFIGURED),
+    }
+}
+
+fn selected_identity_provider(
+    explicit_provider: Option<&str>,
+    configured_provider: Option<&str>,
+) -> Result<IdentityProviderAdapter> {
+    let provider = explicit_provider.or(configured_provider);
+    identity_provider_for(provider).with_context(|| match provider {
+        Some(provider) => format!("unknown identity provider `{provider}`"),
+        None => {
+            "identity provider is not configured; pass --provider marc27 or --provider supabase"
+                .to_string()
+        }
+    })
+}
+
+fn provider_login_mode(
+    endpoints: &PlatformEndpoints,
+    interactive_auth: bool,
+    no_browser: bool,
+) -> Result<LoginMode> {
+    Ok(LoginMode::Provider {
+        provider: selected_identity_provider(None, endpoints.provider.as_deref())?,
+        interactive_auth,
+        no_browser,
+        email: None,
+        supabase_url: None,
+        supabase_anon_key: None,
+    })
+}
+
+fn identity_verifier_for(
+    endpoints: &PlatformEndpoints,
+    credentials: Option<&StoredCredentials>,
+) -> Result<Option<prism_client::auth::IdentityVerifierConfig>> {
+    let Some(provider) = identity_provider_for(endpoints.provider.as_deref()) else {
+        // A provider-neutral or unknown platform may still support its own
+        // API-key registration, but it must not inherit another provider's
+        // remote-session verification protocol.
+        return Ok(None);
+    };
+    let verifier = match provider {
+        IdentityProviderAdapter::Marc27 => prism_client::auth::IdentityVerifierConfig::new(
+            Some(MARC27_IDENTITY_PROVIDER),
+            &endpoints.api_base,
+            None,
+        )?,
+        IdentityProviderAdapter::Supabase => {
+            let credentials = credentials.context(
+                "Supabase identity verification is not configured: no stored login exists",
+            )?;
+            let project_url = credentials
+                .identity_provider_url
+                .as_deref()
+                .context("Supabase identity verification is missing its project URL")?;
+            prism_client::auth::IdentityVerifierConfig::new(
+                Some(SUPABASE_IDENTITY_PROVIDER),
+                project_url,
+                credentials.identity_provider_key.as_deref(),
+            )?
+        }
+    };
+    Ok(Some(verifier))
+}
+
 fn resolve_active_project_id(paths: &PrismPaths) -> Result<String> {
     if let Some(project_id) = env_project_override() {
         return Ok(project_id);
@@ -8559,6 +8830,18 @@ async fn handle_node_token_mint(paths: &PrismPaths, project: Option<&str>) -> Re
     };
 
     let (api_base, auth) = resolve_agent_auth()?;
+    let state = paths.load_cli_state().unwrap_or_default();
+    let config = prism_core::config::NodeConfig::load(CLI_PROJECT_ROOT.get().map(PathBuf::as_path));
+    let mint_endpoints = PlatformEndpoints::resolve_for_paths(
+        config.platform.url.as_deref(),
+        config.platform.provider.as_deref(),
+        state.credentials.as_ref(),
+        paths,
+    )
+    .context("platform endpoint disappeared while minting the node credential")?;
+    if mint_endpoints.api_base != api_base {
+        bail!("platform endpoint changed while minting the node credential; retry the command");
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -8586,6 +8869,8 @@ async fn handle_node_token_mint(paths: &PrismPaths, project: Option<&str>) -> Re
             .to_string(),
         id: created["id"].as_str().unwrap_or("").to_string(),
         prefix: created["prefix"].as_str().unwrap_or("").to_string(),
+        platform_url: api_base.clone(),
+        platform_provider: mint_endpoints.provider,
     };
 
     paths.save_node_token(&token)?;
@@ -10791,9 +11076,7 @@ async fn create_dashboard_session(
     // That defeats the RBAC model on shared machines.
     let rbac_db_path = paths.state_dir.join("rbac.db");
     let rbac_engine = prism_core::rbac::RbacEngine::new(&rbac_db_path)?;
-    if rbac_engine.get_role(user_id)?.is_none() {
-        rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
-    }
+    ensure_dashboard_role(&rbac_engine, creds, user_id)?;
 
     create_dashboard_session_for_user_with_platform_token(
         dashboard_url,
@@ -10802,6 +11085,33 @@ async fn create_dashboard_session(
         Some(creds.access_token.as_str()),
     )
     .await
+}
+
+/// Bootstrap a purely local/login-neutral operator, while requiring a
+/// recognized verified provider role for Supabase principals. An unknown
+/// Supabase claim deliberately leaves no external row and must never turn
+/// into local `NodeAdmin` merely because the dashboard is opened.
+fn ensure_dashboard_role(
+    rbac_engine: &prism_core::rbac::RbacEngine,
+    credentials: &StoredCredentials,
+    user_id: &str,
+) -> Result<()> {
+    if rbac_engine.get_local_role(user_id)?.is_some() {
+        return Ok(());
+    }
+    if credentials.platform_provider.as_deref() == Some(SUPABASE_IDENTITY_PROVIDER)
+        && rbac_engine
+            .get_external_role(prism_node::provider_roles::SUPABASE_ROLE_PROVIDER, user_id)?
+            .is_none()
+    {
+        bail!(
+            "verified Supabase identity has no recognized PRISM role; refusing local administrator bootstrap"
+        );
+    }
+    if rbac_engine.get_role(user_id)?.is_none() {
+        rbac_engine.assign_role(user_id, prism_core::rbac::LocalRole::NodeAdmin)?;
+    }
+    Ok(())
 }
 
 async fn create_dashboard_session_for_user(
@@ -10901,8 +11211,10 @@ async fn create_dashboard_session_for_user_with_platform_token(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        bail!("Dashboard session creation failed: {status} — {body}");
+        // A compromised local dashboard can echo the platform token from the
+        // request body. Never reflect an untrusted response body into CLI/TUI
+        // output or logs.
+        bail!("Dashboard session creation failed: {status}");
     }
 
     let session: DashboardSessionResponse = resp.json().await?;
@@ -11891,19 +12203,21 @@ async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// Mode flag for [`perform_full_login`] — picks the credential source
-/// (PAT vs interactive device flow) without committing the caller to
-/// the structure of [`Commands::Login`]'s arguments.
+/// Mode flag for [`perform_full_login`] — picks the credential source without
+/// committing callers to the structure of [`Commands::Login`]'s arguments.
 enum LoginMode {
     /// Personal Access Token — non-interactive, suitable for headless
     /// scripts and CI. Skips the device-flow polling step.
     Token(String),
-    /// Retained device flow. It is usable only with explicit opt-in and a
-    /// TTY; the URL is printed for the human to open manually and PRISM never
-    /// launches a browser.
-    Device {
+    /// Interactive provider flow. MARC27 uses retained device authorization;
+    /// Supabase uses passwordless email magic-link PKCE.
+    Provider {
+        provider: IdentityProviderAdapter,
         interactive_auth: bool,
         no_browser: bool,
+        email: Option<String>,
+        supabase_url: Option<String>,
+        supabase_anon_key: Option<String>,
     },
 }
 
@@ -11912,10 +12226,10 @@ enum LoginMode {
 /// fail.
 ///
 /// Steps:
-/// 1. Mint fresh credentials (token or device flow).
-/// 2. Fetch the user profile.
-/// 3. Pick org + project (auto-selects when only one exists — see
-///    [`select_project`]).
+/// 1. Mint fresh credentials through the selected provider.
+/// 2. Fetch the provider-platform profile when that protocol supports it.
+/// 3. Pick org + project for a PRISM-compatible platform (auto-selects when
+///    only one exists — see [`select_project`]).
 /// 4. Persist `StoredCredentials` to `cli_state.json`.
 /// 5. Mirror the access/refresh tokens to `~/.prism/credentials.json`
 ///    (0600 on unix) for the Python SDK.
@@ -11933,89 +12247,75 @@ async fn perform_full_login(
     python: &std::path::Path,
     mode: LoginMode,
 ) -> Result<()> {
-    let mut state = paths.load_cli_state().unwrap_or_default();
-    let (credentials, interactive_auth) = match mode {
-        LoginMode::Token(pat) => (run_token_login(endpoints, &pat).await?, false),
-        LoginMode::Device {
+    let (mut credentials, interactive_auth, load_platform_context) = match mode {
+        LoginMode::Token(_)
+            if endpoints.provider.as_deref() == Some(SUPABASE_IDENTITY_PROVIDER) =>
+        {
+            bail!(
+                "pre-issued token login is not supported for Supabase; use its passwordless PKCE login"
+            )
+        }
+        LoginMode::Token(pat) => (run_token_login(endpoints, &pat).await?, false, true),
+        LoginMode::Provider {
+            provider: IdentityProviderAdapter::Marc27,
             interactive_auth,
             no_browser,
+            ..
         } => (
             run_device_login_with_opts(endpoints, interactive_auth, no_browser).await?,
             true,
+            true,
+        ),
+        LoginMode::Provider {
+            provider: IdentityProviderAdapter::Supabase,
+            email,
+            supabase_url,
+            supabase_anon_key,
+            no_browser: _,
+            interactive_auth: _,
+        } => (
+            run_supabase_login(
+                paths,
+                endpoints,
+                email.as_deref(),
+                supabase_url.as_deref(),
+                supabase_anon_key.as_deref(),
+            )
+            .await?,
+            false,
+            false,
         ),
     };
-    let platform = PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
-    let profile = platform.fetch_current_user().await.ok();
-    let selected = select_project(
-        &platform,
-        profile
-            .as_ref()
-            .and_then(|user| user.display_name.as_deref()),
-        interactive_auth,
-    )
-    .await?;
-    state.preferred_python = Some(python.display().to_string());
-    state.credentials = Some(StoredCredentials {
-        access_token: credentials.access_token,
-        refresh_token: credentials.refresh_token,
-        platform_url: credentials.platform_url,
-        platform_provider: credentials.platform_provider,
-        user_id: profile.as_ref().map(|p| p.id.clone()),
-        display_name: profile.and_then(|p| p.display_name),
-        org_id: selected.org_id,
-        org_name: selected.org_name,
-        project_id: selected.project_id,
-        project_name: selected.project_name,
-        expires_at: credentials.expires_at,
-    });
-    paths.save_cli_state(&state)?;
-
-    // Sync credentials to ~/.prism/credentials.json for the Python SDK.
-    //
-    // 0600 because the file holds an access_token + refresh_token. Plain
-    // `fs::write` would inherit the user's umask (typically 0644 =
-    // world-readable on most Linux distros), which would let any other
-    // local user read the tokens. cli_state.json (saved via
-    // PrismPaths::save_cli_state) already uses 0600 for the same reason.
-    if let Some(ref creds) = state.credentials {
-        let sdk_creds = serde_json::json!({
-            "access_token": creds.access_token,
-            "refresh_token": creds.refresh_token,
-            "platform_url": creds.platform_url,
-            "platform_provider": creds.platform_provider,
-            "user_id": creds.user_id,
-            "org_id": creds.org_id,
-            "project_id": creds.project_id,
-        });
-        if let Some(home) = std::env::var_os("HOME") {
-            let sdk_path = std::path::PathBuf::from(home)
-                .join(".prism")
-                .join("credentials.json");
-            if let Ok(json) = serde_json::to_string_pretty(&sdk_creds) {
-                if let Some(parent) = sdk_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                #[cfg(unix)]
-                {
-                    use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&sdk_path)
-                    {
-                        let _ = file.write_all(json.as_bytes());
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = std::fs::write(&sdk_path, json);
-                }
-            }
-        }
+    if load_platform_context {
+        let platform =
+            PlatformClient::new(&endpoints.api_base).with_token(&credentials.access_token);
+        let profile = platform.fetch_current_user().await.ok();
+        let selected = select_project(
+            &platform,
+            profile
+                .as_ref()
+                .and_then(|user| user.display_name.as_deref()),
+            interactive_auth,
+        )
+        .await?;
+        credentials.user_id = profile.as_ref().map(|profile| profile.id.clone());
+        credentials.display_name = profile.and_then(|profile| profile.display_name);
+        credentials.org_id = selected.org_id;
+        credentials.org_name = selected.org_name;
+        credentials.project_id = selected.project_id;
+        credentials.project_name = selected.project_name;
     }
+
+    // Store the non-secret interpreter preference before beginning the
+    // coordinated credential update. A later failure must never report login
+    // failure after the new token pair has already been committed.
+    let mut state = paths.load_cli_state()?;
+    state.preferred_python = Some(python.display().to_string());
+    paths.save_cli_state(&state)?;
+    // The shared writer mirrors the restricted cli-state record into
+    // ~/.prism/credentials.json and rolls the CLI record back if the mirror
+    // cannot be replaced.
+    paths.persist_credentials(&credentials)?;
 
     Ok(())
 }
@@ -12035,6 +12335,13 @@ async fn run_device_login_with_opts(
     interactive_auth: bool,
     _no_browser: bool,
 ) -> Result<StoredCredentials> {
+    match identity_provider_for(endpoints.provider.as_deref()) {
+        Some(IdentityProviderAdapter::Marc27) => {}
+        Some(IdentityProviderAdapter::Supabase) => bail!(
+            "Supabase does not implement device authorization; this provider uses passwordless email PKCE"
+        ),
+        None => bail!("device login requires an explicitly configured MARC27 identity provider"),
+    }
     auth::require_interactive_auth(
         AuthSurface::Cli,
         interactive_auth,
@@ -12059,7 +12366,7 @@ async fn run_device_login_with_opts(
         &http,
         &endpoints.api_base,
         &start.device_code,
-        start.interval.max(1) as u64,
+        u64::try_from(start.interval).unwrap_or_default(),
     )
     .await?;
 
@@ -12115,6 +12422,8 @@ async fn run_device_login_with_opts(
         refresh_token: token.refresh_token,
         platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
         platform_provider: endpoints.provider.clone(),
+        identity_provider_url: None,
+        identity_provider_key: None,
         user_id: None,
         display_name: None,
         org_id: None,
@@ -12123,6 +12432,204 @@ async fn run_device_login_with_opts(
         project_name: None,
         expires_at,
     })
+}
+
+#[derive(Clone)]
+struct SupabaseLoginConfig {
+    project_url: String,
+    anon_key: String,
+}
+
+impl std::fmt::Debug for SupabaseLoginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupabaseLoginConfig")
+            .field("project_url", &self.project_url)
+            .field("anon_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+async fn run_supabase_login(
+    paths: &PrismPaths,
+    endpoints: &PlatformEndpoints,
+    email: Option<&str>,
+    configured_url: Option<&str>,
+    configured_anon_key: Option<&str>,
+) -> Result<StoredCredentials> {
+    let config = resolve_supabase_login_config(paths, configured_url, configured_anon_key)?;
+    let email = resolve_supabase_login_email(email)?;
+    let auth = SupabaseAuth::new(
+        reqwest::Client::new(),
+        &config.project_url,
+        &config.anon_key,
+        SupabaseAuthPolicy::default(),
+    )?;
+
+    let attempt = auth.begin_email_login(&email).await?;
+    println!();
+    println!("Supabase sent a passwordless login link to your email.");
+    println!(
+        "Open it in a browser on this machine; PRISM is waiting on 127.0.0.1:{}.",
+        attempt
+            .redirect_uri()
+            .port()
+            .context("Supabase callback URL is missing its ephemeral port")?
+    );
+    io::stdout()
+        .flush()
+        .context("failed to flush login instructions")?;
+
+    let session = auth.complete_email_login(attempt).await?;
+    let role_claim = session.claims.role.as_deref().unwrap_or("");
+    std::fs::create_dir_all(&paths.state_dir).with_context(|| {
+        format!(
+            "failed to create PRISM state directory {}",
+            paths.state_dir.display()
+        )
+    })?;
+    let engine = prism_core::rbac::RbacEngine::new(&paths.state_dir.join("rbac.db"))?;
+    let role_sync = prism_node::provider_roles::sync_supabase_login_role(
+        &engine,
+        &session.claims.iss,
+        &session.claims.sub,
+        role_claim,
+    )?;
+    let expires_at = session.tokens.expires_in.and_then(|seconds| {
+        chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(seconds as i64))
+    });
+
+    println!("Supabase identity verified.");
+    Ok(StoredCredentials {
+        access_token: session.tokens.access_token,
+        refresh_token: session.tokens.refresh_token,
+        platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
+        platform_provider: Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+        identity_provider_url: Some(config.project_url),
+        identity_provider_key: Some(config.anon_key),
+        user_id: Some(role_sync.principal_id),
+        display_name: session.claims.email,
+        org_id: None,
+        org_name: None,
+        project_id: None,
+        project_name: None,
+        expires_at,
+    })
+}
+
+fn resolve_supabase_login_config(
+    paths: &PrismPaths,
+    configured_url: Option<&str>,
+    configured_anon_key: Option<&str>,
+) -> Result<SupabaseLoginConfig> {
+    let stored = paths
+        .load_cli_state()
+        .ok()
+        .and_then(|state| state.credentials);
+    let stored_supabase = stored.as_ref().filter(|credentials| {
+        credentials.platform_provider.as_deref() == Some(SUPABASE_IDENTITY_PROVIDER)
+    });
+    let environment_provider = std::env::var(PlatformVar::PROVIDER.preferred)
+        .ok()
+        .and_then(|value| non_blank(&value).map(|value| value.to_ascii_lowercase()))
+        .or_else(|| {
+            std::env::var(PlatformVar::PROVIDER.alias)
+                .ok()
+                .and_then(|value| non_blank(&value).map(|value| value.to_ascii_lowercase()))
+        });
+    let provider_neutral_environment_url = environment_provider
+        .as_deref()
+        .is_none_or(|provider| provider == SUPABASE_IDENTITY_PROVIDER)
+        .then(|| {
+            std::env::var(PlatformVar::API_URL.preferred)
+                .ok()
+                .and_then(|value| {
+                    non_blank(&value).map(|value| {
+                        value
+                            .trim_end_matches('/')
+                            .strip_suffix("/api/v1")
+                            .unwrap_or(value.trim_end_matches('/'))
+                            .to_string()
+                    })
+                })
+        })
+        .flatten();
+    let project_url = configured_url
+        .and_then(non_blank)
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("PRISM_SUPABASE_URL")
+                .ok()
+                .and_then(|value| non_blank(&value).map(str::to_string))
+        })
+        // `PRISM_API_URL` is accepted only as an explicit, provider-neutral
+        // input for this attempt. Never recover it through PlatformEndpoints:
+        // that value may instead have come from a MARC27 project config or a
+        // stale MARC27 login and must not be relabelled as Supabase Auth.
+        .or(provider_neutral_environment_url)
+        .or_else(|| {
+            stored_supabase.and_then(|credentials| credentials.identity_provider_url.clone())
+        });
+    let anon_key = configured_anon_key
+        .and_then(non_blank)
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("PRISM_SUPABASE_ANON_KEY")
+                .ok()
+                .and_then(|value| non_blank(&value).map(str::to_string))
+        })
+        // PRISM_API_KEY remains the provider-neutral configured key surface.
+        // Never fall back to MARC27_API_KEY for a Supabase provider.
+        .or_else(|| {
+            std::env::var(PlatformVar::API_KEY.preferred)
+                .ok()
+                .and_then(|value| non_blank(&value).map(str::to_string))
+        })
+        .or_else(|| {
+            stored_supabase.and_then(|credentials| credentials.identity_provider_key.clone())
+        });
+
+    match (project_url, anon_key) {
+        (Some(project_url), Some(anon_key)) => Ok(SupabaseLoginConfig {
+            project_url,
+            anon_key,
+        }),
+        _ => bail!(
+            "Supabase is not configured. Set PRISM_SUPABASE_URL and \
+             PRISM_SUPABASE_ANON_KEY (or configure the same project through \
+             PRISM_API_URL and PRISM_API_KEY)."
+        ),
+    }
+}
+
+fn resolve_supabase_login_email(email: Option<&str>) -> Result<String> {
+    if let Some(email) = email.and_then(non_blank) {
+        return Ok(email.to_string());
+    }
+    ensure_interactive_email_prompt()?;
+    print!("Supabase email: ");
+    io::stdout()
+        .flush()
+        .context("failed to flush the email prompt")?;
+    let mut email = String::new();
+    io::stdin()
+        .read_line(&mut email)
+        .context("failed to read the Supabase email")?;
+    non_blank(&email)
+        .map(str::to_string)
+        .context("Supabase email must not be empty")
+}
+
+fn ensure_interactive_email_prompt() -> Result<()> {
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        Ok(())
+    } else {
+        bail!("Supabase login needs an email. Pass --email <address> or set PRISM_LOGIN_EMAIL.")
+    }
+}
+
+fn non_blank(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 /// Headless / CI / SSH-only login path. Skips the device flow and
@@ -12190,6 +12697,8 @@ async fn run_token_login(endpoints: &PlatformEndpoints, token: &str) -> Result<S
         refresh_token: String::new(),
         platform_url: endpoints.api_base.trim_end_matches("/api/v1").to_string(),
         platform_provider: endpoints.provider.clone(),
+        identity_provider_url: None,
+        identity_provider_key: None,
         user_id: Some(profile.id.clone()),
         display_name: profile.display_name,
         org_id: None,
@@ -12368,19 +12877,71 @@ async fn refresh_access_token(
     endpoints: &PlatformEndpoints,
     creds: &StoredCredentials,
 ) -> Result<StoredCredentials> {
+    auth::validate_stored_session_binding(endpoints, creds)?;
     let platform = PlatformClient::new(&endpoints.api_base);
-    let refreshed =
-        DeviceFlowAuth::refresh_token(platform.inner(), &endpoints.api_base, &creds.refresh_token)
-            .await?;
+    let provider =
+        identity_provider_for(creds.platform_provider.as_deref()).with_context(|| {
+            match creds.platform_provider.as_deref() {
+                Some(provider) => {
+                    format!("unknown identity provider `{provider}`; refusing refresh")
+                }
+                None => {
+                    "identity provider is missing; refusing to send the refresh token".to_string()
+                }
+            }
+        })?;
+    let (provider_url, provider_key) = match provider {
+        IdentityProviderAdapter::Marc27 => (marc27_refresh_url(endpoints, creds)?, None),
+        IdentityProviderAdapter::Supabase => {
+            let url = creds
+                .identity_provider_url
+                .as_deref()
+                .context("Supabase is not configured: missing identity provider URL")?;
+            let key = creds
+                .identity_provider_key
+                .as_deref()
+                .context("Supabase is not configured: missing identity provider anon key")?;
+            (url.to_string(), Some(key))
+        }
+    };
+    let refreshed = provider
+        .refresh_token(
+            platform.inner(),
+            &provider_url,
+            provider_key,
+            &creds.refresh_token,
+        )
+        .await?;
 
     let mut new_creds = creds.clone();
-    new_creds.access_token = refreshed.access_token;
-    new_creds.refresh_token = refreshed.refresh_token;
-    new_creds.expires_at = refreshed.expires_in.and_then(|secs| {
+    new_creds.access_token = refreshed.tokens.access_token;
+    new_creds.refresh_token = refreshed.tokens.refresh_token;
+    new_creds.expires_at = refreshed.tokens.expires_in.and_then(|secs| {
         chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(secs as i64))
     });
+    if let Some(claims) = refreshed.supabase_claims {
+        ensure_supabase_refresh_principal(creds, &claims.iss, &claims.sub)?;
+        std::fs::create_dir_all(&paths.state_dir).with_context(|| {
+            format!(
+                "failed to create PRISM state directory {}",
+                paths.state_dir.display()
+            )
+        })?;
+        let engine = prism_core::rbac::RbacEngine::new(&paths.state_dir.join("rbac.db"))?;
+        let role_claim = claims.role.as_deref().unwrap_or("");
+        let role_sync = prism_node::provider_roles::sync_supabase_login_role(
+            &engine,
+            &claims.iss,
+            &claims.sub,
+            role_claim,
+        )?;
+        new_creds.user_id = Some(role_sync.principal_id);
+        new_creds.display_name = claims.email;
+    }
 
-    // Persist rotated tokens to BOTH stores atomically: the authoritative
+    auth::validate_stored_session_binding(endpoints, &new_creds)?;
+
+    // Persist rotated tokens to BOTH stores as one coordinated update: the authoritative
     // `cli-state.json` AND the `~/.prism/credentials.json` SDK mirror that the
     // Python platform tools read. Writing only one store left the other holding
     // a refresh token that single-use rotation had since REVOKED — replaying the
@@ -12388,10 +12949,59 @@ async fn refresh_access_token(
     // device-flow re-login (the "re-login every ~24h" drift), and (for the SDK
     // mirror specifically) left node-up reading an expired access token that
     // 401'd on `POST /nodes/register` and dropped to silent offline mode.
-    // `persist_credentials` is the single well-tested both-store writer.
-    paths.persist_credentials(&new_creds)?;
+    // `persist_credentials` is the single well-tested both-store writer; it
+    // rolls the CLI record back if the mirror cannot be replaced.
+    paths.persist_credentials(&new_creds).context(
+        "failed to commit the rotated credential pair; do not retry this refresh token, sign in again",
+    )?;
 
     Ok(new_creds)
+}
+
+fn ensure_supabase_refresh_principal(
+    credentials: &StoredCredentials,
+    issuer: &str,
+    subject: &str,
+) -> Result<String> {
+    let principal_id = prism_node::provider_roles::map_supabase_principal(issuer, subject)
+        .context("verified Supabase token has no canonical PRISM principal")?;
+    let stored_principal = credentials
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("stored Supabase identity is missing its canonical principal; refusing refresh")?;
+    if stored_principal != principal_id {
+        bail!("Supabase refresh returned a different verified subject; refusing refresh");
+    }
+    Ok(principal_id)
+}
+
+/// Select the only MARC27 URL allowed to receive a stored refresh token.
+///
+/// Process and project endpoint overrides are useful for ordinary requests,
+/// but a refresh token is bound to the provider and URL recorded at login.
+/// Requiring the normalized URLs to match prevents an unrelated endpoint,
+/// even one labelled `marc27`, from receiving that long-lived secret.
+fn marc27_refresh_url(endpoints: &PlatformEndpoints, creds: &StoredCredentials) -> Result<String> {
+    if endpoints.provider.as_deref() != Some(MARC27_IDENTITY_PROVIDER) {
+        bail!(
+            "configured platform provider does not match stored identity provider `marc27`; \
+             refusing refresh"
+        );
+    }
+    let stored_url = creds.platform_url.trim();
+    if stored_url.is_empty() {
+        bail!("stored MARC27 identity is missing its platform URL; refusing refresh");
+    }
+    let stored_api_base = PlatformEndpoints::from_url(stored_url).api_base;
+    let selected_api_base = PlatformEndpoints::from_url(&endpoints.api_base).api_base;
+    if stored_api_base != selected_api_base {
+        bail!(
+            "configured platform URL does not match the stored MARC27 identity; refusing refresh"
+        );
+    }
+    Ok(stored_api_base)
 }
 
 /// Resolve the typed platform credential for the node-up register call.
@@ -12417,7 +13027,9 @@ async fn resolve_node_auth(
 ) -> Result<(PlatformAuth, Option<StoredCredentials>)> {
     if let Some(node_token) = paths.load_node_token() {
         tracing::debug!("using durable node token (does not rotate)");
-        return Ok((PlatformAuth::classify(&node_token.key), None));
+        let credential = auth::stored_node_bearer_for_endpoints(endpoints, &node_token)?
+            .context("stored node credential is empty")?;
+        return Ok((credential, None));
     }
     if let Some(creds) = creds
         && matches!(resolved, PlatformAuth::Bearer(value) if value == &creds.access_token)
@@ -12965,7 +13577,12 @@ async fn handle_job_status(paths: &PrismPaths, job_id_str: &str) -> Result<()> {
     );
     let backend: Box<dyn prism_compute::ComputeBackend> = match record.target {
         JobTarget::Marc27 { api_base } => {
-            let (_, platform_auth) = resolve_agent_auth()?;
+            let (resolved_base, platform_auth) = resolve_agent_auth_with_url(Some(&api_base))?;
+            if PlatformEndpoints::from_url(&resolved_base).api_base
+                != PlatformEndpoints::from_url(&api_base).api_base
+            {
+                bail!("current platform credential is bound to a different endpoint than this job");
+            }
             Box::new(prism_compute::Marc27Backend::new(
                 &api_base,
                 marc27_auth_from(platform_auth),
@@ -13118,7 +13735,7 @@ async fn handle_report(
 
     // 4. Send to the hosted platform
     if let Some(c) = creds
-        && !c.access_token.is_empty()
+        && let Some(platform_auth) = auth::stored_bearer_for_endpoints(endpoints, c)?
     {
         print!("Sending to the {}... ", crate::brand::brand().platform_name);
         let platform_body = serde_json::json!({
@@ -13135,9 +13752,8 @@ async fn handle_report(
         // PlatformClient, so it inherited none of that type's offline guard
         // and posted the session Bearer under PRISM_OFFLINE=1.
         prism_runtime::offline::check_url(&url).map_err(|reason| anyhow!(reason))?;
-        let resp = reqwest::Client::new()
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", c.access_token))
+        let resp = platform_auth
+            .apply(reqwest::Client::new().post(&url))
             .json(&platform_body)
             .send()
             .await;
@@ -13358,8 +13974,19 @@ fn marc27_llm_base_url(
     api_base: &str,
     fallback_url: &str,
 ) -> anyhow::Result<String> {
+    marc27_llm_base_url_with_source(paths, api_base, fallback_url).map(|(url, _)| url)
+}
+
+/// Return the selected LLM destination and whether it was derived from the
+/// bound platform endpoint. Stored platform bearers may accompany only the
+/// platform-derived destination.
+fn marc27_llm_base_url_with_source(
+    paths: &PrismPaths,
+    api_base: &str,
+    fallback_url: &str,
+) -> anyhow::Result<(String, bool)> {
     if let Ok(explicit) = std::env::var("LLM_BASE_URL") {
-        return Ok(explicit);
+        return Ok((explicit, false));
     }
     if let Some(project_id) = paths
         .load_cli_state()
@@ -13367,10 +13994,10 @@ fn marc27_llm_base_url(
         .and_then(|s| s.credentials)
         .and_then(|c| c.project_id)
     {
-        return Ok(marc27_llm_url_for_project(api_base, &project_id));
+        return Ok((marc27_llm_url_for_project(api_base, &project_id), true));
     }
     // Unauthenticated: honor only an explicitly-set url, refuse the default.
-    resolve_unauth_llm_url(fallback_url)
+    resolve_unauth_llm_url(fallback_url).map(|url| (url, false))
 }
 
 /// Unauthenticated-case policy (owner: explicit-only local mode). An `[llm].url`
@@ -13777,6 +14404,38 @@ mod tests {
         assert_eq!(platform_token_for("http://127.0.0.1:7327", None), None);
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dashboard_error_body_cannot_reflect_the_platform_token() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _offline = prism_runtime::offline::test_support::OfflineEnvGuard::clear();
+        let dashboard = wiremock::MockServer::start().await;
+        let marker = "dashboard-platform-secret-marker";
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/sessions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(401)
+                    .set_body_json(serde_json::json!({ "error": marker })),
+            )
+            .mount(&dashboard)
+            .await;
+
+        let error = create_dashboard_session_for_user_with_platform_token(
+            &dashboard.uri(),
+            "test-user",
+            None,
+            Some(marker),
+        )
+        .await
+        .expect_err("a 401 must be reported")
+        .to_string();
+
+        assert!(error.contains("401"), "{error}");
+        assert!(!error.contains(marker), "reflected secret leaked: {error}");
+    }
+
     /// Hard offline refuses outright — and still permits loopback, matching
     /// llm/embed/workflows rather than the blanket platform-client rule.
     #[tokio::test]
@@ -13913,7 +14572,7 @@ mod tests {
         ] {
             assert!(
                 command_needs_python(Some(&cmd)),
-                "{cmd:?} spawns the Python tool server"
+                "the command must spawn the Python tool server"
             );
         }
     }
@@ -13991,6 +14650,8 @@ mod tests {
             refresh_token: "unused-in-this-branch".to_string(),
             platform_url: "https://api.marc27.com".to_string(),
             platform_provider: Some("marc27".to_string()),
+            identity_provider_url: None,
+            identity_provider_key: None,
             user_id: None,
             display_name: None,
             org_id: None,
@@ -14014,6 +14675,144 @@ mod tests {
             "non-expired creds must NOT signal a rotation"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn marc27_refresh_refuses_an_unrelated_endpoint_before_any_request() {
+        let server = wiremock::MockServer::start().await;
+        let directory = tempfile::tempdir().expect("isolated refresh state");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let credentials = StoredCredentials {
+            access_token: "expired-access-token".into(),
+            refresh_token: "refresh-token-must-not-leak".into(),
+            platform_url: "https://stored.marc27.example".into(),
+            platform_provider: Some(MARC27_IDENTITY_PROVIDER.into()),
+            ..Default::default()
+        };
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            &server.uri(),
+            Some(MARC27_IDENTITY_PROVIDER.into()),
+        );
+
+        let error = refresh_access_token(&paths, &endpoints, &credentials)
+            .await
+            .expect_err("an endpoint override must not receive the stored refresh token")
+            .to_string();
+
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("refresh-token-must-not-leak"), "{error}");
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("wiremock request recording")
+                .len(),
+            0,
+            "URL binding must fail before any request is sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn supabase_refresh_refuses_an_unrelated_platform_before_identity_request() {
+        let identity = wiremock::MockServer::start().await;
+        let directory = tempfile::tempdir().expect("isolated refresh state");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let credentials = StoredCredentials {
+            access_token: "expired-access-token".into(),
+            refresh_token: "supabase-refresh-token-must-not-leak".into(),
+            platform_url: "https://trusted-platform.example".into(),
+            platform_provider: Some(SUPABASE_IDENTITY_PROVIDER.into()),
+            identity_provider_url: Some(identity.uri()),
+            identity_provider_key: Some("public-anon-key".into()),
+            user_id: Some("supabase:bound-user".into()),
+            ..Default::default()
+        };
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://unrelated-platform.example",
+            Some(SUPABASE_IDENTITY_PROVIDER.into()),
+        );
+
+        let error = refresh_access_token(&paths, &endpoints, &credentials)
+            .await
+            .expect_err("platform mismatch must fail before Supabase refresh")
+            .to_string();
+
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("supabase-refresh-token-must-not-leak"));
+        assert_eq!(
+            identity.received_requests().await.unwrap().len(),
+            0,
+            "binding must fail before any identity-provider request"
+        );
+    }
+
+    #[test]
+    fn supabase_refresh_requires_a_stored_canonical_principal() {
+        let issuer = "https://project.supabase.co/auth/v1";
+        let mut credentials = StoredCredentials {
+            platform_provider: Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+            ..Default::default()
+        };
+
+        for missing in [None, Some("   ".to_string())] {
+            credentials.user_id = missing;
+            let error = ensure_supabase_refresh_principal(&credentials, issuer, "user-123")
+                .expect_err("refresh must not establish a previously unbound identity")
+                .to_string();
+            assert!(error.contains("missing its canonical principal"), "{error}");
+        }
+    }
+
+    #[test]
+    fn unknown_supabase_role_cannot_bootstrap_local_node_admin() {
+        let engine = prism_core::rbac::RbacEngine::in_memory().unwrap();
+        let credentials = StoredCredentials {
+            platform_provider: Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+            user_id: Some("supabase:scoped-user".into()),
+            ..Default::default()
+        };
+
+        let error = ensure_dashboard_role(&engine, &credentials, "supabase:scoped-user")
+            .expect_err("missing recognized Supabase role must fail closed")
+            .to_string();
+        assert!(error.contains("no recognized PRISM role"), "{error}");
+        assert_eq!(engine.get_local_role("supabase:scoped-user").unwrap(), None);
+    }
+
+    #[test]
+    fn recognized_supabase_viewer_never_becomes_local_admin() {
+        let engine = prism_core::rbac::RbacEngine::in_memory().unwrap();
+        let principal = "supabase:scoped-user";
+        engine
+            .assign_external_role(
+                prism_node::provider_roles::SUPABASE_ROLE_PROVIDER,
+                principal,
+                principal,
+                prism_core::rbac::LocalRole::Viewer,
+            )
+            .unwrap();
+        let credentials = StoredCredentials {
+            platform_provider: Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+            user_id: Some(principal.into()),
+            ..Default::default()
+        };
+
+        ensure_dashboard_role(&engine, &credentials, principal).unwrap();
+        assert_eq!(
+            engine.get_role(principal).unwrap(),
+            Some(prism_core::rbac::LocalRole::Viewer)
+        );
+        assert_eq!(engine.get_local_role(principal).unwrap(), None);
     }
 
     #[tokio::test]
@@ -14140,6 +14939,8 @@ mod tests {
             &target,
             &prism_core::config::LlmSection::default(),
             None,
+            None,
+            false,
         );
         assert_eq!(key, Some(("config-resolved-key".to_string(), None)));
     }
@@ -14159,7 +14960,9 @@ mod tests {
         let resolved = resolve_workflow_llm_api_key_for_target(
             &crate::chat_config::ChatTarget::Marc27 { model: None },
             &prism_core::config::LlmSection::default(),
+            Some(&PlatformEndpoints::marc27()),
             Some("stored-session".into()),
+            true,
         );
 
         assert_eq!(
@@ -14170,6 +14973,88 @@ mod tests {
             ))
         );
         boot_checks::clear_platform_env();
+    }
+
+    #[test]
+    fn workflow_supabase_endpoint_does_not_treat_anon_key_as_user_auth() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        boot_checks::clear_platform_env();
+        unsafe {
+            std::env::remove_var("LLM_API_KEY");
+            std::env::set_var("PRISM_API_KEY", "supabase-public-anon-key");
+        }
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://project.supabase.co",
+            Some("supabase".to_string()),
+        );
+
+        let resolved = resolve_workflow_llm_api_key_for_target(
+            &crate::chat_config::ChatTarget::Marc27 { model: None },
+            &prism_core::config::LlmSection::default(),
+            Some(&endpoints),
+            Some("verified-user-session".into()),
+            true,
+        );
+
+        assert_eq!(
+            resolved,
+            Some((
+                "verified-user-session".to_string(),
+                Some(prism_ingest::llm::LlmCredentialKind::Bearer)
+            ))
+        );
+        boot_checks::clear_platform_env();
+    }
+
+    #[test]
+    fn explicit_workflow_llm_url_never_inherits_platform_credentials() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        boot_checks::clear_platform_env();
+        let previous_llm_key = std::env::var_os("LLM_API_KEY");
+        unsafe { std::env::remove_var("LLM_API_KEY") };
+
+        let resolved = resolve_workflow_llm_api_key_for_target(
+            &crate::chat_config::ChatTarget::Marc27 { model: None },
+            &prism_core::config::LlmSection::default(),
+            Some(&PlatformEndpoints::marc27()),
+            Some("stored-platform-secret-marker".into()),
+            false,
+        );
+
+        unsafe {
+            match previous_llm_key {
+                Some(value) => std::env::set_var("LLM_API_KEY", value),
+                None => std::env::remove_var("LLM_API_KEY"),
+            }
+        }
+        assert_eq!(resolved, None);
+        boot_checks::clear_platform_env();
+    }
+
+    #[test]
+    fn tui_platform_auth_refuses_a_stored_bearer_at_an_unrelated_endpoint() {
+        let endpoints = PlatformEndpoints::from_url_with_provider(
+            "https://unrelated.example",
+            Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+        );
+        let credentials = StoredCredentials {
+            access_token: "stored-tui-token-must-not-leak".to_string(),
+            platform_url: "https://trusted.example".to_string(),
+            platform_provider: Some(SUPABASE_IDENTITY_PROVIDER.to_string()),
+            ..Default::default()
+        };
+
+        let error = tui_platform_auth(Some(&endpoints), Some(&credentials))
+            .expect_err("the TUI must not receive a bearer bound to another endpoint")
+            .to_string();
+
+        assert!(error.contains("stored session binding refused"), "{error}");
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!error.contains("stored-tui-token-must-not-leak"));
     }
 
     #[test]
@@ -16018,8 +16903,7 @@ data:\n\
         let cli = Cli::try_parse_from(["prism", "verison"]).expect("typos reach the catch-all");
         assert!(
             matches!(cli.command, Some(Commands::External(_))),
-            "expected clap's external-subcommand catch-all, got {:?}",
-            cli.command
+            "expected clap's external-subcommand catch-all"
         );
         assert!(!command_needs_python(cli.command.as_ref()));
     }

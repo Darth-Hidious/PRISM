@@ -1,10 +1,319 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
 use prism_runtime::retry;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::debug;
 
 use crate::platform_error::{PlatformError, PlatformResponseExt};
+use crate::supabase_auth::{SupabaseAuth, SupabaseAuthPolicy, SupabaseClaims};
+
+/// Stable identity-provider id for the retained MARC27 device flow.
+pub const MARC27_IDENTITY_PROVIDER: &str = "marc27";
+/// Stable identity-provider id for Supabase Auth.
+pub const SUPABASE_IDENTITY_PROVIDER: &str = "supabase";
+
+/// Provider-specific authentication adapter selected explicitly at login and
+/// refresh boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityProviderAdapter {
+    Marc27,
+    Supabase,
+}
+
+/// Provider-neutral identity established only after the configured provider
+/// has verified the presented access token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedIdentity {
+    pub provider: IdentityProviderAdapter,
+    /// Provider-native subject. It is never accepted directly as a PRISM id.
+    pub subject_id: String,
+    /// Signature-verified namespace used to canonicalize provider subjects.
+    /// Supabase carries its exact verified issuer; MARC27's legacy account IDs
+    /// are already canonical and therefore need no separate scope.
+    pub provider_scope: Option<String>,
+    /// Canonical identity used by PRISM sessions and RBAC.
+    pub principal_id: String,
+    /// Signed provider role claim, retained for mapping at the RBAC boundary.
+    pub role_claim: Option<String>,
+}
+
+/// Complete configuration for verifying access tokens presented to a node.
+///
+/// Fields are private so an unknown provider or an incomplete Supabase
+/// configuration cannot be installed in server state. The custom `Debug`
+/// implementation never exposes the Supabase anon key.
+#[derive(Clone)]
+pub struct IdentityVerifierConfig {
+    adapter: IdentityProviderAdapter,
+    provider_url: String,
+    provider_key: Option<String>,
+    supabase_policy: SupabaseAuthPolicy,
+}
+
+impl std::fmt::Debug for IdentityVerifierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentityVerifierConfig")
+            .field("adapter", &self.adapter)
+            .field("provider_url", &self.provider_url)
+            .field(
+                "provider_key",
+                &self.provider_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("supabase_policy", &self.supabase_policy)
+            .finish()
+    }
+}
+
+impl IdentityVerifierConfig {
+    /// Build a verifier using the provider's documented default policy.
+    pub fn new(
+        provider: Option<&str>,
+        provider_url: &str,
+        provider_key: Option<&str>,
+    ) -> Result<Self> {
+        Self::with_supabase_policy(
+            provider,
+            provider_url,
+            provider_key,
+            SupabaseAuthPolicy::default(),
+        )
+    }
+
+    /// Build a verifier with an explicit Supabase verification policy.
+    ///
+    /// MARC27 does not use the Supabase policy; it continues to verify tokens
+    /// against its authenticated `/users/me` endpoint.
+    pub fn with_supabase_policy(
+        provider: Option<&str>,
+        provider_url: &str,
+        provider_key: Option<&str>,
+        supabase_policy: SupabaseAuthPolicy,
+    ) -> Result<Self> {
+        let adapter = identity_provider_for(provider).with_context(|| match provider {
+            Some(provider) => {
+                format!("unknown identity provider `{provider}`; refusing token verification")
+            }
+            None => "identity provider is missing; refusing token verification".to_string(),
+        })?;
+        let provider_url = provider_url.trim();
+        ensure!(
+            !provider_url.is_empty(),
+            "identity provider URL is not configured"
+        );
+
+        let provider_key = match adapter {
+            IdentityProviderAdapter::Marc27 => {
+                ensure!(
+                    provider_key.is_none(),
+                    "MARC27 identity verification does not accept a provider key"
+                );
+                None
+            }
+            IdentityProviderAdapter::Supabase => {
+                let provider_key = provider_key
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .context("Supabase is not configured: missing identity provider anon key")?;
+                // Validate the project URL and key now, before this config can
+                // be installed in a long-lived node state.
+                SupabaseAuth::new(
+                    reqwest::Client::new(),
+                    provider_url,
+                    provider_key,
+                    supabase_policy.clone(),
+                )?;
+                Some(provider_key.to_string())
+            }
+        };
+
+        Ok(Self {
+            adapter,
+            provider_url: provider_url.to_string(),
+            provider_key,
+            supabase_policy,
+        })
+    }
+
+    pub fn provider(&self) -> IdentityProviderAdapter {
+        self.adapter
+    }
+
+    /// Verify one bearer token through the explicitly selected provider.
+    pub async fn verify_access_token(&self, token: &str) -> Result<VerifiedIdentity> {
+        self.adapter
+            .verify_access_token(
+                &self.provider_url,
+                self.provider_key.as_deref(),
+                token,
+                &self.supabase_policy,
+            )
+            .await
+    }
+}
+
+/// Provider refresh output. Supabase carries verified claims so callers can
+/// update PRISM's provider-scoped role assignment before persisting tokens.
+#[derive(Debug, Clone)]
+pub struct ProviderTokenResponse {
+    pub tokens: TokenResponse,
+    pub supabase_claims: Option<SupabaseClaims>,
+}
+
+impl IdentityProviderAdapter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Marc27 => MARC27_IDENTITY_PROVIDER,
+            Self::Supabase => SUPABASE_IDENTITY_PROVIDER,
+        }
+    }
+
+    /// Refresh through this provider's real protocol.
+    ///
+    /// `provider_url` is MARC27's API base for `Marc27` and the Supabase
+    /// project root for `Supabase`. `provider_key` is required only by
+    /// Supabase and is never forwarded to MARC27.
+    pub async fn refresh_token(
+        self,
+        client: &reqwest::Client,
+        provider_url: &str,
+        provider_key: Option<&str>,
+        refresh_token: &str,
+    ) -> Result<ProviderTokenResponse> {
+        match self {
+            Self::Marc27 => Ok(ProviderTokenResponse {
+                tokens: DeviceFlowAuth::refresh_token(client, provider_url, refresh_token).await?,
+                supabase_claims: None,
+            }),
+            Self::Supabase => {
+                let provider_key = provider_key
+                    .context("Supabase is not configured: missing identity provider anon key")?;
+                let auth = SupabaseAuth::new(
+                    client.clone(),
+                    provider_url,
+                    provider_key,
+                    SupabaseAuthPolicy::default(),
+                )?;
+                let session = auth.refresh_session(refresh_token).await?;
+                Ok(ProviderTokenResponse {
+                    tokens: session.tokens,
+                    supabase_claims: Some(session.claims),
+                })
+            }
+        }
+    }
+
+    /// Verify an access token and normalize the provider identity for PRISM.
+    ///
+    /// MARC27 retains its authenticated `/users/me` check. Supabase verifies
+    /// the JWT signature against project JWKS and enforces `exp`, `iss`, and
+    /// `aud` before any claim is returned or canonicalized.
+    pub async fn verify_access_token(
+        self,
+        provider_url: &str,
+        provider_key: Option<&str>,
+        token: &str,
+        supabase_policy: &SupabaseAuthPolicy,
+    ) -> Result<VerifiedIdentity> {
+        ensure!(!token.trim().is_empty(), "access token is empty");
+
+        match self {
+            Self::Marc27 => {
+                ensure!(
+                    provider_key.is_none(),
+                    "MARC27 identity verification does not accept a provider key"
+                );
+                let user = crate::PlatformClient::new(provider_url)
+                    .with_token(token)
+                    .fetch_current_user()
+                    .await
+                    .context("MARC27 access token verification failed")?;
+                ensure!(
+                    !user.id.trim().is_empty(),
+                    "MARC27 returned an empty verified subject"
+                );
+                Ok(VerifiedIdentity {
+                    provider: self,
+                    subject_id: user.id.clone(),
+                    provider_scope: None,
+                    principal_id: user.id,
+                    role_claim: None,
+                })
+            }
+            Self::Supabase => {
+                let provider_key = provider_key
+                    .context("Supabase is not configured: missing identity provider anon key")?;
+                let auth = SupabaseAuth::new(
+                    reqwest::Client::new(),
+                    provider_url,
+                    provider_key,
+                    supabase_policy.clone(),
+                )?;
+                let claims = auth.verify_access_token(token).await?;
+                let principal_id = canonical_supabase_principal(&claims.iss, &claims.sub)
+                    .context("verified Supabase token has no canonical PRISM principal")?;
+                Ok(VerifiedIdentity {
+                    provider: self,
+                    subject_id: claims.sub,
+                    provider_scope: Some(claims.iss),
+                    principal_id,
+                    role_claim: claims.role,
+                })
+            }
+        }
+    }
+}
+
+/// Select only an identity provider PRISM recognizes explicitly.
+///
+/// Unknown and absent provider names fail closed instead of inheriting the
+/// MARC27 device or refresh protocol.
+pub fn identity_provider_for(provider: Option<&str>) -> Option<IdentityProviderAdapter> {
+    match provider {
+        Some(MARC27_IDENTITY_PROVIDER) => Some(IdentityProviderAdapter::Marc27),
+        Some(SUPABASE_IDENTITY_PROVIDER) => Some(IdentityProviderAdapter::Supabase),
+        _ => None,
+    }
+}
+
+/// Build PRISM's project-scoped canonical identity for a Supabase subject.
+///
+/// Supabase `sub` values are unique only within a project. The signature-
+/// verified canonical issuer is hashed into a fixed-size namespace, avoiding
+/// both cross-project collisions and ambiguous URL separators in persisted
+/// principal identifiers.
+pub fn canonical_supabase_principal(project_scope: &str, subject_id: &str) -> Option<String> {
+    let project_scope = project_scope.trim().trim_end_matches('/');
+    if project_scope.is_empty() || subject_id.trim().is_empty() || subject_id.trim() != subject_id {
+        return None;
+    }
+
+    let project_digest = Sha256::digest(project_scope.as_bytes());
+    let encoded_scope = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(project_digest);
+    Some(format!("supabase:{encoded_scope}:{subject_id}"))
+}
+
+/// Polling and timeout policy for MARC27's retained device flow.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceFlowPolicy {
+    /// Smallest interval accepted from the device-code response.
+    pub minimum_poll_interval: Duration,
+    /// Extra delay applied when the provider returns `slow_down`.
+    pub slow_down_increment: Duration,
+    /// Maximum time one device login may wait for approval.
+    pub timeout: Duration,
+}
+
+impl Default for DeviceFlowPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_poll_interval: Duration::from_secs(1),
+            slow_down_increment: Duration::from_secs(5),
+            timeout: Duration::from_secs(15 * 60),
+        }
+    }
+}
 
 /// Response from the device-code initiation endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +326,7 @@ pub struct DeviceCodeResponse {
 }
 
 /// Server-provided config (returned on login).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
     #[serde(default)]
     pub default_model: Option<String>,
@@ -25,6 +334,22 @@ pub struct ServerConfig {
     pub mp_api_key: Option<String>,
     #[serde(default)]
     pub firecrawl_api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("default_model", &self.default_model)
+            .field(
+                "mp_api_key",
+                &self.mp_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "firecrawl_api_key",
+                &self.firecrawl_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Successful token response (initial or refresh).
@@ -52,7 +377,7 @@ impl std::fmt::Debug for TokenResponse {
 }
 
 /// Internal poll response — may carry tokens OR an error string.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct PollPayload {
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -64,6 +389,25 @@ struct PollPayload {
     error: Option<String>,
     #[serde(default)]
     config: Option<ServerConfig>,
+}
+
+impl std::fmt::Debug for PollPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PollPayload")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("error", &self.error)
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 /// Device-code authorisation flow (GitHub CLI-style).
@@ -128,14 +472,36 @@ impl DeviceFlowAuth {
         device_code: &str,
         interval: u64,
     ) -> Result<TokenResponse> {
+        Self::poll_for_token_with_policy(
+            client,
+            base_url,
+            device_code,
+            Duration::from_secs(interval),
+            DeviceFlowPolicy::default(),
+        )
+        .await
+    }
+
+    /// Poll using an explicit, documented policy.
+    pub async fn poll_for_token_with_policy(
+        client: &reqwest::Client,
+        base_url: &str,
+        device_code: &str,
+        interval: Duration,
+        policy: DeviceFlowPolicy,
+    ) -> Result<TokenResponse> {
         let url = format!("{base_url}/auth/device/poll");
         // Before the sleep loop: refusing after a wait would be indistinguishable
         // from a slow network to anyone watching.
         Self::offline_guard(&url)?;
-        let mut sleep_secs = interval.max(1);
+        let mut poll_interval = interval.max(policy.minimum_poll_interval);
+        let started = tokio::time::Instant::now();
 
         loop {
-            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            if started.elapsed().saturating_add(poll_interval) > policy.timeout {
+                bail!("device login timed out before approval");
+            }
+            tokio::time::sleep(poll_interval).await;
             debug!(%url, "polling for token");
 
             let resp = client
@@ -168,7 +534,7 @@ impl DeviceFlowAuth {
             match payload.error.as_deref() {
                 Some("authorization_pending") => continue,
                 Some("slow_down") => {
-                    sleep_secs += 5;
+                    poll_interval = poll_interval.saturating_add(policy.slow_down_increment);
                     continue;
                 }
                 Some("access_denied") => bail!("device login denied by user"),
@@ -235,6 +601,100 @@ mod tests {
     /// actually issued. The guard must refuse before that, so these tests are
     /// fast — a slow one means the guard did not fire.
     const UNROUTABLE: &str = "http://127.0.0.1:1";
+
+    #[test]
+    fn poll_payload_debug_redacts_tokens_and_nested_api_keys() {
+        let payload = PollPayload {
+            access_token: Some("poll-access-secret-marker".into()),
+            refresh_token: Some("poll-refresh-secret-marker".into()),
+            token_type: Some("bearer".into()),
+            expires_in: Some(3600),
+            error: None,
+            config: Some(ServerConfig {
+                default_model: Some("model-name".into()),
+                mp_api_key: Some("materials-api-key-secret-marker".into()),
+                firecrawl_api_key: Some("firecrawl-api-key-secret-marker".into()),
+            }),
+        };
+
+        let rendered = format!("{payload:?}");
+
+        for secret in [
+            "poll-access-secret-marker",
+            "poll-refresh-secret-marker",
+            "materials-api-key-secret-marker",
+            "firecrawl-api-key-secret-marker",
+        ] {
+            assert!(!rendered.contains(secret), "secret leaked: {rendered}");
+        }
+        assert_eq!(rendered.matches("[REDACTED]").count(), 4, "{rendered}");
+        assert!(rendered.contains("model-name"), "{rendered}");
+    }
+
+    #[test]
+    fn identity_provider_dispatch_is_explicit_and_fails_closed() {
+        assert_eq!(
+            identity_provider_for(Some("marc27")),
+            Some(IdentityProviderAdapter::Marc27)
+        );
+        assert_eq!(
+            identity_provider_for(Some("supabase")),
+            Some(IdentityProviderAdapter::Supabase)
+        );
+        assert_eq!(identity_provider_for(None), None);
+        assert_eq!(identity_provider_for(Some("unknown")), None);
+        assert_eq!(identity_provider_for(Some("Supabase")), None);
+        assert_eq!(identity_provider_for(Some("")), None);
+    }
+
+    #[test]
+    fn supabase_principal_is_deterministic_and_project_scoped() {
+        let first =
+            canonical_supabase_principal("https://first.supabase.co/auth/v1", "subject-123")
+                .expect("canonical principal");
+        let equivalent =
+            canonical_supabase_principal("https://first.supabase.co/auth/v1/", "subject-123")
+                .expect("canonical principal");
+        let second =
+            canonical_supabase_principal("https://second.supabase.co/auth/v1", "subject-123")
+                .expect("canonical principal");
+
+        assert_eq!(first, equivalent);
+        assert_ne!(first, second);
+        assert!(first.starts_with("supabase:"));
+        assert!(!first.contains("https://"));
+    }
+
+    #[test]
+    fn verifier_configuration_fails_closed_and_redacts_provider_key() {
+        let config = IdentityVerifierConfig::new(
+            Some(SUPABASE_IDENTITY_PROVIDER),
+            "https://project.supabase.co",
+            Some("public-but-sensitive-anon-key"),
+        )
+        .expect("valid Supabase verifier");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("public-but-sensitive-anon-key"));
+        assert!(debug.contains("[REDACTED]"));
+
+        let missing = IdentityVerifierConfig::new(None, "https://provider.invalid", None)
+            .expect_err("missing provider must fail closed")
+            .to_string();
+        assert!(
+            missing.contains("identity provider is missing"),
+            "{missing}"
+        );
+
+        let unknown = IdentityVerifierConfig::new(
+            Some("unknown"),
+            "https://provider.invalid",
+            Some("must-not-leak"),
+        )
+        .expect_err("unknown provider must fail closed")
+        .to_string();
+        assert!(unknown.contains("unknown identity provider"), "{unknown}");
+        assert!(!unknown.contains("must-not-leak"), "{unknown}");
+    }
 
     /// The refresh path is the one that matters most: it POSTs the REFRESH
     /// TOKEN, and it runs unattended whenever a session nears expiry. It takes

@@ -9,9 +9,11 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 prism-runtime = { path = "../runtime" }
 prism-core = { path = "../core" }
 prism-client = { path = "../client" }
+prism-node = { path = "../node" }
 chrono.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
