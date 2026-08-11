@@ -64,22 +64,11 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
     //    `models/embeddinggemma-300m.gguf` and claim it "auto-downloads on
     //    first `prism`" — nothing in the tree has ever written that file, so
     //    the row was permanently red with a hint that was simply untrue.
-    //    The model PRISM actually uses is BGE-small-en-v1.5, cached by
-    //    `prism-embed` under `models/embed/` on first semantic search.
-    let embed_dir = prism_dir.join("models/embed");
-    checks.push(BootCheck {
-        name: "Embedding model".to_string(),
-        result: if embed_model_cached(&embed_dir) {
-            format!("cached at {}", embed_dir.display())
-        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            "unavailable on Intel macOS — set PRISM_EMBED_BACKEND=openai".to_string()
-        } else {
-            "downloads on first semantic search (~90 MB)".to_string()
-        },
-        ok: embed_model_cached(&embed_dir),
-        dots: 4,
-        delay_ms: 0,
-    });
+    //    The model PRISM actually uses is the pinned BGE-small-en-v1.5
+    //    snapshot under `models/embed/`. Normal inference never downloads it.
+    let embed_dir = prism_embed::default_cache_dir()?;
+    let embed_status = prism_embed::configured_embedding_status();
+    checks.push(embedding_check(&embed_status, &embed_dir));
 
     // 3. FunctionGemma model — DEPRECATED. The Stage 2.2 local-routing
     //    path was removed because it caused silent failures (it picked a
@@ -295,14 +284,10 @@ async fn provision_venv(prism_dir: &Path, project_root: &Path) -> Result<String,
 }
 
 /// Hint for the case where no embedding backend can be built at all.
-const EMBED_MANUAL: &str =
-    "retry with network access, or set PRISM_EMBED_BACKEND=openai with PRISM_EMBED_ENDPOINT_URL";
+const EMBED_MANUAL: &str = "explicit acquisition: `prism models install bge-small-en-v1.5`; \
+     hosted alternative: PRISM_EMBED_BACKEND=openai with PRISM_EMBED_ENDPOINT_URL";
 
-/// Warm the local embedding model cache.
-///
-/// Building the configured backend is what downloads the weights, so that is
-/// the repair — and it only counts as one if the cache directory has content
-/// afterwards.
+/// Re-check the configured embedding backend without acquiring model files.
 ///
 /// A hosted (OpenAI-compatible) embedder needs no local weights at all. That
 /// case gets its own verdict rather than being pushed through the cache
@@ -310,45 +295,71 @@ const EMBED_MANUAL: &str =
 /// is needed" next to a red mark — the exact species of nonsense row this
 /// file has spent three deletions getting rid of.
 async fn fix_embedding_model(embed_dir: &Path) -> BootCheck {
-    let dir = embed_dir.to_path_buf();
-    let cached = move || embed_model_cached(&dir);
-    if cached() {
-        return settle("Embedding model", Ok("already cached".into()), cached, "");
+    match tokio::task::spawn_blocking(prism_embed::configured_embedding_status).await {
+        Ok(status) => embedding_check(&status, embed_dir),
+        Err(err) => BootCheck {
+            name: "Embedding backend".to_string(),
+            result: format!("embedding status task failed: {err} — {EMBED_MANUAL}"),
+            ok: false,
+            dots: 4,
+            delay_ms: 0,
+        },
     }
-    println!("  building the embedding backend (native weights are ~90 MB, once)…");
-    // `from_config` blocks on the download; keep it off the async workers.
-    // The backend id tells us which one we got: `native:…` or `openai:…`.
-    let id = tokio::task::spawn_blocking(prism_embed::from_config)
-        .await
-        .ok()
-        .flatten()
-        .map(|backend| backend.id().to_string());
+}
 
-    match id {
-        Some(id) if !id.starts_with("native:") => {
-            // Nothing to download and nothing wrong. The re-check here is
-            // "did a usable backend come back?", which it did.
-            settle(
-                "Embedding model",
-                Ok(format!(
-                    "hosted embedder configured ({id}) — no local model needed"
-                )),
-                || true,
-                "",
+fn embedding_check(
+    status: &prism_embed::EmbeddingConfigurationStatus,
+    embed_dir: &Path,
+) -> BootCheck {
+    use prism_embed::{ConfiguredBackendStatus, NativeModelStatus};
+
+    let snapshot = match &status.native_snapshot {
+        NativeModelStatus::Ready { snapshot_dir, .. } => {
+            format!(
+                "local snapshot integrity verified at {}",
+                snapshot_dir.display()
             )
         }
-        Some(_) => settle(
-            "Embedding model",
-            Ok(format!("downloaded to {}", embed_dir.display())),
-            cached,
-            EMBED_MANUAL,
+        NativeModelStatus::Unavailable(reason) => {
+            format!("local snapshot integrity unavailable ({:?})", reason.code)
+        }
+    };
+    let (ok, result) = match &status.backend {
+        ConfiguredBackendStatus::NativeSupported => match &status.native_snapshot {
+            NativeModelStatus::Ready { .. } => (true, format!("native configured; {snapshot}")),
+            NativeModelStatus::Unavailable(reason) => (
+                false,
+                format!(
+                    "native configured but {snapshot} — {reason}; cache: {}",
+                    embed_dir.display()
+                ),
+            ),
+        },
+        ConfiguredBackendStatus::NativeUnsupported { reason } => (
+            false,
+            format!("native configured but platform unusable: {reason}; {snapshot}"),
         ),
-        None => settle(
-            "Embedding model",
-            Err("no embedding backend could be built".to_string()),
-            cached,
-            EMBED_MANUAL,
+        ConfiguredBackendStatus::HostedReady { backend_id } => (
+            true,
+            format!(
+                "hosted configured ({backend_id}); {snapshot} (not required by hosted backend)"
+            ),
         ),
+        ConfiguredBackendStatus::HostedUnavailable { reason } => (
+            false,
+            format!("hosted configured but unusable: {reason}; {snapshot} (not selected)"),
+        ),
+        ConfiguredBackendStatus::Disabled => (
+            true,
+            format!("disabled by configuration; {snapshot} (not required)"),
+        ),
+    };
+    BootCheck {
+        name: "Embedding backend".to_string(),
+        result,
+        ok,
+        dots: 4,
+        delay_ms: 0,
     }
 }
 
@@ -412,14 +423,6 @@ fn check_binary(name: &str, candidates: &[&str]) -> BootCheck {
         dots: 4,
         delay_ms: 0,
     }
-}
-
-/// Does the native embedding model cache hold anything? Shared by the check
-/// and `--fix` so the diagnostic and the repair cannot drift apart about what
-/// "cached" means — the same anti-drift reason the venv rows both go through
-/// `prism_python_bridge::venv::missing_requirements`.
-fn embed_model_cached(embed_dir: &Path) -> bool {
-    embed_dir.exists() && std::fs::read_dir(embed_dir).is_ok_and(|mut d| d.next().is_some())
 }
 
 /// Venv check that verifies every **declared** dependency is present, not
@@ -621,15 +624,68 @@ mod tests {
     }
 
     #[test]
-    fn embed_cache_predicate_needs_actual_content() {
+    fn embed_cache_predicate_rejects_arbitrary_content() {
         let dir = std::env::temp_dir().join(format!("prism-doctor-embed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!embed_model_cached(&dir), "missing dir is not a cache");
+        assert!(
+            !prism_embed::native_model_status_at(&dir).is_ready(),
+            "missing dir is not a cache"
+        );
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!embed_model_cached(&dir), "empty dir is not a cache");
+        assert!(
+            !prism_embed::native_model_status_at(&dir).is_ready(),
+            "empty dir is not a cache"
+        );
         std::fs::write(dir.join("model.onnx"), b"weights").unwrap();
-        assert!(embed_model_cached(&dir));
+        assert!(
+            !prism_embed::native_model_status_at(&dir).is_ready(),
+            "unversioned, unverified content is not an installed snapshot"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn missing_native_snapshot() -> prism_embed::NativeModelStatus {
+        prism_embed::NativeModelStatus::Unavailable(prism_embed::NativeModelUnavailable {
+            code: prism_embed::NativeModelUnavailableCode::MissingReference,
+            detail: "missing in test".to_string(),
+            install_command: prism_embed::BGE_INSTALL_COMMAND,
+        })
+    }
+
+    #[test]
+    fn hosted_configuration_does_not_fail_doctor_for_missing_local_weights() {
+        let status = prism_embed::EmbeddingConfigurationStatus {
+            backend: prism_embed::ConfiguredBackendStatus::HostedReady {
+                backend_id: "openai:test-embedding".to_string(),
+            },
+            native_snapshot: missing_native_snapshot(),
+        };
+        let row = embedding_check(&status, Path::new("/unused/embed-cache"));
+        assert!(row.ok, "hosted backend does not require local weights");
+        assert!(row.result.contains("hosted configured"), "{}", row.result);
+        assert!(row.result.contains("not required"), "{}", row.result);
+        assert!(
+            row.result.contains("integrity unavailable"),
+            "{}",
+            row.result
+        );
+    }
+
+    #[test]
+    fn platform_unusable_native_backend_never_reports_as_ready() {
+        let status = prism_embed::EmbeddingConfigurationStatus {
+            backend: prism_embed::ConfiguredBackendStatus::NativeUnsupported {
+                reason: "unsupported test platform".to_string(),
+            },
+            native_snapshot: prism_embed::NativeModelStatus::Ready {
+                snapshot_dir: PathBuf::from("/verified/snapshot"),
+                revision: prism_embed::BGE_SMALL_EN_V15_MANIFEST.revision,
+            },
+        };
+        let row = embedding_check(&status, Path::new("/unused/embed-cache"));
+        assert!(!row.ok, "verified bytes cannot make the platform usable");
+        assert!(row.result.contains("platform unusable"), "{}", row.result);
+        assert!(row.result.contains("integrity verified"), "{}", row.result);
     }
 
     /// A venv path that cannot possibly host a venv (there is a regular file

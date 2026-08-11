@@ -29,7 +29,8 @@ pub struct ModelArtifactManifest {
     pub size_bytes: u64,
     pub sha256: &'static str,
     pub license: &'static str,
-    pub license_url: &'static str,
+    pub license_evidence_url: &'static str,
+    pub install_command: &'static str,
 }
 
 impl ModelArtifactManifest {
@@ -54,7 +55,8 @@ pub const BUNDLED_GEMMA: ModelArtifactManifest = ModelArtifactManifest {
     size_bytes: 6_975_879_296,
     sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
     license: "Apache-2.0",
-    license_url: "https://www.apache.org/licenses/LICENSE-2.0",
+    license_evidence_url: "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/tree/ef7b15515d7ed7f34305a08edb5717e7989d6dc9",
+    install_command: "prism models install gemma-4-12b-it-qat-q4_0",
 };
 
 /// Verify an explicitly acquired artifact without moving or modifying it.
@@ -111,6 +113,12 @@ mod tests {
         let url = BUNDLED_GEMMA.download_url();
         assert!(url.contains(BUNDLED_GEMMA.revision), "{url}");
         assert!(!url.contains("/main/"), "{url}");
+        assert!(
+            BUNDLED_GEMMA
+                .license_evidence_url
+                .contains(BUNDLED_GEMMA.revision)
+        );
+        assert!(!BUNDLED_GEMMA.license_evidence_url.contains("/main"));
     }
 
     #[test]

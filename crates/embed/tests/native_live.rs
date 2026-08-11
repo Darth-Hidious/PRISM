@@ -1,8 +1,9 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 //! Live smoke test for the native ONNX backend.
 //!
-//! Ignored by default: the first run downloads ~90 MB of model weights into
-//! `~/.prism/models/embed/`. Run explicitly with:
+//! Ignored by default: it requires the exact pinned snapshot to have been
+//! installed explicitly under `~/.prism/models/embed/`. Runtime inference
+//! never downloads it. Run explicitly with:
 //!
 //! ```sh
 //! cargo test -p prism-embed --test native_live -- --ignored --nocapture
@@ -15,9 +16,10 @@
 use prism_embed::{EmbedBackend, NativeOnnx, cosine_similarity};
 
 #[tokio::test]
-#[ignore = "downloads the embedding model (~90 MB) on first run"]
+#[ignore = "requires the explicitly installed pinned BGE snapshot"]
 async fn related_sentences_score_higher_than_unrelated() {
-    let backend = NativeOnnx::new().expect("native backend init (needs network on first run)");
+    let backend = NativeOnnx::new()
+        .expect("native backend init (run `prism models install bge-small-en-v1.5` first)");
     assert_eq!(backend.dimensions(), 384);
     assert!(backend.id().starts_with("native:"));
 

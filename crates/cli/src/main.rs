@@ -12,6 +12,7 @@ use prism_core::chat_config;
 mod doctor;
 mod local_llm;
 mod mcp_server_native;
+mod model_install;
 mod notebook;
 mod onboarding;
 mod ontology_cmd;
@@ -1377,6 +1378,14 @@ enum DeployCommands {
 
 #[derive(Debug, Subcommand)]
 enum ModelsCommands {
+    /// Explicitly download and verify one pinned local model.
+    Install {
+        #[arg(value_enum)]
+        model: model_install::InstallableModel,
+        /// Output a machine-readable installation report.
+        #[arg(long)]
+        json: bool,
+    },
     /// List hosted models available to the active platform project.
     List {
         /// Filter by provider such as `anthropic`, `openai`, `google`, or `openrouter`.
@@ -10204,8 +10213,65 @@ fn merge_and_rank_models(catalog: Vec<serde_json::Value>) -> Vec<serde_json::Val
 }
 
 async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> Result<()> {
-    // Register is purely local: no auth, no network.
+    // Install is the only explicit local-model acquisition path. Register is
+    // purely local. Neither needs platform auth or the hosted catalog.
     let command = match command {
+        ModelsCommands::Install { model, json } => {
+            let report = model_install::install(model).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{} model: {}",
+                    match report.status {
+                        model_install::InstallDisposition::Installed => "Installed",
+                        model_install::InstallDisposition::AlreadyInstalled => {
+                            "Already installed"
+                        }
+                    },
+                    report.model
+                );
+                println!("  path: {}", report.path.display());
+                println!("  source: {}@{}", report.repository, report.revision);
+                println!("  pinned artifact view: {}", report.artifact_revision_url);
+                println!(
+                    "  verified: {} file(s), {} bytes",
+                    report.files_verified, report.bytes_verified
+                );
+                if let Some(sha256) = report.sha256 {
+                    println!("  SHA-256: {sha256}");
+                }
+                match (
+                    report.artifact_license,
+                    report.artifact_license_evidence_url,
+                ) {
+                    (Some(license), Some(evidence)) => {
+                        println!("  artifact license: {license} (evidence: {evidence})")
+                    }
+                    (Some(license), None) => println!("  artifact license: {license}"),
+                    (None, _) => {
+                        println!("  artifact license: not declared by artifact repository")
+                    }
+                }
+                if let (Some(repository), Some(revision), Some(url)) = (
+                    report.source_model_repository,
+                    report.source_model_revision,
+                    report.source_model_revision_url.as_deref(),
+                ) {
+                    println!("  source model: {repository}@{revision}");
+                    println!("  pinned source view: {url}");
+                }
+                if let Some(license) = report.source_model_license {
+                    match report.source_model_license_evidence_url {
+                        Some(evidence) => {
+                            println!("  source model license: {license} (evidence: {evidence})")
+                        }
+                        None => println!("  source model license: {license}"),
+                    }
+                }
+            }
+            return Ok(());
+        }
         ModelsCommands::Register {
             model_id,
             provider,
@@ -10346,6 +10412,7 @@ async fn handle_models_command(paths: &PrismPaths, command: ModelsCommands) -> R
             println!("{}", serde_json::to_string_pretty(&model)?)
         }
         // Handled by the early-return above; the rebind can't carry it here.
+        ModelsCommands::Install { .. } => unreachable!("install returns early"),
         ModelsCommands::Register { .. } => unreachable!("register returns early"),
     }
 
@@ -11727,7 +11794,8 @@ async fn local_semantic_lookup(
         return Ok(Vec::new()); // nothing ingested yet — a real empty answer
     }
 
-    // First ever native init may download the model — blocking pool.
+    // Native snapshot verification and ONNX initialization are blocking;
+    // acquisition is a separate explicit command and never occurs here.
     let backend = tokio::task::spawn_blocking(prism_embed::from_config)
         .await
         .context("embedding backend initialization panicked")?
@@ -15102,6 +15170,31 @@ data:\n\
                 assert!(!json);
             }
             _ => panic!("expected Models::List command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_both_explicit_model_install_commands() {
+        for (name, expected) in [
+            (
+                "bge-small-en-v1.5",
+                model_install::InstallableModel::BgeSmallEnV15,
+            ),
+            (
+                "gemma-4-12b-it-qat-q4_0",
+                model_install::InstallableModel::Gemma4_12bItQatQ40,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["prism", "models", "install", name]).unwrap();
+            match cli.command.unwrap() {
+                Commands::Models {
+                    command: ModelsCommands::Install { model, json },
+                } => {
+                    assert_eq!(model, expected);
+                    assert!(!json);
+                }
+                _ => panic!("expected Models::Install command for {name}"),
+            }
         }
     }
 

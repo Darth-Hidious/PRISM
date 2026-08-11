@@ -72,6 +72,19 @@ fn missing_weights_refusal(requested: &str, model_dir: &Path, searched: &[PathBu
         .iter()
         .map(|path| path.display().to_string())
         .collect();
+    let install_hint = if requested == crate::BUNDLED_GEMMA.id
+        || requested == crate::BUNDLED_GEMMA.filename
+    {
+        format!(
+            "Run `{}` explicitly. Normal inference does not download or substitute model weights.",
+            crate::BUNDLED_GEMMA.install_command
+        )
+    } else {
+        format!(
+            "Place a user-obtained .gguf model in {} or configure an explicit .gguf path. PRISM does not download or substitute model weights during inference.",
+            model_dir.display()
+        )
+    };
     let body = serde_json::json!({
         "status": "refused",
         "error": format!("No readable local GGUF weights were found for {requested:?}"),
@@ -83,10 +96,7 @@ fn missing_weights_refusal(requested: &str, model_dir: &Path, searched: &[PathBu
             "searched": searched,
             "expected_format": ".gguf"
         },
-        "install_hint": format!(
-            "Place a user-obtained .gguf model in {} or configure an explicit .gguf path. PRISM does not download or substitute model weights.",
-            model_dir.display()
-        )
+        "install_hint": install_hint
     });
     format!(
         "local GGUF inference refused:\n{}",
@@ -1288,6 +1298,22 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("does not download")
+        );
+    }
+
+    #[test]
+    fn absent_pinned_gemma_names_the_explicit_installer() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = resolve_model_path_in(crate::BUNDLED_GEMMA.id, temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(crate::BUNDLED_GEMMA.install_command),
+            "{error}"
+        );
+        assert!(
+            error.contains("Normal inference does not download"),
+            "{error}"
         );
     }
 
