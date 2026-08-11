@@ -565,6 +565,142 @@ pub fn supporting_quote(
     supporting_quote_or_refusal(subject, object, value, block_text).ok()
 }
 
+/// Find a supporting quote by comparing complete numeric lexemes rather than
+/// formatted renderings of `value`.
+///
+/// `numeric_tolerance` is caller policy, not matcher policy. Candidates match
+/// when they have the same sign and `abs(candidate - value) /
+/// max(1, abs(candidate), abs(value)) <= numeric_tolerance`. A non-finite value
+/// or tolerance, a negative tolerance, and ambiguous single-comma forms such as
+/// `1,140` fail closed. The scanner recognizes decimal points, unambiguous
+/// decimal-comma/grouped forms, ASCII/U+2212 signs, and exponents. It then sends
+/// the exact lexeme and byte range through the same refusal guards as
+/// [`supporting_quote`].
+///
+/// The existing [`supporting_quote`] behavior intentionally remains string
+/// based for compatibility; ingest callers that declare a tolerance should use
+/// this API.
+#[must_use]
+pub fn supporting_quote_with_numeric_tolerance(
+    subject: &str,
+    object: &str,
+    value: f64,
+    block_text: &str,
+    numeric_tolerance: f64,
+) -> Option<String> {
+    supporting_quote_with_numeric_tolerance_or_refusal(
+        subject,
+        object,
+        value,
+        block_text,
+        numeric_tolerance,
+    )
+    .ok()
+}
+
+/// Return whether an evidential numeric lexeme satisfies a caller's metadata
+/// check.
+///
+/// Every candidate passes the same numeric parser, tolerance comparison,
+/// subject/object proximity rule, and citation/range/label/name/sign guards as
+/// [`supporting_quote_with_numeric_tolerance`] before `accepts` can see it.
+/// The callback receives the normalized supporting span and the accepted
+/// lexeme's byte range within that span. This is the safe integration point
+/// for binding an adjacent unit: a refused equal-valued citation or identifier
+/// can never donate its unit to another occurrence.
+#[must_use]
+pub fn evidential_numeric_lexeme_satisfies(
+    subject: &str,
+    object: &str,
+    value: f64,
+    block_text: &str,
+    numeric_tolerance: f64,
+    mut accepts: impl FnMut(&str, std::ops::Range<usize>) -> bool,
+) -> bool {
+    if !value.is_finite() || !numeric_tolerance.is_finite() || numeric_tolerance < 0.0 {
+        return false;
+    }
+
+    let subject_n = normalize_for_containment(subject);
+    let object_n = normalize_for_containment(object);
+    for span in supporting_spans(block_text) {
+        let hay = normalize_for_containment(span);
+        let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
+            || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
+        if !name_near {
+            continue;
+        }
+
+        let mut search_from = 0usize;
+        while search_from < hay.len() {
+            let Some(first_char) = hay[search_from..].chars().next() else {
+                break;
+            };
+            let Some(lexeme) = numeric_lexeme_at(&hay, search_from) else {
+                search_from += first_char.len_utf8();
+                continue;
+            };
+            search_from = lexeme.end;
+            let Some(observed) = lexeme.value else {
+                continue;
+            };
+            if numeric_values_match(value, observed, numeric_tolerance)
+                && refusing_guard(
+                    &hay,
+                    &hay[lexeme.start..lexeme.end],
+                    lexeme.start,
+                    lexeme.end,
+                    &subject_n,
+                    &object_n,
+                    value,
+                )
+                .is_none()
+                && accepts(&hay, lexeme.start..lexeme.end)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn supporting_quote_with_numeric_tolerance_or_refusal(
+    subject: &str,
+    object: &str,
+    value: f64,
+    block_text: &str,
+    numeric_tolerance: f64,
+) -> Result<String, SupportRefusal> {
+    if !value.is_finite() || !numeric_tolerance.is_finite() || numeric_tolerance < 0.0 {
+        return Err(SupportRefusal::NoSpan);
+    }
+
+    let subject_n = normalize_for_containment(subject);
+    let object_n = normalize_for_containment(object);
+    let mut first_refusal: Option<(RefusalGuard, String)> = None;
+    for span in supporting_spans(block_text) {
+        let hay = normalize_for_containment(span);
+        let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
+            || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
+        if !name_near {
+            continue;
+        }
+
+        match scan_numeric_lexeme_evidence(&hay, value, numeric_tolerance, &subject_n, &object_n) {
+            NumberScan::Evidential => return Ok(span.trim().to_string()),
+            NumberScan::Refused(guard) => {
+                first_refusal.get_or_insert((guard, span.trim().to_string()));
+            }
+            NumberScan::Absent => {}
+        }
+    }
+
+    match first_refusal {
+        Some((guard, span)) => Err(SupportRefusal::Guarded { guard, span }),
+        None => Err(SupportRefusal::NoSpan),
+    }
+}
+
 /// Split `block_text` into candidate supporting spans: sentences and table
 /// rows. Spans are verbatim substrings (only trimmed), so anything found
 /// here can be stored as a quote and later verified by containment.
@@ -574,14 +710,15 @@ fn supporting_spans(text: &str) -> Vec<&str> {
         let bytes = line.as_bytes();
         let mut start = 0usize;
         for (i, b) in bytes.iter().enumerate() {
-            // Do not break sentences on the decimal point of a number.
-            let is_decimal_point = b == &b'.'
+            // Do not break inside a numeric decimal or a dot-joined
+            // scientific unit such as `MPa.m^0.5`.
+            let is_inline_token_point = b == &b'.'
                 && i > 0
                 && i + 1 < bytes.len()
-                && bytes[i - 1].is_ascii_digit()
-                && bytes[i + 1].is_ascii_digit();
+                && bytes[i - 1].is_ascii_alphanumeric()
+                && bytes[i + 1].is_ascii_alphanumeric();
             let is_sentence_break = matches!(b, b'.' | b'!' | b'?' | b';')
-                && !is_decimal_point
+                && !is_inline_token_point
                 && !(*b == b'.' && period_ends_abbreviation(line, i));
             if is_sentence_break {
                 spans.push(&line[start..=i]);
@@ -682,6 +819,287 @@ fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) 
     }
 }
 
+#[derive(Clone, Copy)]
+struct NumericLexeme {
+    start: usize,
+    end: usize,
+    /// `None` means the complete source token is ambiguous or malformed. Its
+    /// byte range is still returned so the scanner skips the token whole
+    /// instead of reconsidering an interior suffix as a different number.
+    value: Option<f64>,
+}
+
+/// Numeric counterpart to `scan_number_evidence`. Unlike `number_needles`,
+/// this scans the document's complete numeric lexemes and compares their
+/// parsed values. The exact source spelling and byte range still go through
+/// `refusing_guard`; numeric equivalence never bypasses provenance guards.
+fn scan_numeric_lexeme_evidence(
+    hay: &str,
+    value: f64,
+    numeric_tolerance: f64,
+    subject_n: &str,
+    object_n: &str,
+) -> NumberScan {
+    let mut first: Option<RefusalGuard> = None;
+    let mut search_from = 0usize;
+    while search_from < hay.len() {
+        let Some(first_char) = hay[search_from..].chars().next() else {
+            break;
+        };
+        let Some(lexeme) = numeric_lexeme_at(hay, search_from) else {
+            search_from += first_char.len_utf8();
+            continue;
+        };
+        search_from = lexeme.end;
+
+        let Some(observed) = lexeme.value else {
+            continue;
+        };
+        if !numeric_values_match(value, observed, numeric_tolerance) {
+            continue;
+        }
+        let needle = &hay[lexeme.start..lexeme.end];
+        match refusing_guard(
+            hay,
+            needle,
+            lexeme.start,
+            lexeme.end,
+            subject_n,
+            object_n,
+            value,
+        ) {
+            None => return NumberScan::Evidential,
+            Some(guard) => {
+                first.get_or_insert(guard);
+            }
+        }
+    }
+
+    match first {
+        Some(guard) => NumberScan::Refused(guard),
+        None => NumberScan::Absent,
+    }
+}
+
+fn numeric_values_match(expected: f64, observed: f64, numeric_tolerance: f64) -> bool {
+    if !expected.is_finite()
+        || !observed.is_finite()
+        || !numeric_tolerance.is_finite()
+        || numeric_tolerance < 0.0
+    {
+        return false;
+    }
+    if expected == 0.0 || observed == 0.0 {
+        return expected == observed;
+    }
+    if expected.is_sign_negative() != observed.is_sign_negative() {
+        return false;
+    }
+    let scale = expected.abs().max(observed.abs()).max(1.0);
+    (expected - observed).abs() / scale <= numeric_tolerance
+}
+
+/// Parse a numeric lexeme beginning exactly at `start`. A leading sign stays
+/// attached so the boundary guard sees the complete token; only a dash after
+/// a digit is left outside the lexeme so `dash_range_endpoint` can recognize
+/// the high endpoint of a digit/dash/digit range. The caller advances to
+/// `end`, so digits inside a complete (including malformed or ambiguous)
+/// candidate are never reconsidered as shorter substrings.
+fn numeric_lexeme_at(hay: &str, start: usize) -> Option<NumericLexeme> {
+    let first = hay[start..].chars().next()?;
+    let mut cursor = start;
+    if is_numeric_sign(first) {
+        let sign_is_prefix = hay[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_ascii_digit());
+        if !sign_is_prefix {
+            return None;
+        }
+        cursor += first.len_utf8();
+        if !hay[cursor..].starts_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+    } else if !first.is_ascii_digit() {
+        return None;
+    }
+
+    cursor += hay[cursor..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+
+    loop {
+        let Some(separator) = hay[cursor..].chars().next() else {
+            break;
+        };
+        if !matches!(separator, '.' | ',') {
+            break;
+        }
+        let after_separator = cursor + separator.len_utf8();
+        if !hay[after_separator..].starts_with(|c: char| c.is_ascii_digit()) {
+            break;
+        }
+        cursor = after_separator
+            + hay[after_separator..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .map(char::len_utf8)
+                .sum::<usize>();
+    }
+
+    if hay[cursor..].starts_with(['e', 'E']) {
+        cursor += 1;
+        if let Some(sign) = hay[cursor..].chars().next()
+            && is_numeric_sign(sign)
+        {
+            cursor += sign.len_utf8();
+        }
+        let exponent_digits = hay[cursor..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if exponent_digits == 0 {
+            // Keep the exponent marker, its first sign, and any immediately
+            // following sign/digit run inside one malformed token. Resetting
+            // to `exponent_mark` made `1e--3` rescan `-3` as independent
+            // evidence.
+            cursor += hay[cursor..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || is_numeric_sign(*c))
+                .map(char::len_utf8)
+                .sum::<usize>();
+        } else {
+            cursor += exponent_digits;
+        }
+    }
+
+    let raw = &hay[start..cursor];
+    let value = parse_numeric_lexeme(raw);
+    Some(NumericLexeme {
+        start,
+        end: cursor,
+        value,
+    })
+}
+
+fn is_numeric_sign(c: char) -> bool {
+    matches!(c, '+' | '-' | '\u{2212}')
+}
+
+/// Parse one complete source lexeme. A lone comma followed by three digits is
+/// ambiguous (`1,140` is either 1140 or 1.140), so it fails closed. Other lone
+/// commas are decimal, multiple three-digit comma groups are grouped integers,
+/// and mixed punctuation supports the unambiguous `1,140.5` form while
+/// rejecting the inverse.
+fn parse_numeric_lexeme(raw: &str) -> Option<f64> {
+    let normalized: String = raw
+        .chars()
+        .map(|c| if c == '\u{2212}' { '-' } else { c })
+        .collect();
+    let exponent_at = normalized.find(['e', 'E']);
+    let (mantissa, exponent) = match exponent_at {
+        Some(at) => {
+            if normalized[at + 1..].contains(['e', 'E']) {
+                return None;
+            }
+            (&normalized[..at], Some(&normalized[at + 1..]))
+        }
+        None => (normalized.as_str(), None),
+    };
+
+    let (sign, unsigned_mantissa) = match mantissa.as_bytes().first() {
+        Some(b'+' | b'-') => (&mantissa[..1], &mantissa[1..]),
+        _ => ("", mantissa),
+    };
+    if unsigned_mantissa.is_empty() {
+        return None;
+    }
+
+    let comma_count = unsigned_mantissa.bytes().filter(|b| *b == b',').count();
+    let dot_count = unsigned_mantissa.bytes().filter(|b| *b == b'.').count();
+    let canonical_mantissa = match (comma_count, dot_count) {
+        (0, 0) if unsigned_mantissa.bytes().all(|b| b.is_ascii_digit()) => {
+            unsigned_mantissa.to_string()
+        }
+        (0, 1) => {
+            let (integer, fraction) = unsigned_mantissa.split_once('.')?;
+            if integer.is_empty()
+                || fraction.is_empty()
+                || !integer.bytes().all(|b| b.is_ascii_digit())
+                || !fraction.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            unsigned_mantissa.to_string()
+        }
+        (1, 0) => {
+            let (integer, trailing) = unsigned_mantissa.split_once(',')?;
+            if integer.is_empty()
+                || trailing.is_empty()
+                || !integer.bytes().all(|b| b.is_ascii_digit())
+                || !trailing.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            if integer != "0" && trailing.len() == 3 {
+                return None;
+            }
+            format!("{integer}.{trailing}")
+        }
+        (_, 0) if comma_grouped_integer(unsigned_mantissa) => unsigned_mantissa.replace(',', ""),
+        (_, 1) => {
+            let (integer, fraction) = unsigned_mantissa.split_once('.')?;
+            if !comma_grouped_integer(integer)
+                || fraction.is_empty()
+                || !fraction.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            format!("{}.{}", integer.replace(',', ""), fraction)
+        }
+        _ => return None,
+    };
+
+    let mut canonical = format!("{sign}{canonical_mantissa}");
+    if let Some(exponent) = exponent {
+        let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if exponent_digits.is_empty() || !exponent_digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        canonical.push('e');
+        canonical.push_str(exponent);
+    }
+    canonical
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn comma_grouped_integer(value: &str) -> bool {
+    let mut groups = value.split(',');
+    let Some(first) = groups.next() else {
+        return false;
+    };
+    if first.is_empty()
+        || first.len() > 3
+        || !first.bytes().all(|b| b.is_ascii_digit())
+        || first == "0"
+    {
+        return false;
+    }
+    let mut group_count = 0usize;
+    for group in groups {
+        group_count += 1;
+        if group.len() != 3 || !group.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    group_count > 0
+}
+
 /// The guard that refuses the occurrence of `needle` at [start, end), or
 /// `None` when the occurrence is evidential. Checked most-specific first so
 /// the NAMED refusal is the most informative one; the refuse/accept decision
@@ -717,7 +1135,7 @@ fn refusing_guard(
     if !clean_number_boundary(hay, needle, start, end) {
         return Some(RefusalGuard::Boundary);
     }
-    if inside_citation_marker(hay, start) {
+    if inside_citation_marker(hay, start, end) {
         return Some(RefusalGuard::Citation);
     }
     if preceding_word_is_label(hay, start, end) {
@@ -747,7 +1165,10 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
     }
     let mut search_from = 0usize;
     while let Some((name_start, name_end)) = find_name(hay, name, search_from) {
-        if name_start <= start && end <= name_end {
+        // Numeric canonicalization may make the source lexeme longer than the
+        // model's name spelling (`Inconel 718.0` vs `Inconel 718`). Any
+        // overlap is designation evidence, not an independent measurement.
+        if name_start < end && start < name_end {
             return true;
         }
         // Char-not-byte advance, as in evidential_number_occurrence:
@@ -1254,10 +1675,8 @@ fn dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
 /// hand-picked trio. `[11\u{2010}13]` and its five other glyph twins
 /// walked back only to the dash, never saw the bracket, and stamped
 /// the second citation number as a measurement.
-fn inside_citation_marker(hay: &str, start: usize) -> bool {
-    let prefix = hay[..start].trim_end_matches(|c: char| {
-        c.is_ascii_digit() || matches!(c, ',' | ' ') || MINUS_CAPABLE_DASHES.contains(&c)
-    });
+fn inside_citation_marker(hay: &str, start: usize, end: usize) -> bool {
+    let prefix = hay[..start].trim_end_matches(is_citation_numeric_syntax);
     let Some(open) = prefix.chars().next_back() else {
         return false;
     };
@@ -1265,13 +1684,18 @@ fn inside_citation_marker(hay: &str, start: usize) -> bool {
         '[' => true,
         '(' | '{' => {
             let close = if open == '(' { ')' } else { '}' };
-            let after = hay[start..].trim_start_matches(|c: char| {
-                c.is_ascii_digit() || matches!(c, ',' | ' ') || MINUS_CAPABLE_DASHES.contains(&c)
-            });
+            let after = hay[end..].trim_start_matches(is_citation_numeric_syntax);
             after.starts_with(close)
         }
         _ => false,
     }
+}
+
+fn is_citation_numeric_syntax(c: char) -> bool {
+    c.is_ascii_digit()
+        || c.is_ascii_whitespace()
+        || matches!(c, ',' | ';' | '.' | '+' | 'e' | 'E')
+        || MINUS_CAPABLE_DASHES.contains(&c)
 }
 
 /// Words after which a number is a label, never a measurement — unless
@@ -1376,19 +1800,10 @@ fn unit_follows(hay: &str, end: usize) -> bool {
     })
 }
 
-/// Byte length of the leading number in `s`, reading through
-/// thousands-grouping commas ("1,140"). A comma followed by a space is a
-/// list separator, not grouping, and ends the number.
+/// Byte length of the leading complete numeric token in `s`. A comma followed
+/// by a space is a list separator, not part of the token.
 fn leading_number_len(s: &str) -> usize {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len()
-        && (bytes[i].is_ascii_digit()
-            || (bytes[i] == b',' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit)))
-    {
-        i += 1;
-    }
-    i
+    numeric_lexeme_at(s, 0).map_or(0, |lexeme| lexeme.end)
 }
 
 /// Does the list chain continuing after `end` — ", <number>" items and
@@ -1431,15 +1846,35 @@ fn chain_ends_in_unit(hay: &str, end: usize) -> bool {
 fn walk_comma_items(prefix: &mut String, word: &mut String) {
     while word.is_empty() && prefix.ends_with(',') {
         let before_comma = prefix[..prefix.len() - 1].trim_end_matches(' ');
-        let number = trailing_word(before_comma);
-        if number.is_empty() || !number.chars().all(|c: char| c.is_ascii_digit()) {
+        let Some(number_start) = trailing_numeric_lexeme_start(before_comma) else {
             break;
-        }
-        *prefix = before_comma[..before_comma.len() - number.len()]
+        };
+        *prefix = before_comma[..number_start]
             .trim_end_matches([' ', '.', ':'])
             .to_string();
         *word = trailing_word(prefix);
     }
+}
+
+/// Start byte of a complete numeric token ending `s`, when the token begins at
+/// a lexical boundary. This lets label-list walking treat `Figures 1.20, 2.30`
+/// like an integer list instead of stranding the fractional suffix.
+fn trailing_numeric_lexeme_start(s: &str) -> Option<usize> {
+    s.char_indices().find_map(|(start, first)| {
+        if !first.is_ascii_digit() && !is_numeric_sign(first) {
+            return None;
+        }
+        if s[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+        {
+            return None;
+        }
+        numeric_lexeme_at(s, start)
+            .filter(|lexeme| lexeme.end == s.len())
+            .map(|_| start)
+    })
 }
 
 /// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
@@ -1869,6 +2304,289 @@ mod tests {
     fn supporting_quote_matches_comma_grouped_numbers() {
         let block = "The Ti-6Al-4V billet showed a UTS of 1,140 MPa.";
         assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), block).is_some());
+    }
+
+    #[test]
+    fn numeric_tolerant_supporting_quote_matches_complete_numeric_lexemes() {
+        let exact_rendering = "The Alloy A modulus was 1.20 GPa.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                1.2,
+                exact_rendering,
+                0.0,
+            )
+            .as_deref(),
+            Some(exact_rendering)
+        );
+
+        let decimal_comma = "The Alloy A modulus was 1,20 GPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance("Alloy A", "modulus", 1.2, decimal_comma, 0.0,)
+                .is_some()
+        );
+
+        let ambiguous_comma = "The Alloy A UTS was 1,140 MPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "UTS",
+                1140.0,
+                ambiguous_comma,
+                0.0,
+            )
+            .is_none()
+        );
+        assert!(
+            supporting_quote_with_numeric_tolerance("Alloy A", "UTS", 1.14, ambiguous_comma, 0.0,)
+                .is_none()
+        );
+
+        let unambiguous_grouping = "The Alloy A UTS was 1,140,000 MPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "UTS",
+                1_140_000.0,
+                unambiguous_grouping,
+                0.0,
+            )
+            .is_some()
+        );
+
+        let signed_exponent =
+            "The residual stress in Alloy A was \u{2212}1.20e+3 MPa after cooling.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "residual_stress",
+                -1200.0,
+                signed_exponent,
+                0.0,
+            )
+            .is_some()
+        );
+
+        let positive_negative_exponent = "The Alloy A conductivity was +1.20E-3 S/m.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "conductivity",
+                0.0012,
+                positive_negative_exponent,
+                0.0,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn numeric_tolerant_supporting_quote_uses_the_supplied_relative_tolerance() {
+        let block = "The Alloy A modulus was 1.2004 GPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance("Alloy A", "modulus", 1.2, block, 0.001,)
+                .is_some()
+        );
+        assert!(
+            supporting_quote_with_numeric_tolerance("Alloy A", "modulus", 1.2, block, 0.0001,)
+                .is_none()
+        );
+
+        let opposite_sign = "The Alloy A residual stress was -1.0 MPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "residual stress",
+                1.0,
+                opposite_sign,
+                2.0,
+            )
+            .is_none(),
+            "tolerance must never reverse numeric polarity"
+        );
+    }
+
+    #[test]
+    fn numeric_tolerant_supporting_quote_skips_rejected_lexemes_whole() {
+        let mixed_locale = "The Alloy A modulus was 1.140,5 GPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                140.5,
+                mixed_locale,
+                0.0,
+            )
+            .is_none(),
+            "a suffix of a rejected complete token is not independent evidence"
+        );
+
+        for malformed_exponent in [
+            "The Alloy A residual stress token was 1e--3 MPa.",
+            "The Alloy A residual stress token was 1e+-3 MPa.",
+        ] {
+            assert!(
+                supporting_quote_with_numeric_tolerance(
+                    "Alloy A",
+                    "residual stress",
+                    -3.0,
+                    malformed_exponent,
+                    0.0,
+                )
+                .is_none(),
+                "a malformed exponent suffix became evidence: {malformed_exponent}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_tolerant_supporting_quote_keeps_every_refusal_guard() {
+        let range = "The Alloy A modulus ranged from 1.20\u{2013}1.40 GPa.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A", "modulus", 1.2, range, 0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Range,
+                span: range.to_string(),
+            })
+        );
+
+        let citation = "The Alloy A modulus follows prior work [1.20].";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A", "modulus", 1.2, citation, 0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Citation,
+                span: citation.to_string(),
+            })
+        );
+
+        let later_citation = "The Alloy A modulus follows prior work [1.20, 2.30].";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A",
+                "modulus",
+                2.3,
+                later_citation,
+                0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Citation,
+                span: later_citation.to_string(),
+            })
+        );
+
+        let label = "The Alloy A modulus is plotted in Figure 1.20.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A", "modulus", 1.2, label, 0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: label.to_string(),
+            })
+        );
+
+        let later_label = "The Alloy A modulus appears in Figures 1.20, 2.30.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A",
+                "modulus",
+                2.3,
+                later_label,
+                0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Label,
+                span: later_label.to_string(),
+            })
+        );
+
+        let inside_name = "Inconel 718 was studied for UTS.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Inconel 718",
+                "UTS",
+                718.0,
+                inside_name,
+                0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::InsideName,
+                span: inside_name.to_string(),
+            })
+        );
+
+        let formatted_inside_name = "Inconel 718.0 UTS results were reported in MPa.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Inconel 718",
+                "UTS",
+                718.0,
+                formatted_inside_name,
+                0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::InsideName,
+                span: formatted_inside_name.to_string(),
+            })
+        );
+
+        let boundary = "The Alloy A UTS marker was x950.0x.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A", "UTS", 950.0, boundary, 0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::Boundary,
+                span: boundary.to_string(),
+            })
+        );
+
+        let sign_domain = "The Alloy A UTS was -950.0 MPa.";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A",
+                "UTS",
+                -950.0,
+                sign_domain,
+                0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::SignDomain,
+                span: sign_domain.to_string(),
+            })
+        );
+
+        let separator = "Alloy A residual stress \u{2212}950.0 MPa (longitudinal).";
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance_or_refusal(
+                "Alloy A",
+                "residual_stress",
+                -950.0,
+                separator,
+                0.0,
+            ),
+            Err(SupportRefusal::Guarded {
+                guard: RefusalGuard::SeparatorDash,
+                span: separator.to_string(),
+            })
+        );
+
+        let true_negative = "The residual stress in Alloy A was \u{2212}950.0 MPa.";
+        assert!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "residual_stress",
+                -950.0,
+                true_negative,
+                0.0,
+            )
+            .is_some()
+        );
     }
 
     #[test]
