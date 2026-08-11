@@ -1,5 +1,6 @@
 // Copyright (c) 2025-2026 Mirdyne. Licensed under Mirdyne Source-Available License.
 pub mod agent_loop;
+mod apply_patch;
 pub mod capability;
 pub mod command_tools;
 pub mod commands;

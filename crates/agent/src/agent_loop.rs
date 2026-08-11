@@ -39,6 +39,92 @@ pub type ApprovalSender = tokio::sync::mpsc::Sender<ApprovalResponse>;
 pub type ApprovalReceiver = tokio::sync::mpsc::Receiver<ApprovalResponse>;
 pub type SharedApprovalReceiver = Arc<tokio::sync::Mutex<ApprovalReceiver>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalGateOutcome {
+    Proceed,
+    Denied,
+}
+
+/// Apply the human-approval boundary for one tool call.
+///
+/// Keeping the decision and its denial side effects together gives callers a
+/// single outcome to check immediately before dispatch. A missing approval
+/// channel retains the legacy auto-approve behavior.
+#[allow(clippy::too_many_arguments)]
+async fn approval_gate_outcome(
+    config: &AgentConfig,
+    permission_decision: &crate::permissions::ToolPermissionDecision,
+    tool_catalog: &ToolCatalog,
+    tool_name: &str,
+    args: &Value,
+    call_id: &str,
+    preview: &Option<String>,
+    approval_rx: Option<&SharedApprovalReceiver>,
+    live_permission_overrides: Option<&SharedPermissionOverrides>,
+    history: &mut Vec<ChatMessage>,
+    emit: &mut (dyn FnMut(AgentEvent) + Send),
+) -> ApprovalGateOutcome {
+    if config.auto_approve || permission_decision.auto_approved {
+        return ApprovalGateOutcome::Proceed;
+    }
+
+    let tool_meta = tool_catalog.find(tool_name);
+    // Feed the TUI the loaded tool metadata so approval prompts can explain
+    // *why* something like execute_bash is gated.
+    emit(AgentEvent::ToolApprovalRequest {
+        tool_name: tool_name.to_string(),
+        tool_args: args.clone(),
+        call_id: call_id.to_string(),
+        tool_description: tool_meta.map(|tool| tool.description.clone()),
+        requires_approval: tool_meta
+            .map(|tool| tool.requires_approval)
+            .unwrap_or(false),
+        permission_mode: tool_meta
+            .map(|tool| tool.permission_mode.as_str().to_string())
+            .unwrap_or_else(|| "workspace-write".to_string()),
+    });
+
+    // If no approval channel is wired, auto-approve for backward
+    // compatibility. A closed wired channel is a denial.
+    let Some(rx) = approval_rx else {
+        return ApprovalGateOutcome::Proceed;
+    };
+
+    // Turn execution runs outside the stdin loop, so the approval receiver
+    // must be shared across the spawned turn.
+    let mut rx = rx.lock().await;
+    match rx.recv().await {
+        Some(ApprovalResponse::Allow) => ApprovalGateOutcome::Proceed,
+        Some(ApprovalResponse::AllowAll) => {
+            // Approve this call AND auto-approve every later one for the rest
+            // of the session. Explicit denials remain intact.
+            if let Some(overrides) = live_permission_overrides {
+                overrides.write().await.allow_all();
+            }
+            ApprovalGateOutcome::Proceed
+        }
+        Some(ApprovalResponse::Deny) | None => {
+            let denied_msg = format!("Tool '{tool_name}' denied by user.");
+            emit(AgentEvent::ToolCallResult {
+                call_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                content: denied_msg.clone(),
+                summary: Some(format!("{tool_name}: denied")),
+                preview: preview.clone(),
+                elapsed_ms: 0,
+                is_error: true,
+            });
+            history.push(ChatMessage {
+                role: "tool".to_string(),
+                content: Some(denied_msg),
+                tool_calls: None,
+                tool_call_id: Some(call_id.to_string()),
+            });
+            ApprovalGateOutcome::Denied
+        }
+    }
+}
+
 // ── Constants ─────────────────────────────────────────────────────
 
 const MAX_TOOL_RESULT_CHARS: usize = 30_000;
@@ -445,6 +531,14 @@ fn is_empty_result(content: &str) -> bool {
     false
 }
 
+/// Workspace mutation is evidence of an edit only after it succeeds. Other
+/// tools remain attempt-evidence (for example, a failing test command was
+/// still run), preserving the execution contract's existing semantics.
+fn tool_evidence_requires_success(tool_name: &str) -> bool {
+    crate::meta_tools::MetaTool::from_name(tool_name)
+        .is_some_and(|tool| tool.effect() == crate::meta_tools::MetaToolEffect::WritesWorkspace)
+}
+
 /// VS2-P1b: build the "stop self-repairing" directive for a code-exec tool that
 /// has failed `streak` consecutive times. Returns `None` unless `streak >=
 /// CODE_REPAIR_MAX` AND `tool` is a code-exec tool — so the call site can gate
@@ -523,6 +617,7 @@ fn tool_preview(tool_name: &str, args: &Value) -> Option<String> {
             .get("query")
             .and_then(|value| value.as_str())
             .map(|query| format!("find tools for \"{query}\"")),
+        "apply_patch" => Some("apply project patch".to_string()),
         "spawn_subagent" => args
             .get("task")
             .and_then(|value| value.as_str())
@@ -1941,73 +2036,36 @@ pub(crate) async fn run_turn_inner(
             }
 
             // ── h5. Approval gate ─────────────────────────────────
-            if !config.auto_approve && !permission_decision.auto_approved {
-                let tool_meta = tool_catalog.find(tool_name);
-                // Feed the TUI the loaded tool metadata so approval prompts can
-                // explain *why* something like execute_bash is gated.
-                emit(AgentEvent::ToolApprovalRequest {
-                    tool_name: tool_name.clone(),
-                    tool_args: args.clone(),
-                    call_id: call_id.clone(),
-                    tool_description: tool_meta.map(|tool| tool.description.clone()),
-                    requires_approval: tool_meta
-                        .map(|tool| tool.requires_approval)
-                        .unwrap_or(false),
-                    permission_mode: tool_meta
-                        .map(|tool| tool.permission_mode.as_str().to_string())
-                        .unwrap_or_else(|| "workspace-write".to_string()),
-                });
-
-                // Wait for approval from TUI (if approval channel is wired)
-                if let Some(rx) = approval_rx.as_ref() {
-                    // Turn execution now runs outside the stdin loop, so the
-                    // approval receiver must be shared across the spawned turn.
-                    let mut rx = rx.lock().await;
-                    match rx.recv().await {
-                        Some(ApprovalResponse::Allow) => {
-                            // Proceed with this tool call
-                        }
-                        Some(ApprovalResponse::AllowAll) => {
-                            // Approve this call AND auto-approve every later one
-                            // for the rest of the session. Persist into the
-                            // shared session overrides so the gate at the top of
-                            // this loop skips future prompts (survives across
-                            // turns; explicit denials are left untouched). Before
-                            // this, "Allow All" silently behaved like "Allow Once".
-                            if let Some(overrides) = live_permission_overrides.as_ref() {
-                                overrides.write().await.allow_all();
-                            }
-                        }
-                        Some(ApprovalResponse::Deny) | None => {
-                            let denied_msg = format!("Tool '{tool_name}' denied by user.");
-                            emit(AgentEvent::ToolCallResult {
-                                call_id: call_id.clone(),
-                                tool_name: tool_name.clone(),
-                                content: denied_msg.clone(),
-                                summary: Some(format!("{tool_name}: denied")),
-                                preview: preview.clone(),
-                                elapsed_ms: 0,
-                                is_error: true,
-                            });
-                            history.push(ChatMessage {
-                                role: "tool".to_string(),
-                                content: Some(denied_msg),
-                                tool_calls: None,
-                                tool_call_id: Some(call_id.clone()),
-                            });
-                            continue;
-                        }
-                    }
-                }
-                // If no approval channel, auto-approve (backward compat)
+            if approval_gate_outcome(
+                config,
+                &permission_decision,
+                tool_catalog,
+                tool_name,
+                &args,
+                call_id,
+                &preview,
+                approval_rx.as_ref(),
+                live_permission_overrides.as_ref(),
+                history,
+                emit,
+            )
+            .await
+                == ApprovalGateOutcome::Denied
+            {
+                continue;
             }
 
             // ── h5. Execute tool ──────────────────────────────────
             // Evidence for the execution-contract gate is recorded HERE, not
             // where the model requested the call: h2-h5 above all `continue`
             // on hook abort / permission block / policy deny / approval deny,
-            // and a call that never ran is not evidence of anything.
-            tools_used_this_turn.push(tool_name.clone());
+            // and a call that never ran is not evidence of anything. Workspace
+            // mutations are deferred until the executor confirms success: an
+            // ambiguous/refused patch is not evidence that a file was edited.
+            let evidence_requires_success = tool_evidence_requires_success(tool_name);
+            if !evidence_requires_success {
+                tools_used_this_turn.push(tool_name.clone());
+            }
             let start = Instant::now();
             let mut result: Result<Value> =
                 if let Some(meta_tool) = crate::meta_tools::MetaTool::from_name(tool_name) {
@@ -2016,13 +2074,14 @@ pub(crate) async fn run_turn_inner(
                     // (recall / find_tools / list_skills / list_failures) operates
                     // on the agent's own state — durable memory + the tool catalog
                     // — and is intercepted here before command-tool / Python
-                    // dispatch. The EXECUTING members (write_skill / run_skill run
-                    // un-sandboxed shell/Python as the node OS user; spawn_subagent
-                    // drives a nested turn over the same tool surface) pass the
-                    // same platform-access gate as every other execution surface —
-                    // resolved inside their executors so no dispatch path can skip
-                    // it. The old blanket `is_meta_tool` interception carried them
-                    // ahead of every gate call site.
+                    // dispatch. The MUTATING/EXECUTING members (apply_patch
+                    // changes project source; write_skill / run_skill run
+                    // un-sandboxed shell/Python as the node OS user;
+                    // spawn_subagent drives a nested turn over the same tool
+                    // surface) pass the same platform-access gate as every other
+                    // execution surface — resolved inside their executors so no
+                    // dispatch path can skip it. The old blanket `is_meta_tool`
+                    // interception carried them ahead of every gate call site.
                     if meta_tool == crate::meta_tools::MetaTool::SpawnSubagent {
                         // spawn_subagent needs the LIVE turn machinery (LLM
                         // client, tool server, approval channel, policy engine)
@@ -2062,12 +2121,13 @@ pub(crate) async fn run_turn_inner(
                         // Real session id supplies `recall`'s default scope
                         // instead of the pre-fix literal "session" bucket.
                         let session_id = crate::hooks::provenance_session_id();
-                        crate::meta_tools::execute_meta_tool(
+                        crate::meta_tools::execute_meta_tool_with_project_root(
                             tool_name,
                             &args,
                             store.as_ref(),
                             &session_id,
                             tool_catalog,
+                            Some(&command_tool_runtime.project_root),
                         )
                         .await
                         .map(|value| serde_json::json!({ "result": value }))
@@ -2106,6 +2166,10 @@ pub(crate) async fn run_turn_inner(
                         Err(error) => Err(error),
                     }
                 };
+
+            if evidence_requires_success && result.is_ok() {
+                tools_used_this_turn.push(tool_name.clone());
+            }
 
             // Auto-pin tools surfaced by find_tools so their full definitions
             // become callable next iteration (the "now available" hint used to
@@ -2499,6 +2563,132 @@ mod tests {
         assert!(!crate::tool_result::tool_result_is_error(&v));
     }
 
+    #[test]
+    fn workspace_patch_is_edit_evidence_only_after_success() {
+        assert!(tool_evidence_requires_success("apply_patch"));
+        assert!(!tool_evidence_requires_success("execute_bash"));
+        assert!(!tool_evidence_requires_success("recall"));
+    }
+
+    #[tokio::test]
+    async fn denied_apply_patch_stops_before_dispatch_and_preserves_target_bytes() {
+        use crate::command_tools::{CommandToolPlatformAccess, with_platform_access};
+
+        let project = tempfile::tempdir().expect("temp project");
+        let target = project.path().join("denied.txt");
+        let original = b"before\n".to_vec();
+        std::fs::write(&target, &original).expect("write target");
+        let runtime = CommandToolRuntime {
+            project_root: project.path().to_path_buf(),
+            ..Default::default()
+        };
+        let args = serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: denied.txt\n@@\n-before\n+after\n*** End Patch"
+        });
+
+        // Use the authoritative built-in definition and the same permission
+        // decision the turn loop computes immediately before this seam.
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(crate::meta_tools::definitions());
+        let permissions = ToolPermissionContext::default();
+        let permission_decision = permissions.decision_for("apply_patch", None);
+        assert!(!permission_decision.blocked);
+        assert!(!permission_decision.auto_approved);
+
+        let config = AgentConfig {
+            auto_approve: false,
+            ..Default::default()
+        };
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(1);
+        approval_tx
+            .send(ApprovalResponse::Deny)
+            .await
+            .expect("queue denial");
+        let approval_rx = Arc::new(tokio::sync::Mutex::new(approval_rx));
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        let outcome = {
+            let mut emit = |event| events.push(event);
+            approval_gate_outcome(
+                &config,
+                &permission_decision,
+                &catalog,
+                "apply_patch",
+                &args,
+                "denied-apply-patch",
+                &Some("apply project patch".to_string()),
+                Some(&approval_rx),
+                None,
+                &mut history,
+                &mut emit,
+            )
+            .await
+        };
+
+        // This is the production ordering: only Proceed may reach the real
+        // dispatcher, and it receives the runtime's authoritative project
+        // root. If the seam ever permits Deny, this valid patch mutates the
+        // target and the byte-identity assertion below catches it.
+        let mut dispatched = false;
+        if outcome == ApprovalGateOutcome::Proceed {
+            dispatched = true;
+            with_platform_access(
+                CommandToolPlatformAccess::VerifiedNodeOwner,
+                crate::meta_tools::execute_meta_tool_with_project_root(
+                    "apply_patch",
+                    &args,
+                    None,
+                    "approval-denial-test",
+                    &catalog,
+                    Some(&runtime.project_root),
+                ),
+            )
+            .await
+            .expect("a mistakenly approved patch should reach the real dispatcher");
+        }
+
+        assert_eq!(outcome, ApprovalGateOutcome::Denied);
+        assert!(!dispatched, "denied patch must stop before dispatch");
+        assert_eq!(
+            std::fs::read(&target).expect("read target after denial"),
+            original,
+            "denial must leave the target byte-identical"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolApprovalRequest {
+                tool_name,
+                tool_args,
+                requires_approval: true,
+                permission_mode,
+                ..
+            } if tool_name == "apply_patch"
+                && tool_args == &args
+                && permission_mode == "workspace-write"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallResult {
+                tool_name,
+                is_error: true,
+                content,
+                ..
+            } if tool_name == "apply_patch" && content.contains("denied by user")
+        )));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "tool");
+        assert_eq!(
+            history[0].tool_call_id.as_deref(),
+            Some("denied-apply-patch")
+        );
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("denied by user"))
+        );
+    }
+
     // ── VS2-P1b: code_repair_directive ─────────────────────────────────
 
     #[test]
@@ -2726,7 +2916,7 @@ mod tests {
         let catalog = catalog_of_54();
         let mut pinned = std::collections::HashSet::new();
         pinned.insert("tool_42".to_string());
-        // The smallest budget PRISM ever hands a model: meta (~984) plus room
+        // The smallest budget PRISM ever hands a model: meta (1,536) plus room
         // for a tool or two. The route matches nothing, so nothing but the pin
         // has any claim on the remainder.
         let budget = crate::tool_catalog::MIN_TOOL_TOKENS;

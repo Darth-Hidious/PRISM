@@ -25,7 +25,7 @@ const CODE_EXECUTION_ACCESS_REFUSAL: &str = "Un-sandboxed code execution is owne
      non-owner. This request requires a verified node-owner session.";
 const MCP_ACCESS_REFUSAL: &str = "External MCP execution is owner-only: globally installed MCP servers may inherit node \
      credentials. This request requires a verified node-owner session.";
-const META_EXECUTION_ACCESS_REFUSAL: &str = "Un-sandboxed meta-tool execution is owner-only: write_skill and run_skill execute authored \
+const META_EXECUTION_ACCESS_REFUSAL: &str = "Privileged meta-tool execution is owner-only: apply_patch mutates project source, write_skill and run_skill execute authored \
      shell/Python as the node OS user, and spawn_subagent drives a nested agent turn over the \
      same code-running tools, so caller approval cannot authorize a non-owner. This request \
      requires a verified node-owner session.";
@@ -1291,10 +1291,11 @@ pub(crate) fn gate_external_tool_execution(
 
 /// Gate the native meta-tools by their EFFECT classification, not their
 /// membership: `recall`/`find_tools`/`list_skills`/`list_failures` read agent
-/// state and pass for LocalOnly callers, while `write_skill`/`run_skill`
-/// (un-sandboxed shell/Python as the node OS user) and `spawn_subagent`
-/// (drives a nested turn over the same tool surface) require a verified
-/// node-owner session — same as `execute_python`/`execute_bash`.
+/// state and pass for LocalOnly callers, while `apply_patch` (workspace source
+/// mutation), `write_skill`/`run_skill` (un-sandboxed shell/Python as the node
+/// OS user), and `spawn_subagent` (drives a nested turn over the same tool
+/// surface) require a verified node-owner session — same posture as
+/// `execute_python`/`execute_bash`.
 ///
 /// Exhaustive by design, like [`gate_command_execution`]: the requirement is
 /// derived from [`MetaTool::effect`], a wildcard-free match over the closed
@@ -1306,12 +1307,15 @@ pub(crate) fn gate_meta_tool_execution(
 ) -> Result<()> {
     match (platform_access, meta_tool.effect()) {
         (CommandToolPlatformAccess::VerifiedNodeOwner, MetaToolEffect::ReadOnly)
+        | (CommandToolPlatformAccess::VerifiedNodeOwner, MetaToolEffect::WritesWorkspace)
         | (CommandToolPlatformAccess::VerifiedNodeOwner, MetaToolEffect::ExecutesCode)
         | (CommandToolPlatformAccess::LocalOnly, MetaToolEffect::ReadOnly) => Ok(()),
-        (CommandToolPlatformAccess::LocalOnly, MetaToolEffect::ExecutesCode) => {
+        (CommandToolPlatformAccess::LocalOnly, MetaToolEffect::WritesWorkspace)
+        | (CommandToolPlatformAccess::LocalOnly, MetaToolEffect::ExecutesCode) => {
             bail!(META_EXECUTION_ACCESS_REFUSAL)
         }
         (CommandToolPlatformAccess::UnverifiedHttp, MetaToolEffect::ReadOnly)
+        | (CommandToolPlatformAccess::UnverifiedHttp, MetaToolEffect::WritesWorkspace)
         | (CommandToolPlatformAccess::UnverifiedHttp, MetaToolEffect::ExecutesCode) => {
             Err(platform_access_refusal())
         }
@@ -5341,7 +5345,8 @@ mod tests {
             MetaTool::ListSkills,
             MetaTool::ListFailures,
         ];
-        let executing = [
+        let owner_only = [
+            MetaTool::ApplyPatch,
             MetaTool::WriteSkill,
             MetaTool::RunSkill,
             MetaTool::SpawnSubagent,
@@ -5360,9 +5365,9 @@ mod tests {
                 tool.name()
             );
         }
-        for tool in executing {
+        for tool in owner_only {
             let error = gate_meta_tool_execution(tool, CommandToolPlatformAccess::LocalOnly)
-                .expect_err("executing meta-tools are owner-only");
+                .expect_err("mutating and executing meta-tools are owner-only");
             assert!(
                 error.to_string().contains("owner-only"),
                 "refusal must say why approval is insufficient: {error:#}"

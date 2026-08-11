@@ -21,9 +21,10 @@ use crate::permissions::PermissionMode;
 use crate::tool_catalog::{LoadedTool, ToolCatalog};
 
 /// What a meta-tool DOES — the classification the access gate keys on. The
-/// layer is NOT homogeneous: most members read agent state, but `write_skill`
-/// and `run_skill` execute un-sandboxed shell/Python as the node OS user, and
-/// `spawn_subagent` drives a nested agent turn over the same tool surface.
+/// layer is NOT homogeneous: most members read agent state, `apply_patch`
+/// mutates project source, `write_skill` and `run_skill` execute un-sandboxed
+/// shell/Python as the node OS user, and `spawn_subagent` drives a nested agent
+/// turn over the same tool surface.
 /// Classifying by membership alone ("it is a meta-tool") is what once carried
 /// the executing members ahead of every gate call site — so classification is
 /// by effect.
@@ -33,6 +34,10 @@ pub enum MetaToolEffect {
     /// inventory, failure list). Keeps the early interception in the agent
     /// loop; no platform-access gate.
     ReadOnly,
+    /// Mutates files inside the trusted project root. This is owner-only even
+    /// though it does not spawn a process: source edits are just as capable of
+    /// changing what the node executes next.
+    WritesWorkspace,
     /// Executes code, or drives a nested agent turn that can. Must pass the
     /// same platform-access gate as every other execution surface (see
     /// `command_tools::gate_meta_tool_execution`).
@@ -46,6 +51,7 @@ pub enum MetaToolEffect {
 /// closed the command-dispatch series (`gate_command_execution`), reused here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaTool {
+    ApplyPatch,
     Recall,
     FindTools,
     WriteSkill,
@@ -59,7 +65,8 @@ impl MetaTool {
     /// Every meta-tool. A variant missing from this array still cannot skip
     /// classification (the wildcard-free matches force it), but it would skip
     /// the registry-parity test — the array makes that a compile-time count.
-    pub const ALL: [MetaTool; 7] = [
+    pub const ALL: [MetaTool; 8] = [
+        MetaTool::ApplyPatch,
         MetaTool::Recall,
         MetaTool::FindTools,
         MetaTool::WriteSkill,
@@ -76,6 +83,7 @@ impl MetaTool {
     #[must_use]
     pub fn from_name(tool_name: &str) -> Option<MetaTool> {
         match tool_name {
+            "apply_patch" => Some(MetaTool::ApplyPatch),
             "recall" => Some(MetaTool::Recall),
             "find_tools" => Some(MetaTool::FindTools),
             "write_skill" => Some(MetaTool::WriteSkill),
@@ -92,6 +100,7 @@ impl MetaTool {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            MetaTool::ApplyPatch => "apply_patch",
             MetaTool::Recall => "recall",
             MetaTool::FindTools => "find_tools",
             MetaTool::WriteSkill => "write_skill",
@@ -111,6 +120,7 @@ impl MetaTool {
             | MetaTool::FindTools
             | MetaTool::ListSkills
             | MetaTool::ListFailures => MetaToolEffect::ReadOnly,
+            MetaTool::ApplyPatch => MetaToolEffect::WritesWorkspace,
             // write_skill verifies by RUNNING the code once; run_skill
             // re-executes stored code; spawn_subagent drives a nested turn
             // over the same code-running tool surface. All three are
@@ -172,6 +182,51 @@ pub fn is_reserved_tool_name(tool_name: &str) -> bool {
 #[must_use]
 pub fn definitions() -> Vec<LoadedTool> {
     vec![
+        LoadedTool {
+            name: "apply_patch".to_string(),
+            description: "Patch one UTF-8 file: `*** Begin Patch`, `*** Update File: path`, `@@` hunks of space/`-`/`+` lines, `*** End Patch`; hunks must match uniquely."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string"
+                    },
+                    "match_policy": {
+                        "type": "object",
+                        "properties": {
+                            "allow_whitespace": {
+                                "type": "boolean",
+                                "default": true
+                            },
+                            "allow_fuzzy": {
+                                "type": "boolean",
+                                "default": true
+                            },
+                            "fuzzy_similarity_threshold": {
+                                "type": "number",
+                                "minimum": 0.5,
+                                "maximum": 1.0,
+                                "default": 0.9
+                            },
+                            "fuzzy_window_lines": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 100000,
+                                "default": 4096
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+            requires_approval: true,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            source: Some("builtin".to_string()),
+            source_detail: Some("workspace-edit".to_string()),
+        },
         LoadedTool {
             name: "recall".to_string(),
             description: "Retrieve earlier tool results from durable memory. Pass \
@@ -354,18 +409,33 @@ pub fn definitions() -> Vec<LoadedTool> {
 /// Execute a meta-tool. Returns the tool's result value; the caller wraps it
 /// as `{ "result": ... }` to match the command-tool convention.
 ///
-/// Access is resolved HERE, not at any one dispatch site: executing meta-tools
-/// (`write_skill` / `run_skill`) run un-sandboxed code as the node OS user, so
-/// they must prove node-owner access exactly like every other execution
-/// surface — no matter who calls (agent-loop dispatch, the `/skills` slash
-/// command, or anything added later). Read-only state access stays open to
-/// LocalOnly callers. Mirrors `execute_command_tool`, which gates internally.
+/// Access is resolved HERE, not at any one dispatch site: mutating or executing
+/// meta-tools (`apply_patch`, `write_skill`, `run_skill`) must prove node-owner
+/// access exactly like every other execution surface — no matter who calls
+/// (agent-loop dispatch, the `/skills` slash command, or anything added later).
+/// Read-only state access stays open to LocalOnly callers. Mirrors
+/// `execute_command_tool`, which gates internally.
 pub async fn execute_meta_tool(
     tool_name: &str,
     args: &Value,
     store: Option<&ProvenanceStore>,
     session_id: &str,
     catalog: &ToolCatalog,
+) -> Result<Value> {
+    execute_meta_tool_with_project_root(tool_name, args, store, session_id, catalog, None).await
+}
+
+/// Execute a meta-tool with the trusted project root supplied by the agent
+/// runtime. Callers that do not own a project context use [`execute_meta_tool`];
+/// `apply_patch` refuses in that context instead of deriving a root from CWD or
+/// accepting one from model-controlled arguments.
+pub async fn execute_meta_tool_with_project_root(
+    tool_name: &str,
+    args: &Value,
+    store: Option<&ProvenanceStore>,
+    session_id: &str,
+    catalog: &ToolCatalog,
+    project_root: Option<&std::path::Path>,
 ) -> Result<Value> {
     let meta_tool = MetaTool::from_name(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown meta-tool '{tool_name}'"))?;
@@ -377,6 +447,12 @@ pub async fn execute_meta_tool(
     // Wildcard-free over the closed registry: a new meta-tool cannot compile
     // until it is wired here.
     match meta_tool {
+        MetaTool::ApplyPatch => {
+            let project_root = project_root.ok_or_else(|| {
+                anyhow::anyhow!("apply_patch requires a trusted project-root context")
+            })?;
+            crate::apply_patch::execute(project_root, args)
+        }
         MetaTool::Recall => recall(args, store, session_id).await,
         MetaTool::FindTools => Ok(find_tools(args, catalog)),
         MetaTool::WriteSkill => write_skill(args).await,
@@ -1008,6 +1084,7 @@ mod tests {
 
     #[test]
     fn is_meta_tool_recognizes_native_tools() {
+        assert!(is_meta_tool("apply_patch"));
         assert!(is_meta_tool("recall"));
         assert!(is_meta_tool("find_tools"));
         assert!(is_meta_tool("spawn_subagent"));
@@ -1040,6 +1117,10 @@ mod tests {
         ] {
             assert_eq!(tool.effect(), MetaToolEffect::ReadOnly, "{}", tool.name());
         }
+        assert_eq!(
+            MetaTool::ApplyPatch.effect(),
+            MetaToolEffect::WritesWorkspace
+        );
         // Code execution (or a nested turn that drives it): owner-gated.
         for tool in [
             MetaTool::WriteSkill,
@@ -1071,7 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn execute_meta_tool_refuses_non_owner_execution_and_allows_read_only() {
         let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
-        for tool in ["write_skill", "run_skill"] {
+        for tool in ["apply_patch", "write_skill", "run_skill"] {
             let err = execute_meta_tool(tool, &json!({ "name": "x" }), None, "", &catalog)
                 .await
                 .expect_err("{tool} must be refused for a LocalOnly caller");
@@ -1084,9 +1165,51 @@ mod tests {
         assert!(out["skills"].is_array(), "{out}");
     }
 
+    #[tokio::test]
+    async fn apply_patch_dispatch_is_owner_only_and_uses_the_trusted_root() {
+        use crate::command_tools::{CommandToolPlatformAccess, with_platform_access};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("demo.txt"), b"before\n").unwrap();
+        let catalog = ToolCatalog::from_tool_server_json(&json!({ "tools": [] }));
+        let args = json!({
+            "patch": "*** Begin Patch\n*** Update File: demo.txt\n@@\n-before\n+after\n*** End Patch"
+        });
+
+        let missing_root = with_platform_access(
+            CommandToolPlatformAccess::VerifiedNodeOwner,
+            execute_meta_tool("apply_patch", &args, None, "", &catalog),
+        )
+        .await
+        .expect_err("a caller may not derive the project root implicitly");
+        assert!(
+            missing_root.to_string().contains("trusted project-root"),
+            "{missing_root:#}"
+        );
+
+        with_platform_access(
+            CommandToolPlatformAccess::VerifiedNodeOwner,
+            execute_meta_tool_with_project_root(
+                "apply_patch",
+                &args,
+                None,
+                "",
+                &catalog,
+                Some(root.path()),
+            ),
+        )
+        .await
+        .expect("verified owner should reach the patch engine");
+        assert_eq!(
+            std::fs::read(root.path().join("demo.txt")).unwrap(),
+            b"after\n"
+        );
+    }
+
     #[test]
     fn reserved_names_cover_meta_and_command_tools_but_not_arbitrary() {
         // Anti-spoofing: both trusted layers are reserved against authored/user tools.
+        assert!(is_reserved_tool_name("apply_patch")); // mutating meta-tool
         assert!(is_reserved_tool_name("recall")); // meta-tool
         assert!(is_reserved_tool_name("mesh_publish")); // command-tool (spine)
         assert!(is_reserved_tool_name("mesh_health")); // freshly-ported command-tool
@@ -1100,7 +1223,7 @@ mod tests {
     async fn write_skill_rejects_reserved_names() {
         // A skill trying to squat a trusted built-in name is refused BEFORE any
         // execution or storage — the model is told to rename and retry.
-        for squat in ["recall", "mesh_publish", "research"] {
+        for squat in ["apply_patch", "recall", "mesh_publish", "research"] {
             let out = write_skill(&json!({
                 "name": squat,
                 "description": "impostor",
@@ -1132,14 +1255,53 @@ mod tests {
         }
         // Code-executing self-authoring tools — and delegation, which spends
         // tokens and drives tools — are workspace-write + gated.
-        for name in ["write_skill", "run_skill", "spawn_subagent"] {
+        for name in ["apply_patch", "write_skill", "run_skill", "spawn_subagent"] {
             let t = by(name);
             assert_eq!(t.permission_mode, PermissionMode::WorkspaceWrite, "{name}");
             assert!(
                 t.requires_approval,
-                "{name} executes code → must need approval"
+                "{name} mutates state or executes code → must need approval"
             );
         }
+    }
+
+    #[test]
+    fn apply_patch_definition_declares_every_match_relaxation() {
+        let tool = definitions()
+            .into_iter()
+            .find(|tool| tool.name == "apply_patch")
+            .expect("apply_patch definition");
+        let policy = &tool.input_schema["properties"]["match_policy"]["properties"];
+
+        assert_eq!(policy["allow_whitespace"]["type"], json!("boolean"));
+        assert_eq!(policy["allow_fuzzy"]["type"], json!("boolean"));
+        assert_eq!(
+            policy["fuzzy_similarity_threshold"]["type"],
+            json!("number")
+        );
+        assert_eq!(policy["fuzzy_window_lines"]["type"], json!("integer"));
+        assert_eq!(policy["fuzzy_window_lines"]["default"], json!(4096));
+        assert_eq!(policy["fuzzy_window_lines"]["maximum"], json!(100000));
+        assert_eq!(
+            tool.input_schema["properties"]["match_policy"]["additionalProperties"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn always_on_meta_tools_leave_room_in_the_minimum_tool_budget() {
+        // The smallest supported context must still afford one ordinary task
+        // tool after the mandatory meta surface. A token-sized remainder can
+        // pass the arithmetic bound while leaving the agent unable to work.
+        const MIN_CATALOG_HEADROOM: usize = 512;
+        let charged: usize = definitions()
+            .iter()
+            .map(|tool| crate::tool_catalog::definition_tokens(&tool.to_definition()))
+            .sum();
+        assert!(
+            charged + MIN_CATALOG_HEADROOM <= crate::tool_catalog::MIN_TOOL_TOKENS,
+            "always-on meta-tools charge {charged} tokens and leave less than {MIN_CATALOG_HEADROOM} for task tools"
+        );
     }
 
     #[test]

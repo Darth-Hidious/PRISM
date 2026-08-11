@@ -88,7 +88,7 @@ impl Evidence {
             ],
             Evidence::Write => &[
                 "edit", "write", "create", "ingest", "save", "append", "install", "import",
-                "commit", "publish", "upload", "skill",
+                "commit", "publish", "upload", "skill", "patch",
             ],
             Evidence::Deploy => &["deploy", "publish", "mesh", "submit", "serve", "push"],
         }
@@ -322,6 +322,10 @@ mod tests {
         );
         assert_eq!(
             unsupported_execution_claim("I edited the module.", &used(&["edit_file"])),
+            None
+        );
+        assert_eq!(
+            unsupported_execution_claim("I edited the module.", &used(&["apply_patch"])),
             None
         );
         // Editing a file is not evidence of a deployment.

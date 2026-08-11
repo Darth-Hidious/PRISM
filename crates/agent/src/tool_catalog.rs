@@ -14,13 +14,13 @@ use crate::permissions::{PermissionMode, get_tool_permission};
 const BYTES_PER_TOKEN: usize = 4;
 
 /// Ceiling on tool-definition tokens per request, whatever the context window.
-/// The whole live catalog (54 Python + 77 command + 6 meta = 119,554 bytes)
-/// charges 29,889 here, so today everything fits with ~10% headroom; past that
-/// the escape hatch (`find_tools`) starts mattering again.
+/// Sized from the measured live catalog so today's full surface fits with
+/// headroom; past that the escape hatch (`find_tools`) starts mattering again.
 pub const MAX_TOOL_TOKENS: usize = 32_768;
 
 /// Floor, so a small-context model still gets the meta-tools plus a couple of
-/// real ones rather than meta-tools alone (the meta-tools alone charge 984).
+/// real ones rather than meta-tools alone (currently 1,536 charged tokens,
+/// guarded where the native definitions are declared).
 pub const MIN_TOOL_TOKENS: usize = 2_048;
 
 /// Share of the model's context window spendable on tool definitions (1/N).

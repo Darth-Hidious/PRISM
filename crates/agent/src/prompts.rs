@@ -58,12 +58,9 @@ pub fn append_runtime_tool_guidance(
         );
     }
 
-    if has_all_tools(
-        &tool_names,
-        &["read_file", "edit_file", "write_file", "execute_bash"],
-    ) {
+    if has_all_tools(&tool_names, &["file", "apply_patch", "execute_bash"]) {
         bullets.push(
-            "For code work, inspect first with `read_file`, prefer `edit_file` for targeted changes, reserve `write_file` for whole-file replacement or creation, and use `execute_bash` for search, build, test, and git flows."
+            "For code work, inspect first with `file(action=\"read\")`, use `apply_patch` for transactional targeted changes that may need drift-tolerant context matching, and use `execute_bash` for search, build, test, and git flows."
                 .to_string(),
         );
     }

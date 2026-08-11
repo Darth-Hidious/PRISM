@@ -2918,7 +2918,14 @@ fn emit_files_screen(transcript: &TranscriptStore, scratchpad: &Scratchpad) {
         .filter(|entry| {
             matches!(
                 entry.tool_name.as_deref(),
-                Some("read_file" | "write_file" | "edit_file" | "execute_bash" | "execute_python")
+                Some(
+                    "apply_patch"
+                        | "read_file"
+                        | "write_file"
+                        | "edit_file"
+                        | "execute_bash"
+                        | "execute_python"
+                )
             )
         })
         .take(8)
@@ -5243,6 +5250,7 @@ fn humanize_tool_verb(tool_name: &str, preview: Option<&str>) -> String {
             None => "Running a command".to_string(),
         },
         "execute_python" => "Running Python code".to_string(),
+        "apply_patch" => "Applying a project patch".to_string(),
         "recall" => "Recalling earlier results".to_string(),
         "list_failures" => "Listing failed runs".to_string(),
         "find_tools" => "Finding tools".to_string(),
@@ -7867,6 +7875,10 @@ pub async fn build_agent_seed(
         .context("failed to list tools")?;
     let mut tool_catalog = ToolCatalog::from_tool_server_json(&tools_json);
     tool_catalog.extend(command_tools::command_tools());
+    // Keep native meta-tool metadata in the trusted catalog as well as the
+    // always-offered model surface. Approval prompts and mode policy must see
+    // `apply_patch` as the workspace-writing, approval-required tool it is.
+    tool_catalog.extend(crate::meta_tools::definitions());
 
     // External MCP servers (~/.prism/mcp.json): connect, list their tools, and
     // fold them into the catalog as UNTRUSTED (namespaced mcp__<server>__<tool>,
@@ -8609,16 +8621,16 @@ mod tests {
     use super::{
         BashSlashAction, DiffSlashAction, EditSlashAction, PlanRuntimeState, PythonSlashAction,
         SessionMode, SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
-        build_effective_permission_context, build_tool_card_payload, build_ui_card_payload,
-        format_skill_create, format_skill_run, format_skills_list, handle_notebook_slash_command,
-        handle_skills_slash_command, humanize_tool_verb, inline_list, load_plan_snapshot,
-        notification_value, parse_artifact_fetch_response, parse_artifact_list_response,
-        parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
-        parse_edit_slash_action, parse_notebook_run_args, parse_python_slash_action,
-        parse_read_slash_path, parse_skill_create_args, parse_slash_command, parse_title_json,
-        parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
-        plan_snapshot_path, platform_llm_connected, project_api_history,
-        session_sync_response_error, shell_command_join, summarize_api_view,
+        build_effective_permission_context, build_permission_context, build_tool_card_payload,
+        build_ui_card_payload, format_skill_create, format_skill_run, format_skills_list,
+        handle_notebook_slash_command, handle_skills_slash_command, humanize_tool_verb,
+        inline_list, load_plan_snapshot, notification_value, parse_artifact_fetch_response,
+        parse_artifact_list_response, parse_bash_slash_action, parse_command_tail,
+        parse_diff_slash_action, parse_edit_slash_action, parse_notebook_run_args,
+        parse_python_slash_action, parse_read_slash_path, parse_skill_create_args,
+        parse_slash_command, parse_title_json, parse_write_slash_action, persist_plan_snapshot,
+        pick_organization, pick_project, plan_snapshot_path, platform_llm_connected,
+        project_api_history, session_sync_response_error, shell_command_join, summarize_api_view,
         system_prompt_for_mode, tool_surface_downgrade_note, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
@@ -8634,7 +8646,7 @@ mod tests {
         }
     }
     use crate::commands::is_cli_backed_slash_root;
-    use crate::permissions::PermissionOverrides;
+    use crate::permissions::{PermissionMode, PermissionOverrides};
     use crate::tool_catalog::ToolCatalog;
     use prism_client::api::{OrgInfo, ProjectInfo};
     use prism_ingest::llm::{ChatMessage, FunctionCall, ToolCallResponse};
@@ -8915,6 +8927,10 @@ mod tests {
         assert_eq!(
             humanize_tool_verb("recall", Some("recall x")),
             "Recalling earlier results"
+        );
+        assert_eq!(
+            humanize_tool_verb("apply_patch", Some("apply project patch")),
+            "Applying a project patch"
         );
         assert_eq!(humanize_tool_verb("find_tools", None), "Finding tools");
     }
@@ -9310,6 +9326,22 @@ mod tests {
         let permissions = build_effective_permission_context(SessionMode::Chat, &tools, &overrides);
         assert!(permissions.auto_approves("execute_bash"));
         assert!(!permissions.blocks("execute_bash"));
+    }
+
+    #[test]
+    fn apply_patch_metadata_requires_approval_and_plan_mode_blocks_it() {
+        let mut tools = ToolCatalog::default();
+        tools.extend(crate::meta_tools::definitions());
+        let patch = tools.find("apply_patch").expect("trusted patch metadata");
+        assert!(patch.requires_approval);
+        assert_eq!(patch.permission_mode, PermissionMode::WorkspaceWrite);
+
+        let chat = build_permission_context(SessionMode::Chat, &tools);
+        assert!(!chat.auto_approves("apply_patch"));
+        assert!(!chat.blocks("apply_patch"));
+
+        let plan = build_permission_context(SessionMode::Plan, &tools);
+        assert!(plan.blocks("apply_patch"));
     }
 
     #[test]
