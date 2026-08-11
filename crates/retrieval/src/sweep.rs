@@ -206,6 +206,9 @@ impl RetrievalEngine {
             let mut raw_seen_this_source = 0u64;
             // Last server-reported total for the query, when any page said.
             let mut available_this_source: Option<u64> = None;
+            // Pages this source served without touching the network, so the
+            // per-source `cache_hit` below can report what actually happened.
+            let mut cached_pages_this_source = 0usize;
             let mut error_this_source: Option<String> = None;
             let mut failure_kind_this_source: Option<FailureKind> = None;
             let mut timed_out_this_source = false;
@@ -245,6 +248,7 @@ impl RetrievalEngine {
                             // becomes visible instead of silent.
                             if ctx.network_fetches.load(Ordering::SeqCst) == network_before {
                                 pages_from_cache += 1;
+                                cached_pages_this_source += 1;
                             } else {
                                 pages_fetched += 1;
                                 replay_refetches += 1;
@@ -337,6 +341,7 @@ impl RetrievalEngine {
                         // network traffic, not by bookkeeping.
                         if ctx.network_fetches.load(Ordering::SeqCst) == network_before {
                             pages_from_cache += 1;
+                            cached_pages_this_source += 1;
                         } else {
                             pages_fetched += 1;
                         }
@@ -409,7 +414,15 @@ impl RetrievalEngine {
                 count: count_this_source,
                 available: available_this_source,
                 latency_ms,
-                cache_hit: false,
+                // True only when EVERY page this source served came from
+                // cache; a partially-cached source is not a cache hit.
+                //
+                // This was hardcoded `false` while the signal was already
+                // being measured per page for the run totals — so every
+                // `prism papers sweep` report told the user every source was
+                // a cache MISS even when fully served from cache. Output that
+                // is simply wrong is worse than output that is missing.
+                cache_hit: pages_this_source > 0 && cached_pages_this_source == pages_this_source,
                 error: error_this_source,
                 failure_kind: failure_kind_this_source,
             });
