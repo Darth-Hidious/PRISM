@@ -16642,10 +16642,8 @@ data:\n\
 
     /// A document text laid out so `[ingest] chunk_bytes = 2000` windows it
     /// into exactly 3 chunks (0-2000, 1488-3488, 2976-end), with ONE unique
-    /// marker per window — so each mock LLM response can be keyed to
-    /// exactly one chunk's request and no two mocks ever match one request
-    /// (mockito serves the first-created mock still missing hits, which
-    /// makes overlapping matchers order-dependent).
+    /// marker per window — so each extraction/review mock can be keyed to a
+    /// chunk and prompt role without overlapping another request.
     /// A document that spans three windows AND actually states the facts the
     /// stub extractor returns.
     ///
@@ -16661,7 +16659,9 @@ data:\n\
         text.push_str(&filler(70)); // MIDMARKER lands ~byte 2390: window 2 only
         text.push_str("MIDMARKER ");
         text.push_str(&filler(50)); // ZZZMARKER lands ~byte 4100: window 3 only
-        text.push_str("ZZZMARKER LateFactium exhibits the omega phase.");
+        text.push_str(
+            "ZZZMARKER LateFactium exhibits the omega phase, and EarlyFactium exhibits the alpha phase.",
+        );
         assert!(text.len() > 4_000, "fixture must span three windows");
         text
     }
@@ -16672,6 +16672,57 @@ data:\n\
             "choices": [{"message": {"role": "assistant", "content": facts_json}}]
         })
         .to_string()
+    }
+
+    /// Match one text-extraction request for a particular chunk without also
+    /// matching the semantic assertion-review request for that same text.
+    fn extraction_request_for(marker: &str) -> mockito::Matcher {
+        mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex(marker.to_owned()),
+            mockito::Matcher::Regex("Extract structured facts".into()),
+        ])
+    }
+
+    /// Match the semantic assertion-review request for a particular chunk.
+    fn assertion_review_request_for(marker: &str) -> mockito::Matcher {
+        mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex(marker.to_owned()),
+            mockito::Matcher::Regex("semantic grounding reviewer".into()),
+        ])
+    }
+
+    fn asserted_review_body(fact_indices: &[usize]) -> String {
+        let decisions: Vec<_> = fact_indices
+            .iter()
+            .map(|fact_index| {
+                serde_json::json!({
+                    "fact_index": fact_index,
+                    "verdict": "asserted",
+                    "reason": "the source positively states the phase",
+                })
+            })
+            .collect();
+        chat_body(&serde_json::json!({"decisions": decisions}).to_string())
+    }
+
+    fn classification_request_for(terms: &[&str]) -> mockito::Matcher {
+        let mut matchers = vec![mockito::Matcher::Regex(
+            "classifying materials-science terms into an ontology".into(),
+        )];
+        matchers.extend(
+            terms
+                .iter()
+                .map(|term| mockito::Matcher::Regex((*term).to_owned())),
+        );
+        mockito::Matcher::AllOf(matchers)
+    }
+
+    fn classification_body(material: &str, phase: &str) -> String {
+        let reply = serde_json::json!({"classifications": [
+            {"term": material, "class": "Material"},
+            {"term": phase, "class": "Phase"},
+        ]});
+        chat_body(&reply.to_string())
     }
 
     /// The whole document is processed in windows and MERGED: facts from
@@ -16688,24 +16739,45 @@ data:\n\
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut server = mockito::Server::new_async().await;
-        // One mock per window, each keyed to that window's unique marker.
-        let _mid = server
+        // Each extraction is keyed to its window marker and prompt role;
+        // categorical windows also have a separately matched review call.
+        let mid = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("MIDMARKER".into()))
+            .match_body(extraction_request_for("MIDMARKER"))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(chat_body(r#"{"facts":[]}"#))
+            .expect(1)
             .create_async()
             .await;
         let early = r#"{"facts":[
             {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
         ]}"#;
-        let _early = server
+        let early_extraction = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("AAAMARKER".into()))
+            .match_body(extraction_request_for("AAAMARKER"))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(chat_body(early))
+            .expect(1)
+            .create_async()
+            .await;
+        let early_review = server
+            .mock("POST", "/chat/completions")
+            .match_body(assertion_review_request_for("AAAMARKER"))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(asserted_review_body(&[0]))
+            .expect(1)
+            .create_async()
+            .await;
+        let early_classification = server
+            .mock("POST", "/chat/completions")
+            .match_body(classification_request_for(&["EarlyFactium", "alpha"]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(classification_body("EarlyFactium", "alpha"))
+            .expect(1)
             .create_async()
             .await;
         // The LAST window's reply also re-asserts the early fact — the
@@ -16714,12 +16786,31 @@ data:\n\
             {"subject":"LateFactium","predicate":"has_phase","object":"omega","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"},
             {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
         ]}"#;
-        let _late = server
+        let late_extraction = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("ZZZMARKER".into()))
+            .match_body(extraction_request_for("ZZZMARKER"))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(chat_body(late))
+            .expect(1)
+            .create_async()
+            .await;
+        let late_review = server
+            .mock("POST", "/chat/completions")
+            .match_body(assertion_review_request_for("ZZZMARKER"))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(asserted_review_body(&[0, 1]))
+            .expect(1)
+            .create_async()
+            .await;
+        let late_classification = server
+            .mock("POST", "/chat/completions")
+            .match_body(classification_request_for(&["LateFactium", "omega"]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(classification_body("LateFactium", "omega"))
+            .expect(1)
             .create_async()
             .await;
 
@@ -16753,6 +16844,14 @@ data:\n\
         .await
         .expect("a multi-window document must ingest");
 
+        mid.assert_async().await;
+        early_extraction.assert_async().await;
+        early_review.assert_async().await;
+        early_classification.assert_async().await;
+        late_extraction.assert_async().await;
+        late_review.assert_async().await;
+        late_classification.assert_async().await;
+
         assert_eq!(
             summary["chunks_total"].as_u64().unwrap() as usize,
             expected_chunks,
@@ -16767,6 +16866,11 @@ data:\n\
             "the duplicated fact must merge, not double: {summary}"
         );
         assert_eq!(summary["errors"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            summary["dropped_facts"].as_array().unwrap().len(),
+            0,
+            "every fixture fact must reach the merge path: {summary}"
+        );
         assert_eq!(ingest_summary_errors(&summary), 0);
 
         let db_path = home.path().join(".prism/provenance.db");
@@ -16826,31 +16930,52 @@ data:\n\
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut server = mockito::Server::new_async().await;
-        let _mid = server
+        let mid = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("MIDMARKER".into()))
+            .match_body(extraction_request_for("MIDMARKER"))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(chat_body(r#"{"facts":[]}"#))
+            .expect(1)
             .create_async()
             .await;
         let early = r#"{"facts":[
             {"subject":"Survivium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
         ]}"#;
-        let _early = server
+        let early_extraction = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("AAAMARKER".into()))
+            .match_body(extraction_request_for("AAAMARKER"))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(chat_body(early))
+            .expect(1)
+            .create_async()
+            .await;
+        let early_review = server
+            .mock("POST", "/chat/completions")
+            .match_body(assertion_review_request_for("AAAMARKER"))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(asserted_review_body(&[0]))
+            .expect(1)
+            .create_async()
+            .await;
+        let early_classification = server
+            .mock("POST", "/chat/completions")
+            .match_body(classification_request_for(&["Survivium", "alpha"]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(classification_body("Survivium", "alpha"))
+            .expect(1)
             .create_async()
             .await;
         // The LAST window fails hard (400 is not retried).
-        let _late = server
+        let late_extraction = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("ZZZMARKER".into()))
+            .match_body(extraction_request_for("ZZZMARKER"))
             .with_status(400)
             .with_body("boom")
+            .expect(1)
             .create_async()
             .await;
 
@@ -16880,6 +17005,12 @@ data:\n\
         )
         .await
         .expect("a partial run is a reported partial result, not a crash");
+
+        mid.assert_async().await;
+        early_extraction.assert_async().await;
+        early_review.assert_async().await;
+        early_classification.assert_async().await;
+        late_extraction.assert_async().await;
 
         let errors = summary["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1, "{summary}");

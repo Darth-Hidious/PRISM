@@ -174,7 +174,12 @@ const UNIT_SPELLINGS: &[(&str, &str)] = &[
 #[must_use]
 pub fn resolve_unit(raw: &str) -> Option<QudtUnit> {
     let raw = raw.trim();
-    if let Some(local) = raw.strip_prefix("QUDT:") {
+    let prefix_len = "QUDT:".len();
+    if raw
+        .get(..prefix_len)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("QUDT:"))
+    {
+        let local = &raw[prefix_len..];
         if let Some(unit) = lookup(local) {
             return Some(unit);
         }
@@ -189,10 +194,233 @@ pub fn resolve_unit(raw: &str) -> Option<QudtUnit> {
         // identity per unit. Meanwhile the user was told any unresolvable
         // unit had been dropped.
         return KNOWN_IDENTIFIERS
-            .contains(&raw)
-            .then(|| QudtUnit::new(raw).expect("KNOWN_IDENTIFIERS holds valid identifiers"));
+            .iter()
+            .find(|identifier| identifier.eq_ignore_ascii_case(raw))
+            .map(|identifier| {
+                QudtUnit::new(*identifier).expect("KNOWN_IDENTIFIERS holds valid identifiers")
+            });
     }
     lookup(raw)
+}
+
+/// Return whether `span` contains a controlled unit spelling that resolves to
+/// exactly `expected`.
+///
+/// Matching uses [`resolve_unit`] rather than a second spelling table, so the
+/// span gate accepts the same printed forms as conversion (`GPa`,
+/// `W/(m·K)`, `g/cm³`, `%`, and known canonical `QUDT:` identifiers) and
+/// cannot drift from it. Candidates must occupy a complete lexical unit: a
+/// single-letter unit cannot be found inside a word, and a component of a
+/// compound unit cannot masquerade as the whole unit. Every candidate must
+/// also occupy quantity position after a number, so homographs such as the
+/// article `a`, ordinal `second`, and sample-count `N` are not unit evidence.
+///
+/// Bare `1` and `-` are intentionally not unit evidence here even though
+/// [`resolve_unit`] accepts them as model spellings for `QUDT:UNITLESS`. In a
+/// source span those glyphs are indistinguishable from a numeric value or a
+/// sign. Explicit `unitless` and `dimensionless` spellings are found when
+/// printed in quantity position.
+#[must_use]
+pub fn span_contains_resolved_unit(span: &str, expected: &QudtUnit) -> bool {
+    span_contains_unit_matching(span, |resolved, _, _| resolved == expected)
+}
+
+/// Return whether `span` contains any lexically bounded controlled unit.
+///
+/// This shares all spelling, boundary, and ambiguous-glyph rules with
+/// [`span_contains_resolved_unit`]. In particular, numeric `1`, a minus sign,
+/// articles, ordinals, and author/sample labels do not become unit evidence
+/// merely because the model-side resolver accepts a homographic spelling.
+#[must_use]
+pub fn span_contains_any_resolved_unit(span: &str) -> bool {
+    span_contains_unit_matching(span, |_, _, _| true)
+}
+
+/// Return whether `expected` occurs in quantity position immediately after
+/// the numeric lexeme ending at byte offset `value_end`.
+///
+/// Only whitespace may separate the value and unit; parenthesized units still
+/// work because the unit candidate itself begins at `(`. This binds a unit to
+/// one value rather than borrowing another quantity's unit from elsewhere in
+/// the same sentence.
+#[must_use]
+pub fn span_value_has_resolved_unit(span: &str, value_end: usize, expected: &QudtUnit) -> bool {
+    if value_end > span.len() || !span.is_char_boundary(value_end) {
+        return false;
+    }
+    span_contains_unit_matching(span, |resolved, start, _| {
+        resolved == expected
+            && start >= value_end
+            && span[value_end..start].chars().all(char::is_whitespace)
+    })
+}
+
+/// Return whether any controlled unit occurs immediately after the numeric
+/// lexeme ending at `value_end`.
+///
+/// This is the absence check for an implicit `QUDT:UNITLESS` value: units on
+/// other quantities later in the sentence do not contaminate it.
+#[must_use]
+pub fn span_value_has_any_resolved_unit(span: &str, value_end: usize) -> bool {
+    if value_end > span.len() || !span.is_char_boundary(value_end) {
+        return false;
+    }
+    span_contains_unit_matching(span, |_, start, _| {
+        start >= value_end && span[value_end..start].chars().all(char::is_whitespace)
+    })
+}
+
+/// Longest folded candidate the scanner can resolve. This is derived from
+/// the spelling table (including `QUDT:`-prefixed spellings and canonical
+/// identifiers), so adding a longer controlled spelling expands the scanner
+/// automatically.
+static MAX_FOLDED_UNIT_CANDIDATE_LEN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    UNIT_SPELLINGS
+        .iter()
+        .flat_map(|(spelling, identifier)| {
+            [
+                spelling.len(),
+                "qudt:".len() + spelling.len(),
+                fold(identifier).len(),
+            ]
+        })
+        .max()
+        .expect("UNIT_SPELLINGS is non-empty")
+});
+
+fn span_contains_unit_matching(
+    span: &str,
+    mut matches: impl FnMut(&QudtUnit, usize, usize) -> bool,
+) -> bool {
+    for (start, first) in span.char_indices() {
+        if first.is_whitespace() || !has_unit_start_boundary(span, start, first) {
+            continue;
+        }
+
+        for (relative_end, last) in span[start..].char_indices() {
+            let end = start + relative_end + last.len_utf8();
+            let candidate = &span[start..end];
+            let folded = fold(candidate);
+            if folded.len() > *MAX_FOLDED_UNIT_CANDIDATE_LEN {
+                break;
+            }
+            if last.is_whitespace() || !has_unit_end_boundary(span, end) {
+                continue;
+            }
+
+            if let Some(resolved) = resolve_unit_candidate(candidate) {
+                if !unit_candidate_has_quantity_context(span, start, end) {
+                    continue;
+                }
+                if matches(&resolved, start, end) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A controlled spelling is unit evidence only in quantity position: after a
+/// printed number (including `4 (A)`). This uniform rule covers symbolic and
+/// word homographs without another vocabulary (`A` as an article, `N` as an
+/// author initial, `second` as an ordinal, `none` as prose). It deliberately
+/// refuses bare table-header units: without the matched value's position,
+/// `(N)` and the plural suffix in `result(s)` are indistinguishable.
+fn unit_candidate_has_quantity_context(span: &str, start: usize, end: usize) -> bool {
+    if span[end..].starts_with('.')
+        && span[end + 1..]
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(char::is_alphabetic)
+    {
+        // An author initial (`Ref. 5 N. Smith`) is not a newton. Sentence
+        // splitting means a genuine sentence-final `5 N.` has no following
+        // alphabetic text in the span.
+        return false;
+    }
+
+    span[..start]
+        .chars()
+        .rev()
+        .find(|c| !c.is_whitespace())
+        .is_some_and(|c| c.is_ascii_digit())
+}
+
+fn resolve_unit_candidate(candidate: &str) -> Option<QudtUnit> {
+    let folded = fold(candidate);
+
+    // These table entries are useful at the model-conversion boundary, but
+    // the same glyphs inside source text are ordinarily values/punctuation.
+    if matches!(folded.as_str(), "1" | "-") {
+        return None;
+    }
+
+    resolve_unit(candidate)
+}
+
+fn has_unit_start_boundary(span: &str, start: usize, first: char) -> bool {
+    let Some(previous) = span[..start].chars().next_back() else {
+        return true;
+    };
+
+    if previous == '.' {
+        // A dot immediately before a candidate continues a scientific unit
+        // (`at.%`, `MPa.m^0.5`); it is not a token boundary.
+        return false;
+    }
+    if matches!(previous, '\'' | '\u{2019}') && matches!(first, 's' | 'S') {
+        // The `s` in an English possessive ("alloy's" / "alloy’s") is
+        // not a printed second unit. Treating an apostrophe as punctuation
+        // here would let a fabricated `QUDT:SEC` pass grounding.
+        return false;
+    }
+    if is_unit_connector(previous) {
+        return false;
+    }
+    if previous.is_alphabetic() || previous == '_' {
+        // An opening parenthesis can itself delimit a following unit, as in
+        // `value(GPa)`. Starting at the `G` is disallowed; starting at `(`
+        // lets the resolver consume the complete parenthesised spelling.
+        return first == '(';
+    }
+    !(previous.is_numeric() && first.is_numeric())
+}
+
+fn has_unit_end_boundary(span: &str, end: usize) -> bool {
+    let Some(next) = span[end..].chars().next() else {
+        return true;
+    };
+    if next == '.' {
+        return span[end + next.len_utf8()..]
+            .chars()
+            .next()
+            .is_none_or(|after| !after.is_alphanumeric());
+    }
+    !next.is_alphanumeric() && next != '_' && !is_unit_connector(next)
+}
+
+fn is_unit_connector(c: char) -> bool {
+    matches!(
+        c,
+        '/' | ':'
+            | '-'
+            | '−'
+            | '–'
+            | '^'
+            | '⁻'
+            | '¹'
+            | '²'
+            | '³'
+            | '·'
+            | '⋅'
+            | '∙'
+            | '×'
+            | '*'
+            | '°'
+            | '('
+            | ')'
+    )
 }
 
 /// Every identifier the spelling table can produce — the set a `QUDT:` value
@@ -302,12 +530,123 @@ mod tests {
     }
 
     #[test]
+    fn source_spans_find_printed_aliases_and_canonical_units() {
+        for (span, expected) in [
+            ("The elastic modulus was 1.20 GPa.", "QUDT:GigaPA"),
+            ("Yield strength reached 950 MPa.", "QUDT:MegaPA"),
+            ("Thermal conductivity was 18 W/(m·K).", "QUDT:W-PER-M-K"),
+            ("The measured density was 7.9 g/cm³.", "QUDT:GM-PER-CentiM3"),
+            ("Porosity remained below 2%.", "QUDT:PERCENT"),
+            ("The normalized value is 1 QUDT:GigaPA.", "QUDT:GigaPA"),
+        ] {
+            let expected = QudtUnit::new(expected).unwrap();
+            assert!(
+                span_contains_resolved_unit(span, &expected),
+                "span did not ground {}: {span:?}",
+                expected.as_str()
+            );
+            assert!(span_contains_any_resolved_unit(span));
+        }
+    }
+
+    #[test]
+    fn source_span_requires_the_exact_resolved_unit() {
+        let gigapascal = QudtUnit::new("QUDT:GigaPA").unwrap();
+        let megapascal = QudtUnit::new("QUDT:MegaPA").unwrap();
+
+        assert!(span_contains_resolved_unit(
+            "Yield strength reached 950 MPa.",
+            &megapascal
+        ));
+        assert!(!span_contains_resolved_unit(
+            "Yield strength reached 950 MPa.",
+            &gigapascal
+        ));
+
+        let mixed = "UTS reached 950 MPa at 300 K.";
+        let value_end = mixed.find("950").unwrap() + "950".len();
+        assert!(span_value_has_resolved_unit(mixed, value_end, &megapascal));
+        assert!(!span_value_has_resolved_unit(
+            mixed,
+            value_end,
+            &QudtUnit::new("QUDT:K").unwrap()
+        ));
+    }
+
+    #[test]
+    fn source_span_unit_matches_respect_lexical_boundaries() {
+        let kelvin = QudtUnit::new("QUDT:K").unwrap();
+        let ampere = QudtUnit::new("QUDT:A").unwrap();
+        let second = QudtUnit::new("QUDT:SEC").unwrap();
+        let watt = QudtUnit::new("QUDT:W").unwrap();
+
+        assert!(!span_contains_resolved_unit(
+            "PEEK retained its stiffness.",
+            &kelvin
+        ));
+        assert!(!span_contains_resolved_unit(
+            "The alloy was selected from a sample.",
+            &ampere
+        ));
+        assert!(!span_contains_resolved_unit(
+            "A specimen had conductivity 5 S/m.",
+            &ampere
+        ));
+        assert!(!span_contains_resolved_unit("The rate was 1/s.", &second));
+        assert!(!span_contains_resolved_unit(
+            "Alloy's UTS was 950 MPa.",
+            &second
+        ));
+        assert!(!span_contains_resolved_unit(
+            "The alloy’s UTS was 950 MPa.",
+            &second
+        ));
+        assert!(!span_contains_resolved_unit(
+            "Conductivity was 18 W/(m·K).",
+            &watt
+        ));
+
+        assert!(span_contains_resolved_unit(
+            "The temperature was 300 K.",
+            &kelvin
+        ));
+        assert!(span_contains_resolved_unit(
+            "The current was held at 4 A.",
+            &ampere
+        ));
+        assert!(!span_contains_resolved_unit(
+            "UTS was 950 MPa (N = 3).",
+            &QudtUnit::new("QUDT:N").unwrap()
+        ));
+        assert!(!span_contains_resolved_unit(
+            "The result(s) were reproducible.",
+            &second
+        ));
+        assert!(!span_contains_resolved_unit(
+            "See Ref. 5 N. Smith for details.",
+            &QudtUnit::new("QUDT:N").unwrap()
+        ));
+        assert!(!span_contains_resolved_unit(
+            "Nickel content was 5 at.% Ni.",
+            &QudtUnit::new("QUDT:PERCENT").unwrap()
+        ));
+        assert!(!span_contains_resolved_unit(
+            "Fracture toughness was 20 MPa.m^0.5.",
+            &QudtUnit::new("QUDT:MegaPA").unwrap()
+        ));
+        assert!(!span_contains_any_resolved_unit(
+            "The ratio was reported as -1."
+        ));
+    }
+
+    #[test]
     fn qudt_identifiers_pass_through_untouched() {
         assert_eq!(
             resolve_unit("QUDT:W-PER-M-K").unwrap().as_str(),
             "QUDT:W-PER-M-K"
         );
         assert_eq!(resolve_unit("QUDT:MegaPA").unwrap().as_str(), "QUDT:MegaPA");
+        assert_eq!(resolve_unit("qudt:gigapa").unwrap().as_str(), "QUDT:GigaPA");
     }
 
     /// Every canonical identifier in the table must be a FIXED POINT of
