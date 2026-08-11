@@ -219,6 +219,62 @@ impl Default for AgentRunFilter {
     }
 }
 
+/// Resource policy for one transitive agent-run spawn traversal.
+///
+/// The default follows at most 64 spawn edges below the requested root and
+/// accepts at most 1,000 stored child rows. One additional row may be inspected
+/// as a truncation probe. Reaching either bound is reported through
+/// [`AgentRunTraversalOutcome::Incomplete`]; it is never presented as a
+/// complete answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRunTraversalPolicy {
+    /// Deepest spawn edge included below the root (`1` means direct children).
+    pub max_depth: usize,
+    /// Maximum stored child rows accepted into the traversal.
+    ///
+    /// The store may inspect one additional row as a truncation probe.
+    pub max_rows: usize,
+}
+
+impl Default for AgentRunTraversalPolicy {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            max_rows: MAX_AGENT_RUN_QUERY_LIMIT,
+        }
+    }
+}
+
+/// Why a transitive agent-run traversal could not claim completeness.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentRunTraversalIssue {
+    /// A row pointed back to a run already visited on the same spawn path.
+    CycleDetected { repeated_run_id: String },
+    /// At least one descendant exists below the policy's maximum depth.
+    DepthLimitReached { max_depth: usize },
+    /// At least one traversal row exists beyond the policy's row budget.
+    RowLimitReached { max_rows: usize },
+}
+
+/// Completeness of a transitive agent-run traversal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AgentRunTraversalOutcome {
+    /// Every reachable spawn edge was inspected without a cycle or bound hit.
+    Complete,
+    /// Returned runs are partial or the stored topology is cyclic.
+    Incomplete { issues: Vec<AgentRunTraversalIssue> },
+}
+
+/// Transitive descendants of one agent run plus an explicit completeness claim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentRunDescendants {
+    /// Reachable runs excluding the root, in stable breadth-first order.
+    pub runs: Vec<AgentRun>,
+    pub outcome: AgentRunTraversalOutcome,
+}
+
 /// Rebuildable search metadata for one durable agent session.
 ///
 /// The session JSONL remains the source of truth. This row is only a mirror
@@ -503,11 +559,11 @@ pub struct ProvenanceStore {
     ///
     /// Most single-table read paths deliberately do NOT take the lock: a read
     /// joins an open transaction harmlessly and holds nothing that a rollback
-    /// could destroy. The session-metadata list and reconciliation reads are
-    /// the exception because they must not observe a partially staged
-    /// multi-table source rebuild. SEPARATE handles need no help either: they
-    /// serialize via the database busy wait, which is what the concurrency
-    /// tests exercise.
+    /// could destroy. The session-metadata reads are exceptions because they
+    /// must not observe a partially staged multi-table source rebuild. The
+    /// agent-run descendant traversal is another: it opens a read transaction
+    /// so its multi-query completeness claim refers to one stable snapshot,
+    /// and no same-handle writer may silently join that transaction.
     write_lock: tokio::sync::Mutex<()>,
 }
 
@@ -979,6 +1035,146 @@ impl ProvenanceStore {
             runs.push(row_to_agent_run(&row)?);
         }
         Ok(runs)
+    }
+
+    /// List every run transitively spawned below `root_run_id`.
+    ///
+    /// This follows only [`AgentRun::parent_run_id`] spawn edges. It does not
+    /// use session threading or [`ProvenanceRecord::parent_id`], and the root
+    /// row itself need not exist because orphaned child edges are intentionally
+    /// retained by the ledger. Results exclude the root and are stable by
+    /// breadth-first depth, with every parent's children ordered by run id.
+    ///
+    /// The visited set and depth policy independently stop cycles, while a
+    /// one-row probe makes row-budget truncation observable in
+    /// [`AgentRunTraversalOutcome`]. The whole walk uses one deferred read
+    /// transaction, so `Complete` describes a single stable database snapshot.
+    pub async fn list_agent_run_descendants(
+        &self,
+        root_run_id: &str,
+        policy: &AgentRunTraversalPolicy,
+    ) -> Result<AgentRunDescendants> {
+        let _same_handle_guard = self.write_lock.lock().await;
+        let txn = turso::transaction::Transaction::new_unchecked(
+            &self.conn,
+            turso::transaction::TransactionBehavior::Deferred,
+        )
+        .await
+        .context("failed to begin agent run traversal snapshot")?;
+
+        let result: Result<AgentRunDescendants> = async {
+            let mut runs = Vec::new();
+            let mut observed_rows = 0usize;
+            let mut depth_limit_reached = false;
+            let mut row_limit_reached = false;
+            let mut repeated_run_ids = std::collections::BTreeSet::new();
+            let mut visited = std::collections::BTreeSet::from([root_run_id.to_string()]);
+            let mut pending = std::collections::VecDeque::from([(root_run_id.to_string(), 0usize)]);
+
+            // SQLite supports recursive CTEs, but the Turso 0.7 parser used by
+            // this crate rejects `WITH RECURSIVE` with "Recursive CTEs are not
+            // yet supported". Execute the same recurrence breadth-first in
+            // Rust until Turso exposes it, retaining independent visited,
+            // depth, and row guards. Each expansion still uses the parent
+            // index and a bound query.
+            'traversal: while let Some((parent_run_id, parent_depth)) = pending.pop_front() {
+                let child_depth = parent_depth
+                    .checked_add(1)
+                    .context("agent run traversal depth overflowed usize")?;
+                if child_depth > policy.max_depth {
+                    let mut rows = txn
+                        .query(
+                            "SELECT EXISTS(\
+                                 SELECT 1 FROM agent_runs WHERE parent_run_id = ?1\
+                             )",
+                            [Value::Text(parent_run_id)],
+                        )
+                        .await?;
+                    let row = rows
+                        .next()
+                        .await?
+                        .context("agent run depth probe returned no row")?;
+                    depth_limit_reached |= get_agent_run_traversal_bool(&row, 0, "depth probe")?;
+                    continue;
+                }
+
+                let probe_rows = policy
+                    .max_rows
+                    .saturating_sub(observed_rows)
+                    .checked_add(1)
+                    .context("agent run traversal max_rows cannot be probed safely")?;
+                let probe_rows = i64::try_from(probe_rows)
+                    .context("agent run traversal max_rows exceeds SQLite integer range")?;
+                let sql = format!(
+                    "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
+                     WHERE parent_run_id = ?1 ORDER BY id ASC LIMIT ?2"
+                );
+                let mut rows = txn
+                    .query(
+                        &sql,
+                        [Value::Text(parent_run_id), Value::Integer(probe_rows)],
+                    )
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    observed_rows += 1;
+                    let run_id = get_str(&row, 0)?;
+                    let is_cycle = visited.contains(&run_id);
+                    if is_cycle {
+                        repeated_run_ids.insert(run_id.clone());
+                    }
+                    if observed_rows > policy.max_rows {
+                        row_limit_reached = true;
+                        break 'traversal;
+                    }
+                    if is_cycle {
+                        continue;
+                    }
+
+                    let run = row_to_agent_run(&row)?;
+                    visited.insert(run_id.clone());
+                    pending.push_back((run_id, child_depth));
+                    runs.push(run);
+                }
+            }
+
+            let mut issues = Vec::new();
+            if depth_limit_reached {
+                issues.push(AgentRunTraversalIssue::DepthLimitReached {
+                    max_depth: policy.max_depth,
+                });
+            }
+            if row_limit_reached {
+                issues.push(AgentRunTraversalIssue::RowLimitReached {
+                    max_rows: policy.max_rows,
+                });
+            }
+            issues.extend(
+                repeated_run_ids.into_iter().map(|repeated_run_id| {
+                    AgentRunTraversalIssue::CycleDetected { repeated_run_id }
+                }),
+            );
+
+            let outcome = if issues.is_empty() {
+                AgentRunTraversalOutcome::Complete
+            } else {
+                AgentRunTraversalOutcome::Incomplete { issues }
+            };
+            Ok(AgentRunDescendants { runs, outcome })
+        }
+        .await;
+
+        match result {
+            Ok(descendants) => {
+                txn.commit()
+                    .await
+                    .context("failed to close agent run traversal snapshot")?;
+                Ok(descendants)
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// Return running rows whose last heartbeat is older than `policy` permits.
@@ -1749,6 +1945,14 @@ fn get_u64(row: &turso::Row, idx: usize, field: &str) -> Result<u64> {
     }
 }
 
+fn get_agent_run_traversal_bool(row: &turso::Row, idx: usize, field: &str) -> Result<bool> {
+    match row.get_value(idx)? {
+        Value::Integer(0) => Ok(false),
+        Value::Integer(1) => Ok(true),
+        value => anyhow::bail!("agent run traversal {field} is not a boolean: {value:?}"),
+    }
+}
+
 fn row_to_agent_run(row: &turso::Row) -> Result<AgentRun> {
     let cost_usd = match row.get_value(11)? {
         Value::Real(value) => value,
@@ -2008,6 +2212,164 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0].id, other.id);
+    }
+
+    #[tokio::test]
+    async fn agent_run_descendants_returns_all_three_spawn_levels() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let root = new_agent_run("session-a", "agent", "root", None);
+        let child = new_agent_run("session-a", "subagent", "child", Some(&root.id));
+        let grandchild = new_agent_run("session-a", "subagent", "grandchild", Some(&child.id));
+        let great_grandchild = new_agent_run(
+            "session-a",
+            "subagent",
+            "great-grandchild",
+            Some(&grandchild.id),
+        );
+        for run in [&root, &child, &grandchild, &great_grandchild] {
+            store.start_agent_run(run).await.unwrap();
+        }
+
+        let result = store
+            .list_agent_run_descendants(&root.id, &AgentRunTraversalPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, AgentRunTraversalOutcome::Complete);
+        assert_eq!(
+            result
+                .runs
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                child.id.as_str(),
+                grandchild.id.as_str(),
+                great_grandchild.id.as_str()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_run_descendants_reports_a_cycle_instead_of_hanging() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let root = new_agent_run("session-a", "agent", "root", None);
+        let child = new_agent_run("session-a", "subagent", "child", Some(&root.id));
+        let grandchild = new_agent_run("session-a", "subagent", "grandchild", Some(&child.id));
+        for run in [&root, &child, &grandchild] {
+            store.start_agent_run(run).await.unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE agent_runs SET parent_run_id = ?1 WHERE id = ?2",
+                [
+                    Value::Text(grandchild.id.clone()),
+                    Value::Text(root.id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.list_agent_run_descendants(
+                &root.id,
+                &AgentRunTraversalPolicy {
+                    max_depth: 10,
+                    max_rows: 10,
+                },
+            ),
+        )
+        .await
+        .expect("cycle-safe traversal must terminate")
+        .unwrap();
+        assert_eq!(
+            result
+                .runs
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![child.id.as_str(), grandchild.id.as_str()]
+        );
+        assert_eq!(
+            result.outcome,
+            AgentRunTraversalOutcome::Incomplete {
+                issues: vec![AgentRunTraversalIssue::CycleDetected {
+                    repeated_run_id: root.id.clone(),
+                }]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_run_descendants_reports_depth_truncation() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let root = new_agent_run("session-a", "agent", "root", None);
+        let child = new_agent_run("session-a", "subagent", "child", Some(&root.id));
+        let grandchild = new_agent_run("session-a", "subagent", "grandchild", Some(&child.id));
+        for run in [&root, &child, &grandchild] {
+            store.start_agent_run(run).await.unwrap();
+        }
+
+        let result = store
+            .list_agent_run_descendants(
+                &root.id,
+                &AgentRunTraversalPolicy {
+                    max_depth: 1,
+                    max_rows: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.runs, vec![child]);
+        assert_eq!(
+            result.outcome,
+            AgentRunTraversalOutcome::Incomplete {
+                issues: vec![AgentRunTraversalIssue::DepthLimitReached { max_depth: 1 }]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_run_descendants_reports_row_truncation_but_not_an_exact_boundary() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let root = new_agent_run("session-a", "agent", "root", None);
+        let child = new_agent_run("session-a", "subagent", "child", Some(&root.id));
+        let grandchild = new_agent_run("session-a", "subagent", "grandchild", Some(&child.id));
+        for run in [&root, &child, &grandchild] {
+            store.start_agent_run(run).await.unwrap();
+        }
+
+        let exact = store
+            .list_agent_run_descendants(
+                &root.id,
+                &AgentRunTraversalPolicy {
+                    max_depth: 10,
+                    max_rows: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.runs, vec![child.clone(), grandchild]);
+        assert_eq!(exact.outcome, AgentRunTraversalOutcome::Complete);
+
+        let truncated = store
+            .list_agent_run_descendants(
+                &root.id,
+                &AgentRunTraversalPolicy {
+                    max_depth: 10,
+                    max_rows: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(truncated.runs, vec![child]);
+        assert_eq!(
+            truncated.outcome,
+            AgentRunTraversalOutcome::Incomplete {
+                issues: vec![AgentRunTraversalIssue::RowLimitReached { max_rows: 1 }]
+            }
+        );
     }
 
     #[tokio::test]
