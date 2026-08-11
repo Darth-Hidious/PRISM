@@ -439,6 +439,9 @@ impl SupabaseAuth {
             .into_iter()
             .map(str::to_string)
             .collect::<HashSet<_>>();
+        // Honor the `nbf` ("not before") claim: a token that declares itself not
+        // yet valid must be refused, not silently accepted.
+        validation.validate_nbf = true;
 
         let verified = decode::<SupabaseClaims>(token, &decoding_key, &validation)
             .context("Supabase access token verification failed")?;

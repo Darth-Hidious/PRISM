@@ -1145,7 +1145,25 @@ async fn check_near_duplicates<'a>(
     }
     findings.sort_by(|a, b| a.cosine_distance.total_cmp(&b.cosine_distance));
     findings.truncate(policy.maximum_findings);
-    applied_check(entities.len(), entities.len(), findings)
+    let evaluated = entities
+        .iter()
+        .filter(|entity| vector_for(&entity.name).is_some())
+        .count();
+    if evaluated == entities.len() {
+        applied_check(entities.len(), entities.len(), findings)
+    } else {
+        SemanticCheckReport {
+            status: SemanticValidationStatus::Unavailable,
+            candidates: entities.len(),
+            evaluated,
+            passed: None,
+            findings,
+            message: Some(
+                "one or more proposed instances lacked an embedding vector and could not be compared for near-duplicate collisions"
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 async fn check_typing<'a>(
