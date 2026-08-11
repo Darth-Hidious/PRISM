@@ -4,7 +4,7 @@
 Run as: python3 -m app.tool_server
 
 Reads one JSON object per line from stdin, writes one JSON object per line
-to stdout.  Methods: list_tools, call_tool.
+to stdout.  Methods: list_tools, call_tool, set_session_id.
 """
 import json
 import os
@@ -52,6 +52,18 @@ def _handle(registry, request: dict) -> dict:
                 for t in registry.list_tools()
             ]
         }
+
+    if method == "set_session_id":
+        session_id = request.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return {"error": "'session_id' must be a non-empty string"}
+        try:
+            from app.tools.memory import configure as configure_memory
+
+            configure_memory(session_id=session_id)
+        except Exception as exc:
+            return {"error": str(exc)}
+        return {"status": "ok", "session_id": session_id}
 
     if method == "call_tool":
         name = request.get("tool", "")

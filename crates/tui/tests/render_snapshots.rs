@@ -26,6 +26,7 @@
 #![cfg(test)]
 
 use prism_tui::app::{App, Focus};
+use prism_tui::artifact::{ArtifactPromotion, ArtifactStoreState, WorkspaceArtifact};
 use prism_tui::backend::{BackendHandle, FakeScenario};
 use prism_tui::msg::AgentMsg;
 use prism_tui::render::draw;
@@ -197,6 +198,7 @@ fn snapshot_basic_chat_after_response_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     // Apply status
     app.apply_agent_msg(AgentMsg::Status {
@@ -230,6 +232,7 @@ fn snapshot_thinking_stream_collapsed_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -266,6 +269,7 @@ fn snapshot_thinking_stream_expanded_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -300,6 +304,7 @@ fn snapshot_tool_success_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -341,6 +346,7 @@ fn snapshot_tool_error_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -381,6 +387,7 @@ fn snapshot_approval_required_popup_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -418,6 +425,7 @@ fn snapshot_notebook_exec_approval_code_popup_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -459,6 +467,7 @@ fn snapshot_cost_metrics_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -494,6 +503,7 @@ fn snapshot_ansi_injection_sanitized_100x30() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -525,6 +535,7 @@ fn snapshot_tiny_terminal_basic_chat_40x12() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -568,13 +579,14 @@ fn workspace_tab_strip_never_wraps_at_any_width() {
             .lines()
             .find(|l| l.contains("[Activity]") || l.contains("[Act]"))
             .unwrap_or_else(|| panic!("no workspace tab strip rendered at {w}x{h}"));
-        // All four tabs must sit on that ONE line. If the strip wrapped, the
+        // All five tabs must sit on that ONE line. If the strip wrapped, the
         // trailing tab is on the next line and this fails.
         for (full, short) in [
             ("Activity", "Act"),
             ("Tools", "Too"),
             ("Files", "Fil"),
             ("Objects", "Obj"),
+            ("Artifacts", "Art"),
         ] {
             assert!(
                 strip.contains(full) || strip.contains(short),
@@ -638,6 +650,7 @@ fn snapshot_wide_terminal_basic_chat_200x60() {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -670,6 +683,7 @@ fn app_with_welcome() -> App {
     app.apply_agent_msg(AgentMsg::Welcome {
         version: "2.7.1-fake".into(),
         tool_count: 99,
+        session_id: None,
     });
     app.apply_agent_msg(AgentMsg::Status {
         model: "fake-backend".into(),
@@ -1369,6 +1383,75 @@ fn snapshot_workspace_objects_empty_100x30() {
     let rendered = render_app_to_string(&app, 100, 30);
     assert_no_terminal_controls(&rendered);
     insta::assert_snapshot!("workspace_objects_empty_100x30", rendered);
+}
+
+/// Snapshot: artifact metadata keeps KG promotion visible at a glance while
+/// also showing tool, summary, record count, size, and age.
+#[test]
+fn snapshot_workspace_artifacts_entries_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+    app.workspace_selected = 0;
+    app.artifact_store = ArtifactStoreState::Ready(vec![
+        WorkspaceArtifact {
+            id: "art_promoted".into(),
+            tool: "materials_search".into(),
+            summary: "24 refractory alloy candidates with complete property rows".into(),
+            record_count: Some(24),
+            bytes_size: 18_432,
+            created_at: "2026-08-11T11:58:00+00:00".into(),
+            age: "2m ago".into(),
+            promotion: ArtifactPromotion::Promoted,
+            session_id: "session-artifacts".into(),
+        },
+        WorkspaceArtifact {
+            id: "art_local".into(),
+            tool: "phase_diagram".into(),
+            summary: "Calculated binary phase boundaries for inspection".into(),
+            record_count: None,
+            bytes_size: 2_048,
+            created_at: "2026-08-11T11:45:00+00:00".into(),
+            age: "15m ago".into(),
+            promotion: ArtifactPromotion::NotPromoted,
+            session_id: "session-artifacts".into(),
+        },
+    ]);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_artifacts_entries_100x30", rendered);
+}
+
+/// Snapshot: a healthy store with no rows must not resemble a failed store.
+#[test]
+fn snapshot_workspace_artifacts_empty_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+    app.artifact_store = ArtifactStoreState::Ready(Vec::new());
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_artifacts_empty_100x30", rendered);
+}
+
+/// Snapshot: a store-open failure is explicit and visually distinct from an
+/// empty, healthy session.
+#[test]
+fn snapshot_workspace_artifacts_unavailable_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    let mut app = app_with_welcome();
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+    app.artifact_store =
+        ArtifactStoreState::Unavailable("database could not be opened: permission denied".into());
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_artifacts_unavailable_100x30", rendered);
 }
 
 // ── Form pane (generic structured input) ────────────────────────────

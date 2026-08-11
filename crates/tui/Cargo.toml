@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
 unicode-width = { workspace = true }
+unicode-truncate = "2"
 strip-ansi-escapes = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }

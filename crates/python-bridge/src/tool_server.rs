@@ -128,6 +128,15 @@ impl ToolServerHandle {
         self.call(&req).await
     }
 
+    /// Set the artifact recorder's authoritative session identifier.
+    pub async fn set_session_id(&mut self, session_id: &str) -> Result<Value, PythonBridgeError> {
+        let req = serde_json::json!({
+            "method": "set_session_id",
+            "session_id": session_id,
+        });
+        self.call(&req).await
+    }
+
     /// Kill the child process.
     pub async fn shutdown(&mut self) -> Result<(), PythonBridgeError> {
         self.child.kill().await?;
@@ -168,10 +177,16 @@ import os
 import sys
 for line in sys.stdin:
     request = json.loads(line)
-    response = {"result": {
-        "offline": os.environ.get("PRISM_OFFLINE"),
-        "home": os.environ.get("HOME"),
-    }}
+    if request.get("method") == "set_session_id":
+        response = {
+            "status": "ok",
+            "session_id": request.get("session_id"),
+        }
+    else:
+        response = {"result": {
+            "offline": os.environ.get("PRISM_OFFLINE"),
+            "home": os.environ.get("HOME"),
+        }}
     sys.stdout.write(json.dumps(response) + "\n")
     sys.stdout.flush()
 "#,
@@ -194,6 +209,13 @@ for line in sys.stdin:
 
         assert_eq!(response["result"]["offline"], "1");
         assert!(response["result"]["home"].is_null(), "response: {response}");
+
+        let response = worker
+            .set_session_id("session-from-rust")
+            .await
+            .expect("set worker session id");
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["session_id"], "session-from-rust");
         worker.shutdown().await.expect("shutdown worker");
     }
 }

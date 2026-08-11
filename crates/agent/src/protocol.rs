@@ -183,6 +183,285 @@ struct ServerRuntime {
     policy_engine: Option<prism_policy::PolicyEngine>,
 }
 
+fn artifact_tool_result<'a>(
+    response: &'a Value,
+    malformed_message: &str,
+) -> std::result::Result<&'a Value, String> {
+    let outer = response
+        .as_object()
+        .ok_or_else(|| malformed_message.to_string())?;
+    if let Some(error) = outer.get("error") {
+        return Err(error
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| malformed_message.to_string()));
+    }
+
+    let result = outer
+        .get("result")
+        .ok_or_else(|| malformed_message.to_string())?;
+    let inner = result
+        .as_object()
+        .ok_or_else(|| malformed_message.to_string())?;
+    if let Some(error) = inner.get("error") {
+        return Err(error
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| malformed_message.to_string()));
+    }
+    if inner.get("success").and_then(Value::as_bool) == Some(false) {
+        return Err(malformed_message.to_string());
+    }
+
+    Ok(result)
+}
+
+fn parse_artifact_list_response(
+    response: &Value,
+    current_session_id: &str,
+) -> std::result::Result<Vec<Value>, String> {
+    const MALFORMED: &str = "artifact store returned a malformed list response";
+
+    let result = artifact_tool_result(response, MALFORMED)?;
+    let session_filter = result
+        .get("session_filter")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MALFORMED.to_string())?;
+    if session_filter != current_session_id {
+        return Err(format!(
+            "artifact store returned list for session '{session_filter}', not current session '{current_session_id}'"
+        ));
+    }
+
+    let artifacts = result
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| MALFORMED.to_string())?;
+    let count = result
+        .get("count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| MALFORMED.to_string())?;
+    if count != artifacts.len() as u64 {
+        return Err(MALFORMED.to_string());
+    }
+
+    for artifact in artifacts {
+        let artifact_session_id = artifact
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MALFORMED.to_string())?;
+        if artifact_session_id != current_session_id {
+            return Err(format!(
+                "artifact store returned an artifact for session '{artifact_session_id}', not current session '{current_session_id}'"
+            ));
+        }
+    }
+
+    Ok(artifacts.clone())
+}
+
+fn parse_artifact_fetch_response(
+    response: &Value,
+    requested_artifact_id: &str,
+    current_session_id: &str,
+) -> std::result::Result<Value, String> {
+    const MALFORMED: &str = "artifact store returned a malformed fetch response";
+
+    let artifact = artifact_tool_result(response, MALFORMED)?;
+    let returned_artifact_id = artifact
+        .get("artifact_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MALFORMED.to_string())?;
+    if returned_artifact_id != requested_artifact_id {
+        return Err(format!(
+            "artifact store returned artifact '{returned_artifact_id}', not requested artifact '{requested_artifact_id}'"
+        ));
+    }
+
+    let artifact_session_id = artifact
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| MALFORMED.to_string())?;
+    if artifact_session_id != current_session_id {
+        return Err(format!(
+            "artifact '{requested_artifact_id}' belongs to session '{artifact_session_id}', not current session '{current_session_id}'"
+        ));
+    }
+
+    Ok(artifact.clone())
+}
+
+fn session_sync_response_error(response: &Value, session_id: &str) -> Option<String> {
+    let Some(object) = response.as_object() else {
+        return Some("tool server returned a malformed session sync response".to_string());
+    };
+    if let Some(error) = object.get("error") {
+        return Some(error.as_str().map(str::to_string).unwrap_or_else(|| {
+            "tool server returned a malformed session sync response".to_string()
+        }));
+    }
+    if object.get("status").and_then(Value::as_str) != Some("ok")
+        || object.get("session_id").and_then(Value::as_str) != Some(session_id)
+    {
+        return Some("tool server returned a malformed session sync response".to_string());
+    }
+    None
+}
+
+async fn sync_tool_server_session(tool_server: &mut ToolServerHandle, session_id: &str) {
+    match tool_server.set_session_id(session_id).await {
+        Ok(response) => {
+            if let Some(error) = session_sync_response_error(&response, session_id) {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "artifact recorder session sync failed"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                "artifact recorder session sync failed"
+            );
+        }
+    }
+}
+
+async fn sync_changed_session(
+    tool_server: &mut ToolServerHandle,
+    previous_session_id: Option<String>,
+    current_session_id: Option<String>,
+) {
+    if previous_session_id == current_session_id {
+        return;
+    }
+
+    let Some(session_id) = current_session_id else {
+        tracing::warn!("session changed but no current session id is available");
+        return;
+    };
+    emit_notification(
+        "ui.session.changed",
+        serde_json::json!({
+            "session_id": session_id,
+            "previous_session_id": previous_session_id,
+        }),
+    );
+    // Publish the authoritative scope before a potentially slow/nonfatal
+    // Python recorder sync. The protocol loop remains serialized, so later
+    // artifact reads still cannot overtake this synchronization.
+    sync_tool_server_session(tool_server, &session_id).await;
+}
+
+async fn emit_workspace_artifact_list(runtime: &mut ServerRuntime, limit: u64) {
+    let Some(session_id) = runtime.session_store.current_id().map(str::to_string) else {
+        let message = "no active session is available";
+        tracing::warn!(message, "workspace artifact list failed");
+        emit_notification(
+            "ui.artifacts.unavailable",
+            serde_json::json!({ "message": message }),
+        );
+        return;
+    };
+
+    let response = runtime
+        .tool_server
+        .call_tool(
+            "list_artifacts",
+            serde_json::json!({
+                "session": session_id,
+                "limit": limit,
+            }),
+        )
+        .await;
+    let artifacts = match response {
+        Ok(response) => parse_artifact_list_response(&response, &session_id),
+        Err(error) => Err(error.to_string()),
+    };
+
+    match artifacts {
+        Ok(artifacts) => emit_notification(
+            "ui.artifacts.list",
+            serde_json::json!({
+                "session_id": session_id,
+                "artifacts": artifacts,
+            }),
+        ),
+        Err(message) => {
+            tracing::warn!(
+                session_id,
+                error = %message,
+                "workspace artifact list failed"
+            );
+            emit_notification(
+                "ui.artifacts.unavailable",
+                serde_json::json!({ "message": message }),
+            );
+        }
+    }
+}
+
+async fn emit_workspace_artifact(runtime: &mut ServerRuntime, requested_artifact_id: &str) {
+    let Some(session_id) = runtime.session_store.current_id().map(str::to_string) else {
+        let message = "no active session is available";
+        tracing::warn!(
+            artifact_id = requested_artifact_id,
+            message,
+            "workspace artifact fetch failed"
+        );
+        emit_notification(
+            "ui.artifact.error",
+            serde_json::json!({
+                "artifact_id": requested_artifact_id,
+                "message": message,
+            }),
+        );
+        return;
+    };
+
+    let response = runtime
+        .tool_server
+        .call_tool(
+            "fetch_artifact",
+            serde_json::json!({ "artifact_id": requested_artifact_id }),
+        )
+        .await;
+    let artifact = match response {
+        Ok(response) => {
+            parse_artifact_fetch_response(&response, requested_artifact_id, &session_id)
+        }
+        Err(error) => Err(error.to_string()),
+    };
+
+    match artifact {
+        Ok(artifact) => emit_notification(
+            "ui.artifact.fetched",
+            serde_json::json!({
+                "artifact_id": requested_artifact_id,
+                "session_id": session_id,
+                "artifact": artifact,
+            }),
+        ),
+        Err(message) => {
+            tracing::warn!(
+                session_id,
+                artifact_id = requested_artifact_id,
+                error = %message,
+                "workspace artifact fetch failed"
+            );
+            emit_notification(
+                "ui.artifact.error",
+                serde_json::json!({
+                    "artifact_id": requested_artifact_id,
+                    "message": message,
+                }),
+            );
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct SelectedContext {
@@ -7883,7 +8162,6 @@ async fn run_server_core(
                     emit_error(-32000, "Cannot initialize while a turn is active", id);
                     continue;
                 };
-
                 let resume_ref = params.get("resume").and_then(|v| v.as_str()).unwrap_or("");
                 let resume_ref = if resume_ref == "latest" {
                     startup_latest_session.as_deref().unwrap_or("latest")
@@ -7956,6 +8234,13 @@ async fn run_server_core(
                         "resumed session"
                     );
                 }
+
+                let session_after = runtime.session_store.current_id().map(str::to_string);
+                // The session created while assembling the runtime has not yet been exposed to
+                // the frontend or the Python artifact recorder. Treat initialization as a
+                // transition from no client-visible session so the recorder is scoped even when
+                // `init` does not resume a different session.
+                sync_changed_session(&mut runtime.tool_server, None, session_after).await;
 
                 emit_response(id, serde_json::json!({ "status": "ok" }));
                 emit_notification("ui.welcome", welcome);
@@ -8045,7 +8330,8 @@ async fn run_server_core(
                 }
 
                 let runtime_ref = runtime.as_mut().expect("runtime should exist");
-                let handled = match command_tools::with_platform_access(
+                let session_before = runtime_ref.session_store.current_id().map(str::to_string);
+                let command_result = command_tools::with_platform_access(
                     CommandToolPlatformAccess::VerifiedNodeOwner,
                     handle_command(
                         command,
@@ -8066,8 +8352,11 @@ async fn run_server_core(
                         &mut runtime_ref.policy_engine,
                     ),
                 )
-                .await
-                {
+                .await;
+                let session_after = runtime_ref.session_store.current_id().map(str::to_string);
+                sync_changed_session(&mut runtime_ref.tool_server, session_before, session_after)
+                    .await;
+                let handled = match command_result {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::error!(error = %error, command, "slash command failed");
@@ -8125,6 +8414,57 @@ async fn run_server_core(
                     Arc::clone(&approval_rx),
                     Arc::clone(&live_permission_overrides),
                 ));
+            }
+
+            "workspace.artifacts.list" => {
+                let Some(limit) = params.get("limit").and_then(Value::as_u64) else {
+                    emit_error(-32602, "Missing or invalid params.limit", id);
+                    continue;
+                };
+                if limit == 0 {
+                    emit_error(-32602, "params.limit must be greater than zero", id);
+                    continue;
+                }
+                emit_response(id, serde_json::json!({ "status": "ok" }));
+
+                if turn_active {
+                    emit_notification(
+                        "ui.artifacts.pending",
+                        serde_json::json!({
+                            "message": "artifact data is waiting for the active turn"
+                        }),
+                    );
+                    continue;
+                }
+
+                let runtime_ref = runtime.as_mut().expect("runtime should exist");
+                emit_workspace_artifact_list(runtime_ref, limit).await;
+            }
+
+            "workspace.artifact.fetch" => {
+                let Some(artifact_id) = params.get("artifact_id").and_then(Value::as_str) else {
+                    emit_error(-32602, "Missing params.artifact_id", id);
+                    continue;
+                };
+                if artifact_id.trim().is_empty() {
+                    emit_error(-32602, "params.artifact_id must not be empty", id);
+                    continue;
+                }
+                emit_response(id, serde_json::json!({ "status": "ok" }));
+
+                if turn_active {
+                    emit_notification(
+                        "ui.artifact.pending",
+                        serde_json::json!({
+                            "artifact_id": artifact_id,
+                            "message": "artifact content is waiting for the active turn"
+                        }),
+                    );
+                    continue;
+                }
+
+                let runtime_ref = runtime.as_mut().expect("runtime should exist");
+                emit_workspace_artifact(runtime_ref, artifact_id).await;
             }
 
             "input.prompt_response" => {
@@ -8277,12 +8617,14 @@ mod tests {
         build_effective_permission_context, build_tool_card_payload, build_ui_card_payload,
         format_skill_create, format_skill_run, format_skills_list, handle_notebook_slash_command,
         handle_skills_slash_command, humanize_tool_verb, inline_list, load_plan_snapshot,
-        notification_value, parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
+        notification_value, parse_artifact_fetch_response, parse_artifact_list_response,
+        parse_bash_slash_action, parse_command_tail, parse_diff_slash_action,
         parse_edit_slash_action, parse_notebook_run_args, parse_python_slash_action,
         parse_read_slash_path, parse_skill_create_args, parse_slash_command, parse_title_json,
         parse_write_slash_action, persist_plan_snapshot, pick_organization, pick_project,
-        plan_snapshot_path, platform_llm_connected, project_api_history, shell_command_join,
-        summarize_api_view, system_prompt_for_mode, tool_surface_downgrade_note, truncate_for_ui,
+        plan_snapshot_path, platform_llm_connected, project_api_history,
+        session_sync_response_error, shell_command_join, summarize_api_view,
+        system_prompt_for_mode, tool_surface_downgrade_note, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
     use prism_runtime::auth;
@@ -8301,6 +8643,123 @@ mod tests {
     use crate::tool_catalog::ToolCatalog;
     use prism_client::api::{OrgInfo, ProjectInfo};
     use prism_ingest::llm::{ChatMessage, FunctionCall, ToolCallResponse};
+
+    #[test]
+    fn empty_artifact_list_is_a_healthy_response() {
+        let response = serde_json::json!({
+            "result": {
+                "artifacts": [],
+                "count": 0,
+                "session_filter": "session-a",
+            }
+        });
+
+        assert_eq!(
+            parse_artifact_list_response(&response, "session-a"),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn artifact_list_preserves_rows_and_rejects_cross_session_data() {
+        let row = serde_json::json!({
+            "artifact_id": "art-a",
+            "tool": "materials_search",
+            "summary": "candidate set",
+            "record_count": 2,
+            "bytes_size": 512,
+            "created_at": "2026-08-11T10:00:00Z",
+            "promoted_to_kg": "future-state",
+            "session_id": "session-a",
+        });
+        let response = serde_json::json!({
+            "result": {
+                "artifacts": [row.clone()],
+                "count": 1,
+                "session_filter": "session-a",
+            }
+        });
+        assert_eq!(
+            parse_artifact_list_response(&response, "session-a"),
+            Ok(vec![row])
+        );
+
+        let wrong_session = serde_json::json!({
+            "result": {
+                "artifacts": [{"session_id": "session-b"}],
+                "count": 1,
+                "session_filter": "session-a",
+            }
+        });
+        let error = parse_artifact_list_response(&wrong_session, "session-a")
+            .expect_err("cross-session row must be rejected");
+        assert_eq!(
+            error,
+            "artifact store returned an artifact for session 'session-b', not current session 'session-a'"
+        );
+    }
+
+    #[test]
+    fn artifact_list_preserves_top_level_and_inner_error_text() {
+        let top_level = serde_json::json!({"error": "store could not be opened"});
+        assert_eq!(
+            parse_artifact_list_response(&top_level, "session-a"),
+            Err("store could not be opened".to_string())
+        );
+
+        let inner = serde_json::json!({
+            "result": {"error": "Artifact store not configured."}
+        });
+        assert_eq!(
+            parse_artifact_list_response(&inner, "session-a"),
+            Err("Artifact store not configured.".to_string())
+        );
+    }
+
+    #[test]
+    fn artifact_fetch_is_unchanged_and_session_scoped() {
+        let artifact = serde_json::json!({
+            "artifact_id": "art-a",
+            "session_id": "session-a",
+            "tool": "materials_search",
+            "result": {"unknown_status": "cancelled-upstream"},
+        });
+        let response = serde_json::json!({"result": artifact.clone()});
+        assert_eq!(
+            parse_artifact_fetch_response(&response, "art-a", "session-a"),
+            Ok(artifact)
+        );
+
+        let wrong_session = serde_json::json!({
+            "result": {
+                "artifact_id": "art-a",
+                "session_id": "session-b",
+            }
+        });
+        let error = parse_artifact_fetch_response(&wrong_session, "art-a", "session-a")
+            .expect_err("cross-session fetch must be rejected");
+        assert_eq!(
+            error,
+            "artifact 'art-a' belongs to session 'session-b', not current session 'session-a'"
+        );
+    }
+
+    #[test]
+    fn artifact_fetch_and_session_sync_preserve_remote_errors() {
+        let response = serde_json::json!({
+            "result": {"error": "Artifact 'art-missing' not found"}
+        });
+        assert_eq!(
+            parse_artifact_fetch_response(&response, "art-missing", "session-a"),
+            Err("Artifact 'art-missing' not found".to_string())
+        );
+
+        let sync_response = serde_json::json!({"error": "memory module unavailable"});
+        assert_eq!(
+            session_sync_response_error(&sync_response, "session-a"),
+            Some("memory module unavailable".to_string())
+        );
+    }
 
     /// TRACE TEST — proves the Agent Execution Contract is in the system
     /// message that actually reaches the model, not merely present in a

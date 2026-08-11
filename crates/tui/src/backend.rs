@@ -266,6 +266,23 @@ impl RealBackend {
         )
     }
 
+    /// Request session-scoped artifact metadata. The backend performs the
+    /// store read and replies through `ui.artifacts.*` notifications.
+    pub fn request_artifacts(&mut self, limit: u64) -> Result<u64> {
+        self.send_request(
+            "workspace.artifacts.list",
+            serde_json::json!({"limit": limit}),
+        )
+    }
+
+    /// Request the full stored content for one artifact.
+    pub fn fetch_artifact(&mut self, artifact_id: &str) -> Result<u64> {
+        self.send_request(
+            "workspace.artifact.fetch",
+            serde_json::json!({"artifact_id": artifact_id}),
+        )
+    }
+
     pub fn send_approval(&mut self, response: &str, tool_name: &str) -> Result<()> {
         // The backend routes prompt/approval responses through
         // `input.prompt_response`; `tool_name` lets an "allow all" (a)
@@ -309,6 +326,7 @@ pub struct FakeBackend {
     rx: mpsc::UnboundedReceiver<Value>,
     next_id: u64,
     scenario: FakeScenario,
+    session_id: String,
 }
 
 impl FakeBackend {
@@ -322,6 +340,7 @@ impl FakeBackend {
             rx,
             next_id: 1,
             scenario,
+            session_id: "fake-session".to_string(),
         };
         backend.enqueue_startup();
         backend
@@ -352,6 +371,7 @@ impl FakeBackend {
             serde_json::json!({
                 "version": "2.7.1-fake",
                 "tool_count": 99,
+                "session_id": self.session_id,
             }),
         );
         self.notify(
@@ -656,7 +676,20 @@ impl FakeBackend {
     }
 
     /// Enqueue a simple response for a slash command.
-    fn enqueue_command_response(&self, command: &str) {
+    fn enqueue_command_response(&mut self, command: &str) {
+        if command == "/clear" {
+            let previous_session_id = self.session_id.clone();
+            self.session_id = format!("fake-session-{}", self.next_id);
+            self.notify(
+                "ui.session.changed",
+                serde_json::json!({
+                    "session_id": self.session_id,
+                    "previous_session_id": previous_session_id,
+                }),
+            );
+            self.notify("ui.turn.complete", serde_json::json!({}));
+            return;
+        }
         // Model picker: `/models list` → deterministic `ui.model.list`.
         if command.starts_with("/models") {
             let items = vec![
@@ -831,6 +864,30 @@ impl FakeBackend {
         Ok(id)
     }
 
+    pub fn request_artifacts(&mut self, _limit: u64) -> Result<u64> {
+        let id = self.next_id();
+        self.notify(
+            "ui.artifacts.list",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "artifacts": [],
+            }),
+        );
+        Ok(id)
+    }
+
+    pub fn fetch_artifact(&mut self, artifact_id: &str) -> Result<u64> {
+        let id = self.next_id();
+        self.notify(
+            "ui.artifact.error",
+            serde_json::json!({
+                "artifact_id": artifact_id,
+                "message": format!("Artifact '{artifact_id}' not found"),
+            }),
+        );
+        Ok(id)
+    }
+
     pub fn send_approval(&mut self, response: &str, _tool_name: &str) -> Result<()> {
         // Enqueue the deterministic approval response based on the
         // user's decision (y/n/a).  This lets the TUI test the full
@@ -929,6 +986,22 @@ impl BackendHandle {
             Self::Real(b) => b.send_command(command),
             Self::Fake(b) => b.send_command(command),
             Self::Native(b) => b.send_command(command),
+        }
+    }
+
+    pub fn request_artifacts(&mut self, limit: u64) -> Result<u64> {
+        match self {
+            Self::Real(b) => b.request_artifacts(limit),
+            Self::Fake(b) => b.request_artifacts(limit),
+            Self::Native(b) => b.request_artifacts(limit),
+        }
+    }
+
+    pub fn fetch_artifact(&mut self, artifact_id: &str) -> Result<u64> {
+        match self {
+            Self::Real(b) => b.fetch_artifact(artifact_id),
+            Self::Fake(b) => b.fetch_artifact(artifact_id),
+            Self::Native(b) => b.fetch_artifact(artifact_id),
         }
     }
 
@@ -1039,6 +1112,20 @@ impl NativeBackend {
         self.send_request(
             "input.command",
             serde_json::json!({"command": command, "silent": false}),
+        )
+    }
+
+    pub fn request_artifacts(&mut self, limit: u64) -> Result<u64> {
+        self.send_request(
+            "workspace.artifacts.list",
+            serde_json::json!({"limit": limit}),
+        )
+    }
+
+    pub fn fetch_artifact(&mut self, artifact_id: &str) -> Result<u64> {
+        self.send_request(
+            "workspace.artifact.fetch",
+            serde_json::json!({"artifact_id": artifact_id}),
         )
     }
 
