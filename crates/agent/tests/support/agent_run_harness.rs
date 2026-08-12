@@ -144,6 +144,7 @@ pub async fn run_stub_turn(session_id: &str) -> Result<StubTurnOutcome> {
         },
         None,
         None,
+        None,
     )
     .await?;
 

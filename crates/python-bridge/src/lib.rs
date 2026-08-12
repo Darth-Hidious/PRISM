@@ -14,8 +14,10 @@
 //! replacement. Callers that need liveness/restart must implement it
 //! themselves.
 
+pub mod pool;
 pub mod tool_server;
 pub mod venv;
+pub use pool::{LaneEnvironment, ToolServerLease, ToolServerPool, ToolServerPoolPolicy};
 pub use tool_server::{TOOL_SERVER_MODULE, ToolServer, ToolServerHandle};
 pub use venv::ensure_venv;
 
@@ -48,6 +50,27 @@ pub enum PythonBridgeError {
     /// expected JSON value.
     #[error("failed to parse python worker response: {0}")]
     Parse(#[from] serde_json::Error),
+
+    /// A previous call on this handle failed mid-exchange, so the next line
+    /// on the pipe may belong to that earlier call. Reading it could deliver
+    /// one caller's response to another, which is why the handle refuses
+    /// instead. `reason` names the original fault.
+    #[error(
+        "tool server pipe desynchronized: an earlier call {reason} — the next response on this \
+         pipe cannot be attributed to any caller, so this child must be replaced (pool lanes \
+         replace it automatically; bare handles must be respawned)"
+    )]
+    Desynchronized { reason: &'static str },
+
+    /// Every pool lane stayed checked out for the whole acquire deadline.
+    #[error(
+        "tool-server pool exhausted: all {lanes} lanes stayed busy for {waited:?} — raise \
+         ToolServerPoolPolicy::max_lanes or reduce the number of concurrently executing agents"
+    )]
+    PoolExhausted {
+        lanes: usize,
+        waited: std::time::Duration,
+    },
 }
 
 #[cfg(test)]

@@ -11,10 +11,13 @@
 //! 1. the loop intercepts `spawn_subagent` and runs a nested `run_turn`,
 //! 2. the nested turn is routed to the requested model,
 //! 3. the nested turn can CALL TOOLS (the stub `stub_echo` executes exactly
-//!    once through the shared Python tool server),
+//!    once — on the subagent's own pool lane when lanes are provided, on the
+//!    parent's handle otherwise),
 //! 4. the subagent's answer comes back to the parent as the tool result and
 //!    the parent finishes its own turn on top of it,
-//! 5. the depth cap refuses to spawn from an agent already at max depth.
+//! 5. the depth cap refuses to spawn from an agent already at max depth,
+//! 6. with a lane pool the subagent's tool calls run on a DIFFERENT child
+//!    process than the parent's; without one they share the parent's child.
 //!
 //! Requires `python3` on PATH; tests skip (with a note) when absent.
 
@@ -65,7 +68,7 @@ for line in sys.stdin:
         ]}
     elif method == "call_tool":
         with open(LOG, "a") as f:
-            f.write(json.dumps(req) + "\n")
+            f.write(json.dumps({"pid": os.getpid(), "req": req}) + "\n")
         resp = {"result": {"ok": True, "tool": req.get("tool"), "payload": "ECHO_PAYLOAD"}}
     else:
         resp = {"error": "unknown method"}
@@ -177,13 +180,17 @@ fn llm_config(base_url: String) -> LlmConfig {
 /// event plus the final answer. `access` is the platform-credential boundary
 /// the transport establishes around the turn: the real TUI dispatch scopes
 /// `VerifiedNodeOwner` (protocol::spawn_agent_turn); tests for non-owner
-/// callers pass `LocalOnly` (the unscoped default).
+/// callers pass `LocalOnly` (the unscoped default). `use_lanes` mirrors the
+/// production dispatch (which passes the seed's subagent lane pool); `false`
+/// exercises the legacy serialized path where the subagent borrows the
+/// parent's tool-server handle.
 async fn run_parent_turn(
     project: &Path,
     python: &Path,
     base_url: String,
     subagent_depth: usize,
     access: CommandToolPlatformAccess,
+    use_lanes: bool,
 ) -> (String, Vec<AgentEvent>) {
     let seed = build_agent_seed(
         &tool_server_config(project, python),
@@ -193,6 +200,7 @@ async fn run_parent_turn(
     .expect("backend seed");
     let prism_agent::protocol::AgentSeed {
         mut tool_server,
+        subagent_lanes,
         command_tool_runtime,
         tools,
         config,
@@ -236,6 +244,7 @@ async fn run_parent_turn(
             },
             None,
             None,
+            use_lanes.then_some(&subagent_lanes),
         ),
     )
     .await
@@ -271,6 +280,7 @@ async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
         base_url,
         0,
         CommandToolPlatformAccess::VerifiedNodeOwner,
+        true,
     )
     .await;
 
@@ -297,7 +307,8 @@ async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
         )),
         "nested tool calls must be visible to the parent's event sink"
     );
-    // …and the tool REALLY executed, exactly once, via the shared server.
+    // …and the tool REALLY executed, exactly once (on the subagent's own
+    // pool lane — the production dispatch shape).
     let log = std::fs::read_to_string(&calls_log).expect("nested tool must have executed");
     let calls = log.lines().filter(|l| l.contains("stub_echo")).count();
     assert_eq!(calls, 1, "nested tool executes exactly once");
@@ -351,6 +362,7 @@ async fn spawn_subagent_refuses_beyond_max_depth() {
         base_url,
         prism_agent::subagent::MAX_SUBAGENT_DEPTH,
         CommandToolPlatformAccess::VerifiedNodeOwner,
+        true,
     )
     .await;
 
@@ -392,6 +404,7 @@ async fn local_only_caller_cannot_spawn_a_subagent() {
         base_url,
         0,
         CommandToolPlatformAccess::LocalOnly,
+        true,
     )
     .await;
 
@@ -412,6 +425,135 @@ async fn local_only_caller_cannot_spawn_a_subagent() {
     assert!(
         !calls_log.exists(),
         "no nested tool may run for a refused spawn"
+    );
+}
+
+// ── Lane separation: the subagent's tools run on its OWN child ───────
+
+/// Routes so BOTH the parent and the subagent call `stub_echo` once:
+/// - `stub-model` (parent): stub_echo → spawn_subagent → PARENT_DONE.
+/// - `claude-fable-5` (subagent): stub_echo → SUBAGENT_DONE.
+async fn start_lane_stub_llm() -> String {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(
+            |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                let tool_msgs = body["messages"]
+                    .as_array()
+                    .map(|msgs| msgs.iter().filter(|m| m["role"] == "tool").count())
+                    .unwrap_or(0);
+                let sse = match (model.as_str(), tool_msgs) {
+                    ("claude-fable-5", 0) => sse_tool_call("stub_echo", "{}"),
+                    ("claude-fable-5", _) => sse_text("SUBAGENT_DONE"),
+                    (_, 0) => sse_tool_call("stub_echo", "{}"),
+                    (_, 1) => sse_tool_call(
+                        "spawn_subagent",
+                        "{\"task\": \"run the echo tool and report back\"}",
+                    ),
+                    (_, _) => sse_text("PARENT_DONE"),
+                };
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .expect("stub response")
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub llm");
+    let addr = listener.local_addr().expect("stub llm addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+/// The pids of the Python children that answered each logged `stub_echo`
+/// call, in execution order.
+fn logged_echo_pids(calls_log: &Path) -> Vec<u64> {
+    let log = std::fs::read_to_string(calls_log).expect("calls.log written");
+    log.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["req"]["tool"] == "stub_echo")
+        .map(|entry| entry["pid"].as_u64().expect("stub logs its pid"))
+        .collect()
+}
+
+/// With a lane pool (the production dispatch), the subagent executes tools
+/// on its OWN tool-server child: the parent's `stub_echo` and the nested
+/// `stub_echo` answer from different pids. This is the falsifiable core of
+/// "the subagent takes its own lane" — if the subagent still borrowed the
+/// parent's handle, both calls would log the same pid and this test fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn subagent_tools_run_on_their_own_lane() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_lane_stub_llm().await;
+    let calls_log = project.path().join("calls.log");
+
+    let (answer, events) = run_parent_turn(
+        project.path(),
+        &python,
+        base_url,
+        0,
+        CommandToolPlatformAccess::VerifiedNodeOwner,
+        true,
+    )
+    .await;
+
+    assert_eq!(answer, "PARENT_DONE");
+    let sub_result =
+        tool_result_content(&events, "spawn_subagent").expect("spawn_subagent result event");
+    assert!(sub_result.contains("SUBAGENT_DONE"), "{sub_result}");
+
+    let pids = logged_echo_pids(&calls_log);
+    assert_eq!(pids.len(), 2, "parent + subagent each echo once: {pids:?}");
+    assert_ne!(
+        pids[0], pids[1],
+        "the subagent must execute tools on its own lane's child, \
+         not the parent's: {pids:?}"
+    );
+}
+
+/// Without a pool (`subagent_lanes: None` — callers that do not opt in), the
+/// legacy path is unchanged: the subagent borrows the PARENT's handle, so
+/// both `stub_echo` calls answer from the same child process.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_pool_the_subagent_borrows_the_parents_handle() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_lane_stub_llm().await;
+    let calls_log = project.path().join("calls.log");
+
+    let (answer, _events) = run_parent_turn(
+        project.path(),
+        &python,
+        base_url,
+        0,
+        CommandToolPlatformAccess::VerifiedNodeOwner,
+        false,
+    )
+    .await;
+
+    assert_eq!(answer, "PARENT_DONE");
+    let pids = logged_echo_pids(&calls_log);
+    assert_eq!(pids.len(), 2, "parent + subagent each echo once: {pids:?}");
+    assert_eq!(
+        pids[0], pids[1],
+        "the no-pool path must keep sharing the parent's child: {pids:?}"
     );
 }
 
@@ -521,6 +663,7 @@ async fn spawn_subagent_preserves_parent_repair_chain() {
         base_url,
         0,
         CommandToolPlatformAccess::VerifiedNodeOwner,
+        true,
     )
     .await;
 

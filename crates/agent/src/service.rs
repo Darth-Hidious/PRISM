@@ -30,7 +30,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use prism_ingest::LlmConfig;
 use prism_ingest::llm::{ChatMessage, LlmClient};
-use prism_python_bridge::{ToolServer, ToolServerHandle};
+use prism_python_bridge::{ToolServer, ToolServerHandle, ToolServerPool};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -211,6 +211,12 @@ struct ChatInner {
     /// inherited platform/provider credentials blanked, so allowing a local
     /// Python tool does not also allow an owner credentialed platform call.
     local_only_tool_server: ToolServerHandle,
+    /// Lane pool for delegated (subagent) turns — see [`AgentSeed`]. Handed
+    /// to `run_turn` only for VerifiedNodeOwner turns; LocalOnly turns get
+    /// `None` (their subagent spawns are refused at the gate anyway, and no
+    /// pool means even a gate regression cannot hand them a credentialed
+    /// child).
+    subagent_lanes: ToolServerPool,
     command_tool_runtime: CommandToolRuntime,
     config: Arc<AgentConfig>,
     hooks: Arc<HookRegistry>,
@@ -221,8 +227,12 @@ struct ChatInner {
 }
 
 /// The agent loop as a service. One instance per node process; turns are
-/// serialized through an async mutex (the underlying Python tool server is
-/// a single stdio child — same one-turn-at-a-time model as the backend).
+/// serialized through an async mutex (each turn drives a single stdio
+/// tool-server child — same one-turn-at-a-time model as the backend).
+/// Within a turn, delegated subagents check out their own children from
+/// `ChatInner::subagent_lanes`, so delegation no longer contends for the
+/// turn's child; lifting the turn-level serialization itself is the
+/// orchestrator fan-out work that builds on those lanes.
 pub struct ChatService {
     inner: tokio::sync::Mutex<ChatInner>,
     /// Cloned out of the seed so read paths don't need the turn lock.
@@ -247,6 +257,7 @@ impl ChatService {
     ) -> Result<Self> {
         let AgentSeed {
             tool_server,
+            subagent_lanes,
             command_tool_runtime,
             tools,
             config,
@@ -284,6 +295,7 @@ impl ChatService {
             inner: tokio::sync::Mutex::new(ChatInner {
                 tool_server,
                 local_only_tool_server,
+                subagent_lanes,
                 command_tool_runtime,
                 config,
                 hooks,
@@ -661,6 +673,7 @@ impl ChatService {
         let ChatInner {
             tool_server,
             local_only_tool_server,
+            subagent_lanes,
             command_tool_runtime,
             hooks,
             permissions,
@@ -671,6 +684,17 @@ impl ChatService {
         let selected_tool_server = match platform_access {
             CommandToolPlatformAccess::VerifiedNodeOwner => tool_server,
             CommandToolPlatformAccess::LocalOnly => local_only_tool_server,
+            CommandToolPlatformAccess::UnverifiedHttp => {
+                unreachable!("UnverifiedHttp is refused before chat_inner")
+            }
+        };
+        // Subagent lanes are owner-only: the pool's children carry the normal
+        // (credentialed) environment, so a LocalOnly turn gets no pool —
+        // belt to the spawn gate's braces (spawn_subagent already refuses
+        // LocalOnly callers before any lane is touched).
+        let subagent_lanes = match platform_access {
+            CommandToolPlatformAccess::VerifiedNodeOwner => Some(&*subagent_lanes),
+            CommandToolPlatformAccess::LocalOnly => None,
             CommandToolPlatformAccess::UnverifiedHttp => {
                 unreachable!("UnverifiedHttp is refused before chat_inner")
             }
@@ -767,6 +791,7 @@ impl ChatService {
             &mut emit,
             Some(approval_rx),
             policy.as_mut(),
+            subagent_lanes,
         )
         .await
         .map_err(ChatError::Turn)?;

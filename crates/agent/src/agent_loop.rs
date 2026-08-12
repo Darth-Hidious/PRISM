@@ -1619,6 +1619,7 @@ pub async fn run_turn(
     emit: &mut (dyn FnMut(AgentEvent) + Send),
     approval_rx: Option<SharedApprovalReceiver>,
     policy: Option<&mut prism_policy::PolicyEngine>,
+    subagent_lanes: Option<&prism_python_bridge::ToolServerPool>,
 ) -> Result<()> {
     let session_id = crate::hooks::provenance_session_id();
     let run =
@@ -1655,6 +1656,7 @@ pub async fn run_turn(
                     emit,
                     approval_rx,
                     policy,
+                    subagent_lanes,
                     &run.id,
                     &run.session_id,
                     &mut run_metrics,
@@ -1721,6 +1723,9 @@ pub(crate) async fn run_turn_inner(
     emit: &mut (dyn FnMut(AgentEvent) + Send),
     approval_rx: Option<SharedApprovalReceiver>,
     mut policy: Option<&mut prism_policy::PolicyEngine>,
+    // Lane pool for delegated (subagent) turns. `None` = the legacy
+    // serialized path: a spawned subagent borrows THIS turn's tool server.
+    subagent_lanes: Option<&prism_python_bridge::ToolServerPool>,
     current_run_id: &str,
     current_session_id: &str,
     run_metrics: &mut AgentRunMetrics,
@@ -2580,6 +2585,7 @@ pub(crate) async fn run_turn_inner(
                             emit,
                             approval_rx.clone(),
                             policy.as_deref_mut(),
+                            subagent_lanes,
                         )
                         .await;
                         // The subagent's spend counts against the PARENT's cumulative

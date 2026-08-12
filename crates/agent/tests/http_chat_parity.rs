@@ -401,6 +401,7 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
 
     let AgentSeed {
         mut tool_server,
+        subagent_lanes: _,
         command_tool_runtime,
         tools,
         config,
@@ -435,6 +436,7 @@ async fn http_chat_service_and_backend_share_loop_and_catalog() {
                 backend_answer = text;
             }
         },
+        None,
         None,
         None,
     )
@@ -791,6 +793,7 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
     .expect("seed");
     let AgentSeed {
         mut tool_server,
+        subagent_lanes: _,
         command_tool_runtime,
         tools,
         config,
@@ -825,6 +828,7 @@ async fn unsupported_execution_claim_cannot_finalize_a_turn() {
             } if !text.is_empty() => answer = text,
             _ => {}
         },
+        None,
         None,
         None,
     )

@@ -18,6 +18,7 @@ use prism_client::api::{OrgInfo, PlatformClient, ProjectInfo};
 use prism_ingest::LlmConfig;
 use prism_ingest::llm::{ChatMessage, LlmClient};
 use prism_python_bridge::tool_server::{ToolServer, ToolServerHandle};
+use prism_python_bridge::{LaneEnvironment, ToolServerPool, ToolServerPoolPolicy};
 use prism_runtime::auth::{self, AUTH_REQUIRED_RPC_CODE};
 use prism_runtime::platform_env::PlatformVar;
 use prism_runtime::{PlatformEndpoints, PrismPaths, StoredCredentials};
@@ -170,6 +171,8 @@ struct SlashCommandContext {
 
 struct ServerRuntime {
     tool_server: ToolServerHandle,
+    /// Lane pool for delegated (subagent) turns — see [`AgentSeed`].
+    subagent_lanes: ToolServerPool,
     command_tool_runtime: CommandToolRuntime,
     llm_config: LlmConfig,
     history: Vec<ChatMessage>,
@@ -6211,6 +6214,7 @@ fn spawn_agent_turn(
                 },
                 Some(approval_rx),
                 runtime.policy_engine.as_mut(),
+                Some(&runtime.subagent_lanes),
             ),
         )
         .await;
@@ -7858,6 +7862,14 @@ async fn handle_command(
 /// same hooks, same chat-mode permission baseline.
 pub struct AgentSeed {
     pub tool_server: ToolServerHandle,
+    /// Bounded lane pool for delegated (subagent) turns, so a subagent
+    /// executes Python tools on its own child instead of serializing behind
+    /// the parent's `tool_server`. Normal (inherited) environment by design:
+    /// `spawn_subagent` is owner-gated (effect-classified ExecutesCode), so
+    /// no LocalOnly caller can reach these lanes — the LocalOnly surface
+    /// keeps its own scrubbed child and receives no pool at all. Children
+    /// spawn lazily: a session that never delegates pays nothing.
+    pub subagent_lanes: ToolServerPool,
     pub command_tool_runtime: CommandToolRuntime,
     pub tools: Arc<ToolCatalog>,
     pub config: Arc<AgentConfig>,
@@ -7911,8 +7923,25 @@ pub async fn build_agent_seed(
     let tools = Arc::new(tool_catalog);
     tracing::info!(tool_count = tools.len(), "loaded tool catalog");
 
+    // Runtime instruction discovery: fold any per-project `AGENTS.md`
+    // (walked from the working directory up to the git root, plus
+    // `~/.prism/AGENTS.md`) into the base prompt. A missing file is normal
+    // and adds nothing; an unreadable or non-UTF-8 file is reported as a
+    // warning, never swallowed.
+    let instruction_discovery = crate::prompts::discover_instruction_files(
+        &tool_server_config.project_root,
+        &crate::prompts::InstructionPolicy::default(),
+    );
+    for warning in &instruction_discovery.warnings {
+        tracing::warn!(target: "prism::instructions", "{warning}");
+    }
+    let system_prompt = crate::prompts::inject_project_instructions(
+        &build_system_prompt(true),
+        &instruction_discovery,
+    );
+
     let config = Arc::new(AgentConfig {
-        system_prompt: build_system_prompt(true),
+        system_prompt,
         ..Default::default()
     });
     let command_tool_runtime = CommandToolRuntime {
@@ -7937,6 +7966,11 @@ pub async fn build_agent_seed(
 
     Ok(AgentSeed {
         tool_server,
+        subagent_lanes: ToolServerPool::new(
+            tool_server_config.clone(),
+            LaneEnvironment::Inherited,
+            ToolServerPoolPolicy::default(),
+        ),
         command_tool_runtime,
         tools,
         config,
@@ -7998,6 +8032,7 @@ async fn run_server_core(
 
     let AgentSeed {
         tool_server,
+        subagent_lanes,
         command_tool_runtime,
         tools,
         config,
@@ -8064,6 +8099,7 @@ async fn run_server_core(
 
     let mut runtime = Some(ServerRuntime {
         tool_server,
+        subagent_lanes,
         command_tool_runtime,
         llm_config,
         history: Vec::new(),

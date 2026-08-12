@@ -1,10 +1,14 @@
 //! `spawn_subagent` — delegate a self-contained task to a nested agent turn.
 //!
 //! The subagent is not a stub: it runs one full [`crate::agent_loop::run_turn`]
-//! (the same TAOR loop the parent is running) against the SAME tool server,
-//! command-tool runtime, tool catalog, hooks, and permission context — with a
-//! fresh history/transcript/scratchpad and (by default) the Fable frontier
-//! model. The parent receives a short text summary plus provenance REFERENCES
+//! (the same TAOR loop the parent is running) against the same command-tool
+//! runtime, tool catalog, hooks, and permission context — with a fresh
+//! history/transcript/scratchpad and (by default) the Fable frontier model.
+//! When the caller provides a lane pool ([`ToolServerPool`]), the subagent
+//! checks out its OWN tool-server lane instead of borrowing the parent's
+//! handle, so its Python tool calls no longer serialize behind the parent's;
+//! without a pool it borrows the parent's handle exactly as before.
+//! The parent receives a short text summary plus provenance REFERENCES
 //! to what the subagent produced ([`ArtifactHandle`]s — pointers, not blobs;
 //! `recall(id=…)` expands them).
 //!
@@ -41,6 +45,7 @@ use serde_json::{Value, json};
 
 use prism_ingest::llm::LlmClient;
 use prism_python_bridge::tool_server::ToolServerHandle;
+use prism_python_bridge::{ToolServerLease, ToolServerPool};
 
 use crate::agent_loop::SharedApprovalReceiver;
 use crate::command_tools::CommandToolRuntime;
@@ -212,6 +217,7 @@ pub fn execute_spawn_subagent<'a>(
     emit: &'a mut (dyn FnMut(AgentEvent) + Send),
     approval_rx: Option<SharedApprovalReceiver>,
     policy: Option<&'a mut prism_policy::PolicyEngine>,
+    subagent_lanes: Option<&'a ToolServerPool>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         execute_spawn_subagent_inner(
@@ -229,6 +235,7 @@ pub fn execute_spawn_subagent<'a>(
             emit,
             approval_rx,
             policy,
+            subagent_lanes,
         )
         .await
     })
@@ -250,6 +257,7 @@ async fn execute_spawn_subagent_inner(
     emit: &mut (dyn FnMut(AgentEvent) + Send),
     approval_rx: Option<SharedApprovalReceiver>,
     policy: Option<&mut prism_policy::PolicyEngine>,
+    subagent_lanes: Option<&ToolServerPool>,
 ) -> Result<Value> {
     // SAFETY: access gate FIRST. spawn_subagent is effect-classified
     // ExecutesCode (it drives a nested turn over the same code-running tool
@@ -268,6 +276,61 @@ async fn execute_spawn_subagent_inner(
         return Ok(err);
     }
     let sub = parse_args(args)?;
+
+    // Own tool-server lane. With a pool, the subagent's Python tool calls run
+    // on a child of its OWN instead of serializing behind (and mutably
+    // borrowing) the parent's handle — the substrate for concurrent
+    // delegation. Acquired BEFORE the durable child row for the same reason
+    // the gates run first: a refused lane leaves no ghost agent. Refusal is a
+    // model-visible soft error (the honest pool error names the bound), never
+    // a silent fallback onto the parent's handle — quietly re-serializing
+    // would hide the resource pressure the pool bound exists to surface.
+    //
+    // LocalOnly isolation note: this pool vends normal-environment children,
+    // which is safe here because the ExecutesCode gate above already refused
+    // every non-node-owner caller — and the LocalOnly chat path additionally
+    // passes no pool at all (see `ChatService::chat_inner`).
+    let mut own_lane: Option<ToolServerLease> = match subagent_lanes {
+        Some(pool) => match pool.acquire().await {
+            Ok(mut lane) => {
+                // Point the lane's Python artifact recorder at the parent's
+                // session (the subagent's work belongs to the same session).
+                // App-level refusal is nonfatal — the same best-effort
+                // contract as `sync_tool_server_session` in protocol.rs — but
+                // a TRANSPORT failure means the lane itself is broken, and a
+                // broken lane must be reported, not used.
+                match lane.set_session_id(parent_session_id).await {
+                    Ok(response) => {
+                        if let Some(error) = response.get("error") {
+                            tracing::warn!(
+                                session_id = parent_session_id,
+                                %error,
+                                "subagent lane session sync refused; continuing"
+                            );
+                        }
+                        Some(lane)
+                    }
+                    Err(error) => {
+                        return Ok(json!({
+                            "error": format!(
+                                "subagent tool-server lane failed during session sync: {error}. \
+                                 Do the task yourself in this turn instead of delegating."
+                            ),
+                        }));
+                    }
+                }
+            }
+            Err(error) => {
+                return Ok(json!({
+                    "error": format!(
+                        "subagent tool-server lane unavailable: {error}. \
+                         Do the task yourself in this turn instead of delegating."
+                    ),
+                }));
+            }
+        },
+        None => None,
+    };
 
     // The child row is created only after every spawn gate above succeeds, so
     // refused delegation does not leave a ghost agent. Its explicit parent id
@@ -397,10 +460,17 @@ async fn execute_spawn_subagent_inner(
         // (H3: the old restore-before-`?` was skipped on unwind). The parent's
         // chain survives intact and the subagent's is isolated + discarded.
         let _chain_guard = crate::hooks::CodeRunChainGuard::new();
+        // The nested turn executes tools on the subagent's own lane when one
+        // was acquired; only the legacy no-pool path still borrows the
+        // parent's handle.
+        let nested_tool_server: &mut ToolServerHandle = match own_lane.as_mut() {
+            Some(lane) => lane,
+            None => tool_server,
+        };
         let nested: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> =
             Box::pin(crate::agent_loop::run_turn_inner(
                 &sub_llm,
-                tool_server,
+                nested_tool_server,
                 command_tool_runtime,
                 &mut history,
                 tool_catalog,
@@ -415,6 +485,9 @@ async fn execute_spawn_subagent_inner(
                 &mut nested_emit,
                 approval_rx,
                 policy,
+                // Forwarded so a depth-2 subagent also takes its own lane
+                // (bounded by the pool, refused honestly on exhaustion).
+                subagent_lanes,
                 &child_run.id,
                 &child_run.session_id,
                 &mut run_metrics,
@@ -422,6 +495,10 @@ async fn execute_spawn_subagent_inner(
         // `_chain_guard` restores the parent's chain on drop (Ok/Err/unwind).
         nested_result = nested.await;
     }
+    // Release the lane as soon as the nested turn is over — a healthy child
+    // returns to the pool for reuse; a desynchronized one is discarded and
+    // replaced on the next acquire (see ToolServerLease).
+    drop(own_lane);
 
     run_heartbeat.stop().await;
 

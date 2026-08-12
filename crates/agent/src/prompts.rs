@@ -10,6 +10,8 @@
 //! prompt state rather than one giant monolithic blob.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::prompt_profile::{LengthBudget, PromptProfile, ReasoningMode, StructureStyle};
 use crate::tool_catalog::ToolCatalog;
@@ -568,6 +570,279 @@ pub fn render_system_prompt(canonical: &str, profile: &PromptProfile) -> String 
     out
 }
 
+// ---------------------------------------------------------------------------
+// Runtime instruction-file discovery.
+//
+// A lab encodes its own conventions — preferred units, ontology choices, which
+// sources it trusts — in an `AGENTS.md` checked into the project, the same way
+// this repo's own root `AGENTS.md` carries contributor tooling notes. At agent
+// startup PRISM walks from the working directory UPWARD to the git root,
+// collecting any `AGENTS.md` it finds, and folds the text into the system
+// prompt as a trailing "Project Instructions" section. Nearest file last, so
+// the most specific instructions win. An optional `~/.prism/AGENTS.md` carries
+// host-wide defaults and is treated as the most general (first) section.
+//
+// Context is a budget: an enormous file is truncated, and the truncation is
+// stated in the injected text rather than silently cut. Files PRISM cannot
+// read (non-UTF-8, unreadable) are REPORTED as warnings, never swallowed — a
+// lab that wrote instructions PRISM cannot parse must find that out. A missing
+// file is the normal case and adds nothing.
+// ---------------------------------------------------------------------------
+
+/// Filename discovered at each level of the upward walk.
+const INSTRUCTION_FILE_NAME: &str = "AGENTS.md";
+/// Marker that bounds the upward walk: a directory containing a `.git` entry
+/// (file or directory) is the repository root, and discovery stops there.
+const GIT_DIR: &str = ".git";
+
+/// Policy for runtime instruction-file discovery.
+///
+/// All size ceilings live here rather than at call sites so operators reason
+/// about one declared policy and a hidden magic number cannot creep in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstructionPolicy {
+    /// Maximum bytes read from a single instruction file. A file larger than
+    /// this is truncated to fit, and the injected text says so — it is never
+    /// silently cut.
+    pub max_bytes_per_file: usize,
+    /// Hard cap on the total bytes of instruction text injected across every
+    /// discovered file. Honoured after per-file truncation; if the assembled
+    /// body still exceeds it, the body is tail-truncated and a marker is added.
+    pub max_total_bytes: usize,
+    /// Whether `~/.prism/AGENTS.md` is consulted after the upward walk, as the
+    /// most general (first) section. Off disables host-wide instructions.
+    pub enable_home_lookup: bool,
+}
+
+impl Default for InstructionPolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_file: 32_768,
+            max_total_bytes: 65_536,
+            enable_home_lookup: true,
+        }
+    }
+}
+
+/// The result of runtime instruction-file discovery.
+///
+/// `text` is the assembled body (most-general-first, nearest-last), ready to
+/// fold into the system prompt. `warnings` carries non-fatal problems — an
+/// unreadable or non-UTF-8 file — that the caller should surface, since a lab
+/// that wrote instructions PRISM cannot read must find that out. Empty `text`
+/// with no warnings is the normal "no instruction file present" case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstructionDiscovery {
+    /// Assembled instruction text, or empty when nothing was found.
+    pub text: String,
+    /// Non-fatal read problems (non-UTF-8, I/O error) worth reporting.
+    pub warnings: Vec<String>,
+}
+
+/// One file's read outcome: usable content (with a truncation flag) or a
+/// warning string explaining why it could not be used.
+enum FileRead {
+    Content { text: String, truncated: bool },
+    Warning(String),
+}
+
+/// Discover and read project instruction files from `cwd` upward to the git
+/// root, then optionally `~/.prism/AGENTS.md`.
+///
+/// The walk visits `cwd`, then each parent, and stops AFTER the first ancestor
+/// that contains a `.git` entry — so the repository root's own `AGENTS.md` is
+/// included and nothing above it is read. A `~/.prism/AGENTS.md` (when enabled
+/// and present) is the most general section and is listed FIRST.
+///
+/// `AGENTS.md` symlinks are refused outright (never followed): this is the
+/// strict reading of "never follow symlinks out of the tree", and a symlinked
+/// instruction file is unusual enough that refusing it is safer than
+/// canonicalizing and re-checking containment.
+///
+/// Never panics and never returns an error: a missing file, a missing home
+/// directory, or an unreadable ancestor is simply not an instruction file.
+#[must_use]
+pub fn discover_instruction_files(cwd: &Path, policy: &InstructionPolicy) -> InstructionDiscovery {
+    // Collect candidates in walk order (nearest first). The output is reversed
+    // later so the nearest, most-specific file comes last.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut dir: &Path = cwd;
+    loop {
+        let candidate = dir.join(INSTRUCTION_FILE_NAME);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+        if dir.join(GIT_DIR).exists() {
+            break; // repository root: include it, stop above it
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break, // filesystem root with no `.git` — walk to the top
+        }
+    }
+    if policy.enable_home_lookup
+        && let Some(home) = dirs::home_dir()
+    {
+        let home_file = home.join(".prism").join(INSTRUCTION_FILE_NAME);
+        if home_file.is_file() {
+            candidates.push(home_file);
+        }
+    }
+
+    // Most-general-first, nearest-last: home (if any) then repo-root ... cwd.
+    candidates.reverse();
+
+    // Read every candidate so unreadable / non-UTF-8 files are always reported,
+    // even ones later dropped by the total budget.
+    let mut sections: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for path in &candidates {
+        let display = display_path(path, cwd);
+        match read_one_instruction_file(path, &display, policy.max_bytes_per_file) {
+            Some(FileRead::Content { text, truncated }) => {
+                sections.push(format_file_section(
+                    &display,
+                    &text,
+                    truncated,
+                    policy.max_bytes_per_file,
+                ));
+            }
+            Some(FileRead::Warning(message)) => warnings.push(message),
+            None => {} // absent, non-regular, or a refused symlink
+        }
+    }
+
+    let mut text = sections.join("\n\n");
+    if text.len() > policy.max_total_bytes {
+        // Tail-truncate the assembled body to the total budget. This is the
+        // last-resort ceiling; the realistic "enormous AGENTS.md" case is
+        // handled per-file above with its own marker. A tail cut may drop the
+        // most-specific file, which is documented and rare under sane sizes.
+        let cut = text.floor_char_boundary(policy.max_total_bytes);
+        text.truncate(cut);
+        text.push_str(&format!(
+            "\n\n[PRISM: combined project instructions exceed the total budget \
+             of {budget} bytes and were truncated; later, more-specific sections \
+             may be missing.]",
+            budget = policy.max_total_bytes
+        ));
+    }
+
+    InstructionDiscovery { text, warnings }
+}
+
+/// Fold discovered instruction text into a base system prompt.
+///
+/// When `discovery.text` is empty the base is returned byte-for-byte: the
+/// common "no instruction file" case provably does not alter today's prompt.
+/// Otherwise the text is appended as a trailing "Project Instructions" section.
+#[must_use]
+pub fn inject_project_instructions(base: &str, discovery: &InstructionDiscovery) -> String {
+    if discovery.text.is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\n# Project Instructions\n\n{preamble}\n\n{body}",
+        preamble = INJECTION_PREAMBLE,
+        body = discovery.text,
+    )
+}
+
+/// One-line preamble explaining the section's ordering to the model.
+const INJECTION_PREAMBLE: &str = "The following project instruction files were \
+discovered from the working directory up to the git root, and optionally \
+`~/.prism/AGENTS.md`. They are listed most-general-first; LATER sections are \
+more specific and take precedence over earlier ones.";
+
+/// Read one instruction file, honouring the per-file byte cap and refusing
+/// symlinks. Returns `None` for an absent / non-regular / symlinked path,
+/// `Warning` for a file that exists but cannot be parsed, and `Content`
+/// (with a `truncated` flag) for a usable file.
+fn read_one_instruction_file(path: &Path, display: &str, max_bytes: usize) -> Option<FileRead> {
+    // `symlink_metadata` does not follow symlinks, so a symlinked AGENTS.md
+    // is detected and refused here rather than resolved out of the tree.
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return None;
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+
+    // Cap the read at max_bytes + 1: the +1 byte lets us detect "oversized"
+    // without reading a multi-gigabyte file into memory.
+    let cap = max_bytes.saturating_add(1);
+    let bytes = match read_capped(path, cap) {
+        Ok(b) => b,
+        Err(err) => {
+            return Some(FileRead::Warning(format!(
+                "could not read instruction file {display}: {err}"
+            )));
+        }
+    };
+
+    let oversized = bytes.len() > max_bytes;
+    // Validate UTF-8 on the bytes we actually read. A non-UTF-8 file is
+    // reported, never lossily coerced into the prompt.
+    let validated = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return Some(FileRead::Warning(format!(
+                "instruction file {display} is not valid UTF-8 and was skipped"
+            )));
+        }
+    };
+    let (text, truncated) = if oversized {
+        let cut = validated.floor_char_boundary(max_bytes);
+        (validated[..cut].to_string(), true)
+    } else {
+        (validated.to_string(), false)
+    };
+    Some(FileRead::Content { text, truncated })
+}
+
+/// Read up to `cap` bytes from `path`.
+fn read_capped(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    file.take(cap as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Render one file's contribution as a titled, self-describing section.
+fn format_file_section(display: &str, text: &str, truncated: bool, budget: usize) -> String {
+    let mut section = format!("## {display}\n\n{text}");
+    if truncated {
+        section.push_str(&format!(
+            "\n\n[PRISM: {display} exceeds the per-file budget of {budget} bytes \
+             and was truncated; the remainder was not read.]"
+        ));
+    }
+    section
+}
+
+/// Human-friendly path for a discovered file: `~/.prism/AGENTS.md` for the home
+/// file, a path relative to `cwd` for in-tree files, and the absolute path
+/// otherwise.
+fn display_path(path: &Path, cwd: &Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && path.starts_with(&home)
+    {
+        return path
+            .strip_prefix(&home)
+            .map(|rest| format!("~/{}", rest.display()))
+            .unwrap_or_else(|_| path.display().to_string());
+    }
+    if let Ok(rel) = path.strip_prefix(cwd) {
+        if rel.as_os_str().is_empty() {
+            return INSTRUCTION_FILE_NAME.to_string();
+        }
+        return rel.display().to_string();
+    }
+    path.display().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1294,161 @@ mod tests {
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("pareto_screen"));
         assert!(prompt.contains("multi-objective") || prompt.contains("suggest_next_experiments"));
+    }
+
+    // ---- Runtime instruction-file discovery ------------------------------
+    //
+    // Every test pins a `.git` at the temp root so the upward walk cannot
+    // escape into the shared system temp, and disables home lookup so the
+    // developer's own `~/.prism/AGENTS.md` never leaks into results.
+
+    fn test_policy() -> InstructionPolicy {
+        InstructionPolicy {
+            enable_home_lookup: false,
+            ..InstructionPolicy::default()
+        }
+    }
+
+    fn git_bound(dir: &std::path::Path) {
+        std::fs::write(dir.join(".git"), "gitdir: nowhere").unwrap();
+    }
+
+    /// Non-negotiable: with no instruction file anywhere reachable, the prompt
+    /// is byte-for-byte today's static base. Fails the instant discovery
+    /// disturbs the empty case (e.g. appends an empty section header) or the
+    /// static prompt text is edited.
+    #[test]
+    fn no_instructions_yields_byte_for_byte_prompt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_bound(dir.path());
+
+        let discovery = discover_instruction_files(dir.path(), &test_policy());
+        assert!(discovery.text.is_empty());
+        assert!(discovery.warnings.is_empty());
+
+        let base = build_system_prompt(true);
+        assert_eq!(inject_project_instructions(&base, &discovery), base);
+    }
+
+    /// A file sitting at the working directory is folded into the prompt.
+    #[test]
+    fn instruction_file_at_cwd_is_injected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_bound(dir.path());
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "Always cite MP ids verbatim.\n",
+        )
+        .unwrap();
+
+        let d = discover_instruction_files(dir.path(), &test_policy());
+        let prompt = inject_project_instructions(&build_system_prompt(true), &d);
+
+        assert!(
+            prompt.starts_with("You are PRISM"),
+            "base prompt stays intact at the front"
+        );
+        assert!(prompt.contains("# Project Instructions"));
+        assert!(prompt.contains("Always cite MP ids verbatim."));
+    }
+
+    /// Two levels: both files are included, nearest (most specific) LAST.
+    #[test]
+    fn two_levels_both_included_nearest_last() {
+        let root = tempfile::TempDir::new().unwrap();
+        git_bound(root.path());
+        std::fs::write(root.path().join("AGENTS.md"), "GENERAL-ROOT\n").unwrap();
+        let deep = root.path().join("sub");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("AGENTS.md"), "NEAREST-DEEP\n").unwrap();
+
+        let d = discover_instruction_files(&deep, &test_policy());
+        let prompt = inject_project_instructions(&build_system_prompt(true), &d);
+
+        let general = prompt.find("GENERAL-ROOT").expect("general file present");
+        let nearest = prompt.find("NEAREST-DEEP").expect("nearest file present");
+        assert!(
+            general < nearest,
+            "general (repo root) must precede the nearest (most specific) file"
+        );
+    }
+
+    /// Discovery stops at the git root: a file ABOVE it is never read.
+    #[test]
+    fn discovery_stops_at_git_root() {
+        let outer = tempfile::TempDir::new().unwrap();
+        // A file above the repo root — must not be read.
+        std::fs::write(
+            outer.path().join("AGENTS.md"),
+            "ABOVE-ROOT-MUST-NOT-APPEAR\n",
+        )
+        .unwrap();
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_bound(&repo);
+        let work = repo.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("AGENTS.md"), "INSIDE-REPO\n").unwrap();
+
+        let d = discover_instruction_files(&work, &test_policy());
+        let prompt = inject_project_instructions(&build_system_prompt(true), &d);
+
+        assert!(prompt.contains("INSIDE-REPO"));
+        assert!(
+            !prompt.contains("ABOVE-ROOT-MUST-NOT-APPEAR"),
+            "discovery read a file above the git root"
+        );
+    }
+
+    /// An oversized file is truncated AND the injected text says so — never a
+    /// silent cut.
+    #[test]
+    fn oversized_file_is_truncated_and_says_so() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_bound(dir.path());
+        std::fs::write(dir.path().join("AGENTS.md"), "A".repeat(200)).unwrap();
+
+        let policy = InstructionPolicy {
+            max_bytes_per_file: 64,
+            enable_home_lookup: false,
+            ..InstructionPolicy::default()
+        };
+        let d = discover_instruction_files(dir.path(), &policy);
+        let prompt = inject_project_instructions(&build_system_prompt(true), &d);
+
+        assert!(
+            prompt.contains("truncated"),
+            "truncation must be stated in the injected text"
+        );
+        assert!(
+            prompt.contains("64 bytes"),
+            "marker must state the per-file budget"
+        );
+        // The first 64 bytes survive; the 65th onward do not.
+        assert!(prompt.contains(&"A".repeat(64)));
+        assert!(!prompt.contains(&"A".repeat(65)));
+    }
+
+    /// A non-UTF-8 file is REPORTED (a warning), not silently skipped, and its
+    /// bytes are never lossily injected.
+    #[test]
+    fn non_utf8_file_is_reported_not_silent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_bound(dir.path());
+        let mut bytes = b"readable prefix ".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0xC0, 0xC0]);
+        std::fs::write(dir.path().join("AGENTS.md"), bytes).unwrap();
+
+        let d = discover_instruction_files(dir.path(), &test_policy());
+        assert!(
+            !d.warnings.is_empty(),
+            "a non-UTF-8 file must be reported, not silent"
+        );
+        assert!(
+            d.warnings.iter().any(|w| w.contains("UTF-8")),
+            "warning must mention UTF-8: {:?}",
+            d.warnings
+        );
+        assert!(!d.text.contains("readable prefix"));
     }
 }
