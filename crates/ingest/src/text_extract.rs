@@ -79,6 +79,104 @@ impl Default for GroundingPolicy {
     }
 }
 
+/// Why one extracted fact was refused.
+///
+/// One variant per real refusal site in this module, because the repair
+/// queue's policy hangs off exactly this distinction — see
+/// [`RejectionClass::judgement_was_rendered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionClass {
+    /// The unit did not resolve to a QUDT identifier. A vocabulary lookup
+    /// failed; nothing was judged about whether the fact is true.
+    UnresolvedUnit,
+    /// The extracted shape could not be converted at all (a measurement with
+    /// no value, a numeric condition with no unit, …).
+    MalformedShape,
+    /// The document never names the fact's subject.
+    SubjectNotNamed,
+    /// No single span carries the value together with its subject, unit and
+    /// conditions.
+    NumericUnsupported,
+    /// A value-less assertion arrived carrying a unit — a contradictory shape.
+    ValuelessWithUnit,
+    /// Policy forbade storing a value-less assertion without a model review.
+    /// Not an error: an operator's configured choice.
+    PolicyDeferred,
+    /// Semantic review examined the fact and said the source denies it.
+    ReviewDenied,
+    /// Semantic review examined the fact and abstained.
+    ReviewUncertain,
+    /// Semantic review rendered NO verdict for this fact — the call failed,
+    /// or its reply carried nothing for this item.
+    ReviewMissing,
+}
+
+impl RejectionClass {
+    /// Whether a judgement about this fact was actually RENDERED.
+    ///
+    /// This is the anti-ratchet rule, in the type rather than in a caller's
+    /// discipline. A repair loop that re-asks where an answer already exists
+    /// keeps every "yes" and re-rolls every "no", so sampling noise converts
+    /// monotonically into acceptances — laundering a fact past a guard,
+    /// whatever the intent. Re-asking is legitimate only where nothing was
+    /// ever decided.
+    ///
+    /// The honest way to revisit a rendered judgement is a VERSIONED gate
+    /// change plus re-ingest, which re-judges the whole corpus symmetrically
+    /// (a yes can become a no). Per-item retry can only ratchet upward.
+    #[must_use]
+    pub fn judgement_was_rendered(self) -> bool {
+        match self {
+            Self::ReviewDenied
+            | Self::ReviewUncertain
+            | Self::SubjectNotNamed
+            | Self::NumericUnsupported => true,
+            Self::UnresolvedUnit
+            | Self::MalformedShape
+            | Self::ValuelessWithUnit
+            | Self::PolicyDeferred
+            | Self::ReviewMissing => false,
+        }
+    }
+
+    /// Stable identifier for ledgers and reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnresolvedUnit => "unresolved_unit",
+            Self::MalformedShape => "malformed_shape",
+            Self::SubjectNotNamed => "subject_not_named",
+            Self::NumericUnsupported => "numeric_unsupported",
+            Self::ValuelessWithUnit => "valueless_with_unit",
+            Self::PolicyDeferred => "policy_deferred",
+            Self::ReviewDenied => "review_denied",
+            Self::ReviewUncertain => "review_uncertain",
+            Self::ReviewMissing => "review_missing",
+        }
+    }
+}
+
+/// What was refused: a converted fact, or the raw extraction that could not
+/// be converted into one. Exactly one, never both.
+#[derive(Debug, Clone)]
+pub enum RejectedSubject {
+    Converted(Box<MaterialFact>),
+    Raw(Box<serde_json::Value>),
+}
+
+/// One refused fact, structured.
+///
+/// `dropped_facts` carries the same refusals as human-readable prose and is
+/// unchanged. Prose cannot be re-judged: a repair queue needs the fact, its
+/// class and the reason as separate fields.
+#[derive(Debug, Clone)]
+pub struct RejectedFact {
+    pub subject: RejectedSubject,
+    pub class: RejectionClass,
+    /// The same human-readable reason that goes to `dropped_facts`.
+    pub detail: String,
+}
+
 /// What one extraction call produced.
 #[derive(Debug, Clone)]
 pub struct TextExtraction {
@@ -1045,6 +1143,59 @@ fn extract_json_block(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The anti-ratchet rule, asserted rather than assumed.
+    ///
+    /// A repair queue may only re-ask where no judgement exists. If a future
+    /// change moves a RENDERED judgement into the re-askable set, this test
+    /// fails — which is the point: that change converts sampling noise into
+    /// acceptances and launders facts past a guard.
+    #[test]
+    fn only_unrendered_judgements_may_be_re_asked() {
+        use RejectionClass::*;
+        // A verdict was given, or code searched the document and found none.
+        for rendered in [
+            ReviewDenied,
+            ReviewUncertain,
+            SubjectNotNamed,
+            NumericUnsupported,
+        ] {
+            assert!(
+                rendered.judgement_was_rendered(),
+                "{} is a rendered judgement; re-asking it is persuasion, not repair",
+                rendered.as_str()
+            );
+        }
+        // Nothing was decided: a lookup failed, a shape was wrong, a verdict
+        // never arrived, or an operator deferred the question.
+        for unrendered in [
+            UnresolvedUnit,
+            MalformedShape,
+            ValuelessWithUnit,
+            PolicyDeferred,
+            ReviewMissing,
+        ] {
+            assert!(
+                !unrendered.judgement_was_rendered(),
+                "{} had no judgement rendered; obtaining one is not overriding one",
+                unrendered.as_str()
+            );
+        }
+    }
+
+    /// A denial and a missing verdict come from adjacent lines and are
+    /// ethically opposite. Nothing may collapse them.
+    #[test]
+    fn a_denial_and_a_missing_verdict_are_never_the_same_class() {
+        assert_ne!(RejectionClass::ReviewDenied, RejectionClass::ReviewMissing);
+        assert!(RejectionClass::ReviewDenied.judgement_was_rendered());
+        assert!(!RejectionClass::ReviewMissing.judgement_was_rendered());
+        // Distinct ledger identifiers, so an audit can tell them apart.
+        assert_ne!(
+            RejectionClass::ReviewDenied.as_str(),
+            RejectionClass::ReviewMissing.as_str()
+        );
+    }
 
     use super::*;
     use wiremock::matchers::{method, path};
