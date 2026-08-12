@@ -65,6 +65,24 @@ const UNIT_SPELLINGS: &[(&str, &str)] = &[
     // Speed — LPBF scan speeds live here
     ("mm/s", "QUDT:MilliM-PER-SEC"),
     ("m/s", "QUDT:M-PER-SEC"),
+    // DESCRIPTIVE spellings of the same two units. Measured on a real
+    // 36-page LPBF paper through the live pipeline (Gemma 4 12B): of 58
+    // extracted facts only 4 were stored, and 27 of the 54 drops were this
+    // one unit — the model wrote `QUDT:Meter-Per-Second`, the human-readable
+    // form of an identifier this table ALREADY vouches for. Half the loss on
+    // that paper was spelling, not data.
+    //
+    // These add SPELLINGS for identifiers already in the table; no new QUDT
+    // identifier is invented here, so the rule that an unknown `QUDT:` local
+    // name is refused is untouched.
+    ("meterpersecond", "QUDT:M-PER-SEC"),
+    ("meter-per-second", "QUDT:M-PER-SEC"),
+    ("metrepersecond", "QUDT:M-PER-SEC"),
+    ("metre-per-second", "QUDT:M-PER-SEC"),
+    ("millimeterpersecond", "QUDT:MilliM-PER-SEC"),
+    ("millimeter-per-second", "QUDT:MilliM-PER-SEC"),
+    ("millimetrepersecond", "QUDT:MilliM-PER-SEC"),
+    ("millimetre-per-second", "QUDT:MilliM-PER-SEC"),
     // Force / power / electrical
     ("n", "QUDT:N"),
     ("newton", "QUDT:N"),
@@ -690,6 +708,21 @@ mod tests {
         // Rockwell C is a real hardness scale and NOT a QUDT unit; refused
         // rather than stored under an identifier that does not exist.
         assert!(resolve_unit("QUDT:HRC").is_none());
+        // Measured on a live ingest: the model writes the DESCRIPTIVE form of
+        // a unit this table already knows. Both spellings must land on the
+        // SAME identifier — one unit, one identity.
+        assert_eq!(
+            resolve_unit("QUDT:Meter-Per-Second").map(|u| u.as_str().to_string()),
+            resolve_unit("m/s").map(|u| u.as_str().to_string()),
+        );
+        assert_eq!(
+            resolve_unit("QUDT:Meter-Per-Second").unwrap().as_str(),
+            "QUDT:M-PER-SEC"
+        );
+        // A descriptive spelling for a unit NOT in the vocabulary is still
+        // refused — no identifier is invented to make an extraction fit.
+        assert!(resolve_unit("QUDT:Cycle").is_none());
+        assert!(resolve_unit("QUDT:Inverse-Cubic-Meter").is_none());
         assert!(resolve_unit("QUDT:Furlong").is_none());
         // A KNOWN spelling wearing the prefix is canonicalised, not refused —
         // `QUDT:UM` means micrometre and now lands on the one identifier for
