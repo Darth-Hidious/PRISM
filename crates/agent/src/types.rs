@@ -154,6 +154,20 @@ pub struct AgentConfig {
     /// `subagent::MAX_SUBAGENT_DEPTH`).
     #[serde(default)]
     pub subagent_depth: usize,
+    /// Set on every agent spawned BY `orchestrate_agents`: such an agent may
+    /// not orchestrate again.
+    ///
+    /// Fan-out is WIDTH, not depth. Without this, a nested orchestration got
+    /// its own fresh call budget and inherited `auto_approve`, so one ordinary
+    /// "Allow All" could authorise a second batch the approver never saw and
+    /// the first budget never counted — width x width, on the order of a
+    /// thousand turns from one consent. The depth cap did not stop it, because
+    /// the escape is not depth.
+    ///
+    /// A caller who wants more parallel work asks for a WIDER batch: visible
+    /// in the one prompt, charged to the one budget.
+    #[serde(default)]
+    pub orchestration_forbidden: bool,
 }
 
 impl Default for AgentConfig {
@@ -165,6 +179,7 @@ impl Default for AgentConfig {
             model: "claude-sonnet-4-6".to_string(),
             core_tools_only: false,
             subagent_depth: 0,
+            orchestration_forbidden: false,
         }
     }
 }

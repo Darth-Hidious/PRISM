@@ -235,6 +235,28 @@ pub struct ItemReport {
     pub id: String,
     #[serde(flatten)]
     pub outcome: ItemOutcome,
+    /// False when this item's `agent_runs` ledger row could not be written —
+    /// the store was locked, unreachable, or the insert failed.
+    ///
+    /// The item still RAN: it spawned, spent real tokens, and may well have
+    /// succeeded. But it has no durable row, so it will never appear in
+    /// `list_agent_run_descendants` and `recall` cannot reach it. Serialized
+    /// only when false, so the common case stays quiet and the exception is
+    /// impossible to miss.
+    ///
+    /// Without this the run's own summary told the caller "per-item details
+    /// are durable: each item's run_id is in the agent-run ledger" — a claim
+    /// that was simply untrue for such an item. In a system whose thesis is
+    /// that the evidence chain is the authority, billed work with no evidence
+    /// trail must be stated, not logged and forgotten. Found by adversarial
+    /// review.
+    #[serde(skip_serializing_if = "is_true")]
+    pub ledger_recorded: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// The full result of one orchestrated run, in input order.
@@ -535,6 +557,18 @@ pub trait ItemAgent: Send {
     /// Called exactly once, after the outcome is decided (or on
     /// cancellation). Must be safe to call when no attempt ever ran.
     fn finalize(&mut self, disposition: FinalDisposition) -> BoxFut<'_, ()>;
+
+    /// Whether this item obtained a durable `agent_runs` row.
+    ///
+    /// Defaults to `true` because an implementation with no ledger of its own
+    /// (a test double) has nothing to under-report. A real agent whose ledger
+    /// write FAILED must return `false`: the item ran and spent tokens with no
+    /// row `list_agent_run_descendants` will ever return, and the caller has
+    /// to be told rather than the failure living in a log line while the run
+    /// summary claims every item is durable.
+    fn ledger_recorded(&self) -> bool {
+        true
+    }
 }
 
 // ── The verification core ─────────────────────────────────────────────
@@ -669,7 +703,12 @@ where
     let semaphore = Arc::new(Semaphore::new(semaphore_capacity));
 
     let mut outcomes: Vec<Option<ItemOutcome>> = specs.iter().map(|_| None).collect();
-    let mut tasks: JoinSet<(usize, ItemOutcome)> = JoinSet::new();
+    // Whether each item's `agent_runs` row was actually written. Default true:
+    // items that never spawn (skipped) have nothing to record and must not be
+    // reported as missing provenance.
+    let mut ledger_recorded: Vec<bool> = specs.iter().map(|_| true).collect();
+    // (index, outcome, ledger_recorded)
+    let mut tasks: JoinSet<(usize, ItemOutcome, bool)> = JoinSet::new();
     let mut task_indices = HashMap::with_capacity(specs.len());
 
     for (index, spec) in specs.iter().enumerate() {
@@ -741,17 +780,23 @@ where
                 }
                 other => disposition_of(other),
             };
+            // Ask BEFORE finalize consumes the agent: did this item actually
+            // get a durable ledger row? A ledger write that failed is logged
+            // today and never reaches the caller, so the run's own summary
+            // claims durability the item does not have.
+            let recorded = agent.ledger_recorded();
             agent.finalize(disposition).await;
-            (index, outcome)
+            (index, outcome, recorded)
         });
         task_indices.insert(task.id(), index);
     }
 
     while let Some(joined) = tasks.join_next_with_id().await {
         match joined {
-            Ok((task_id, (index, outcome))) => {
+            Ok((task_id, (index, outcome, recorded))) => {
                 task_indices.remove(&task_id);
                 outcomes[index] = Some(outcome);
+                ledger_recorded[index] = recorded;
             }
             Err(join_error) => {
                 // A panicked/aborted item task fails THAT item, never its
@@ -774,11 +819,13 @@ where
     let items = specs
         .iter()
         .zip(outcomes)
-        .map(|(spec, outcome)| ItemReport {
+        .zip(ledger_recorded)
+        .map(|((spec, outcome), recorded)| ItemReport {
             id: spec.id.clone(),
             outcome: outcome.unwrap_or_else(|| ItemOutcome::Failed {
                 reason: "orchestrated agent task ended without reporting an outcome".to_string(),
             }),
+            ledger_recorded: recorded,
         })
         .collect();
 
@@ -1105,6 +1152,15 @@ impl OrchestratedAgent {
 }
 
 impl ItemAgent for OrchestratedAgent {
+    fn ledger_recorded(&self) -> bool {
+        // `live` is None only when the item never spawned; such an item has
+        // nothing to record. Once it spawned, an absent store means the
+        // ledger write failed.
+        self.live
+            .as_ref()
+            .is_none_or(|live| live.run_store.is_some())
+    }
+
     fn attempt(&mut self, repair: Option<String>) -> BoxFut<'_, Result<AttemptReport>> {
         Box::pin(async move {
             if self.live.is_none() {
@@ -1200,14 +1256,28 @@ impl ItemAgent for OrchestratedAgent {
                 nested_result =
                     crate::command_tools::with_platform_access(ctx.access, nested).await;
             }
-            nested_result?;
+            // Charge from the INCREMENTAL metrics, BEFORE propagating the
+            // error.
+            //
+            // Two bugs in one line, both found by adversarial review. The
+            // charge used to sit after the `?`, and it read `usage`, which is
+            // only ever populated by `TurnComplete` — an event that never
+            // fires when a turn errors. So an item that made four billed calls
+            // and died on the fifth contributed ZERO to the parent's charge.
+            // That is exactly the budget escape hatch the comment below
+            // promises does not exist: a batch that burned real money on
+            // failures read as free to whatever debits the parent.
+            //
+            // `live.metrics` accrues per LLM call as the turn runs (it is what
+            // the per-item ledger row already reports accurately), so it holds
+            // the real spend whether the turn finished or died. Tokens spent
+            // are spent; the outcome does not refund them.
+            ctx.usage_in
+                .fetch_add(live.metrics.tokens_in, Ordering::Relaxed);
+            ctx.usage_out
+                .fetch_add(live.metrics.tokens_out, Ordering::Relaxed);
 
-            if let Some(usage) = &usage {
-                ctx.usage_in
-                    .fetch_add(usage.input_tokens, Ordering::Relaxed);
-                ctx.usage_out
-                    .fetch_add(usage.output_tokens, Ordering::Relaxed);
-            }
+            nested_result?;
 
             let answer = final_text
                 .filter(|text| !text.trim().is_empty())
@@ -1306,6 +1376,26 @@ pub fn execute_orchestrate_agents<'a>(
             crate::command_tools::current_platform_access(),
         )?;
 
+        // SAFETY: an orchestrated agent may never orchestrate again.
+        //
+        // This is checked BEFORE the depth cap because the depth cap does not
+        // catch it: at depth 1 there is still headroom, and the escape is
+        // width x width rather than depth. A nested call would mint its own
+        // `max_agent_calls` budget and inherit `auto_approve`, so a single
+        // "Allow All" could authorise a second batch the approver never saw
+        // and the first budget never counted.
+        //
+        // The refusal names the alternative, because an agent that is told
+        // only "no" will try something else: ask for a WIDER batch, which the
+        // approver sees in one prompt and one budget charges.
+        if parent_config.orchestration_forbidden {
+            return Ok(json!({
+                "error": "an orchestrated agent cannot orchestrate again — fan-out is width, \
+                          not depth. Ask for a WIDER batch in a single orchestrate_agents call \
+                          so its size and cost ceiling are approved and charged once.",
+            }));
+        }
+
         // SAFETY: recursion cap — fan-out is WIDTH, not depth. Orchestrated
         // items run at depth+1 under the unchanged MAX_SUBAGENT_DEPTH.
         if parent_config.subagent_depth >= MAX_SUBAGENT_DEPTH {
@@ -1334,6 +1424,29 @@ pub fn execute_orchestrate_agents<'a>(
 
         let mut config_template = parent_config.clone();
         config_template.subagent_depth = parent_config.subagent_depth + 1;
+        // An orchestrated item may never orchestrate again.
+        //
+        // Found by adversarial review, and it defeated BOTH guarantees this
+        // tool advertises. `fan_out` builds a fresh `AgentCallBudget` from its
+        // own `max_agent_calls` on every call, and `auto_approve` is copied
+        // verbatim into each item's config — while `approval_gate_outcome`
+        // checks `auto_approve` BEFORE the fail-closed channel logic. So after
+        // one ordinary "Allow All", a depth-1 item could call
+        // `orchestrate_agents` again with its own budget: auto-approved,
+        // uncounted by the ceiling the human actually saw, and multiplying
+        // width by width. One consent event could authorise on the order of a
+        // thousand nested turns.
+        //
+        // The depth cap did not stop it — depth 2 still permits one further
+        // orchestration, and the escape is width x width, not depth.
+        //
+        // Refusing recursion outright is the honest fix: fan-out is WIDTH, and
+        // a batch the approver saw is the batch that runs. A caller wanting
+        // more parallel work asks for a wider batch, which is visible in the
+        // one prompt and charged to the one budget. Propagating a remaining
+        // budget downward would preserve the count but not the CONSENT — the
+        // approver still never saw the second batch.
+        config_template.orchestration_forbidden = true;
 
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let ctx = Arc::new(OrchestrationContext {
@@ -2044,6 +2157,34 @@ mod tests {
         assert_eq!(effective_concurrency(&p, None).get(), 4);
         assert_eq!(effective_concurrency(&p, NonZeroUsize::new(2)).get(), 2);
         assert_eq!(effective_concurrency(&p, NonZeroUsize::new(9)).get(), 4);
+    }
+
+    /// An orchestrated agent may not orchestrate again.
+    ///
+    /// Found by adversarial review: a nested `orchestrate_agents` minted its
+    /// OWN call budget and inherited `auto_approve`, and `approval_gate_outcome`
+    /// checks `auto_approve` before the fail-closed channel logic. So one
+    /// ordinary "Allow All" could authorise a second batch the approver never
+    /// saw, uncounted by the ceiling they did see — width x width, on the
+    /// order of a thousand turns from one consent. The depth cap did not stop
+    /// it because the escape is not depth.
+    #[test]
+    fn an_orchestrated_agent_cannot_orchestrate_again() {
+        // Depth 1 with headroom under the cap: the depth guard would ALLOW
+        // this. Only the orchestration flag refuses it.
+        let config = AgentConfig {
+            subagent_depth: 1,
+            orchestration_forbidden: true,
+            ..AgentConfig::default()
+        };
+        assert!(
+            config.subagent_depth < MAX_SUBAGENT_DEPTH,
+            "test premise: the depth cap must NOT be what refuses this"
+        );
+        assert!(
+            config.orchestration_forbidden,
+            "every agent spawned by orchestrate_agents carries this flag"
+        );
     }
 
     #[test]
