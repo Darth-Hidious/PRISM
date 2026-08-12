@@ -2595,6 +2595,38 @@ pub(crate) async fn run_turn_inner(
                             transcript.record_cost("subagent", sub_in, sub_out);
                         }
                         sub_result.map(|value| serde_json::json!({ "result": value }))
+                    } else if meta_tool == crate::meta_tools::MetaTool::OrchestrateAgents {
+                        // orchestrate_agents is spawn_subagent's fan-out sibling:
+                        // N nested turns, concurrently, over the lane pool. Same
+                        // dispatch shape (needs the live turn machinery), same
+                        // access gate inside the executor. It receives whether an
+                        // approval CHANNEL exists — not the channel itself —
+                        // because concurrent items cannot share one uncorrelated
+                        // Allow/Deny stream; see orchestrator.rs "Approval shape".
+                        let orch_result = crate::orchestrator::execute_orchestrate_agents(
+                            llm,
+                            command_tool_runtime,
+                            tool_catalog,
+                            config,
+                            current_run_id,
+                            current_session_id,
+                            &args,
+                            permissions,
+                            live_permission_overrides.clone(),
+                            emit,
+                            approval_rx.is_some(),
+                            policy.as_deref(),
+                            subagent_lanes,
+                        )
+                        .await;
+                        // The whole fan-out's spend counts against the PARENT's
+                        // budget — orchestration must not be a budget escape
+                        // hatch either.
+                        if let Ok(value) = &orch_result {
+                            let (orch_in, orch_out) = crate::subagent::usage_from_result(value);
+                            transcript.record_cost("orchestrate_agents", orch_in, orch_out);
+                        }
+                        orch_result.map(|value| serde_json::json!({ "result": value }))
                     } else {
                         // Open the same Turso store the provenance hook writes to.
                         let db_path = crate::hooks::provenance_db_path();

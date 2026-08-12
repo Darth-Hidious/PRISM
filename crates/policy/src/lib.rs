@@ -145,6 +145,13 @@ fn gate_deny_reason(decision: PolicyDecision) -> String {
 
 /// The PRISM policy engine. Wraps `regorus::Engine` with PRISM-specific
 /// input/output types and policy discovery.
+///
+/// `Clone` duplicates the loaded policy set (`regorus::Engine` is itself
+/// `Clone`): each clone evaluates independently with no shared mutability.
+/// Concurrent agent fan-out (prism-agent's orchestrator) relies on this to
+/// give every delegated turn its own engine instead of serializing evaluation
+/// behind one `&mut`.
+#[derive(Clone)]
 pub struct PolicyEngine {
     engine: regorus::Engine,
     policy_count: usize,

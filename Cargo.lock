@@ -5063,6 +5063,7 @@ dependencies = [
  "ctor",
  "directories",
  "dirs",
+ "jsonschema",
  "libc",
  "prism-agent",
  "prism-campaign",

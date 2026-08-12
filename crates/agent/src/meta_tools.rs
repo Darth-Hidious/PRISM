@@ -58,6 +58,7 @@ pub enum MetaTool {
     RunSkill,
     ListSkills,
     SpawnSubagent,
+    OrchestrateAgents,
     ListFailures,
 }
 
@@ -65,7 +66,7 @@ impl MetaTool {
     /// Every meta-tool. A variant missing from this array still cannot skip
     /// classification (the wildcard-free matches force it), but it would skip
     /// the registry-parity test — the array makes that a compile-time count.
-    pub const ALL: [MetaTool; 8] = [
+    pub const ALL: [MetaTool; 9] = [
         MetaTool::ApplyPatch,
         MetaTool::Recall,
         MetaTool::FindTools,
@@ -73,6 +74,7 @@ impl MetaTool {
         MetaTool::RunSkill,
         MetaTool::ListSkills,
         MetaTool::SpawnSubagent,
+        MetaTool::OrchestrateAgents,
         MetaTool::ListFailures,
     ];
 
@@ -90,6 +92,7 @@ impl MetaTool {
             "run_skill" => Some(MetaTool::RunSkill),
             "list_skills" => Some(MetaTool::ListSkills),
             "spawn_subagent" => Some(MetaTool::SpawnSubagent),
+            "orchestrate_agents" => Some(MetaTool::OrchestrateAgents),
             "list_failures" => Some(MetaTool::ListFailures),
             _ => None,
         }
@@ -107,6 +110,7 @@ impl MetaTool {
             MetaTool::RunSkill => "run_skill",
             MetaTool::ListSkills => "list_skills",
             MetaTool::SpawnSubagent => "spawn_subagent",
+            MetaTool::OrchestrateAgents => "orchestrate_agents",
             MetaTool::ListFailures => "list_failures",
         }
     }
@@ -122,12 +126,13 @@ impl MetaTool {
             | MetaTool::ListFailures => MetaToolEffect::ReadOnly,
             MetaTool::ApplyPatch => MetaToolEffect::WritesWorkspace,
             // write_skill verifies by RUNNING the code once; run_skill
-            // re-executes stored code; spawn_subagent drives a nested turn
-            // over the same code-running tool surface. All three are
-            // node-owner only.
-            MetaTool::WriteSkill | MetaTool::RunSkill | MetaTool::SpawnSubagent => {
-                MetaToolEffect::ExecutesCode
-            }
+            // re-executes stored code; spawn_subagent and orchestrate_agents
+            // drive nested turns over the same code-running tool surface.
+            // All four are node-owner only.
+            MetaTool::WriteSkill
+            | MetaTool::RunSkill
+            | MetaTool::SpawnSubagent
+            | MetaTool::OrchestrateAgents => MetaToolEffect::ExecutesCode,
         }
     }
 }
@@ -230,21 +235,18 @@ pub fn definitions() -> Vec<LoadedTool> {
         LoadedTool {
             name: "recall".to_string(),
             description: "Retrieve earlier tool results from durable memory. Pass \
-                `id` to fetch one specific result (e.g. the id printed when a large \
-                result was truncated), or `query` to search past tool calls \
-                semantically (by meaning, when the local embedding model is \
-                available) plus by keyword. Searches default to the current \
-                session; pass `session_id` for another session or set \
-                `all_sessions` to true to search all sessions. Use this instead \
-                of re-running a tool whose output you already produced but no \
-                longer have in context."
+                `id` to fetch one specific result in full, or `query` to search \
+                past tool calls by meaning and keyword. Defaults to the current \
+                session; `session_id` scopes to another, `all_sessions: true` \
+                searches all sessions. Use this instead of re-running a tool \
+                whose output left your context."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Exact provenance record id to fetch in full; pass its session_id for a result from another session."
+                        "description": "Exact provenance record id to fetch in full."
                     },
                     "query": {
                         "type": "string",
@@ -260,7 +262,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                     "all_sessions": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Search across all sessions when using `query`; cannot be combined with `session_id`."
+                        "description": "Search every session (with `query` only)."
                     },
                     "limit": {
                         "type": "integer",
@@ -276,12 +278,9 @@ pub fn definitions() -> Vec<LoadedTool> {
         LoadedTool {
             name: "list_failures".to_string(),
             description: "List this session's FAILED tool runs from durable memory, newest \
-                first — the answer to 'which runs failed?'. Each entry carries the tool \
-                name, its exit_code, the recorded error, and a timestamp. Use this after \
-                a sequence of tool calls to see at a glance what broke (e.g. a code-exec \
-                that crashed with SIGSEGV) without re-running anything. Pass `session_id` \
-                to scope to another session; otherwise the current session is used. \
-                `limit` caps the list (default 10, max 1000)."
+                first — tool name, exit_code, recorded error, timestamp. Use it to see \
+                at a glance what broke without re-running anything. `session_id` scopes \
+                to another session; `limit` caps the list (default 10, max 1000)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -303,11 +302,10 @@ pub fn definitions() -> Vec<LoadedTool> {
         },
         LoadedTool {
             name: "find_tools".to_string(),
-            description: "Search the full tool catalog for tools relevant to a task \
-                and make them available to call. Use this when you need a capability \
-                that isn't already among your offered tools: describe what you want \
-                to do (e.g. 'deploy a model', 'query the materials graph') and then \
-                call a returned tool by name."
+            description: "Search the full tool catalog and make matching tools \
+                available to call. Use this when you need a capability that isn't \
+                among your offered tools: describe what you want to do, then call \
+                a returned tool by name."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -332,32 +330,31 @@ pub fn definitions() -> Vec<LoadedTool> {
         },
         LoadedTool {
             name: "write_skill".to_string(),
-            description: "Author a REUSABLE skill: a named snippet of shell or python you \
-                can call again on later turns. The skill is VERIFIED by running it once — \
-                it is only saved if it exits cleanly — then stored so `list_skills` shows \
-                it and `run_skill` re-executes it. Use this when you solve something with \
-                code you'll likely need again (a conversion, a fetch, a computation). \
-                Provide a clear one-line `description` (it is embedded for later retrieval)."
+            description: "Author a REUSABLE skill: a named shell or python snippet you \
+                can call again on later turns. VERIFIED by running it once — saved only \
+                if it exits cleanly — then `list_skills` shows it and `run_skill` \
+                re-executes it. Use it for code you'll likely need again; give a clear \
+                one-line `description` (embedded for later retrieval)."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Short slug, 1-64 chars of [A-Za-z0-9_-]. Becomes the skill id."
+                        "description": "Slug of [A-Za-z0-9_-], 1-64 chars. Becomes the skill id."
                     },
                     "description": {
                         "type": "string",
-                        "description": "One line describing what the skill does (embedded for retrieval)."
+                        "description": "One line: what the skill does."
                     },
                     "language": {
                         "type": "string",
                         "enum": ["shell", "python"],
-                        "description": "Interpreter for the code. Default 'shell'."
+                        "description": "Default 'shell'."
                     },
                     "code": {
                         "type": "string",
-                        "description": "The skill body. Must exit 0 when run or it is rejected."
+                        "description": "Skill body; must exit 0."
                     }
                 },
                 "required": ["name", "description", "code"]
@@ -372,8 +369,8 @@ pub fn definitions() -> Vec<LoadedTool> {
             description: "Follow a stored skill by name (see list_skills). Agent-authored \
                 JSON skills execute their stored code. Human-authored Markdown skills return \
                 untrusted procedure instructions only when explicitly selected with `$name` \
-                or when their policy permits implicit invocation. This tool is approval-gated; \
-                every command requested by a Markdown procedure must still use normal gated tools."
+                or their policy permits implicit invocation; commands they request still \
+                use normal gated tools."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -403,6 +400,7 @@ pub fn definitions() -> Vec<LoadedTool> {
             source_detail: Some("self-authoring".to_string()),
         },
         crate::subagent::definition(),
+        crate::orchestrator::definition(),
     ]
 }
 
@@ -467,6 +465,11 @@ pub async fn execute_meta_tool_with_project_root(
         // refusal is about context, not privilege.
         MetaTool::SpawnSubagent => anyhow::bail!(
             "spawn_subagent runs a nested agent turn and is dispatched inside the agent loop only"
+        ),
+        // Same context requirement as spawn_subagent: the fan-out drives
+        // nested turns over the live turn machinery.
+        MetaTool::OrchestrateAgents => anyhow::bail!(
+            "orchestrate_agents runs nested agent turns and is dispatched inside the agent loop only"
         ),
     }
 }
@@ -1126,6 +1129,7 @@ mod tests {
             MetaTool::WriteSkill,
             MetaTool::RunSkill,
             MetaTool::SpawnSubagent,
+            MetaTool::OrchestrateAgents,
         ] {
             assert_eq!(
                 tool.effect(),

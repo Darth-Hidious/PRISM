@@ -92,27 +92,25 @@ pub fn definition() -> LoadedTool {
     LoadedTool {
         name: SPAWN_SUBAGENT_TOOL.to_string(),
         description: "Delegate a SELF-CONTAINED task to a nested subagent turn \
-            (a full agent loop with the same tools, defaulting to the frontier \
-            model claude-fable-5). Use it for a meaty, well-scoped piece of work \
-            you can hand off with one clear instruction — the subagent cannot ask \
-            you questions, so include all context it needs in `task`. Returns a \
-            short summary plus provenance references (expand with recall(id=…)). \
-            Subagents run sequentially and may nest at most one level further."
+            (a full agent loop with the same tools; default model claude-fable-5). \
+            The subagent cannot ask questions — include all context in `task`. \
+            Returns a short summary plus provenance references (expand with \
+            recall(id=…)). For several independent tasks use orchestrate_agents."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The complete, self-contained task instruction for the subagent."
+                    "description": "Complete, self-contained task instruction."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model id for the subagent (default 'claude-fable-5')."
+                    "description": "Default 'claude-fable-5'."
                 },
                 "max_tokens": {
                     "type": "integer",
-                    "description": "Cumulative input-token budget for the subagent turn (default 100000)."
+                    "description": "Input-token budget (default 100000)."
                 }
             },
             "required": ["task"]

@@ -30,6 +30,10 @@ prism-embed = { path = "../embed" }
 prism-campaign = { path = "../campaign" }
 
 regex = "1"
+# Structured-output verification for the orchestrator (self-contained JSON
+# Schemas on delegated tasks). External `$ref` is rejected by scan before
+# compilation, so no resolver ever fetches anything.
+jsonschema = { version = "0.30", default-features = false }
 rmcp = { workspace = true }
 anyhow.workspace = true
 base64.workspace = true
