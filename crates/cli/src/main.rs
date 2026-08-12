@@ -7314,6 +7314,7 @@ async fn run_local_text_ingest_file(
     let mut written_facts: Vec<prism_provenance::MaterialFact> = Vec::new();
     let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped_facts: Vec<String> = Vec::new();
+    let mut rejections: Vec<prism_ingest::text_extract::RejectedFact> = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut peer_echoes: Vec<serde_json::Value> = Vec::new();
@@ -7363,6 +7364,7 @@ async fn run_local_text_ingest_file(
             parse_errors.push(format!("chunk {chunk_no}/{chunks_total}: {parse_error}"));
         }
         dropped_facts.extend(extraction.dropped_facts);
+        rejections.extend(extraction.rejections);
 
         // De-duplicate across windows: the overlap re-reads boundary text by
         // design, so both neighbours may extract the same fact — it is ONE
@@ -7552,6 +7554,81 @@ async fn run_local_text_ingest_file(
         );
     }
 
+    // ── Repair pass: code tiers first; models never see rendered judgements ──
+    //
+    // Phase 1 ends with the graph built and every refusal in `rejections`.
+    // A deterministic rule decides everything it can — recorded in the
+    // append-only disposition ledger with `code:<rule>` as the
+    // dispositioner and ZERO model calls — and ONLY what code could not
+    // decide is enqueued for the model tier (Phase 2). `dispose` itself
+    // enforces the anti-ratchet invariant: a rendered judgement can never
+    // take the queue path.
+    let repair_policy = prism_ingest::repair::RepairPolicy::default();
+    let document_id = path.display().to_string();
+    let decided_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let mut repair_dispositions: Vec<serde_json::Value> = Vec::new();
+    let mut repairs_accepted = 0usize;
+    let mut repairs_withdrawn = 0usize;
+    let mut repairs_enqueued = 0usize;
+    // Overlapping windows re-report a boundary refusal by design; it is ONE
+    // refusal, keyed by its item id.
+    let mut seen_repair_items: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for rejection in &rejections {
+        let item_id = prism_ingest::repair::repair_item_id(&document_id, rejection);
+        if !seen_repair_items.insert(item_id.clone()) {
+            continue;
+        }
+        match prism_ingest::repair::dispose(
+            rejection,
+            &document_id,
+            &text,
+            &repair_policy,
+            decided_at,
+        ) {
+            Some(disposition) => {
+                if let Err(e) = store.record_repair_disposition(&disposition).await {
+                    errors.push(format!("repair ledger write failed for {item_id}: {e:#}"));
+                    continue;
+                }
+                if disposition.outcome == "accept" {
+                    repairs_accepted += 1;
+                } else {
+                    repairs_withdrawn += 1;
+                }
+                repair_dispositions.push(serde_json::json!({
+                    "item_id": disposition.item_id,
+                    "class": disposition.class,
+                    "outcome": disposition.outcome,
+                    "reason": disposition.reason,
+                    "dispositioner": disposition.dispositioner,
+                    "evidence": disposition.evidence,
+                }));
+            }
+            None => {
+                let item = prism_ingest::repair::queue_item(
+                    rejection,
+                    &document_id,
+                    &prov.tenant,
+                    decided_at,
+                );
+                if let Err(e) = store.enqueue_repair(&item).await {
+                    errors.push(format!("repair enqueue failed for {item_id}: {e:#}"));
+                    continue;
+                }
+                repairs_enqueued += 1;
+            }
+        }
+    }
+    if !rejections.is_empty() {
+        eprintln!(
+            "  repair queue: {} refusal(s) — {} decided by code ({repairs_accepted} accepted, \
+             {repairs_withdrawn} withdrawn, zero model calls), {repairs_enqueued} enqueued \
+             for model repair",
+            seen_repair_items.len(),
+            repairs_accepted + repairs_withdrawn,
+        );
+    }
+
     // Zero facts because the model returned garbage is a different outcome
     // from zero facts because the document held none. Only `parse_error`
     // tells them apart on the user's side; with windows it aggregates one
@@ -7587,6 +7664,16 @@ async fn run_local_text_ingest_file(
         // pipeline's `dropped_relationships`: a PARTIAL result the summary
         // must surface, never a silent drop.
         "dropped_facts": dropped_facts,
+        // The repair pass over those refusals: what code decided alone
+        // (ledgered, zero model calls) and what was enqueued for Phase 2's
+        // model tier. Rendered judgements are never enqueued — the code
+        // tiers enforce that, not this summary.
+        "repairs": {
+            "code_accepted": repairs_accepted,
+            "code_withdrawn": repairs_withdrawn,
+            "enqueued_for_model": repairs_enqueued,
+            "dispositions": repair_dispositions,
+        },
         // Chunk-level step failures: extraction or store-write failures for
         // individual chunks. The OTHER chunks' facts are already stored — a
         // mid-run failure costs the failed chunk, never the run.
@@ -17662,6 +17749,35 @@ data:\n\
             hardness.is_empty(),
             "a numeric value whose unit could not be resolved must never be stored: {hardness:?}"
         );
+
+        // The repair pass ran at the end of Phase 1: the banana refusal was
+        // decided BY CODE — the document's own spelling ("349 banana")
+        // resolves to nothing, a vocabulary gap withdrawn with zero model
+        // calls — recorded in the ledger, and NOT enqueued for a model.
+        assert_eq!(
+            summary["repairs"]["code_withdrawn"], 1,
+            "summary: {summary}"
+        );
+        assert_eq!(summary["repairs"]["code_accepted"], 0, "summary: {summary}");
+        assert_eq!(
+            summary["repairs"]["enqueued_for_model"], 0,
+            "summary: {summary}"
+        );
+        let document_id = md.display().to_string();
+        let ledger = store.repair_dispositions(&document_id).await.unwrap();
+        assert_eq!(ledger.len(), 1, "{ledger:?}");
+        assert_eq!(ledger[0].outcome, "withdraw");
+        assert_eq!(ledger[0].reason, "vocabulary-gap:banana");
+        assert!(
+            ledger[0].dispositioner.starts_with("code:"),
+            "an audit must see this was a code rule: {}",
+            ledger[0].dispositioner
+        );
+        let pending = store.pending_repairs(&document_id, 10).await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "a code-decided refusal must not also be queued: {pending:?}"
+        );
     }
 
     /// F1, at PRODUCTION dispatch (`run_local_text_ingest_file` against a
@@ -17756,6 +17872,25 @@ data:\n\
                 "no node may be minted for a refused fact's endpoint: {hits:?}"
             );
         }
+
+        // A malformed shape has no code tier: the refusal is ENQUEUED for
+        // the model tier — the queue half of the Phase-1 repair wiring.
+        assert_eq!(
+            summary["repairs"]["enqueued_for_model"], 1,
+            "summary: {summary}"
+        );
+        let document_id = md.display().to_string();
+        let pending = store.pending_repairs(&document_id, 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].class, "malformed_shape");
+        assert!(
+            store
+                .repair_dispositions(&document_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an undecided item must not carry a disposition"
+        );
     }
 
     // ── Whole-document chunking through the PRODUCTION text path ───────

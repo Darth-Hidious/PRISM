@@ -36,6 +36,10 @@ pub enum QuantityKind {
     ThermalConductivity,
     /// Dimensionless fraction (percent).
     Fraction,
+    /// Linear speed — LPBF scan speeds (mm/s, m/s).
+    Speed,
+    /// Elapsed time / duration (s, min, h).
+    Time,
 }
 
 impl QuantityKind {
@@ -47,6 +51,8 @@ impl QuantityKind {
             Self::Temperature => "temperature",
             Self::ThermalConductivity => "thermal conductivity",
             Self::Fraction => "fraction",
+            Self::Speed => "speed",
+            Self::Time => "time",
         }
     }
 }
@@ -66,14 +72,33 @@ pub const EXTRACTION_UNITS: &[(&str, QuantityKind)] = &[
     ("QUDT:PERCENT", QuantityKind::Fraction),
 ];
 
-/// The quantity kind of a declared extraction unit. `None` for anything
-/// outside [`EXTRACTION_UNITS`] — including bare spellings like `"MPa"`,
-/// which are a vocabulary problem (unit normalisation's job), not a
-/// quantity-kind contradiction.
+/// Quantity kinds for canonical units OUTSIDE the tabular-extraction
+/// vocabulary. These identifiers are ones `prism_provenance::units` already
+/// resolves from document spellings (mm/s and m/s carry LPBF scan speeds;
+/// s/min/h are hold and exposure times) — the repair tier's strict
+/// quantity-kind guard needs their kinds to tell a printed scan speed from
+/// a printed dwell time sitting next to the same number.
+///
+/// Deliberately a SEPARATE table: [`EXTRACTION_UNITS`] also generates the
+/// tabular extraction schema's `unit` enum, and these units must not widen
+/// what that schema lets a model emit. They only inform kind lookups.
+pub const NON_SCHEMA_UNIT_KINDS: &[(&str, QuantityKind)] = &[
+    ("QUDT:MilliM-PER-SEC", QuantityKind::Speed),
+    ("QUDT:M-PER-SEC", QuantityKind::Speed),
+    ("QUDT:SEC", QuantityKind::Time),
+    ("QUDT:MIN", QuantityKind::Time),
+    ("QUDT:HR", QuantityKind::Time),
+];
+
+/// The quantity kind of a declared unit — [`EXTRACTION_UNITS`] plus
+/// [`NON_SCHEMA_UNIT_KINDS`]. `None` for anything else — including bare
+/// spellings like `"MPa"`, which are a vocabulary problem (unit
+/// normalisation's job), not a quantity-kind contradiction.
 #[must_use]
 pub fn unit_quantity_kind(unit: &str) -> Option<QuantityKind> {
     EXTRACTION_UNITS
         .iter()
+        .chain(NON_SCHEMA_UNIT_KINDS)
         .find(|(id, _)| *id == unit)
         .map(|(_, kind)| *kind)
 }
@@ -101,6 +126,9 @@ pub fn property_quantity_kind(property_name: &str) -> Option<QuantityKind> {
     if name.contains("temperature") || name.contains("melting point") {
         return Some(QuantityKind::Temperature);
     }
+    if name.contains("speed") || name.contains("velocity") {
+        return Some(QuantityKind::Speed);
+    }
     None
 }
 
@@ -119,10 +147,33 @@ mod tests {
                 "{id} is not a QUDT-prefixed identifier"
             );
         }
-        // No duplicate identifiers.
+        // No duplicate identifiers — across BOTH tables: a unit declared in
+        // each with different kinds would make the lookup order-dependent.
         let mut seen = std::collections::HashSet::new();
-        for (id, _) in EXTRACTION_UNITS {
+        for (id, _) in EXTRACTION_UNITS.iter().chain(NON_SCHEMA_UNIT_KINDS) {
             assert!(seen.insert(*id), "unit {id} declared twice");
+        }
+    }
+
+    /// The non-schema table informs kind lookups without touching the
+    /// extraction schema: every identifier resolves to its declared kind,
+    /// is a canonical identifier the unit vocabulary itself vouches for,
+    /// and is NOT in [`EXTRACTION_UNITS`] (that would widen the schema).
+    #[test]
+    fn non_schema_units_resolve_kinds_without_entering_the_schema() {
+        for (id, kind) in NON_SCHEMA_UNIT_KINDS {
+            assert_eq!(unit_quantity_kind(id), Some(*kind), "{id}");
+            assert_eq!(
+                prism_provenance::units::resolve_unit(id).map(|u| u.as_str().to_string()),
+                Some((*id).to_string()),
+                "{id} must be a canonical identifier of the controlled vocabulary"
+            );
+            assert!(
+                !EXTRACTION_UNITS
+                    .iter()
+                    .any(|(schema_id, _)| schema_id == id),
+                "{id} must not leak into the extraction schema enum"
+            );
         }
     }
 
@@ -164,6 +215,14 @@ mod tests {
         assert_eq!(
             property_quantity_kind("melting point"),
             Some(QuantityKind::Temperature)
+        );
+        assert_eq!(
+            property_quantity_kind("scan speed"),
+            Some(QuantityKind::Speed)
+        );
+        assert_eq!(
+            property_quantity_kind("scanning velocity"),
+            Some(QuantityKind::Speed)
         );
         // No claim where none is defensible: hardness is deliberately
         // unmapped, and electrical conductivity must not ride on "thermal".

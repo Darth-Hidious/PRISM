@@ -288,6 +288,34 @@ pub fn span_value_has_any_resolved_unit(span: &str, value_end: usize) -> bool {
     })
 }
 
+/// The controlled unit occupying quantity position immediately after the
+/// numeric lexeme ending at byte offset `value_end`, or `None` when nothing
+/// adjacent resolves.
+///
+/// Same adjacency contract as [`span_value_has_resolved_unit`] — only
+/// whitespace may separate the value and the unit — but this returns WHICH
+/// unit sits there instead of confirming a caller's expectation. It exists
+/// for the repair tier's unit re-resolution: the corrected identifier must
+/// come from the document's own printed spelling, never from the model's
+/// claim, so the two paths (checking a claimed unit, reading the printed
+/// one) share one scanner and cannot drift.
+#[must_use]
+pub fn span_value_resolved_adjacent_unit(span: &str, value_end: usize) -> Option<QudtUnit> {
+    if value_end > span.len() || !span.is_char_boundary(value_end) {
+        return None;
+    }
+    let mut found = None;
+    span_contains_unit_matching(span, |resolved, start, _| {
+        let adjacent =
+            start >= value_end && span[value_end..start].chars().all(char::is_whitespace);
+        if adjacent {
+            found = Some(resolved.clone());
+        }
+        adjacent
+    });
+    found
+}
+
 /// Longest folded candidate the scanner can resolve. This is derived from
 /// the spelling table (including `QUDT:`-prefixed spellings and canonical
 /// identifiers), so adding a longer controlled spelling expands the scanner
@@ -655,6 +683,44 @@ mod tests {
         assert!(!span_contains_any_resolved_unit(
             "The ratio was reported as -1."
         ));
+    }
+
+    /// Reading the printed unit off a value shares the checking scanner:
+    /// only the unit in quantity position immediately after THIS value is
+    /// returned, compound spellings are read whole, and a span with nothing
+    /// resolvable adjacent returns nothing rather than a guess.
+    #[test]
+    fn adjacent_unit_is_read_from_quantity_position() {
+        let mixed = "UTS reached 950 MPa at 300 K.";
+        let after_950 = mixed.find("950").unwrap() + "950".len();
+        assert_eq!(
+            span_value_resolved_adjacent_unit(mixed, after_950)
+                .unwrap()
+                .as_str(),
+            "QUDT:MegaPA"
+        );
+        let after_300 = mixed.find("300").unwrap() + "300".len();
+        assert_eq!(
+            span_value_resolved_adjacent_unit(mixed, after_300)
+                .unwrap()
+                .as_str(),
+            "QUDT:K"
+        );
+
+        let compound = "The scan speed was 1250 mm/s.";
+        let after_1250 = compound.find("1250").unwrap() + "1250".len();
+        assert_eq!(
+            span_value_resolved_adjacent_unit(compound, after_1250)
+                .unwrap()
+                .as_str(),
+            "QUDT:MilliM-PER-SEC"
+        );
+
+        let bare = "The count was 950 samples overall.";
+        let after_count = bare.find("950").unwrap() + "950".len();
+        assert!(span_value_resolved_adjacent_unit(bare, after_count).is_none());
+        // Out-of-range offsets fail closed.
+        assert!(span_value_resolved_adjacent_unit(mixed, mixed.len() + 1).is_none());
     }
 
     #[test]

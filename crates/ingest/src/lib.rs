@@ -47,6 +47,7 @@ pub mod ontologies;
 pub mod ontology;
 pub mod pipeline;
 pub mod qudt_units;
+pub mod repair;
 pub mod schema;
 pub mod semantic_validation;
 pub mod text_extract;

@@ -193,6 +193,13 @@ pub struct TextExtraction {
     /// result the caller MUST surface, never a step failure — every safe fact
     /// was still extracted.
     pub dropped_facts: Vec<String>,
+    /// The same refusals as `dropped_facts`, structured: one
+    /// [`RejectedFact`] per entry, in the same order, each carrying the
+    /// refused fact (or raw extraction), its [`RejectionClass`], and the
+    /// identical human-readable detail. `dropped_facts` stays the prose
+    /// contract; this is what the repair queue consumes — prose cannot be
+    /// re-judged.
+    pub rejections: Vec<RejectedFact>,
     /// Token usage the backend reported for all model calls made by this
     /// extraction, if any. This includes the semantic assertion review when
     /// the grounding policy requires one. Output is metered and billed per
@@ -239,12 +246,20 @@ pub async fn extract_facts_from_text_with_policy(
     );
     let prompt = build_extraction_prompt(title, text);
     let (raw, usage) = llm.generate_json_with_usage(&prompt).await?;
-    let (facts, mut dropped_facts, parse_error) = parse_extraction(&raw);
-    let (facts, review_usage) = retain_grounded(llm, facts, text, policy, &mut dropped_facts).await;
+    let (facts, mut rejections, parse_error) = parse_extraction(&raw);
+    let (facts, review_usage) = retain_grounded(llm, facts, text, policy, &mut rejections).await;
+    // `dropped_facts` is DERIVED from the structured rejections — one source
+    // of truth, so the prose report and the repair queue cannot disagree
+    // about what was refused or why.
+    let dropped_facts = rejections
+        .iter()
+        .map(|rejection| rejection.detail.clone())
+        .collect();
     Ok(TextExtraction {
         facts,
         parse_error,
         dropped_facts,
+        rejections,
         usage: merge_usage(usage, review_usage),
     })
 }
@@ -329,9 +344,9 @@ async fn retain_grounded(
     facts: Vec<MaterialFact>,
     text: &str,
     policy: GroundingPolicy,
-    dropped_facts: &mut Vec<String>,
+    rejections: &mut Vec<RejectedFact>,
 ) -> (Vec<MaterialFact>, Option<prism_llm::UsageInfo>) {
-    retain_grounded_with(llm, facts, text, policy, dropped_facts).await
+    retain_grounded_with(llm, facts, text, policy, rejections).await
 }
 
 async fn retain_grounded_with(
@@ -339,7 +354,7 @@ async fn retain_grounded_with(
     facts: Vec<MaterialFact>,
     text: &str,
     policy: GroundingPolicy,
-    dropped_facts: &mut Vec<String>,
+    rejections: &mut Vec<RejectedFact>,
 ) -> (Vec<MaterialFact>, Option<prism_llm::UsageInfo>) {
     // A source line is a provenance boundary. PDF soft wraps and table/record
     // boundaries are indistinguishable here; joining on typography can merge
@@ -353,16 +368,22 @@ async fn retain_grounded_with(
         if !subject_appears(&fact.subject, text) {
             report_grounding_drop(
                 &fact,
+                RejectionClass::SubjectNotNamed,
                 "the document never names that subject",
-                dropped_facts,
+                rejections,
             );
             continue;
         }
 
         if fact.value.is_some() {
             match numeric_fact_grounding(&fact, text, policy) {
-                Ok(()) => grounded.push((source_index, fact)),
-                Err(reason) => report_grounding_drop(&fact, &reason, dropped_facts),
+                Ok(_supporting_span) => grounded.push((source_index, fact)),
+                Err(reason) => report_grounding_drop(
+                    &fact,
+                    RejectionClass::NumericUnsupported,
+                    &reason,
+                    rejections,
+                ),
             }
             continue;
         }
@@ -370,8 +391,9 @@ async fn retain_grounded_with(
         if fact.unit.is_some() {
             report_grounding_drop(
                 &fact,
+                RejectionClass::ValuelessWithUnit,
                 "a value-less assertion carried a unit, so its quantity cannot be grounded",
-                dropped_facts,
+                rejections,
             );
             continue;
         }
@@ -379,7 +401,12 @@ async fn retain_grounded_with(
         if let Err(reason) =
             assertion_conditions_grounded_in_text(&fact, text, policy.numeric_tolerance)
         {
-            report_grounding_drop(&fact, &reason, dropped_facts);
+            report_grounding_drop(
+                &fact,
+                RejectionClass::NumericUnsupported,
+                &reason,
+                rejections,
+            );
             continue;
         }
 
@@ -389,8 +416,9 @@ async fn retain_grounded_with(
             }
             AssertionGrounding::DropUnreviewable => report_grounding_drop(
                 &fact,
+                RejectionClass::PolicyDeferred,
                 "the policy forbids storing value-less assertions without semantic model review",
-                dropped_facts,
+                rejections,
             ),
         }
     }
@@ -414,12 +442,24 @@ async fn retain_grounded_with(
                                 decision.reason.trim()
                             )
                         };
-                        report_grounding_drop(&fact, &reason, dropped_facts);
+                        // A denial and an abstention are both RENDERED
+                        // verdicts, but they are distinct classes: an audit
+                        // must be able to tell "the source says otherwise"
+                        // from "the reviewer could not decide".
+                        let class = match decision.verdict {
+                            AssertionVerdict::Denied => RejectionClass::ReviewDenied,
+                            AssertionVerdict::Uncertain => RejectionClass::ReviewUncertain,
+                            AssertionVerdict::Asserted => {
+                                unreachable!("asserted verdicts are grounded above")
+                            }
+                        };
+                        report_grounding_drop(&fact, class, &reason, rejections);
                     }
                     None => report_grounding_drop(
                         &fact,
+                        RejectionClass::ReviewMissing,
                         "semantic model review returned no verdict for this assertion",
-                        dropped_facts,
+                        rejections,
                     ),
                 }
             }
@@ -428,10 +468,11 @@ async fn retain_grounded_with(
             for (_, fact) in pending_assertions {
                 report_grounding_drop(
                     &fact,
+                    RejectionClass::ReviewMissing,
                     &format!(
                         "semantic model review could not ground this assertion: {review_error}"
                     ),
-                    dropped_facts,
+                    rejections,
                 );
             }
         }
@@ -444,11 +485,14 @@ async fn retain_grounded_with(
     )
 }
 
-fn numeric_fact_grounding(
+/// Ground a numeric fact in `text`, returning the (trimmed, verbatim)
+/// supporting span on success so callers — the repair tier's accept path in
+/// particular — can carry the evidence that justified it.
+pub(crate) fn numeric_fact_grounding(
     fact: &MaterialFact,
     text: &str,
     policy: GroundingPolicy,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<String, String> {
     let value = fact
         .value
         .expect("numeric_fact_grounding is called only for facts with a value");
@@ -496,7 +540,7 @@ fn numeric_fact_grounding(
         unit_span_found = true;
 
         match conditions_grounded_in_span(fact, span, policy.numeric_tolerance) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(span.trim().to_string()),
             Err(reason) => condition_failure.get_or_insert(reason),
         };
     }
@@ -672,14 +716,23 @@ fn span_contains_term(span: &str, term: &str) -> bool {
     })
 }
 
-fn report_grounding_drop(fact: &MaterialFact, reason: &str, dropped_facts: &mut Vec<String>) {
-    dropped_facts.push(format!(
-        "{} {} {}{}: not supported by the document — {reason}",
-        fact.subject,
-        fact.predicate,
-        fact.object,
-        fact.value.map(|v| format!(" ({v})")).unwrap_or_default(),
-    ));
+fn report_grounding_drop(
+    fact: &MaterialFact,
+    class: RejectionClass,
+    reason: &str,
+    rejections: &mut Vec<RejectedFact>,
+) {
+    rejections.push(RejectedFact {
+        subject: RejectedSubject::Converted(Box::new(fact.clone())),
+        class,
+        detail: format!(
+            "{} {} {}{}: not supported by the document — {reason}",
+            fact.subject,
+            fact.predicate,
+            fact.object,
+            fact.value.map(|v| format!(" ({v})")).unwrap_or_default(),
+        ),
+    });
 }
 
 async fn review_assertions(
@@ -831,7 +884,7 @@ fn value_shares_a_span_with_subject(
 ///
 /// Splitting naively on `.` cuts `1.2` into `1` and `2`, and turns
 /// `MPa.m^0.5` into a fabricated terminal `MPa`. Both corrupt grounding.
-fn sentence_spans(line: &str) -> Vec<&str> {
+pub(crate) fn sentence_spans(line: &str) -> Vec<&str> {
     let bytes = line.as_bytes();
     let mut spans = Vec::new();
     let mut start = 0usize;
@@ -861,7 +914,7 @@ fn sentence_spans(line: &str) -> Vec<&str> {
 /// the two forms. Either complete half counts, so a paper that says `L-PBF`
 /// throughout supports a fact whose subject is
 /// `Laser Powder Bed Fusion (L-PBF)`.
-fn subject_appears(subject: &str, text: &str) -> bool {
+pub(crate) fn subject_appears(subject: &str, text: &str) -> bool {
     let subject = subject.trim();
     if subject.is_empty() {
         return false;
@@ -920,7 +973,7 @@ Use "kind" to classify: measurement | phase | composition | processing | structu
 
 /// Parse the LLM's extraction output. Tolerant of fenced JSON.
 ///
-/// Returns `(facts, dropped_facts, parse_error)`. The envelope is parsed
+/// Returns `(facts, rejections, parse_error)`. The envelope is parsed
 /// first; only a response that is not the expected JSON shape AT ALL sets
 /// `parse_error` (zero facts for that reason rather than because the
 /// document held none — see [`TextExtraction`]). Every fact inside a
@@ -929,7 +982,7 @@ Use "kind" to classify: measurement | phase | composition | processing | structu
 /// reason so the caller can surface it. A domain rejection (for example an
 /// unresolvable unit) is reported as exactly that — it must never wear the
 /// costume of a JSON parse failure.
-fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<String>, Option<String>) {
+fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<RejectedFact>, Option<String>) {
     let json_str = extract_json_block(raw);
     let envelope = match serde_json::from_str::<ExtractionEnvelope>(json_str) {
         Ok(envelope) => envelope,
@@ -945,8 +998,13 @@ fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<String>, Option<String
         }
     };
     let mut facts = Vec::with_capacity(envelope.facts.len());
-    let mut dropped_facts = Vec::new();
+    let mut rejections = Vec::new();
     for raw_fact in envelope.facts {
+        // Preserved BEFORE conversion: `convert_fact` rewrites its argument
+        // (strips padding, normalises unit spellings) on the way to a
+        // failure, and the repair queue must hold what the model actually
+        // wrote, not a half-converted intermediate.
+        let preserved = raw_fact.clone();
         match convert_fact(raw_fact) {
             Ok(mut fact) => {
                 fact.evidence_class = evidence_for_result(
@@ -957,11 +1015,35 @@ fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<String>, Option<String
             }
             Err(reason) => {
                 tracing::warn!(%reason, "extracted fact dropped");
-                dropped_facts.push(reason);
+                rejections.push(RejectedFact {
+                    class: conversion_rejection_class(&preserved),
+                    subject: RejectedSubject::Raw(Box::new(preserved)),
+                    detail: reason,
+                });
             }
         }
     }
-    (facts, dropped_facts, None)
+    (facts, rejections, None)
+}
+
+/// Classify a conversion failure by RE-DERIVING the failed check, never by
+/// parsing the error prose: the raw fact's own `unit` field is put back
+/// through [`prism_provenance::units::resolve_unit`]. `convert_fact` checks
+/// the fact's own unit FIRST, so an unresolvable spelling there is exactly
+/// the check that failed; everything else (missing units, value-less
+/// measurements, unresolvable CONDITION units, shape errors) is a malformed
+/// shape — the repair tier's unit re-resolution operates on the fact's own
+/// unit and must not be handed defects it cannot address.
+fn conversion_rejection_class(raw_fact: &serde_json::Value) -> RejectionClass {
+    let own_unit_unresolvable = raw_fact
+        .get("unit")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|spelling| prism_provenance::units::resolve_unit(spelling).is_none());
+    if own_unit_unresolvable {
+        RejectionClass::UnresolvedUnit
+    } else {
+        RejectionClass::MalformedShape
+    }
 }
 
 /// Convert one raw extracted fact, normalising unit spellings on the way in
@@ -976,7 +1058,7 @@ fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<String>, Option<String
 /// that. A unit on a value-less fact is contradictory model output — the
 /// fact is dropped rather than second-guessed. Either way the reason names
 /// the offending field and value.
-fn convert_fact(mut raw_fact: serde_json::Value) -> Result<MaterialFact, String> {
+pub(crate) fn convert_fact(mut raw_fact: serde_json::Value) -> Result<MaterialFact, String> {
     let identity = fact_identity(&raw_fact);
 
     // Contentless condition padding is stripped BEFORE any validation:
@@ -1114,7 +1196,7 @@ fn convert_fact(mut raw_fact: serde_json::Value) -> Result<MaterialFact, String>
 
 /// `'subject predicate object'` of a raw fact, for drop reasons a human can
 /// trace back into the model output. Missing fields render as `?`.
-fn fact_identity(raw_fact: &serde_json::Value) -> String {
+pub(crate) fn fact_identity(raw_fact: &serde_json::Value) -> String {
     let get = |key: &str| {
         raw_fact
             .get(key)
@@ -1509,6 +1591,20 @@ mod tests {
             "the invention must be reported: {:?}",
             extraction.dropped_facts,
         );
+        // The structured rejections carry the SAME refusals in the SAME
+        // order — the repair queue and the prose report cannot disagree.
+        assert_eq!(
+            extraction
+                .rejections
+                .iter()
+                .map(|rejection| rejection.detail.as_str())
+                .collect::<Vec<_>>(),
+            extraction
+                .dropped_facts
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
         server.verify().await;
     }
 
@@ -1549,6 +1645,9 @@ mod tests {
             "the denied assertion must be reported: {:?}",
             extraction.dropped_facts
         );
+        // A denial is the RENDERED verdict class, not the missing one.
+        assert_eq!(extraction.rejections.len(), 1);
+        assert_eq!(extraction.rejections[0].class, RejectionClass::ReviewDenied);
         server.verify().await;
     }
 
@@ -1577,6 +1676,13 @@ mod tests {
                 .any(|reason| reason.contains("review") && reason.contains("valid decision JSON")),
             "malformed review must be reported: {:?}",
             extraction.dropped_facts
+        );
+        // No verdict was RENDERED — the class must say so, or the repair
+        // queue would treat a broken call as a judgement.
+        assert_eq!(extraction.rejections.len(), 1);
+        assert_eq!(
+            extraction.rejections[0].class,
+            RejectionClass::ReviewMissing
         );
         server.verify().await;
     }
@@ -2113,6 +2219,111 @@ mod tests {
             "the policy drop must be reported: {:?}",
             extraction.dropped_facts
         );
+        // An operator's deferral is its own class — not an error, and not a
+        // rendered judgement.
+        assert_eq!(extraction.rejections.len(), 1);
+        assert_eq!(
+            extraction.rejections[0].class,
+            RejectionClass::PolicyDeferred
+        );
+        server.verify().await;
+    }
+
+    /// End to end into the code tiers, against a real socket: a fact whose
+    /// invented unit failed to resolve is ACCEPTED by Tier A with the
+    /// corrected identifier and the verbatim span — and the wiremock server
+    /// proves the repair itself made ZERO model calls (`.expect(1)` covers
+    /// exactly the one extraction request; `verify()` fails on any more).
+    #[tokio::test]
+    async fn a_rejected_unit_is_re_resolved_by_code_with_zero_model_calls() {
+        let facts = serde_json::json!({"facts": [{
+            "subject": "AlSi10Mg", "predicate": "has_measurement",
+            "object": "scan speed", "value": 1250.0, "unit": "QUDT:MM-PER-S",
+            "kind": "measurement", "confidence": 0.9,
+            "evidence_class": "research", "conditions": []
+        }]});
+        let server = scripted_server(vec![facts.to_string()], 1).await;
+        let source = "The AlSi10Mg parts were built at a scan speed of 1250 mm/s.";
+
+        let extraction = extract_facts_from_text(&client_for(&server), "LPBF study", source)
+            .await
+            .expect("extraction succeeds");
+        assert!(
+            extraction.facts.is_empty(),
+            "the invented unit must be refused first"
+        );
+        assert_eq!(extraction.rejections.len(), 1);
+        assert_eq!(
+            extraction.rejections[0].class,
+            RejectionClass::UnresolvedUnit
+        );
+
+        let disposition = crate::repair::dispose(
+            &extraction.rejections[0],
+            "doc:lpbf-study.pdf",
+            source,
+            &crate::repair::RepairPolicy::default(),
+            0.0,
+        )
+        .expect("Tier A decides this without a model");
+        assert_eq!(disposition.outcome, "accept");
+        assert_eq!(disposition.dispositioner, "code:unit-re-resolution");
+        let corrected: MaterialFact =
+            serde_json::from_str(disposition.corrected_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            corrected.unit.as_ref().map(|unit| unit.as_str()),
+            Some("QUDT:MilliM-PER-SEC")
+        );
+        let evidence = disposition.evidence.as_deref().unwrap();
+        assert!(evidence.contains("1250 mm/s"), "{evidence}");
+        // Exactly ONE request ever reached the model: the extraction.
+        server.verify().await;
+    }
+
+    /// End to end into the code tiers: invented numbers (the three
+    /// accuracies) are WITHDRAWN `no-near-miss` with zero model calls — the
+    /// wiremock `.expect(1)` proves the withdrawals asked nobody.
+    #[tokio::test]
+    async fn invented_numbers_are_withdrawn_by_code_with_zero_model_calls() {
+        let facts = serde_json::json!({"facts": [
+            {"subject": "CNN model", "predicate": "has_measurement", "object": "accuracy",
+             "value": 0.935, "unit": "QUDT:UNITLESS", "kind": "measurement",
+             "evidence_class": "research", "conditions": []},
+            {"subject": "CNN model", "predicate": "has_measurement", "object": "accuracy",
+             "value": 0.944, "unit": "QUDT:UNITLESS", "kind": "measurement",
+             "evidence_class": "research", "conditions": []},
+            {"subject": "CNN model", "predicate": "has_measurement", "object": "accuracy",
+             "value": 0.946, "unit": "QUDT:UNITLESS", "kind": "measurement",
+             "evidence_class": "research", "conditions": []}
+        ]});
+        let server = scripted_server(vec![facts.to_string()], 1).await;
+        let source = "The CNN model was evaluated on a held-out split and its accuracy \
+                      was described qualitatively.";
+
+        let extraction = extract_facts_from_text(&client_for(&server), "ML study", source)
+            .await
+            .expect("extraction succeeds");
+        assert!(extraction.facts.is_empty());
+        assert_eq!(extraction.rejections.len(), 3);
+
+        for rejection in &extraction.rejections {
+            assert_eq!(rejection.class, RejectionClass::NumericUnsupported);
+            let disposition = crate::repair::dispose(
+                rejection,
+                "doc:ml-study.pdf",
+                source,
+                &crate::repair::RepairPolicy::default(),
+                0.0,
+            )
+            .expect("a rendered judgement is always a code decision");
+            assert_eq!(disposition.outcome, "withdraw");
+            assert!(
+                disposition.reason.starts_with("no-near-miss"),
+                "{}",
+                disposition.reason
+            );
+        }
+        // Exactly ONE request ever reached the model: the extraction.
         server.verify().await;
     }
 
@@ -2197,10 +2408,11 @@ mod tests {
         assert!(kept.is_empty());
         assert_eq!(dropped.len(), 1);
         assert!(
-            dropped[0].contains("never names that subject"),
+            dropped[0].detail.contains("never names that subject"),
             "{}",
-            dropped[0]
+            dropped[0].detail
         );
+        assert_eq!(dropped[0].class, RejectionClass::SubjectNotNamed);
     }
 
     /// THE regression, verbatim. This exact abstract went to `qwen2.5:3b`,
@@ -2237,8 +2449,16 @@ mod tests {
 
         assert!(kept.is_empty(), "an invented fact must never be stored");
         assert_eq!(dropped.len(), 1);
-        assert!(dropped[0].contains("Ti-6Al-4V"), "{}", dropped[0]);
-        assert!(dropped[0].contains("not supported"), "{}", dropped[0]);
+        assert!(
+            dropped[0].detail.contains("Ti-6Al-4V"),
+            "{}",
+            dropped[0].detail
+        );
+        assert!(
+            dropped[0].detail.contains("not supported"),
+            "{}",
+            dropped[0].detail
+        );
     }
 
     /// The other half, or the guard would be a fact shredder: something the
@@ -2405,9 +2625,17 @@ mod tests {
         );
         assert_eq!(dropped.len(), 1);
         assert!(
-            dropped[0].contains("banana") && dropped[0].contains("hardness"),
+            dropped[0].detail.contains("banana") && dropped[0].detail.contains("hardness"),
             "the reason must name the offending unit and fact: {}",
-            dropped[0]
+            dropped[0].detail
+        );
+        // The class is RE-DERIVED (the raw unit fails to resolve), never
+        // sniffed from the prose.
+        assert_eq!(dropped[0].class, RejectionClass::UnresolvedUnit);
+        assert!(
+            matches!(&dropped[0].subject, RejectedSubject::Raw(raw)
+                if raw.get("unit").and_then(serde_json::Value::as_str) == Some("banana")),
+            "the queue must hold what the model actually wrote"
         );
     }
 
@@ -2427,20 +2655,21 @@ mod tests {
         // JSON-parse costume the old path dressed it in.
         assert_eq!(err, None);
         assert!(
-            dropped[0].contains("unit") && dropped[0].contains("furlongs"),
+            dropped[0].detail.contains("unit") && dropped[0].detail.contains("furlongs"),
             "reason must name the field and offending value: {}",
-            dropped[0]
+            dropped[0].detail
         );
         assert!(
-            dropped[0].contains("880"),
+            dropped[0].detail.contains("880"),
             "reason must surface the numeric value that was protected: {}",
-            dropped[0]
+            dropped[0].detail
         );
         assert!(
-            !dropped[0].contains("parsed as JSON"),
+            !dropped[0].detail.contains("parsed as JSON"),
             "a domain rejection must not report itself as a parse failure: {}",
-            dropped[0]
+            dropped[0].detail
         );
+        assert_eq!(dropped[0].class, RejectionClass::UnresolvedUnit);
     }
 
     /// A numeric condition with an unresolvable unit poisons the whole fact:
@@ -2453,10 +2682,14 @@ mod tests {
         assert!(facts.is_empty(), "{facts:?}");
         assert_eq!(dropped.len(), 1);
         assert!(
-            dropped[0].contains("temperature") && dropped[0].contains("gluons"),
+            dropped[0].detail.contains("temperature") && dropped[0].detail.contains("gluons"),
             "reason must name the condition and its unit: {}",
-            dropped[0]
+            dropped[0].detail
         );
+        // The fact's OWN unit resolves; the defect is a condition's. Unit
+        // re-resolution cannot address it, so it must not be classed as an
+        // unresolved unit.
+        assert_eq!(dropped[0].class, RejectionClass::MalformedShape);
     }
 
     /// Observed live (qwen2.5:3b): every fact arrives padded with
@@ -2490,10 +2723,12 @@ mod tests {
         assert!(facts.is_empty(), "{facts:?}");
         assert_eq!(dropped.len(), 1);
         assert!(
-            dropped[0].contains("4.5") && dropped[0].contains("no unit at all"),
+            dropped[0].detail.contains("4.5") && dropped[0].detail.contains("no unit at all"),
             "reason must name the naked value: {}",
-            dropped[0]
+            dropped[0].detail
         );
+        // No unit spelling to re-resolve — this is a shape defect.
+        assert_eq!(dropped[0].class, RejectionClass::MalformedShape);
     }
 
     /// A NUMERIC condition with no unit must be refused here, per fact:
@@ -2508,10 +2743,11 @@ mod tests {
         assert!(facts.is_empty(), "{facts:?}");
         assert_eq!(dropped.len(), 1);
         assert!(
-            dropped[0].contains("aging temperature"),
+            dropped[0].detail.contains("aging temperature"),
             "reason must name the condition: {}",
-            dropped[0]
+            dropped[0].detail
         );
+        assert_eq!(dropped[0].class, RejectionClass::MalformedShape);
     }
 
     /// A categorical fact (no value, no unit) is untouched by the unit rule.

@@ -664,6 +664,43 @@ pub fn evidential_numeric_lexeme_satisfies(
     false
 }
 
+/// Whether ANY complete numeric lexeme in `block_text` renders `value`
+/// under `numeric_tolerance` — no subject/object proximity, no evidential
+/// guards.
+///
+/// This is deliberately the WEAKEST matching this module offers, because it
+/// exists to prove ABSENCE: the repair tier withdraws a refused numeric
+/// fact with zero model calls only when the value appears nowhere in the
+/// document in any rendered form, so the generous direction (a citation or
+/// a range endpoint still counts as an appearance) is the conservative one.
+/// It must never be used as evidence that a value IS supported — that is
+/// [`supporting_quote_with_numeric_tolerance`]'s job, guards included.
+#[must_use]
+pub fn numeric_value_appears(value: f64, block_text: &str, numeric_tolerance: f64) -> bool {
+    if !value.is_finite() || !numeric_tolerance.is_finite() || numeric_tolerance < 0.0 {
+        return false;
+    }
+    let hay = normalize_for_containment(block_text);
+    let mut search_from = 0usize;
+    while search_from < hay.len() {
+        let Some(first_char) = hay[search_from..].chars().next() else {
+            break;
+        };
+        let Some(lexeme) = numeric_lexeme_at(&hay, search_from) else {
+            search_from += first_char.len_utf8();
+            continue;
+        };
+        search_from = lexeme.end;
+        if lexeme
+            .value
+            .is_some_and(|observed| numeric_values_match(value, observed, numeric_tolerance))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn supporting_quote_with_numeric_tolerance_or_refusal(
     subject: &str,
     object: &str,
@@ -2165,6 +2202,41 @@ mod tests {
                 quote: None,
             },
         }
+    }
+
+    /// The absence check is deliberately WEAKER than evidential matching:
+    /// rendered-form equivalence counts, and so does a guarded occurrence
+    /// (a citation label is still an appearance). Only a value the document
+    /// never prints at all fails it.
+    #[test]
+    fn numeric_value_appears_is_the_weakest_check() {
+        // Rendered forms of 1.2 all count.
+        for text in [
+            "modulus was 1.2 GPa",
+            "modulus was 1.20 GPa",
+            "modulus was 1,2 GPa",
+        ] {
+            assert!(numeric_value_appears(1.2, text, 1e-9), "{text}");
+        }
+        // A citation occurrence would be REFUSED as evidence, but it is
+        // still an appearance — near-miss, not invention.
+        assert!(numeric_value_appears(
+            1.2,
+            "prior work [1.20] reported this",
+            1e-9
+        ));
+        // Absent means absent: no rendering anywhere, and a different
+        // number containing the same digits is not a rendering.
+        assert!(!numeric_value_appears(
+            0.935,
+            "the accuracy was described qualitatively",
+            1e-9
+        ));
+        assert!(!numeric_value_appears(
+            0.935,
+            "sample 935 of the batch",
+            1e-9
+        ));
     }
 
     #[test]
