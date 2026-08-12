@@ -5,13 +5,15 @@
 //! when the theme changes.
 
 use crate::app::{
-    App, Focus, LineKind, Modal, ObjectStatus, Role, WorkspaceTab, evidence_token, first_line,
+    App, Focus, LineKind, Modal, ObjectKind, ObjectStatus, Role, WorkspaceTab, evidence_token,
+    first_line,
 };
 use crate::artifact::{ArtifactPromotion, ArtifactStoreState, format_bytes};
 use crate::command;
 use crate::gh;
 use crate::keymap;
 use crate::markdown;
+use crate::structures::{StructuresStoreState, UNKNOWN};
 use crate::theme::Theme;
 use crate::toast::ToastKind;
 use prism_provenance::EvidenceClass;
@@ -612,6 +614,10 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, w),
         WorkspaceTab::Files => build_files_lines(app, t, &mut lines, w),
         WorkspaceTab::Objects => build_objects_lines(app, t, &mut lines, w),
+        WorkspaceTab::Structures => {
+            let available = usize::from(inner.height).saturating_sub(lines.len());
+            build_structures_lines(app, t, &mut lines, w, available);
+        }
         WorkspaceTab::Artifacts => {
             let available = usize::from(inner.height).saturating_sub(lines.len());
             build_artifact_lines(app, t, &mut lines, w, available);
@@ -629,27 +635,31 @@ fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> Line<'static> {
     // small terminal, and the paragraph wraps — "Objects" dropped onto its own
     // line, ate a row of the panel and shoved every entry down (caught at
     // 40x12). Abbreviate instead of wrapping: a cramped strip is legible, a
-    // wrapped one silently costs a row of content.
-    const FULL: [(WorkspaceTab, &str); 5] = [
-        (WorkspaceTab::Activity, "Activity"),
-        (WorkspaceTab::Tools, "Tools"),
-        (WorkspaceTab::Files, "Files"),
-        (WorkspaceTab::Objects, "Objects"),
-        (WorkspaceTab::Artifacts, "Artifacts"),
-    ];
-    const SHORT: [(WorkspaceTab, &str); 5] = [
+    // wrapped one silently costs a row of content. With six tabs the full
+    // set can never fit the 42-column sidebar ceiling, so the degradation
+    // ladder is three-letter labels, then two-letter initials.
+    const SHORT: [(WorkspaceTab, &str); 6] = [
         (WorkspaceTab::Activity, "Act"),
         (WorkspaceTab::Tools, "Too"),
         (WorkspaceTab::Files, "Fil"),
         (WorkspaceTab::Objects, "Obj"),
+        (WorkspaceTab::Structures, "Str"),
         (WorkspaceTab::Artifacts, "Art"),
+    ];
+    const MIN: [(WorkspaceTab, &str); 6] = [
+        (WorkspaceTab::Activity, "Ac"),
+        (WorkspaceTab::Tools, "To"),
+        (WorkspaceTab::Files, "Fi"),
+        (WorkspaceTab::Objects, "Ob"),
+        (WorkspaceTab::Structures, "St"),
+        (WorkspaceTab::Artifacts, "Ar"),
     ];
     // Rendered width: a leading space, a space between each, and the active
     // label gains two brackets.
     let width_of = |set: &[(WorkspaceTab, &str)]| -> usize {
         1 + set.iter().map(|(_, label)| label.width()).sum::<usize>() + (set.len() - 1) + 2
     };
-    let tabs = if width_of(&FULL) <= w { FULL } else { SHORT };
+    let tabs = if width_of(&SHORT) <= w { &SHORT } else { &MIN };
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     for (i, (tab, label)) in tabs.iter().enumerate() {
         if i > 0 {
@@ -1023,6 +1033,165 @@ fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: u
     }
 }
 
+/// The Structures tab — the materials plane of the sidebar. Shows each
+/// structure this session touched: formula first (the identity a materials
+/// person scans for), then atom count · composition · source, then the
+/// `cache://` reference. Missing meta fields render as `unknown` / `?` —
+/// never as plausible defaults. Empty and unavailable are DIFFERENT facts
+/// and read differently.
+fn build_structures_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    w: usize,
+    available_lines: usize,
+) {
+    let structures = match &app.structure_store {
+        StructuresStoreState::Loading => {
+            lines.push(Line::from(Span::styled(
+                "  Loading structures…",
+                Style::default().fg(t.warn),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Structure cache data is not ready yet.",
+                Style::default().fg(t.dim),
+            )));
+            return;
+        }
+        StructuresStoreState::Unavailable(reason) => {
+            lines.push(Line::from(Span::styled(
+                "  Structure cache unavailable",
+                Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", clip(reason, w.saturating_sub(2))),
+                Style::default().fg(t.dim),
+            )));
+            return;
+        }
+        StructuresStoreState::Ready(structures) if structures.is_empty() => {
+            lines.push(Line::from(Span::styled(
+                "  No structures yet",
+                Style::default().fg(t.muted),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Structures appear when this",
+                Style::default().fg(t.dim),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  session imports, looks up,",
+                Style::default().fg(t.dim),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  or computes one.",
+                Style::default().fg(t.dim),
+            )));
+            return;
+        }
+        StructuresStoreState::Ready(structures) => structures,
+    };
+
+    let policy_limited =
+        u64::try_from(structures.len()).is_ok_and(|count| count >= app.structure_policy.list_limit);
+    let mut item_viewport_lines = available_lines;
+    if policy_limited {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Newest {} · policy limit reached",
+                app.structure_policy.list_limit
+            ),
+            Style::default().fg(t.warn),
+        )));
+        item_viewport_lines = item_viewport_lines.saturating_sub(1);
+    }
+
+    let selected = app
+        .workspace_selected
+        .min(structures.len().saturating_sub(1));
+    let expanded_lines = if app.workspace_expanded {
+        app.structure_policy.expanded_lines
+    } else {
+        0
+    };
+    let visible_items = item_viewport_lines
+        .saturating_sub(expanded_lines)
+        .checked_div(app.structure_policy.item_lines.max(1))
+        .unwrap_or(0)
+        .max(1);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_items)
+        .min(structures.len().saturating_sub(visible_items));
+    let end = start.saturating_add(visible_items).min(structures.len());
+
+    for (index, structure) in structures.iter().enumerate().take(end).skip(start) {
+        let focused = app.focus == Focus::Workspace && index == selected;
+        let prefix = if focused { "▸ " } else { "  " };
+
+        // Line 1 — formula leads: it is the identity a materials person
+        // scans for. Bold so it reads as the row's headline.
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(t.accent)),
+            Span::styled(
+                format!("{} ", ObjectKind::Structure.glyph()),
+                Style::default().fg(t.dim),
+            ),
+            Span::styled(
+                clip(structure.formula_display(), w.saturating_sub(6)).to_string(),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        // Line 2 — atom count · composition · source. `?` for an unknown
+        // count (the Objects-tab convention); the literal word `unknown`
+        // for text fields PRISM never received.
+        let atoms = structure
+            .n_atoms
+            .map(|count| format!("{count} atoms"))
+            .unwrap_or_else(|| "? atoms".to_string());
+        let facts = format!(
+            "{atoms} · {} · {}",
+            structure.composition.as_deref().unwrap_or(UNKNOWN),
+            structure.source_display(),
+        );
+        lines.push(Line::from(Span::styled(
+            format!("    {}", clip(&facts, w.saturating_sub(4))),
+            Style::default().fg(t.dim),
+        )));
+
+        // Line 3 — the cache reference (clipped; the full ref is in the
+        // Enter detail view).
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {}",
+                clip(structure.cache_ref_display(), w.saturating_sub(4))
+            ),
+            Style::default().fg(t.muted),
+        )));
+
+        if focused && app.workspace_expanded {
+            if let Some(name) = &structure.name {
+                lines.push(Line::from(Span::styled(
+                    format!("    name: {}", clip(name, w.saturating_sub(10))),
+                    Style::default().fg(t.dim),
+                )));
+            }
+            if let Some(tool) = &structure.tool {
+                lines.push(Line::from(Span::styled(
+                    format!("    tool: {}", clip(tool, w.saturating_sub(10))),
+                    Style::default().fg(t.dim),
+                )));
+            }
+            if let Some(created_at) = &structure.created_at {
+                lines.push(Line::from(Span::styled(
+                    format!("    cached: {}", clip(created_at, w.saturating_sub(12))),
+                    Style::default().fg(t.dim),
+                )));
+            }
+        }
+    }
+}
+
 fn build_artifact_lines(
     app: &App,
     t: Theme,
@@ -1233,7 +1402,7 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
         kv_row(
             t,
             "← / →",
-            "switch Activity / Tools / Files / Objects / Artifacts",
+            "switch Activity / Tools / Files / Objects / Structures / Artifacts",
         ),
         kv_row(t, "↑ / ↓", "move selection"),
         kv_row(t, "Enter", "open details for the selected item"),

@@ -11,6 +11,9 @@ use crate::knowledge::{self, IngestPhase, KnowledgePane, KnowledgeTab};
 use crate::msg::{AgentMsg, parse_notification};
 use crate::notebook::{self, NotebookCell, NotebookPane};
 use crate::sanitize::{sanitize_code_for_preview, sanitize_for_render};
+use crate::structures::{
+    StructurePolicy, StructuresStoreState, UNKNOWN, WorkspaceStructure, format_cif_body,
+};
 use crate::theme;
 use crate::toast::{self, ToastKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -78,6 +81,9 @@ pub enum WorkspaceTab {
     Tools,
     Files,
     Objects,
+    /// The materials plane: structures this session touched and their CIF
+    /// documentation, read from the content-addressed structure cache.
+    Structures,
     Artifacts,
 }
 
@@ -437,6 +443,16 @@ pub(crate) fn extract_path(content: &str) -> Option<String> {
     None
 }
 
+/// Short display form of a content-addressed cache key (full sha256 hex)
+/// for titles where the formula is unknown. Display-only — the full key
+/// remains the fetch identity. Never padded or guessed.
+pub(crate) fn clip_cache_key(cache_key: &str) -> String {
+    if cache_key.len() <= 16 {
+        return cache_key.to_string();
+    }
+    format!("{}…", &cache_key[..16])
+}
+
 fn evidence_class_from_str(value: &str) -> EvidenceClass {
     match value {
         "reference_validated" => EvidenceClass::ReferenceValidated,
@@ -626,7 +642,8 @@ pub struct App {
     /// Set at startup and on each turn boundary to trigger a cheap balance
     /// refresh in the event loop (never on every keystroke).
     pub needs_credits_refresh: bool,
-    // Workspace sidebar — Activity / Tools / Files / Objects / Artifacts.
+    // Workspace sidebar — Activity / Tools / Files / Objects / Structures /
+    // Artifacts.
     pub workspace_tab: WorkspaceTab,
     pub workspace_selected: usize,
     pub workspace_expanded: bool,
@@ -648,6 +665,25 @@ pub struct App {
     artifact_view_id: Option<String>,
     /// Deferred fetch retry after a backend-busy notification.
     artifact_fetch_retry_at: Option<std::time::Instant>,
+    /// Store loading/health state for the Structures tab. `Ready([])` is
+    /// "no structures yet"; `Unavailable` is a different fact.
+    pub structure_store: StructuresStoreState,
+    /// Declared structure list/CIF display limits.
+    pub structure_policy: StructurePolicy,
+    /// Coalesced structures refresh deadline, polled by the main event loop.
+    structure_refresh_at: Option<std::time::Instant>,
+    /// Cache key whose CIF is being fetched into the existing View panel.
+    structure_fetch_key: Option<String>,
+    /// Cache key whose CIF currently owns the View panel, fetched or not.
+    structure_view_key: Option<String>,
+    /// Deferred CIF fetch retry after a backend-busy notification.
+    structure_fetch_retry_at: Option<std::time::Instant>,
+    /// JSON-RPC id of the outstanding structures list request. Lets a
+    /// protocol error (e.g. a backend without structures support answering
+    /// `-32601`) become an honest "unavailable" state instead of chat noise.
+    structure_list_rpc_id: Option<u64>,
+    /// JSON-RPC id of the outstanding CIF fetch request (same attribution).
+    structure_fetch_rpc_id: Option<u64>,
     /// Max chat scroll offset, recomputed by the renderer each frame
     /// (content height − viewport). Lets key handlers clamp/anchor scrolling
     /// without knowing the terminal size.
@@ -757,6 +793,14 @@ impl App {
             artifact_fetch_pending: None,
             artifact_view_id: None,
             artifact_fetch_retry_at: None,
+            structure_store: StructuresStoreState::Loading,
+            structure_policy: StructurePolicy::default(),
+            structure_refresh_at: None,
+            structure_fetch_key: None,
+            structure_view_key: None,
+            structure_fetch_retry_at: None,
+            structure_list_rpc_id: None,
+            structure_fetch_rpc_id: None,
             view_max_scroll: std::cell::Cell::new(0),
             modal: None,
             goal: None,
@@ -1184,16 +1228,22 @@ impl App {
                 self.workspace_expanded = false;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.workspace_selected = if self.workspace_tab == WorkspaceTab::Artifacts {
-                    match &self.artifact_store {
+                self.workspace_selected = match self.workspace_tab {
+                    WorkspaceTab::Artifacts => match &self.artifact_store {
                         ArtifactStoreState::Ready(artifacts) => self
                             .workspace_selected
                             .saturating_add(1)
                             .min(artifacts.len().saturating_sub(1)),
                         ArtifactStoreState::Loading | ArtifactStoreState::Unavailable(_) => 0,
-                    }
-                } else {
-                    self.workspace_selected.saturating_add(1)
+                    },
+                    WorkspaceTab::Structures => match &self.structure_store {
+                        StructuresStoreState::Ready(structures) => self
+                            .workspace_selected
+                            .saturating_add(1)
+                            .min(structures.len().saturating_sub(1)),
+                        StructuresStoreState::Loading | StructuresStoreState::Unavailable(_) => 0,
+                    },
+                    _ => self.workspace_selected.saturating_add(1),
                 };
                 self.workspace_expanded = false;
             }
@@ -1300,6 +1350,8 @@ impl App {
     ///   - Files:    the file's content (text files, capped at 200 KB).
     ///   - Activity: the underlying event of that row as pretty JSON.
     ///   - Objects:  the object's parameters and result summary.
+    ///   - Structures: the structure's actual CIF text, fetched from the
+    ///     content-addressed cache (bounded by [`StructurePolicy::cif_bytes`]).
     ///   - Artifacts: asynchronously fetched args and result content.
     pub fn open_workspace_detail(&mut self) {
         match self.workspace_tab {
@@ -1368,6 +1420,43 @@ impl App {
                 let title = format!("{} — {}", obj.kind.as_str(), obj.label);
                 self.open_detail_view(title, body);
             }
+            WorkspaceTab::Structures => {
+                let structure = match &self.structure_store {
+                    StructuresStoreState::Loading => {
+                        self.toast("structure data is still loading", ToastKind::Info);
+                        return;
+                    }
+                    StructuresStoreState::Unavailable(reason) => {
+                        self.toast(
+                            format!("structure cache unavailable: {reason}"),
+                            ToastKind::Err,
+                        );
+                        return;
+                    }
+                    StructuresStoreState::Ready(structures) if structures.is_empty() => {
+                        self.toast("no structures yet", ToastKind::Info);
+                        return;
+                    }
+                    StructuresStoreState::Ready(structures) => structures[self
+                        .workspace_selected
+                        .min(structures.len().saturating_sub(1))]
+                    .clone(),
+                };
+                self.structure_fetch_key = Some(structure.cache_key.clone());
+                self.structure_fetch_retry_at = None;
+                // The formula is the identity — lead with it. A formula PRISM
+                // never received falls back to the cache key, not a guess.
+                let identity = structure
+                    .formula
+                    .clone()
+                    .unwrap_or_else(|| clip_cache_key(&structure.cache_key));
+                self.open_detail_view(
+                    format!("Structure — {identity}"),
+                    format!("Loading CIF from {}…", structure.cache_ref_display()),
+                );
+                self.structure_view_key = Some(structure.cache_key.clone());
+                self.request_structure_fetch(&structure.cache_key);
+            }
             WorkspaceTab::Artifacts => {
                 let artifact = match &self.artifact_store {
                     ArtifactStoreState::Loading => {
@@ -1418,13 +1507,15 @@ impl App {
             WorkspaceTab::Activity => WorkspaceTab::Tools,
             WorkspaceTab::Tools => WorkspaceTab::Files,
             WorkspaceTab::Files => WorkspaceTab::Objects,
-            WorkspaceTab::Objects => WorkspaceTab::Artifacts,
+            WorkspaceTab::Objects => WorkspaceTab::Structures,
+            WorkspaceTab::Structures => WorkspaceTab::Artifacts,
             WorkspaceTab::Artifacts => WorkspaceTab::Activity,
         };
         self.workspace_selected = 0;
         self.workspace_expanded = false;
         self.ensure_tool_catalog();
         self.refresh_artifacts_on_tab_entry();
+        self.refresh_structures_on_tab_entry();
     }
 
     fn workspace_prev_tab(&mut self) {
@@ -1433,12 +1524,14 @@ impl App {
             WorkspaceTab::Tools => WorkspaceTab::Activity,
             WorkspaceTab::Files => WorkspaceTab::Tools,
             WorkspaceTab::Objects => WorkspaceTab::Files,
-            WorkspaceTab::Artifacts => WorkspaceTab::Objects,
+            WorkspaceTab::Structures => WorkspaceTab::Objects,
+            WorkspaceTab::Artifacts => WorkspaceTab::Structures,
         };
         self.workspace_selected = 0;
         self.workspace_expanded = false;
         self.ensure_tool_catalog();
         self.refresh_artifacts_on_tab_entry();
+        self.refresh_structures_on_tab_entry();
     }
 
     /// The catalog arrives at startup (`ui.tools.catalog`), so no fetch here.
@@ -1450,11 +1543,26 @@ impl App {
         }
     }
 
+    /// The Structures tab pulls fresh cache metadata on entry; new
+    /// structures otherwise surface at the next turn boundary.
+    fn refresh_structures_on_tab_entry(&mut self) {
+        if self.workspace_tab == WorkspaceTab::Structures && !self.is_waiting {
+            self.schedule_structure_refresh(self.structure_policy.refresh_debounce);
+        }
+    }
+
     fn schedule_artifact_refresh(&mut self, delay: std::time::Duration) {
         if self.session_id.is_none() {
             return;
         }
         self.artifact_refresh_at = Some(std::time::Instant::now() + delay);
+    }
+
+    fn schedule_structure_refresh(&mut self, delay: std::time::Duration) {
+        if self.session_id.is_none() {
+            return;
+        }
+        self.structure_refresh_at = Some(std::time::Instant::now() + delay);
     }
 
     /// Poll coalesced artifact list/fetch requests from the main event loop.
@@ -1500,6 +1608,108 @@ impl App {
         }
     }
 
+    // ── Structures plane (mirrors the artifact flow above) ────────────
+
+    /// Poll coalesced structures list/fetch requests from the main event
+    /// loop. Sending a JSON request is nonblocking; the backend reads the
+    /// structure cache and CIF text off the render thread.
+    pub fn poll_structure_requests(&mut self) {
+        let now = std::time::Instant::now();
+        if self.structure_refresh_at.is_some_and(|due| due <= now) {
+            self.structure_refresh_at = None;
+            self.structure_store = StructuresStoreState::Loading;
+            match self
+                .backend
+                .request_structures(self.structure_policy.list_limit)
+            {
+                Ok(id) => self.structure_list_rpc_id = Some(id),
+                Err(error) => {
+                    self.structure_list_rpc_id = None;
+                    self.structure_store =
+                        StructuresStoreState::Unavailable(sanitize_for_render(&error.to_string()));
+                    self.workspace_selected = 0;
+                }
+            }
+        }
+
+        if self.structure_fetch_retry_at.is_some_and(|due| due <= now) {
+            self.structure_fetch_retry_at = None;
+            if !self.view.open {
+                self.structure_fetch_key = None;
+                return;
+            }
+            if let Some(cache_key) = self.structure_fetch_key.clone() {
+                self.request_structure_fetch(&cache_key);
+            }
+        }
+    }
+
+    fn request_structure_fetch(&mut self, cache_key: &str) {
+        match self.backend.fetch_structure(cache_key) {
+            Ok(id) => self.structure_fetch_rpc_id = Some(id),
+            Err(error) => {
+                self.structure_fetch_key = None;
+                self.structure_fetch_retry_at = None;
+                self.structure_fetch_rpc_id = None;
+                if self.view.open {
+                    self.view.tabs = vec![(
+                        String::new(),
+                        sanitize_for_render(&format!("Structure unavailable: {error}")),
+                    )];
+                }
+            }
+        }
+    }
+
+    fn finish_structure_fetch_error(&mut self, message: &str) {
+        self.structure_fetch_key = None;
+        self.structure_fetch_retry_at = None;
+        self.structure_fetch_rpc_id = None;
+        if self.view.open {
+            self.view.tabs = vec![(
+                String::new(),
+                sanitize_for_render(&format!("Structure unavailable: {message}")),
+            )];
+            self.view.scroll = 0;
+        }
+    }
+
+    /// The row for a cache key, if the current store holds it.
+    fn structure_row(&self, cache_key: &str) -> Option<WorkspaceStructure> {
+        match &self.structure_store {
+            StructuresStoreState::Ready(rows) => rows
+                .iter()
+                .find(|structure| structure.cache_key == cache_key)
+                .cloned(),
+            _ => None,
+        }
+    }
+
+    /// Detail body for the CIF view: the meta PRISM actually has (missing
+    /// fields read `unknown` — never invented), then the verbatim CIF text.
+    fn structure_detail_body(structure: &WorkspaceStructure, cif_body: String) -> String {
+        let atoms = structure
+            .n_atoms
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut body = format!(
+            "formula:     {}\natoms:       {atoms}\ncomposition: {}\nsource:      {}\nref:         {}\n",
+            structure.formula_display(),
+            structure.composition.as_deref().unwrap_or(UNKNOWN),
+            structure.source_display(),
+            structure.cache_ref_display(),
+        );
+        if let Some(tool) = &structure.tool {
+            body.push_str(&format!("tool:        {tool}\n"));
+        }
+        if let Some(name) = &structure.name {
+            body.push_str(&format!("name:        {name}\n"));
+        }
+        body.push_str("\n── CIF ──\n");
+        body.push_str(&cif_body);
+        body
+    }
+
     fn finish_artifact_fetch_error(&mut self, message: &str) {
         self.artifact_fetch_pending = None;
         self.artifact_fetch_retry_at = None;
@@ -1512,10 +1722,14 @@ impl App {
         }
     }
 
-    fn set_artifact_session(&mut self, session_id: &str) {
+    /// Scope every session-derived workspace plane to a new backend session
+    /// id (artifacts AND structures): close any detail view owned by the
+    /// old session, drop pending fetches, and re-request fresh data. Called
+    /// on welcome, `/clear`, and resume.
+    fn set_session_scope(&mut self, session_id: &str) {
         let clean = sanitize_for_render(session_id);
         if clean.trim().is_empty() || clean != session_id {
-            if self.artifact_view_id.is_some() {
+            if self.artifact_view_id.is_some() || self.structure_view_key.is_some() {
                 self.close_view();
             }
             self.session_id = None;
@@ -1525,21 +1739,31 @@ impl App {
             self.artifact_store = ArtifactStoreState::Unavailable(
                 "backend reported an invalid artifact session id".to_string(),
             );
+            self.structure_refresh_at = None;
+            self.structure_fetch_key = None;
+            self.structure_fetch_retry_at = None;
+            self.structure_store = StructuresStoreState::Unavailable(
+                "backend reported an invalid session id".to_string(),
+            );
             return;
         }
         if self.session_id.as_deref() == Some(clean.as_str()) {
             return;
         }
-        if self.artifact_view_id.is_some() {
+        if self.artifact_view_id.is_some() || self.structure_view_key.is_some() {
             self.close_view();
         }
         self.session_id = Some(clean);
         self.artifact_store = ArtifactStoreState::Loading;
+        self.structure_store = StructuresStoreState::Loading;
         self.workspace_selected = 0;
         self.workspace_expanded = false;
         self.artifact_fetch_pending = None;
         self.artifact_fetch_retry_at = None;
+        self.structure_fetch_key = None;
+        self.structure_fetch_retry_at = None;
         self.schedule_artifact_refresh(self.artifact_policy.refresh_debounce);
+        self.schedule_structure_refresh(self.structure_policy.refresh_debounce);
     }
 
     fn handle_approval_key(&mut self, key: KeyEvent) {
@@ -2885,6 +3109,9 @@ impl App {
         self.artifact_fetch_pending = None;
         self.artifact_view_id = None;
         self.artifact_fetch_retry_at = None;
+        self.structure_fetch_key = None;
+        self.structure_view_key = None;
+        self.structure_fetch_retry_at = None;
     }
 
     fn handle_view_key(&mut self, key: KeyEvent) {
@@ -3538,6 +3765,13 @@ impl App {
                 self.workspace_expanded = false;
                 self.focus = Focus::Workspace;
             }
+            "workspace.structures" => {
+                self.workspace_tab = WorkspaceTab::Structures;
+                self.workspace_selected = 0;
+                self.workspace_expanded = false;
+                self.focus = Focus::Workspace;
+                self.refresh_structures_on_tab_entry();
+            }
             "workspace.artifacts" => {
                 self.workspace_tab = WorkspaceTab::Artifacts;
                 self.workspace_selected = 0;
@@ -3684,7 +3918,7 @@ impl App {
                 self.prism_version = version;
                 self.tool_count = tool_count;
                 if let Some(session_id) = session_id {
-                    self.set_artifact_session(&session_id);
+                    self.set_session_scope(&session_id);
                 }
                 self.push_system(&format!(
                     "PRISM ready — {} tools available",
@@ -3722,7 +3956,7 @@ impl App {
                 }
             }
             AgentMsg::SessionChanged { session_id } => {
-                self.set_artifact_session(&session_id);
+                self.set_session_scope(&session_id);
             }
             AgentMsg::ArtifactsListed {
                 session_id,
@@ -3826,6 +4060,98 @@ impl App {
                     .is_none_or(|id| self.artifact_fetch_pending.as_deref() == Some(id));
                 if applies && self.artifact_fetch_pending.is_some() {
                     self.finish_artifact_fetch_error(&message);
+                }
+            }
+            AgentMsg::StructuresListed {
+                session_id,
+                structures,
+            } => {
+                self.structure_list_rpc_id = None;
+                let clean_session = sanitize_for_render(&session_id);
+                if clean_session.trim().is_empty() || clean_session != session_id {
+                    self.structure_store = StructuresStoreState::Unavailable(
+                        "structure list reported an invalid session id".to_string(),
+                    );
+                    self.workspace_selected = 0;
+                    self.structure_refresh_at = None;
+                    return;
+                }
+                if self.session_id.as_deref() != Some(clean_session.as_str()) {
+                    // A response from the previous session raced a resume or
+                    // fork. It is stale data, not evidence about this cache.
+                    self.structure_store = StructuresStoreState::Loading;
+                    self.schedule_structure_refresh(self.structure_policy.refresh_debounce);
+                    return;
+                }
+                let parsed = structures
+                    .iter()
+                    .map(WorkspaceStructure::from_value)
+                    .collect::<Result<Vec<_>, _>>();
+                self.structure_store = match parsed {
+                    Ok(rows) => StructuresStoreState::Ready(rows),
+                    Err(error) => StructuresStoreState::Unavailable(sanitize_for_render(&error)),
+                };
+                if let StructuresStoreState::Ready(rows) = &self.structure_store {
+                    self.workspace_selected =
+                        self.workspace_selected.min(rows.len().saturating_sub(1));
+                } else {
+                    self.workspace_selected = 0;
+                }
+            }
+            AgentMsg::StructuresPending { message: _ } => {
+                self.structure_store = StructuresStoreState::Loading;
+                self.schedule_structure_refresh(self.structure_policy.busy_retry_delay);
+            }
+            AgentMsg::StructureStoreUnavailable { message } => {
+                self.structure_list_rpc_id = None;
+                self.structure_store =
+                    StructuresStoreState::Unavailable(sanitize_for_render(&message));
+                self.workspace_selected = 0;
+                self.structure_refresh_at = None;
+            }
+            AgentMsg::StructureFetched {
+                session_id,
+                cache_key,
+                cif,
+                truncated,
+            } => {
+                if self.structure_fetch_key.as_deref() != Some(cache_key.as_str()) {
+                    return;
+                }
+                self.structure_fetch_rpc_id = None;
+                if self.session_id.as_deref() != Some(session_id.as_str()) {
+                    self.finish_structure_fetch_error("session changed while fetching the CIF");
+                    return;
+                }
+                // Bounded by policy: a large CIF never becomes an unbounded
+                // allocation held by the TUI (see StructurePolicy::cif_bytes).
+                let cif_body = format_cif_body(&cif, self.structure_policy.cif_bytes, truncated);
+                let body = match self.structure_row(&cache_key) {
+                    Some(structure) => Self::structure_detail_body(&structure, cif_body),
+                    None => cif_body,
+                };
+                if self.view.open {
+                    self.view.tabs = vec![(String::new(), sanitize_for_render(&body))];
+                    self.view.scroll = 0;
+                }
+                self.structure_fetch_key = None;
+                self.structure_fetch_retry_at = None;
+            }
+            AgentMsg::StructurePending {
+                cache_key,
+                message: _,
+            } => {
+                if self.structure_fetch_key.as_deref() == Some(cache_key.as_str()) {
+                    self.structure_fetch_retry_at =
+                        Some(std::time::Instant::now() + self.structure_policy.busy_retry_delay);
+                }
+            }
+            AgentMsg::StructureFetchError { cache_key, message } => {
+                let applies = cache_key
+                    .as_deref()
+                    .is_none_or(|key| self.structure_fetch_key.as_deref() == Some(key));
+                if applies && self.structure_fetch_key.is_some() {
+                    self.finish_structure_fetch_error(&message);
                 }
             }
             AgentMsg::GhData {
@@ -4102,6 +4428,12 @@ impl App {
                     self.artifact_fetch_retry_at =
                         Some(std::time::Instant::now() + self.artifact_policy.refresh_debounce);
                 }
+                // Structures the agent touched this turn surface here.
+                self.schedule_structure_refresh(self.structure_policy.refresh_debounce);
+                if self.structure_fetch_key.is_some() && self.view.open {
+                    self.structure_fetch_retry_at =
+                        Some(std::time::Instant::now() + self.structure_policy.refresh_debounce);
+                }
                 // A login/logout turn just finished — refresh account status.
                 if self.account.busy {
                     self.account.busy = false;
@@ -4112,6 +4444,9 @@ impl App {
                 self.artifact_fetch_pending = None;
                 self.artifact_view_id = None;
                 self.artifact_fetch_retry_at = None;
+                self.structure_fetch_key = None;
+                self.structure_view_key = None;
+                self.structure_fetch_retry_at = None;
                 // Render view results (tools/status/context/…) as a tabbed,
                 // scrollable panel rather than a flat chat dump.
                 let clean_title = sanitize_for_render(&title);
@@ -4137,7 +4472,28 @@ impl App {
                 code,
                 message,
                 recoverable,
+                rpc_id,
             } => {
+                // Attribute protocol-level error RESPONSES to the structures
+                // request that provoked them (matched by JSON-RPC id). A
+                // backend without structures support answers `-32601 Method
+                // not found`; that is "structure cache unavailable", not a
+                // chat-transcript error.
+                if let Some(id) = rpc_id {
+                    if self.structure_list_rpc_id == Some(id) {
+                        self.structure_list_rpc_id = None;
+                        self.structure_refresh_at = None;
+                        self.structure_store =
+                            StructuresStoreState::Unavailable(sanitize_for_render(&message));
+                        self.workspace_selected = 0;
+                        return;
+                    }
+                    if self.structure_fetch_rpc_id == Some(id) {
+                        self.structure_fetch_rpc_id = None;
+                        self.finish_structure_fetch_error(&message);
+                        return;
+                    }
+                }
                 let prefix = match (code, recoverable) {
                     (Some(c), Some(false)) => format!("[fatal error {c}]"),
                     (Some(c), _) => format!("[error {c}]"),

@@ -53,6 +53,8 @@ prism tui --fake-backend --scenario approval_required
 prism tui --fake-backend --scenario cost_metrics
 prism tui --fake-backend --scenario backend_warning_error
 prism tui --fake-backend --scenario ansi_injection
+prism tui --fake-backend --scenario object_progress
+prism tui --fake-backend --scenario structures_cache
 ```
 
 ## Required Verification Command

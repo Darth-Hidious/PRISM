@@ -3,7 +3,7 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New ses│ Workspace
-response: PRISM▲│ [Act] Too Fil Obj Art
+response: PRISM▲│ [Ac] To Fi Ob St Ar
 TUI is running ║│
 in deterministi║│  1. prompt "Hello" •
 test mode.     █│

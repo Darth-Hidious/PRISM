@@ -21,6 +21,76 @@ use tokio::sync::mpsc;
 
 // ── Fake scenario ───────────────────────────────────────────────────
 
+/// Deterministic structure-cache data for [`FakeScenario::StructuresCache`].
+/// Three structures with distinct provenance (a user import, a database
+/// lookup, a relaxation) — different epistemic objects, each carrying its
+/// own `source` verbatim.
+const FAKE_TIAL_CACHE_KEY: &str =
+    "0f7a1c2e9b4d4a6f8c1e3b5d7f9a0c2e4b6d8f0a1c3e5b7d9f0a2c4e6b8d0f1a";
+const FAKE_MGB2_CACHE_KEY: &str =
+    "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809";
+const FAKE_W_CACHE_KEY: &str = "9e8d7c6b5a4938271605f4e3d2c1b0a99e8d7c6b5a4938271605f4e3d2c1b0a9";
+
+/// The CIF served for [`FAKE_TIAL_CACHE_KEY`] — small, deterministic, and
+/// shaped like ASE's CIF writer output (what `structure_import` stores).
+const FAKE_TIAL_CIF: &str = "\
+data_TiAl
+_chemical_formula_sum \"Al1 Ti1\"
+_chemical_name_common \"TiAl gamma\"
+_cell_length_a 4.005
+_cell_length_b 4.005
+_cell_length_c 4.171
+_cell_angle_alpha 90.0
+_cell_angle_beta 90.0
+_cell_angle_gamma 90.0
+_symmetry_space_group_name_H-M \"P 4/m m m\"
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Ti1 Ti 0.00000 0.00000 0.00000
+Al1 Al 0.50000 0.50000 0.50000
+";
+
+fn fake_structure_rows() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "cache_key": FAKE_TIAL_CACHE_KEY,
+            "cache_ref": format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
+            "tool": "structure_import",
+            "name": "TiAl gamma (user CIF)",
+            "formula": "TiAl",
+            "n_atoms": 2,
+            "composition": {"Al": 1, "Ti": 1},
+            "source": "user_import",
+            "created_at": "2026-08-11T09:14:00+00:00"
+        }),
+        serde_json::json!({
+            "cache_key": FAKE_MGB2_CACHE_KEY,
+            "cache_ref": format!("cache://{FAKE_MGB2_CACHE_KEY}/structure.cif"),
+            "tool": "structure_import",
+            "name": "MgB2 database lookup",
+            "formula": "MgB2",
+            "n_atoms": 3,
+            "composition": {"B": 2, "Mg": 1},
+            "source": "materials_project",
+            "created_at": "2026-08-11T09:41:00+00:00"
+        }),
+        serde_json::json!({
+            "cache_key": FAKE_W_CACHE_KEY,
+            "cache_ref": format!("cache://{FAKE_W_CACHE_KEY}/structure.cif"),
+            "tool_name": "mace_relax",
+            "formula": "W2",
+            "n_atoms": 2,
+            "composition": {"W": 2},
+            "source": "mace_relaxation",
+            "created_at": "2026-08-11T10:02:00+00:00"
+        }),
+    ]
+}
+
 /// Deterministic fake-backend scenario.  Each variant corresponds to a
 /// fixed sequence of JSON-RPC notifications that the fake backend
 /// replays when the user interacts with the TUI.
@@ -46,6 +116,10 @@ pub enum FakeScenario {
     AnsiInjection,
     /// Domain objects: object creation, progress updates, and terminal states.
     ObjectProgress,
+    /// Structures plane: a session structure cache with entries from
+    /// distinct sources (user import, database lookup, relaxation) and a
+    /// fetchable CIF for the first entry.
+    StructuresCache,
 }
 
 impl FakeScenario {
@@ -62,6 +136,7 @@ impl FakeScenario {
             "backend_warning_error" => Ok(Self::BackendWarningError),
             "ansi_injection" => Ok(Self::AnsiInjection),
             "object_progress" => Ok(Self::ObjectProgress),
+            "structures_cache" => Ok(Self::StructuresCache),
             other => bail!(
                 "unknown fake backend scenario: '{other}'. \
                  Available scenarios: {}",
@@ -83,6 +158,7 @@ impl FakeScenario {
             Self::BackendWarningError => "backend_warning_error",
             Self::AnsiInjection => "ansi_injection",
             Self::ObjectProgress => "object_progress",
+            Self::StructuresCache => "structures_cache",
         }
     }
 
@@ -99,6 +175,7 @@ impl FakeScenario {
             "backend_warning_error",
             "ansi_injection",
             "object_progress",
+            "structures_cache",
         ]
     }
 }
@@ -280,6 +357,24 @@ impl RealBackend {
         self.send_request(
             "workspace.artifact.fetch",
             serde_json::json!({"artifact_id": artifact_id}),
+        )
+    }
+
+    /// Request the session's structures from the structure cache. The
+    /// backend performs the cache read and replies through `ui.structures.*`
+    /// notifications (never on the render thread).
+    pub fn request_structures(&mut self, limit: u64) -> Result<u64> {
+        self.send_request(
+            "workspace.structures.list",
+            serde_json::json!({"limit": limit}),
+        )
+    }
+
+    /// Request the CIF text for one cached structure.
+    pub fn fetch_structure(&mut self, cache_key: &str) -> Result<u64> {
+        self.send_request(
+            "workspace.structure.fetch",
+            serde_json::json!({"cache_key": cache_key}),
         )
     }
 
@@ -672,6 +767,22 @@ impl FakeBackend {
                 );
                 self.notify("ui.turn.complete", serde_json::json!({}));
             }
+            FakeScenario::StructuresCache => {
+                // The science of this scenario is the structures plane
+                // (served via `request_structures` / `fetch_structure`).
+                // The chat reply stays minimal; the turn boundary is what
+                // refreshes the Structures tab.
+                self.notify(
+                    "ui.text.delta",
+                    serde_json::json!({"text": "Three structures are in this session's cache. "}),
+                );
+                self.notify(
+                    "ui.text.delta",
+                    serde_json::json!({"text": "Open the Workspace Structures tab to inspect them. "}),
+                );
+                self.notify("ui.text.flush", serde_json::json!({}));
+                self.notify("ui.turn.complete", serde_json::json!({}));
+            }
         }
     }
 
@@ -888,6 +999,55 @@ impl FakeBackend {
         Ok(id)
     }
 
+    /// Request the session's structure list. Every scenario answers (an
+    /// empty list outside `structures_cache`) so the tab never parks in
+    /// "loading" — mirroring [`Self::request_artifacts`].
+    pub fn request_structures(&mut self, _limit: u64) -> Result<u64> {
+        let id = self.next_id();
+        let structures = if self.scenario == FakeScenario::StructuresCache {
+            serde_json::json!(fake_structure_rows())
+        } else {
+            serde_json::json!([])
+        };
+        self.notify(
+            "ui.structures.list",
+            serde_json::json!({
+                "session_id": self.session_id,
+                "structures": structures,
+            }),
+        );
+        Ok(id)
+    }
+
+    /// Fetch one structure's CIF text. Only the TiAl entry of the
+    /// `structures_cache` scenario exists; anything else is an honest
+    /// not-found error.
+    pub fn fetch_structure(&mut self, cache_key: &str) -> Result<u64> {
+        let id = self.next_id();
+        if self.scenario == FakeScenario::StructuresCache && cache_key == FAKE_TIAL_CACHE_KEY {
+            self.notify(
+                "ui.structure.fetched",
+                serde_json::json!({
+                    "session_id": self.session_id,
+                    "cache_key": cache_key,
+                    "cif": FAKE_TIAL_CIF,
+                    "truncated": false,
+                }),
+            );
+        } else {
+            self.notify(
+                "ui.structure.error",
+                serde_json::json!({
+                    "cache_key": cache_key,
+                    "message": format!(
+                        "no structure with cache key '{cache_key}' in this session's cache"
+                    ),
+                }),
+            );
+        }
+        Ok(id)
+    }
+
     pub fn send_approval(&mut self, response: &str, _tool_name: &str) -> Result<()> {
         // Enqueue the deterministic approval response based on the
         // user's decision (y/n/a).  This lets the TUI test the full
@@ -1002,6 +1162,22 @@ impl BackendHandle {
             Self::Real(b) => b.fetch_artifact(artifact_id),
             Self::Fake(b) => b.fetch_artifact(artifact_id),
             Self::Native(b) => b.fetch_artifact(artifact_id),
+        }
+    }
+
+    pub fn request_structures(&mut self, limit: u64) -> Result<u64> {
+        match self {
+            Self::Real(b) => b.request_structures(limit),
+            Self::Fake(b) => b.request_structures(limit),
+            Self::Native(b) => b.request_structures(limit),
+        }
+    }
+
+    pub fn fetch_structure(&mut self, cache_key: &str) -> Result<u64> {
+        match self {
+            Self::Real(b) => b.fetch_structure(cache_key),
+            Self::Fake(b) => b.fetch_structure(cache_key),
+            Self::Native(b) => b.fetch_structure(cache_key),
         }
     }
 
@@ -1126,6 +1302,20 @@ impl NativeBackend {
         self.send_request(
             "workspace.artifact.fetch",
             serde_json::json!({"artifact_id": artifact_id}),
+        )
+    }
+
+    pub fn request_structures(&mut self, limit: u64) -> Result<u64> {
+        self.send_request(
+            "workspace.structures.list",
+            serde_json::json!({"limit": limit}),
+        )
+    }
+
+    pub fn fetch_structure(&mut self, cache_key: &str) -> Result<u64> {
+        self.send_request(
+            "workspace.structure.fetch",
+            serde_json::json!({"cache_key": cache_key}),
         )
     }
 

@@ -1136,6 +1136,7 @@ fn parse_backend_error_notification() {
             code,
             message,
             recoverable,
+            ..
         } => {
             assert_eq!(code, Some(500));
             assert_eq!(message, "Internal backend error");
@@ -1159,6 +1160,7 @@ fn parse_jsonrpc_error_response_structured() {
             code,
             message,
             recoverable,
+            ..
         } => {
             assert_eq!(code, Some(-32600));
             assert_eq!(message, "Invalid Request");
@@ -1321,6 +1323,7 @@ fn backend_error_pushes_error_line() {
         code: Some(500),
         message: "Internal error".into(),
         recoverable: Some(true),
+        rpc_id: None,
     });
     assert!(
         app.messages
@@ -1336,6 +1339,7 @@ fn backend_error_fatal_pushes_error_line() {
         code: Some(-1),
         message: "Backend crashed".into(),
         recoverable: Some(false),
+        rpc_id: None,
     });
     assert!(app.messages.iter().any(|m| m.text.contains("fatal")));
 }
@@ -1347,6 +1351,7 @@ fn backend_error_no_code_still_pushes() {
         code: None,
         message: "Unknown failure".into(),
         recoverable: None,
+        rpc_id: None,
     });
     assert!(
         app.messages
@@ -2074,6 +2079,7 @@ fn backend_error_with_ansi_stores_sanitized_text() {
         code: Some(500),
         message: "\x1b[31mInternal\x1b[0m error\x07".into(),
         recoverable: Some(true),
+        rpc_id: None,
     });
     let last = app.messages.last().unwrap();
     assert!(last.text.contains("Internal error"));
@@ -3329,4 +3335,382 @@ fn parse_object_update_notification() {
         }
         other => panic!("expected ObjectUpdate, got {other:?}"),
     }
+}
+
+// ── Structures plane (materials sidebar) ────────────────────────────
+
+fn structure_row_json(cache_key: &str) -> serde_json::Value {
+    json!({
+        "cache_key": cache_key,
+        "cache_ref": format!("cache://{cache_key}/structure.cif"),
+        "tool": "structure_import",
+        "name": "TiAl gamma",
+        "formula": "TiAl",
+        "n_atoms": 2,
+        "composition": {"Al": 1, "Ti": 1},
+        "source": "user_import",
+    })
+}
+
+#[test]
+fn parse_structures_list_notification() {
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.structures.list",
+        "params": {
+            "session_id": "session-a",
+            "structures": [structure_row_json("key-1")],
+        },
+    });
+    match parse_notification(&msg) {
+        AgentMsg::StructuresListed {
+            session_id,
+            structures,
+        } => {
+            assert_eq!(session_id, "session-a");
+            assert_eq!(structures.len(), 1);
+        }
+        other => panic!("expected StructuresListed, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_structures_list_malformed_becomes_unavailable() {
+    // Missing session_id — never silently accepted.
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.structures.list",
+        "params": {"structures": []},
+    });
+    assert!(matches!(
+        parse_notification(&msg),
+        AgentMsg::StructureStoreUnavailable { .. }
+    ));
+}
+
+#[test]
+fn parse_structure_fetched_notification() {
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.structure.fetched",
+        "params": {
+            "session_id": "session-a",
+            "cache_key": "key-1",
+            "cif": "data_TiAl\n",
+            "truncated": true,
+        },
+    });
+    match parse_notification(&msg) {
+        AgentMsg::StructureFetched {
+            session_id,
+            cache_key,
+            cif,
+            truncated,
+        } => {
+            assert_eq!(session_id, "session-a");
+            assert_eq!(cache_key, "key-1");
+            assert_eq!(cif, "data_TiAl\n");
+            assert!(truncated);
+        }
+        other => panic!("expected StructureFetched, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_structure_fetched_malformed_becomes_error() {
+    // Missing CIF text — a fetch response without the text is an error,
+    // not an empty CIF.
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.structure.fetched",
+        "params": {"session_id": "session-a", "cache_key": "key-1"},
+    });
+    assert!(matches!(
+        parse_notification(&msg),
+        AgentMsg::StructureFetchError { .. }
+    ));
+}
+
+#[test]
+fn parse_structure_error_notification_keeps_key() {
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "ui.structure.error",
+        "params": {"cache_key": "key-9", "message": "not found"},
+    });
+    match parse_notification(&msg) {
+        AgentMsg::StructureFetchError { cache_key, message } => {
+            assert_eq!(cache_key.as_deref(), Some("key-9"));
+            assert_eq!(message, "not found");
+        }
+        other => panic!("expected StructureFetchError, got {other:?}"),
+    }
+}
+
+#[test]
+fn jsonrpc_error_response_carries_the_request_id() {
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "error": {"code": -32601, "message": "Method not found: workspace.structures.list"},
+    });
+    match parse_notification(&msg) {
+        AgentMsg::BackendError { code, rpc_id, .. } => {
+            assert_eq!(code, Some(-32601));
+            assert_eq!(rpc_id, Some(7));
+        }
+        other => panic!("expected BackendError, got {other:?}"),
+    }
+}
+
+#[test]
+fn structures_listed_populates_the_store() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.workspace_selected = 5; // must be clamped to the row count
+
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![structure_row_json("key-1"), structure_row_json("key-2")],
+    });
+
+    match &app.structure_store {
+        prism_tui::structures::StructuresStoreState::Ready(rows) => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].formula_display(), "TiAl");
+            assert_eq!(rows[0].source_display(), "user_import");
+        }
+        other => panic!("expected Ready store, got {other:?}"),
+    }
+    assert_eq!(app.workspace_selected, 1);
+}
+
+#[test]
+fn structures_listed_from_a_stale_session_is_not_trusted() {
+    let mut app = test_app();
+    app.session_id = Some("session-b".into());
+
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![structure_row_json("key-1")],
+    });
+
+    assert!(
+        matches!(
+            &app.structure_store,
+            prism_tui::structures::StructuresStoreState::Loading
+        ),
+        "stale response must leave the store loading, not populate it"
+    );
+}
+
+#[test]
+fn structures_listed_with_a_malformed_row_is_unavailable() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        // Second row has no cache_key — the list is malformed, and a
+        // half-parsed store would be a lie of omission.
+        structures: vec![structure_row_json("key-1"), json!({"formula": "TiAl"})],
+    });
+
+    assert!(matches!(
+        &app.structure_store,
+        prism_tui::structures::StructuresStoreState::Unavailable(_)
+    ));
+}
+
+#[test]
+fn structure_unavailable_and_empty_are_distinct_facts() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![],
+    });
+    assert!(
+        matches!(
+            &app.structure_store,
+            prism_tui::structures::StructuresStoreState::Ready(rows) if rows.is_empty()
+        ),
+        "an empty list is healthy"
+    );
+
+    app.apply_agent_msg(AgentMsg::StructureStoreUnavailable {
+        message: "cache directory unreadable".into(),
+    });
+    assert!(
+        matches!(
+            &app.structure_store,
+            prism_tui::structures::StructuresStoreState::Unavailable(reason)
+                if reason.contains("cache directory unreadable")
+        ),
+        "unavailable must never collapse into empty"
+    );
+}
+
+#[test]
+fn structures_enter_on_empty_tab_toasts_instead_of_opening() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![],
+    });
+    app.workspace_tab = WorkspaceTab::Structures;
+    app.focus = Focus::Workspace;
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(!app.view.open);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.message.contains("no structures yet")),
+        "empty structures tab must say why"
+    );
+}
+
+#[test]
+fn structures_enter_fetches_cif_into_the_view_panel() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![structure_row_json("key-1")],
+    });
+    app.workspace_tab = WorkspaceTab::Structures;
+    app.focus = Focus::Workspace;
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.view.open);
+    assert!(app.view.title.contains("TiAl"), "formula leads the title");
+    assert!(
+        app.view.tabs[0].1.contains("Loading CIF"),
+        "the panel must say the CIF is on its way"
+    );
+
+    app.apply_agent_msg(AgentMsg::StructureFetched {
+        session_id: "session-a".into(),
+        cache_key: "key-1".into(),
+        cif: "data_TiAl\n_cell_length_a 4.005\n".into(),
+        truncated: false,
+    });
+
+    let body = &app.view.tabs[0].1;
+    assert!(body.contains("data_TiAl"), "the actual CIF text is shown");
+    assert!(
+        body.contains("cache://key-1/structure.cif"),
+        "full ref visible"
+    );
+    assert!(body.contains("source:      user_import"), "source visible");
+}
+
+#[test]
+fn structure_fetch_for_another_key_does_not_hijack_the_view() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![structure_row_json("key-1")],
+    });
+    app.workspace_tab = WorkspaceTab::Structures;
+    app.focus = Focus::Workspace;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    app.apply_agent_msg(AgentMsg::StructureFetched {
+        session_id: "session-a".into(),
+        cache_key: "key-OTHER".into(),
+        cif: "data_SomethingElse\n".into(),
+        truncated: false,
+    });
+
+    assert!(
+        app.view.tabs[0].1.contains("Loading CIF"),
+        "a fetch response for a key we did not ask for must be ignored"
+    );
+}
+
+#[test]
+fn structure_fetch_error_is_shown_in_the_view() {
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-a".into(),
+        structures: vec![structure_row_json("key-1")],
+    });
+    app.workspace_tab = WorkspaceTab::Structures;
+    app.focus = Focus::Workspace;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+    app.apply_agent_msg(AgentMsg::StructureFetchError {
+        cache_key: Some("key-1".into()),
+        message: "no structure with cache key 'key-1'".into(),
+    });
+
+    assert!(app.view.tabs[0].1.contains("Structure unavailable"));
+}
+
+#[test]
+fn backend_method_not_found_becomes_unavailable_not_chat_noise() {
+    // A backend without structures support answers -32601 to the list
+    // request. That is "structure cache unavailable" — not a chat error.
+    let mut app = test_app();
+    app.session_id = Some("session-a".into());
+    app.structure_policy.refresh_debounce = std::time::Duration::ZERO;
+
+    // Enter the Structures tab through the real key path, then let the
+    // event-loop poll send the list request (id 1 on a fresh backend).
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(app.workspace_tab, WorkspaceTab::Structures);
+    app.poll_structure_requests();
+
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: Some(-32601),
+        message: "Method not found: workspace.structures.list".into(),
+        recoverable: None,
+        rpc_id: Some(1),
+    });
+
+    match &app.structure_store {
+        prism_tui::structures::StructuresStoreState::Unavailable(reason) => {
+            assert!(reason.contains("Method not found"));
+        }
+        other => panic!("expected Unavailable store, got {other:?}"),
+    }
+    assert!(
+        !app.messages
+            .iter()
+            .any(|m| matches!(m.kind, LineKind::Error(_))),
+        "an attributed protocol error must not land in the chat transcript"
+    );
+
+    // An UNattributed backend error still reaches the chat, as before.
+    app.apply_agent_msg(AgentMsg::BackendError {
+        code: Some(500),
+        message: "boom".into(),
+        recoverable: None,
+        rpc_id: None,
+    });
+    assert!(app.messages.iter().any(|m| m.text.contains("boom")));
+}
+
+#[test]
+fn structures_tab_cycles_between_objects_and_artifacts() {
+    let mut app = test_app();
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Objects;
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(app.workspace_tab, WorkspaceTab::Structures);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(app.workspace_tab, WorkspaceTab::Artifacts);
+    app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+    assert_eq!(app.workspace_tab, WorkspaceTab::Structures);
+    app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+    assert_eq!(app.workspace_tab, WorkspaceTab::Objects);
 }

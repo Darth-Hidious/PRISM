@@ -233,6 +233,11 @@ pub enum AgentMsg {
         code: Option<i64>,
         message: String,
         recoverable: Option<bool>,
+        /// JSON-RPC `id` of the response this error arrived on, when any.
+        /// Notifications carry none. Lets the app attribute a protocol
+        /// error (e.g. `-32601 Method not found`) to the request that
+        /// provoked it instead of dumping it into the chat transcript.
+        rpc_id: Option<u64>,
     },
 
     // ── Domain objects ─────────────────────────────────────────────
@@ -248,6 +253,38 @@ pub enum AgentMsg {
         progress_total: Option<u64>,
         detail: Option<String>,
     },
+
+    // ── Structures (materials plane) ───────────────────────────────
+    /// `ui.structures.list` — the session's structures from the
+    /// content-addressed structure cache (response to
+    /// `workspace.structures.list`). Rows are raw meta objects;
+    /// [`crate::structures::WorkspaceStructure::from_value`] types them.
+    StructuresListed {
+        session_id: String,
+        structures: Vec<Value>,
+    },
+    /// `ui.structures.unavailable` — the structure cache could not be
+    /// queried or returned a malformed list. Distinct from an empty list.
+    StructureStoreUnavailable { message: String },
+    /// `ui.structures.pending` — the active agent turn owns the tool
+    /// worker; the list is delayed, not lost.
+    StructuresPending { message: String },
+    /// `ui.structure.fetched` — the CIF text for one cache key (response
+    /// to `workspace.structure.fetch`). `truncated` reports the backend's
+    /// own cap; the TUI applies its display cap on top.
+    StructureFetched {
+        session_id: String,
+        cache_key: String,
+        cif: String,
+        truncated: bool,
+    },
+    /// `ui.structure.error` — one CIF could not be fetched.
+    StructureFetchError {
+        cache_key: Option<String>,
+        message: String,
+    },
+    /// `ui.structure.pending` — CIF fetch delayed behind the active turn.
+    StructurePending { cache_key: String, message: String },
 
     // ── Legacy / fallback ────────────────────────────────────────────
     /// A generic error string.  Kept for backward compatibility with
@@ -400,6 +437,84 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("artifact could not be fetched")
+                .to_string(),
+        },
+
+        // ── Structures (materials plane) ───────────────────────────
+        "ui.structures.list" => {
+            let session_id = params.get("session_id").and_then(Value::as_str);
+            let structures = params.get("structures").and_then(Value::as_array);
+            match (session_id, structures) {
+                (Some(session_id), Some(structures)) if !session_id.trim().is_empty() => {
+                    AgentMsg::StructuresListed {
+                        session_id: session_id.to_string(),
+                        structures: structures.clone(),
+                    }
+                }
+                _ => AgentMsg::StructureStoreUnavailable {
+                    message: "structure cache returned an invalid list response".to_string(),
+                },
+            }
+        }
+        "ui.structures.pending" => AgentMsg::StructuresPending {
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("structure data is waiting for the active turn")
+                .to_string(),
+        },
+        "ui.structures.unavailable" => AgentMsg::StructureStoreUnavailable {
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("structure cache unavailable")
+                .to_string(),
+        },
+        "ui.structure.fetched" => {
+            let session_id = params.get("session_id").and_then(Value::as_str);
+            let cache_key = params.get("cache_key").and_then(Value::as_str);
+            let cif = params.get("cif").and_then(Value::as_str);
+            match (session_id, cache_key, cif) {
+                (Some(session_id), Some(cache_key), Some(cif))
+                    if !session_id.trim().is_empty() && !cache_key.trim().is_empty() =>
+                {
+                    AgentMsg::StructureFetched {
+                        session_id: session_id.to_string(),
+                        cache_key: cache_key.to_string(),
+                        cif: cif.to_string(),
+                        truncated: params
+                            .get("truncated")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    }
+                }
+                _ => AgentMsg::StructureFetchError {
+                    cache_key: cache_key.map(str::to_string),
+                    message: "structure cache returned an invalid fetch response".to_string(),
+                },
+            }
+        }
+        "ui.structure.pending" => AgentMsg::StructurePending {
+            cache_key: params
+                .get("cache_key")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("CIF is waiting for the active turn")
+                .to_string(),
+        },
+        "ui.structure.error" => AgentMsg::StructureFetchError {
+            cache_key: params
+                .get("cache_key")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("structure CIF could not be fetched")
                 .to_string(),
         },
 
@@ -738,6 +853,7 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .unwrap_or("")
                 .to_string(),
             recoverable: params.get("recoverable").and_then(|r| r.as_bool()),
+            rpc_id: None,
         },
 
         // ── Fallbacks ────────────────────────────────────────────────
@@ -756,6 +872,12 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                         code,
                         message,
                         recoverable: None,
+                        // The echoed request id — lets the app attribute this
+                        // error to the request that provoked it (e.g. a
+                        // `-32601 Method not found` from a backend without
+                        // structures support becomes an honest "unavailable"
+                        // store state instead of a chat error line).
+                        rpc_id: msg.get("id").and_then(Value::as_u64),
                     }
                 } else {
                     // Fallback: treat the whole error value as a string.

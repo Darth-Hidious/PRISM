@@ -50,6 +50,7 @@ pub mod notebook;
 #[doc(hidden)]
 pub mod render;
 pub mod sanitize;
+pub mod structures;
 pub mod theme;
 pub mod toast;
 
@@ -328,6 +329,9 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         // Coalesced artifact requests only enqueue JSON messages; the backend
         // performs all store I/O off the render thread.
         app.poll_artifact_requests();
+        // Same discipline for the structures plane: the backend reads the
+        // structure cache (and CIF text) off the render thread.
+        app.poll_structure_requests();
 
         // Render every frame
         terminal.draw(|f| render::draw(f, &app))?;

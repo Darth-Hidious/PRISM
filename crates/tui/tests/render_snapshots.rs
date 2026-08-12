@@ -568,7 +568,10 @@ fn snapshot_tiny_terminal_basic_chat_40x12() {
 /// suite: a snapshot records whatever it is given, so it cannot object to a
 /// layout getting worse. This asserts the invariant directly.
 ///
-/// Mutation: make `workspace_tabs_line` always use the FULL labels and this
+/// With six tabs the ladder is three-letter labels, then two-letter initials
+/// (the full words can never fit the 42-column sidebar ceiling).
+///
+/// Mutation: make `workspace_tabs_line` always use the SHORT labels and this
 /// fails at 40 columns.
 #[test]
 fn workspace_tab_strip_never_wraps_at_any_width() {
@@ -577,22 +580,24 @@ fn workspace_tab_strip_never_wraps_at_any_width() {
         let rendered = render_app_to_string(&app, w, h);
         let strip = rendered
             .lines()
-            .find(|l| l.contains("[Activity]") || l.contains("[Act]"))
+            .find(|l| l.contains("[Activity]") || l.contains("[Act]") || l.contains("[Ac]"))
             .unwrap_or_else(|| panic!("no workspace tab strip rendered at {w}x{h}"));
-        // All five tabs must sit on that ONE line. If the strip wrapped, the
+        // All six tabs must sit on that ONE line. If the strip wrapped, the
         // trailing tab is on the next line and this fails.
-        for (full, short) in [
-            ("Activity", "Act"),
-            ("Tools", "Too"),
-            ("Files", "Fil"),
-            ("Objects", "Obj"),
-            ("Artifacts", "Art"),
+        for label in [
+            ["Activity", "Act", "Ac"],
+            ["Tools", "Too", "To"],
+            ["Files", "Fil", "Fi"],
+            ["Objects", "Obj", "Ob"],
+            ["Structures", "Str", "St"],
+            ["Artifacts", "Art", "Ar"],
         ] {
             assert!(
-                strip.contains(full) || strip.contains(short),
-                "tab `{full}` missing from the strip at {w}x{h} — it wrapped \
+                label.iter().any(|variant| strip.contains(variant)),
+                "tab `{}` missing from the strip at {w}x{h} — it wrapped \
                  onto another line and stole a row of panel content.\n\
-                 strip: {strip:?}"
+                 strip: {strip:?}",
+                label[0]
             );
         }
     }
@@ -719,6 +724,7 @@ fn snapshot_backend_warning_error_100x30() {
         code: Some(429),
         message: "Rate limit exceeded, please retry in 60s".into(),
         recoverable: Some(true),
+        rpc_id: None,
     });
     app.apply_agent_msg(AgentMsg::TurnComplete);
     freeze_metrics(&mut app);
@@ -1452,6 +1458,207 @@ fn snapshot_workspace_artifacts_unavailable_100x30() {
     let rendered = render_app_to_string(&app, 100, 30);
     assert_no_terminal_controls(&rendered);
     insta::assert_snapshot!("workspace_artifacts_unavailable_100x30", rendered);
+}
+
+// ── Workspace Structures tab (the materials plane) ────────────────
+
+/// One structures row in the wire shape `structure_io.py`'s meta defines.
+fn structure_row(
+    cache_key: &str,
+    formula: &str,
+    n_atoms: u64,
+    composition: serde_json::Value,
+    source: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "cache_key": cache_key,
+        "cache_ref": format!("cache://{cache_key}/structure.cif"),
+        "tool": "structure_import",
+        "formula": formula,
+        "n_atoms": n_atoms,
+        "composition": composition,
+        "source": source,
+        "created_at": "2026-08-11T09:14:00+00:00",
+    })
+}
+
+/// Snapshot: structures read formula-first, with atom count, composition,
+/// source (verbatim — a user import is not a database lookup), and the
+/// cache:// reference.
+#[test]
+fn snapshot_workspace_structures_entries_100x30() {
+    use prism_tui::app::WorkspaceTab;
+    use prism_tui::structures::StructuresStoreState;
+
+    let mut app = app_with_welcome();
+    app.session_id = Some("session-structures".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-structures".into(),
+        structures: vec![
+            structure_row(
+                "0f7a1c2e9b4d4a6f",
+                "TiAl",
+                2,
+                serde_json::json!({"Al": 1, "Ti": 1}),
+                "user_import",
+            ),
+            structure_row(
+                "1a2b3c4d5e6f7081",
+                "MgB2",
+                3,
+                serde_json::json!({"B": 2, "Mg": 1}),
+                "materials_project",
+            ),
+            structure_row(
+                "9e8d7c6b5a493827",
+                "W2",
+                2,
+                serde_json::json!({"W": 2}),
+                "mace_relaxation",
+            ),
+        ],
+    });
+    assert!(matches!(
+        &app.structure_store,
+        StructuresStoreState::Ready(rows) if rows.len() == 3
+    ));
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Structures;
+    app.workspace_selected = 0;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_structures_entries_100x30", rendered);
+}
+
+/// Snapshot: a healthy cache with no structures must not resemble a failed
+/// cache — it says "no structures yet" and why they would appear.
+#[test]
+fn snapshot_workspace_structures_empty_100x30() {
+    use prism_tui::app::WorkspaceTab;
+
+    let mut app = app_with_welcome();
+    app.session_id = Some("session-structures".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-structures".into(),
+        structures: vec![],
+    });
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Structures;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_structures_empty_100x30", rendered);
+}
+
+/// Snapshot: a cache that could not be queried is explicit and visually
+/// distinct from an empty, healthy session.
+#[test]
+fn snapshot_workspace_structures_unavailable_100x30() {
+    use prism_tui::app::WorkspaceTab;
+
+    let mut app = app_with_welcome();
+    app.session_id = Some("session-structures".into());
+    app.apply_agent_msg(AgentMsg::StructureStoreUnavailable {
+        message: "structure cache directory could not be opened: permission denied".into(),
+    });
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Structures;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_structures_unavailable_100x30", rendered);
+}
+
+/// Snapshot: selecting a structure opens the scrollable CIF detail — the
+/// actual text, with the meta PRISM has (full cache:// ref included).
+#[test]
+fn snapshot_workspace_structures_selected_cif_100x30() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use prism_tui::app::WorkspaceTab;
+
+    let mut app = app_with_welcome();
+    app.session_id = Some("session-structures".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-structures".into(),
+        structures: vec![structure_row(
+            "0f7a1c2e9b4d4a6f",
+            "TiAl",
+            2,
+            serde_json::json!({"Al": 1, "Ti": 1}),
+            "user_import",
+        )],
+    });
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Structures;
+
+    // Real interaction path: Enter requests the CIF, the fetch reply
+    // fills the existing view panel.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.view.open);
+    app.apply_agent_msg(AgentMsg::StructureFetched {
+        session_id: "session-structures".into(),
+        cache_key: "0f7a1c2e9b4d4a6f".into(),
+        cif: "\
+data_TiAl
+_chemical_formula_sum \"Al1 Ti1\"
+_chemical_name_common \"TiAl gamma\"
+_cell_length_a 4.005
+_cell_length_b 4.005
+_cell_length_c 4.171
+_cell_angle_alpha 90.0
+_cell_angle_beta 90.0
+_cell_angle_gamma 90.0
+_symmetry_space_group_name_H-M \"P 4/m m m\"
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Ti1 Ti 0.00000 0.00000 0.00000
+Al1 Al 0.50000 0.50000 0.50000
+"
+        .into(),
+        truncated: false,
+    });
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_structures_selected_cif_100x30", rendered);
+}
+
+/// Snapshot: missing meta fields render as unknown — a formula PRISM did
+/// not compute is never invented.
+#[test]
+fn snapshot_workspace_structures_missing_meta_unknown_100x30() {
+    use prism_tui::app::WorkspaceTab;
+
+    let mut app = app_with_welcome();
+    app.session_id = Some("session-structures".into());
+    app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-structures".into(),
+        // Only identity — the cache holds this entry, but no meta writer
+        // recorded formula, atom count, composition, or source.
+        structures: vec![serde_json::json!({
+            "cache_key": "beef0000deadbeef",
+            "cache_ref": "cache://beef0000deadbeef/structure.cif",
+        })],
+    });
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Structures;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    assert!(
+        rendered.contains("unknown"),
+        "missing text fields must read as unknown:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("? atoms"),
+        "a missing atom count must not become a number:\n{rendered}"
+    );
+    insta::assert_snapshot!("workspace_structures_missing_meta_unknown_100x30", rendered);
 }
 
 // ── Form pane (generic structured input) ────────────────────────────

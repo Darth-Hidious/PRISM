@@ -3,7 +3,7 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New session    0 tools    Ctrl-P · ?                      │ Workspace
-                                                                   │ [Act] Too Fil Obj Art
+                                                                   │ [Act] Too Fil Obj Str Art
                                                                    │
                                                                    │  (no activity yet)
                                                                    │
