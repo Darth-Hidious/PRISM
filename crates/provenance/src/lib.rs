@@ -306,6 +306,55 @@ pub struct SessionIndexEntry {
     pub size_bytes: u64,
 }
 
+/// One refused fact awaiting repair.
+///
+/// `item_id` identifies the REFUSAL — the fact's identity plus its class —
+/// not the run that produced it, so re-ingesting a document does not enqueue
+/// the same refusal twice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairItem {
+    pub item_id: String,
+    /// The source document this refusal came from.
+    pub document: String,
+    pub tenant: String,
+    /// `RejectionClass::as_str()` from the ingest crate. Stored as text so
+    /// the store does not depend on the extractor's enum.
+    pub class: String,
+    /// The refused fact, or the raw extraction when conversion itself failed.
+    pub subject_json: String,
+    /// The human-readable reason the fact was refused.
+    pub detail: String,
+    pub enqueued_at: f64,
+    pub attempts: i64,
+}
+
+/// One recorded decision about a queued item.
+///
+/// Append-only. `outcome` is `accept` (with the correction and the evidence
+/// that verified it) or `withdraw` (with the reason). There is deliberately
+/// no third state: an item that was looked at and left undecided would be
+/// exactly the silent outcome this ledger exists to prevent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepairDisposition {
+    pub item_id: String,
+    /// Which attempt this decision belongs to. A second decision on the same
+    /// item is a new row, never an overwrite.
+    pub attempt: i64,
+    pub document: String,
+    pub class: String,
+    /// `accept` or `withdraw`.
+    pub outcome: String,
+    /// The corrected fact, when accepted.
+    pub corrected_json: Option<String>,
+    /// What verified the correction — the verbatim span, or the code rule.
+    pub evidence: Option<String>,
+    pub reason: String,
+    /// Who decided: `code:<rule>` or `model:<id>`. An audit must be able to
+    /// tell a deterministic repair from a model's judgement.
+    pub dispositioner: String,
+    pub decided_at: f64,
+}
+
 /// Filters for [`ProvenanceStore::list_session_metadata`].
 #[derive(Debug, Clone)]
 pub struct SessionIndexQuery {
@@ -824,6 +873,62 @@ impl ProvenanceStore {
         )
         .await?;
 
+        // ── Repair queue and disposition ledger ──────────────────────────
+        //
+        // A refused fact is not thrown away: it is queued, and Phase 2 works
+        // the queue AFTER the graph is built. Two tables because they answer
+        // different questions — `repair_queue` is current state (what is
+        // still owed), `repair_disposition` is an append-only ledger (what
+        // was decided, by whom, on what evidence). Deleting a queue row must
+        // never erase the record that it was judged.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS repair_queue (
+                item_id TEXT PRIMARY KEY,
+                document TEXT NOT NULL,
+                tenant TEXT NOT NULL,
+                class TEXT NOT NULL,
+                subject_json TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                enqueued_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0)
+            )"#,
+            (),
+        )
+        .await?;
+        // Append-only: one row per decision, never updated in place. The
+        // `attempt` column makes a second decision on the same item a new
+        // row rather than an overwrite, so the history of a repair is
+        // readable rather than replaced.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS repair_disposition (
+                item_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL CHECK (attempt >= 0),
+                document TEXT NOT NULL,
+                class TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (outcome IN ('accept', 'withdraw')),
+                corrected_json TEXT,
+                evidence TEXT,
+                reason TEXT NOT NULL,
+                dispositioner TEXT NOT NULL,
+                decided_at REAL NOT NULL,
+                PRIMARY KEY (item_id, attempt)
+            )"#,
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_repair_queue_document \
+             ON repair_queue(document, enqueued_at)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_repair_disposition_document \
+             ON repair_disposition(document, decided_at)",
+            (),
+        )
+        .await?;
+
         // EMMO materials ontology + PROV-O assertion tables (same store).
         emmo::init_schema(conn).await?;
 
@@ -1338,6 +1443,148 @@ impl ProvenanceStore {
         }
         .await;
         finish_session_index_txn(txn, result).await
+    }
+
+    // ── Repair queue ────────────────────────────────────────────────────
+    //
+    // Phase 1 builds the graph; Phase 2 works these. Enqueue is idempotent
+    // on `item_id`, so re-ingesting the same document does not duplicate an
+    // item that was already judged.
+
+    /// Queue one refused fact for later repair.
+    ///
+    /// `item_id` must identify the refusal (the fact's identity plus its
+    /// class), NOT the run — the same refusal seen twice is one item.
+    /// Re-enqueueing an existing item leaves its attempt count alone.
+    pub async fn enqueue_repair(&self, item: &RepairItem) -> Result<()> {
+        self.conn
+            .execute(
+                r#"INSERT INTO repair_queue
+                   (item_id, document, tenant, class, subject_json, detail,
+                    enqueued_at, attempts)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+                   ON CONFLICT(item_id) DO NOTHING"#,
+                vec![
+                    Value::Text(item.item_id.clone()),
+                    Value::Text(item.document.clone()),
+                    Value::Text(item.tenant.clone()),
+                    Value::Text(item.class.clone()),
+                    Value::Text(item.subject_json.clone()),
+                    Value::Text(item.detail.clone()),
+                    Value::Real(item.enqueued_at),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Items still owed for a document, oldest first.
+    pub async fn pending_repairs(&self, document: &str, limit: i64) -> Result<Vec<RepairItem>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT item_id, document, tenant, class, subject_json, detail, \
+                 enqueued_at, attempts FROM repair_queue \
+                 WHERE document = ?1 ORDER BY enqueued_at, item_id LIMIT ?2",
+                vec![Value::Text(document.to_string()), Value::Integer(limit)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(RepairItem {
+                item_id: get_str(&row, 0)?,
+                document: get_str(&row, 1)?,
+                tenant: get_str(&row, 2)?,
+                class: get_str(&row, 3)?,
+                subject_json: get_str(&row, 4)?,
+                detail: get_str(&row, 5)?,
+                enqueued_at: row
+                    .get_value(6)
+                    .ok()
+                    .and_then(|v| v.as_real().copied())
+                    .unwrap_or_default(),
+                attempts: row
+                    .get_value(7)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Record a decision and remove the item from the queue, atomically in
+    /// intent: the ledger row is written FIRST, so a crash between the two
+    /// leaves a judged item still queued (it will be re-judged and produce a
+    /// second attempt row) rather than an item silently dropped with no
+    /// record of why.
+    pub async fn record_repair_disposition(&self, d: &RepairDisposition) -> Result<()> {
+        self.conn
+            .execute(
+                r#"INSERT INTO repair_disposition
+                   (item_id, attempt, document, class, outcome, corrected_json,
+                    evidence, reason, dispositioner, decided_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                   ON CONFLICT(item_id, attempt) DO NOTHING"#,
+                vec![
+                    Value::Text(d.item_id.clone()),
+                    Value::Integer(d.attempt),
+                    Value::Text(d.document.clone()),
+                    Value::Text(d.class.clone()),
+                    Value::Text(d.outcome.clone()),
+                    d.corrected_json.clone().map_or(Value::Null, Value::Text),
+                    d.evidence.clone().map_or(Value::Null, Value::Text),
+                    Value::Text(d.reason.clone()),
+                    Value::Text(d.dispositioner.clone()),
+                    Value::Real(d.decided_at),
+                ],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM repair_queue WHERE item_id = ?1",
+                vec![Value::Text(d.item_id.clone())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every decision recorded for a document, oldest first. The audit trail:
+    /// what was decided, by whom, on what evidence.
+    pub async fn repair_dispositions(&self, document: &str) -> Result<Vec<RepairDisposition>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT item_id, attempt, document, class, outcome, corrected_json, \
+                 evidence, reason, dispositioner, decided_at FROM repair_disposition \
+                 WHERE document = ?1 ORDER BY decided_at, item_id",
+                vec![Value::Text(document.to_string())],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(RepairDisposition {
+                item_id: get_str(&row, 0)?,
+                attempt: row
+                    .get_value(1)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or_default(),
+                document: get_str(&row, 2)?,
+                class: get_str(&row, 3)?,
+                outcome: get_str(&row, 4)?,
+                corrected_json: get_opt_str(&row, 5)?,
+                evidence: get_opt_str(&row, 6)?,
+                reason: get_str(&row, 7)?,
+                dispositioner: get_str(&row, 8)?,
+                decided_at: row
+                    .get_value(9)
+                    .ok()
+                    .and_then(|v| v.as_real().copied())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
     }
 
     /// Return the last successful full-rebuild timestamp for a source.
@@ -2094,6 +2341,120 @@ pub fn new_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repair_item(id: &str, class: &str) -> RepairItem {
+        RepairItem {
+            item_id: id.into(),
+            document: "paper.pdf".into(),
+            tenant: "local".into(),
+            class: class.into(),
+            subject_json: r#"{"subject":"Ti-6Al-4V"}"#.into(),
+            detail: "unit QUDT:MM-PER-S is not in the vocabulary".into(),
+            enqueued_at: 1.0,
+            attempts: 0,
+        }
+    }
+
+    /// The same refusal seen twice is ONE item. Re-ingesting a document must
+    /// not re-queue work that was already judged, or the queue grows without
+    /// bound on every re-run.
+    #[tokio::test]
+    async fn enqueueing_the_same_refusal_twice_yields_one_item() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let item = repair_item("fact-1|unresolved_unit", "unresolved_unit");
+        store.enqueue_repair(&item).await.unwrap();
+        store.enqueue_repair(&item).await.unwrap();
+        let pending = store.pending_repairs("paper.pdf", 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].item_id, item.item_id);
+    }
+
+    /// Deciding an item clears it from the queue but the DECISION survives.
+    /// A queue that could be drained without leaving a record is exactly the
+    /// silent outcome this ledger exists to prevent.
+    #[tokio::test]
+    async fn a_decision_leaves_the_queue_empty_and_the_record_intact() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        store
+            .enqueue_repair(&repair_item("fact-1|unresolved_unit", "unresolved_unit"))
+            .await
+            .unwrap();
+
+        store
+            .record_repair_disposition(&RepairDisposition {
+                item_id: "fact-1|unresolved_unit".into(),
+                attempt: 0,
+                document: "paper.pdf".into(),
+                class: "unresolved_unit".into(),
+                outcome: "accept".into(),
+                corrected_json: Some(r#"{"unit":"QUDT:MilliM-PER-SEC"}"#.into()),
+                evidence: Some("scanned at 1250 mm/s".into()),
+                reason: "the document states the unit; the vocabulary resolves it".into(),
+                dispositioner: "code:unit_span_lookup".into(),
+                decided_at: 2.0,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .pending_repairs("paper.pdf", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a decided item must leave the queue"
+        );
+        let ledger = store.repair_dispositions("paper.pdf").await.unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].outcome, "accept");
+        assert_eq!(
+            ledger[0].dispositioner, "code:unit_span_lookup",
+            "an audit must be able to tell a code repair from a model's judgement"
+        );
+        assert_eq!(ledger[0].evidence.as_deref(), Some("scanned at 1250 mm/s"));
+    }
+
+    /// A second decision on the same item is a NEW row, not an overwrite —
+    /// the history of a repair stays readable.
+    #[tokio::test]
+    async fn a_second_attempt_is_appended_never_replacing_the_first() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let base = RepairDisposition {
+            item_id: "fact-1|review_missing".into(),
+            attempt: 0,
+            document: "paper.pdf".into(),
+            class: "review_missing".into(),
+            outcome: "withdraw".into(),
+            corrected_json: None,
+            evidence: None,
+            reason: "no verdict on the first pass".into(),
+            dispositioner: "model:gemma-4-12b".into(),
+            decided_at: 2.0,
+        };
+        store.record_repair_disposition(&base).await.unwrap();
+        store
+            .record_repair_disposition(&RepairDisposition {
+                attempt: 1,
+                outcome: "accept".into(),
+                reason: "verdict obtained on retry".into(),
+                ..base.clone()
+            })
+            .await
+            .unwrap();
+
+        let ledger = store.repair_dispositions("paper.pdf").await.unwrap();
+        assert_eq!(ledger.len(), 2, "both attempts must survive: {ledger:?}");
+        assert!(
+            ledger
+                .iter()
+                .any(|d| d.attempt == 0 && d.outcome == "withdraw")
+        );
+        assert!(
+            ledger
+                .iter()
+                .any(|d| d.attempt == 1 && d.outcome == "accept")
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fresh_file_accepts_concurrent_store_opens() {
