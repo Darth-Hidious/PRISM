@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ Act Too Fil Obj [Str] Art
+                                                                   │
+                                                                   │▸ ◇ TiAl
+                                                                   │    2 atoms · Al1 Ti1 · user_im…
+                                                                   │    cache://0f7a1c2e9b4d4a6f/st…
+                                                                   │  ◇ MgB2
+                                                                   │    3 atoms · B2 Mg1 · material…
+                                                                   │    cache://1a2b3c4d5e6f7081/st…
+                                                                   │  ◇ W2
+                                                                   │    2 atoms · W2 · mace_relaxat…
+                                                                   │    cache://9e8d7c6b5a493827/st…
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+┌ Prompt ─────────────────────────────────────────────────────────┐│
+│type a message…  (press i to focus · ↵ send)                     ││
+│                                                                 ││
+│                                                                 ││
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit          │

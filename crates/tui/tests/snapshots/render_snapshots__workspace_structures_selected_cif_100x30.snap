@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
+· PRISM ready — 99 tools available                                 │ Act Too Fil Obj [Str] Art
+       ┌────────────────────────────────────────────────────────────────────────────────────┐
+       │ Structure — TiAl                                                                   │
+       │                                                                                    │ser_im…
+       │formula:     TiAl                                                                   │a6f/st…
+       │atoms:       2                                                                      │
+       │composition: Al1 Ti1                                                                │
+       │source:      user_import                                                            │
+       │ref:         cache://0f7a1c2e9b4d4a6f/structure.cif                                 │
+       │tool:        structure_import                                                       │
+       │                                                                                    │
+       │── CIF ──                                                                           │
+       │data_TiAl                                                                           │
+       │_chemical_formula_sum "Al1 Ti1"                                                     │
+       │_chemical_name_common "TiAl gamma"                                                  │
+       │_cell_length_a 4.005                                                                │
+       │_cell_length_b 4.005                                                                │
+       │_cell_length_c 4.171                                                                │
+       │_cell_angle_alpha 90.0                                                              │
+       │_cell_angle_beta 90.0                                                               │
+       │_cell_angle_gamma 90.0                                                              │
+       │_symmetry_space_group_name_H-M "P 4/m m m"                                          │
+       │loop_                                                                               │
+┌ Promp│_atom_site_label                                                                    │
+│type a│_atom_site_type_symbol                                                              │
+│      │_atom_site_fract_x                                                                  │
+│      └────────────────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────┘│
+  Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit          │

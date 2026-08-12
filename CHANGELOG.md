@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — tool transport
+
+- **A timed-out tool call could hand its late response to the NEXT caller.**
+  The Python tool-server wire protocol is one request line → one response line
+  with NO request ids. When a call failed mid-exchange (timeout, partial write,
+  worker exit, junk on stdout), the child still owed that response, and the
+  next `call_tool` on the same handle would read it — delivering one caller's
+  result to a different caller. Pre-existing; found while building the
+  multi-lane pool, not introduced by it.
+
+  A handle that fails mid-exchange now marks itself desynchronized and refuses
+  every further call with `ToolServerError::Desynchronized { reason }` instead
+  of silently resuming. Pool lanes discard and respawn the child; owners of a
+  bare handle must spawn a replacement. Success-path wire traffic is
+  byte-identical.
+
+  This is fail-closed on purpose: in a provenance system a misattributed tool
+  result is corruption, not a glitch — a fact would carry another document's
+  evidence. Guarded by
+  `tool_server::tests::desynchronized_handle_refuses_instead_of_misdelivering`
+  and, under concurrency, by `pool::tests::timed_out_lane_is_discarded_not_reused`.
+
+  Also fixes an orphan-process leak: children are now `kill_on_drop`.
+
+### Added — agent orchestration
+
+- **Multi-lane tool-server pool** (`crates/python-bridge/src/pool.rs`), the
+  substrate agent orchestration runs on. Turns were serialized behind an async
+  mutex because the tool server was a single stdio child, and a subagent
+  borrowed its parent's handle — concurrency was structurally impossible.
+  A bounded pool of children gives each lane its own interpreter and GIL;
+  response attribution is structural, since a lane is exclusively checked out
+  for a call's duration. Measured 3.8x on 4x400 ms calls. `local_only`
+  isolation is carried by pool flavour, not runtime data.
+- **AGENTS.md runtime discovery**: per-project instruction files are found from
+  the working directory up to the git root and folded into the system prompt,
+  size-bounded, with truncation stated in the injected text and an unreadable
+  file reported rather than skipped.
+
 ## [2.7.1] - 2026-05-10
 
 Bug-bounty + UX cleanup release. 79 commits over v2.7.0 — no breaking changes,
