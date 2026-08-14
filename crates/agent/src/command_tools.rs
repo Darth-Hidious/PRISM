@@ -1672,6 +1672,14 @@ fn ingest_schema(path_description: &str) -> Value {
                 "type": "string",
                 "description": "Optional corpus slug to attach to the ingest job."
             },
+            "vision_model": {
+                "type": "string",
+                "description": "Model that READS PAGE IMAGES when the text layer cannot recover a page — scanned pages, figures, broken font encodings. Reading images and extracting facts are different capabilities: a text-only extraction model handed a page image returns an error, the page is reported unreadable, and it looks like a bad PDF when it is really a misconfiguration. Defaults to the extraction model, which is correct for a multimodal local model. Set it when the extraction model is text-only (e.g. extraction on glm-5.2, vision on glm-4.5v)."
+            },
+            "vision_url": {
+                "type": "string",
+                "description": "Base URL for the vision model when it is not served by the same endpoint as `llm_url`. Defaults to `llm_url`."
+            },
             "samples": {
                 "type": "integer",
                 "minimum": 1,
@@ -3273,6 +3281,20 @@ fn build_ingest_args(input: &Value) -> Result<Vec<String>> {
         args.push("--corpus".to_string());
         args.push(corpus);
     }
+    // A vision URL without a vision model is almost always a mistake: it points
+    // page reading at another host while still sending the extraction model's
+    // name, which that host will not know. Refused with the reason rather than
+    // failing later as an unknown-model error from a stranger's API.
+    if optional_string(input, "vision_url").is_some()
+        && optional_string(input, "vision_model").is_none()
+    {
+        anyhow::bail!(
+            "`vision_url` was given without `vision_model`. The vision URL only changes \
+             WHERE page images are read; without a model name the extraction model's \
+             name is sent to that endpoint, which will not recognise it. Name the \
+             vision model too."
+        );
+    }
     // Sampling. Refused HERE rather than by the CLI, so the agent gets a
     // usable error instead of a process exit code it has to interpret: an
     // agreement above the sample count can never be met, and a model that
@@ -3295,6 +3317,15 @@ fn build_ingest_args(input: &Value) -> Result<Vec<String>> {
              single pass can only ever agree with itself. Set `samples` to the \
              number of extraction passes you want (3 or 5 is typical)."
         );
+    }
+    for (flag, value) in [
+        ("--vision-model", optional_string(input, "vision_model")),
+        ("--vision-url", optional_string(input, "vision_url")),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.to_string());
+            args.push(value);
+        }
     }
     for (flag, value) in [("--samples", samples), ("--agreement", agreement)] {
         if let Some(value) = value {
@@ -7873,6 +7904,39 @@ ValueError: boom\n";
             "{stringy:?}"
         );
         let _ = ingest;
+
+        // Vision reaches the command line. Reading page images and extracting
+        // facts are different capabilities; before this, both used ONE model,
+        // so a text-only extractor was handed PNGs and every figure page came
+        // back HTTP 400 while looking like a bad PDF.
+        let vision = build_ingest_args(&json!({
+            "path": "paper.pdf", "model": "glm-5.2", "vision_model": "glm-4.5v"
+        }))
+        .expect("a text extractor plus a vision reader is a valid pairing");
+        assert!(
+            vision
+                .windows(2)
+                .any(|w| w[0] == "--vision-model" && w[1] == "glm-4.5v"),
+            "{vision:?}"
+        );
+        // …and the extraction model is untouched by it.
+        assert!(
+            vision
+                .windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "glm-5.2"),
+            "{vision:?}"
+        );
+        // Default: no vision flags, so a multimodal local model keeps reading
+        // both text and images with no configuration at all.
+        let plain = build_ingest_args(&json!({"path": "paper.pdf"})).expect("builds");
+        assert!(!plain.iter().any(|a| a == "--vision-model"), "{plain:?}");
+        // A vision URL alone is refused: it would send the extraction model's
+        // name to a host that has never heard of it.
+        let orphan = build_ingest_args(&json!({
+            "path": "paper.pdf", "vision_url": "https://api.z.ai/api/coding/paas/v4"
+        }))
+        .expect_err("a vision URL without a vision model is unusable");
+        assert!(orphan.to_string().contains("vision_model"), "{orphan}");
 
         let spec = spec_by_name("ingest_and_wait").expect("spec resolves");
         // A source is required.

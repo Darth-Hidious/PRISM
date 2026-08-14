@@ -306,6 +306,22 @@ enum Commands {
         /// Corpus slug to associate with the ingested data.
         #[arg(long)]
         corpus: Option<String>,
+        /// Model that READS PAGE IMAGES when the text layer cannot recover a
+        /// page (scanned pages, figures, broken font encodings).
+        ///
+        /// Reading images and extracting facts are different capabilities. A
+        /// text-only extraction model handed a page image returns HTTP 400,
+        /// the page is reported unreadable, and the cause looks like a bad
+        /// PDF when it is really a bad configuration. Defaults to --model,
+        /// which is correct for a multimodal local model.
+        #[arg(long, value_name = "MODEL", env = "LLM_VISION_MODEL")]
+        vision_model: Option<String>,
+
+        /// Base URL for the vision model, when it is not served by the same
+        /// endpoint as --llm-url. Defaults to --llm-url.
+        #[arg(long, value_name = "URL", env = "LLM_VISION_URL")]
+        vision_url: Option<String>,
+
         /// Extract each document this many times and keep only facts that
         /// recur (see --agreement).
         ///
@@ -3972,6 +3988,8 @@ async fn main() -> Result<()> {
             corpus,
             samples,
             agreement,
+            vision_model,
+            vision_url,
             model,
             llm_url,
             api_key,
@@ -4055,6 +4073,10 @@ async fn main() -> Result<()> {
                     json,
                     mapping.as_deref(),
                     sampling,
+                    VisionModelChoice {
+                        model: vision_model.as_deref(),
+                        url: vision_url.as_deref(),
+                    },
                 )
                 .await?;
             } else {
@@ -4073,6 +4095,10 @@ async fn main() -> Result<()> {
                     json,
                     mapping.as_deref(),
                     sampling,
+                    VisionModelChoice {
+                        model: vision_model.as_deref(),
+                        url: vision_url.as_deref(),
+                    },
                 )
                 .await?;
             }
@@ -7233,6 +7259,55 @@ fn semantic_entities_for_text_facts(
 /// and the text layer still works without it. What it must never do is fail
 /// SILENTLY — a missing renderer surfaces as the reason escalation reports
 /// against the page it could not fix.
+/// Build the config for the VISION reader.
+///
+/// Reading a page image and extracting facts from text are DIFFERENT
+/// CAPABILITIES, and assuming one model does both is how a text-only
+/// extraction model ends up being handed a PNG. Measured: running ingest with
+/// `--model glm-5.2` made the vision reader glm-5.2 too, and every figure page
+/// came back `HTTP 400 messages.content.type is invalid, allowed values:
+/// ['text']`. The page was reported honestly as unreadable, but the cause was
+/// our own configuration.
+///
+/// So vision takes its own model, and its own base URL when the vision model
+/// lives somewhere else. Both fall back to the extraction model's — which is
+/// correct for a genuinely multimodal local model (Gemma 4 reads both), and
+/// which keeps the no-flags path exactly as it was.
+/// Which model reads page images, when it differs from the extraction model.
+/// A named pair rather than two more bare `Option<&str>` parameters, so a
+/// caller cannot silently transpose the URL and the model.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VisionModelChoice<'a> {
+    pub model: Option<&'a str>,
+    pub url: Option<&'a str>,
+}
+
+fn build_vision_llm_config(
+    project_root: &Path,
+    llm_url: Option<&str>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+    vision_url: Option<&str>,
+    vision_model: Option<&str>,
+) -> Result<prism_ingest::LlmConfig> {
+    let mut cfg = build_llm_config(
+        project_root,
+        vision_url.or(llm_url),
+        vision_model.or(model),
+        api_key,
+    )?;
+    // An explicit vision model must win even when the chat target supplied a
+    // model — otherwise `prism use local` would silently override it and the
+    // flag would look accepted while doing nothing.
+    if let Some(vision_model) = vision_model.filter(|m| !m.trim().is_empty()) {
+        cfg.model = vision_model.to_string();
+    }
+    if let Some(vision_url) = vision_url.filter(|u| !u.trim().is_empty()) {
+        cfg.base_url = vision_url.to_string();
+    }
+    Ok(cfg)
+}
+
 fn register_vision_reader(cfg: prism_ingest::LlmConfig) {
     use std::sync::Arc;
     if cfg.base_url.trim().is_empty() {
@@ -7313,6 +7388,7 @@ async fn run_local_text_ingest_file(
     schema_only: bool,
     mapping_path: Option<&Path>,
     sampling: prism_ingest::text_extract::SamplingPolicy,
+    vision: VisionModelChoice<'_>,
 ) -> Result<serde_json::Value> {
     // Text-document extraction is wired to the built-in EMMO ontology only
     // (EMMO prompt, QUDT-typed MaterialFacts). Refuse honestly under any
@@ -7342,7 +7418,14 @@ async fn run_local_text_ingest_file(
     // must not start requiring a model just because escalation might want
     // one. With no model configured there is simply no vision reader, and
     // escalation reports that against any page it could not fix.
-    if let Ok(cfg) = build_llm_config(project_root, llm_url, model, api_key) {
+    if let Ok(cfg) = build_vision_llm_config(
+        project_root,
+        llm_url,
+        model,
+        api_key,
+        vision.url,
+        vision.model,
+    ) {
         register_vision_reader(cfg);
     }
 
@@ -9179,6 +9262,7 @@ async fn handle_ingest(
     json_output: bool,
     mapping_path: Option<&Path>,
     sampling: prism_ingest::text_extract::SamplingPolicy,
+    vision: VisionModelChoice<'_>,
 ) -> Result<()> {
     let ingest_targets = collect_ingest_paths(path)?;
     if ingest_targets.is_empty() {
@@ -9260,6 +9344,7 @@ async fn handle_ingest(
                     schema_only,
                     mapping_path,
                     sampling,
+                    vision,
                 )
                 .await?
             }
@@ -9325,6 +9410,7 @@ async fn handle_ingest_watch(
     json_output: bool,
     mapping: Option<&Path>,
     sampling: prism_ingest::text_extract::SamplingPolicy,
+    vision: VisionModelChoice<'_>,
 ) -> Result<()> {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
@@ -9365,6 +9451,7 @@ async fn handle_ingest_watch(
             json_output,
             mapping,
             sampling,
+            vision,
         )
         .await
         {
@@ -9416,6 +9503,7 @@ async fn handle_ingest_watch(
                     json_output,
                     mapping,
                     sampling,
+                    vision,
                 )
                 .await
                 {
@@ -18229,6 +18317,7 @@ data:\n\
             true,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect_err("a non-default ontology must refuse text ingest");
@@ -18303,6 +18392,7 @@ data:\n\
             true, // schema-only: text extraction without an LLM or a store
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("a parseable PDF must ingest locally");
@@ -18335,6 +18425,7 @@ data:\n\
             true,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect_err("a malformed PDF must be an error, not a silent skip");
@@ -18474,6 +18565,7 @@ data:\n\
             false,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("a document with one bad fact must still ingest the good ones");
@@ -18663,6 +18755,7 @@ data:\n\
             false,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("the document ingests; the refusal is queued, not lost");
@@ -18853,6 +18946,7 @@ data:\n\
             false,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("a document whose one fact is refused must still ingest cleanly");
@@ -19003,6 +19097,7 @@ data:\n\
             false,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("the alias-bearing document must ingest");
@@ -19287,6 +19382,7 @@ data:\n\
             false,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("a multi-window document must ingest");
@@ -19456,6 +19552,7 @@ data:\n\
             false,
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
         )
         .await
         .expect("a partial run is a reported partial result, not a crash");
