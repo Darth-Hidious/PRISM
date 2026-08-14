@@ -183,9 +183,53 @@ pub fn property_quantity_kind(property_name: &str) -> Option<QuantityKind> {
     None
 }
 
+/// The CLOSED unit vocabulary the repair model tier may choose from for a
+/// property — [`EXTRACTION_UNITS`] plus [`NON_SCHEMA_UNIT_KINDS`], filtered
+/// to the property's quantity kind when the kind is known.
+///
+/// The UnresolvedUnit repair prompt hands the model THIS list and the model
+/// picks from it; it cannot mint an identifier. Kind-filtering is access,
+/// not decoration: a speed repair sees speed units, not pressures. When the
+/// property's kind is unknown (`None`) the whole declared vocabulary is
+/// offered — the re-validation gates, not the list, decide the correction.
+#[must_use]
+pub fn repair_unit_vocabulary(kind: Option<QuantityKind>) -> Vec<&'static str> {
+    EXTRACTION_UNITS
+        .iter()
+        .chain(NON_SCHEMA_UNIT_KINDS)
+        .filter(|(_, unit_kind)| kind.is_none_or(|expected| expected == *unit_kind))
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The repair vocabulary is the declared tables and nothing else: for a
+    /// known kind only that kind's units, for an unknown kind the union —
+    /// and every offered identifier is one the controlled vocabulary itself
+    /// resolves, so an accepted pick can never be a minted identifier.
+    #[test]
+    fn repair_vocabulary_is_closed_and_kind_filtered() {
+        let speeds = repair_unit_vocabulary(Some(QuantityKind::Speed));
+        assert_eq!(speeds, vec!["QUDT:MilliM-PER-SEC", "QUDT:M-PER-SEC"]);
+        assert!(
+            !speeds.contains(&"QUDT:MegaPA"),
+            "a pressure unit must not be offered for a speed repair"
+        );
+        let all = repair_unit_vocabulary(None);
+        assert_eq!(
+            all.len(),
+            EXTRACTION_UNITS.len() + NON_SCHEMA_UNIT_KINDS.len()
+        );
+        for id in &all {
+            assert!(
+                prism_provenance::units::resolve_unit(id).is_some(),
+                "offered identifier {id} must resolve in the controlled vocabulary"
+            );
+        }
+    }
 
     /// Every declared unit resolves to its own kind — the table IS the
     /// lookup, no second list to drift.

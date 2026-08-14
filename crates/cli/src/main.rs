@@ -359,6 +359,15 @@ enum Commands {
         /// Path to a YAML ontology mapping file (custom entity/relationship rules).
         #[arg(long)]
         mapping: Option<PathBuf>,
+        /// Run the Phase-2 REPAIR pass instead of ingesting: drain the
+        /// document's repair queue ONE ITEM AT A TIME through the model
+        /// tier. `<PATH>` is the document as it was ingested (the queue is
+        /// keyed by the path shown at ingest time). Requires the document
+        /// to have been ingested locally — refusals the code tiers could
+        /// not decide are the only items queued. Every item ends in an
+        /// explicit accept or withdraw, ledgered; nothing is batched.
+        #[arg(long)]
+        repair: bool,
     },
     /// MatKG reference knowledge graph (Venugopal & Olivetti 2024, CC BY 4.0).
     Matkg {
@@ -3973,6 +3982,7 @@ async fn main() -> Result<()> {
             runtime_url,
             json,
             mapping,
+            repair,
         } => {
             // Refused BEFORE any work, and before the status/platform/watch
             // branch, so every route that ingests honours the same bar: an
@@ -3989,7 +3999,40 @@ async fn main() -> Result<()> {
                      filtered and the document would look empty"
                 )
             })?;
-            if status {
+
+            if repair {
+                if status || platform || watch || schema_only {
+                    bail!(
+                        "`--repair` runs the Phase-2 repair pass over a document's repair \
+                         queue and cannot be combined with --status, --platform, --watch \
+                         or --schema-only."
+                    );
+                }
+                let path = path.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "`prism ingest --repair` requires the document whose repair queue \
+                         should be drained — the same path it was ingested under."
+                    )
+                })?;
+                let summary = run_local_repair_pass(
+                    path,
+                    &project_root,
+                    model.as_deref(),
+                    llm_url.as_deref(),
+                    api_key.as_deref(),
+                    &runtime_url,
+                )
+                .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print_repair_summary(&summary);
+                }
+                let error_count = summary["errors"].as_array().map_or(0, Vec::len);
+                if error_count > 0 {
+                    bail!("{error_count} repair step(s) failed — see errors above/in JSON");
+                }
+            } else if status {
                 handle_ingest_status(corpus.as_deref(), json).await?;
             } else if platform {
                 let path = path.as_deref().ok_or_else(|| {
@@ -7204,6 +7247,58 @@ fn register_vision_reader(cfg: prism_ingest::LlmConfig) {
     }
 }
 
+/// Read one document's text ON DEVICE — the SAME reader Phase 1 uses,
+/// because the repair tier must look at exactly the text the facts were
+/// judged against. PDFs go through the document-understanding plane (no
+/// runtime sidecar, no network beyond the operator's configured model);
+/// other text formats read the file directly.
+async fn read_document_text(path: &Path, runtime_url: &str) -> Result<(String, Option<String>)> {
+    if ingest_format(path) == "pdf" {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read PDF {}", path.display()))?;
+        // Read through the document-understanding plane rather than calling
+        // one extractor directly: the text layer is only one way to read a
+        // PDF, and a page it cannot read (scanned, or a broken font encoding
+        // that drops a whole table) escalates to whichever richer adapter is
+        // registered and available. Which reader actually ran is reported,
+        // never assumed.
+        let label = path.display().to_string();
+        let doc = prism_ingest::document::SourceDocument::whole(&bytes, "pdf", &label);
+        let outcome =
+            prism_ingest::document::read(&doc, &prism_ingest::document::Policy::default())
+                .await
+                .with_context(|| format!("reading PDF {} locally", path.display()))?;
+
+        // Say what could not be read and what could not be tried. A page of a
+        // paper that silently never reached the extractor is exactly the kind
+        // of hole this plane exists to stop being invisible.
+        for skipped in &outcome.skipped {
+            eprintln!("Note: document reader unavailable — {skipped}");
+        }
+        let unrecovered: Vec<String> = outcome
+            .unrecovered()
+            .map(|note| format!("p{} ({})", note.number, note.damage))
+            .collect();
+        let warning = (!unrecovered.is_empty()).then(|| {
+            format!(
+                "{} of {} pages could not be read cleanly: {}",
+                unrecovered.len(),
+                outcome.understanding.pages.len(),
+                unrecovered.join(", "),
+            )
+        });
+        if let Some(warning) = &warning {
+            eprintln!("Warning: {warning}");
+        }
+        Ok((outcome.understanding.plain_text(), warning))
+    } else {
+        // Non-PDF text formats just read the file. Either way the runtime
+        // sidecar is never contacted on the local path.
+        let (text, _pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
+        Ok((text, warning))
+    }
+}
+
 /// Ingest a text document entirely on-device: extract EMMO facts with the
 /// local LLM and write them (with one PROV-O activity) into the bundled
 /// Turso provenance store. Nothing leaves the machine.
@@ -8026,6 +8121,203 @@ async fn run_local_text_ingest_file(
         // can therefore never pose as validated in machine-readable output.
         "semantic_validation": semantic_validation,
     }))
+}
+
+/// Phase 2 of the document path: drain the document's repair queue ONE
+/// ITEM AT A TIME through the model tier ([`prism_ingest::repair_worker`]).
+///
+/// Phase 1 ([`run_local_text_ingest_file`]) builds the graph, decides every
+/// refusal the code tiers can decide, and enqueues the rest. THIS is the
+/// only thing that works that queue. The document text is re-read with the
+/// SAME reader Phase 1 used, the worker makes at most one model call per
+/// item, and every item ends in an explicit accept or withdraw — ledgered
+/// with who decided and on what evidence. An accepted repair is written
+/// through the normal write path.
+async fn run_local_repair_pass(
+    path: &Path,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
+    runtime_url: &str,
+) -> Result<serde_json::Value> {
+    // Same honesty as the ingest path: repair runs against the built-in
+    // EMMO extraction contract only.
+    let ontology_id = active_ontology_from_config(project_root)?;
+    if ontology_id != prism_ingest::ontologies::DEFAULT_ONTOLOGY_ID {
+        bail!(
+            "text-document repair currently runs against the built-in EMMO ontology only; \
+             the active ontology '{ontology_id}' has no repair tier. Set [ontology] id = \"emmo\"."
+        );
+    }
+    let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
+
+    let (text, warning) = read_document_text(path, runtime_url)
+        .await
+        .with_context(|| format!("reading {} for the repair pass", path.display()))?;
+    if text.trim().is_empty() {
+        bail!("No readable text found in {}", path.display());
+    }
+
+    // The queue is keyed by the path Phase 1 SHOWED — the same display
+    // string, so the same path must be passed here.
+    let document_id = path.display().to_string();
+
+    let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
+    let agent_id = if llm_cfg.model.is_empty() {
+        "prism-repair".to_string()
+    } else {
+        llm_cfg.model.clone()
+    };
+    let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let db_path = PathBuf::from(home).join(".prism/provenance.db");
+    let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
+
+    // Say "nothing to do" honestly instead of spending a model on an empty
+    // queue (or mis-reporting it as a success that repaired something).
+    if store.pending_repairs(&document_id, 1).await?.is_empty() {
+        eprintln!(
+            "repair queue: no pending items for {} — nothing to do.",
+            path.display()
+        );
+        return Ok(serde_json::json!({
+            "backend": "local_repair",
+            "document": document_id,
+            "warning": warning,
+            "items_seen": 0,
+            "accepted": 0,
+            "withdrawn": 0,
+            "requeued": 0,
+            "model_calls": 0,
+            "dispositions": [],
+            "errors": [],
+        }));
+    }
+
+    // The repair run is its OWN activity: a distinct agent row so the
+    // ledger can tell Phase 1 writes from Phase 2 repairs.
+    let now = chrono::Utc::now().to_rfc3339();
+    let prov = prism_provenance::LocalProvenance {
+        activity_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.clone(),
+        agent_kind: "SoftwareAgent".into(),
+        source_entity_id: document_id.clone(),
+        source_kind: "Document".into(),
+        // Local single-user store — same tenancy as Phase 1.
+        tenant: "local".into(),
+        started_at: now.clone(),
+        ended_at: now,
+        locality: "local".into(),
+        origin_source_id: None,
+    };
+    store.record_activity(&prov).await?;
+    let classification = prism_provenance::OntologyClassification {
+        version_iri: ontology.version_iri().as_str(),
+        artifact_sha256: ontology.artifact_sha256(),
+    };
+
+    let policy = prism_ingest::repair_worker::RepairWorkerPolicy::default();
+    let decided_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    eprintln!(
+        "repair queue: working at most {} item(s) for {} — one model call per item, every \
+         item ends in an explicit accept or withdraw (a local model can take minutes per \
+         item — this is work, not a hang)…",
+        policy.max_items_per_run,
+        path.display()
+    );
+    let report = prism_ingest::repair_worker::run_repair_pass(
+        &store,
+        &llm,
+        &document_id,
+        &text,
+        &prov,
+        classification,
+        &policy,
+        decided_at,
+    )
+    .await?;
+
+    for disposition in &report.dispositions {
+        eprintln!(
+            "  {} [{}] {}: {}",
+            disposition.item_id, disposition.dispositioner, disposition.outcome, disposition.reason
+        );
+    }
+    for error in &report.errors {
+        eprintln!("  ERROR: {error}");
+    }
+    eprintln!(
+        "repair queue: {} item(s) seen — {} accepted, {} withdrawn, {} requeued for a \
+         later run; {} model call(s)",
+        report.items_seen, report.accepted, report.withdrawn, report.requeued, report.model_calls
+    );
+    if let Some(usage) = &report.usage {
+        eprintln!(
+            "  LLM usage (billed): {} prompt + {} completion = {} tokens",
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        );
+    }
+
+    Ok(serde_json::json!({
+        "backend": "local_repair",
+        "document": document_id,
+        "model": agent_id,
+        "store": db_path.display().to_string(),
+        "warning": warning,
+        "items_seen": report.items_seen,
+        "accepted": report.accepted,
+        "withdrawn": report.withdrawn,
+        "requeued": report.requeued,
+        "model_calls": report.model_calls,
+        "dispositions": report
+            .dispositions
+            .iter()
+            .map(|d| serde_json::json!({
+                "item_id": d.item_id,
+                "attempt": d.attempt,
+                "class": d.class,
+                "outcome": d.outcome,
+                "reason": d.reason,
+                "dispositioner": d.dispositioner,
+                "evidence": d.evidence,
+            }))
+            .collect::<Vec<_>>(),
+        "errors": report.errors,
+        "llm_usage": report.usage,
+    }))
+}
+
+/// Human-readable rendering of a `local_repair` summary (the `--json` flag
+/// prints the raw value instead).
+fn print_repair_summary(summary: &serde_json::Value) {
+    let document = summary["document"].as_str().unwrap_or("?");
+    println!("Repairing: {document}");
+    println!(
+        "  Items: {} seen — {} accepted, {} withdrawn, {} requeued; {} model call(s)",
+        summary["items_seen"].as_u64().unwrap_or(0),
+        summary["accepted"].as_u64().unwrap_or(0),
+        summary["withdrawn"].as_u64().unwrap_or(0),
+        summary["requeued"].as_u64().unwrap_or(0),
+        summary["model_calls"].as_u64().unwrap_or(0),
+    );
+    if let Some(dispositions) = summary["dispositions"].as_array() {
+        for row in dispositions {
+            println!(
+                "  - [{}] {} {}: {}",
+                row["dispositioner"].as_str().unwrap_or("?"),
+                row["item_id"].as_str().unwrap_or("?"),
+                row["outcome"].as_str().unwrap_or("?"),
+                row["reason"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    if let Some(errors) = summary["errors"].as_array() {
+        for error in errors {
+            println!("  ERROR: {}", error.as_str().unwrap_or("?"));
+        }
+    }
 }
 
 /// Peer-echo scan for facts about to be written under the local tenant:
@@ -18290,6 +18582,222 @@ data:\n\
             pending.is_empty(),
             "a code-decided refusal must not also be queued: {pending:?}"
         );
+    }
+
+    /// THE FULL LOOP through production dispatch: Phase 1 enqueues a
+    /// refusal the code tiers cannot decide (an unknown-kind property, so
+    /// no deterministic unit pick is legal), and `run_local_repair_pass`
+    /// — the `prism ingest --repair` handler — drains it: ONE model call,
+    /// an explicit accept whose correction clears the same gates, the fact
+    /// written through the normal write path, one ledger row by
+    /// `model:<id>`, and an empty queue.
+    ///
+    /// Falsifiable at the shortcut: if the repair pass never ran (or
+    /// batched, or accepted without the gates), the store lacks the fact,
+    /// the ledger lacks the model row, or the mock's `.expect(1)` trips.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn repair_pass_drains_the_queue_phase_one_enqueued() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Phase 1: the extractor's unit resolves to nothing, and the
+        // property ("elongation") is unknown to the quantity-kind table —
+        // code cannot pick a unit legally, so the item must be ENQUEUED.
+        //
+        // The document prints the SAME value with TWO different units, which
+        // is the refusal that still reaches the queue.
+        //
+        // This fixture used to read "4.5 %" once. Document-first unit
+        // resolution now reads that `%` off the page and stores the fact at
+        // Phase 1 — correctly — so it never reached repair and this test had
+        // nothing to drain. Printing it with no unit at all does not work
+        // either: the page then genuinely cannot answer, and the code tier
+        // WITHDRAWS as a vocabulary gap, which is also correct.
+        //
+        // Ambiguity is what neither can settle. Two resolvable units beside
+        // the same value means document-first refuses to pick (one printed
+        // unit or nothing), and the code tier sees two candidate identifiers
+        // and declines to guess — so it queues for the model tier, which is
+        // exactly the path under test.
+        let mut ingest_server = mockito::Server::new_async().await;
+        let extraction = r#"{"facts":[
+            {"subject":"steel","predicate":"has_measurement","object":"elongation","value":4.5,"unit":"QUDT:INVENTED","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+        ]}"#;
+        let _ingest_mock = ingest_server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": extraction}}]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+
+        let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = project.path();
+        let md = root.join("steel-report.md");
+        std::fs::write(
+            &md,
+            "The steel samples reached an elongation of 4.5 % in tension. For the\n\
+             same steel the transverse elongation of 4.5 mm was recorded instead.",
+        )
+        .unwrap();
+
+        let summary = run_local_text_ingest_file(
+            &md,
+            root,
+            Some("test-extractor"),
+            Some(&ingest_server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+        )
+        .await
+        .expect("the document ingests; the refusal is queued, not lost");
+        assert_eq!(summary["facts_written"], 0, "{summary}");
+        assert_eq!(summary["repairs"]["code_accepted"], 0, "{summary}");
+        assert_eq!(summary["repairs"]["code_withdrawn"], 0, "{summary}");
+        assert_eq!(
+            summary["repairs"]["enqueued_for_model"], 1,
+            "the unknown-kind refusal must queue for the model tier: {summary}"
+        );
+
+        let document_id = md.display().to_string();
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .expect("the store Phase 1 wrote must open");
+        assert_eq!(
+            store.pending_repairs(&document_id, 10).await.unwrap().len(),
+            1,
+            "the queue holds the refusal Phase 1 could not decide"
+        );
+
+        // Phase 2: the repair pass picks the unit the document prints,
+        // from the closed vocabulary. ONE call — `.expect(1)` kills a
+        // retry loop or a batch re-prompt.
+        let mut repair_server = mockito::Server::new_async().await;
+        let repair_reply = serde_json::json!({
+            "decision": "accept",
+            "corrected": {
+                "subject": "steel", "predicate": "has_measurement", "object": "elongation",
+                "value": 4.5, "unit": "QUDT:PERCENT", "kind": "measurement",
+                "confidence": 0.9, "evidence_class": "research", "conditions": []
+            },
+            "reason": "the document prints the value with a percent sign"
+        })
+        .to_string();
+        let _repair_mock = repair_server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": repair_reply}}]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let repair_summary = run_local_repair_pass(
+            &md,
+            root,
+            Some("test-repairer"),
+            Some(&repair_server.url()),
+            None,
+            "http://192.0.2.1:1",
+        )
+        .await
+        .expect("the repair pass completes");
+        assert_eq!(repair_summary["backend"], "local_repair");
+        assert_eq!(repair_summary["items_seen"], 1, "{repair_summary}");
+        assert_eq!(repair_summary["accepted"], 1, "{repair_summary}");
+        assert_eq!(repair_summary["withdrawn"], 0, "{repair_summary}");
+        assert_eq!(repair_summary["model_calls"], 1, "{repair_summary}");
+        assert!(
+            repair_summary["errors"].as_array().unwrap().is_empty(),
+            "{repair_summary}"
+        );
+
+        // The repaired fact is in the graph with the corrected unit…
+        let recalled = store
+            .recall_with_context("elongation", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(recalled.len(), 1, "{recalled:?}");
+        assert_eq!(recalled[0].value, Some(4.5));
+        assert_eq!(recalled[0].unit.as_deref(), Some("QUDT:PERCENT"));
+
+        // …the ledger shows WHO decided and on WHAT evidence…
+        let ledger = store.repair_dispositions(&document_id).await.unwrap();
+        assert_eq!(ledger.len(), 1, "{ledger:?}");
+        assert_eq!(ledger[0].outcome, "accept");
+        assert_eq!(ledger[0].dispositioner, "model:test-repairer");
+        let evidence = ledger[0].evidence.as_deref().expect("evidence recorded");
+        assert!(evidence.contains("elongation of 4.5 %"), "{evidence}");
+
+        // …and the queue is drained — nothing left owed.
+        assert!(
+            store
+                .pending_repairs(&document_id, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the repair pass must drain what it decides"
+        );
+
+        // A second run says "nothing to do" honestly — zero model calls,
+        // no re-judging of what was already decided.
+        let rerun = run_local_repair_pass(
+            &md,
+            root,
+            Some("test-repairer"),
+            Some(&repair_server.url()),
+            None,
+            "http://192.0.2.1:1",
+        )
+        .await
+        .expect("an empty queue is not an error");
+        assert_eq!(rerun["items_seen"], 0, "{rerun}");
+        assert_eq!(rerun["model_calls"], 0, "{rerun}");
+    }
+
+    /// `--repair` parses as an ingest flag carrying the document, and it
+    /// refuses the combinations that make no sense — naming them, not
+    /// silently picking one meaning.
+    #[test]
+    fn repair_flag_parses_and_conflicts_are_named() {
+        let cli = Cli::try_parse_from(["prism", "ingest", "--repair", "/tmp/paper.pdf"]).unwrap();
+        match cli.command {
+            Some(Commands::Ingest { path, repair, .. }) => {
+                assert!(repair);
+                assert_eq!(path.unwrap(), PathBuf::from("/tmp/paper.pdf"));
+            }
+            _ => panic!("expected Ingest command"),
+        }
+        // --repair parses without a path (the runtime handler names the
+        // missing document); the flag itself must not require it.
+        let cli = Cli::try_parse_from(["prism", "ingest", "--repair"]).unwrap();
+        match cli.command {
+            Some(Commands::Ingest { path, repair, .. }) => {
+                assert!(repair && path.is_none());
+            }
+            _ => panic!("expected Ingest command"),
+        }
     }
 
     /// F1, at PRODUCTION dispatch (`run_local_text_ingest_file` against a

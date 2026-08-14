@@ -49,6 +49,10 @@ pub mod ontology;
 pub mod pipeline;
 pub mod qudt_units;
 pub mod repair;
+/// Phase 2: the model tier that drains the repair queue one item at a
+/// time, after the code tiers ([`repair`]) have decided everything code
+/// alone can decide.
+pub mod repair_worker;
 pub mod schema;
 pub mod semantic_validation;
 pub mod text_extract;
