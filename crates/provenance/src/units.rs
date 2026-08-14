@@ -83,6 +83,41 @@ const UNIT_SPELLINGS: &[(&str, &str)] = &[
     ("millimeter-per-second", "QUDT:MilliM-PER-SEC"),
     ("millimetrepersecond", "QUDT:MilliM-PER-SEC"),
     ("millimetre-per-second", "QUDT:MilliM-PER-SEC"),
+    // Counts, count densities and event rates.
+    //
+    // These are spellings papers PRINT, not spellings a model invented — the
+    // distinction that separates this from chasing a generator. The resolver
+    // reads the DOCUMENT, so the set of forms it must know is bounded by how
+    // journals typeset quantities, which is finite. Adding rows for a model's
+    // invented identifiers (`QUDT:MM-PER-S`) is the losing game; three
+    // consecutive runs of the same paper invented three DIFFERENT sets.
+    //
+    // Identifiers verified live against `http://qudt.org/vocab/unit/<name>`.
+    // `CYC-PER-MIN` is NOT a QUDT unit (404): a cycle is dimensionless, so a
+    // cycle rate is PER-MIN and a cycle count is NUM.
+    //
+    // Bare `n`/`no` are deliberately ABSENT as count spellings: `n` is
+    // already newton above, and a sample count `N` next to a number is
+    // exactly the homograph the span gate exists to refuse.
+    ("cycle", "QUDT:NUM"),
+    ("cycles", "QUDT:NUM"),
+    ("count", "QUDT:NUM"),
+    ("counts", "QUDT:NUM"),
+    // Number density — pores per cubic millimetre. `mm⁻³` and `mm^-3` both
+    // fold to `mm-3`; `1/mm3` and `/mm3` are the slashed forms.
+    ("/mm3", "QUDT:NUM-PER-MilliM3"),
+    ("1/mm3", "QUDT:NUM-PER-MilliM3"),
+    ("mm-3", "QUDT:NUM-PER-MilliM3"),
+    ("permm3", "QUDT:NUM-PER-MilliM3"),
+    ("pores/mm3", "QUDT:NUM-PER-MilliM3"),
+    // Event rate. `min` alone stays the time unit above; only the explicitly
+    // reciprocal forms are a frequency.
+    ("/min", "QUDT:PER-MIN"),
+    ("1/min", "QUDT:PER-MIN"),
+    ("min-1", "QUDT:PER-MIN"),
+    ("permin", "QUDT:PER-MIN"),
+    ("cycles/min", "QUDT:PER-MIN"),
+    ("cpm", "QUDT:PER-MIN"),
     // Force / power / electrical
     ("n", "QUDT:N"),
     ("newton", "QUDT:N"),
@@ -787,9 +822,20 @@ mod tests {
         );
         // A descriptive spelling for a unit NOT in the vocabulary is still
         // refused — no identifier is invented to make an extraction fit.
-        assert!(resolve_unit("QUDT:Cycle").is_none());
         assert!(resolve_unit("QUDT:Inverse-Cubic-Meter").is_none());
         assert!(resolve_unit("QUDT:Furlong").is_none());
+        assert!(resolve_unit("QUDT:Rankine").is_none());
+        // `QUDT:Cycle` USED to sit in the list above. It moved here when the
+        // count vocabulary was added for a measured LPBF fatigue paper: a
+        // cycle is dimensionless, so a cycle count is QUDT:NUM. The rule did
+        // not change — an invented identifier is still never coined — the
+        // VOCABULARY grew, and `Cycle` is now a known spelling that
+        // canonicalises like `QUDT:UM` does below.
+        assert_eq!(resolve_unit("QUDT:Cycle").unwrap().as_str(), "QUDT:NUM");
+        assert_eq!(
+            resolve_unit("QUDT:Cycle").map(|u| u.as_str().to_string()),
+            resolve_unit("cycles").map(|u| u.as_str().to_string()),
+        );
         // A KNOWN spelling wearing the prefix is canonicalised, not refused —
         // `QUDT:UM` means micrometre and now lands on the one identifier for
         // it instead of being stored as its own unit.

@@ -152,6 +152,12 @@ pub fn dispose(
     use RejectionClass::*;
     let disposition = match rejection.class {
         UnresolvedUnit => tier_unit_re_resolution(rejection, document, text, policy, decided_at),
+        // Disagreement between extraction passes is a statement about the
+        // MODEL's consistency, not about the document. No code tier can
+        // settle it — deciding would mean re-running extraction, which is a
+        // model call, so it queues for the model tier rather than being
+        // withdrawn on code's authority.
+        SampleDisagreement => None,
         NumericUnsupported => Some(tier_numeric_near_miss(
             rejection, document, text, policy, decided_at,
         )),

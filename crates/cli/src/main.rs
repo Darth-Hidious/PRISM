@@ -24,6 +24,7 @@ mod use_command;
 
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
+use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 // std::process::Stdio removed — old Ink TUI launcher no longer needed
@@ -140,10 +141,31 @@ enum Commands {
         )]
         token: Option<String>,
 
-        /// Identity provider used for interactive login (`marc27` or
-        /// `supabase`). Unknown values fail closed.
+        /// Identity provider used for interactive login (`marc27`,
+        /// `supabase`, or `mirdyne`). Unknown values fail closed.
+        ///
+        /// `mirdyne` is a SEPARATE identity domain from `marc27` — its own
+        /// issuer, its own accounts, its own principals. Signing in to one is
+        /// not signing in to the other.
         #[arg(long, value_name = "PROVIDER", conflicts_with = "token")]
         provider: Option<String>,
+
+        /// Enterprise SAML SSO by email domain, e.g. `--sso-domain acme.com`.
+        ///
+        /// The SAML exchange happens between your organisation's identity
+        /// provider and PRISM's — PRISM never parses a SAML assertion. What
+        /// returns here is the same signed token a passwordless login yields.
+        #[arg(long, value_name = "DOMAIN", conflicts_with_all = ["token", "email"])]
+        sso_domain: Option<String>,
+
+        /// Enterprise SAML SSO by explicit connection id, for organisations
+        /// with several connections or none registered against a domain.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["token", "email", "sso_domain"]
+        )]
+        sso_provider_id: Option<String>,
 
         /// Email address for Supabase's passwordless magic-link PKCE flow.
         #[arg(long, env = "PRISM_LOGIN_EMAIL", conflicts_with = "token")]
@@ -284,6 +306,22 @@ enum Commands {
         /// Corpus slug to associate with the ingested data.
         #[arg(long)]
         corpus: Option<String>,
+        /// Extract each document this many times and keep only facts that
+        /// recur (see --agreement).
+        ///
+        /// A small extraction model does not fail deterministically — it
+        /// invents, differently each run. Measured on one 36-page LPBF paper,
+        /// five passes over identical text stored 4, 0, 2, 3 and 1 facts, and
+        /// a third to two thirds of everything emitted was a number that
+        /// appears nowhere in the document. A fabricated value changes
+        /// between passes; a printed one does not. Cost is linear in this
+        /// number. Default 1 — single pass, no filtering.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=9))]
+        samples: u8,
+        /// Passes a fact must appear in before it is believed. Must not
+        /// exceed --samples, or nothing could ever clear the bar.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=9))]
+        agreement: u8,
         /// Override LLM model (otherwise uses prism.toml or `prism configure`).
         #[arg(long)]
         model: Option<String>,
@@ -2016,6 +2054,8 @@ async fn main() -> Result<()> {
             token,
             provider,
             email,
+            sso_domain,
+            sso_provider_id,
             supabase_url,
             supabase_anon_key,
             no_browser,
@@ -2038,6 +2078,12 @@ async fn main() -> Result<()> {
                     email,
                     supabase_url,
                     supabase_anon_key,
+                    // Clap's `conflicts_with_all` already guarantees at most
+                    // one of these is set, so this cannot silently prefer one
+                    // organisation's connection over another.
+                    sso: sso_domain
+                        .map(SsoChoice::Domain)
+                        .or_else(|| sso_provider_id.map(SsoChoice::ProviderId)),
                 },
             };
             perform_full_login(&paths, &login_endpoints, &python, mode).await?;
@@ -3915,6 +3961,8 @@ async fn main() -> Result<()> {
         Commands::Ingest {
             path,
             corpus,
+            samples,
+            agreement,
             model,
             llm_url,
             api_key,
@@ -3926,6 +3974,21 @@ async fn main() -> Result<()> {
             json,
             mapping,
         } => {
+            // Refused BEFORE any work, and before the status/platform/watch
+            // branch, so every route that ingests honours the same bar: an
+            // agreement above the sample count filters out every fact and
+            // would report a full document as empty.
+            let sampling = prism_ingest::text_extract::SamplingPolicy::new(
+                NonZeroUsize::from(NonZeroU8::new(samples).expect("clap enforces >= 1")),
+                NonZeroUsize::from(NonZeroU8::new(agreement).expect("clap enforces >= 1")),
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "--agreement {agreement} exceeds --samples {samples}: no fact can \
+                     appear in more passes than are run, so every fact would be \
+                     filtered and the document would look empty"
+                )
+            })?;
             if status {
                 handle_ingest_status(corpus.as_deref(), json).await?;
             } else if platform {
@@ -3948,6 +4011,7 @@ async fn main() -> Result<()> {
                     corpus.as_deref(),
                     json,
                     mapping.as_deref(),
+                    sampling,
                 )
                 .await?;
             } else {
@@ -3965,6 +4029,7 @@ async fn main() -> Result<()> {
                     corpus.as_deref(),
                     json,
                     mapping.as_deref(),
+                    sampling,
                 )
                 .await?;
             }
@@ -7123,6 +7188,7 @@ async fn run_local_text_ingest_file(
     runtime_url: &str,
     schema_only: bool,
     mapping_path: Option<&Path>,
+    sampling: prism_ingest::text_extract::SamplingPolicy,
 ) -> Result<serde_json::Value> {
     // Text-document extraction is wired to the built-in EMMO ontology only
     // (EMMO prompt, QUDT-typed MaterialFacts). Refuse honestly under any
@@ -7330,10 +7396,12 @@ async fn run_local_text_ingest_file(
             "  chunk {chunk_no}/{chunks_total}: extracting bytes {start}-{end} \
              (a local model can take minutes per chunk — this is work, not a hang)…"
         );
-        let extraction = match prism_ingest::text_extract::extract_facts_from_text(
+        let extraction = match prism_ingest::text_extract::extract_facts_sampled(
             &llm,
             title,
             &text[*start..*end],
+            prism_ingest::text_extract::GroundingPolicy::default(),
+            sampling,
         )
         .await
         {
@@ -8508,6 +8576,7 @@ async fn handle_ingest(
     corpus: Option<&str>,
     json_output: bool,
     mapping_path: Option<&Path>,
+    sampling: prism_ingest::text_extract::SamplingPolicy,
 ) -> Result<()> {
     let ingest_targets = collect_ingest_paths(path)?;
     if ingest_targets.is_empty() {
@@ -8580,6 +8649,7 @@ async fn handle_ingest(
                     runtime_url,
                     schema_only,
                     mapping_path,
+                    sampling,
                 )
                 .await?
             }
@@ -8644,6 +8714,7 @@ async fn handle_ingest_watch(
     corpus: Option<&str>,
     json_output: bool,
     mapping: Option<&Path>,
+    sampling: prism_ingest::text_extract::SamplingPolicy,
 ) -> Result<()> {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
@@ -8683,6 +8754,7 @@ async fn handle_ingest_watch(
             corpus,
             json_output,
             mapping,
+            sampling,
         )
         .await
         {
@@ -8733,6 +8805,7 @@ async fn handle_ingest_watch(
                     corpus,
                     json_output,
                     mapping,
+                    sampling,
                 )
                 .await
                 {
@@ -8957,10 +9030,9 @@ fn selected_identity_provider(
     let provider = explicit_provider.or(configured_provider);
     identity_provider_for(provider).with_context(|| match provider {
         Some(provider) => format!("unknown identity provider `{provider}`"),
-        None => {
-            "identity provider is not configured; pass --provider marc27 or --provider supabase"
-                .to_string()
-        }
+        None => "identity provider is not configured; pass --provider marc27, \
+                 --provider supabase, or --provider mirdyne"
+            .to_string(),
     })
 }
 
@@ -8976,6 +9048,9 @@ fn provider_login_mode(
         email: None,
         supabase_url: None,
         supabase_anon_key: None,
+        // This helper re-logs in with whatever the platform is configured
+        // for; it has no user-supplied SSO connection to pass on.
+        sso: None,
     })
 }
 
@@ -8995,16 +9070,29 @@ fn identity_verifier_for(
             &endpoints.api_base,
             None,
         )?,
-        IdentityProviderAdapter::Supabase => {
-            let credentials = credentials.context(
-                "Supabase identity verification is not configured: no stored login exists",
-            )?;
+        // Shared arm, but the verifier is built with `provider.as_str()` — the
+        // adapter's OWN id — never a hard-coded one. Hard-coding Supabase here
+        // would silently verify a Mirdyne token against Supabase's issuer,
+        // which is precisely the identity-domain collapse this design exists
+        // to prevent.
+        IdentityProviderAdapter::Supabase | IdentityProviderAdapter::Mirdyne => {
+            let credentials = credentials.with_context(|| {
+                format!(
+                    "{} identity verification is not configured: no stored login exists",
+                    provider.as_str()
+                )
+            })?;
             let project_url = credentials
                 .identity_provider_url
                 .as_deref()
-                .context("Supabase identity verification is missing its project URL")?;
+                .with_context(|| {
+                    format!(
+                        "{} identity verification is missing its project URL",
+                        provider.as_str()
+                    )
+                })?;
             prism_client::auth::IdentityVerifierConfig::new(
-                Some(SUPABASE_IDENTITY_PROVIDER),
+                Some(provider.as_str()),
                 project_url,
                 credentials.identity_provider_key.as_deref(),
             )?
@@ -12471,6 +12559,22 @@ async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
 
 /// Mode flag for [`perform_full_login`] — picks the credential source without
 /// committing callers to the structure of [`Commands::Login`]'s arguments.
+/// Owned form of `SsoSelector` so `LoginMode` holds no borrows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SsoChoice {
+    Domain(String),
+    ProviderId(String),
+}
+
+impl SsoChoice {
+    fn as_selector(&self) -> prism_client::supabase_auth::SsoSelector<'_> {
+        match self {
+            Self::Domain(d) => prism_client::supabase_auth::SsoSelector::Domain(d),
+            Self::ProviderId(id) => prism_client::supabase_auth::SsoSelector::ProviderId(id),
+        }
+    }
+}
+
 enum LoginMode {
     /// Personal Access Token — non-interactive, suitable for headless
     /// scripts and CI. Skips the device-flow polling step.
@@ -12484,6 +12588,9 @@ enum LoginMode {
         email: Option<String>,
         supabase_url: Option<String>,
         supabase_anon_key: Option<String>,
+        /// Enterprise SAML SSO connection, when the user named one. Clap
+        /// already guarantees at most one of domain/provider-id/email/token.
+        sso: Option<SsoChoice>,
     },
 }
 
@@ -12532,11 +12639,17 @@ async fn perform_full_login(
             true,
             true,
         ),
+        // Mirdyne signs in through the same passwordless PKCE flow, pointed at
+        // MIRDYNE's issuer. `run_supabase_login` takes the project URL and key
+        // as arguments, so nothing about it is Supabase-specific except the
+        // name; a Mirdyne login therefore stores Mirdyne's issuer and produces
+        // a Mirdyne-scoped principal.
         LoginMode::Provider {
-            provider: IdentityProviderAdapter::Supabase,
+            provider: IdentityProviderAdapter::Supabase | IdentityProviderAdapter::Mirdyne,
             email,
             supabase_url,
             supabase_anon_key,
+            sso,
             no_browser: _,
             interactive_auth: _,
         } => (
@@ -12546,6 +12659,7 @@ async fn perform_full_login(
                 email.as_deref(),
                 supabase_url.as_deref(),
                 supabase_anon_key.as_deref(),
+                sso.as_ref().map(SsoChoice::as_selector),
             )
             .await?,
             false,
@@ -12605,6 +12719,9 @@ async fn run_device_login_with_opts(
         Some(IdentityProviderAdapter::Marc27) => {}
         Some(IdentityProviderAdapter::Supabase) => bail!(
             "Supabase does not implement device authorization; this provider uses passwordless email PKCE"
+        ),
+        Some(IdentityProviderAdapter::Mirdyne) => bail!(
+            "Mirdyne does not implement device authorization; this provider uses passwordless email PKCE"
         ),
         None => bail!("device login requires an explicitly configured MARC27 identity provider"),
     }
@@ -12721,9 +12838,9 @@ async fn run_supabase_login(
     email: Option<&str>,
     configured_url: Option<&str>,
     configured_anon_key: Option<&str>,
+    sso: Option<prism_client::supabase_auth::SsoSelector<'_>>,
 ) -> Result<StoredCredentials> {
     let config = resolve_supabase_login_config(paths, configured_url, configured_anon_key)?;
-    let email = resolve_supabase_login_email(email)?;
     let auth = SupabaseAuth::new(
         reqwest::Client::new(),
         &config.project_url,
@@ -12731,16 +12848,40 @@ async fn run_supabase_login(
         SupabaseAuthPolicy::default(),
     )?;
 
-    let attempt = auth.begin_email_login(&email).await?;
-    println!();
-    println!("Supabase sent a passwordless login link to your email.");
-    println!(
-        "Open it in a browser on this machine; PRISM is waiting on 127.0.0.1:{}.",
-        attempt
-            .redirect_uri()
-            .port()
-            .context("Supabase callback URL is missing its ephemeral port")?
-    );
+    // SSO and email login converge on ONE completion path, so there is no
+    // second token-handling route to keep correct.
+    let attempt = match sso {
+        Some(selector) => {
+            let (attempt, url) = auth.begin_sso_login(selector).await?;
+            println!();
+            println!("Sign in with your organisation's identity provider:");
+            println!();
+            println!("    {url}");
+            println!();
+            println!(
+                "PRISM is waiting on 127.0.0.1:{}. It does not open a browser for you.",
+                attempt
+                    .redirect_uri()
+                    .port()
+                    .context("SSO callback URL is missing its ephemeral port")?
+            );
+            attempt
+        }
+        None => {
+            let email = resolve_supabase_login_email(email)?;
+            let attempt = auth.begin_email_login(&email).await?;
+            println!();
+            println!("Supabase sent a passwordless login link to your email.");
+            println!(
+                "Open it in a browser on this machine; PRISM is waiting on 127.0.0.1:{}.",
+                attempt
+                    .redirect_uri()
+                    .port()
+                    .context("Supabase callback URL is missing its ephemeral port")?
+            );
+            attempt
+        }
+    };
     io::stdout()
         .flush()
         .context("failed to flush login instructions")?;
@@ -13158,15 +13299,19 @@ async fn refresh_access_token(
         })?;
     let (provider_url, provider_key) = match provider {
         IdentityProviderAdapter::Marc27 => (marc27_refresh_url(endpoints, creds)?, None),
-        IdentityProviderAdapter::Supabase => {
-            let url = creds
-                .identity_provider_url
-                .as_deref()
-                .context("Supabase is not configured: missing identity provider URL")?;
-            let key = creds
-                .identity_provider_key
-                .as_deref()
-                .context("Supabase is not configured: missing identity provider anon key")?;
+        IdentityProviderAdapter::Supabase | IdentityProviderAdapter::Mirdyne => {
+            let url = creds.identity_provider_url.as_deref().with_context(|| {
+                format!(
+                    "{} is not configured: missing identity provider URL",
+                    provider.as_str()
+                )
+            })?;
+            let key = creds.identity_provider_key.as_deref().with_context(|| {
+                format!(
+                    "{} is not configured: missing identity provider key",
+                    provider.as_str()
+                )
+            })?;
             (url.to_string(), Some(key))
         }
     };
@@ -17435,6 +17580,7 @@ data:\n\
             "http://192.0.2.1:1",
             true,
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect_err("a non-default ontology must refuse text ingest");
@@ -17508,6 +17654,7 @@ data:\n\
             "http://192.0.2.1:1",
             true, // schema-only: text extraction without an LLM or a store
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect("a parseable PDF must ingest locally");
@@ -17539,6 +17686,7 @@ data:\n\
             "http://192.0.2.1:1",
             true,
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect_err("a malformed PDF must be an error, not a silent skip");
@@ -17677,6 +17825,7 @@ data:\n\
             "http://192.0.2.1:1",
             false,
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect("a document with one bad fact must still ingest the good ones");
@@ -17832,6 +17981,7 @@ data:\n\
             "http://192.0.2.1:1",
             false,
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect("a document whose one fact is refused must still ingest cleanly");
@@ -18098,6 +18248,7 @@ data:\n\
             "http://192.0.2.1:1",
             false,
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect("a multi-window document must ingest");
@@ -18259,6 +18410,7 @@ data:\n\
             "http://192.0.2.1:1",
             false,
             None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
         )
         .await
         .expect("a partial run is a reported partial result, not a crash");

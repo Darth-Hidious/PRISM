@@ -10,6 +10,7 @@
 //! to the cloud.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 
 use anyhow::{Result, ensure};
 use prism_llm::LlmClient;
@@ -69,6 +70,59 @@ pub struct GroundingPolicy {
     pub numeric_tolerance: f64,
 }
 
+/// How many independent extraction passes a document gets, and how many of
+/// them must produce a fact before it is believed.
+///
+/// WHY THIS EXISTS. A small extraction model does not fail deterministically
+/// — it invents. Measured on one 36-page LPBF paper, five runs of the SAME
+/// model over the SAME text stored 4, 0, 2, 3 and 1 facts, and between 32%
+/// and 68% of everything it emitted was a numeric value that appears nowhere
+/// in the document. No downstream rule fixes that, because the defect is not
+/// in the rule: it is a different wrong answer every time.
+///
+/// But that is exactly what makes it filterable. A fabricated value differs
+/// from sample to sample; a value printed on the page is the same in every
+/// sample. So run the extraction more than once and keep what RECURS. This
+/// uses the nondeterminism as the signal instead of fighting it.
+///
+/// Cost is linear in `samples` and is the caller's to declare — the default
+/// is ONE sample with an agreement of one, i.e. exactly today's behaviour and
+/// today's bill, so nothing changes for a caller that does not ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamplingPolicy {
+    /// Independent extraction passes over the same text.
+    pub samples: NonZeroUsize,
+    /// Passes a fact must appear in to be kept. Must not exceed `samples`,
+    /// or nothing could ever clear the bar — checked, not assumed.
+    pub agreement: NonZeroUsize,
+}
+
+impl Default for SamplingPolicy {
+    fn default() -> Self {
+        Self {
+            samples: NonZeroUsize::new(1).expect("1 is non-zero"),
+            agreement: NonZeroUsize::new(1).expect("1 is non-zero"),
+        }
+    }
+}
+
+impl SamplingPolicy {
+    /// A policy that samples `samples` times and keeps facts seen at least
+    /// `agreement` times. `None` when agreement exceeds samples, which would
+    /// silently discard every fact.
+    #[must_use]
+    pub fn new(samples: NonZeroUsize, agreement: NonZeroUsize) -> Option<Self> {
+        (agreement <= samples).then_some(Self { samples, agreement })
+    }
+
+    /// Whether more than one pass is requested — the cheap check callers use
+    /// to skip the whole agreement machinery.
+    #[must_use]
+    pub fn is_single_pass(self) -> bool {
+        self.samples.get() == 1
+    }
+}
+
 impl Default for GroundingPolicy {
     fn default() -> Self {
         Self {
@@ -94,6 +148,10 @@ pub enum RejectionClass {
     MalformedShape,
     /// The document never names the fact's subject.
     SubjectNotNamed,
+    /// Too few independent extraction passes produced this fact — see
+    /// [`SamplingPolicy`]. NOT a statement about the document: nothing was
+    /// checked against the text, only against the model's own consistency.
+    SampleDisagreement,
     /// No single span carries the value together with its subject, unit and
     /// conditions.
     NumericUnsupported,
@@ -135,7 +193,11 @@ impl RejectionClass {
             | Self::MalformedShape
             | Self::ValuelessWithUnit
             | Self::PolicyDeferred
-            | Self::ReviewMissing => false,
+            | Self::ReviewMissing
+            // Disagreement between passes is a statement about the MODEL, not
+            // about the document — the text was never consulted. Nothing was
+            // judged, so re-asking is not laundering.
+            | Self::SampleDisagreement => false,
         }
     }
 
@@ -147,6 +209,7 @@ impl RejectionClass {
             Self::MalformedShape => "malformed_shape",
             Self::SubjectNotNamed => "subject_not_named",
             Self::NumericUnsupported => "numeric_unsupported",
+            Self::SampleDisagreement => "sample_disagreement",
             Self::ValuelessWithUnit => "valueless_with_unit",
             Self::PolicyDeferred => "policy_deferred",
             Self::ReviewDenied => "review_denied",
@@ -232,6 +295,99 @@ pub async fn extract_facts_from_text(
     extract_facts_from_text_with_policy(llm, title, text, GroundingPolicy::default()).await
 }
 
+/// Keep the facts that appeared in at least `agreement` of the samples.
+///
+/// A fact seen in too few passes is REJECTED, not silently dropped: it gets a
+/// [`RejectionClass::SampleDisagreement`] entry naming how many passes
+/// produced it. That keeps the contract every other refusal here honours —
+/// the caller can always account for every fact the model emitted — and makes
+/// the filter auditable rather than a quiet cull.
+///
+/// `SampleDisagreement` renders NO judgement about the fact's truth (the
+/// document was never consulted), so it is re-askable under the anti-ratchet
+/// rule and can queue for a later tier.
+fn keep_recurring_facts(
+    per_sample: Vec<Vec<MaterialFact>>,
+    sampling: SamplingPolicy,
+    rejections: &mut Vec<RejectedFact>,
+) -> Vec<MaterialFact> {
+    // How many DISTINCT passes produced each fact. Counting occurrences
+    // instead of passes would let one pass that emitted the same fact twice
+    // corroborate itself — a single sample agreeing with nobody.
+    let mut passes_seen: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut exemplar: std::collections::BTreeMap<String, MaterialFact> =
+        std::collections::BTreeMap::new();
+    for sample in &per_sample {
+        let mut this_pass: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for fact in sample {
+            let key = agreement_key(fact);
+            if this_pass.insert(key.clone()) {
+                *passes_seen.entry(key.clone()).or_insert(0) += 1;
+            }
+            exemplar.entry(key).or_insert_with(|| fact.clone());
+        }
+    }
+
+    let required = sampling.agreement.get();
+    let total = sampling.samples.get();
+    let mut kept = Vec::new();
+    for (key, count) in passes_seen {
+        let fact = exemplar
+            .remove(&key)
+            .expect("every counted key has an exemplar");
+        if count >= required {
+            kept.push(fact);
+        } else {
+            rejections.push(RejectedFact {
+                class: RejectionClass::SampleDisagreement,
+                detail: format!(
+                    "'{} {} {}': produced by {count} of {total} extraction \
+                     passes, below the {required} required — a value the model \
+                     invents differs between passes, one it read does not",
+                    fact.subject, fact.predicate, fact.object
+                ),
+                subject: RejectedSubject::Converted(Box::new(fact)),
+            });
+        }
+    }
+    kept
+}
+
+/// The identity two extractions must share to count as the SAME fact.
+///
+/// Deliberately strict on the number and loose on nothing else: subject,
+/// property and unit are compared case- and space-folded (models vary the
+/// capitalisation of the same entity between runs), while the value is
+/// compared at fixed precision. Agreement that ignored the value would count
+/// two different fabricated numbers for one property as corroboration, which
+/// is precisely the failure this filter exists to catch.
+///
+/// The unit is part of the key: 1250 mm/s and 1250 m/s are not the same
+/// measurement, and treating them as one would let a wrong unit ride in on
+/// the strength of a right value.
+fn agreement_key(fact: &MaterialFact) -> String {
+    fn folded(s: &str) -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    // {:.6e} gives a stable decimal form for values that differ only by
+    // float formatting, without collapsing genuinely different numbers.
+    let value = fact
+        .value
+        .map_or_else(|| "novalue".to_string(), |v| format!("{v:.6e}"));
+    format!(
+        "{}|{}|{}|{}|{}",
+        folded(&fact.subject),
+        folded(&fact.predicate),
+        folded(&fact.object),
+        value,
+        fact.unit.as_ref().map_or("nounit", |u| u.as_str()),
+    )
+}
+
 /// [`extract_facts_from_text`] with an explicit, caller-swappable grounding
 /// policy.
 pub async fn extract_facts_from_text_with_policy(
@@ -244,9 +400,63 @@ pub async fn extract_facts_from_text_with_policy(
         policy.numeric_tolerance.is_finite() && policy.numeric_tolerance >= 0.0,
         "grounding numeric_tolerance must be finite and non-negative"
     );
+    extract_facts_sampled(llm, title, text, policy, SamplingPolicy::default()).await
+}
+
+/// [`extract_facts_from_text_with_policy`] that may extract the same text
+/// more than once and keep only what RECURS — see [`SamplingPolicy`].
+///
+/// With the default single-sample policy this is byte-for-byte the old path:
+/// one request, one parse, no agreement bookkeeping, no extra cost.
+pub async fn extract_facts_sampled(
+    llm: &LlmClient,
+    title: &str,
+    text: &str,
+    policy: GroundingPolicy,
+    sampling: SamplingPolicy,
+) -> Result<TextExtraction> {
+    ensure!(
+        policy.numeric_tolerance.is_finite() && policy.numeric_tolerance >= 0.0,
+        "grounding numeric_tolerance must be finite and non-negative"
+    );
+    ensure!(
+        sampling.agreement <= sampling.samples,
+        "sampling agreement ({}) cannot exceed samples ({}) — no fact could \
+         ever clear that bar",
+        sampling.agreement,
+        sampling.samples
+    );
     let prompt = build_extraction_prompt(title, text);
-    let (raw, usage) = llm.generate_json_with_usage(&prompt).await?;
-    let (facts, mut rejections, parse_error) = parse_extraction(&raw);
+
+    // Sample the model `samples` times. Each pass is INDEPENDENT: a fresh
+    // request, parsed and unit-resolved on its own. Passes are sequential
+    // rather than concurrent because the local server is a single slot —
+    // firing them at once would queue inside llama.cpp, not go faster.
+    let mut usage: Option<prism_llm::UsageInfo> = None;
+    let mut per_sample: Vec<Vec<MaterialFact>> = Vec::with_capacity(sampling.samples.get());
+    let mut rejections = Vec::new();
+    let mut parse_error = None;
+    for pass in 0..sampling.samples.get() {
+        let (raw, pass_usage) = llm.generate_json_with_usage(&prompt).await?;
+        usage = merge_usage(usage, pass_usage);
+        let (facts, mut pass_rejections, pass_parse_error) = parse_extraction(&raw, text, policy);
+        // Refusals are reported from the FIRST pass only. Later passes see
+        // the same document and would restate the same refusals with
+        // different wording, inflating the repair queue with duplicates of
+        // one refusal.
+        if pass == 0 {
+            rejections.append(&mut pass_rejections);
+            parse_error = pass_parse_error;
+        }
+        per_sample.push(facts);
+    }
+
+    let facts = if sampling.is_single_pass() {
+        per_sample.pop().unwrap_or_default()
+    } else {
+        keep_recurring_facts(per_sample, sampling, &mut rejections)
+    };
+
     let (facts, review_usage) = retain_grounded(llm, facts, text, policy, &mut rejections).await;
     // `dropped_facts` is DERIVED from the structured rejections — one source
     // of truth, so the prose report and the repair queue cannot disagree
@@ -982,7 +1192,65 @@ Use "kind" to classify: measurement | phase | composition | processing | structu
 /// reason so the caller can surface it. A domain rejection (for example an
 /// unresolvable unit) is reported as exactly that — it must never wear the
 /// costume of a JSON parse failure.
-fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<RejectedFact>, Option<String>) {
+/// The unit as the DOCUMENT prints it, next to this fact's value.
+///
+/// The extraction model's `unit` string is not evidence. Measured on one
+/// LPBF paper across four runs of the same model: the same quantity was
+/// written `QUDT:MM-PER-S`, then `QUDT:Number-PER-Millimeter-3`, then
+/// `QUDT:Inverse-Cubic-Meter`, then `QUDT:Micra` — a different invented
+/// identifier every run, none of them a QUDT unit. The PAGE, meanwhile,
+/// printed `1250 mm/s` and `70 µm` every single time: spellings this
+/// vocabulary already resolves.
+///
+/// So the document decides and the model's string never does. This is not a
+/// softened gate — the returned identifier is a CANDIDATE that must still
+/// clear the full grounding pass in [`retain_grounded`], which re-checks
+/// that the unit occurs in the same supporting span as the value. A wrong
+/// adjacent unit is refused there, exactly as before; the only change is
+/// that grounding now gets a candidate to verify instead of the fact being
+/// discarded before verification on the strength of a model's typo.
+fn unit_from_document(
+    raw: &serde_json::Value,
+    text: &str,
+    policy: GroundingPolicy,
+) -> Option<String> {
+    let subject = raw.get("subject").and_then(serde_json::Value::as_str)?;
+    let object = raw.get("object").and_then(serde_json::Value::as_str)?;
+    let value = raw.get("value").and_then(serde_json::Value::as_f64)?;
+
+    let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for span in text.lines().flat_map(sentence_spans) {
+        let _ = prism_retrieval::claims::evidential_numeric_lexeme_satisfies(
+            subject,
+            object,
+            value,
+            span,
+            policy.numeric_tolerance,
+            |hay, range| {
+                if let Some(unit) =
+                    prism_provenance::units::span_value_resolved_adjacent_unit(hay, range.end)
+                {
+                    found.insert(unit.as_str().to_string());
+                }
+                false
+            },
+        );
+    }
+    // Exactly one printed unit, or nothing. Two different units printed next
+    // to the same value in different passages is a genuine ambiguity the
+    // document does not resolve, and guessing between them is how a wrong
+    // number acquires a real quote.
+    match found.len() {
+        1 => found.into_iter().next(),
+        _ => None,
+    }
+}
+
+fn parse_extraction(
+    raw: &str,
+    text: &str,
+    policy: GroundingPolicy,
+) -> (Vec<MaterialFact>, Vec<RejectedFact>, Option<String>) {
     let json_str = extract_json_block(raw);
     let envelope = match serde_json::from_str::<ExtractionEnvelope>(json_str) {
         Ok(envelope) => envelope,
@@ -1013,7 +1281,41 @@ fn parse_extraction(raw: &str) -> (Vec<MaterialFact>, Vec<RejectedFact>, Option<
                 );
                 facts.push(fact);
             }
+            // The model's unit did not resolve. That is a statement about the
+            // MODEL, not about the paper — so ask the paper before giving up.
+            // The rescued fact is re-converted through the SAME `convert_fact`
+            // and still faces the full grounding pass afterwards; nothing is
+            // admitted here that a normally-extracted fact would not face.
             Err(reason) => {
+                // Only an unresolvable UNIT is re-asked, and only of the
+                // document. Every other refusal (an invented value, a
+                // malformed shape) is a judgement that stands — re-asking
+                // those would be laundering, the anti-ratchet rule.
+                let class = conversion_rejection_class(&preserved);
+                if class == RejectionClass::UnresolvedUnit
+                    && let Some(printed) = unit_from_document(&preserved, text, policy)
+                {
+                    {
+                        let mut corrected = preserved.clone();
+                        corrected["unit"] = serde_json::Value::String(printed.clone());
+                        if let Ok(mut fact) = convert_fact(corrected) {
+                            tracing::info!(
+                                claimed = preserved
+                                    .get("unit")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("?"),
+                                resolved = %printed,
+                                "unit taken from the document, not the model"
+                            );
+                            fact.evidence_class = evidence_for_result(
+                                EvidenceSource::LiteratureExtraction,
+                                [fact.evidence_class],
+                            );
+                            facts.push(fact);
+                            continue;
+                        }
+                    }
+                }
                 tracing::warn!(%reason, "extracted fact dropped");
                 rejections.push(RejectedFact {
                     class: conversion_rejection_class(&preserved),
@@ -2229,13 +2531,26 @@ mod tests {
         server.verify().await;
     }
 
-    /// End to end into the code tiers, against a real socket: a fact whose
-    /// invented unit failed to resolve is ACCEPTED by Tier A with the
-    /// corrected identifier and the verbatim span — and the wiremock server
-    /// proves the repair itself made ZERO model calls (`.expect(1)` covers
-    /// exactly the one extraction request; `verify()` fails on any more).
+    /// End to end against a real socket: the model writes an identifier that
+    /// is not a QUDT unit, the PAGE prints `1250 mm/s`, and the fact is
+    /// stored with the unit the page gives — no rejection, no repair round
+    /// trip, and ZERO extra model calls (`.expect(1)` covers exactly the one
+    /// extraction request; `verify()` fails on any more).
+    ///
+    /// This is the architecture the measurements forced. Four runs of the
+    /// same paper through the same model invented FOUR different identifiers
+    /// for the same quantity (`MM-PER-S`, `Number-PER-Millimeter-3`,
+    /// `Inverse-Cubic-Meter`, `Micra`); the paper printed `mm/s` and `µm`
+    /// every time. Determinism cannot be extracted from the model, so the
+    /// model's unit string is not evidence and never decides — the document
+    /// does. The rescued unit still faces the full grounding pass, so this
+    /// admits nothing a normally-extracted fact would not face.
+    ///
+    /// The deferred repair tier still exists for rejections that reach it by
+    /// other routes and is covered by `repair`'s own tests, including
+    /// `a_resolvable_but_wrong_adjacent_token_is_never_accepted`.
     #[tokio::test]
-    async fn a_rejected_unit_is_re_resolved_by_code_with_zero_model_calls() {
+    async fn the_document_supplies_the_unit_when_the_model_invents_one() {
         let facts = serde_json::json!({"facts": [{
             "subject": "AlSi10Mg", "predicate": "has_measurement",
             "object": "scan speed", "value": 1250.0, "unit": "QUDT:MM-PER-S",
@@ -2248,35 +2563,177 @@ mod tests {
         let extraction = extract_facts_from_text(&client_for(&server), "LPBF study", source)
             .await
             .expect("extraction succeeds");
+        // The fact is KEPT, and it is kept with the page's unit.
+        assert_eq!(
+            extraction.facts.len(),
+            1,
+            "the document prints `1250 mm/s`; an unresolvable string from the \
+             model must not cost the fact. dropped: {:?}",
+            extraction.dropped_facts
+        );
+        assert_eq!(
+            extraction.facts[0].unit.as_ref().map(|unit| unit.as_str()),
+            Some("QUDT:MilliM-PER-SEC"),
+            "the stored identifier comes from the page, not the model"
+        );
+        assert_eq!(extraction.facts[0].value, Some(1250.0));
+        // Nothing was refused, so nothing is queued for repair.
+        assert!(
+            extraction.rejections.is_empty(),
+            "{:?}",
+            extraction.dropped_facts
+        );
+        // Exactly ONE request ever reached the model: the extraction. Reading
+        // a unit off the page costs no inference.
+        server.verify().await;
+    }
+
+    /// The whole point of sampling, on the shape the measurements showed.
+    ///
+    /// Three passes over one document. The scan speed — a value printed on
+    /// the page — comes back identically every pass. The "prediction
+    /// accuracy" is fabricated, so it comes back as a DIFFERENT number each
+    /// pass, which is exactly how fabrication behaves and exactly why
+    /// agreement catches it. Only the recurring fact survives.
+    #[tokio::test]
+    async fn a_value_that_changes_between_passes_is_not_believed() {
+        let pass = |accuracy: f64| {
+            serde_json::json!({"facts": [
+                {"subject": "AlSi10Mg", "predicate": "has_measurement",
+                 "object": "scan speed", "value": 1250.0,
+                 "unit": "QUDT:MilliM-PER-SEC", "kind": "measurement",
+                 "confidence": 0.9, "evidence_class": "research", "conditions": []},
+                {"subject": "AlSi10Mg", "predicate": "has_measurement",
+                 "object": "prediction accuracy", "value": accuracy,
+                 "unit": "QUDT:PERCENT", "kind": "measurement",
+                 "confidence": 0.9, "evidence_class": "research", "conditions": []}
+            ]})
+            .to_string()
+        };
+        let server = scripted_server(vec![pass(93.5), pass(94.4), pass(94.6)], 3).await;
+        let source = "The AlSi10Mg parts were built at a scan speed of 1250 mm/s.";
+
+        let sampling =
+            SamplingPolicy::new(NonZeroUsize::new(3).unwrap(), NonZeroUsize::new(2).unwrap())
+                .expect("2 of 3 is a valid policy");
+        let extraction = extract_facts_sampled(
+            &client_for(&server),
+            "LPBF study",
+            source,
+            GroundingPolicy::default(),
+            sampling,
+        )
+        .await
+        .expect("extraction succeeds");
+
+        assert_eq!(
+            extraction.facts.len(),
+            1,
+            "only the recurring fact survives: {:?}",
+            extraction.facts
+        );
+        assert_eq!(extraction.facts[0].object, "scan speed");
+        assert_eq!(extraction.facts[0].value, Some(1250.0));
+        // The fabricated one is REFUSED, not silently culled, and its class
+        // says the model disagreed with itself rather than that the document
+        // denied it.
+        assert!(
+            extraction
+                .rejections
+                .iter()
+                .any(|r| r.class == RejectionClass::SampleDisagreement),
+            "{:?}",
+            extraction.dropped_facts
+        );
+        server.verify().await;
+    }
+
+    /// One pass cannot corroborate itself. A policy demanding agreement from
+    /// more passes than it runs is refused at the door — otherwise it would
+    /// silently discard every fact and report an empty document.
+    #[test]
+    fn agreement_can_never_exceed_the_samples_taken() {
+        assert!(
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(3).unwrap())
+                .is_none(),
+            "3-of-2 is unsatisfiable and must not be constructible"
+        );
+        assert!(
+            SamplingPolicy::new(NonZeroUsize::new(3).unwrap(), NonZeroUsize::new(3).unwrap())
+                .is_some()
+        );
+        // The default is exactly today's behaviour: one pass, one vote.
+        assert!(SamplingPolicy::default().is_single_pass());
+    }
+
+    /// Sampling never counts a pass twice. A model that emits the same fact
+    /// twice in ONE response has still only been asked once, and must not
+    /// clear a 2-of-3 bar on its own.
+    #[test]
+    fn one_pass_repeating_itself_is_still_one_vote() {
+        let fact = |object: &str| MaterialFact {
+            subject: "AlSi10Mg".into(),
+            predicate: "has_measurement".into(),
+            object: object.into(),
+            value: Some(1250.0),
+            unit: prism_provenance::QudtUnit::new("QUDT:MilliM-PER-SEC").ok(),
+            conditions: Vec::new(),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: Default::default(),
+        };
+        let mut rejections = Vec::new();
+        // ONE pass that emitted the identical fact three times.
+        let kept = keep_recurring_facts(
+            vec![vec![
+                fact("scan speed"),
+                fact("scan speed"),
+                fact("scan speed"),
+            ]],
+            SamplingPolicy::new(NonZeroUsize::new(3).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            &mut rejections,
+        );
+        assert!(
+            kept.is_empty(),
+            "one response repeating itself is one vote, not three"
+        );
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].class, RejectionClass::SampleDisagreement);
+    }
+
+    /// The rescue reads the page; it does not invent. When the document does
+    /// NOT print a resolvable unit beside the value, the fact is still
+    /// dropped whole — the gate is unchanged for everything the page cannot
+    /// answer, and a number without its unit is still a wrong number.
+    ///
+    /// Delete the `found.len() == 1` arm in `unit_from_document`, or let it
+    /// fall back to the model's string, and this fails.
+    #[tokio::test]
+    async fn a_unit_the_page_does_not_print_is_still_refused() {
+        let facts = serde_json::json!({"facts": [{
+            "subject": "AlSi10Mg", "predicate": "has_measurement",
+            "object": "scan speed", "value": 1250.0, "unit": "QUDT:Micra",
+            "kind": "measurement", "confidence": 0.9,
+            "evidence_class": "research", "conditions": []
+        }]});
+        let server = scripted_server(vec![facts.to_string()], 1).await;
+        // The value appears; no unit is printed next to it.
+        let source = "The AlSi10Mg parts were built at a scan speed of 1250.";
+
+        let extraction = extract_facts_from_text(&client_for(&server), "LPBF study", source)
+            .await
+            .expect("extraction succeeds");
         assert!(
             extraction.facts.is_empty(),
-            "the invented unit must be refused first"
+            "no printed unit means no fact: {:?}",
+            extraction.facts
         );
         assert_eq!(extraction.rejections.len(), 1);
         assert_eq!(
             extraction.rejections[0].class,
             RejectionClass::UnresolvedUnit
         );
-
-        let disposition = crate::repair::dispose(
-            &extraction.rejections[0],
-            "doc:lpbf-study.pdf",
-            source,
-            &crate::repair::RepairPolicy::default(),
-            0.0,
-        )
-        .expect("Tier A decides this without a model");
-        assert_eq!(disposition.outcome, "accept");
-        assert_eq!(disposition.dispositioner, "code:unit-re-resolution");
-        let corrected: MaterialFact =
-            serde_json::from_str(disposition.corrected_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            corrected.unit.as_ref().map(|unit| unit.as_str()),
-            Some("QUDT:MilliM-PER-SEC")
-        );
-        let evidence = disposition.evidence.as_deref().unwrap();
-        assert!(evidence.contains("1250 mm/s"), "{evidence}");
-        // Exactly ONE request ever reached the model: the extraction.
         server.verify().await;
     }
 
@@ -2495,7 +2952,7 @@ mod tests {
     #[test]
     fn parse_extraction_valid_json() {
         let raw = r#"{"facts": [{"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":1140.0,"unit":"QUDT:MegaPA","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, _, _) = parse_extraction(raw);
+        let (facts, _, _) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].subject, "Ti-6Al-4V");
         assert_eq!(facts[0].predicate, "has_measurement");
@@ -2510,7 +2967,7 @@ mod tests {
     #[test]
     fn parse_extraction_fenced_json() {
         let raw = "```json\n{\"facts\": [{\"subject\":\"Fe\",\"predicate\":\"has_phase\",\"object\":\"BCC\",\"kind\":\"phase\"}]}\n```";
-        let (facts, _, _) = parse_extraction(raw);
+        let (facts, _, _) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].kind.as_deref(), Some("phase"));
         // Optional fields absent in the JSON default to None.
@@ -2520,8 +2977,16 @@ mod tests {
 
     #[test]
     fn parse_extraction_garbage_returns_empty() {
-        assert!(parse_extraction("not json at all").0.is_empty());
-        assert!(parse_extraction("").0.is_empty());
+        assert!(
+            parse_extraction("not json at all", "", GroundingPolicy::default())
+                .0
+                .is_empty()
+        );
+        assert!(
+            parse_extraction("", "", GroundingPolicy::default())
+                .0
+                .is_empty()
+        );
     }
 
     /// Zero facts because the model misbehaved must be distinguishable from
@@ -2532,7 +2997,7 @@ mod tests {
     /// against a broken model reported a clean, empty success.
     #[test]
     fn unparseable_output_reports_why_it_found_nothing() {
-        let (facts, _, err) = parse_extraction("not json at all");
+        let (facts, _, err) = parse_extraction("not json at all", "", GroundingPolicy::default());
         assert!(facts.is_empty());
         let err = err.expect("an unparseable response must say so");
         assert!(
@@ -2544,7 +3009,8 @@ mod tests {
     #[test]
     fn a_document_with_no_facts_is_not_reported_as_an_error() {
         // Valid JSON, genuinely empty — silence is the correct answer here.
-        let (facts, dropped, err) = parse_extraction(r#"{"facts": []}"#);
+        let (facts, dropped, err) =
+            parse_extraction(r#"{"facts": []}"#, "", GroundingPolicy::default());
         assert!(facts.is_empty());
         assert!(dropped.is_empty());
         assert!(
@@ -2556,7 +3022,7 @@ mod tests {
     #[test]
     fn literature_extractor_cannot_claim_green() {
         let raw = r#"{"facts":[{"subject":"steel","predicate":"has_phase","object":"bcc","conditions":[],"kind":"phase","evidence_class":"reference_validated"}]}"#;
-        let (facts, _, _) = parse_extraction(raw);
+        let (facts, _, _) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(
             facts[0].evidence_class,
             prism_provenance::EvidenceClass::Research
@@ -2573,7 +3039,7 @@ mod tests {
             {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":880.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
             {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"density","value":4.43,"unit":"g/cm3","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
         ]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None, "domain conversion must not report a parse error");
         assert!(dropped.is_empty(), "nothing to drop here: {dropped:?}");
         assert_eq!(facts.len(), 2);
@@ -2592,7 +3058,7 @@ mod tests {
     #[test]
     fn condition_unit_spellings_are_normalised_too() {
         let raw = r#"{"facts":[{"subject":"alumina","predicate":"has_measurement","object":"thermal conductivity","value":30.0,"unit":"W/(m·K)","conditions":[{"name":"temperature","value":298.15,"unit":"K"}],"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None);
         assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 1);
@@ -2616,7 +3082,7 @@ mod tests {
             {"subject":"steel","predicate":"has_measurement","object":"hardness","value":250.0,"unit":"banana","conditions":[],"kind":"measurement","evidence_class":"research"},
             {"subject":"steel","predicate":"has_phase","object":"ferrite","conditions":[],"kind":"phase","evidence_class":"research"}
         ]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None, "the envelope parsed — no parse error");
         assert_eq!(
             facts.len(),
@@ -2645,7 +3111,7 @@ mod tests {
     #[test]
     fn numeric_value_with_unresolvable_unit_is_dropped_never_stored_unitless() {
         let raw = r#"{"facts":[{"subject":"steel","predicate":"has_measurement","object":"UTS","value":880.0,"unit":"furlongs","conditions":[],"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert!(
             facts.is_empty(),
             "the fact must not surface at all, with ANY unit value: {facts:?}"
@@ -2677,7 +3143,7 @@ mod tests {
     #[test]
     fn unresolvable_condition_unit_drops_the_whole_fact() {
         let raw = r#"{"facts":[{"subject":"alloy","predicate":"has_measurement","object":"creep rate","value":1e-7,"unit":"QUDT:PER-SEC","conditions":[{"name":"temperature","value":1200.0,"unit":"gluons"}],"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None);
         assert!(facts.is_empty(), "{facts:?}");
         assert_eq!(dropped.len(), 1);
@@ -2700,7 +3166,7 @@ mod tests {
     #[test]
     fn contentless_condition_padding_is_stripped_not_fatal() {
         let raw = r#"{"facts":[{"subject":"18Ni-300","predicate":"has_measurement","object":"UTS","value":2050.0,"unit":"QUDT:MegaPA","conditions":[{"name":"temperature","value":null,"unit":null},{"name":"atmosphere","value":null,"unit":null}],"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None);
         assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 1);
@@ -2718,7 +3184,7 @@ mod tests {
     #[test]
     fn numeric_value_with_no_unit_at_all_is_dropped() {
         let raw = r#"{"facts":[{"subject":"18Ni-300","predicate":"has_measurement","object":"elongation","value":4.5,"unit":null,"conditions":[],"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None);
         assert!(facts.is_empty(), "{facts:?}");
         assert_eq!(dropped.len(), 1);
@@ -2738,7 +3204,7 @@ mod tests {
     #[test]
     fn numeric_condition_without_unit_drops_the_fact() {
         let raw = r#"{"facts":[{"subject":"18Ni-300","predicate":"has_measurement","object":"UTS","value":2050.0,"unit":"QUDT:MegaPA","conditions":[{"name":"aging temperature","value":763.0,"unit":null}],"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None);
         assert!(facts.is_empty(), "{facts:?}");
         assert_eq!(dropped.len(), 1);
@@ -2754,7 +3220,7 @@ mod tests {
     #[test]
     fn a_categorical_fact_without_a_unit_is_unaffected() {
         let raw = r#"{"facts":[{"subject":"steel","predicate":"has_phase","object":"austenite","conditions":[],"kind":"phase","evidence_class":"research"}]}"#;
-        let (facts, dropped, err) = parse_extraction(raw);
+        let (facts, dropped, err) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(err, None);
         assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts.len(), 1);
@@ -2775,7 +3241,7 @@ mod tests {
 
         // Deterministic fake-LLM response: no provider or network is used in tests.
         let raw = r#"{"facts":[{"subject":"test ceramic","predicate":"has_measurement","object":"thermal conductivity","value":22.0,"unit":"QUDT:W-PER-M-K","conditions":[{"name":"temperature","value":1200.0,"unit":"QUDT:K"},{"name":"atmosphere","value":"air","unit":null}],"confidence":0.9,"kind":"measurement","evidence_class":"research"}]}"#;
-        let (facts, _, _) = parse_extraction(raw);
+        let (facts, _, _) = parse_extraction(raw, "", GroundingPolicy::default());
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].conditions.len(), 2);
         assert_eq!(facts[0].evidence_class, EvidenceClass::Research);

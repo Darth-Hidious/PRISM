@@ -40,6 +40,21 @@ pub enum QuantityKind {
     Speed,
     /// Elapsed time / duration (s, min, h).
     Time,
+    /// A COUNT of discrete events or objects — fatigue cycles to failure,
+    /// numbers of pores. Dimensionless, but NOT [`Self::Fraction`]: 50,000
+    /// cycles is not 50,000 percent, and conflating them would let a
+    /// percentage stand as evidence for a cycle count.
+    Count,
+    /// Counts per unit VOLUME — pore number density (mm⁻³).
+    ///
+    /// Deliberately distinct from [`Self::Density`], which is MASS per
+    /// volume. Both properties are called "density" in papers, and a
+    /// substring match on that word alone would let a printed `8.19 g/cm³`
+    /// satisfy the kind guard for a pore-count property — storing a mass
+    /// density as a number density, with a genuine verbatim span attached.
+    NumberDensity,
+    /// Events per unit time — fatigue test frequency in cycles/min.
+    Frequency,
 }
 
 impl QuantityKind {
@@ -53,6 +68,9 @@ impl QuantityKind {
             Self::Fraction => "fraction",
             Self::Speed => "speed",
             Self::Time => "time",
+            Self::Count => "count",
+            Self::NumberDensity => "number density",
+            Self::Frequency => "frequency",
         }
     }
 }
@@ -88,6 +106,21 @@ pub const NON_SCHEMA_UNIT_KINDS: &[(&str, QuantityKind)] = &[
     ("QUDT:SEC", QuantityKind::Time),
     ("QUDT:MIN", QuantityKind::Time),
     ("QUDT:HR", QuantityKind::Time),
+    // Counts, count densities and event rates. Measured on a real 36-page
+    // LPBF fatigue paper through the live pipeline (Gemma 4 12B): of 47
+    // extracted facts, TEN were refused for these three quantities alone —
+    // six pore number densities, three LCF cycle counts, one test frequency.
+    // The repair tier could not rescue any of them, because a unit whose
+    // kind is unknown can never satisfy its strict kind-equality guard, so
+    // every one queued for a model tier that does not exist yet.
+    //
+    // Each identifier verified against the live QUDT vocabulary
+    // (`http://qudt.org/vocab/unit/<name>` → HTTP 200) rather than recalled;
+    // `CYC-PER-MIN`, the obvious spelling for a cycle rate, is NOT a QUDT
+    // unit (404) — cycles are dimensionless, so a cycle rate is PER-MIN.
+    ("QUDT:NUM", QuantityKind::Count),
+    ("QUDT:NUM-PER-MilliM3", QuantityKind::NumberDensity),
+    ("QUDT:PER-MIN", QuantityKind::Frequency),
 ];
 
 /// The quantity kind of a declared unit — [`EXTRACTION_UNITS`] plus
@@ -117,8 +150,26 @@ pub fn property_quantity_kind(property_name: &str) -> Option<QuantityKind> {
     if name.contains("thermal conductivity") {
         return Some(QuantityKind::ThermalConductivity);
     }
+    // BEFORE the bare "density" arm, and load-bearing. A pore NUMBER density
+    // is a count per volume (mm⁻³); a mass density is g/cm³. Both are spelt
+    // "density" in papers. Falling through to `Density` here would let a
+    // printed mass density satisfy the repair tier's kind-equality guard for
+    // a pore-count property and store it as evidenced — a false fact wearing
+    // a genuine verbatim quote, which is worse than a dropped one.
+    // `a_pore_number_density_is_not_a_mass_density` fails if this arm is
+    // moved below the next one.
+    if name.contains("number density") || name.contains("pore density") {
+        return Some(QuantityKind::NumberDensity);
+    }
     if name.contains("density") {
         return Some(QuantityKind::Density);
+    }
+    // "cycles to failure", "LCF cycles", "fatigue life (cycles)".
+    if name.contains("cycles") || name.contains("cycle count") {
+        return Some(QuantityKind::Count);
+    }
+    if name.contains("frequency") {
+        return Some(QuantityKind::Frequency);
     }
     if name.contains("strength") || name.contains("stress") || name.contains("modulus") {
         return Some(QuantityKind::Pressure);
@@ -153,6 +204,78 @@ mod tests {
         for (id, _) in EXTRACTION_UNITS.iter().chain(NON_SCHEMA_UNIT_KINDS) {
             assert!(seen.insert(*id), "unit {id} declared twice");
         }
+    }
+
+    /// A pore NUMBER density (count per volume) must never be classified as
+    /// a MASS density. Both are spelt "density"; only the ordering of the
+    /// arms in `property_quantity_kind` separates them.
+    ///
+    /// Without the `number density` arm sitting ABOVE the bare `density`
+    /// arm, these properties resolve to `Density`, whose units are g/cm³ and
+    /// kg/m³ — so a mass density printed anywhere near the value would
+    /// satisfy the repair tier's kind-equality guard and be stored as a pore
+    /// count with a real verbatim span attached. Move that arm down and this
+    /// test fails.
+    #[test]
+    fn a_pore_number_density_is_not_a_mass_density() {
+        for property in [
+            "internal pore number density",
+            "surface pore number density",
+            "Pore Number Density",
+            "pore density",
+        ] {
+            assert_eq!(
+                property_quantity_kind(property),
+                Some(QuantityKind::NumberDensity),
+                "{property} must be a number density, not a mass density"
+            );
+        }
+        // The mass-density path is untouched by the new arm.
+        assert_eq!(
+            property_quantity_kind("density"),
+            Some(QuantityKind::Density)
+        );
+        assert_eq!(
+            property_quantity_kind("density_g_cm3"),
+            Some(QuantityKind::Density)
+        );
+        // And the two kinds are genuinely different, so the guard that
+        // compares them cannot be satisfied across the pair.
+        assert_ne!(QuantityKind::NumberDensity, QuantityKind::Density);
+    }
+
+    /// The three quantities that cost the LPBF paper ten facts now have both
+    /// halves the repair tier needs: a property name that states a kind, and
+    /// a unit identifier carrying the SAME kind. Either half alone leaves the
+    /// tier unable to decide.
+    #[test]
+    fn the_lpbf_refused_quantities_have_matching_property_and_unit_kinds() {
+        for (property, unit) in [
+            ("internal pore number density", "QUDT:NUM-PER-MilliM3"),
+            ("LCF cycles @ 758 MPa", "QUDT:NUM"),
+            ("fatigue test frequency", "QUDT:PER-MIN"),
+        ] {
+            let from_property = property_quantity_kind(property);
+            let from_unit = unit_quantity_kind(unit);
+            assert!(
+                from_property.is_some() && from_property == from_unit,
+                "{property} states {from_property:?} but {unit} carries \
+                 {from_unit:?} — the kind guard cannot establish equality"
+            );
+        }
+    }
+
+    /// A count is not a fraction. 50,000 cycles is not 50,000 percent, and
+    /// keeping them distinct stops a printed percentage standing as evidence
+    /// for a cycle count.
+    #[test]
+    fn a_count_is_not_a_fraction() {
+        assert_ne!(QuantityKind::Count, QuantityKind::Fraction);
+        assert_eq!(unit_quantity_kind("QUDT:NUM"), Some(QuantityKind::Count));
+        assert_eq!(
+            unit_quantity_kind("QUDT:PERCENT"),
+            Some(QuantityKind::Fraction)
+        );
     }
 
     /// The non-schema table informs kind lookups without touching the

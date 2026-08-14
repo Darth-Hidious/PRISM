@@ -1672,6 +1672,18 @@ fn ingest_schema(path_description: &str) -> Value {
                 "type": "string",
                 "description": "Optional corpus slug to attach to the ingest job."
             },
+            "samples": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9,
+                "description": "Extract the document this many times and keep only facts that RECUR (see `agreement`). Use this when the facts matter more than the wall-clock — a small local extraction model invents values, and it invents a DIFFERENT one each pass, so a value that appears in every pass was read off the page while one that changes was made up. Measured on a 36-page paper: five identical runs stored 4, 0, 2, 3 and 1 facts, and between a third and two thirds of everything emitted was a number absent from the document. Cost and time are LINEAR in this number, so leave it at 1 for a quick look and raise it (3 or 5) when the graph is being built for real."
+            },
+            "agreement": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9,
+                "description": "How many of the `samples` passes must produce a fact before it is stored. Must not exceed `samples`. A sensible default is a simple majority (2 of 3, 3 of 5): higher is stricter and discards more, lower admits more of the model's invention. Facts that miss the bar are REFUSED with a reason, not silently dropped, so you can always see what was filtered and why."
+            },
             "model": {
                 "type": "string",
                 "description": "Override generation model for ingest."
@@ -2618,6 +2630,16 @@ fn optional_bool(input: &Value, key: &str) -> bool {
     input.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// A non-negative integer parameter. Also accepts a numeric STRING: models
+/// routinely send `"3"` where a schema says integer, and refusing that is a
+/// pointless round trip when the intent is unambiguous.
+fn optional_u64(input: &Value, key: &str) -> Option<u64> {
+    let value = input.get(key)?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 fn parse_string_map(input: &Value, key: &str) -> Result<BTreeMap<String, String>> {
     let Some(raw_map) = input.get(key) else {
         return Ok(BTreeMap::new());
@@ -3250,6 +3272,35 @@ fn build_ingest_args(input: &Value) -> Result<Vec<String>> {
     if let Some(corpus) = optional_string(input, "corpus") {
         args.push("--corpus".to_string());
         args.push(corpus);
+    }
+    // Sampling. Refused HERE rather than by the CLI, so the agent gets a
+    // usable error instead of a process exit code it has to interpret: an
+    // agreement above the sample count can never be met, and a model that
+    // asked for it deserves to be told why, not handed an empty document.
+    let samples = optional_u64(input, "samples");
+    let agreement = optional_u64(input, "agreement");
+    if let (Some(agreement), Some(samples)) = (agreement, samples)
+        && agreement > samples
+    {
+        anyhow::bail!(
+            "agreement ({agreement}) cannot exceed samples ({samples}) — no fact \
+             could appear in more passes than were run, so every fact would be \
+             filtered out and the document would look empty. Use an agreement of \
+             at most {samples} (a simple majority is usually right)."
+        );
+    }
+    if agreement.is_some() && samples.is_none() {
+        anyhow::bail!(
+            "`agreement` was given without `samples`, which defaults to 1 — a \
+             single pass can only ever agree with itself. Set `samples` to the \
+             number of extraction passes you want (3 or 5 is typical)."
+        );
+    }
+    for (flag, value) in [("--samples", samples), ("--agreement", agreement)] {
+        if let Some(value) = value {
+            args.push(flag.to_string());
+            args.push(value.to_string());
+        }
     }
     for (flag, value) in [
         ("--model", optional_string(input, "model")),
@@ -7776,6 +7827,52 @@ ValueError: boom\n";
                     .to_string()
             )
         );
+
+        // Sampling reaches the CLI. Asserting the SCHEMA mentions `samples`
+        // would prove nothing — the question is whether a model that fills the
+        // field gets the flag on the command line.
+        let ingest = spec_by_name("ingest_file").expect("spec resolves");
+        let args = build_ingest_args(&json!({
+            "path": "paper.pdf", "samples": 5, "agreement": 3
+        }))
+        .expect("a satisfiable policy builds");
+        assert!(
+            args.windows(2).any(|w| w[0] == "--samples" && w[1] == "5"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--agreement" && w[1] == "3"),
+            "{args:?}"
+        );
+        // Default: no sampling flags at all, so the bill is unchanged for a
+        // caller that did not ask for extra passes.
+        let plain = build_ingest_args(&json!({"path": "paper.pdf"})).expect("builds");
+        assert!(!plain.iter().any(|a| a == "--samples"), "{plain:?}");
+        // An unsatisfiable policy is refused HERE, with a reason the model can
+        // act on, rather than becoming an empty document downstream.
+        let err = build_ingest_args(&json!({
+            "path": "paper.pdf", "samples": 2, "agreement": 3
+        }))
+        .expect_err("3-of-2 is unsatisfiable");
+        assert!(err.to_string().contains("cannot exceed"), "{err}");
+        // Agreement without samples is the same trap wearing a default.
+        assert!(
+            build_ingest_args(&json!({"path": "paper.pdf", "agreement": 2})).is_err(),
+            "agreement alone cannot be honoured by a single pass"
+        );
+        // Models send "3" for an integer field routinely; that is unambiguous.
+        let stringy = build_ingest_args(&json!({
+            "path": "paper.pdf", "samples": "3", "agreement": "2"
+        }))
+        .expect("numeric strings are accepted");
+        assert!(
+            stringy
+                .windows(2)
+                .any(|w| w[0] == "--samples" && w[1] == "3"),
+            "{stringy:?}"
+        );
+        let _ = ingest;
 
         let spec = spec_by_name("ingest_and_wait").expect("spec resolves");
         // A source is required.
