@@ -6568,10 +6568,26 @@ enum TextLocality {
     /// with. Nobody chose the cloud here, so a missing account is a dead end
     /// to report — not a routing decision to announce. See [`handle_ingest`].
     CloudNoLocalModel,
+    /// The LOCAL pipeline driving a REMOTE model the caller named explicitly.
+    /// Everything but inference happens here; document text goes to that
+    /// endpoint and the facts land in the bundled store. Separate from
+    /// [`Self::Local`] for one reason: the banner must not claim "nothing
+    /// leaves your machine" when text is being sent somewhere.
+    LocalPipelineRemoteModel,
 }
 
 impl TextLocality {
+    /// Does this run use the LOCAL PIPELINE — extract here, ground here,
+    /// write to the bundled store — as opposed to handing the document to the
+    /// hosted platform? True for a remote model the caller named, because
+    /// only inference is remote.
     fn is_local(self) -> bool {
+        matches!(self, Self::Local | Self::LocalPipelineRemoteModel)
+    }
+
+    /// Does inference happen ON THIS MACHINE? Only this may be used to claim
+    /// nothing leaves it.
+    fn inference_is_on_device(self) -> bool {
         matches!(self, Self::Local)
     }
 }
@@ -6592,10 +6608,23 @@ fn text_locality_for(configured: &str, llm_base_url: Option<&str>) -> TextLocali
         // widening `is_loopback_url`, which answers a different (security)
         // question — "does this URL target the loopback interface" — for
         // the offline gate and the local-server sweep.
+        // `auto`: use the LOCAL PIPELINE whenever an extraction backend has
+        // actually been chosen. Loopback and `gguf://local` are on-device. A
+        // caller who passes `--llm-url` (or sets LLM_BASE_URL) with a key has
+        // ALSO chosen where inference happens — an enterprise pointing PRISM
+        // at its own vLLM, or a bring-your-own-key run against a hosted
+        // model. Refusing those into the platform branch made "bring your own
+        // endpoint" impossible: the flags existed and were then overruled.
+        //
+        // Local here means the local PIPELINE (extract, ground, write to the
+        // bundled store), NOT local inference. Where inference happens is said
+        // out loud in the banner, which stops claiming on-device for a remote
+        // endpoint.
         _ => match llm_base_url {
             Some(url) if is_loopback_url(url) || prism_ingest::llm::is_local_gguf_url(url) => {
                 TextLocality::Local
             }
+            Some(url) if !url.trim().is_empty() => TextLocality::LocalPipelineRemoteModel,
             _ => TextLocality::CloudNoLocalModel,
         },
     }
@@ -7227,7 +7256,10 @@ async fn run_local_text_ingest_file(
     // configured. Each reader owns its own blocking, so a `pdf-extract` panic
     // on one malformed file is an honest per-file error rather than a dead
     // ingest run.
-    let (text, _pages, warning) = if ingest_format(path) == "pdf" {
+    // `page_ranges` carries the document's structural units (byte ranges of
+    // pages in `text`) into segmentation; empty means "no page structure
+    // known" and segmentation falls back to blank-line paragraphs.
+    let (text, page_ranges, warning) = if ingest_format(path) == "pdf" {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read PDF {}", path.display()))?;
         // Read through the document-understanding plane rather than calling
@@ -7264,11 +7296,13 @@ async fn run_local_text_ingest_file(
         if let Some(warning) = &warning {
             eprintln!("Warning: {warning}");
         }
-        (outcome.understanding.plain_text(), None, warning)
+        let (text, ranges) = outcome.understanding.plain_text_with_page_ranges();
+        (text, ranges, warning)
     } else {
         // Non-PDF text formats just read the file. Either way the runtime
         // sidecar is never contacted on the local path.
-        extract_platform_ingest_text(path, runtime_url).await?
+        let (text, _pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
+        (text, Vec::new(), warning)
     };
     let chars = text.chars().count();
     if text.trim().is_empty() {
@@ -7329,8 +7363,19 @@ async fn run_local_text_ingest_file(
             (budget, note)
         }
     };
-    let windows = prism_ingest::batching::chunk_windows(&text, window_bytes);
+    // Structure-aware segmentation: whole pages, then blank-line paragraphs,
+    // packed to the budget; an oversized unit falls back to overlapped byte
+    // windows for that unit only. A chunk that starts mid-sentence hands the
+    // model a fragment whose subject lives in the previous window — cutting
+    // on structure instead is free precision.
+    let windows = prism_ingest::batching::chunk_structured(&text, &page_ranges, window_bytes);
     let chunks_total = windows.len();
+    // The grounding corpus: the WHOLE document with soft line breaks
+    // unwrapped, computed ONCE per run. Every chunk's facts are grounded
+    // against this, not against the chunk — a subject correctly resolved to
+    // a name from another section must not be refused as invented, while a
+    // fabricated name is still absent from all of it.
+    let corpus = prism_ingest::text_extract::unwrap_soft_line_breaks(&text);
     // Cost, said BEFORE the run starts: input at the client's ~4-bytes/token
     // estimate. Output is metered and billed per token — counting is the
     // control, and the actual usage is reported at the end.
@@ -7390,16 +7435,55 @@ async fn run_local_text_ingest_file(
     let mut llm_usage: Option<prism_ingest::llm::UsageInfo> = None;
     let semantic_policy = prism_ingest::semantic_validation::SemanticValidationPolicy::default();
 
+    // ── The extraction funnel, counted where each fact leaves it ──
+    //
+    // "58 extracted, 4 stored" is an anecdote until every lost fact is
+    // attributed to the stage that refused it. These counters partition
+    // every proposed fact: facts_proposed = dropped_ungrounded +
+    // dropped_units + dropped_malformed + dropped_disagreement + deduped +
+    // store_failed + facts_written, asserted by test. `store_failed` covers facts stranded
+    // by a mid-chunk store-write failure (also on the errors spine) so the
+    // identity holds even on a partial run.
+    let mut facts_proposed = 0usize;
+    let mut dropped_ungrounded = 0usize;
+    // Its own bucket, deliberately. A sampling refusal is a statement about
+    // the MODEL disagreeing with itself; the document was never consulted.
+    // Counting it as "ungrounded" would claim the text refused a fact the
+    // text never saw.
+    let mut dropped_disagreement = 0usize;
+    let mut dropped_units = 0usize;
+    let mut dropped_malformed = 0usize;
+    let mut deduped = 0usize;
+    let mut store_failed = 0usize;
+
+    // Entity names from facts that SURVIVED grounding, offered to later
+    // chunks as the KNOWN ENTITIES block so "Ti64" in results reuses the
+    // "Ti-6Al-4V" of methods instead of minting a second node. Grounded-only
+    // entry is load-bearing (see `EntityRegistry`): seeding from raw
+    // extraction would let one hallucinated name echo forward through every
+    // later chunk.
+    let mut registry = prism_ingest::text_extract::EntityRegistry::default();
+    // Every entity class any chunk resolved, so the alias pass at the end
+    // can write its `same_as` edges under the SAME labels the entities were
+    // written with — a different label is a different node key, and the edge
+    // would connect two freshly minted strangers instead.
+    let mut all_classes: std::collections::HashMap<String, prism_ingest::classify::EntityClass> =
+        std::collections::HashMap::new();
+
     for (index, (start, end)) in windows.iter().enumerate() {
         let chunk_no = index + 1;
         eprintln!(
             "  chunk {chunk_no}/{chunks_total}: extracting bytes {start}-{end} \
              (a local model can take minutes per chunk — this is work, not a hang)…"
         );
-        let extraction = match prism_ingest::text_extract::extract_facts_sampled(
+        let extraction = match prism_ingest::text_extract::extract_facts_from_chunk_sampled(
             &llm,
             title,
             &text[*start..*end],
+            prism_ingest::text_extract::DocumentContext {
+                document: &corpus,
+                known_entities: &registry,
+            },
             prism_ingest::text_extract::GroundingPolicy::default(),
             sampling,
         )
@@ -7431,13 +7515,36 @@ async fn run_local_text_ingest_file(
         if let Some(parse_error) = extraction.parse_error {
             parse_errors.push(format!("chunk {chunk_no}/{chunks_total}: {parse_error}"));
         }
+        // Funnel: everything the model proposed for this chunk either
+        // survived into `extraction.facts` or is in `extraction.rejections`.
+        facts_proposed += extraction.facts.len() + extraction.rejections.len();
+        for rejection in &extraction.rejections {
+            use prism_ingest::text_extract::RejectionClass;
+            match rejection.class {
+                RejectionClass::UnresolvedUnit => dropped_units += 1,
+                RejectionClass::MalformedShape | RejectionClass::ValuelessWithUnit => {
+                    dropped_malformed += 1;
+                }
+                RejectionClass::SubjectNotNamed
+                | RejectionClass::NumericUnsupported
+                | RejectionClass::PolicyDeferred
+                | RejectionClass::ReviewDenied
+                | RejectionClass::ReviewUncertain
+                | RejectionClass::ReviewMissing => dropped_ungrounded += 1,
+                RejectionClass::SampleDisagreement => dropped_disagreement += 1,
+            }
+        }
         dropped_facts.extend(extraction.dropped_facts);
         rejections.extend(extraction.rejections);
+        // These facts survived grounding — and ONLY these may feed the
+        // known-entities registry for later chunks.
+        registry.record_grounded_facts(&extraction.facts);
 
         // De-duplicate across windows: the overlap re-reads boundary text by
         // design, so both neighbours may extract the same fact — it is ONE
         // fact. (The store would refuse the duplicate evidence anyway; this
         // keeps `facts_written` honest and skips redundant writes.)
+        let grounded_count = extraction.facts.len();
         let new_facts: Vec<prism_provenance::MaterialFact> = extraction
             .facts
             .into_iter()
@@ -7447,6 +7554,7 @@ async fn run_local_text_ingest_file(
                     .unwrap_or(true)
             })
             .collect();
+        deduped += grounded_count - new_facts.len();
 
         // Peer-echo tripwire, BEFORE this chunk's writes: an agent that read
         // a peer fact out of `prism query` and fed it back through `prism
@@ -7508,6 +7616,11 @@ async fn run_local_text_ingest_file(
                 Default::default()
             }
         };
+        for (name, class) in &classes {
+            all_classes
+                .entry(name.clone())
+                .or_insert_with(|| class.clone());
+        }
 
         // The model proposes; geometry measures. This runs once for the
         // chunk's whole batch BEFORE its first fact write. Its report cannot
@@ -7528,6 +7641,7 @@ async fn run_local_text_ingest_file(
 
         let mut chunk_written = 0usize;
         let mut write_error = None;
+        let planned_writes = new_facts.len();
         for fact in new_facts {
             let nodes = classes
                 .get(&fact.subject)
@@ -7602,6 +7716,9 @@ async fn run_local_text_ingest_file(
         }
         match write_error {
             Some(message) => {
+                // Facts stranded by the failed write: neither written nor
+                // dropped, so the funnel needs its own bucket for them.
+                store_failed += planned_writes - chunk_written;
                 errors.push(message);
                 eprintln!(
                     "  chunk {chunk_no}/{chunks_total}: STORE WRITE FAILED — earlier \
@@ -7612,6 +7729,126 @@ async fn run_local_text_ingest_file(
                 chunks_processed += 1;
                 eprintln!("  chunk {chunk_no}/{chunks_total}: {chunk_written} fact(s) stored");
             }
+        }
+    }
+
+    eprintln!(
+        "  extraction funnel: {facts_proposed} proposed → {} written \
+         ({dropped_ungrounded} ungrounded, {dropped_units} unit-refused, \
+         {dropped_malformed} malformed, {dropped_disagreement} sample-disagreement, \
+         {deduped} duplicate, {store_failed} store-failed)",
+        written_facts.len(),
+    );
+
+    // ── Verified alias pass: reconnect the identities chunking split ──
+    //
+    // ONE small call over the distinct entity NAMES actually written (no
+    // document text). The model only PROPOSES pairs; code accepts exactly
+    // deterministic normalisation or a defining span found in the document
+    // ("Ti-6Al-4V (Ti64)", "hereafter", "denoted", "also known as") — mere
+    // co-occurrence is rejected. Verified pairs become `same_as` EDGES
+    // between the existing nodes, never destructive merges. A failure here
+    // degrades the run (reported under `alias`), never fails it: every
+    // extracted fact is already stored.
+    let mut alias_written = 0usize;
+    let mut alias_accepted: Vec<serde_json::Value> = Vec::new();
+    let mut alias_rejected: Vec<serde_json::Value> = Vec::new();
+    let alias_error: Option<String>;
+    {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for fact in &written_facts {
+            for name in [fact.subject.as_str(), fact.object.as_str()] {
+                if seen_names.insert(name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        let pass = prism_ingest::alias::link_aliases(&llm, &names, &corpus).await;
+        if let Some(usage) = pass.usage {
+            let total = llm_usage.get_or_insert(prism_ingest::llm::UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            });
+            total.prompt_tokens += usage.prompt_tokens;
+            total.completion_tokens += usage.completion_tokens;
+            total.total_tokens += usage.total_tokens;
+        }
+        alias_error = pass.error;
+        if let Some(error) = &alias_error {
+            eprintln!("  Note: alias pass unavailable — {error}");
+        }
+        for rejected in &pass.rejected {
+            alias_rejected.push(serde_json::json!({
+                "a": rejected.a,
+                "b": rejected.b,
+                "reason": rejected.reason,
+            }));
+        }
+        for verified in pass.accepted {
+            // Same label rule as the fact writes above: classified when BOTH
+            // endpoints have a class this run resolved, legacy fallback for
+            // both otherwise — the edge must land on the nodes the facts
+            // were written under.
+            let fact = &verified.fact;
+            let nodes = all_classes
+                .get(&fact.subject)
+                .zip(all_classes.get(&fact.object))
+                .map(|(subject, object)| prism_provenance::ClassifiedFactNodes {
+                    subject: prism_provenance::ClassifiedNode {
+                        entity_type: &subject.entity_type,
+                        storage_label: &subject.storage_label,
+                        class_iri: &subject.class_iri,
+                    },
+                    object: prism_provenance::ClassifiedNode {
+                        entity_type: &object.entity_type,
+                        storage_label: &object.storage_label,
+                        class_iri: &object.class_iri,
+                    },
+                });
+            let write = match nodes {
+                Some(nodes) => {
+                    store
+                        .write_classified_fact_with_evidence(
+                            fact,
+                            &prov,
+                            fact.evidence_class,
+                            nodes,
+                            classification,
+                        )
+                        .await
+                }
+                None => {
+                    store
+                        .write_fact_with_classification(fact, &prov, classification)
+                        .await
+                }
+            };
+            match write {
+                Ok(()) => {
+                    alias_written += 1;
+                    alias_accepted.push(serde_json::json!({
+                        "a": fact.subject,
+                        "b": fact.object,
+                        "evidence": verified.evidence.describe(),
+                    }));
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "alias edge write failed ('{} same_as {}'): {e:#}",
+                        fact.subject, fact.object
+                    ));
+                }
+            }
+        }
+        if !names.is_empty() && alias_error.is_none() {
+            eprintln!(
+                "  alias pass: {} name(s) → {} same_as edge(s) written, {} proposal(s) rejected",
+                names.len(),
+                alias_written,
+                alias_rejected.len(),
+            );
         }
     }
 
@@ -7646,10 +7883,14 @@ async fn run_local_text_ingest_file(
         if !seen_repair_items.insert(item_id.clone()) {
             continue;
         }
+        // The repair tier re-checks refusals against the SAME corpus the
+        // grounding gate used — the unwrapped document — or its bar would
+        // silently be narrower than Phase 1's for every wrap-rescued fact
+        // ("same functions, same bar" is repair's own stated invariant).
         match prism_ingest::repair::dispose(
             rejection,
             &document_id,
-            &text,
+            &corpus,
             &repair_policy,
             decided_at,
         ) {
@@ -7724,6 +7965,33 @@ async fn run_local_text_ingest_file(
         // accompanied by entries in `errors` (→ FAILED STEPS, non-zero exit).
         "chunks_total": chunks_total,
         "chunks_processed": chunks_processed,
+        // The extraction funnel: every proposed fact attributed to the stage
+        // that refused it (or to the write). The counters PARTITION
+        // facts_proposed — dropped_ungrounded + dropped_units +
+        // dropped_malformed + deduped + store_failed + facts_written =
+        // facts_proposed — so "58 extracted, 4 stored" stops being an
+        // anecdote and becomes a diagnosis.
+        "funnel": {
+            "facts_proposed": facts_proposed,
+            "dropped_ungrounded": dropped_ungrounded,
+            "dropped_disagreement": dropped_disagreement,
+            "dropped_units": dropped_units,
+            "dropped_malformed": dropped_malformed,
+            "deduped": deduped,
+            "store_failed": store_failed,
+            "facts_written": written_facts.len(),
+        },
+        // The verified alias pass: `same_as` edges written (with the
+        // evidence that justified each), proposals code rejected, and the
+        // degradation reason when the pass could not run. Alias edges are
+        // additive to `facts_written` and outside the funnel — they are not
+        // extraction proposals.
+        "alias": {
+            "written": alias_written,
+            "accepted": alias_accepted,
+            "rejected": alias_rejected,
+            "error": alias_error,
+        },
         "parse_error": parse_error,
         // Facts dropped ONE BY ONE during extraction: malformed shape, or a
         // unit that resolves to no QUDT identifier (a numeric value is never
@@ -7993,6 +8261,48 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                     let store =
                         value_string(summary, &["store"]).unwrap_or("~/.prism/provenance.db");
                     println!("  Facts: {facts} written to local store ({store})");
+                    // The extraction funnel: where every proposed fact went.
+                    // This line is what turns "58 extracted, 4 stored" from
+                    // an anecdote into a diagnosis.
+                    if let Some(funnel) = summary.get("funnel") {
+                        let count = |key: &str| {
+                            funnel
+                                .get(key)
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0)
+                        };
+                        println!(
+                            "  Funnel: {} proposed -> {} written ({} ungrounded, {} \
+                             unit-refused, {} malformed, {} duplicate, {} store-failed)",
+                            count("facts_proposed"),
+                            count("facts_written"),
+                            count("dropped_ungrounded"),
+                            count("dropped_units"),
+                            count("dropped_malformed"),
+                            count("deduped"),
+                            count("store_failed"),
+                        );
+                    }
+                    if let Some(alias) = summary.get("alias") {
+                        let written = alias
+                            .get("written")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0);
+                        let rejected = alias
+                            .get("rejected")
+                            .and_then(|value| value.as_array())
+                            .map(Vec::len)
+                            .unwrap_or(0);
+                        if written > 0 || rejected > 0 {
+                            println!(
+                                "  Aliases: {written} verified same_as edge(s) written, \
+                                 {rejected} proposal(s) rejected"
+                            );
+                        }
+                        if let Some(error) = alias.get("error").and_then(|value| value.as_str()) {
+                            println!("  Warning: alias pass unavailable — {error}");
+                        }
+                    }
                     // Per-fact drops are the text path's analogue of the
                     // tabular `dropped_relationships` report: a PARTIAL
                     // result the user must see — these lines are the only
@@ -8608,8 +8918,16 @@ async fn handle_ingest(
                 no_ingest_backend_message(&local_llm::discover().await)
             );
         }
-        if locality.is_local() {
+        if locality.inference_is_on_device() {
             eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
+        } else if locality.is_local() {
+            // Local pipeline, remote model. Say so plainly: document text IS
+            // sent to the endpoint the caller named. Printing the on-device
+            // banner here would be a lie the user cannot detect.
+            eprintln!(
+                "⚑ LOCAL PIPELINE, REMOTE MODEL — document text is sent to the \
+                 endpoint you configured; facts are written to your local store"
+            );
         } else {
             // Cloud ingest is two stages and the first one is LOCAL: document
             // text is extracted by the runtime on this machine, and only that
@@ -15885,8 +16203,14 @@ mod tests {
             assert!(is_loopback_url(url));
             assert!(text_locality_for("auto", Some(url)).is_local());
         }
+        // A remote endpoint now uses the local PIPELINE (that is the point of
+        // bring-your-own-endpoint), so `is_local` no longer distinguishes it.
+        // The agreement this test exists to pin is about ON-DEVICE inference,
+        // which is the predicate discovery reports and the banner claims.
         assert!(!is_loopback_url("https://api.openai.com/v1"));
-        assert!(!text_locality_for("auto", Some("https://api.openai.com/v1")).is_local());
+        assert!(
+            !text_locality_for("auto", Some("https://api.openai.com/v1")).inference_is_on_device()
+        );
     }
 
     #[test]
@@ -15909,8 +16233,34 @@ mod tests {
             text_locality_for("auto", Some("http://localhost:11434/v1")),
             TextLocality::Local
         );
+
+        // CHANGED DELIBERATELY. A remote endpoint the caller NAMED used to
+        // land in `CloudNoLocalModel`, which then demanded a platform
+        // account — so `--llm-url` at a third-party OpenAI-compatible
+        // endpoint was accepted as a flag and then overruled, making
+        // bring-your-own-endpoint impossible. It now uses the local PIPELINE
+        // with a remote model.
         assert_eq!(
             text_locality_for("auto", Some("https://api.openai.com/v1")),
+            TextLocality::LocalPipelineRemoteModel
+        );
+
+        // What the old assertion was really protecting SURVIVES, and is what
+        // the banner keys on: a remote endpoint is never mistaken for
+        // on-device, so PRISM cannot claim "nothing leaves your machine"
+        // while sending document text away.
+        assert!(!TextLocality::LocalPipelineRemoteModel.inference_is_on_device());
+        assert!(TextLocality::Local.inference_is_on_device());
+        // …while both still use the local pipeline and the bundled store.
+        assert!(TextLocality::LocalPipelineRemoteModel.is_local());
+
+        // No endpoint at all is still a dead end, not a routing decision.
+        assert_eq!(
+            text_locality_for("auto", None),
+            TextLocality::CloudNoLocalModel
+        );
+        assert_eq!(
+            text_locality_for("auto", Some("   ")),
             TextLocality::CloudNoLocalModel
         );
     }
@@ -15929,10 +16279,16 @@ mod tests {
                 "{url} runs in-process and must classify as local"
             );
         }
-        // The sentinel is exact — a lookalike remote URL must not ride in.
+        // The sentinel is exact — a lookalike must not ride in as in-process.
+        // It is now treated as a named remote endpoint (any non-empty URL is),
+        // but the property that matters holds: it is NOT on-device, so PRISM
+        // will not claim in-process execution for it.
         assert_eq!(
             text_locality_for("auto", Some("gguf://local.example.com")),
-            TextLocality::CloudNoLocalModel
+            TextLocality::LocalPipelineRemoteModel
+        );
+        assert!(
+            !text_locality_for("auto", Some("gguf://local.example.com")).inference_is_on_device()
         );
         // And an explicit cloud choice is still never second-guessed.
         assert_eq!(
@@ -17834,6 +18190,13 @@ data:\n\
         // old "could not be parsed as JSON" misreport must be gone.
         assert_eq!(summary["facts_written"], 2, "summary: {summary}");
         assert_eq!(summary["parse_error"], serde_json::Value::Null);
+        // The funnel partitions every proposal: 3 proposed = 1 unit-refused
+        // + 2 written, nothing unattributed.
+        let funnel = &summary["funnel"];
+        assert_eq!(funnel["facts_proposed"], 3, "summary: {summary}");
+        assert_eq!(funnel["dropped_units"], 1, "summary: {summary}");
+        assert_eq!(funnel["facts_written"], 2, "summary: {summary}");
+        assert_funnel_partitions(funnel);
         let semantic = summary["semantic_validation"]
             .as_array()
             .expect("semantic validation reports must be machine-readable");
@@ -18043,6 +18406,166 @@ data:\n\
         );
     }
 
+    /// THE funnel invariant: the six counters PARTITION `facts_proposed`.
+    /// Any fact leaving the pipeline without incrementing exactly one bucket
+    /// breaks this — which is the point: an unattributed loss is how "58
+    /// extracted, 4 stored" stayed an anecdote.
+    fn assert_funnel_partitions(funnel: &serde_json::Value) {
+        let count = |key: &str| {
+            funnel[key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("funnel[{key}] must be a count: {funnel}"))
+        };
+        assert_eq!(
+            count("facts_proposed"),
+            count("dropped_ungrounded")
+                + count("dropped_units")
+                + count("dropped_malformed")
+                + count("deduped")
+                + count("store_failed")
+                + count("facts_written"),
+            "the funnel must partition every proposed fact: {funnel}"
+        );
+    }
+
+    /// End to end through the PRODUCTION path: the verified alias pass
+    /// connects the two nodes chunk-split identity produced — "Ti-6Al-4V"
+    /// and "Ti64" — with a `same_as` EDGE justified by the document's own
+    /// parenthetical, while "IN718 outperformed IN625"-style co-occurrence
+    /// is REJECTED and reported. A wrong merge is worse than no merge.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn alias_pass_writes_a_verified_same_as_edge_and_rejects_co_occurrence() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut server = mockito::Server::new_async().await;
+        let extraction = r#"{"facts":[
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":880.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"Ti64","predicate":"has_measurement","object":"density","value":4.43,"unit":"g/cm3","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"IN718","predicate":"has_measurement","object":"UTS","value":1100.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"IN625","predicate":"has_measurement","object":"UTS","value":900.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+        ]}"#;
+        let extraction_mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("Extract structured facts".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(extraction))
+            .expect(1)
+            .create_async()
+            .await;
+        // The model proposes one real alias and one co-occurrence trap.
+        let alias_mock = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::Regex("alias auditor".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(chat_body(
+                r#"{"aliases":[{"a":"Ti-6Al-4V","b":"Ti64"},{"a":"IN718","b":"IN625"}]}"#,
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+
+        let project = project_with_ontology_config(
+            "[ontology]\nid = \"emmo\"\n\n[ingest]\nchunk_bytes = 4096\n",
+        );
+        let root = project.path();
+        let md = root.join("alias-paper.md");
+        std::fs::write(
+            &md,
+            "Ti-6Al-4V (Ti64): UTS 880 MPa. Ti64 density 4.43 g/cm3. \
+             IN718 UTS 1100 MPa while IN625 UTS 900 MPa.",
+        )
+        .unwrap();
+
+        let summary = run_local_text_ingest_file(
+            &md,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+        )
+        .await
+        .expect("the alias-bearing document must ingest");
+
+        extraction_mock.assert_async().await;
+        alias_mock.assert_async().await;
+
+        // All four extraction facts landed, and the funnel partitions them.
+        assert_eq!(summary["facts_written"], 4, "summary: {summary}");
+        let funnel = &summary["funnel"];
+        assert_eq!(funnel["facts_proposed"], 4, "summary: {summary}");
+        assert_eq!(funnel["facts_written"], 4, "summary: {summary}");
+        assert_funnel_partitions(funnel);
+
+        // The verified pair became ONE same_as edge, evidence = the
+        // document's own parenthetical; the co-occurrence pair is rejected
+        // with the reason. Alias edges stay OUT of the extraction funnel.
+        let alias = &summary["alias"];
+        assert_eq!(alias["written"], 1, "summary: {summary}");
+        assert_eq!(alias["error"], serde_json::Value::Null);
+        let accepted = alias["accepted"].as_array().unwrap();
+        assert_eq!(accepted.len(), 1, "summary: {summary}");
+        assert_eq!(accepted[0]["a"], "Ti-6Al-4V");
+        assert_eq!(accepted[0]["b"], "Ti64");
+        assert!(
+            accepted[0]["evidence"]
+                .as_str()
+                .unwrap()
+                .contains("Ti-6Al-4V (Ti64)"),
+            "the evidence must be the defining span: {summary}"
+        );
+        let rejected = alias["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1, "summary: {summary}");
+        assert_eq!(rejected[0]["a"], "IN718");
+        assert_eq!(rejected[0]["b"], "IN625");
+        assert!(
+            rejected[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("co-occurrence"),
+            "the rejection must say why: {summary}"
+        );
+        // A refused alias is not a failed step — nothing else may be either.
+        assert_eq!(ingest_summary_errors(&summary), 0, "summary: {summary}");
+
+        // END TO END: the edge connects the two nodes in the store.
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let ti64 = store
+            .recall_with_context("Ti64", "local", 10)
+            .await
+            .unwrap();
+        let edge = ti64
+            .iter()
+            .find(|fact| fact.predicate == "same_as")
+            .unwrap_or_else(|| panic!("the same_as edge must be recallable from Ti64: {ti64:?}"));
+        assert_eq!(edge.subject, "Ti-6Al-4V");
+        assert_eq!(edge.object, "Ti64");
+        assert_eq!(edge.value, None, "same_as is value-less");
+        // And the REJECTED pair produced no edge in either direction.
+        for name in ["IN718", "IN625"] {
+            let facts = store.recall_with_context(name, "local", 10).await.unwrap();
+            assert!(
+                facts.iter().all(|fact| fact.predicate != "same_as"),
+                "a co-occurrence pair must never be linked: {facts:?}"
+            );
+        }
+    }
+
     // ── Whole-document chunking through the PRODUCTION text path ───────
     //
     // The defect this replaces: `MAX_PROMPT_TEXT_BYTES = 60_000` truncated
@@ -18061,16 +18584,23 @@ data:\n\
     /// must not be able to write it into the graph), so a fixture whose
     /// document never mentions `EarlyFactium` would exercise the drop path
     /// instead of the windowing and merge behaviour these tests are about.
+    ///
+    /// `EarlyFactium` is stated ONLY in the first window. The last window's
+    /// stub reply still re-asserts it (the realistic overlap shape), which
+    /// survives precisely because grounding consults the DOCUMENT, not the
+    /// chunk — narrowing grounding back to the chunk drops it and fails the
+    /// merge test's "no drops" assertion. It also keeps each marker's
+    /// sentence free of the other windows' subjects, so the review-request
+    /// mocks can be keyed on markers without cross-matching document-wide
+    /// evidence spans.
     fn three_chunk_text() -> String {
         let filler = |n: usize| "filler sentence about processing. ".repeat(n);
         let mut text =
             String::from("AAAMARKER EarlyFactium and Survivium exhibit the alpha phase. ");
         text.push_str(&filler(70)); // MIDMARKER lands ~byte 2390: window 2 only
         text.push_str("MIDMARKER ");
-        text.push_str(&filler(50)); // ZZZMARKER lands ~byte 4100: window 3 only
-        text.push_str(
-            "ZZZMARKER LateFactium exhibits the omega phase, and EarlyFactium exhibits the alpha phase.",
-        );
+        text.push_str(&filler(50)); // ZZZMARKER lands ~byte 4030: window 3 only
+        text.push_str("ZZZMARKER LateFactium exhibits the omega phase.");
         assert!(text.len() > 4_000, "fixture must span three windows");
         text
     }
@@ -18274,6 +18804,13 @@ data:\n\
             summary["facts_written"], 2,
             "the duplicated fact must merge, not double: {summary}"
         );
+        // Funnel across windows: 3 proposed (1 early + 2 late), 1 deduped
+        // (the overlap re-assertion), 2 written — and the partition holds.
+        let funnel = &summary["funnel"];
+        assert_eq!(funnel["facts_proposed"], 3, "summary: {summary}");
+        assert_eq!(funnel["deduped"], 1, "summary: {summary}");
+        assert_eq!(funnel["facts_written"], 2, "summary: {summary}");
+        assert_funnel_partitions(funnel);
         assert_eq!(summary["errors"].as_array().unwrap().len(), 0);
         assert_eq!(
             summary["dropped_facts"].as_array().unwrap().len(),
