@@ -12,6 +12,7 @@ pub mod knowledge;
 pub mod marketplace;
 pub mod node_registry;
 pub mod node_session;
+pub mod oidc;
 pub mod platform_error;
 pub mod supabase_auth;
 

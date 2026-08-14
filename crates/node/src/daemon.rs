@@ -2099,6 +2099,21 @@ async fn refresh_token(
                 .context("Supabase is not configured: missing identity provider anon key")?;
             (provider_url.to_string(), Some(provider_key))
         }
+        // Mirdyne refreshes against the issuer stored WITH the credential, not
+        // against whatever the platform config currently points at — the
+        // provider-match check above already refused a config that disagrees
+        // with the stored identity, so this cannot silently retarget.
+        IdentityProviderAdapter::Mirdyne => {
+            let provider_url = creds
+                .identity_provider_url
+                .as_deref()
+                .context("Mirdyne is not configured: missing identity provider URL")?;
+            let provider_key = creds
+                .identity_provider_key
+                .as_deref()
+                .context("Mirdyne is not configured: missing identity provider key")?;
+            (provider_url.to_string(), Some(provider_key))
+        }
     };
     let policy = IdentityRefreshPolicy::default();
     let client = reqwest::Client::builder()
@@ -2140,6 +2155,28 @@ async fn refresh_token(
             bail!("MARC27 refresh returned claims for the wrong provider; refusing refresh")
         }
         (IdentityProviderAdapter::Marc27, None) => {}
+        // Mirdyne is held to the SAME anti-hijack rule as Supabase: the
+        // refreshed token's verified (issuer, subject) must still canonicalize
+        // to the principal already stored, or the refresh is refused. Without
+        // this a rotated token could quietly hand the session to a different
+        // account inside the same issuer.
+        (IdentityProviderAdapter::Mirdyne, Some(claims)) => {
+            ensure_supabase_refresh_principal(creds, &claims.iss, &claims.sub)?;
+
+            let engine = prism_core::rbac::RbacEngine::new(&paths.state_dir.join("rbac.db"))?;
+            let role_claim = claims.role.as_deref().unwrap_or("");
+            let role_sync = crate::provider_roles::sync_supabase_login_role(
+                &engine,
+                &claims.iss,
+                &claims.sub,
+                role_claim,
+            )?;
+            new_credentials.user_id = Some(role_sync.principal_id);
+            new_credentials.display_name = claims.email;
+        }
+        (IdentityProviderAdapter::Mirdyne, None) => {
+            bail!("Mirdyne refresh returned no verified claims; refusing refresh")
+        }
     }
 
     validate_stored_session_binding(endpoints, &new_credentials)?;

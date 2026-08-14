@@ -74,7 +74,13 @@ fn sync_verified_provider_role(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     match identity.provider {
         prism_client::auth::IdentityProviderAdapter::Marc27 => Ok(()),
-        prism_client::auth::IdentityProviderAdapter::Supabase => {
+        // Supabase and Mirdyne share this arm because they are the SAME shape
+        // of provider: an issuer-scoped JWT carrying a role claim. They stay
+        // distinct identities regardless — `provider_scope` is the verified
+        // issuer, and the principal is derived from it, so merging the code
+        // never merges the accounts.
+        prism_client::auth::IdentityProviderAdapter::Supabase
+        | prism_client::auth::IdentityProviderAdapter::Mirdyne => {
             let Some(rbac_db_path) = state.rbac_db_path.as_deref() else {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,

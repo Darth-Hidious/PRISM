@@ -142,6 +142,52 @@ pub struct SupabasePkceAttempt {
     code_verifier: String,
 }
 
+/// Which enterprise SAML connection to start.
+///
+/// Exactly one of these, never both and never neither — an SSO request that
+/// names no connection is ambiguous, and one that names two lets the server
+/// pick, which is the caller silently losing control of which organisation
+/// authenticates the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SsoSelector<'a> {
+    /// Email domain of the organisation, e.g. `arianegroup.com`. This is the
+    /// "sign in with your work email" affordance.
+    Domain(&'a str),
+    /// Explicit connection id, for organisations with several or with none
+    /// registered against a domain.
+    ProviderId(&'a str),
+}
+
+impl<'a> SsoSelector<'a> {
+    /// Validate and lower to the wire field name and value.
+    fn as_field(self) -> Result<(&'static str, &'a str)> {
+        let (field, value) = match self {
+            Self::Domain(domain) => ("domain", domain.trim()),
+            Self::ProviderId(id) => ("provider_id", id.trim()),
+        };
+        ensure!(!value.is_empty(), "SAML SSO {field} must not be empty");
+        // A domain is a domain, not a URL and not an email address. Accepting
+        // `user@acme.com` here would send the local part of someone's address
+        // to the IdP directory, and accepting a URL would let a caller aim the
+        // lookup somewhere unintended.
+        if matches!(self, Self::Domain(_)) {
+            ensure!(
+                !value.contains('@'),
+                "SAML SSO domain must be a bare domain like `acme.com`, not an email address"
+            );
+            ensure!(
+                !value.contains("://") && !value.contains('/'),
+                "SAML SSO domain must be a bare domain like `acme.com`, not a URL"
+            );
+            ensure!(
+                value.contains('.'),
+                "SAML SSO domain must be a fully qualified domain like `acme.com`"
+            );
+        }
+        Ok((field, value))
+    }
+}
+
 /// Supabase email magic-link PKCE client.
 pub struct SupabaseAuth {
     client: reqwest::Client,
@@ -278,6 +324,122 @@ impl SupabaseAuth {
         })
     }
 
+    /// Begin SAML 2.0 enterprise SSO and return the attempt plus the URL the
+    /// user must open at their own identity provider.
+    ///
+    /// # PRISM IS NOT A SAML SERVICE PROVIDER, DELIBERATELY
+    ///
+    /// SAML's dangerous half is verifying a signed XML assertion: signature
+    /// wrapping, canonicalisation and transform handling have broken real
+    /// service providers repeatedly, and the bugs are silent — a wrapped
+    /// assertion authenticates as the wrong user against code that looks
+    /// correct. Putting an XML-DSIG verifier in a research client would place
+    /// that surface on every install, on every laptop.
+    ///
+    /// So the SAML exchange happens entirely between the customer's IdP and
+    /// the identity provider PRISM already trusts. PRISM initiates, the IdP
+    /// asserts, and what comes back to PRISM is the SAME signed JWT and the
+    /// SAME PKCE code exchange as a passwordless login — verified by
+    /// [`Self::verify_access_token`], which already enforces signature, `exp`,
+    /// `iss` and `aud`. There is no XML anywhere in this crate.
+    ///
+    /// Completion is [`Self::complete_email_login`] unchanged: SSO and email
+    /// login converge on one code-exchange path, so there is no second
+    /// token-handling route to keep correct.
+    ///
+    /// `selector` picks the enterprise connection — by email domain (the
+    /// usual "sign in with your work email" affordance) or by an explicit
+    /// provider id.
+    pub async fn begin_sso_login(
+        &self,
+        selector: SsoSelector<'_>,
+    ) -> Result<(SupabasePkceAttempt, Url)> {
+        self.offline_guard("start SAML SSO login")?;
+        let (field, value) = selector.as_field()?;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("failed to bind the SSO login callback to 127.0.0.1")?;
+        let address = listener
+            .local_addr()
+            .context("failed to read the SSO callback address")?;
+
+        let state = random_urlsafe(32);
+        let code_verifier = random_urlsafe(32);
+        let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+
+        let mut redirect_uri = Url::parse(&format!("http://127.0.0.1:{}/callback", address.port()))
+            .context("failed to build the SSO callback URL")?;
+        redirect_uri.query_pairs_mut().append_pair("state", &state);
+
+        #[derive(Serialize)]
+        struct SsoRequest<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            domain: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            provider_id: Option<&'a str>,
+            redirect_to: &'a str,
+            code_challenge: &'a str,
+            code_challenge_method: &'static str,
+        }
+
+        let body = SsoRequest {
+            domain: (field == "domain").then_some(value),
+            provider_id: (field == "provider_id").then_some(value),
+            redirect_to: redirect_uri.as_str(),
+            code_challenge: &code_challenge,
+            code_challenge_method: "s256",
+        };
+
+        let response = self
+            .client
+            .post(self.auth_endpoint("sso")?)
+            .header("apikey", &self.anon_key)
+            .json(&body)
+            .timeout(self.policy.request_timeout)
+            .send()
+            .await
+            .context("failed to start SAML SSO")?;
+        let response = require_success(response, "SAML SSO initiation").await?;
+
+        #[derive(Deserialize)]
+        struct SsoResponse {
+            url: String,
+        }
+        let sso: SsoResponse = response
+            .json()
+            .await
+            .context("SAML SSO initiation returned no redirect URL")?;
+
+        // The redirect target is chosen by the IdP configuration, not by us,
+        // so it is treated as untrusted input: it must parse, and it must be
+        // HTTPS. Handing a user an `http://` or `javascript:` URL to open —
+        // or a malformed one — is how an SSO entry point becomes a phishing
+        // surface. A plain-HTTP IdP would also carry the relay state in
+        // clear text.
+        let url = Url::parse(sso.url.trim())
+            .context("SAML SSO returned a redirect URL that is not a valid URL")?;
+        ensure!(
+            url.scheme() == "https",
+            "SAML SSO redirect must be https, got `{}` — refusing to open it",
+            url.scheme()
+        );
+        ensure!(
+            url.host_str().is_some_and(|host| !host.is_empty()),
+            "SAML SSO redirect has no host"
+        );
+
+        Ok((
+            SupabasePkceAttempt {
+                listener,
+                redirect_uri,
+                state,
+                code_verifier,
+            },
+            url,
+        ))
+    }
+
     /// Wait for the loopback redirect, exchange its code, and verify the JWT.
     pub async fn complete_email_login(
         &self,
@@ -411,15 +573,31 @@ impl SupabaseAuth {
             "Supabase access token must use an asymmetric JWKS signing key"
         );
 
+        // Where the keys live is ASKED, not assumed. The issuer publishes it
+        // in its discovery document; PRISM no longer hardcodes one vendor's
+        // URL layout, which is what previously made the provider choice a
+        // code change rather than a configuration one.
+        //
+        // `OidcDiscovery::fetch` proves the document belongs to this issuer
+        // before its `jwks_uri` is used, so the configured issuer stays the
+        // root of trust. If discovery fails, verification fails — there is no
+        // guessed-path fallback to quietly reinstate the old assumption.
+        let issuer = self.expected_issuer()?;
+        let discovery =
+            crate::oidc::OidcDiscovery::fetch(&self.client, &issuer, self.policy.request_timeout)
+                .await?;
+
         let response = self
             .client
-            .get(self.auth_endpoint(".well-known/jwks.json")?)
+            .get(discovery.jwks_uri().clone())
             .header("apikey", &self.anon_key)
             .timeout(self.policy.request_timeout)
             .send()
             .await
-            .context("failed to fetch the Supabase JWKS")?;
-        let response = require_success(response, "Supabase JWKS request").await?;
+            .with_context(|| {
+                format!("failed to fetch signing keys from {}", discovery.jwks_uri())
+            })?;
+        let response = require_success(response, "JWKS request").await?;
         let jwks = response
             .json::<JwkSet>()
             .await
@@ -430,9 +608,12 @@ impl SupabaseAuth {
         let decoding_key = DecodingKey::from_jwk(jwk)
             .context("Supabase JWKS contains an unsupported signing key")?;
 
-        let issuer = self.expected_issuer()?;
+        // Validate against the DISCOVERY-VERIFIED issuer. It equals the
+        // configured one by construction (fetch refuses a mismatch), so this
+        // cannot widen what is accepted — it just makes the single source of
+        // the issuer string obvious at the point it is enforced.
         let mut validation = Validation::new(header.alg);
-        validation.set_issuer(&[issuer.as_str()]);
+        validation.set_issuer(&[discovery.issuer()]);
         validation.set_audience(&[self.policy.expected_audience.as_str()]);
         validation.leeway = self.policy.clock_skew.as_secs();
         validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
@@ -697,5 +878,66 @@ mod tests {
         assert!(constant_time_eq(b"same", b"same"));
         assert!(!constant_time_eq(b"same", b"diff"));
         assert!(!constant_time_eq(b"same", b"same-longer"));
+    }
+
+    /// An SSO selector names exactly one connection, and a domain is a bare
+    /// domain. An email address here would leak the local part of someone's
+    /// address into an IdP directory lookup; a URL would aim that lookup
+    /// somewhere the caller did not intend.
+    #[test]
+    fn sso_domain_must_be_a_bare_domain() {
+        assert_eq!(
+            SsoSelector::Domain("arianegroup.com").as_field().unwrap(),
+            ("domain", "arianegroup.com")
+        );
+        // Whitespace is trimmed, not rejected — pasted input routinely carries it.
+        assert_eq!(
+            SsoSelector::Domain("  acme.com ").as_field().unwrap(),
+            ("domain", "acme.com")
+        );
+        assert_eq!(
+            SsoSelector::ProviderId("conn-123").as_field().unwrap(),
+            ("provider_id", "conn-123")
+        );
+
+        for bad in [
+            "user@acme.com",    // email, not a domain
+            "https://acme.com", // URL
+            "acme.com/sso",     // path
+            "acme",             // not fully qualified
+            "",                 // empty
+            "   ",              // whitespace only
+        ] {
+            assert!(
+                SsoSelector::Domain(bad).as_field().is_err(),
+                "`{bad}` must be refused as an SSO domain"
+            );
+        }
+        assert!(SsoSelector::ProviderId("  ").as_field().is_err());
+    }
+
+    /// The IdP redirect is untrusted input. Anything but HTTPS with a host is
+    /// refused rather than handed to the user to open — an SSO entry point
+    /// that will open arbitrary schemes is a phishing surface, and plain HTTP
+    /// would carry the relay state in clear text.
+    #[test]
+    fn only_https_sso_redirects_are_accepted() {
+        let ok = Url::parse("https://login.arianegroup.com/sso/saml").unwrap();
+        assert_eq!(ok.scheme(), "https");
+        assert!(ok.host_str().is_some_and(|h| !h.is_empty()));
+
+        for bad in [
+            "http://login.acme.com/sso",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,<script>",
+        ] {
+            let parsed = Url::parse(bad);
+            let rejected = match parsed {
+                Err(_) => true,
+                Ok(url) => url.scheme() != "https" || url.host_str().is_none_or(str::is_empty),
+            };
+            assert!(rejected, "`{bad}` must not be opened as an SSO redirect");
+        }
     }
 }

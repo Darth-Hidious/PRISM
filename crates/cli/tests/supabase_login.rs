@@ -90,12 +90,16 @@ struct LoginSpec {
     token_case: TokenCase,
     role: &'static str,
     mismatched_state: bool,
+    /// Serve a discovery document that names a DIFFERENT issuer than the one
+    /// PRISM configured — the attack OIDC Discovery §4.3 exists to stop.
+    hostile_discovery: bool,
 }
 
 impl Default for LoginSpec {
     fn default() -> Self {
         Self {
             token_case: TokenCase::Valid,
+            hostile_discovery: false,
             role: "authenticated",
             mismatched_state: false,
         }
@@ -178,7 +182,12 @@ fn jwks(signing_key: &SigningKey) -> Value {
     })
 }
 
-async fn mount_supabase(server: &MockServer, access_token: &str, advertised_key: &SigningKey) {
+async fn mount_supabase(
+    server: &MockServer,
+    access_token: &str,
+    advertised_key: &SigningKey,
+    hostile_discovery: bool,
+) {
     Mock::given(method("POST"))
         .and(path("/auth/v1/otp"))
         .and(header("apikey", ANON_KEY))
@@ -194,6 +203,27 @@ async fn mount_supabase(server: &MockServer, access_token: &str, advertised_key:
             "refresh_token": REFRESH_TOKEN,
             "token_type": "bearer",
             "expires_in": 3600,
+        })))
+        .mount(server)
+        .await;
+    // OIDC discovery. PRISM asks the issuer where its keys live rather than
+    // assuming a vendor's URL layout, so the login path fetches this BEFORE
+    // the JWKS and refuses outright if it is missing — there is no
+    // guessed-path fallback. The advertised `issuer` must match the one PRISM
+    // computed or verification is refused; see `oidc::OidcDiscovery::fetch`.
+    let issuer = if hostile_discovery {
+        // A document served by this host claiming to be a different issuer.
+        // If PRISM accepted it, an attacker controlling discovery could point
+        // key lookup at an issuer they own.
+        "https://attacker.example/auth/v1".to_string()
+    } else {
+        format!("{}/auth/v1", server.uri())
+    };
+    Mock::given(method("GET"))
+        .and(path("/auth/v1/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{}/auth/v1/.well-known/jwks.json", server.uri()),
         })))
         .mount(server)
         .await;
@@ -347,7 +377,13 @@ async fn run_login(spec: LoginSpec) -> LoginOutcome {
         _ => &advertised_key,
     };
     let access_token = sign_jwt(token_key, &claims);
-    mount_supabase(&server, &access_token, &advertised_key).await;
+    mount_supabase(
+        &server,
+        &access_token,
+        &advertised_key,
+        spec.hostile_discovery,
+    )
+    .await;
 
     let root = tempfile::tempdir().expect("isolated HOME");
     let mut command = prism(root.path());
@@ -510,6 +546,41 @@ async fn wrong_signing_key_is_refused_by_the_real_login_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_token_is_refused_by_the_real_login_path() {
     assert_verified_token_refused(TokenCase::Expired).await;
+}
+
+/// A discovery document may say WHERE an issuer's keys are. It may never say
+/// WHO the issuer is.
+///
+/// The document is fetched over the network, so it is untrusted input that
+/// describes where to fetch signing keys from. If PRISM honoured an issuer it
+/// nominated, whoever served that document could point key lookup at an issuer
+/// they control and mint tokens PRISM would accept. OIDC Discovery §4.3
+/// requires the advertised issuer to equal the one it was fetched for.
+///
+/// Delete that equality check in `oidc::OidcDiscovery::fetch` and this passes
+/// a login it must refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_naming_a_different_issuer_is_refused() {
+    let outcome = run_login(LoginSpec {
+        hostile_discovery: true,
+        ..LoginSpec::default()
+    })
+    .await;
+    let (_stdout, stderr) = output_text(&outcome.output);
+
+    assert!(
+        !outcome.output.status.success(),
+        "a discovery document naming another issuer must not authenticate: {stderr}"
+    );
+    assert!(
+        stderr.contains("issuer mismatch"),
+        "the refusal must name the mismatch, not fail vaguely: {stderr}"
+    );
+    // Refused BEFORE any key was fetched — the point is not to reach the JWKS
+    // the hostile document nominated.
+    assert_eq!(outcome.jwks_requests, 0, "stderr: {stderr}");
+    assert!(!credentials_path(outcome.root.path()).exists());
+    assert_secrets_absent(&outcome);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

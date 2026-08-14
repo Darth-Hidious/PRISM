@@ -13,6 +13,24 @@ use crate::supabase_auth::{SupabaseAuth, SupabaseAuthPolicy, SupabaseClaims};
 pub const MARC27_IDENTITY_PROVIDER: &str = "marc27";
 /// Stable identity-provider id for Supabase Auth.
 pub const SUPABASE_IDENTITY_PROVIDER: &str = "supabase";
+/// Stable identity-provider id for Mirdyne.
+///
+/// Mirdyne is a SEPARATE identity domain from MARC27 — different issuer,
+/// different principal namespace, different RBAC subject. That separation is
+/// the point: an account in one is not an account in the other, and the
+/// corporate boundary between them is auditable because the provider id is
+/// recorded on every verified identity.
+///
+/// It currently authenticates against a Mirdyne-owned JWT issuer using the
+/// same signature/`exp`/`iss`/`aud` verification Supabase gets, because that
+/// path is proven and a second hand-rolled verifier would be a second place
+/// to get token validation wrong. It is NOT an alias: a Supabase token is not
+/// a Mirdyne token, because the issuer it is checked against differs, and a
+/// token minted for one fails `iss` verification for the other.
+///
+/// When Mirdyne gains its own OIDC service, only this adapter's arms change —
+/// callers select providers by id and never branch on the protocol.
+pub const MIRDYNE_IDENTITY_PROVIDER: &str = "mirdyne";
 
 /// Provider-specific authentication adapter selected explicitly at login and
 /// refresh boundaries.
@@ -20,6 +38,7 @@ pub const SUPABASE_IDENTITY_PROVIDER: &str = "supabase";
 pub enum IdentityProviderAdapter {
     Marc27,
     Supabase,
+    Mirdyne,
 }
 
 /// Provider-neutral identity established only after the configured provider
@@ -126,6 +145,26 @@ impl IdentityVerifierConfig {
                 )?;
                 Some(provider_key.to_string())
             }
+            // Mirdyne fails closed on exactly the same terms as Supabase: an
+            // unconfigured issuer must never yield a verifier that accepts
+            // tokens, because a verifier that cannot check `iss` would accept
+            // ANY provider's token as a Mirdyne identity.
+            IdentityProviderAdapter::Mirdyne => {
+                let provider_key = provider_key
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .context(
+                        "Mirdyne is not configured: missing identity provider key. Set the \
+                         Mirdyne issuer URL and key, or log in with `--provider marc27`.",
+                    )?;
+                SupabaseAuth::new(
+                    reqwest::Client::new(),
+                    provider_url,
+                    provider_key,
+                    supabase_policy.clone(),
+                )?;
+                Some(provider_key.to_string())
+            }
         };
 
         Ok(Self {
@@ -166,6 +205,7 @@ impl IdentityProviderAdapter {
         match self {
             Self::Marc27 => MARC27_IDENTITY_PROVIDER,
             Self::Supabase => SUPABASE_IDENTITY_PROVIDER,
+            Self::Mirdyne => MIRDYNE_IDENTITY_PROVIDER,
         }
     }
 
@@ -189,6 +229,25 @@ impl IdentityProviderAdapter {
             Self::Supabase => {
                 let provider_key = provider_key
                     .context("Supabase is not configured: missing identity provider anon key")?;
+                let auth = SupabaseAuth::new(
+                    client.clone(),
+                    provider_url,
+                    provider_key,
+                    SupabaseAuthPolicy::default(),
+                )?;
+                let session = auth.refresh_session(refresh_token).await?;
+                Ok(ProviderTokenResponse {
+                    tokens: session.tokens,
+                    supabase_claims: Some(session.claims),
+                })
+            }
+            // Mirdyne refreshes against ITS OWN issuer: `provider_url` is the
+            // Mirdyne project root, never MARC27's. The claims come back under
+            // Mirdyne's `iss`, which is what keeps the two identity domains
+            // from collapsing into one on refresh.
+            Self::Mirdyne => {
+                let provider_key = provider_key
+                    .context("Mirdyne is not configured: missing identity provider key")?;
                 let auth = SupabaseAuth::new(
                     client.clone(),
                     provider_url,
@@ -261,6 +320,38 @@ impl IdentityProviderAdapter {
                     role_claim: claims.role,
                 })
             }
+            // Mirdyne. The separation between identity domains is not enforced
+            // by this arm being different code — it is enforced by `iss`:
+            //
+            //   * the token's signature is checked against MIRDYNE's JWKS, so
+            //     a token minted elsewhere fails verification outright, and
+            //   * `canonical_supabase_principal` hashes the VERIFIED issuer
+            //     into the principal, so even identical `sub` values under two
+            //     issuers produce two different PRISM principals.
+            //
+            // That is why this is a real provider and not an alias: pointing
+            // it at another provider's URL cannot import that provider's
+            // users, it just fails to verify.
+            Self::Mirdyne => {
+                let provider_key = provider_key
+                    .context("Mirdyne is not configured: missing identity provider key")?;
+                let auth = SupabaseAuth::new(
+                    reqwest::Client::new(),
+                    provider_url,
+                    provider_key,
+                    supabase_policy.clone(),
+                )?;
+                let claims = auth.verify_access_token(token).await?;
+                let principal_id = canonical_supabase_principal(&claims.iss, &claims.sub)
+                    .context("verified Mirdyne token has no canonical PRISM principal")?;
+                Ok(VerifiedIdentity {
+                    provider: self,
+                    subject_id: claims.sub,
+                    provider_scope: Some(claims.iss),
+                    principal_id,
+                    role_claim: claims.role,
+                })
+            }
         }
     }
 }
@@ -273,6 +364,7 @@ pub fn identity_provider_for(provider: Option<&str>) -> Option<IdentityProviderA
     match provider {
         Some(MARC27_IDENTITY_PROVIDER) => Some(IdentityProviderAdapter::Marc27),
         Some(SUPABASE_IDENTITY_PROVIDER) => Some(IdentityProviderAdapter::Supabase),
+        Some(MIRDYNE_IDENTITY_PROVIDER) => Some(IdentityProviderAdapter::Mirdyne),
         _ => None,
     }
 }
@@ -641,10 +733,76 @@ mod tests {
             identity_provider_for(Some("supabase")),
             Some(IdentityProviderAdapter::Supabase)
         );
+        assert_eq!(
+            identity_provider_for(Some("mirdyne")),
+            Some(IdentityProviderAdapter::Mirdyne)
+        );
         assert_eq!(identity_provider_for(None), None);
         assert_eq!(identity_provider_for(Some("unknown")), None);
         assert_eq!(identity_provider_for(Some("Supabase")), None);
+        assert_eq!(identity_provider_for(Some("Mirdyne")), None);
         assert_eq!(identity_provider_for(Some("")), None);
+    }
+
+    /// Mirdyne and Supabase share an implementation arm. They must NOT share
+    /// identities. The separation rests entirely on the verified issuer, so
+    /// this pins it: the same provider-native subject under two issuers must
+    /// canonicalize to two different PRISM principals.
+    ///
+    /// If someone "simplifies" the adapter by making Mirdyne reuse Supabase's
+    /// configured issuer, this fails — which is the point. Merging the code is
+    /// fine; merging the accounts is a security defect.
+    #[test]
+    fn mirdyne_and_supabase_are_separate_identity_domains() {
+        let supabase = canonical_supabase_principal("https://acme.supabase.co/auth/v1", "user-1")
+            .expect("canonical principal");
+        let mirdyne = canonical_supabase_principal("https://auth.mirdyne.com/auth/v1", "user-1")
+            .expect("canonical principal");
+        assert_ne!(
+            supabase, mirdyne,
+            "identical subjects under different issuers must not collapse into one principal"
+        );
+
+        // The provider ids are distinct and round-trip through the registry,
+        // so a stored credential can always name which domain minted it.
+        assert_ne!(MIRDYNE_IDENTITY_PROVIDER, SUPABASE_IDENTITY_PROVIDER);
+        assert_ne!(MIRDYNE_IDENTITY_PROVIDER, MARC27_IDENTITY_PROVIDER);
+        for id in [
+            MARC27_IDENTITY_PROVIDER,
+            SUPABASE_IDENTITY_PROVIDER,
+            MIRDYNE_IDENTITY_PROVIDER,
+        ] {
+            assert_eq!(
+                identity_provider_for(Some(id))
+                    .expect("registered")
+                    .as_str(),
+                id,
+                "provider id must round-trip"
+            );
+        }
+    }
+
+    /// An unconfigured Mirdyne must not produce a usable verifier. A verifier
+    /// without an issuer key cannot check `iss`, and one that cannot check
+    /// `iss` would accept any provider's token as a Mirdyne identity.
+    #[test]
+    fn mirdyne_without_a_key_fails_closed() {
+        let missing = IdentityVerifierConfig::new(
+            Some(MIRDYNE_IDENTITY_PROVIDER),
+            "https://auth.mirdyne.com",
+            None,
+        );
+        assert!(missing.is_err(), "unconfigured Mirdyne must be refused");
+        let blank = IdentityVerifierConfig::new(
+            Some(MIRDYNE_IDENTITY_PROVIDER),
+            "https://auth.mirdyne.com",
+            Some("   "),
+        );
+        assert!(blank.is_err(), "a blank key is not a configured key");
+        // …and an empty issuer URL is refused for the same reason.
+        let no_url =
+            IdentityVerifierConfig::new(Some(MIRDYNE_IDENTITY_PROVIDER), "  ", Some("anon-key"));
+        assert!(no_url.is_err(), "Mirdyne without an issuer URL must fail");
     }
 
     #[test]

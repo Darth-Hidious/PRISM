@@ -93,7 +93,13 @@ fn resolve_refresh_provider(
                 key: None,
             })
         }
-        prism_client::IdentityProviderAdapter::Supabase => {
+        // Same shape, same handling: both bind the refresh to the issuer URL
+        // and key stored WITH the credential, so an environment override
+        // cannot redirect the refresh secret to another host. The provider
+        // name in the error is taken from the adapter, not hard-coded, so a
+        // Mirdyne failure never reports itself as Supabase.
+        prism_client::IdentityProviderAdapter::Supabase
+        | prism_client::IdentityProviderAdapter::Mirdyne => {
             let url = credentials
                 .identity_provider_url
                 .as_deref()
@@ -101,7 +107,8 @@ fn resolve_refresh_provider(
                 .filter(|url| !url.is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Supabase is not configured: missing identity provider project URL"
+                        "{} is not configured: missing identity provider project URL",
+                        adapter.as_str()
                     )
                 })?;
             let key = credentials
@@ -111,7 +118,8 @@ fn resolve_refresh_provider(
                 .filter(|key| !key.is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Supabase is not configured: missing identity provider anon key"
+                        "{} is not configured: missing identity provider key",
+                        adapter.as_str()
                     )
                 })?;
             Ok(RefreshProviderConfig {
@@ -552,9 +560,34 @@ mod tests {
             .expect_err("Supabase refresh requires its stored public key")
             .to_string();
 
+        // Wording note: this used to assert "anon key". The message became
+        // provider-neutral when Mirdyne joined the shared arm — "anon key" is
+        // Supabase's own term and would be wrong for another issuer. What the
+        // test actually guards is unchanged: an incomplete configuration is
+        // REFUSED, and the error names WHICH provider was misconfigured.
+        assert!(error.contains("missing identity provider key"), "{error}");
         assert!(
-            error.contains("missing identity provider anon key"),
-            "{error}"
+            error.contains("supabase"),
+            "the error must name the provider that is misconfigured: {error}"
+        );
+    }
+
+    /// The same refusal, for Mirdyne, through the same shared arm — proving
+    /// the arm reports the provider it was actually given rather than the one
+    /// whose code path it borrows.
+    #[test]
+    fn incomplete_mirdyne_configuration_is_refused_under_its_own_name() {
+        let mut credentials = stored_credentials(Some("mirdyne"));
+        credentials.identity_provider_key = None;
+
+        let error = resolve_refresh_provider(&credentials)
+            .expect_err("Mirdyne refresh requires its stored key")
+            .to_string();
+
+        assert!(error.contains("missing identity provider key"), "{error}");
+        assert!(
+            error.contains("mirdyne"),
+            "a Mirdyne failure must not report itself as Supabase: {error}"
         );
     }
 
