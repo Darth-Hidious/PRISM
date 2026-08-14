@@ -154,6 +154,27 @@ impl RejectionClass {
             Self::ReviewMissing => "review_missing",
         }
     }
+
+    /// Inverse of [`Self::as_str`] — the queue stores the class as text so
+    /// the store does not depend on this enum, so the model tier parses it
+    /// back here. `None` for any string this enum does not declare.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        use RejectionClass::*;
+        [
+            UnresolvedUnit,
+            MalformedShape,
+            SubjectNotNamed,
+            NumericUnsupported,
+            ValuelessWithUnit,
+            PolicyDeferred,
+            ReviewDenied,
+            ReviewUncertain,
+            ReviewMissing,
+        ]
+        .into_iter()
+        .find(|class| class.as_str() == text)
+    }
 }
 
 /// What was refused: a converted fact, or the raw extraction that could not
@@ -320,18 +341,18 @@ pub enum Attribution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AssertionVerdict {
+pub(crate) enum AssertionVerdict {
     Asserted,
     Denied,
     Uncertain,
 }
 
 #[derive(Debug, Deserialize)]
-struct AssertionDecision {
-    fact_index: usize,
-    verdict: AssertionVerdict,
+pub(crate) struct AssertionDecision {
+    pub fact_index: usize,
+    pub verdict: AssertionVerdict,
     #[serde(default)]
-    reason: String,
+    pub reason: String,
 }
 
 #[derive(Deserialize)]
@@ -623,7 +644,7 @@ fn conditions_grounded_in_span(
     Ok(())
 }
 
-fn assertion_conditions_grounded_in_text(
+pub(crate) fn assertion_conditions_grounded_in_text(
     fact: &MaterialFact,
     text: &str,
     numeric_tolerance: f64,
@@ -650,7 +671,7 @@ fn assertion_conditions_grounded_in_text(
     }))
 }
 
-fn assertion_evidence_spans<'a>(
+pub(crate) fn assertion_evidence_spans<'a>(
     fact: &MaterialFact,
     text: &'a str,
     numeric_tolerance: f64,
@@ -756,7 +777,7 @@ async fn review_assertions(
     (parse_assertion_review(&raw, pending.len()), usage)
 }
 
-fn build_assertion_review_prompt(
+pub(crate) fn build_assertion_review_prompt(
     pending: &[(usize, MaterialFact)],
     text: &str,
     numeric_tolerance: f64,
@@ -805,7 +826,7 @@ Reply with ONLY this JSON shape:
     )
 }
 
-fn parse_assertion_review(
+pub(crate) fn parse_assertion_review(
     raw: &str,
     pending_count: usize,
 ) -> std::result::Result<HashMap<usize, AssertionDecision>, String> {
@@ -833,7 +854,7 @@ fn parse_assertion_review(
     Ok(decisions)
 }
 
-fn merge_usage(
+pub(crate) fn merge_usage(
     extraction: Option<prism_llm::UsageInfo>,
     review: Option<prism_llm::UsageInfo>,
 ) -> Option<prism_llm::UsageInfo> {
@@ -1212,7 +1233,7 @@ pub(crate) fn fact_identity(raw_fact: &serde_json::Value) -> String {
 }
 
 /// Extract the outermost JSON object from a possibly-fenced/preceded response.
-fn extract_json_block(raw: &str) -> &str {
+pub(crate) fn extract_json_block(raw: &str) -> &str {
     if let Some(start) = raw.find('{')
         && let Some(end) = raw.rfind('}')
         && end > start

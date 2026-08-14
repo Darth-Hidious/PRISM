@@ -1513,6 +1513,23 @@ impl ProvenanceStore {
         Ok(out)
     }
 
+    /// Count one FAILED attempt against an item that stays queued.
+    ///
+    /// The model tier gets one attempt per item per run — never a retry
+    /// loop — so a failed attempt is recorded here instead of being
+    /// re-tried in place. When the count reaches the worker's declared
+    /// attempt limit, the worker's next failure becomes a final WITHDRAW
+    /// ledger row instead of another bump.
+    pub async fn bump_repair_attempts(&self, item_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE repair_queue SET attempts = attempts + 1 WHERE item_id = ?1",
+                vec![Value::Text(item_id.to_string())],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Record a decision and remove the item from the queue, atomically in
     /// intent: the ledger row is written FIRST, so a crash between the two
     /// leaves a judged item still queued (it will be re-judged and produce a
