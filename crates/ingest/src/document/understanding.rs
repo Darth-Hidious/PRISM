@@ -81,6 +81,25 @@ impl Understanding {
             .join("\n\n")
     }
 
+    /// The SAME joined string as [`plain_text`], plus each page's byte range
+    /// in it. The ranges TILE the string exactly — each page's range carries
+    /// the joiner that follows it — so structure-aware segmentation
+    /// (`prism_ingest::batching::chunk_structured`) can pack pages as whole
+    /// units without any byte falling between them.
+    pub fn plain_text_with_page_ranges(&self) -> (String, Vec<(usize, usize)>) {
+        let mut text = String::new();
+        let mut ranges = Vec::with_capacity(self.pages.len());
+        for (i, page) in self.pages.iter().enumerate() {
+            let start = text.len();
+            text.push_str(&page.text);
+            if i + 1 < self.pages.len() {
+                text.push_str("\n\n");
+            }
+            ranges.push((start, text.len()));
+        }
+        (text, ranges)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pages.iter().all(|p| p.text.trim().is_empty())
     }
@@ -536,6 +555,52 @@ mod tests {
             );
         }
         assert!(reg.all().is_empty());
+    }
+
+    /// `plain_text_with_page_ranges` yields the SAME string as `plain_text`
+    /// (so the extraction prompt and segmentation cannot drift), with ranges
+    /// that tile it exactly — every byte inside exactly one page's range.
+    #[test]
+    fn page_ranges_tile_the_plain_text_exactly() {
+        let understanding = Understanding {
+            adapter_id: "text-layer".into(),
+            modality: Modality::TextLayer,
+            pages: vec![
+                PageText {
+                    number: 1,
+                    text: "first page".into(),
+                },
+                PageText {
+                    number: 2,
+                    text: "second page".into(),
+                },
+                PageText {
+                    number: 3,
+                    text: "third".into(),
+                },
+            ],
+        };
+        let (text, ranges) = understanding.plain_text_with_page_ranges();
+        assert_eq!(text, understanding.plain_text());
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges.last().unwrap().1, text.len());
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "ranges must tile with no gap");
+        }
+        // Each page's text sits inside its own range (the range also carries
+        // the joiner that follows).
+        for (range, page) in ranges.iter().zip(&understanding.pages) {
+            assert!(text[range.0..range.1].starts_with(&page.text));
+        }
+
+        let empty = Understanding {
+            adapter_id: "text-layer".into(),
+            modality: Modality::TextLayer,
+            pages: vec![],
+        };
+        let (text, ranges) = empty.plain_text_with_page_ranges();
+        assert!(text.is_empty() && ranges.is_empty());
     }
 
     /// Unavailability is reportable BEFORE any bytes are handed over — the
