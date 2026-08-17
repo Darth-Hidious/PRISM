@@ -161,3 +161,10 @@ extensions/**/*.vsix
 !shell-plugin/lib/
 !shell-plugin/lib/**
 /.mcp-tools/
+
+# Internal session work logs — never publish (contains pricing, infra identities, tenant exploit notes)
+WORK_LOG_*.md
+
+# Training/ingress corpora are MOAT — private engine repo only, never public
+data/ingress_dumps/
+data/training/
