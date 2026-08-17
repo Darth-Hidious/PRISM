@@ -17,7 +17,7 @@
 //! queue, whose persisted pre-agent items must still be drainable. They are
 //! not called by fresh paper population.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use anyhow::{Result, ensure};
@@ -319,6 +319,10 @@ pub struct TextExtraction {
     /// lie, never fake — but the outcome names the model and the numbers so
     /// a thin result is not mistaken for a quiet paper. §D.5.
     pub model_insufficient: Option<ModelInsufficiency>,
+    /// What cross-sample agreement achieved, or `None` for a single-pass run
+    /// that never attempted it. Reported so a run where NOTHING agreed cannot
+    /// pass for a clean ingest — see [`AgreementSummary`].
+    pub agreement: Option<AgreementSummary>,
     /// Ontology extensions proposed by the reader. These are records for a
     /// later governance step; extraction never mutates the active ontology.
     pub proposed_classes: Vec<OntologyClassProposal>,
@@ -420,38 +424,215 @@ fn mark_at_most(fact: &mut MaterialFact, status: VerificationStatus, reason: Str
     }
 }
 
+/// Words that carry no distinguishing content, dropped before comparison.
+///
+/// EVERY ENTRY IS THREE CHARACTERS OR LONGER, and that is a hard constraint
+/// rather than a coincidence. Comparison lowercases, and every chemical
+/// element symbol is one or two characters — so a two-letter stop word would
+/// silently delete an element. "In" is indium, "As" is arsenic, "At" is
+/// astatine, "Be" is beryllium, "No" is nobelium. Adding "in" or "as" here
+/// would make `Ti-In alloy` and `Ti-As alloy` the same subject.
+const AGREEMENT_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "its", "are", "was", "were", "been",
+    "being", "into", "onto", "than", "then", "such", "which", "these", "those",
+];
+
+/// Shortest predicate word that can name a relation. Applies to PREDICATES
+/// ONLY: "is obtained as" and "isObtainedBy" agree once the two-letter
+/// scaffolding is gone, while subjects and objects keep their short tokens
+/// because that is where element symbols and enumerated variants live.
+const MIN_PREDICATE_WORD: usize = 3;
+
+/// Predicate words that state only THAT a relation exists, never which one.
+/// "is obtained as" and "isObtainedBy" reduce to the same distinguishing word
+/// once these are removed; without that, they are two different facts.
+const AGREEMENT_COPULAS: &[&str] = &[
+    "has", "have", "had", "get", "gets", "got", "obtain", "obtains", "obtained", "show", "shows",
+    "shown", "exhibit", "exhibits", "equal", "equals", "define", "defined", "value", "result",
+    "results", "given", "gives",
+];
+
+/// Fraction of content words two subjects must share to be the same entity.
+/// Kept high: the subject is the thing being described, and merging two
+/// subjects merges two different facts. Measured on a live three-sample run,
+/// `BaFe2As2 exhibits X` and `TbMnO3 exhibits X` are separated here and
+/// nowhere else.
+const SUBJECT_AGREEMENT: f64 = 0.6;
+/// Fraction two objects must share. Objects are prose in practice (measured
+/// median 11 words), so this is the loosest of the three.
+const OBJECT_AGREEMENT: f64 = 0.6;
+/// Fraction two predicate LABELS must share once copulas are removed.
+const PREDICATE_AGREEMENT: f64 = 0.5;
+
+/// The content words of a free-text field, as the comparison sees them.
+///
+/// `camelCase` is split first, so a model that writes `isObtainedBy` and one
+/// that writes "is obtained as" are talking about the same relation.
+///
+/// Record how much agreement a claim got, WITHOUT lowering its status.
+///
+/// FAIL TO PROMOTE, DO NOT DEMOTE. Cross-sample agreement is a statement about
+/// the MODEL, not about the document — this module says so already, in
+/// [`VerificationStatus::judgement_was_rendered`]: "the text was never
+/// consulted. Nothing was judged." A fact the reader cited from lines it
+/// actually read is a reader-cited fact whether or not a sibling sample
+/// happened to phrase the same claim.
+///
+/// Demoting instead had a measured cost. `SampleDisagreement` ranks 5;
+/// `CitedByReader`, which the fresh path stamps, ranks 7 and is in the TRUSTED
+/// set. So `mark_at_most` pushed uncorroborated facts BELOW the status they
+/// would have had with `--samples 1`: a corpus of 86 papers run at `--samples
+/// 3 --agreement 2` put 21,109 of 21,218 facts under the default read filter,
+/// making 99.5% of it invisible to `prism query`. Enabling corroboration hid
+/// more data than leaving it off.
+///
+/// Nothing is laundered by this. The status does not RISE either — `Grounded`
+/// is reserved for a deterministic pass over the real document, and agreement
+/// between two readings of one document is not that. The count is recorded so
+/// the record still says how much support a claim had.
+fn note_agreement(fact: &mut MaterialFact, reason: String) {
+    // A real defect already recorded — a unit that would not resolve, a value
+    // absent from its span — names the fact ahead of a note about how many
+    // samples happened to phrase it.
+    if fact.verification.is_none() {
+        fact.verification_reason = Some(reason);
+    }
+}
+
+/// SHORT TOKENS ARE KEPT. They are frequently the only thing distinguishing
+/// two subjects — `Variant A` from `Variant B`, `Ti` from `Fe` — and dropping
+/// them merges facts that were never corroborated. Noise from a stray article
+/// costs a little recall; a false merge invents agreement, which is worse.
+fn content_words(text: &str) -> BTreeSet<String> {
+    let mut spaced = String::with_capacity(text.len() + 8);
+    let mut previous: Option<char> = None;
+    for current in text.chars() {
+        if current.is_uppercase() && previous.is_some_and(|p| p.is_lowercase() || p.is_numeric()) {
+            spaced.push(' ');
+        }
+        spaced.push(current);
+        previous = Some(current);
+    }
+    spaced
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .filter(|w| !AGREEMENT_STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Overlap of two word sets, 1.0 when both are empty — two facts that both
+/// omit a field agree about it rather than differing.
+fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
+    if left.is_empty() && right.is_empty() {
+        return 1.0;
+    }
+    let union = left.union(right).count();
+    if union == 0 {
+        return 1.0;
+    }
+    left.intersection(right).count() as f64 / union as f64
+}
+
+/// How a predicate is compared, which depends on whether the reader grounded
+/// it in the ontology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PredicateIdentity {
+    /// An ontology IRI. Authoritative, so compared exactly: two different
+    /// IRIs are two different relations no matter how alike they read.
+    Iri(String),
+    /// A free-text label, reduced to its distinguishing words.
+    Words(BTreeSet<String>),
+    /// A bare copula — "is", "has". It states that a relation exists without
+    /// saying which, so it cannot be evidence that two facts DIFFER.
+    Copula,
+}
+
+impl PredicateIdentity {
+    fn of(predicate: &str) -> Self {
+        // An IRI is the reader's grounded answer; never dissolve it into words.
+        if predicate.starts_with("http://") || predicate.starts_with("https://") {
+            return Self::Iri(predicate.to_string());
+        }
+        let words: BTreeSet<String> = content_words(predicate)
+            .into_iter()
+            .filter(|w| w.len() >= MIN_PREDICATE_WORD)
+            .filter(|w| !AGREEMENT_COPULAS.contains(&w.as_str()))
+            .collect();
+        if words.is_empty() {
+            Self::Copula
+        } else {
+            Self::Words(words)
+        }
+    }
+
+    fn agrees_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Iri(a), Self::Iri(b)) => a == b,
+            // One side said nothing distinguishing, so it contradicts nothing.
+            (Self::Copula, _) | (_, Self::Copula) => true,
+            // IRI against label is a difference in NOTATION, not in claim.
+            // The subject and object still have to agree.
+            (Self::Iri(_), Self::Words(_)) | (Self::Words(_), Self::Iri(_)) => true,
+            (Self::Words(a), Self::Words(b)) => jaccard(a, b) >= PREDICATE_AGREEMENT,
+        }
+    }
+}
+
 /// The identity two extractions must share to count as the SAME fact.
 ///
-/// Deliberately strict on the number and loose on nothing else: subject,
-/// property and unit are compared case- and space-folded (models vary the
-/// capitalisation of the same entity between runs), while the value is
-/// compared at fixed precision. Agreement that ignored the value would count
-/// two different fabricated numbers for one property as corroboration, which
-/// is precisely the failure this filter exists to catch.
+/// STRICT ON THE NUMBER, SIMILAR ON THE WORDS, and that split is the whole
+/// design. Value and unit are compared exactly: agreement that ignored the
+/// value would count two different fabricated numbers for one property as
+/// corroboration, which is precisely the failure this filter exists to catch,
+/// and 1250 mm/s is not 1250 m/s.
 ///
-/// The unit is part of the key: 1250 mm/s and 1250 m/s are not the same
-/// measurement, and treating them as one would let a wrong unit ride in on
-/// the strength of a right value.
-fn agreement_key(fact: &MaterialFact) -> String {
-    fn folded(s: &str) -> String {
-        s.chars()
-            .filter(|c| !c.is_whitespace())
-            .flat_map(char::to_lowercase)
-            .collect()
+/// Subject, predicate and object are compared by CONTENT-WORD OVERLAP, not
+/// string equality. An earlier version folded case and whitespace and then
+/// demanded the three match character-for-character. Measured on a live
+/// three-sample run of one paper — all three samples having read all 344
+/// lines — that key found agreement on ZERO of 104 facts, because a model
+/// does not phrase a claim the same way twice:
+///
+/// ```text
+/// sample 2:  RKKY interaction —"is obtained as"→ second order perturbation…
+/// sample 3:  RKKY interaction —"isObtainedBy"→   second order perturbation…
+/// ```
+///
+/// Unanimous to a reader, two separate `SampleDisagreement` facts to that
+/// key. The corpus it produced carries `sample_disagreement` on 21,109 of
+/// 21,218 facts. Similarity recovers seven such clusters here; it does not
+/// pretend to recover more, because the samples genuinely extract different
+/// claims (see [`keep_recurring_cited_facts`]).
+#[derive(Debug, Clone)]
+struct FactIdentity {
+    subject: BTreeSet<String>,
+    predicate: PredicateIdentity,
+    object: BTreeSet<String>,
+    /// `{:.6e}` gives a stable decimal form for values that differ only by
+    /// float formatting, without collapsing genuinely different numbers.
+    value: Option<String>,
+    unit: Option<String>,
+}
+
+impl FactIdentity {
+    fn of(fact: &MaterialFact) -> Self {
+        Self {
+            subject: content_words(&fact.subject),
+            predicate: PredicateIdentity::of(&fact.predicate),
+            object: content_words(&fact.object),
+            value: fact.value.map(|v| format!("{v:.6e}")),
+            unit: fact.unit.as_ref().map(|u| u.as_str().to_lowercase()),
+        }
     }
-    // {:.6e} gives a stable decimal form for values that differ only by
-    // float formatting, without collapsing genuinely different numbers.
-    let value = fact
-        .value
-        .map_or_else(|| "novalue".to_string(), |v| format!("{v:.6e}"));
-    format!(
-        "{}|{}|{}|{}|{}",
-        folded(&fact.subject),
-        folded(&fact.predicate),
-        folded(&fact.object),
-        value,
-        fact.unit.as_ref().map_or("nounit", |u| u.as_str()),
-    )
+
+    fn same_fact(&self, other: &Self) -> bool {
+        self.value == other.value
+            && self.unit == other.unit
+            && self.predicate.agrees_with(&other.predicate)
+            && jaccard(&self.subject, &other.subject) >= SUBJECT_AGREEMENT
+            && jaccard(&self.object, &other.object) >= OBJECT_AGREEMENT
+    }
 }
 
 /// [`extract_facts_from_text`] with an explicit, caller-swappable grounding
@@ -662,10 +843,16 @@ pub async fn extract_facts_from_chunk_sampled(
             }
         }
     }
+    // A single pass never attempts agreement, so it reports none — an
+    // agreement rate of "0 of N" would read as total disagreement when in
+    // fact nothing was ever compared.
+    let mut agreement = None;
     let cited_facts = if sampling.is_single_pass() {
         per_sample.pop().unwrap_or_default()
     } else {
-        keep_recurring_cited_facts(per_sample, sampling, complete_samples)
+        let outcome = keep_recurring_cited_facts(per_sample, sampling, complete_samples);
+        agreement = Some(outcome.summary);
+        outcome.facts
     };
     let cited_facts = cited_facts
         .into_iter()
@@ -694,6 +881,7 @@ pub async fn extract_facts_from_chunk_sampled(
         agent_traces,
         agreement_exclusions,
         model_insufficient,
+        agreement,
         proposed_classes,
         proposed_relations,
     })
@@ -863,21 +1051,115 @@ struct CitedFact {
 ///
 /// Absence of evidence from a reader that was interrupted is not evidence of
 /// absence.
+/// What cross-sample agreement actually achieved on one document.
+///
+/// Reported because its failure was SILENT. A corpus of 86 papers ingested
+/// with `--samples 3 --agreement 2` stamped `sample_disagreement` on 21,109 of
+/// 21,218 facts, and nothing in any summary said so — the operator saw
+/// "21,218 facts written" and a clean exit. Since the default read filter
+/// shows only the trusted subset, 99.5% of that corpus was invisible to
+/// `prism query` while appearing fully ingested.
+///
+/// A run where nothing agreed is a result about the MODEL, and it must be as
+/// visible as the fact count it silently invalidates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgreementSummary {
+    /// Distinct claims after clustering — what the samples proposed, counted
+    /// once each rather than once per phrasing.
+    pub claims: usize,
+    /// Claims that reached [`Self::required`] comparable samples.
+    pub corroborated: usize,
+    /// Samples that earned a vote (see [`sample_counts_toward_agreement`]).
+    pub comparable_samples: usize,
+    /// Votes a claim needed here, never more than `comparable_samples`.
+    pub required: usize,
+}
+
+impl AgreementSummary {
+    /// Claims left stamped `sample_disagreement`, and so hidden from the
+    /// default read.
+    #[must_use]
+    pub fn stamped(&self) -> usize {
+        self.claims.saturating_sub(self.corroborated)
+    }
+
+    /// Fold one chunk's agreement into a whole-document total.
+    ///
+    /// A paper is read in one workspace, but a long document is chunked and
+    /// each chunk's samples vote among themselves. Claims and corroborations
+    /// ADD. The sampling policy is per-run, so the two sample counts are the
+    /// widest any chunk achieved — summing them would invent readers.
+    pub fn absorb(&mut self, other: &Self) {
+        self.claims += other.claims;
+        self.corroborated += other.corroborated;
+        self.comparable_samples = self.comparable_samples.max(other.comparable_samples);
+        self.required = self.required.max(other.required);
+    }
+
+    /// One line for the operator, or `None` for a single-pass run where
+    /// agreement was never attempted and a rate would be meaningless.
+    #[must_use]
+    pub fn report(&self) -> Option<String> {
+        if self.claims == 0 || self.required <= 1 {
+            return None;
+        }
+        let percent = 100.0 * self.corroborated as f64 / self.claims as f64;
+        Some(format!(
+            "cross-sample agreement: {} of {} claims corroborated ({percent:.0}%) \
+             by {} of {} comparable samples; {} stamped sample_disagreement and \
+             hidden from `prism query` unless --include-unverified",
+            self.corroborated,
+            self.claims,
+            self.required,
+            self.comparable_samples,
+            self.stamped(),
+        ))
+    }
+}
+
+/// Clustered facts and the measured agreement that produced them.
+struct AgreementOutcome {
+    facts: Vec<CitedFact>,
+    summary: AgreementSummary,
+}
+
+/// One claim, the samples that proposed it, and the phrasing kept for the store.
+struct AgreementCluster {
+    identity: FactIdentity,
+    /// The first sample's wording. Every member matched it, so any of them
+    /// would do; taking the first keeps the choice deterministic.
+    exemplar: CitedFact,
+    /// INDICES of the samples that proposed this claim — a set, so a sample
+    /// that states the same thing twice still casts one vote.
+    samples: BTreeSet<usize>,
+}
+
 fn keep_recurring_cited_facts(
     per_sample: Vec<Vec<CitedFact>>,
     sampling: SamplingPolicy,
     complete_samples: usize,
-) -> Vec<CitedFact> {
-    let mut passes_seen = std::collections::BTreeMap::<String, usize>::new();
-    let mut exemplars = std::collections::BTreeMap::<String, CitedFact>::new();
-    for sample in &per_sample {
-        let mut this_pass = std::collections::BTreeSet::new();
+) -> AgreementOutcome {
+    // Clusters in FIRST-SEEN order. Deterministic, and the exemplar that
+    // reaches the store is the first phrasing of a claim rather than an
+    // alphabetical accident of whatever key sorted lowest.
+    let mut clusters: Vec<AgreementCluster> = Vec::new();
+    for (index, sample) in per_sample.iter().enumerate() {
         for cited in sample {
-            let key = agreement_key(&cited.fact);
-            if this_pass.insert(key.clone()) {
-                *passes_seen.entry(key.clone()).or_insert(0) += 1;
+            let identity = FactIdentity::of(&cited.fact);
+            if let Some(cluster) = clusters
+                .iter_mut()
+                .find(|cluster| cluster.identity.same_fact(&identity))
+            {
+                // One response repeating itself is ONE vote: a set of sample
+                // indices absorbs the repeat instead of counting it twice.
+                cluster.samples.insert(index);
+            } else {
+                clusters.push(AgreementCluster {
+                    identity,
+                    exemplar: cited.clone(),
+                    samples: BTreeSet::from([index]),
+                });
             }
-            exemplars.entry(key).or_insert_with(|| cited.clone());
         }
     }
 
@@ -897,25 +1179,31 @@ fn keep_recurring_cited_facts(
     // claim it: every fact is stamped, and the reason says why rather than
     // quoting a denominator that does not exist.
     if complete_samples == 0 {
-        return passes_seen
-            .into_keys()
-            .map(|key| {
-                let mut cited = exemplars
-                    .remove(&key)
-                    .expect("every counted proposal has an exemplar");
-                mark_at_most(
-                    &mut cited.fact,
-                    VerificationStatus::SampleDisagreement,
-                    format!(
-                        "no paper-reading sample finished comparably ({} attempted): \
-                         cross-sample agreement could not be established, so this is \
-                         one reader's unconfirmed claim",
-                        sampling.samples.get()
-                    ),
-                );
-                cited
-            })
-            .collect();
+        let claims = clusters.len();
+        return AgreementOutcome {
+            facts: clusters
+                .into_iter()
+                .map(|cluster| {
+                    let mut cited = cluster.exemplar;
+                    note_agreement(
+                        &mut cited.fact,
+                        format!(
+                            "no paper-reading sample finished comparably ({} attempted): \
+                             cross-sample agreement could not be established, so this claim \
+                             carries no agreement evidence either way",
+                            sampling.samples.get()
+                        ),
+                    );
+                    cited
+                })
+                .collect(),
+            summary: AgreementSummary {
+                claims,
+                corroborated: 0,
+                comparable_samples: 0,
+                required: sampling.agreement.get(),
+            },
+        };
     }
 
     // Never demand more agreement than there were complete readers. With one
@@ -924,24 +1212,38 @@ fn keep_recurring_cited_facts(
     // facts for a failure that was ours, not the paper's.
     let total = complete_samples;
     let required = sampling.agreement.get().min(total);
-    passes_seen
+    let mut summary = AgreementSummary {
+        claims: clusters.len(),
+        corroborated: 0,
+        comparable_samples: total,
+        required,
+    };
+    let facts = clusters
         .into_iter()
-        .map(|(key, count)| {
-            let mut cited = exemplars
-                .remove(&key)
-                .expect("every counted proposal has an exemplar");
+        .map(|cluster| {
+            let count = cluster.samples.len();
+            let mut cited = cluster.exemplar;
             if count < required {
-                mark_at_most(
+                note_agreement(
                     &mut cited.fact,
-                    VerificationStatus::SampleDisagreement,
                     format!(
-                        "proposed by {count} of {total} paper-reading samples, below the {required} required"
+                        "proposed by {count} of {total} paper-reading samples, below the \
+                         {required} required for corroboration; retained at its reader-cited \
+                         status because disagreement between passes is a statement about the \
+                         model, not about the document"
                     ),
+                );
+            } else {
+                summary.corroborated += 1;
+                note_agreement(
+                    &mut cited.fact,
+                    format!("corroborated by {count} of {total} paper-reading samples"),
                 );
             }
             cited
         })
-        .collect()
+        .collect();
+    AgreementOutcome { facts, summary }
 }
 
 fn materialize_proposal(
@@ -2802,10 +3104,20 @@ mod tests {
             .iter()
             .filter(|f| f.object != "Shared Concept")
         {
+            // CONTRACT: FAIL TO PROMOTE, NOT DEMOTE. A proposal seen in one
+            // sample keeps the reader-cited status it earned by citing lines
+            // it read — the same status it would have had at `--samples 1` —
+            // and the missing corroboration is RECORDED rather than punished.
             assert_eq!(
                 nonrecurring.verification,
-                Some(VerificationStatus::SampleDisagreement),
-                "a proposal seen in only one sample must be annotated: {nonrecurring:?}"
+                Some(VerificationStatus::CitedByReader),
+                "one sample's proposal must not be demoted below `--samples 1`: \
+                 {nonrecurring:?}"
+            );
+            let reason = nonrecurring.verification_reason.as_deref().unwrap_or("");
+            assert!(
+                reason.contains("below the") && reason.contains("paper-reading samples"),
+                "the shortfall must still be on the record: {nonrecurring:?}"
             );
         }
         server.verify().await;
@@ -2853,7 +3165,7 @@ mod tests {
             ontology: Default::default(),
         };
         // ONE pass that emitted the identical fact three times.
-        let kept = keep_recurring_cited_facts(
+        let kept = kept_facts(
             vec![vec![
                 fact("scan speed"),
                 fact("scan speed"),
@@ -2864,18 +3176,18 @@ mod tests {
             // All three samples finished; only one of them emitted anything.
             3,
         );
-        // CONTRACT CHANGE (annotate-not-refuse): below-agreement facts are
-        // returned stamped `sample_disagreement` instead of rejected — but
-        // the VOTE COUNT rule is unchanged: one response repeating itself
-        // is one vote, not three, so the stamp must be present.
+        // CONTRACT CHANGE (fail-to-promote): a below-agreement fact is no
+        // longer DEMOTED — it keeps its reader-cited status and the shortfall
+        // is recorded. The VOTE COUNT rule is untouched, which is what this
+        // test guards: one response repeating itself is one vote, not three,
+        // so the recorded count must read "1 of 3" and not "3 of 3".
         //
         // See also `a_truncated_sample_does_not_vote_against_what_it_never_read`:
         // the denominator is the COMPLETE samples, not the configured count.
         assert_eq!(kept.len(), 1);
         assert_eq!(
-            kept[0].fact.verification,
-            Some(VerificationStatus::SampleDisagreement),
-            "one response repeating itself is one vote, not three: {:?}",
+            kept[0].fact.verification, None,
+            "nothing may demote a fact for a repeat it did not benefit from: {:?}",
             kept[0].fact
         );
         assert!(
@@ -2916,24 +3228,375 @@ mod tests {
             citation: SourceCitation::new(1, 1, "line", "0".repeat(64), None).unwrap(),
             ontology: Default::default(),
         };
-        let kept = keep_recurring_cited_facts(
+        let outcome = keep_recurring_cited_facts(
             vec![vec![fact("scan speed")], vec![]],
             SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
                 .unwrap(),
             // BOTH samples excluded — nobody finished comparably.
             0,
         );
-        assert_eq!(kept.len(), 1);
+        assert_eq!(outcome.facts.len(), 1);
+        // CONTRACT CHANGE (fail-to-promote): the claim is NOT demoted — a
+        // reader still cited lines it read, and its siblings dying says
+        // nothing against it. So "no consensus" can no longer be asserted on
+        // the fact's status; it is asserted where consensus is actually
+        // claimed — the reported count, which must stay at zero.
         assert_eq!(
-            kept[0].fact.verification,
-            Some(VerificationStatus::SampleDisagreement),
-            "with no comparable reader this is one unconfirmed claim, not consensus"
+            outcome.summary.corroborated, 0,
+            "a crippled run must never report corroboration: {:?}",
+            outcome.summary
         );
-        let reason = kept[0].fact.verification_reason.as_deref().unwrap_or("");
+        assert_eq!(outcome.summary.comparable_samples, 0);
+        assert_eq!(
+            outcome.facts[0].fact.verification, None,
+            "a truncated sibling must not cost this claim its status"
+        );
+        let reason = outcome.facts[0]
+            .fact
+            .verification_reason
+            .as_deref()
+            .unwrap_or("");
         assert!(
             reason.contains("no paper-reading sample finished comparably"),
             "the reason must say agreement could not be established, got: {reason:?}"
         );
+    }
+
+    /// Clustered facts only, for the tests that assert on stamps rather than
+    /// on the reported agreement rate.
+    fn kept_facts(
+        per_sample: Vec<Vec<CitedFact>>,
+        sampling: SamplingPolicy,
+        complete_samples: usize,
+    ) -> Vec<CitedFact> {
+        keep_recurring_cited_facts(per_sample, sampling, complete_samples).facts
+    }
+
+    /// Build a cited fact, varying every field agreement compares.
+    ///
+    /// Deliberately NOT the `fact("scan speed")` shape used by the vote-count
+    /// tests above. Those pass the identical string to every sample, so they
+    /// can only ever exercise the counting arithmetic — which is exactly why
+    /// a key that never matched real model output shipped. These tests vary
+    /// the wording the way two samples actually do.
+    fn worded(subject: &str, predicate: &str, object: &str, value: Option<f64>) -> CitedFact {
+        CitedFact {
+            fact: MaterialFact {
+                subject: subject.into(),
+                predicate: predicate.into(),
+                object: object.into(),
+                value,
+                unit: None,
+                conditions: Vec::new(),
+                confidence: Some(0.9),
+                kind: Some("measurement".into()),
+                evidence_class: Default::default(),
+                verification: None,
+                verification_reason: None,
+            },
+            citation: SourceCitation::new(1, 1, "line", "0".repeat(64), None).unwrap(),
+            ontology: Default::default(),
+        }
+    }
+
+    /// TWO SAMPLES THAT SAY THE SAME THING IN DIFFERENT WORDS AGREE.
+    ///
+    /// Verbatim from a live three-sample run of arXiv:1107.4928, where all
+    /// three samples read all 344 lines. Samples 2 and 3 made the identical
+    /// claim, differing only in how they spelled the relation. The former
+    /// character-exact key scored this "1 of 3" TWICE and stamped both copies
+    /// `SampleDisagreement`, which the default read filter then hides.
+    #[test]
+    fn wording_variance_between_samples_counts_as_agreement() {
+        let kept = kept_facts(
+            vec![
+                vec![worded(
+                    "RKKY interaction",
+                    "is obtained as",
+                    "second order perturbation with respect to the exchange coupling",
+                    None,
+                )],
+                vec![worded(
+                    "RKKY interaction",
+                    "isObtainedBy",
+                    "second-order perturbation with respect to exchange coupling",
+                    None,
+                )],
+            ],
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            2,
+        );
+        assert_eq!(kept.len(), 1, "one claim, not two: {kept:?}");
+        assert_eq!(
+            kept[0].fact.verification, None,
+            "two samples stated this claim, so nothing may stamp it as unconfirmed"
+        );
+        assert!(
+            kept[0]
+                .fact
+                .verification_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("corroborated by 2 of 2")),
+            "agreement is EVIDENCE and belongs on the record, not just in the \
+             aggregate: {:?}",
+            kept[0].fact.verification_reason
+        );
+    }
+
+    /// TURNING SAMPLING ON MUST NEVER HIDE A FACT THAT `--samples 1` SHOWS.
+    ///
+    /// This is the regression that cost a whole corpus. `CitedByReader` ranks
+    /// 7 and is TRUSTED — included in the default read. `SampleDisagreement`
+    /// ranks 5 and is not, and `mark_at_most` overwrites downward, so an
+    /// uncorroborated fact used to land BELOW where a single pass would have
+    /// left it. 86 papers at `--samples 3 --agreement 2` put 21,109 of 21,218
+    /// facts under the default filter: asking for more evidence returned less
+    /// data.
+    ///
+    /// A fact that cited lines the reader actually read is a reader-cited
+    /// fact. What a sibling sample did or did not phrase cannot take that
+    /// away, so sampling may only ever ADD evidence.
+    #[test]
+    fn enabling_sampling_never_hides_what_a_single_pass_would_show() {
+        let one_pass = worded("Ti alloy", "has hardness", "measured hardness", Some(400.0));
+        let sampled = kept_facts(
+            vec![
+                vec![one_pass.clone()],
+                // Two siblings that found nothing in common with it.
+                vec![worded("Fe alloy", "has hardness", "measured", Some(500.0))],
+                vec![worded("Ni alloy", "has hardness", "measured", Some(600.0))],
+            ],
+            SamplingPolicy::new(NonZeroUsize::new(3).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            3,
+        );
+        let ours = sampled
+            .iter()
+            .find(|cited| cited.fact.subject == "Ti alloy")
+            .expect("the fact survives sampling");
+        // Both paths reach `annotate_cited_fact` with no status set, so both
+        // are stamped `CitedByReader` and both are visible. Sampling changed
+        // the RECORD, never the reachability.
+        assert_eq!(one_pass.fact.verification, None);
+        assert_eq!(
+            ours.fact.verification, None,
+            "sampling must not leave this fact worse off than one pass: {ours:?}"
+        );
+        assert!(
+            !VerificationStatus::SampleDisagreement.is_trusted(),
+            "guard the premise: if this status ever became trusted, demoting \
+             would stop hiding data and this test would stop meaning anything"
+        );
+        assert!(VerificationStatus::CitedByReader.is_trusted());
+    }
+
+    /// SIMILARITY MUST NOT MERGE DIFFERENT SUBJECTS.
+    ///
+    /// The loosening above buys agreement; this is the bill it must not pay.
+    /// Two materials sharing one long property phrase are two facts, and a
+    /// key that pooled subject and object words together would fuse them —
+    /// inventing corroboration for a claim neither sample made about the
+    /// other's material. Subject and object are therefore compared
+    /// SEPARATELY, each against its own floor.
+    #[test]
+    fn a_shared_object_never_merges_two_different_subjects() {
+        let kept = kept_facts(
+            vec![
+                vec![worded(
+                    "BaFe2As2",
+                    "exhibits",
+                    "significant magnetomechanical coupling near the transition",
+                    None,
+                )],
+                vec![worded(
+                    "TbMnO3",
+                    "exhibits",
+                    "significant magnetomechanical coupling near the transition",
+                    None,
+                )],
+            ],
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            2,
+        );
+        assert_eq!(kept.len(), 2, "different materials are different facts");
+        for cited in &kept {
+            // Not demoted (fail-to-promote), but each must still be ON RECORD
+            // as having only one sample behind it — otherwise a false merge
+            // and a true non-merge would be indistinguishable.
+            assert_eq!(cited.fact.verification, None, "not demoted: {cited:?}");
+            assert!(
+                cited
+                    .fact
+                    .verification_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("1 of 2")),
+                "one sample only, and it must say so: {cited:?}"
+            );
+        }
+    }
+
+    /// A ONE- OR TWO-LETTER WORD CAN BE THE WHOLE DIFFERENCE.
+    ///
+    /// Guards the tokenizer, which an earlier draft of this comparison got
+    /// wrong: it dropped words shorter than three characters as noise. Every
+    /// chemical element symbol is one or two characters, so `Ti` and `Fe` both
+    /// vanished and two alloys became one corroborated fact. The same draft
+    /// merged `Variant A` with `Variant B`.
+    ///
+    /// This is the failure direction that matters. A missed agreement leaves a
+    /// true fact marked unconfirmed; a false agreement marks a fact CONFIRMED
+    /// that no two readers ever agreed on, and confirmation is what downstream
+    /// trust is built from.
+    #[test]
+    fn short_words_that_distinguish_two_subjects_are_never_dropped() {
+        let sampling =
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap();
+        for (left, right) in [
+            ("Ti alloy", "Fe alloy"),
+            ("Variant A", "Variant B"),
+            // In is indium and As is arsenic; neither may be read as a
+            // stop word once the comparison has lowercased them.
+            ("Ti-In alloy", "Ti-As alloy"),
+        ] {
+            let kept = kept_facts(
+                vec![
+                    vec![worded(
+                        left,
+                        "has hardness",
+                        "measured hardness",
+                        Some(400.0),
+                    )],
+                    vec![worded(
+                        right,
+                        "has hardness",
+                        "measured hardness",
+                        Some(400.0),
+                    )],
+                ],
+                sampling,
+                2,
+            );
+            assert_eq!(
+                kept.len(),
+                2,
+                "{left:?} and {right:?} are different subjects and must not merge"
+            );
+            for cited in &kept {
+                assert!(
+                    cited
+                        .fact
+                        .verification_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("1 of 2")),
+                    "neither {left:?} nor {right:?} was corroborated, and a merge \
+                     would have recorded 2 of 2: {cited:?}"
+                );
+            }
+        }
+    }
+
+    /// A RUN WHERE NOTHING AGREED MUST SAY SO.
+    ///
+    /// The failure this reporting exists for was silent: 86 papers ingested at
+    /// `--samples 3 --agreement 2` stamped `sample_disagreement` on 21,109 of
+    /// 21,218 facts, and every summary reported only the fact count. The
+    /// operator saw a clean ingest while 99.5% of it was hidden from the
+    /// default read.
+    #[test]
+    fn the_agreement_rate_reaches_the_operator() {
+        let outcome = keep_recurring_cited_facts(
+            vec![
+                vec![
+                    worded("Ti alloy", "has hardness", "measured hardness", Some(400.0)),
+                    worded("Fe alloy", "has hardness", "measured hardness", Some(500.0)),
+                ],
+                vec![worded(
+                    "Ti alloy",
+                    "has hardness",
+                    "measured hardness",
+                    Some(400.0),
+                )],
+            ],
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            2,
+        );
+        assert_eq!(
+            outcome.summary,
+            AgreementSummary {
+                claims: 2,
+                corroborated: 1,
+                comparable_samples: 2,
+                required: 2,
+            }
+        );
+        assert_eq!(outcome.summary.stamped(), 1);
+        let report = outcome.summary.report().expect("a sampled run reports");
+        assert!(
+            report.contains("1 of 2 claims corroborated (50%)"),
+            "the rate must be stated plainly, got: {report:?}"
+        );
+        assert!(
+            report.contains("hidden from `prism query`"),
+            "the CONSEQUENCE is the point, not just the count: {report:?}"
+        );
+
+        // A single-pass run never compared anything, so it must not report a
+        // rate — "0 of N corroborated" would read as total disagreement.
+        assert_eq!(
+            AgreementSummary {
+                claims: 40,
+                corroborated: 0,
+                comparable_samples: 1,
+                required: 1,
+            }
+            .report(),
+            None
+        );
+    }
+
+    /// THE NUMBER IS STILL COMPARED EXACTLY.
+    ///
+    /// Loosening the WORDS must not loosen the VALUE. Two samples reporting
+    /// different numbers for the same property have not corroborated
+    /// anything, and treating them as one fact is the fabrication this filter
+    /// exists to catch.
+    #[test]
+    fn similar_wording_with_a_different_value_is_not_agreement() {
+        let kept = kept_facts(
+            vec![
+                vec![worded(
+                    "AlSi10Mg",
+                    "has scan speed",
+                    "optimal laser scan speed",
+                    Some(1250.0),
+                )],
+                vec![worded(
+                    "AlSi10Mg",
+                    "has scan speed",
+                    "optimal laser scan speed",
+                    Some(1400.0),
+                )],
+            ],
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            2,
+        );
+        assert_eq!(kept.len(), 2, "1250 and 1400 are not one measurement");
+        for cited in &kept {
+            assert_eq!(cited.fact.verification, None, "not demoted: {cited:?}");
+            assert!(
+                cited
+                    .fact
+                    .verification_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("1 of 2")),
+                "neither number was corroborated, and the record must say so: {cited:?}"
+            );
+        }
     }
 
     /// A sample cut off by a context overflow must not vote against facts it
@@ -2965,7 +3628,7 @@ mod tests {
             citation: SourceCitation::new(1, 1, "line", "0".repeat(64), None).unwrap(),
             ontology: Default::default(),
         };
-        let kept = keep_recurring_cited_facts(
+        let kept = kept_facts(
             vec![
                 vec![fact("scan speed")],
                 // The overflow-truncated pass: it read almost nothing.

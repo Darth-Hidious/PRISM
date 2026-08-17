@@ -7689,6 +7689,8 @@ async fn run_local_text_ingest_file(
     // chance to read the document, and chunks where EVERY sample showed the
     // routed model was not capable — both reported, never silent.
     let mut agreement_exclusions: Vec<prism_ingest::text_extract::SampleExclusion> = Vec::new();
+    // Summed across chunks so the reported rate describes the whole document.
+    let mut agreement: Option<prism_ingest::text_extract::AgreementSummary> = None;
     let mut model_insufficient: Vec<prism_ingest::text_extract::ModelInsufficiency> = Vec::new();
     let mut agent_turns = 0usize;
     let mut agent_tool_calls = 0usize;
@@ -7772,9 +7774,15 @@ async fn run_local_text_ingest_file(
             agent_traces: chunk_agent_traces,
             agreement_exclusions: chunk_agreement_exclusions,
             model_insufficient: chunk_model_insufficient,
+            agreement: chunk_agreement,
             proposed_classes: chunk_proposed_classes,
             proposed_relations: chunk_proposed_relations,
         } = extraction;
+        if let Some(chunk_agreement) = chunk_agreement {
+            agreement
+                .get_or_insert_with(prism_ingest::text_extract::AgreementSummary::default)
+                .absorb(&chunk_agreement);
+        }
         if let Some(usage) = usage {
             let total = llm_usage.get_or_insert(prism_ingest::llm::UsageInfo {
                 prompt_tokens: 0,
@@ -8199,6 +8207,10 @@ async fn run_local_text_ingest_file(
             // fair chance to read the document, each with the measured
             // reason.
             "agreement_exclusions": agreement_exclusions,
+            // What cross-sample agreement ACHIEVED. Absent for a single-pass
+            // run, which never attempted it. A run where nothing agreed must
+            // not be indistinguishable from a clean one.
+            "agreement": agreement,
             "traces": agent_traces,
         },
         // Non-empty means EVERY sample of those chunks showed the routed
@@ -8653,6 +8665,9 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                 if let Some(report) = chunk_coverage_report(summary) {
                     println!("{report}");
                 }
+                if let Some(report) = agreement_report(summary) {
+                    println!("{report}");
+                }
                 if let Some(report) = llm_usage_report(summary) {
                     println!("{report}");
                 }
@@ -8935,6 +8950,41 @@ fn row_coverage_report(result: &serde_json::Value) -> Option<String> {
         out.push_str(&format!(
             " — {} row(s) NOT processed ({failed} batch(es) failed; see FAILED STEPS)",
             total.saturating_sub(processed),
+        ));
+    }
+    Some(out)
+}
+
+/// Cross-sample agreement for one paper ingest, and what it cost.
+///
+/// `None` for a single-pass run, which never attempted agreement — a rate
+/// would imply a comparison that never happened.
+///
+/// This line exists because its absence hid a real failure. A corpus of 86
+/// papers run at `--samples 3 --agreement 2` stamped `sample_disagreement` on
+/// 21,109 of 21,218 facts. Every summary reported "facts written" and exited
+/// clean, so the operator had no way to see that the default read filter was
+/// hiding 99.5% of what had just been ingested. Corroboration failing is a
+/// result about the MODEL, and it belongs next to the fact count it qualifies.
+fn agreement_report(summary: &serde_json::Value) -> Option<String> {
+    let agreement = summary.get("paper_agent")?.get("agreement")?;
+    let claims = agreement.get("claims")?.as_u64()?;
+    let corroborated = agreement.get("corroborated")?.as_u64()?;
+    let required = agreement.get("required")?.as_u64()?;
+    let comparable = agreement.get("comparable_samples")?.as_u64()?;
+    if claims == 0 || required <= 1 {
+        return None;
+    }
+    let percent = 100.0 * corroborated as f64 / claims as f64;
+    let mut out = format!(
+        "  Agreement: {corroborated} of {claims} claim(s) corroborated ({percent:.0}%) \
+         by {required} of {comparable} comparable sample(s)"
+    );
+    let stamped = claims.saturating_sub(corroborated);
+    if stamped > 0 {
+        out.push_str(&format!(
+            " — {stamped} stamped sample_disagreement and HIDDEN from `prism query` \
+             unless --include-unverified"
         ));
     }
     Some(out)
@@ -13284,8 +13334,20 @@ async fn handle_query(
     limit: usize,
     include_unverified: bool,
 ) -> Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let turso_db = PathBuf::from(home).join(".prism/provenance.db");
+    // Resolve through the SHARED helper, which honours `$PRISM_PROVENANCE_DB`
+    // — "the platform's documented override for this database".
+    //
+    // This line used to open-code `$HOME/.prism/provenance.db`, which is
+    // precisely what that helper's doc comment warns against, and the
+    // consequence was not a test-isolation slip but a wrong ANSWER: the
+    // agent's `query_local` shells out to this command, so pointing PRISM at
+    // a different store (a merged corpus, a scratch graph) moved the agent's
+    // ingest and its writes but NOT its reads. The agent searched the empty
+    // default store, found nothing, and truthfully reported that the corpus
+    // contained no papers on the subject — while 21k assertions sat in the
+    // store the operator had actually selected. A retrieval layer that reads
+    // the wrong database turns an honest agent into a confidently wrong one.
+    let turso_db = prism_agent::hooks::provenance_db_path();
 
     if semantic {
         // Bundled Turso entity vectors written by local ingest, ranked by
@@ -15503,6 +15565,48 @@ mod tests {
         );
 
         assert_eq!(chunk_coverage_report(&serde_json::json!({})), None);
+    }
+
+    /// A run where corroboration collapsed must SAY so in the summary.
+    ///
+    /// Regression for a silent failure: 86 papers at `--samples 3
+    /// --agreement 2` stamped `sample_disagreement` on 21,109 of 21,218 facts
+    /// while every printed line said the ingest was clean. The rate and its
+    /// consequence — hidden from the default read — both have to appear.
+    #[test]
+    fn collapsed_agreement_reaches_the_ingest_summary() {
+        let collapsed = serde_json::json!({"paper_agent": {"agreement": {
+            "claims": 104, "corroborated": 0, "comparable_samples": 3, "required": 2,
+        }}});
+        let report = agreement_report(&collapsed).expect("a sampled run reports");
+        assert!(
+            report.contains("0 of 104 claim(s) corroborated (0%)"),
+            "the collapse must be stated, got: {report}"
+        );
+        assert!(
+            report.contains("104 stamped sample_disagreement")
+                && report.contains("HIDDEN from `prism query`"),
+            "the consequence is the point, not just the rate: {report}"
+        );
+
+        // Full agreement reports the rate and adds no scare text.
+        let clean = serde_json::json!({"paper_agent": {"agreement": {
+            "claims": 12, "corroborated": 12, "comparable_samples": 3, "required": 2,
+        }}});
+        let report = agreement_report(&clean).expect("a sampled run reports");
+        assert!(
+            report.contains("12 of 12 claim(s) corroborated (100%)"),
+            "{report}"
+        );
+        assert!(!report.contains("HIDDEN"), "nothing was hidden: {report}");
+
+        // A single-pass run never compared anything, so it must not print a
+        // rate — "0 of N corroborated" would libel a perfectly good ingest.
+        let single = serde_json::json!({"paper_agent": {"agreement": {
+            "claims": 40, "corroborated": 0, "comparable_samples": 1, "required": 1,
+        }}});
+        assert_eq!(agreement_report(&single), None);
+        assert_eq!(agreement_report(&serde_json::json!({})), None);
     }
 
     /// Reported usage is what the run COST — output is metered and billed

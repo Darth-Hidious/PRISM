@@ -279,6 +279,17 @@ pub enum VerificationStatus {
     /// Too few independent extraction passes produced this fact (see the
     /// ingest sampling policy). A statement about the MODEL's consistency;
     /// the document was never consulted.
+    ///
+    /// LEGACY — NO LONGER PRODUCED, AND MUST NOT BE DELETED. Ingest moved to
+    /// fail-to-promote: a fact short of the agreement bar keeps its
+    /// reader-cited status and records the shortfall in
+    /// `verification_reason`, because demoting it ranked an uncorroborated
+    /// fact BELOW where `--samples 1` would have left it and hid 21,109 of
+    /// one corpus's 21,218 facts from the default read.
+    ///
+    /// The variant stays because stored data still carries it: those rows are
+    /// readable, and `reverify list --status sample_disagreement` reaches them
+    /// through [`Self::ALL`]. Removing it would orphan every such row.
     SampleDisagreement,
     /// Nothing beyond the model's own assertion vouches for this fact: the
     /// review was skipped by policy, the reviewer rendered no verdict, or
@@ -1672,7 +1683,7 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     // Cheap unlocked pre-check: almost every open is of an already-stamped
     // database and must not pay for a write transaction.
-    if read_user_version(conn).await? >= PROV_EVIDENCE_VERSION {
+    if read_user_version(conn).await? >= SAMPLE_DISAGREEMENT_RETIRED_VERSION {
         return Ok(());
     }
 
@@ -1685,7 +1696,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     let txn = begin_immediate(conn).await?;
     let result = async {
         let version = read_user_version(conn).await?;
-        if version >= PROV_EVIDENCE_VERSION {
+        if version >= SAMPLE_DISAGREEMENT_RETIRED_VERSION {
             return Ok(());
         }
 
@@ -1703,6 +1714,9 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         if version < PROV_EVIDENCE_VERSION {
             migrate_corroborations_to_evidence(conn).await?;
         }
+        if version < SAMPLE_DISAGREEMENT_RETIRED_VERSION {
+            migrate_retire_sample_disagreement(conn).await?;
+        }
 
         // Stamp even when nothing needed changing — a fresh store has empty
         // tables, and returning without stamping would make every subsequent
@@ -1710,7 +1724,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         // all generations, so a crash between them re-runs from the last
         // committed generation rather than skipping one.
         conn.execute(
-            &format!("PRAGMA user_version = {PROV_EVIDENCE_VERSION}"),
+            &format!("PRAGMA user_version = {SAMPLE_DISAGREEMENT_RETIRED_VERSION}"),
             (),
         )
         .await?;
@@ -1742,6 +1756,83 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
 /// Caller must hold the one-shot guard and the open transaction — see
 /// [`run_key_migrations`]. Runs AFTER the id re-keys so evidence rows are
 /// born under final assertion ids.
+/// Generation 6 — move stored `sample_disagreement` rows to the status
+/// fail-to-promote ingest would have given them.
+///
+/// See [`SAMPLE_DISAGREEMENT_RETIRED_VERSION`] for why this is safe to move
+/// UP and why value-less-with-unit rows land on `model_asserted` instead.
+///
+/// THE STATUS IS DENORMALIZED ACROSS THREE SURFACES and all three move, or
+/// the graph and the assertion table would disagree about the same fact:
+/// `prov_assertion` (the authority), `prov_assertion_evidence` (per witness),
+/// and the `emmo_edge.props_json` copy the graph reads.
+///
+/// One bounded imprecision, stated rather than hidden: `emmo_edge` carries no
+/// assertion id and no value or unit, so the value-less-with-unit exception
+/// cannot be reproduced there and every edge copy moves to
+/// `cited_by_reader`. On one measured corpus that is ~196 of 20,892 edges
+/// whose denormalized copy reads one rank more trusting than their assertion
+/// row, which still says `model_asserted`. `prov_assertion` remains the
+/// authority for trust decisions; a graph read that filters on the edge copy
+/// alone was already reading a cache, not the record.
+///
+/// The original reason is KEPT and the migration appends its own marker. That
+/// text is the only surviving evidence of how much agreement a fact had, and
+/// an audit must be able to tell a migrated row from a freshly ingested one.
+///
+/// Caller must hold the one-shot guard and the open transaction — see
+/// [`run_key_migrations`].
+async fn migrate_retire_sample_disagreement(conn: &turso::Connection) -> Result<()> {
+    const MIGRATED: &str =
+        "[migrated: cross-sample disagreement no longer lowers a reader-cited fact]";
+
+    // The authority. `NULL || ' '` is NULL, so COALESCE supplies the empty
+    // prefix when a row never carried a reason.
+    conn.execute(
+        &format!(
+            "UPDATE prov_assertion \
+                SET verification_status = CASE \
+                        WHEN value IS NULL AND unit IS NOT NULL THEN 'model_asserted' \
+                        ELSE 'cited_by_reader' END, \
+                    verification_reason = COALESCE(verification_reason || ' ', '') || '{MIGRATED}' \
+              WHERE verification_status = 'sample_disagreement'"
+        ),
+        (),
+    )
+    .await?;
+
+    // Per-witness rows take the SAME decision as their parent, read from the
+    // parent's value and unit. `EXISTS` guards the correlated subquery: a
+    // witness whose assertion is gone must keep its own status rather than
+    // have NULL written over it.
+    conn.execute(
+        "UPDATE prov_assertion_evidence \
+            SET verification_status = ( \
+                    SELECT CASE \
+                             WHEN a.value IS NULL AND a.unit IS NOT NULL THEN 'model_asserted' \
+                             ELSE 'cited_by_reader' END \
+                      FROM prov_assertion a WHERE a.id = prov_assertion_evidence.assertion_id) \
+          WHERE verification_status = 'sample_disagreement' \
+            AND EXISTS (SELECT 1 FROM prov_assertion a \
+                         WHERE a.id = prov_assertion_evidence.assertion_id)",
+        (),
+    )
+    .await?;
+
+    // The graph's denormalized copy. Replaces the exact key/value pair rather
+    // than the whole column, so any other property on the edge survives.
+    conn.execute(
+        "UPDATE emmo_edge \
+            SET props_json = replace(props_json, \
+                    '\"verification_status\":\"sample_disagreement\"', \
+                    '\"verification_status\":\"cited_by_reader\"') \
+          WHERE props_json LIKE '%sample_disagreement%'",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn migrate_corroborations_to_evidence(conn: &turso::Connection) -> Result<()> {
     struct LegacyRow {
         id: String,
@@ -1925,6 +2016,29 @@ const EMMO_KEY_MIGRATION_VERSION: i64 = 4;
 /// from each other: a v4 database needs only this backfill, and must not pay
 /// for an assertion re-key or a key qualification that are already done.
 const PROV_EVIDENCE_VERSION: i64 = 5;
+
+/// Generation 6 — retire `sample_disagreement` from STORED rows.
+///
+/// Ingest moved to fail-to-promote: a fact short of the cross-sample agreement
+/// bar keeps the reader-cited status it earned and records the shortfall in
+/// `verification_reason`. Changing that code does not rewrite databases that
+/// were already written under the old rule, and those rows are the whole
+/// problem — `sample_disagreement` is not in [`VerificationStatus::is_trusted`],
+/// so the default read hides them. One measured corpus of 86 papers has 21,109
+/// of 21,218 facts in exactly that state: present, correct, and invisible.
+///
+/// Safe to move UP because `mark_at_most` only ever recorded the LOWEST-ranked
+/// finding. A row reading `sample_disagreement` (rank 5) therefore had nothing
+/// worse to say about itself — any real defect would have outranked it
+/// downward and be stored instead.
+///
+/// ONE EXCEPTION, and it is recoverable from the data rather than guessed: a
+/// value-less row carrying a unit is what `annotate_cited_fact` calls
+/// `model_asserted` (rank 6). Under the old ordering the disagreement stamp
+/// landed first and blocked that, so those rows must land on `model_asserted`,
+/// not `cited_by_reader`, or the migration would promote them past a finding
+/// that genuinely applies.
+const SAMPLE_DISAGREEMENT_RETIRED_VERSION: i64 = 6;
 
 /// Tenant to attribute a row to when the stored value is absent.
 ///
@@ -8905,7 +9019,7 @@ mod tests {
         let conn = database.connect().unwrap();
         assert_eq!(
             read_user_version(&conn).await.unwrap(),
-            PROV_EVIDENCE_VERSION,
+            SAMPLE_DISAGREEMENT_RETIRED_VERSION,
             "the stamp must be the LATEST generation, not the assertion one — \
              stamping the assertion version would leave the key migration \
              re-running on every open",
@@ -8920,6 +9034,117 @@ mod tests {
     /// carrying a deliberately wrong id is left alone (the re-key did not run)
     /// while the unqualified EMMO key beside it IS qualified (the key migration
     /// did), and the database ends stamped at v4.
+    /// A STORE WRITTEN UNDER THE OLD DEMOTION RULE BECOMES READABLE ON OPEN.
+    ///
+    /// The measured damage: 21,109 of one corpus's 21,218 facts sat at
+    /// `sample_disagreement`, which is not in the trusted set, so the default
+    /// read hid them. Ingest now fails-to-promote instead of demoting, but that
+    /// only helps FUTURE writes — a database already on disk stays hidden until
+    /// something moves it, and no user should have to know that.
+    ///
+    /// Also pins the exception: a value-less row carrying a unit is
+    /// `model_asserted`, not `cited_by_reader`, because that finding genuinely
+    /// applies and was only masked by the disagreement stamp landing first.
+    #[tokio::test]
+    async fn a_legacy_sample_disagreement_store_becomes_readable_on_open() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        drop(store);
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            // Two legacy rows: an ordinary one, and the value-less-with-unit
+            // shape that must NOT be promoted as far.
+            conn.execute(
+                r#"INSERT INTO prov_assertion
+                   (id, subject, predicate, object, conditions_json, evidence_class,
+                    confidence, corroborations, activity_id, source, agent, tenant,
+                    value, unit, verification_status, verification_reason)
+                   VALUES ('ordinary', 'steel', 'has_phase', 'bcc', '[]', 'research',
+                           0.7, 1, 'act', 'x.pdf', 'agent', 't1', 5.0, NULL,
+                           'sample_disagreement', 'proposed by 1 of 3 paper-reading samples'),
+                          ('valueless', 'steel', 'has_speed', 'fast', '[]', 'research',
+                           0.7, 1, 'act', 'x.pdf', 'agent', 't1', NULL, 'QUDT:MilliM-PER-SEC',
+                           'sample_disagreement', 'proposed by 1 of 3 paper-reading samples')"#,
+                (),
+            )
+            .await
+            .unwrap();
+            // The graph's denormalized copy, alongside another property that
+            // must survive the rewrite.
+            conn.execute(
+                r#"INSERT INTO emmo_edge (id, source_key, target_key, rel_type, predicate,
+                                          confidence, tenant, props_json)
+                   VALUES ('e1', 'Matter:steel', 'Matter:bcc', 'has_phase', 'has_phase',
+                           0.7, 't1',
+                           '{"verification_status":"sample_disagreement","keep":"me"}')"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("PRAGMA user_version = 5", ()).await.unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion WHERE verification_status = 'sample_disagreement'",
+            )
+            .await,
+            0,
+            "no stored row may still carry the retired status"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion \
+                 WHERE id = 'ordinary' AND verification_status = 'cited_by_reader'",
+            )
+            .await,
+            1,
+            "an ordinary uncorroborated fact becomes trusted-but-unverified"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion \
+                 WHERE id = 'valueless' AND verification_status = 'model_asserted'",
+            )
+            .await,
+            1,
+            "a value-less row carrying a unit must not be promoted past `model_asserted`"
+        );
+        // The original reason survives — it is the only record of how much
+        // agreement the fact had — and the migration is auditable.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion \
+                 WHERE verification_reason LIKE '%1 of 3 paper-reading samples%' \
+                   AND verification_reason LIKE '%[migrated:%'",
+            )
+            .await,
+            2,
+            "the original reason must be kept AND the migration marked"
+        );
+        // The graph copy moves too, and unrelated properties survive.
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_edge \
+                 WHERE props_json LIKE '%\"verification_status\":\"cited_by_reader\"%' \
+                   AND props_json LIKE '%\"keep\":\"me\"%'",
+            )
+            .await,
+            1,
+            "the denormalized edge copy must move without losing other properties"
+        );
+    }
+
     #[tokio::test]
     async fn a_v3_database_migrates_keys_without_rekeying_assertions() {
         let db = TempDb::new();
@@ -8974,7 +9199,7 @@ mod tests {
         );
         assert_eq!(
             read_user_version(&store.conn).await.unwrap(),
-            PROV_EVIDENCE_VERSION,
+            SAMPLE_DISAGREEMENT_RETIRED_VERSION,
         );
     }
 
@@ -9519,7 +9744,7 @@ mod tests {
             .await
             .unwrap();
             conn.execute(
-                &format!("PRAGMA user_version = {PROV_EVIDENCE_VERSION}"),
+                &format!("PRAGMA user_version = {SAMPLE_DISAGREEMENT_RETIRED_VERSION}"),
                 (),
             )
             .await

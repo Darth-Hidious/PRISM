@@ -343,6 +343,9 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             let rejected: Vec<serde_json::Value> = Vec::new();
             let mut agreement_exclusions: Vec<prism_ingest::text_extract::SampleExclusion> =
                 Vec::new();
+            // What cross-sample agreement achieved, so a run where nothing
+            // agreed cannot report as a clean ingest.
+            let mut agreement: Option<prism_ingest::text_extract::AgreementSummary> = None;
             let mut model_insufficient: Option<prism_ingest::text_extract::ModelInsufficiency> =
                 None;
             // The paper agent gets one workspace containing every selected
@@ -406,6 +409,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     .await
                     .with_context(|| "agentic paper extraction failed")?;
                 agreement_exclusions = extraction.agreement_exclusions.clone();
+                agreement = extraction.agreement.clone();
                 model_insufficient = extraction.model_insufficient.clone();
                 if let Some(reason) = &extraction.parse_error {
                     extraction_failures.push(json!({
@@ -529,6 +533,9 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         // never had a fair chance to read the document, each
                         // with the measured reason.
                         "agreement_exclusions": agreement_exclusions,
+                        // What cross-sample agreement ACHIEVED. Absent for a
+                        // single-pass run, which never attempted it.
+                        "agreement": agreement,
                         "traces": agent_traces,
                     },
                     // Non-null means EVERY sample showed the routed model was
