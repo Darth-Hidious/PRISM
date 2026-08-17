@@ -179,6 +179,12 @@ pub fn to_turtle(o: &InducedOntology) -> String {
         if class.declared_by_reference {
             out.push_str(";\n    prism:declaredByReference true ");
         }
+        if let Some(sign_domain) = class.sign_domain {
+            out.push_str(&format!(
+                ";\n    prism:signDomain \"{}\" ",
+                super::sign_domain_as_stored(sign_domain)
+            ));
+        }
         out.push_str(".\n\n");
     }
 
@@ -207,6 +213,15 @@ pub fn to_turtle(o: &InducedOntology) -> String {
         match &rel.aligned_iri {
             Some(iri) => out.push_str(&format!(";\n    skos:exactMatch <{iri}> ")),
             None => out.push_str(";\n    prism:alignment \"unmatched\" "),
+        }
+        // The relation's typed fact shape, when declared. This is what lets a
+        // promoted ontology reach typed measurement/phase/processing/contains
+        // facts instead of untyped edges — with zero Rust edits.
+        if let Some(kind) = rel.fact_kind {
+            out.push_str(&format!(
+                ";\n    prism:factKind \"{}\" ",
+                super::fact_kind_as_stored(kind)
+            ));
         }
         out.push_str(".\n\n");
     }
@@ -360,10 +375,22 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
     }
 
     let declared_by_ref = prism.get_unchecked("declaredByReference");
+    let sign_domain_pred = prism.get_unchecked("signDomain");
     let mut classes = Vec::with_capacity(class_nodes.len());
     for node in &class_nodes {
         let label = literal_of(&graph, node, &pref_label).unwrap_or_default();
         let parent = iri_of(&graph, node, &sub_class_of).map(|iri| label_for_iri(&iri, &labels));
+        // Governance, not provenance: an unknown sign-domain value is a
+        // loud refusal, never a silent read-as-silence.
+        let sign_domain = match literal_of(&graph, node, &sign_domain_pred) {
+            Some(raw) => Some(super::sign_domain_from_stored(&raw).ok_or_else(|| {
+                anyhow!(
+                    "class {label:?} carries prism:signDomain {raw:?} — expected \
+                         \"non_negative\", \"signed\" or \"unspecified\""
+                )
+            })?),
+            None => None,
+        };
         classes.push(InducedClass {
             label,
             definition: literal_of(&graph, node, &comment).unwrap_or_default(),
@@ -371,6 +398,7 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
             aligned_iri: iri_of(&graph, node, &exact_match),
             declared_by_reference: literal_of(&graph, node, &declared_by_ref)
                 .is_some_and(|v| v == "true"),
+            sign_domain,
         });
     }
 
@@ -378,10 +406,24 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
         .triples_matching(Any, [rdf::type_], [owl_object_property])
         .filter_map(|t| t.ok().map(|t| t.s()))
         .collect();
+    let fact_kind_pred = prism.get_unchecked("factKind");
     let mut relations = Vec::with_capacity(rel_nodes.len());
     for node in &rel_nodes {
+        let label = literal_of(&graph, node, &pref_label).unwrap_or_default();
+        // Same governance as `signDomain`: an unknown value is a loud
+        // refusal. Reading a tampered annotation as "generic edge" would
+        // silently downgrade typed facts to untyped ones.
+        let fact_kind = match literal_of(&graph, node, &fact_kind_pred) {
+            Some(raw) => Some(super::fact_kind_from_stored(&raw).ok_or_else(|| {
+                anyhow!(
+                    "relation {label:?} carries prism:factKind {raw:?} — expected \
+                     \"measurement\", \"phase\", \"processing\" or \"contains\""
+                )
+            })?),
+            None => None,
+        };
         relations.push(InducedRelation {
-            label: literal_of(&graph, node, &pref_label).unwrap_or_default(),
+            label,
             definition: literal_of(&graph, node, &comment).unwrap_or_default(),
             domain: iri_of(&graph, node, &rdfs_domain)
                 .map(|iri| label_for_iri(&iri, &labels))
@@ -390,6 +432,7 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
                 .map(|iri| label_for_iri(&iri, &labels))
                 .unwrap_or_default(),
             aligned_iri: iri_of(&graph, node, &exact_match),
+            fact_kind,
         });
     }
 
@@ -463,6 +506,7 @@ mod tests {
     use crate::semantic_validation::{
         OntologyLabelProposal, SemanticCheckReport, SemanticValidationStatus,
     };
+    use prism_provenance::QuantitySignDomain;
 
     fn sample() -> InducedOntology {
         InducedOntology {
@@ -475,6 +519,7 @@ mod tests {
                     parent: Some("Material".into()),
                     aligned_iri: Some("https://w3id.org/emmo#EMMO_alloy".into()),
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
                 InducedClass {
                     label: "Heat \"Quench\" Treatment\nStep".into(),
@@ -482,6 +527,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: true,
+                    sign_domain: None,
                 },
                 InducedClass {
                     label: "Material".into(),
@@ -489,6 +535,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
             ],
             relations: vec![InducedRelation {
@@ -497,6 +544,7 @@ mod tests {
                 domain: "Alloy".into(),
                 range: "Material".into(),
                 aligned_iri: None,
+                fact_kind: None,
             }],
             provenance: InductionProvenance {
                 model: "qwen2.5:3b".into(),
@@ -671,5 +719,48 @@ mod tests {
         // And the artifact on disk is untouched — still a draft.
         let reread = parse_turtle(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(reread.status, OntologyStatus::Draft);
+    }
+
+    /// The optional `prism:signDomain` annotation round-trips through the
+    /// artifact bytes — this is the channel a promoted ontology uses to
+    /// supply quantity sign constraints with zero Rust edits.
+    #[test]
+    fn sign_domain_annotations_round_trip_and_absence_stays_silence() {
+        let mut o = sample();
+        o.classes[0].sign_domain = Some(QuantitySignDomain::NonNegative);
+        o.classes[2].sign_domain = Some(QuantitySignDomain::Signed);
+        let ttl = to_turtle(&o);
+        assert!(ttl.contains("prism:signDomain \"non_negative\""), "{ttl}");
+        assert!(ttl.contains("prism:signDomain \"signed\""), "{ttl}");
+
+        let parsed = parse_turtle(&ttl).expect("emitted artifact must parse");
+        let alloy = parsed.classes.iter().find(|c| c.label == "Alloy").unwrap();
+        assert_eq!(alloy.sign_domain, Some(QuantitySignDomain::NonNegative));
+        let material = parsed
+            .classes
+            .iter()
+            .find(|c| c.label == "Material")
+            .unwrap();
+        assert_eq!(material.sign_domain, Some(QuantitySignDomain::Signed));
+        // A class without the annotation stays silent.
+        let quench = parsed
+            .classes
+            .iter()
+            .find(|c| c.label.contains("Quench"))
+            .unwrap();
+        assert_eq!(quench.sign_domain, None);
+    }
+
+    #[test]
+    fn an_unknown_sign_domain_value_is_refused_loudly() {
+        // Governance, not provenance: a tampered or foreign annotation must
+        // fail the parse naming the offending class — never read as silence.
+        let mut o = sample();
+        o.classes[0].sign_domain = Some(QuantitySignDomain::NonNegative);
+        let ttl = to_turtle(&o).replace("non_negative", "always_positive");
+        let err = parse_turtle(&ttl).expect_err("an unknown sign domain is a refusal");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("signDomain"), "{msg}");
+        assert!(msg.contains("Alloy"), "{msg}");
     }
 }

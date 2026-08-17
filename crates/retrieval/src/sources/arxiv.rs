@@ -7,7 +7,12 @@ use quick_xml::events::Event;
 use super::{FetchCtx, normalize_doi, url_encode};
 use crate::model::{FulltextFormat, Paper, SourcePage};
 
-const DEFAULT_BASE: &str = "http://export.arxiv.org/api/query";
+/// HTTPS, not HTTP. arXiv answers plain `http://` with a bare `301` and an
+/// EMPTY body, so every arXiv search silently returned zero results — on the
+/// single most important source for this domain. The client does not follow
+/// redirects, so nothing recovered it and nothing failed loudly either: the
+/// agent simply concluded arXiv had no papers on the subject.
+const DEFAULT_BASE: &str = "https://export.arxiv.org/api/query";
 
 pub const ID: &str = "arxiv";
 pub const INITIAL_CURSOR: &str = "0";

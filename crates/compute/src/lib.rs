@@ -6,12 +6,15 @@
 //! - **Local** ([`LocalBackend`]): Docker/Podman containers on the current machine.
 //! - **Cloud** ([`Marc27Backend`]): MARC27 platform-managed compute via REST API.
 //! - **BYOC** ([`byoc`]): Bring Your Own Compute — SSH, Kubernetes, or SLURM.
+//! - **HyperQueue** ([`hyperqueue`]): many independent tasks via the `hq`
+//!   binary, standalone or on top of Slurm/PBS through HQ's autoallocator.
 //!
 //! The [`ComputeRouter`] selects the appropriate backend based on image names and
 //! configuration. Job lifecycle is tracked by [`JobTracker`].
 
 pub mod backend;
 pub mod byoc;
+pub mod hyperqueue;
 pub mod job;
 pub mod local;
 pub mod marc27;
@@ -23,6 +26,7 @@ use uuid::Uuid;
 
 // Re-exports for convenience.
 pub use backend::ComputeRouter;
+pub use hyperqueue::{HqTask, HyperQueueBackend, HyperQueueConfig};
 pub use job::JobTracker;
 pub use local::LocalBackend;
 pub use marc27::Marc27Auth;
@@ -44,7 +48,7 @@ pub struct ExperimentPlan {
     pub inputs: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobStatus {
     Queued,
     Running { progress: f64 },

@@ -340,7 +340,10 @@ async fn same_corpus_same_responses_same_artifact_modulo_timestamp() {
     }
     assert_eq!(artifacts[0], artifacts[1]);
     assert!(artifacts[0].contains("prism:model \"scripted-test-model\""));
-    assert!(artifacts[0].contains("prism:promptVersion \"1\""));
+    // CONTRACT CHANGE: the induction prompt is domain-abstract since
+    // PROMPT_VERSION 2 (metallurgy examples replaced by placeholders), so
+    // every artifact induced after that bump stamps "2".
+    assert!(artifacts[0].contains("prism:promptVersion \"2\""));
     assert!(artifacts[0].contains(&format!("prism:corpusHash \"{}\"", corpus.hash)));
     assert!(
         artifacts[0].contains("prism:status \"draft\""),

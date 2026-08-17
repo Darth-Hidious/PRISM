@@ -29,6 +29,6 @@ expression: rendered
 ┌ Prompt ─│   Ctrl-$                Toggle cost in the status bar                        │
 │ Type a m│   Ctrl-Y                Copy mode — disable mouse capture to drag-select/copy│
 │         └──────────────────────────────────────────────────────────────────────────────┘
-│                                                                 ││
-└─────────────────────────────────────────────────────────────────┘│
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

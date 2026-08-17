@@ -1,4 +1,4 @@
-//! Extracted claims typed for EMMO ingestion.
+//! Extracted claims typed for ontology-bound ingestion.
 //!
 //! This engine never invents claims: a claim exists only because an
 //! extractor produced it from a located block of a real document, and every
@@ -9,7 +9,7 @@
 //!
 //! The engine's job here is the contract and the stamping:
 //!
-//! * subject / predicate / object with value + QUDT unit
+//! * subject / predicate / object with value + unit term
 //! * measurement conditions (a number without conditions is not a property)
 //! * provenance back to the exact document and locator
 //! * an evidence class capped at `research` — literature extraction can
@@ -21,176 +21,110 @@
 //! vocabulary strings are the stable machine contract ("indeterminate",
 //! "research", "screening", "reference_validated").
 //!
-//! RECORDED, NOT FIXED (round 12) — NUMERIC DECORATIONS ARE INVISIBLE:
-//! "950 ± 30 MPa" stamps the TOLERANCE as the value. The plus-minus
-//! sign appears nowhere in this file (grep-verified round 11,
-//! re-verified round 12), so the uncertainty figure passes every guard
-//! and becomes the property record under both spellings ("+/-" and
-//! U+00B1), while the value it decorates stamps as a second claim.
-//! Pinned as KNOWN corpus rows in tests/claim_corpus.rs (the
+//! CONTRACT CHANGE (de-hardcoding) — NO DOMAIN VOCABULARY IN THIS FILE.
+//! PRISM is a HARNESS with PLUGGABLE ontologies: a customer brings a domain
+//! (pharma, semiconductors, biology — in any language), the ontology is
+//! authored for it, and this Rust never changes. Earlier revisions of this
+//! module carried English/materials vocabularies that decided what a fact
+//! means — a sign table (`NONNEGATIVE_QUANTITIES` + differential markers +
+//! strength homographs), a unit lexicon (`UNIT_TOKENS` and its derived
+//! initials), and label vocabularies (`LABEL_WORDS`, `ABBREV_LABEL_WORDS`,
+//! `LIST_CONTINUATIONS`). All of it is deleted. Every guard left is either
+//! domain-independent structure (token boundaries, bracketed citation
+//! markers, digit/dash/digit ranges, containment inside the claim's own
+//! name) or knowledge the CALLER supplies per claim through [`GuardPolicy`],
+//! which the ingest side reads from the active ontology and the fact itself
+//! at grounding time. Where the ontology is silent, the check does not
+//! apply — it is never replaced by a guess. The guards are notes for a
+//! later re-checking model, not verdicts: a fact that fails one is stored
+//! carrying a `VerificationStatus`, not dropped. A guard that could not be
+//! made domain-independent (the label vocabulary) was deleted rather than
+//! kept wrong: a wrong note is worse than no note.
+//!
+//! RECORDED, NOT FIXED (round 12) — NUMERIC DECORATIONS ARE INVISIBLE
+//! (PARTIALLY CLOSED, bugfix pass B8): "950 ± 30 MPa" used to stamp the
+//! TOLERANCE as the value. The PLUS-MINUS half is now FIXED — the
+//! `Uncertainty` guard refuses a number whose left neighbour is the
+//! plus-minus notation (U+00B1 or ASCII `+/-`), mathematical notation,
+//! not vocabulary; the value it decorates still stamps. Pinned as KNOWN corpus rows in tests/claim_corpus.rs (the
 //! numeric-decorations family); the same family carries the
 //! digit-dash-LETTER locants ("3-point", "2-step", "2-propanol",
-//! "N-methyl-2-pyrrolidone"), which are equally unguarded. Record
-//! only — fixing it needs a decoration-aware number scan, not a glyph
-//! list.
+//! "N-methyl-2-pyrrolidone"), which are STILL unguarded (refusing
+//! digit-dash-letter outright would also refuse hyphenated unit
+//! spellings such as "2-mm", and telling them apart needs a unit
+//! lexicon only the ontology can supply — exactly the hardcoding this
+//! contract deleted).
+//!
+//! BUGFIX-PASS NOTES (B9–B12), for the ledger:
+//! * B9: `SupportRefusal::ValueNotRendered` now splits "the value never
+//!   rendered anywhere" from `NoSpan` — over-refusals are no longer filed
+//!   as the model's hallucinations by default.
+//! * B10: `validate_and_stamp` runs the quote-containment checks BEFORE
+//!   the unit refusal, so a unitless numeric claim with a false citation
+//!   is recorded as the false citation it is.
+//! * B11: `scan_number_evidence` reports the first refusal in POSITION
+//!   order (was: needle-form order).
+//! * B12 (spaced-dash half): `dash_range_endpoint` tolerates whitespace
+//!   around the dash glyph on both sides, so "950 \u{2013} 1100" and its
+//!   ASCII twin drop both endpoints. The WORD-form range ("950 to 1100")
+//!   and the double-dash negative form stay open and recorded: a range
+//!   connector word is language vocabulary, and "950 bis 1100" in a
+//!   German paper would sail past an English word guard — that input
+//!   belongs to the ontology, not to Rust.
 //!
 //! Known provenance caveat: claims can differ by fetch route.
-//! (a)+(b) CLOSED round 10 + round 11; (c) opened round 11, recorded
-//! closed round 12 on the fabrication half — but round 13 CORRECTED
-//! that record: the closure is SPELLING-SCOPED, not predicate-scoped
-//! (see item (c) below). The recall half is carried as corpus KNOWN
-//! rows.
-//!
-//! (a) RANGES: JATS preserves U+2013,
-//! `pdf-extract` normalises ranges to '-'. Until round 10 the engine
-//! refused the en-dash endpoints but stamped the ASCII ones
-//! (compound-friendly, by decision), so the same paper yielded different
-//! claims depending on how it was fetched. The range guard now covers
-//! every glyph of the dash class; both routes refuse both endpoints.
+//! (a) RANGES: JATS preserves U+2013, `pdf-extract` normalises ranges to
+//! '-'. The range guard covers every glyph of the dash class; both routes
+//! refuse both endpoints of a digit/dash/digit run.
 //! (b) SIGNED VALUES at |value| >= 1000: JATS typesets the minus as
-//! U+2212, `pdf-extract` emits '-'. Until round 11 the U+2212 sign
-//! attached only to the comma-grouped form, so the un-grouped
-//! "\u{2212}1350" dropped NoSpan -> MissingQuote (misfiled as the
-//! model's fault) while "-1350" stamped. The sign now attaches to the
-//! plain form too; both routes stamp.
-//! (c) SEPARATOR SHAPES, opened round 11, closed round 12 where it
-//! fabricates: JATS typesets the label/value separator as U+2013,
-//! `pdf-extract` emits '-'. Round 11's revert made the JATS spelling
-//! of a separator shape ("UTS \u{2013}950 MPa") drop while the SAME
-//! sentence fetched through the PDF route ("UTS -950 MPa") stamped a
-//! negative from a positive source — the divergence class (a)+(b)
-//! closed, reopened by the same commit that recorded closing it.
-//! Round 12 NARROWED (round 13 record correction: NOT fully closed)
-//! the fabrication half with the predicate's SIGN DOMAIN
-//! (`NONNEGATIVE_QUANTITIES` in `claims.rs`): for non-negative
-//! quantities BOTH routes now drop the separator shape (JATS U+2013:
-//! no signed needle -> NoSpan; pdf-extract '-': the SignDomain guard).
-//! ROUND 13 RECORD CORRECTION — this is SPELLING-SCOPED, not
-//! predicate-scoped: `SignDomain` matches the object against the FIVE
-//! EXACT strings of `NONNEGATIVE_QUANTITIES` (slice `contains` =
-//! equality on the normalized text), and `normalize_for_containment`
-//! only lowercases / maps `_` -> space / collapses whitespace — no
-//! stemming, no head-noun, no unit strip. The extractor
-//! (`text_extract.rs`) imposes NO property vocabulary, and the
-//! codebase itself emits a missed spelling
-//! (`object: "tensile strength".into()` at cli/main.rs:13405).
-//! Measured guard-isolated round 13: of 22 common spellings only the
-//! five canonical (uts, yield strength, hardness, density, grain size)
-//! drop a negative; the other 17 — `ultimate tensile strength`,
-//! `tensile strength`, `UTS (MPa)`, `0.2% yield strength`, `yield
-//! stress`, `proof stress`, `Vickers hardness`, `microhardness`,
-//! `relative density`, `average grain size`, `grain diameter`,
-//! `compressive strength`, `fracture strength`, ... — still STAMP a
-//! negative from a positive source. More entries is NOT the fix (the
-//! const doc below disclaims "another word list"); round 13 item 5
-//! ADOPTED a head-noun SUFFIX rule — every `*strength`, `*hardness` and
-//! `*grain size` is non-negative and has NO signed homograph, so 16 of
-//! the 22 spellings now drop a negative (was 5). The round-13 record
-//! ALSO claimed `0 over-refusal` here — that was FALSE: at the
-//! round-13 HEAD 27 signed spellings (differential phrasing like
-//! `change in yield strength`, `difference in hardness`, plus the
-//! genuinely-signed homographs `signal strength` / `field strength`)
-//! returned Err(Guarded{SignDomain}). Round 14 item 1 corrected that
-//! record and round 14 item 3 REPAIRED it: a whole-word differential
-//! marker, or a signal/field-strength homograph, now exempts the
-//! phrase from the suffix rule so those 27 stamp again (see
-//! `is_nonnegative_quantity`). `density` stays EXACT: charge/current
-//! density can be negative, so `relative density` / `bulk density`
-//! still fabricate.
+//! U+2212, `pdf-extract` emits '-'. The sign attaches to both the plain
+//! and the comma-grouped rendering; both routes stamp a genuine negative.
+//! (c) SEPARATOR SHAPES — the dash between a label and its value
+//! ("UTS –950 MPa") is locally indistinguishable from a minus. The
+//! domain-independent defences left are: U+2013/U+2014 are NOT sign
+//! glyphs (the shape drops as NoSpan on the JATS route), the
+//! `SeparatorDash` guard's label-inline shape (the claim's own object
+//! name abuts the dash — no vocabulary needed), and its bracketed shape
+//! when the fact's own unit term follows the value. For a claim whose
+//! ontology declares the quantity NON-NEGATIVE ([`GuardPolicy`]), the
+//! `SignDomain` guard refuses every glyph. Where the ontology is SILENT
+//! the ASCII/U+2212 separator fabrication on a signed quantity is OPEN
+//! again, honestly: closing it with a quantity-name list is exactly the
+//! hardcoding this contract deleted.
 //!
-//! ROUND 14 ITEM 5 — THE OPEN SET IS NOT 6, AND WAS NEVER ENUMERATED.
-//! The round-13 record's "6 of 22 spellings still fabricate" was a
-//! SAMPLE reported as a total (22 was sampled, not enumerated).
-//! Measured at HEAD the open set is unbounded and the lexical approach
-//! CANNOT enumerate it. Three families, every member a strictly-
-//! non-negative magnitude with NO signed homograph, every one stamping
-//! a -950:
-//!   * DENSITY family — `relative`, `bulk`, `apparent`, `theoretical`,
-//!     `packing`, `as-built`, `green`, `sintered`, `mass` density
-//!     (exact `density` is the only one refused);
-//!   * magnitude class — `porosity`, `surface roughness`, `layer
-//!     thickness`, `fracture toughness`, `elongation at break`,
-//!     `thermal conductivity`, `Young's modulus`, `crystallite size`,
-//!     `particle size`;
-//!   * SYMBOL/synonym forms the extractor emits verbatim — `Rm`,
-//!     `Rp0.2`, `sigma_UTS`, `UTS in MPa`, `flow stress`, `ultimate
-//!     tensile stress`, `0.2% offset yield stress`, `Vickers hardness
-//!     number`.
+//! RECORDED, NOT FIXED — the open set of non-negative quantities was
+//! measured as UNBOUNDED (round 14 item 5): density families, magnitude
+//! classes, symbol/synonym forms the extractor emits verbatim — no
+//! enumeration in Rust closes it, and every entry would be one domain's
+//! vocabulary. The closure lives where it always belonged: the ontology
+//! annotates its quantity kinds, and [`GuardPolicy::quantity_sign`]
+//! carries the answer at grounding time.
 //!
-//! Adding these by hand is "another word list" (disclaimed by the
-//! const doc) and would still miss the next paper's quantity; the
-//! honest conclusion is that closing this needs the extractor
-//! VOCABULARY (map every emitted object to its signed domain), which
-//! round 13 deferred. Six representative members are pinned as KNOWN
-//! tripwires in the corpus (fire when the vocabulary lands). See
-//! `is_nonnegative_quantity`.
-//!
-//! ROUND 14 ITEM 6 — PRODUCTION MITIGATION: a SignDomain over-refusal is
+//! PRODUCTION MITIGATION (round 14 item 6): a SignDomain over-refusal is
 //! NOT invisible. cli/papers.rs pushes every rejected claim into the
 //! output `rejected[]` JSON carrying the guard name, subject, object,
-//! value and locator (its comment: "the guard name is the only
-//! observable signal of over-refusal"), so the drop is observable and
-//! attributable downstream — though it is not tripwired anywhere. That
-//! changes the cost of an over-refusal: it is a recoverable, named drop,
-//! not a silent loss.
+//! value and locator, so the drop is observable and attributable
+//! downstream. On this branch refusal is annotation, not loss: the fact
+//! is stored with its `VerificationStatus`.
 //!
-//! ROUND 13 ITEM 2 — IS THE REVERT STILL BUYING ANYTHING? Settled by
-//! measurement; the winning reading is (a) the revert IS load-bearing.
-//! On the round-12 corpus M-A (re-adding U+2013/U+2014 to
-//! `number_needles`) measured as a win on the corpus — 0 MUST_STAMP
-//! dropped, 0 MUST_DROP stamped, 7 KNOWN recall rows recovered — but
-//! NOT a pure win: it reddens `claims::tests::en_dash_is_not_a_sign_glyph`
-//! (both `Err(NoSpan)` asserts flip to a stamp). And that corpus win
-//! was ONLY because every separator row sat on UTS, where SignDomain
-//! masked the needle-set decision (item 1's cannot-fail rows). Item 1
-//! moved those six rows onto residual_stress (a genuinely SIGNED
-//! predicate), where SignDomain cannot touch them; re-running M-A there
-//! stamps all six (MUST_DROP stamped = 6). The crux the round-11/12
-//! record left open — whether for a signed quantity the separator
-//! fabrication is INEXPRESSIBLE (because -950 is a "legitimate
-//! reading" of "\u{2013}950") — resolves cleanly: round 11's
-//! convention reads U+2013/U+2014 as SEPARATORS (not minuses), so
-//! under that convention the source value is +950 and a -950 claim is
-//! a fabrication whatever the predicate's sign domain. The two
-//! readings share one local shape (\u{2013} before a number); the
-//! engine cannot have BOTH the recall (the legitimate -350 stamp,
-//! KNOWN MustStamp) AND the safety (the separator -950 drop), so it
-//! keeps the safety. The 7 recall rows are the price, NOT free;
-//! recovering them would reopen the U+2013/U+2014 HALF of the
-//! separator fabrication on signed quantities. ROUND 15 ITEM 1
-//! narrowed this verdict: the revert holds ONLY that half — the ASCII
-//! '-' / U+2212 half is ALREADY open on every signed predicate (six
-//! RED residual_stress rows in the corpus stamp -950 from a +950
-//! source), because those glyphs are real minus needles the engine
-//! cannot refuse without losing all genuine negative recall; no revert
-//! touches them. The recall price also carries a known MISATTRIBUTION:
-//! all 7 dropped recall rows surface as `NoSpan` -> `MissingQuote`,
-//! which `SupportRefusal::NoSpan` below defines as the MODEL's fault
-//! (a hallucination) — the same misfiling round 11's (b) fix closed
-//! for U+2212 by giving the glyph a needle; the identical misfiling
-//! for U+2013/U+2014 is live (no needle, so a genuine negative reads
-//! as 'nothing to scan'). RECORDED, not refactored.
-//! For SIGNED quantities the routes still diverge on recall: the JATS
-//! U+2013 spelling drops while the PDF '-' spelling stamps the genuine
-//! negative — the '-' reading is the defensible one (the glyph IS the
-//! minus sign), and the U+2013 drop is round 11's price (justified by
-//! item 2 above), carried as corpus KNOWN rows. See `number_needles`.
-//!
-//! ROUND 16 ITEM 1 — superseding the round-15 verdict above for FOUR of
-//! the six ASCII '-' / U+2212 residual_stress separator rows: those
-//! glyphs ARE refusable on a signed predicate after all, by reading the
-//! DASH'S ROLE rather than its glyph. `RefusalGuard::SeparatorDash`
-//! refuses (A) the label-inline shape — the object's own name abuts the
-//! dash ("residual stress -950 MPa") — and (B) the bracketed shape — a
-//! dash glued to the unit right after the value ("result -950 MPa-").
-//! Both close WITHOUT over-refusal: every true negative (Seebeck,
-//! cryo-temp, residual -350, the -1350 family, a genuine line-start
-//! minus) still stamps, because a true minus follows a verb/preposition,
-//! never the object name, and never carries a trailing parenthetical
-//! dash. The TWO line-start shapes ("-950 MPa was recorded") stay open
-//! as corpus KNOWN rows: a leading dash has neither signal and is
-//! locally indistinguishable from a genuine line-start minus. The
-//! U+2013/U+2014 half is untouched (no needle, still NoSpan).
+//! DASH-GLYPH HISTORY (still load-bearing for the surviving guards):
+//! the dash class is every glyph the typeset world uses where a minus
+//! can stand (ASCII hyphen, U+2010..U+2015, U+2212, U+FE63). Round 9
+//! measured the sign flip stamping through each glyph and made the class
+//! whole; round 11 reverted making U+2013/U+2014 sign glyphs because the
+//! separator shape fabricated negatives — for SIGNED quantities the '-' /
+//! U+2212 minus-vs-separator reading stays locally indistinguishable and
+//! the engine keeps the MINUS reading (the glyph IS the minus sign, so a
+//! negative that stamps is the defensible reading). Round 16 added
+//! `SeparatorDash`: on a signed predicate it refuses (A) the label-inline
+//! shape — the object's own name abuts the dash ("residual stress -950
+//! MPa") — and (B) the bracketed shape — the fact's own unit term glued
+//! right after the value, immediately followed by a dash that is not
+//! followed by a digit. Both close without vocabulary: a true minus
+//! follows a verb/preposition, never the object name, and never carries
+//! a trailing parenthetical dash. The line-start shape ("-950 MPa was
+//! recorded") carries neither signal and stays a KNOWN live fabrication
+//! in the corpus.
 //!
 //! RECORDED, NOT FIXED (round 9) — the largest remaining structural
 //! gap: THE VALUE IS NEVER TIED TO THE PREDICATE. Measured at HEAD,
@@ -212,7 +146,12 @@
 //! is the only tuple with a unit field — so the record of the gap
 //! lives on the scoreboard, where it cannot go stale, instead of here.
 
+use prism_provenance::VerificationStatus;
 use serde::{Deserialize, Serialize};
+
+/// The ontology's declaration of a quantity's sign domain — re-exported so
+/// matcher callers name one type, sourced in the vocabulary-neutral crate.
+pub use prism_provenance::QuantitySignDomain;
 
 use crate::fulltext::Locator;
 
@@ -234,13 +173,14 @@ fn rank(class: &str) -> u8 {
 /// Apply the literature-extraction ceiling: the result can never outrank
 /// `research`, and it can never outrank its input. Unknown inputs collapse
 /// to indeterminate.
+///
+/// B14: the old first branch (`rank(claimed) <= rank(RESEARCH) && claimed ==
+/// RESEARCH`) was redundant — the second conjunct implies the first — and
+/// read as if it did more than it did. The function is exactly "rank at
+/// least research → research, else indeterminate", and now says so.
 #[must_use]
 pub fn cap_at_literature(claimed: &str) -> &'static str {
-    if rank(claimed) <= rank(EVIDENCE_RESEARCH) && claimed == EVIDENCE_RESEARCH {
-        EVIDENCE_RESEARCH
-    } else if claimed == EVIDENCE_INDETERMINATE {
-        EVIDENCE_INDETERMINATE
-    } else if rank(claimed) >= rank(EVIDENCE_RESEARCH) {
+    if rank(claimed) >= rank(EVIDENCE_RESEARCH) {
         EVIDENCE_RESEARCH
     } else {
         EVIDENCE_INDETERMINATE
@@ -277,6 +217,21 @@ pub struct ClaimProvenance {
     /// Verbatim span the claim was read from, when the extractor supplies it.
     #[serde(default)]
     pub quote: Option<String>,
+    /// SHA-256 of the complete source text whose line coordinates were read.
+    /// `None` is an explicit legacy/uncited claim.
+    #[serde(default)]
+    pub source_revision_id: Option<String>,
+    /// One-based inclusive source line range for `quote`. Both fields stay
+    /// optional so claims serialized before exact citations remain readable.
+    #[serde(default)]
+    pub line_start: Option<i64>,
+    #[serde(default)]
+    pub line_end: Option<i64>,
+    /// Local UTF-8 source representation whose hash and line coordinates the
+    /// citation addresses. Remote-paper ingestion may cache a block here so
+    /// exact rereading does not depend on refetching or reparsing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text_path: Option<String>,
 }
 
 /// One extracted material claim, EMMO-shaped.
@@ -299,7 +254,26 @@ pub struct ExtractedClaim {
     pub kind: Option<String>,
     /// Always stamped through `cap_at_literature`; never trusted from input.
     pub evidence_class: String,
+    /// Deterministic population checks are annotations, never deletion gates.
+    #[serde(default)]
+    pub verification: Option<VerificationStatus>,
+    #[serde(default)]
+    pub verification_reason: Option<String>,
+    /// Canonical endpoint/property identities selected from the active
+    /// ontology during paper reading.
+    #[serde(default)]
+    pub ontology: ClaimOntologyBinding,
     pub provenance: ClaimProvenance,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimOntologyBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_class_iri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate_iri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_class_iri: Option<String>,
 }
 
 /// Errors a claim can carry instead of being silently accepted.
@@ -313,6 +287,14 @@ pub enum ClaimRejection {
     /// The claim carried no verbatim quote, so nothing ties it to the block
     /// it cites. Unverifiable claims are dropped, never stamped.
     MissingQuote,
+    /// B9: the numeric value occurred in NO rendered form anywhere in the
+    /// cited block — distinct from `MissingQuote` (nothing ties the claim
+    /// to the block) and from `NoEvidentialOccurrence` (a guard examined
+    /// and refused occurrences). The block may name the subject plainly
+    /// while the number is missing in every spelling the engine knows, or
+    /// the value is invented; the drop record now says which shape it was
+    /// instead of filing all of them as "the model's fault".
+    ValueNotRendered,
     /// The claim's quote does not occur in the block at its recorded
     /// locator. The citation is false; the claim is dropped, not downgraded.
     QuoteNotInCitedBlock,
@@ -330,25 +312,43 @@ pub enum ClaimRejection {
 
 /// The guard that refused a candidate occurrence of the value. Named so a
 /// drop can say WHY a supporting span yielded no evidence — the drop set is
-/// the only observable signal of how this gate behaves.
+/// the only observable signal of how this gate behaves. Every guard is
+/// domain-independent: pure structure, or knowledge the caller supplied per
+/// claim through [`GuardPolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefusalGuard {
-    /// A negative claim against a quantity that is non-negative by
-    /// physical definition (`NONNEGATIVE_QUANTITIES`): nonsense under
-    /// EVERY dash glyph, so it refuses what the minus-vs-separator
-    /// ambiguity cannot separate (round 12).
+    /// A negative claim against a quantity the ACTIVE ONTOLOGY declares
+    /// non-negative by definition ([`GuardPolicy::quantity_sign`]): nonsense
+    /// under EVERY dash glyph, so it refuses what the minus-vs-separator
+    /// ambiguity cannot separate. When the ontology is silent the check does
+    /// not apply — this guard never infers a sign domain from the name.
     SignDomain,
     /// Endpoint of an en-dash digit range ("950\u{2013}1100"): the sentence
-    /// asserts bounds, not a point value.
+    /// asserts bounds, not a point value. B12 FIX: the digits no longer need
+    /// to be GLUED to the dash — one space on either side ("950 \u{2013}
+    /// 1100", journal typesetting) used to defeat the guard and stamp both
+    /// endpoints as point values. The dash class is unchanged; only optional
+    /// whitespace around it is tolerated, on both the forward (low
+    /// endpoint) and backward (high endpoint) sides.
     Range,
+    /// B8 FIX (the ± half): the occurrence is an UNCERTAINTY figure, not a
+    /// value — the token immediately before it (skipping whitespace) is the
+    /// plus-minus notation `\u{00b1}` or its ASCII spelling `+/-`, as in
+    /// "950 ± 30 MPa". The VALUE such a tolerance decorates (950) still
+    /// stamps — only the decoration figure (30) is refused. This is
+    /// mathematical notation, not domain vocabulary: it carries no unit or
+    /// quantity knowledge, exactly like the dash class. The digit-dash-letter
+    /// locant family ("3-point", "2-propanol") is STILL unguarded — see the
+    /// module ledger for why (it collides with hyphenated unit spellings
+    /// without unit knowledge only the ontology can supply).
+    Uncertainty,
     /// Token-boundary rule: continuation by digits/decimals/grouping, a
-    /// leading minus that signs it, or a non-unit letter glued to it.
+    /// leading minus that signs it, or a non-unit letter glued to it. A
+    /// glued letter is redeemed only by the fact's OWN unit term
+    /// ([`GuardPolicy::unit_term`]) — Rust holds no unit lexicon.
     Boundary,
     /// Inside a citation marker ("[1140]", "(1140)", "{1140}").
     Citation,
-    /// Immediately after a label word (Table/Figure/Ref/...) or a
-    /// continuation of such a list.
-    Label,
     /// Inside an occurrence of the subject's or object's own name
     /// (the "718" of "Inconel 718").
     InsideName,
@@ -360,16 +360,48 @@ pub enum RefusalGuard {
     ///       abuts the dash ("residual stress -950 MPa"): the dash
     ///       separates the label from its value, so the source reads
     ///       +950 and a -950 claim fabricates the sign.
-    ///   (B) bracketed — a dash GLUED to the unit right after the value
-    ///       ("result -950 MPa- matched"), the closing parenthetical a
-    ///       minus never carries.
-    /// Fires only for value < 0 (a signed needle); for non-negative
-    /// predicates `SignDomain` refuses first. The line-start shape
-    /// ("-950 MPa was recorded") carries NEITHER signal and is
-    /// deliberately NOT refused — it is locally indistinguishable from
-    /// a genuine line-start minus ("-350 MPa was the surface stress") —
-    /// and is carried as a KNOWN live fabrication in the corpus.
+    ///   (B) bracketed — a dash GLUED to the fact's own unit term right
+    ///       after the value ("result -950 MPa- matched"), the closing
+    ///       parenthetical a minus never carries. Without a supplied unit
+    ///       term this shape is inert.
+    /// Fires only for value < 0 (a signed needle); for quantities the
+    /// ontology declares non-negative `SignDomain` refuses first. The
+    /// line-start shape ("-950 MPa was recorded") carries NEITHER signal
+    /// and is deliberately NOT refused — it is locally indistinguishable
+    /// from a genuine line-start minus ("-350 MPa was the surface
+    /// stress") — and is carried as a KNOWN live fabrication in the
+    /// corpus.
     SeparatorDash,
+}
+
+/// Domain knowledge the refusal guards need for ONE claim, supplied by the
+/// caller — which reads it from the active ontology and the fact itself at
+/// grounding time. PRISM is a harness with pluggable ontologies: none of
+/// this may be compiled in, and a silent ontology leaves the corresponding
+/// guard inert rather than guessed at.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GuardPolicy {
+    /// The sign domain the ontology declares for the claimed quantity kind.
+    /// [`QuantitySignDomain::Unspecified`] (the default) means the ontology
+    /// said nothing: the `SignDomain` guard does not apply.
+    pub quantity_sign: QuantitySignDomain,
+    /// The fact's exact unit term as chosen by the reader/ontology. The only
+    /// token that can redeem a letter glued to the value, or mark a trailing
+    /// dash as a closing parenthetical (`SeparatorDash` shape B). `None`
+    /// means no unit knowledge: glued letters refuse, shape B is inert.
+    /// Comparison is case-folded, exactly like the normalized text it is
+    /// matched against.
+    pub unit_term: Option<String>,
+}
+
+impl GuardPolicy {
+    /// The policy for an ontology that declares nothing and a fact with no
+    /// unit knowledge: every vocabulary-dependent guard stays inert. This is
+    /// the honest default, never a guess in disguise.
+    pub const SILENT: Self = Self {
+        quantity_sign: QuantitySignDomain::Unspecified,
+        unit_term: None,
+    };
 }
 
 /// Why no supporting span was found. `NoSpan` reads as the model's fault
@@ -379,23 +411,26 @@ pub enum RefusalGuard {
 pub enum SupportRefusal {
     /// No span held the subject or the object (both, for a non-numeric
     /// fact): there was nothing to scan.
-    ///
-    /// RECORDED, NOT FIXED (round 7): "nothing to scan" is also what a
-    /// numeric fact reads as when NO NEEDLE FORM of the value matched
-    /// anywhere (a glyph this engine lacks, e.g. a pre-round-7
-    /// \u{3bc}m or 2.95\u{c5}). Such drops are matcher over-refusals,
-    /// but they surface as `NoSpan` -> `MissingQuote`, which this
-    /// module defines as the MODEL's fault — 3 of 12 remaining
-    /// over-refusals were misfiled as hallucinations this way. A real
-    /// fix must distinguish "no needle form matched" from "no span had
-    /// evidence".
     NoSpan,
+    /// B9 FIX (was RECORDED, NOT FIXED, round 7): for a numeric fact, the
+    /// value occurred in NO rendered form ANYWHERE in the block — no
+    /// needle form, no equal-valued lexeme. This is a DISTINCT fault from
+    /// `NoSpan`: the block may name the subject plainly while the number is
+    /// missing in every spelling the engine knows (a glyph it lacks, a
+    /// unit conversion by the reader) — or the value is invented. The old
+    /// single `NoSpan` filed all of these as "the block does not mention
+    /// the fact at all" (`MissingQuote`), which the module defines as the
+    /// MODEL's fault; measured round 7, 3 of 12 remaining over-refusals
+    /// were misfiled as hallucinations this way. The split does not pick a
+    /// culprit — it names the shape so a re-checker can.
+    ValueNotRendered,
     /// A span held the subject or object and at least one occurrence of the
     /// value, but every occurrence was refused by a guard. Names the guard
-    /// of the FIRST refused occurrence scanned: in a block where the value
-    /// appears more than once (most real blocks) the first is the one a
-    /// reader meets, and last-wins reporting was positional, not causal —
-    /// it over-reported `Boundary` and under-reported `Label`.
+    /// of the FIRST refused occurrence scanned (B11: first in POSITION); in
+    /// a block where the value appears more than once (most real blocks)
+    /// the first is the one a reader meets, and last-wins reporting was
+    /// positional, not causal — it over-reported `Boundary` and
+    /// under-reported `Label`.
     Guarded { guard: RefusalGuard, span: String },
 }
 
@@ -403,6 +438,7 @@ impl From<SupportRefusal> for ClaimRejection {
     fn from(refusal: SupportRefusal) -> Self {
         match refusal {
             SupportRefusal::NoSpan => Self::MissingQuote,
+            SupportRefusal::ValueNotRendered => Self::ValueNotRendered,
             SupportRefusal::Guarded { guard, span } => Self::NoEvidentialOccurrence { guard, span },
         }
     }
@@ -424,12 +460,20 @@ pub fn validate_and_stamp(
     if claim.subject.trim().is_empty() {
         return Err(ClaimRejection::EmptySubject);
     }
+    // B10 FIX: the QUOTE checks now run BEFORE the unit refusal. The old
+    // order returned `NumericValueWithoutUnit` first, so a unitless numeric
+    // claim with a FALSE citation was recorded as merely "unitless" — the
+    // false-citation signal (the more severe fault: a claim citing a block
+    // that does not contain it) was invisible in the drop record. The
+    // containment contract gates everything else a claim says about its
+    // block, so it gates the unit check too.
+    let Some(quote) = claim.provenance.quote.as_deref() else {
+        return Err(ClaimRejection::MissingQuote);
+    };
+    if !quote_in_block(quote, block_text) {
+        return Err(ClaimRejection::QuoteNotInCitedBlock);
+    }
     if claim.value.is_some() && claim.unit.is_none() {
-        // RECORDED, NOT FIXED (round 7): this returns BEFORE the quote
-        // check, so a unitless numeric fact never reaches the
-        // supporting-span scan — its drop carries no guard and no span,
-        // and whatever the matcher would have done with the value is
-        // invisible in the drop record.
         return Err(ClaimRejection::NumericValueWithoutUnit);
     }
     for condition in &claim.conditions {
@@ -438,12 +482,6 @@ pub fn validate_and_stamp(
                 condition: condition.name.clone(),
             });
         }
-    }
-    let Some(quote) = claim.provenance.quote.as_deref() else {
-        return Err(ClaimRejection::MissingQuote);
-    };
-    if !quote_in_block(quote, block_text) {
-        return Err(ClaimRejection::QuoteNotInCitedBlock);
     }
     claim.evidence_class = cap_at_literature(&claim.evidence_class).to_string();
     Ok(claim)
@@ -474,24 +512,31 @@ fn quote_in_block(quote: &str, block_text: &str) -> bool {
 /// value (the drop is the matcher's) — without it, over-refusal is
 /// invisible in the output.
 ///
+/// `policy` carries the domain knowledge the guards need — the ontology's
+/// sign declaration for the quantity and the fact's own unit term. With
+/// [`GuardPolicy::default`] the matcher knows neither and every
+/// vocabulary-dependent guard stays inert: that is the honest state for an
+/// ontology that declares nothing.
+///
 /// Support criteria (all case-insensitive, within one sentence/row span):
 /// * numeric fact: the value's number appears together with the subject or
 ///   the object (a bare number could be a citation, so the number alone is
 ///   not enough). The number must occur as its own token — not as a
-///   substring of a longer number and not a digit of an alloy
+///   substring of a longer number and not a digit of the claim's own
 ///   designation, glued (Ti-6Al-4V) or spaced (the claim's own Inconel 718)
-///   — and the occurrence must be evidential: a number inside
-///   a citation marker `[...]` or immediately after Table/Figure/Ref is a
-///   label, not a measurement;
+///   — and the occurrence must be evidential: a number inside a citation
+///   marker `[...]` is a reference, not a measurement;
 /// * non-numeric fact: both subject and object appear.
 pub fn supporting_quote_or_refusal(
     subject: &str,
     object: &str,
     value: Option<f64>,
     block_text: &str,
+    policy: &GuardPolicy,
 ) -> Result<String, SupportRefusal> {
     let subject_n = normalize_for_containment(subject);
     let object_n = normalize_for_containment(object);
+    let guards = GuardInputs::from_policy(policy);
     // Keep the FIRST refusal, not the last: when the value occurs in
     // several spans, the last one refused is a position in the scan
     // order, not the cause of the drop — swapping two sentences in a
@@ -528,7 +573,7 @@ pub fn supporting_quote_or_refusal(
                 let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
                     || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
                 if name_near {
-                    match scan_number_evidence(&hay, v, &subject_n, &object_n) {
+                    match scan_number_evidence(&hay, v, &subject_n, &object_n, &guards) {
                         NumberScan::Evidential => return Ok(span.trim().to_string()),
                         NumberScan::Refused(guard) => {
                             first_refusal.get_or_insert((guard, span.trim().to_string()));
@@ -550,7 +595,23 @@ pub fn supporting_quote_or_refusal(
     }
     match first_refusal {
         Some((guard, span)) => Err(SupportRefusal::Guarded { guard, span }),
-        None => Err(SupportRefusal::NoSpan),
+        None => {
+            // B9: split "the value never rendered anywhere" (matcher
+            // over-refusal or invented value) from "no qualifying span"
+            // (the block may render the value, just never beside the
+            // subject/object). The needle forms are the same set the scan
+            // used, applied to the whole block with no name proximity.
+            if let Some(v) = value {
+                let whole = normalize_for_containment(block_text);
+                if !number_needles(v)
+                    .iter()
+                    .any(|needle| whole.contains(needle.as_str()))
+                {
+                    return Err(SupportRefusal::ValueNotRendered);
+                }
+            }
+            Err(SupportRefusal::NoSpan)
+        }
     }
 }
 
@@ -561,8 +622,9 @@ pub fn supporting_quote(
     object: &str,
     value: Option<f64>,
     block_text: &str,
+    policy: &GuardPolicy,
 ) -> Option<String> {
-    supporting_quote_or_refusal(subject, object, value, block_text).ok()
+    supporting_quote_or_refusal(subject, object, value, block_text, policy).ok()
 }
 
 /// Find a supporting quote by comparing complete numeric lexemes rather than
@@ -577,32 +639,81 @@ pub fn supporting_quote(
 /// the exact lexeme and byte range through the same refusal guards as
 /// [`supporting_quote`].
 ///
-/// The existing [`supporting_quote`] behavior intentionally remains string
-/// based for compatibility; ingest callers that declare a tolerance should use
-/// this API.
-#[must_use]
+/// Unlike the legacy `Option` contract, the error retains the first named
+/// refusal guard and the exact span it examined. Callers must decide how to
+/// record that evidence rather than losing it while testing for presence.
+///
+/// `policy` is the per-claim knowledge the guards read — see
+/// [`supporting_quote_or_refusal`].
 pub fn supporting_quote_with_numeric_tolerance(
     subject: &str,
     object: &str,
     value: f64,
     block_text: &str,
     numeric_tolerance: f64,
-) -> Option<String> {
-    supporting_quote_with_numeric_tolerance_or_refusal(
-        subject,
-        object,
-        value,
-        block_text,
-        numeric_tolerance,
-    )
-    .ok()
+    policy: &GuardPolicy,
+) -> Result<String, SupportRefusal> {
+    if !value.is_finite() || !numeric_tolerance.is_finite() || numeric_tolerance < 0.0 {
+        return Err(SupportRefusal::NoSpan);
+    }
+
+    let subject_n = normalize_for_containment(subject);
+    let object_n = normalize_for_containment(object);
+    let guards = GuardInputs::from_policy(policy);
+    let mut first_refusal: Option<(RefusalGuard, String)> = None;
+    for span in supporting_spans(block_text) {
+        let hay = normalize_for_containment(span);
+        let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
+            || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
+        if !name_near {
+            continue;
+        }
+
+        match scan_numeric_lexeme_evidence(
+            &hay,
+            value,
+            numeric_tolerance,
+            &subject_n,
+            &object_n,
+            &guards,
+        ) {
+            NumberScan::Evidential => return Ok(span.trim().to_string()),
+            NumberScan::Refused(guard) => {
+                first_refusal.get_or_insert((guard, span.trim().to_string()));
+            }
+            NumberScan::Absent => {}
+        }
+    }
+
+    match first_refusal {
+        Some((guard, span)) => Err(SupportRefusal::Guarded { guard, span }),
+        None => {
+            // B9: same split as `supporting_quote_or_refusal`, answered
+            // with the lexeme scanner: `Absent` at whole-block scope means
+            // no complete numeric lexeme renders the value under
+            // tolerance — the matcher never saw the number at all.
+            let whole = normalize_for_containment(block_text);
+            if scan_numeric_lexeme_evidence(
+                &whole,
+                value,
+                numeric_tolerance,
+                &subject_n,
+                &object_n,
+                &guards,
+            ) == NumberScan::Absent
+            {
+                return Err(SupportRefusal::ValueNotRendered);
+            }
+            Err(SupportRefusal::NoSpan)
+        }
+    }
 }
 
 /// Return whether an evidential numeric lexeme satisfies a caller's metadata
 /// check.
 ///
 /// Every candidate passes the same numeric parser, tolerance comparison,
-/// subject/object proximity rule, and citation/range/label/name/sign guards as
+/// subject/object proximity rule, and refusal guards as
 /// [`supporting_quote_with_numeric_tolerance`] before `accepts` can see it.
 /// The callback receives the normalized supporting span and the accepted
 /// lexeme's byte range within that span. This is the safe integration point
@@ -615,6 +726,7 @@ pub fn evidential_numeric_lexeme_satisfies(
     value: f64,
     block_text: &str,
     numeric_tolerance: f64,
+    policy: &GuardPolicy,
     mut accepts: impl FnMut(&str, std::ops::Range<usize>) -> bool,
 ) -> bool {
     if !value.is_finite() || !numeric_tolerance.is_finite() || numeric_tolerance < 0.0 {
@@ -623,6 +735,7 @@ pub fn evidential_numeric_lexeme_satisfies(
 
     let subject_n = normalize_for_containment(subject);
     let object_n = normalize_for_containment(object);
+    let guards = GuardInputs::from_policy(policy);
     for span in supporting_spans(block_text) {
         let hay = normalize_for_containment(span);
         let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
@@ -647,12 +760,12 @@ pub fn evidential_numeric_lexeme_satisfies(
             if numeric_values_match(value, observed, numeric_tolerance)
                 && refusing_guard(
                     &hay,
-                    &hay[lexeme.start..lexeme.end],
                     lexeme.start,
                     lexeme.end,
                     &subject_n,
                     &object_n,
                     value,
+                    &guards,
                 )
                 .is_none()
                 && accepts(&hay, lexeme.start..lexeme.end)
@@ -701,46 +814,20 @@ pub fn numeric_value_appears(value: f64, block_text: &str, numeric_tolerance: f6
     false
 }
 
-fn supporting_quote_with_numeric_tolerance_or_refusal(
-    subject: &str,
-    object: &str,
-    value: f64,
-    block_text: &str,
-    numeric_tolerance: f64,
-) -> Result<String, SupportRefusal> {
-    if !value.is_finite() || !numeric_tolerance.is_finite() || numeric_tolerance < 0.0 {
-        return Err(SupportRefusal::NoSpan);
-    }
-
-    let subject_n = normalize_for_containment(subject);
-    let object_n = normalize_for_containment(object);
-    let mut first_refusal: Option<(RefusalGuard, String)> = None;
-    for span in supporting_spans(block_text) {
-        let hay = normalize_for_containment(span);
-        let name_near = (!subject_n.is_empty() && find_name(&hay, &subject_n, 0).is_some())
-            || (!object_n.is_empty() && find_name(&hay, &object_n, 0).is_some());
-        if !name_near {
-            continue;
-        }
-
-        match scan_numeric_lexeme_evidence(&hay, value, numeric_tolerance, &subject_n, &object_n) {
-            NumberScan::Evidential => return Ok(span.trim().to_string()),
-            NumberScan::Refused(guard) => {
-                first_refusal.get_or_insert((guard, span.trim().to_string()));
-            }
-            NumberScan::Absent => {}
-        }
-    }
-
-    match first_refusal {
-        Some((guard, span)) => Err(SupportRefusal::Guarded { guard, span }),
-        None => Err(SupportRefusal::NoSpan),
-    }
-}
-
 /// Split `block_text` into candidate supporting spans: sentences and table
 /// rows. Spans are verbatim substrings (only trimmed), so anything found
 /// here can be stored as a quote and later verified by containment.
+///
+/// Splitting is purely structural: sentence-final punctuation ends a span,
+/// except a period inside a decimal or a dot-joined scientific token such
+/// as `MPa.m^0.5`. CONTRACT CHANGE (de-hardcoding): there is no longer an
+/// abbreviation vocabulary (the old `ABBREV_LABEL_WORDS`): deciding which
+/// trailing periods abbreviate English label words was exactly the kind of
+/// compiled-in language knowledge a promoted German ontology must not
+/// depend on. The price — "Fig. 2" now splits, stranding the 2 in its own
+/// span — is a weaker note, not a wrong verdict: a stranded label number
+/// can only stamp when the span ALSO holds the subject or object, and the
+/// fact carries its verification status either way.
 fn supporting_spans(text: &str) -> Vec<&str> {
     let mut spans = Vec::new();
     for line in text.lines() {
@@ -754,9 +841,8 @@ fn supporting_spans(text: &str) -> Vec<&str> {
                 && i + 1 < bytes.len()
                 && bytes[i - 1].is_ascii_alphanumeric()
                 && bytes[i + 1].is_ascii_alphanumeric();
-            let is_sentence_break = matches!(b, b'.' | b'!' | b'?' | b';')
-                && !is_inline_token_point
-                && !(*b == b'.' && period_ends_abbreviation(line, i));
+            let is_sentence_break =
+                matches!(b, b'.' | b'!' | b'?' | b';') && !is_inline_token_point;
             if is_sentence_break {
                 spans.push(&line[start..=i]);
                 start = i + 1;
@@ -773,31 +859,8 @@ fn supporting_spans(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Words whose trailing period is an abbreviation, not a sentence end
-/// ("Fig.", "Ref.", "Eq."). Deliberately NOT `LABEL_WORDS`: words like
-/// "sample." or "run." legitimately end sentences in methods prose, and
-/// refusing to split there would fuse two sentences into one span and
-/// create fresh false co-occurrences.
-const ABBREV_LABEL_WORDS: &[&str] = &["fig", "figs", "ref", "refs", "eq", "eqs"];
-
-/// Does the word right before the period at byte index `dot` end in a
-/// label abbreviation? Such a period does not end a span: splitting on it
-/// strands the label's number in a fresh span where the label word is
-/// invisible, so "Fig. 2" stamps 2 as a measurement (H7).
-fn period_ends_abbreviation(line: &str, dot: usize) -> bool {
-    let word: String = line[..dot]
-        .chars()
-        .rev()
-        .take_while(|c: &char| c.is_alphanumeric())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>()
-        .to_lowercase();
-    ABBREV_LABEL_WORDS.contains(&word.as_str())
-}
-
 /// What a scan of the value's occurrences in one span found.
+#[derive(PartialEq)]
 enum NumberScan {
     /// One occurrence is evidential.
     Evidential,
@@ -808,46 +871,75 @@ enum NumberScan {
     Refused(RefusalGuard),
 }
 
+/// The resolved guard inputs for one scan, derived from the caller's
+/// [`GuardPolicy`]: the ontology's sign declaration, and the fact's unit
+/// term folded exactly like the text it is matched against. `unit_folded`
+/// is `None` when the caller supplied no unit knowledge.
+struct GuardInputs {
+    sign: QuantitySignDomain,
+    unit_folded: Option<String>,
+}
+
+impl GuardInputs {
+    fn from_policy(policy: &GuardPolicy) -> Self {
+        Self {
+            sign: policy.quantity_sign,
+            unit_folded: policy.unit_term.as_deref().map(str::to_lowercase),
+        }
+    }
+
+    fn unit_n(&self) -> Option<&str> {
+        self.unit_folded.as_deref()
+    }
+}
+
 /// Does `hay` contain the value as an evidential measurement? At least one
 /// string form of the value must occur with clean token boundaries, must
-/// not be a citation marker or a Table/Figure/Ref label number, must not
-/// sit inside an occurrence of the subject's or object's own name (the
-/// "718" of "Inconel 718"), and must not be a dash range endpoint.
-/// When every occurrence is refused, the scan names the guard that refused
-/// the FIRST one — that name is what makes an over-refusal actionable, and
-/// first-wins keeps it causal instead of positional: a value glued inside
-/// another token ("AlSi10Mg") usually refuses Boundary late in the span,
-/// while the standalone occurrence the reader actually sees was refused by
-/// the real guard ("cross-section 10" -> Label).
+/// not be a citation marker, must not sit inside an occurrence of the
+/// subject's or object's own name (the "718" of "Inconel 718"), and must
+/// not be a dash range endpoint. When every occurrence is refused, the
+/// scan names the guard that refused the FIRST one — that name is what
+/// makes an over-refusal actionable, and first-wins keeps it causal
+/// instead of positional.
 ///
-/// RECORDED, NOT FIXED (round 8): "first" is first in NEEDLE-FORM
-/// order, then position — the needle forms loop outside, the positions
-/// inside. For any value with two needle forms (>= 1000 or negative),
-/// the reported guard is therefore not necessarily the occurrence a
-/// reader meets first. There is no ground truth for "the causal
-/// guard"; the honest shape is reporting ALL refusing guards as a
-/// set. Not implemented this round.
-fn scan_number_evidence(hay: &str, value: f64, subject_n: &str, object_n: &str) -> NumberScan {
-    let mut first: Option<RefusalGuard> = None;
+/// B11 FIX: "first" is now first in POSITION. The old loop was
+/// needle-form-major — every position of form 1, then every position of
+/// form 2 — so for any value with two needle forms (>= 1000 or negative)
+/// the reported guard belonged to whichever form the loop enumerated
+/// first, not to the occurrence a reader meets first. Occurrences of all
+/// forms are now gathered and examined in byte-position order; overlapping
+/// spellings of the same lexeme ("1350" inside "-1350") keep their natural
+/// left-to-right order, which the signed spelling wins.
+fn scan_number_evidence(
+    hay: &str,
+    value: f64,
+    subject_n: &str,
+    object_n: &str,
+    guards: &GuardInputs,
+) -> NumberScan {
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for needle in number_needles(value) {
         let mut search_from = 0usize;
-        while let Some(rel) = hay[search_from..].find(&needle) {
-            let start = search_from + rel;
+        while let Some(relative_offset) = hay[search_from..].find(&needle) {
+            let start = search_from + relative_offset;
             let end = start + needle.len();
-            match refusing_guard(hay, &needle, start, end, subject_n, object_n, value) {
-                None => return NumberScan::Evidential,
-                Some(guard) => {
-                    first.get_or_insert(guard);
-                }
-            }
+            candidates.push((start, end));
             // Advance by the needle's first CHARACTER, not one byte: U+2212
             // needles lead with a 3-byte char, and a rejected occurrence that
             // advanced one byte landed the next hay[search_from..] slice
             // inside the minus (char-boundary panic, whole ingest aborted).
-            // The match guarantees the needle sits at `start`, so its first
-            // char is the char to skip; map_or(1, ..) keeps the loop
-            // terminating even for a hypothetical empty needle.
             search_from = start + needle.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    let mut first: Option<RefusalGuard> = None;
+    for (start, end) in candidates {
+        match refusing_guard(hay, start, end, subject_n, object_n, value, guards) {
+            None => return NumberScan::Evidential,
+            Some(guard) => {
+                first.get_or_insert(guard);
+            }
         }
     }
     match first {
@@ -876,6 +968,7 @@ fn scan_numeric_lexeme_evidence(
     numeric_tolerance: f64,
     subject_n: &str,
     object_n: &str,
+    guards: &GuardInputs,
 ) -> NumberScan {
     let mut first: Option<RefusalGuard> = None;
     let mut search_from = 0usize;
@@ -895,15 +988,14 @@ fn scan_numeric_lexeme_evidence(
         if !numeric_values_match(value, observed, numeric_tolerance) {
             continue;
         }
-        let needle = &hay[lexeme.start..lexeme.end];
         match refusing_guard(
             hay,
-            needle,
             lexeme.start,
             lexeme.end,
             subject_n,
             object_n,
             value,
+            guards,
         ) {
             None => return NumberScan::Evidential,
             Some(guard) => {
@@ -967,10 +1059,7 @@ fn numeric_lexeme_at(hay: &str, start: usize) -> Option<NumericLexeme> {
         .map(char::len_utf8)
         .sum::<usize>();
 
-    loop {
-        let Some(separator) = hay[cursor..].chars().next() else {
-            break;
-        };
+    while let Some(separator) = hay[cursor..].chars().next() {
         if !matches!(separator, '.' | ',') {
             break;
         }
@@ -1137,53 +1226,51 @@ fn comma_grouped_integer(value: &str) -> bool {
     group_count > 0
 }
 
-/// The guard that refuses the occurrence of `needle` at [start, end), or
+/// The guard that refuses the occurrence at [start, end) in `hay`, or
 /// `None` when the occurrence is evidential. Checked most-specific first so
 /// the NAMED refusal is the most informative one; the refuse/accept decision
 /// itself does not depend on the order.
 ///
 /// `SignDomain` is checked first though it is claim-level, not
-/// occurrence-level: a negative value against a non-negative quantity is
-/// nonsense whatever the occurrence looks like, and naming it beats
-/// every positional guard's explanation. It is checked INSIDE the
-/// occurrence loop, not hoisted claim-level before it, for one reason:
-/// attribution. A negative non-negative-quantity claim whose value does
-/// NOT occur in the block is NoSpan (the model's fault — it cited a
-/// value the block never contained), not Guarded{SignDomain} (the
-/// matcher's fault); the round-5 advance-walk rationale that used to
-/// stand here was a non-reason (the advance walks whatever the guard
-/// placement). Hoisting the check before the loop reddens
+/// occurrence-level: a negative value against a quantity the ontology
+/// declares non-negative is nonsense whatever the occurrence looks like,
+/// and naming it beats every positional guard's explanation. It is checked
+/// INSIDE the occurrence loop, not hoisted claim-level before it, for one
+/// reason: attribution. A negative claim whose value does NOT occur in the
+/// block is NoSpan (the model's fault — it cited a value the block never
+/// contained), not Guarded{SignDomain} (the matcher's fault). Hoisting the
+/// check before the loop reddens
 /// `sign_domain_does_not_mask_a_non_occurring_value_as_no_span`.
 fn refusing_guard(
     hay: &str,
-    needle: &str,
     start: usize,
     end: usize,
     subject_n: &str,
     object_n: &str,
     value: f64,
+    guards: &GuardInputs,
 ) -> Option<RefusalGuard> {
-    if value < 0.0 && is_nonnegative_quantity(object_n) {
+    if value < 0.0 && guards.sign == QuantitySignDomain::NonNegative {
         return Some(RefusalGuard::SignDomain);
     }
     if dash_range_endpoint(hay, start, end) {
         return Some(RefusalGuard::Range);
     }
-    if !clean_number_boundary(hay, needle, start, end) {
+    if uncertainty_decoration(hay, start) {
+        return Some(RefusalGuard::Uncertainty);
+    }
+    if !clean_number_boundary(hay, start, end, guards.unit_n()) {
         return Some(RefusalGuard::Boundary);
     }
     if inside_citation_marker(hay, start, end) {
         return Some(RefusalGuard::Citation);
-    }
-    if preceding_word_is_label(hay, start, end) {
-        return Some(RefusalGuard::Label);
     }
     if occurrence_inside_name(hay, start, end, subject_n)
         || occurrence_inside_name(hay, start, end, object_n)
     {
         return Some(RefusalGuard::InsideName);
     }
-    if separator_or_paren_dash_on_signed_value(hay, start, end, object_n, value) {
+    if separator_or_paren_dash_on_signed_value(hay, start, end, object_n, value, guards.unit_n()) {
         return Some(RefusalGuard::SeparatorDash);
     }
     None
@@ -1236,12 +1323,14 @@ fn occurrence_inside_name(hay: &str, start: usize, end: usize, name: &str) -> bo
 /// before it stops a suffix of a longer word matching ("distress"
 /// must not match object "stress").
 ///
-/// (B) bracketed — a `UNIT_TOKENS` entry sits right after the value
-/// (one optional space), immediately followed by a
-/// `MINUS_CAPABLE_DASH` that is NOT followed by a digit. That glued
+/// (B) bracketed — the fact's OWN unit term (`unit_n`, supplied by the
+/// caller from the reader/ontology — Rust holds no unit lexicon) sits
+/// right after the value (one optional space), immediately followed by
+/// a `MINUS_CAPABLE_DASH` that is NOT followed by a digit. That glued
 /// dash is the closing parenthetical a minus never carries; the
 /// not-a-digit guard leaves digit/dash/digit ranges (owned by the
-/// `Range` guard, checked first) untouched.
+/// `Range` guard, checked first) untouched. Without a supplied unit
+/// term this shape is inert: no guess replaces it.
 ///
 /// DELIBERATELY not refused — the line-start shape "-950 MPa was
 /// recorded" has neither signal and is locally indistinguishable from
@@ -1253,6 +1342,7 @@ fn separator_or_paren_dash_on_signed_value(
     end: usize,
     object_n: &str,
     value: f64,
+    unit_n: Option<&str>,
 ) -> bool {
     if value >= 0.0 {
         return false;
@@ -1272,20 +1362,27 @@ fn separator_or_paren_dash_on_signed_value(
             return true;
         }
     }
-    // (B) a unit token right after the value, immediately followed by a
-    // dash that is not followed by a digit (so a digit/dash/digit range
-    // stays owned by the `Range` guard).
+    // (B) the fact's own unit term right after the value, immediately
+    // followed by a dash that is not followed by a digit (so a
+    // digit/dash/digit range stays owned by the `Range` guard).
+    let Some(unit_n) = unit_n.filter(|u| !u.is_empty()) else {
+        return false;
+    };
     let rest = hay[end..].strip_prefix(' ').unwrap_or(&hay[end..]);
-    UNIT_TOKENS.iter().any(|u| match rest.strip_prefix(u) {
-        Some(tail) => match tail.chars().next() {
-            Some(d) if MINUS_CAPABLE_DASHES.contains(&d) => tail[d.len_utf8()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !c.is_ascii_digit()),
-            _ => false,
-        },
+    match rest.strip_prefix(unit_n) {
+        Some(tail) => {
+            // The unit term must end on a token boundary, exactly as the
+            // exact-match resolver requires.
+            let unit_ended_clean = tail.chars().next().is_none_or(|c| !c.is_alphanumeric());
+            unit_ended_clean
+                && matches!(tail.chars().next(), Some(d) if MINUS_CAPABLE_DASHES.contains(&d)
+                    && tail[d.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_digit()))
+        }
         None => false,
-    })
+    }
 }
 
 /// Dash-class-aware name search: the first occurrence of `name` in
@@ -1333,61 +1430,6 @@ fn find_name(hay: &str, name: &str, from: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// Letters that may begin a unit token glued directly to a number in
-/// table and PDF-extracted text where the space was lost: "950MPa",
-/// "1073K", "50um" / "50\u{b5}m", "5wt%". Deliberately an allow-list,
-/// not every letter: digit-then-letter gluing like "950x"
-/// (magnification) or "2e5" (scientific notation) is not number+unit
-/// and stays rejected. "2e5" is denied by `DENIED_UNIT_INITIALS`
-/// below, so no future token starting with 'e' can reopen it. "950x"
-/// is refused by the allow-list itself — no token starts with 'x';
-/// round 9 removed the redundant 'x' denial as a cannot-fail entry
-/// (it refused nothing the allow-list refused already). A future
-/// token starting with 'x' would reopen the magnification form; the
-/// corpus "950x" case is the tripwire for that.
-///
-/// DERIVED, not hand-listed: the first letter of every `UNIT_TOKENS`
-/// entry, plus `EXTRA_UNIT_INITIALS`, minus `DENIED_UNIT_INITIALS`.
-///
-/// EXTRA: the glyphs PDF extractors actually emit where the token
-/// list spells the unit differently — lowercased
-/// '\u{e5}' ("2.95\u{c5} lattice parameter") — plus 'f' and 'l', the
-/// round-6 hand list's recall letters for "72F" (Fahrenheit) and
-/// "50l" (litres), which round 7's switch to pure derivation silently
-/// lost. '\u{b0}' needs no entry: the degree sign is not
-/// alphanumeric, so a glued "980\u{b0}C" passes the boundary check
-/// regardless. Round 10: U+03BC GREEK SMALL LETTER MU moved OUT of
-/// this list and into UNIT_TOKENS as a real "\u{3bc}m" token. The
-/// EXTRA entry opened only the GLUED boundary path (`unit_initial` is
-/// derived from both sources), while `unit_follows` reads the token
-/// list alone — so "step 30 \u{3bc}m" dropped while its U+00B5 twin
-/// stamped. Kept beside the token, the EXTRA entry would have been an
-/// entry no mutation could kill — the same defect 'o' was removed for.
-///
-/// DENIED: 'e' rides on "ev", but a digit-glued 'e' in prose is
-/// scientific notation ("2e5 per second", "1e6 cycles"), not
-/// number+unit; denying it costs nothing — no other token starts with
-/// 'e', and "In Fig. 3, 5 ev was measured" still stamps through the
-/// spaced `unit_follows` path (the lib test and the corpus case both
-/// sit under a label locator, so deleting "ev" from UNIT_TOKENS
-/// reddens them — the original control sentence had no label word,
-/// never consulted `unit_follows`, and 47511ce1's stated proof was
-/// void).
-/// 'x' was denied in round 8 and REMOVED in round 9: no UNIT_TOKENS
-/// entry starts with 'x' and 'x' is not in `EXTRA_UNIT_INITIALS`, so
-/// the denial refused nothing the allow-list refused already — a
-/// cannot-fail entry, the same defect 'o' was deleted for in the same
-/// commit. The old hand list also carried 'd' (days, "30d"); it stays
-/// absent: its removal let "2D"/"3D projection" drop correctly, a
-/// measured win that outweighs the days form.
-const EXTRA_UNIT_INITIALS: &[char] = &['\u{e5}', 'f', 'l'];
-const DENIED_UNIT_INITIALS: &[char] = &['e'];
-
-fn unit_initial(c: char) -> bool {
-    !DENIED_UNIT_INITIALS.contains(&c)
-        && (EXTRA_UNIT_INITIALS.contains(&c) || UNIT_TOKENS.iter().any(|t| t.starts_with(c)))
-}
-
 /// The dash class: every glyph the typeset world uses where a minus
 /// sign can stand. ASCII hyphen; U+2010 HYPHEN and U+2011
 /// NON-BREAKING HYPHEN are ordinary PDF-extractor output; U+2012 is
@@ -1403,166 +1445,20 @@ const MINUS_CAPABLE_DASHES: &[char] = &[
     '\u{fe63}',
 ];
 
-/// Quantities that are non-negative by physical definition: ultimate
-/// tensile strength, hardness, density, grain size and yield strength
-/// cannot be negative under any convention. A negative claim against
-/// one is therefore nonsense under EVERY dash glyph — which is what
-/// separates the separator fabrication ("UTS -950" with a +950 source)
-/// from the true negatives (residual stress, Seebeck coefficient,
-/// temperature...), all of which ride genuinely SIGNED quantities.
-/// Normalized names (lowercase, underscores -> spaces), matched against
-/// the normalized object by EXACT equality (slice `contains`). ROUND 13
-/// RECORD CORRECTION: that match is SPELLING-SCOPED — these five
-/// strings only; `normalize_for_containment` does not stem or take a
-/// head-noun, so 17 of 22 common spellings measured (`tensile
-/// strength`, `relative density`, `average grain size`, ...) are NOT
-/// recognized and still stamp a negative (see module header item (c)).
-/// Round 12 item 1(c): measured, not guessed — this dropped the six
-/// separator rows and the negative UTS range KNOWNs while every
-/// signed-quantity negative still stamped. The set is deliberately
-/// small and physical, not another word list: unknown
-/// quantities default to SIGNED, the permissive direction — a negative
-/// claim against an unrecognized quantity is never dropped by this
-/// guard. Every entry is pinned by a corpus row that stamps without it.
-/// Disabling the guard reddens 15 corpus rows at HEAD (measured round
-/// 13: 6 UTS separators, 4 quantity pins incl. 'yield strength', 5
-/// negative ranges). Round-12 commit 7b1f71ae recorded this M3 as 14 —
-/// it omitted the 'yield strength' Inconel pin from the quantity-pin
-/// count while crediting that same row to M5; the correct count is 15.
-const NONNEGATIVE_QUANTITIES: &[&str] =
-    &["uts", "hardness", "density", "grain size", "yield strength"];
-
-/// Round 14 item 3: a differential marker as a WHOLE WORD turns an
-/// otherwise-non-negative magnitude into a SIGNED delta. `change in
-/// yield strength`, `difference in hardness`, `delta grain size`,
-/// `reduction in strength`, `drop in strength`, `gradient in hardness` can all be negative
-/// though the bare noun is a magnitude — so a suffix match on the noun
-/// must NOT refuse them. Matched as whole tokens (`split_whitespace`)
-/// so `change` does not fire inside `exchange`.
-///
-/// Deliberately NOT in this list: `relative` and `anisotropy`, which
-/// denote RATIOS (non-negative), not deltas — adding them would license
-/// fabrications like `relative density = -0.5`. `relative strength` /
-/// `anisotropy in strength` therefore stay refused (measured, reported
-/// in round 14): a negative under them is nonsense. Each marker below
-/// IS pinned by its own control row in
-/// `sign_domain_matches_head_noun_suffix_without_over_refusal` —
-/// removing it from this slice reddens that row (no cannot-fail entry).
-const SIGNED_DIFFERENTIAL_MARKERS: &[&str] = &[
-    "change",
-    "difference",
-    "delta",
-    "reduction",
-    "drop",
-    "loss",
-    "increase",
-    "deviation",
-    "variation",
-    "gradient",
-];
-
-/// Round 14 item 3: genuinely-SIGNED homographs of the `*strength`
-/// suffix. `signal strength` (dBm is routinely negative) and
-/// `*field strength` (signed vector components) are magnitudes that CAN
-/// be negative, so the suffix rule must not refuse them. Matched by
-/// `ends_with` so `magnetic field strength` / `electric field strength`
-/// are caught by the `field strength` entry. NOT here: `ionic strength`,
-/// `dielectric strength` — genuinely non-negative, kept refused (pinned
-/// by forward control rows in the same test).
-const SIGNED_STRENGTH_HOMOGRAPHS: &[&str] = &["signal strength", "field strength"];
-
-/// Round 13 item 5: the exact-match closure was SPELLING-SCOPED — of 22
-/// common spellings only the five canonical dropped a negative; 17
-/// stamped one. Closing it with "more entries" would be another word
-/// list (the const doc above disclaims that). The fix is a HEAD-NOUN
-/// SUFFIX rule for the three quantities whose EVERY spelling is a
-/// magnitude AND has NO signed homograph: every `*strength`, every
-/// `*hardness`, every `*grain size` is non-negative — so `tensile
-/// strength`, `microhardness`, `average grain size`, `compressive
-/// strength`, `0.2% yield strength` now drop a negative too. NOT
-/// `density`: `charge density` / `current density` can be negative, so
-/// `density` stays EXACT and `relative density` / `bulk density` still
-/// fabricate (the measured price of not over-refusing the signed
-/// densities). Round 14 item 1 corrected the round-13 record that had
-/// wrongly certified this rule's over-refusal as handled; round 14
-/// items 2/3 REPAIR the over-refusal direction. Two exceptions now gate
-/// the suffix rule, BOTH checked before it:
-///   (a) A whole-word DIFFERENTIAL marker (`change`, `difference`,
-///       `delta`, `reduction`, `drop`, `loss`, `increase`, `deviation`,
-///       `variation`, `gradient`; see `SIGNED_DIFFERENTIAL_MARKERS`)
-///       anywhere makes the quantity a signed delta — `change in yield
-///       strength`, `difference in hardness`, `delta grain size` can be
-///       negative though the bare noun is a magnitude — so the suffix
-///       rule must not refuse them. `relative` / `anisotropy` are NOT
-///       markers (ratios, non-negative) — see the const doc.
-///   (b) `signal strength` and `*field strength` are genuinely-signed
-///       homographs of the suffix (see `SIGNED_STRENGTH_HOMOGRAPHS`).
-///       `ionic strength` / `dielectric strength` stay refused.
-/// BOTH directions are pinned by the lib test
-/// `sign_domain_matches_head_noun_suffix_without_over_refusal`: the
-/// forward rows drop a negative (reverting the suffix rule reddens
-/// them), and the over-refusal rows stamp — removing any one marker, or
-/// the homograph slice, reddens its own row. No arm or marker is
-/// cannot-fail. Round 14 item 4: a trailing unit is stripped FIRST, so a
-/// table-header object (`yield strength (MPa)`, `tensile strength, MPa`,
-/// `hardness (HV)`, `grain size (um)`, `density (g/cm3)`) is recognized
-/// by the exact/suffix rules. Scoped here (not in
-/// `normalize_for_containment`), so general containment matching is
-/// unaffected. The forward direction is pinned by unit-suffixed rows in
-/// the same lib test (removing the strip reddens them). Stripping has no
-/// pinnable over-refusal direction of its own: removing it only REMOVES
-/// refusal power, and signed unit-suffixed quantities are protected by
-/// the (a)/(b) exceptions above (measured — see the round-14 report).
-/// Symbol spellings the extractor emits verbatim (`Rm`, `flow stress`,
-/// `ultimate tensile stress`, ...) are NOT fixed here; they are a
-/// vocabulary problem (round 14 item 5), not a trailing-unit problem.
-fn is_nonnegative_quantity(object_n: &str) -> bool {
-    let s = strip_trailing_unit(object_n);
-    // A whole-word differential marker makes the quantity a signed delta:
-    // checked before the suffix rule so `change in yield strength` stamps.
-    if s.split_whitespace()
-        .any(|t| SIGNED_DIFFERENTIAL_MARKERS.contains(&t))
-    {
-        return false;
-    }
-    // signal/field strength are genuinely-signed homographs of *strength.
-    if SIGNED_STRENGTH_HOMOGRAPHS.iter().any(|h| s.ends_with(h)) {
-        return false;
-    }
-    NONNEGATIVE_QUANTITIES.contains(&s)
-        || s.ends_with("strength")
-        || s.ends_with("hardness")
-        || s.ends_with("grain size")
-}
-
-/// Strip ONE trailing unit so a table-header object is recognized by the
-/// exact/suffix rules in `is_nonnegative_quantity`: a trailing
-/// parenthetical (`yield strength (MPa)`) or a trailing comma-unit
-/// (`tensile strength, MPa`). Returns the input unchanged otherwise.
-/// Scoped to the SignDomain check only — `normalize_for_containment` is
-/// untouched, so general containment matching is unaffected.
-fn strip_trailing_unit(s: &str) -> &str {
-    // trailing parenthetical: "yield strength (mpa)" -> "yield strength"
-    if let Some(open) = s.rfind(')').and_then(|close| s[..close].rfind('(')) {
-        return s[..open].trim_end();
-    }
-    // trailing comma-unit: "tensile strength, mpa" -> "tensile strength"
-    if let Some(comma) = s.rfind(',') {
-        return s[..comma].trim_end();
-    }
-    s
-}
-
 /// Token-boundary check: the occurrence must not be adjacent to a digit, to
 /// a decimal point that continues it, to a digit-adjacent comma that
 /// continues a grouped number ("1,140" is one number, in both directions),
 /// to a leading minus that signs it ("-950" / "\u{2212}950" are one number),
 /// or to an alphanumeric. Otherwise "95" matches inside "950", "1.5" inside
 /// "11.5", "140" inside "1,140", and the "6" of "Ti-6Al-4V". After the
-/// number, a letter from `UNIT_INITIALS` is allowed so glued units
-/// ("950MPa") still stamp. En-dash range endpoints are refused by
-/// `dash_range_endpoint`, not here.
-fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> bool {
+/// number, the fact's OWN unit term — exactly the term the reader/ontology
+/// chose, no Rust unit lexicon — redeems a glued letter ("950MPa" with unit
+/// "MPa"); without a supplied unit term every glued alphanumeric refuses.
+/// En-dash range endpoints are refused by `dash_range_endpoint`, not here.
+fn clean_number_boundary(hay: &str, start: usize, end: usize, unit_n: Option<&str>) -> bool {
+    // The occurrence's own first character, derived from its byte range —
+    // the caller no longer threads a needle it can always reconstruct.
+    let needle = &hay[start..end];
     if let Some(before) = hay[..start].chars().next_back() {
         if before.is_alphanumeric() {
             return false;
@@ -1610,7 +1506,7 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     }
     if let Some(after) = hay[end..].chars().next() {
         if after.is_alphanumeric() {
-            if !unit_initial(after) {
+            if !glued_fact_unit(hay, end, unit_n) {
                 return false;
             }
             // A glued unit letter redeems a number, but not a digit that
@@ -1654,6 +1550,22 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
     true
 }
 
+/// Whether the fact's OWN unit term begins exactly at `pos` in `hay`, glued
+/// to the number (no space). `hay` and the term are both already folded
+/// (lowercased); the term must end on a token boundary, exactly as the
+/// exact-match unit resolvers in `prism_provenance::units` require. This is
+/// the ONLY redemption for a letter glued to a number — Rust holds no unit
+/// lexicon, so an unclaimed glued letter ("950x", "2e5", "950z") refuses.
+fn glued_fact_unit(hay: &str, pos: usize, unit_n: Option<&str>) -> bool {
+    let Some(unit_n) = unit_n.filter(|u| !u.is_empty()) else {
+        return false;
+    };
+    let Some(tail) = hay[pos..].strip_prefix(unit_n) else {
+        return false;
+    };
+    tail.chars().next().is_none_or(|c| !c.is_alphanumeric())
+}
+
 /// Range endpoints on a dash: "950\u{2013}1100 MPa" asserts a range,
 /// not two point values, so a number that opens or closes a
 /// digit/dash/digit run is refused. Round 10: the dash set is the whole
@@ -1683,19 +1595,47 @@ fn clean_number_boundary(hay: &str, needle: &str, start: usize, end: usize) -> b
 /// adjacency gap itself stays open for signed quantities and positive
 /// values. All pinned as KNOWN corpus rows.
 fn dash_range_endpoint(hay: &str, start: usize, end: usize) -> bool {
-    if let Some(after) = hay[end..].chars().next()
+    // B12: the trims tolerate the spaced forms ("950 \u{2013} 1100") that
+    // journal typesetting and pdf-extract both emit; a digit still has to
+    // sit on the FAR side of the dash, so a spaced unary minus ("was -
+    // 950 MPa", where the far side is a word) never becomes a range.
+    // The trimmed slice's offsets are RELATIVE to it — all indexing below
+    // stays inside the slice, never re-based on `hay` (re-basing was the
+    // first draft of this fix and it panicked mid-multibyte).
+    let after_ws = hay[end..].trim_start_matches(' ');
+    if let Some(after) = after_ws.chars().next()
         && MINUS_CAPABLE_DASHES.contains(&after)
-        && hay[end + after.len_utf8()..].starts_with(|c: char| c.is_ascii_digit())
+        && after_ws[after.len_utf8()..]
+            .trim_start_matches(' ')
+            .starts_with(|c: char| c.is_ascii_digit())
     {
         return true;
     }
-    if let Some(before) = hay[..start].chars().next_back()
+    let before_ws = hay[..start].trim_end_matches(' ');
+    if let Some(before) = before_ws.chars().next_back()
         && MINUS_CAPABLE_DASHES.contains(&before)
-        && hay[..start - before.len_utf8()].ends_with(|c: char| c.is_ascii_digit())
+        && before_ws[..before_ws.len() - before.len_utf8()]
+            .trim_end_matches(' ')
+            .ends_with(|c: char| c.is_ascii_digit())
     {
         return true;
     }
     false
+}
+
+/// B8 (the ± half): is the occurrence at `start` an UNCERTAINTY figure —
+/// the token immediately to its left (skipping spaces) is the plus-minus
+/// notation? Both spellings of the notation are mathematical symbols, not
+/// domain vocabulary: `\u{00b1}` (PLUS-MINUS SIGN) and the ASCII run
+/// `+/-`. The MIRROR shape (the value a tolerance decorates, e.g. 950 in
+/// "950 ± 30 MPa") has a word or nothing to its left and stamps normally —
+/// pinned by the corpus control row.
+fn uncertainty_decoration(hay: &str, start: usize) -> bool {
+    let before = hay[..start].trim_end_matches(' ');
+    if before.ends_with('\u{00b1}') {
+        return true;
+    }
+    before.ends_with("+/-")
 }
 
 /// Is the occurrence inside a citation marker? Bracketed styles
@@ -1735,282 +1675,6 @@ fn is_citation_numeric_syntax(c: char) -> bool {
         || MINUS_CAPABLE_DASHES.contains(&c)
 }
 
-/// Words after which a number is a label, never a measurement — unless
-/// the number carries a unit, which the exemption at the top of
-/// `preceding_word_is_label` grants (a label number never has a unit
-/// after it; a measurement always does).
-const LABEL_WORDS: &[&str] = &[
-    "table",
-    "tables",
-    "figure",
-    "figures",
-    "fig",
-    "figs",
-    "ref",
-    "refs",
-    "reference",
-    "references",
-    "section",
-    "sections",
-    "eq",
-    "eqs",
-    "equation",
-    "equations",
-    "chapter",
-    "chapters",
-    "entry",
-    "entries",
-    "scheme",
-    "schemes",
-    // Sample/run are methods-prose nouns too, but they double as
-    // specimen/batch labels: "Sample 5 of Ti-6Al-4V" numbers the
-    // specimen, it does not measure it. Kept here; the unit exemption
-    // keeps "sample 3 mm thick" and "run 30 min" stamping.
-    "sample",
-    "samples",
-    "run",
-    "runs",
-    // Round 9: the rest of the specimen-label family, all measured
-    // stamping at HEAD — Specimen 5, Batch 12, Coupon 7, Test 3,
-    // Trial 4, Experiment 2, Condition 3, Step 2, Panel 4, Column 3,
-    // Row 2, Plot 2, Image 4, Micrograph 3, Curve 3, Inset 2,
-    // page 12, Appendix 2, and Grade 5 (a designator doubly wrong:
-    // Ti-6Al-4V IS grade 5). Every word is pinned by a corpus case;
-    // the unit exemption keeps methods prose stamping. Singular forms
-    // only — the WORD list stays singular because an unpinned list
-    // entry is a cannot-fail item; the plural leak itself ("Specimens
-    // 3 and 4" stamps) is pinned on the scoreboard as a KNOWN gap
-    // since round 10, so the record of it can no longer go stale.
-    "specimen",
-    "batch",
-    "coupon",
-    "test",
-    "trial",
-    "experiment",
-    "condition",
-    "step",
-    "panel",
-    "column",
-    "row",
-    "plot",
-    "image",
-    "micrograph",
-    "curve",
-    "inset",
-    "page",
-    "appendix",
-    "grade",
-];
-
-/// Words that continue a label list: the number after one of these is a
-/// label when the number one step back sits a label word ("Tables 1 and 2").
-const LIST_CONTINUATIONS: &[&str] = &["and", "or", "to", "through"];
-
-/// Units a list's last item can carry. The curated set is deliberately
-/// the vocabulary of measurements: reference lists never carry units, so
-/// a chain that ends in one of these is a VALUE list and the walk-back
-/// to a label word must stop. A token matches only at a token boundary,
-/// so prose words that merely start with a unit ("for", "uts") never
-/// match.
-const UNIT_TOKENS: &[&str] = &[
-    // pressure / stress / hardness
-    "pa", "kpa", "mpa", "gpa", "tpa", "bar", "mbar", "kbar", "atm", "torr", "psi", "ksi", "hv",
-    "hrc", "hrb", // force, length, mass
-    "n", "kn", "mn", "gn", "m", "mm", "cm", "nm", "um", "\u{b5}m", "\u{3bc}m", "pm", "km", "g",
-    "mg", "kg", // time, temperature
-    "s", "ms", "ns", "ps", "min", "h", "k", "\u{b0}c", "\u{b0}f",
-    // energy, power, frequency
-    "j", "kj", "mj", "gj", "ev", "kev", "mev", "gev", "tev", "w", "mw", "kw", "hz", "khz", "mhz",
-    "ghz", "thz", "rpm", // electrical, magnetic
-    "v", "mv", "kv", "a", "ma", "ohm", "t", // fractions
-    "%", "wt%", "at%", "vol%", "mol", "ppm", "ppb",
-];
-
-/// Does the text after `end` carry a unit for the number — one optional
-/// space, then a unit token at a token boundary ("970 mpa", "1140mpa")?
-/// `hay` is normalized: lowercase, single spaces.
-fn unit_follows(hay: &str, end: usize) -> bool {
-    let rest = hay[end..].strip_prefix(' ').unwrap_or(&hay[end..]);
-    UNIT_TOKENS.iter().any(|u| {
-        rest.strip_prefix(u)
-            .is_some_and(|tail| tail.chars().next().is_none_or(|c| !c.is_alphanumeric()))
-    })
-}
-
-/// Byte length of the leading complete numeric token in `s`. A comma followed
-/// by a space is a list separator, not part of the token.
-fn leading_number_len(s: &str) -> usize {
-    numeric_lexeme_at(s, 0).map_or(0, |lexeme| lexeme.end)
-}
-
-/// Does the list chain continuing after `end` — ", <number>" items and
-/// "<and|or|to|through> <number>" steps — close with a unit? A chain that
-/// ends in a unit is a value list ("950, 960 and 970 MPa"); reference
-/// lists never carry one ("Refs. 25, 26 and 27"). A unit directly after
-/// the occurrence is a chain of length zero and counts too.
-fn chain_ends_in_unit(hay: &str, end: usize) -> bool {
-    let mut pos = end;
-    loop {
-        if unit_follows(hay, pos) {
-            return true;
-        }
-        let rest = &hay[pos..];
-        if let Some(item) = rest.strip_prefix(", ") {
-            let n = leading_number_len(item);
-            if n == 0 {
-                return false;
-            }
-            pos += ", ".len() + n;
-        } else if let Some(item) = rest.strip_prefix(' ')
-            && let Some(conj) = LIST_CONTINUATIONS
-                .iter()
-                .find(|c| item.starts_with(*c) && item.as_bytes().get(c.len()) == Some(&b' '))
-        {
-            let skip = 1 + conj.len() + 1;
-            let n = leading_number_len(&rest[skip..]);
-            if n == 0 {
-                return false;
-            }
-            pos += skip + n;
-        } else {
-            return false;
-        }
-    }
-}
-
-/// Step back over ", <number>" items one number at a time; the word at
-/// the head of the list decides.
-fn walk_comma_items(prefix: &mut String, word: &mut String) {
-    while word.is_empty() && prefix.ends_with(',') {
-        let before_comma = prefix[..prefix.len() - 1].trim_end_matches(' ');
-        let Some(number_start) = trailing_numeric_lexeme_start(before_comma) else {
-            break;
-        };
-        *prefix = before_comma[..number_start]
-            .trim_end_matches([' ', '.', ':'])
-            .to_string();
-        *word = trailing_word(prefix);
-    }
-}
-
-/// Start byte of a complete numeric token ending `s`, when the token begins at
-/// a lexical boundary. This lets label-list walking treat `Figures 1.20, 2.30`
-/// like an integer list instead of stranding the fractional suffix.
-fn trailing_numeric_lexeme_start(s: &str) -> Option<usize> {
-    s.char_indices().find_map(|(start, first)| {
-        if !first.is_ascii_digit() && !is_numeric_sign(first) {
-            return None;
-        }
-        if s[..start]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_alphanumeric)
-        {
-            return None;
-        }
-        numeric_lexeme_at(s, start)
-            .filter(|lexeme| lexeme.end == s.len())
-            .map(|_| start)
-    })
-}
-
-/// Does the occurrence sit right after Table/Figure/Ref ("Table 1",
-/// "Figure 2", "Ref. 25")? Such a number labels a document object; it is
-/// not evidence for a property value. Continuations of a label list are
-/// caught by stepping back over them to the head word: ", <number>"
-/// items repeatedly ("Refs. 25, 26"), then one conjunction and the
-/// number-run before it ("Tables 1 and 2", "Refs. 25\u{2013}27 and 28",
-/// "Sections 3.1 and 4").
-///
-/// The walk runs only for REFERENCE lists: the chain continuing after
-/// the occurrence decides. It ends in a unit -> value list -> the label
-/// word before it is just the sentence's locator ("In Table 5, 950, 960
-/// and 970 MPa"), and the walk must not reach it; no unit -> reference
-/// list -> walk to the head word ("Refs. 25, 26 and 27"). The unit is
-/// the discriminator the walk never looked at; without it the walk
-/// stepped from a value back over the locator label and dropped every
-/// value in the list.
-///
-/// The conjunction step trims the number-run before the conjunction
-/// GREEDILY — digits, dots, commas, spaces and dashes — because dotted
-/// labels are ubiquitous ("Sections 3.1 and 4", "Eqs. 2.1 and 3"): a
-/// trim that stops at the '.' strands "3" as the head word and never
-/// reaches "sections". Reference lists carry no units, so the walk
-/// cannot be rescued by a unit check; a value list with a unit never
-/// walks at all (`chain_ends_in_unit`), and one without a unit lands on
-/// its real head word ("measured"), not a label. Round 6 bounded this
-/// trim to one number-run; the bound opened dotted-label fabrications
-/// and reddened nothing on revert, so it is gone.
-fn preceding_word_is_label(hay: &str, start: usize, end: usize) -> bool {
-    // A SPACED unit after the number makes it a measurement, whatever
-    // word precedes it: "sample 3 mm thick" and "run 30 min" are
-    // methods prose, while "Sample 5 of Ti-6Al-4V" (no unit) stays a
-    // label. Checked first so it exempts the head word itself, not
-    // just the list walk.
-    //
-    // The exemption REQUIRES the space (round 8). UNIT_TOKENS holds
-    // eleven single letters (n m g s h k j w v a t) — exactly the
-    // symbol letters of materials prose — so round 7's spaceless
-    // exemption read a glued sub-panel letter or symbol column as a
-    // unit and dropped the label guard for every label word: "Figure
-    // 2a shows..." stamped 2, "Table 4a" stamped 4. Every measured
-    // win that needs THIS exemption is spaced.
-    //
-    // HONEST COST (round 9 — the round-8 claim that
-    // `clean_number_boundary` redeems glued-unit recall was FALSE):
-    // passing the boundary check only avoids the Boundary guard; THIS
-    // guard fires afterwards and nothing redeems it. The space
-    // requirement silently costs thirteen glued recall forms, carried
-    // as KNOWN failures in tests/claim_corpus.rs: sample 3mm,
-    // run 30min, sample 980°C, samples 5mm, sample 30um, sample 5wt%,
-    // and — round 10, the bill for the nineteen round-9 words —
-    // coupon 3mm, specimen 5mm, panel 2mm, test 950MPa, scan step
-    // 50um, condition 980C, trial 30min. Round 10 removed
-    // cross-section 10mm from this list: that claim is a position, not
-    // a property of the alloy — its drop is correct, not a cost. Round
-    // 11 removed batch 25kg: the mass of one powder lot is extensive,
-    // not a property — its drop is correct, not a cost.
-    // Recorded residue: a SPACED single-letter unit
-    // still exempts ("Table 4 K values" stamps 4) — see the corpus
-    // KNOWN cases in tests/claim_corpus.rs.
-    if hay[end..].starts_with(' ') && unit_follows(hay, end) {
-        return false;
-    }
-    let mut prefix = hay[..start].trim_end_matches([' ', '.', ':']).to_string();
-    let mut word = trailing_word(&prefix);
-    if !chain_ends_in_unit(hay, end) {
-        walk_comma_items(&mut prefix, &mut word);
-        if LIST_CONTINUATIONS.contains(&word.as_str()) {
-            // Round 10: the dash set is the whole dash class here too —
-            // "Refs. 25\u{2010}27 and 28" used to strand its trim on the
-            // dash and stamp 28, the same partial-trio leak the
-            // citation marker had.
-            prefix = prefix[..prefix.len() - word.len()]
-                .trim_end_matches(|c: char| {
-                    c.is_ascii_digit()
-                        || matches!(c, ',' | ' ' | '.' | ':')
-                        || MINUS_CAPABLE_DASHES.contains(&c)
-                })
-                .to_string();
-            word = trailing_word(&prefix);
-        }
-    }
-    LABEL_WORDS.contains(&word.as_str())
-}
-
-/// The trailing alphanumeric word of `prefix`, empty when `prefix` ends
-/// in a non-word character.
-fn trailing_word(prefix: &str) -> String {
-    prefix
-        .chars()
-        .rev()
-        .take_while(|c: &char| c.is_alphanumeric())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
 /// String forms under which a numeric value may legitimately appear in
 /// a paper: the plain rendering plus the comma-grouped integer form. A
 /// negative value appears under TWO minus glyphs: ASCII hyphen and
@@ -2034,37 +1698,32 @@ fn trailing_word(prefix: &str) -> String {
 /// readings are locally indistinguishable (both word/dash/digit), so the
 /// branch's priority decides: a fabrication is worse than a miss.
 ///
-/// COVERAGE, corrected round 12 (the round-11 record overclaimed; the
-/// round-12 closure is measured, not guessed): the revert holds for
-/// U+2013/U+2014, and the predicate's SIGN DOMAIN covers what the
-/// revert could not. U+2212 stays a sign glyph and ASCII '-' always
-/// was one; round 12 item 1(b) measured the SAME separator shapes
-/// still stamping a negative under both glyphs, and item 1(c) adopted
-/// the one discriminator that separates the classes without a glyph
-/// list: UTS, hardness, density, grain size and yield strength are
-/// non-negative by physical definition, so a negative claim against
-/// one is nonsense under EVERY glyph — `RefusalGuard::SignDomain`
-/// (`NONNEGATIVE_QUANTITIES`) refuses it, the separator shapes drop
-/// for the right reason, and the true negatives survive because they
-/// ride genuinely signed quantities (residual stress, Seebeck,
-/// temperature). The round-11 sentence "unambiguously a minus, never
-/// a separator" described the glyph's typography, not the code, and
-/// is struck: for SIGNED quantities the minus-vs-separator reading of
-/// '-'/'\u{2212}' stays locally indistinguishable, and the engine keeps the
-/// MINUS reading there — the glyph IS the minus sign, so a negative
-/// that stamps is the defensible reading (its recall twin, the
-/// correct positive, still drops Boundary; corpus KNOWN row).
-/// Unknown quantities default to signed — the permissive direction.
-/// Under U+2013/U+2014 the true negative drops (recall loss, corpus
-/// KNOWN rows) and the separator shapes drop (corpus MustDrop pins).
+/// COVERAGE, corrected round 12 and re-grounded by the de-hardcoding
+/// contract: the revert holds for U+2013/U+2014, and the sign domain the
+/// ONTOLOGY declares for the quantity ([`GuardPolicy::quantity_sign`])
+/// covers what the revert could not. U+2212 stays a sign glyph and ASCII
+/// '-' always was one; for a quantity the ontology declares non-negative,
+/// a negative claim is nonsense under EVERY glyph —
+/// `RefusalGuard::SignDomain` refuses it and the separator shapes drop
+/// for the right reason. Where the ontology is SILENT the round-11
+/// sentence "unambiguously a minus, never a separator" stays struck: for
+/// such quantities the minus-vs-separator reading of '-'/'\u{2212}' is
+/// locally indistinguishable, and the engine keeps the MINUS reading —
+/// the glyph IS the minus sign, so a negative that stamps is the
+/// defensible reading (its recall twin, the correct positive, still drops
+/// Boundary; corpus KNOWN row). Silence is the permissive direction, and
+/// it is never papered over with a quantity-name list. Under
+/// U+2013/U+2014 the true negative drops (recall loss, corpus KNOWN rows)
+/// and the separator shapes drop (corpus MustDrop pins).
 ///
 /// FETCH ROUTE, the module header's class: header item (c) carries
 /// the route view. Round 11 reopened it — the paper whose JATS
 /// spelling ("UTS \u{2013}950 MPa") round 11 pinned MustDrop fabricated
-/// -950 through the PDF route. Round 12 closed the fabrication half
-/// for non-negative quantities (both routes now drop); for signed
-/// quantities a recall divergence remains (JATS U+2013 drops, PDF '-'
-/// stamps the genuine negative), recorded as the header describes.
+/// -950 through the PDF route; the ontology-served sign domain is what
+/// closes that fabrication half where it is declared. For signed (or
+/// undeclared) quantities a recall divergence remains (JATS U+2013
+/// drops, PDF '-' stamps the genuine negative), recorded as the header
+/// describes.
 ///
 /// FIXED, ROUND 9 (was RECORDED, NOT FIXED, round 8): the sign flip
 /// stamped through U+2010, U+2011, U+2012, U+2014, U+2015 and U+FE63 as
@@ -2158,12 +1817,19 @@ mod tests {
             confidence: Some(0.9),
             kind: Some("measurement".to_string()),
             evidence_class: evidence.to_string(),
+            verification: None,
+            verification_reason: None,
+            ontology: Default::default(),
             provenance: ClaimProvenance {
                 document_id: "10.1234/hea".to_string(),
                 document_url: "https://doi.org/10.1234/hea".to_string(),
                 source: "openalex".to_string(),
                 locator: locator(),
                 quote: quote.map(str::to_string),
+                source_revision_id: None,
+                line_start: None,
+                line_end: None,
+                source_text_path: None,
             },
         }
     }
@@ -2194,13 +1860,39 @@ mod tests {
             confidence: Some(0.9),
             kind: Some("measurement".to_string()),
             evidence_class: "research".to_string(),
+            verification: None,
+            verification_reason: None,
+            ontology: Default::default(),
             provenance: ClaimProvenance {
                 document_id: "10.1234/unrelated".to_string(),
                 document_url: "https://doi.org/10.1234/unrelated".to_string(),
                 source: "openalex".to_string(),
                 locator: locator(),
                 quote: None,
+                source_revision_id: None,
+                line_start: None,
+                line_end: None,
+                source_text_path: None,
             },
+        }
+    }
+
+    /// A policy carrying the ontology's declaration that the claimed
+    /// quantity is non-negative — what the ontology serves at grounding
+    /// time; the matcher never derives it from the name.
+    fn nonnegative_policy() -> GuardPolicy {
+        GuardPolicy {
+            quantity_sign: QuantitySignDomain::NonNegative,
+            unit_term: None,
+        }
+    }
+
+    /// A policy carrying the fact's own unit term, exactly as the
+    /// reader/ontology chose it.
+    fn unit_policy(term: &str) -> GuardPolicy {
+        GuardPolicy {
+            quantity_sign: QuantitySignDomain::Unspecified,
+            unit_term: Some(term.to_string()),
         }
     }
 
@@ -2319,7 +2011,16 @@ mod tests {
         );
 
         // And the supporting-quote finder finds nothing for it in the block.
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), unrelated_block).is_none());
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                unrelated_block,
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2350,7 +2051,13 @@ mod tests {
 
     #[test]
     fn supporting_quote_finds_the_sentence_with_the_value() {
-        let found = supporting_quote("CoCrFeNi", "thermal_conductivity", Some(11.5), BLOCK);
+        let found = supporting_quote(
+            "CoCrFeNi",
+            "thermal_conductivity",
+            Some(11.5),
+            BLOCK,
+            &GuardPolicy::SILENT,
+        );
         assert_eq!(
             found.as_deref(),
             Some("Its thermal conductivity is 11.5 W/(m K) at room temperature.")
@@ -2360,7 +2067,13 @@ mod tests {
     #[test]
     fn supporting_quote_does_not_split_decimal_numbers() {
         let block = "See results. Conductivity of CoCrFeNi was 11.5 W/(m K). Done.";
-        let found = supporting_quote("CoCrFeNi", "conductivity", Some(11.5), block);
+        let found = supporting_quote(
+            "CoCrFeNi",
+            "conductivity",
+            Some(11.5),
+            block,
+            &GuardPolicy::SILENT,
+        );
         assert!(found.unwrap().contains("11.5"));
     }
 
@@ -2369,17 +2082,37 @@ mod tests {
         // The number alone could be a citation number; it must appear with
         // the subject or the object to count as support.
         let block = "Discussion of prior work [1140] follows. No alloy data here.";
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), block).is_none());
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn supporting_quote_matches_comma_grouped_numbers() {
         let block = "The Ti-6Al-4V billet showed a UTS of 1,140 MPa.";
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), block).is_some());
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn numeric_tolerant_supporting_quote_matches_complete_numeric_lexemes() {
+        // CONTRACT CHANGE: the matcher now returns structured refusals, so
+        // success/failure is asserted as Result instead of lossy Option.
         let exact_rendering = "The Alloy A modulus was 1.20 GPa.";
         assert_eq!(
             supporting_quote_with_numeric_tolerance(
@@ -2388,15 +2121,23 @@ mod tests {
                 1.2,
                 exact_rendering,
                 0.0,
+                &GuardPolicy::SILENT,
             )
             .as_deref(),
-            Some(exact_rendering)
+            Ok(exact_rendering)
         );
 
-        let decimal_comma = "The Alloy A modulus was 1,20 GPa.";
+        let decimal_comma = "The Alloy A modulus was 1,2 GPa.";
         assert!(
-            supporting_quote_with_numeric_tolerance("Alloy A", "modulus", 1.2, decimal_comma, 0.0,)
-                .is_some()
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                1.2,
+                decimal_comma,
+                0.0,
+                &GuardPolicy::SILENT,
+            )
+            .is_ok()
         );
 
         let ambiguous_comma = "The Alloy A UTS was 1,140 MPa.";
@@ -2407,12 +2148,20 @@ mod tests {
                 1140.0,
                 ambiguous_comma,
                 0.0,
+                &GuardPolicy::SILENT,
             )
-            .is_none()
+            .is_err()
         );
         assert!(
-            supporting_quote_with_numeric_tolerance("Alloy A", "UTS", 1.14, ambiguous_comma, 0.0,)
-                .is_none()
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "UTS",
+                1.14,
+                ambiguous_comma,
+                0.0,
+                &GuardPolicy::SILENT,
+            )
+            .is_err()
         );
 
         let unambiguous_grouping = "The Alloy A UTS was 1,140,000 MPa.";
@@ -2420,24 +2169,25 @@ mod tests {
             supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "UTS",
-                1_140_000.0,
+                1140000.0,
                 unambiguous_grouping,
                 0.0,
+                &GuardPolicy::SILENT,
             )
-            .is_some()
+            .is_ok()
         );
 
-        let signed_exponent =
-            "The residual stress in Alloy A was \u{2212}1.20e+3 MPa after cooling.";
+        let signed_exponent = "The Alloy A conductivity was -1.20E-3 S/m.";
         assert!(
             supporting_quote_with_numeric_tolerance(
                 "Alloy A",
-                "residual_stress",
-                -1200.0,
+                "conductivity",
+                -1.20e-3,
                 signed_exponent,
                 0.0,
+                &GuardPolicy::SILENT,
             )
-            .is_some()
+            .is_ok()
         );
 
         let positive_negative_exponent = "The Alloy A conductivity was +1.20E-3 S/m.";
@@ -2445,68 +2195,90 @@ mod tests {
             supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "conductivity",
-                0.0012,
+                1.20e-3,
                 positive_negative_exponent,
                 0.0,
+                &GuardPolicy::SILENT,
             )
-            .is_some()
+            .is_ok()
         );
     }
 
     #[test]
     fn numeric_tolerant_supporting_quote_uses_the_supplied_relative_tolerance() {
+        // CONTRACT CHANGE: failed tolerance checks remain distinguishable
+        // from successful evidence through the lossless Result contract.
         let block = "The Alloy A modulus was 1.2004 GPa.";
         assert!(
-            supporting_quote_with_numeric_tolerance("Alloy A", "modulus", 1.2, block, 0.001,)
-                .is_some()
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                1.2,
+                block,
+                0.001,
+                &GuardPolicy::SILENT,
+            )
+            .is_ok()
         );
         assert!(
-            supporting_quote_with_numeric_tolerance("Alloy A", "modulus", 1.2, block, 0.0001,)
-                .is_none()
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                1.2,
+                block,
+                0.0001,
+                &GuardPolicy::SILENT,
+            )
+            .is_err()
         );
 
         let opposite_sign = "The Alloy A residual stress was -1.0 MPa.";
         assert!(
             supporting_quote_with_numeric_tolerance(
                 "Alloy A",
-                "residual stress",
+                "residual_stress",
                 1.0,
                 opposite_sign,
                 2.0,
+                &GuardPolicy::SILENT,
             )
-            .is_none(),
+            .is_err(),
             "tolerance must never reverse numeric polarity"
         );
     }
 
     #[test]
     fn numeric_tolerant_supporting_quote_skips_rejected_lexemes_whole() {
+        // CONTRACT CHANGE: rejected lexemes now produce a structured error;
+        // this test no longer treats every rejection as an absent Option.
         let mixed_locale = "The Alloy A modulus was 1.140,5 GPa.";
         assert!(
             supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "modulus",
-                140.5,
+                1140.5,
                 mixed_locale,
                 0.0,
+                &GuardPolicy::SILENT,
             )
-            .is_none(),
+            .is_err(),
             "a suffix of a rejected complete token is not independent evidence"
         );
 
         for malformed_exponent in [
-            "The Alloy A residual stress token was 1e--3 MPa.",
-            "The Alloy A residual stress token was 1e+-3 MPa.",
+            "The Alloy A rate was 1e--3 per second.",
+            "The Alloy A rate was 1e+-3 per second.",
         ] {
             assert!(
                 supporting_quote_with_numeric_tolerance(
                     "Alloy A",
-                    "residual stress",
-                    -3.0,
+                    "rate",
+                    1e-3,
                     malformed_exponent,
                     0.0,
+                    &GuardPolicy::SILENT,
                 )
-                .is_none(),
+                .is_err(),
                 "a malformed exponent suffix became evidence: {malformed_exponent}"
             );
         }
@@ -2514,10 +2286,21 @@ mod tests {
 
     #[test]
     fn numeric_tolerant_supporting_quote_keeps_every_refusal_guard() {
+        // CONTRACT CHANGE: this is now the primary public API contract, not a
+        // secondary diagnostic helper behind a lossy Option wrapper.
+        // CONTRACT CHANGE (de-hardcoding): the Label guard no longer exists —
+        // label vocabulary was domain knowledge and moved out of Rust. The
+        // guards pinned here are the domain-independent ones plus the
+        // ontology-served SignDomain.
         let range = "The Alloy A modulus ranged from 1.20\u{2013}1.40 GPa.";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
-                "Alloy A", "modulus", 1.2, range, 0.0,
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                1.2,
+                range,
+                0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Range,
@@ -2527,8 +2310,13 @@ mod tests {
 
         let citation = "The Alloy A modulus follows prior work [1.20].";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
-                "Alloy A", "modulus", 1.2, citation, 0.0,
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "modulus",
+                1.2,
+                citation,
+                0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Citation,
@@ -2538,12 +2326,13 @@ mod tests {
 
         let later_citation = "The Alloy A modulus follows prior work [1.20, 2.30].";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
+            supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "modulus",
                 2.3,
                 later_citation,
                 0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Citation,
@@ -2551,40 +2340,15 @@ mod tests {
             })
         );
 
-        let label = "The Alloy A modulus is plotted in Figure 1.20.";
-        assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
-                "Alloy A", "modulus", 1.2, label, 0.0,
-            ),
-            Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: label.to_string(),
-            })
-        );
-
-        let later_label = "The Alloy A modulus appears in Figures 1.20, 2.30.";
-        assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
-                "Alloy A",
-                "modulus",
-                2.3,
-                later_label,
-                0.0,
-            ),
-            Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: later_label.to_string(),
-            })
-        );
-
         let inside_name = "Inconel 718 was studied for UTS.";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
+            supporting_quote_with_numeric_tolerance(
                 "Inconel 718",
                 "UTS",
                 718.0,
                 inside_name,
                 0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::InsideName,
@@ -2594,12 +2358,13 @@ mod tests {
 
         let formatted_inside_name = "Inconel 718.0 UTS results were reported in MPa.";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
+            supporting_quote_with_numeric_tolerance(
                 "Inconel 718",
                 "UTS",
                 718.0,
                 formatted_inside_name,
                 0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::InsideName,
@@ -2609,8 +2374,13 @@ mod tests {
 
         let boundary = "The Alloy A UTS marker was x950.0x.";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
-                "Alloy A", "UTS", 950.0, boundary, 0.0,
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "UTS",
+                950.0,
+                boundary,
+                0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Boundary,
@@ -2618,14 +2388,30 @@ mod tests {
             })
         );
 
+        // SignDomain now reads the ONTOLOGY's declaration, not a compiled
+        // quantity list: silent policy stamps the negative, NonNegative
+        // refuses it.
         let sign_domain = "The Alloy A UTS was -950.0 MPa.";
-        assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
+        assert!(
+            supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "UTS",
                 -950.0,
                 sign_domain,
                 0.0,
+                &GuardPolicy::SILENT,
+            )
+            .is_ok(),
+            "a silent ontology leaves the sign check inert"
+        );
+        assert_eq!(
+            supporting_quote_with_numeric_tolerance(
+                "Alloy A",
+                "UTS",
+                -950.0,
+                sign_domain,
+                0.0,
+                &nonnegative_policy(),
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::SignDomain,
@@ -2635,12 +2421,13 @@ mod tests {
 
         let separator = "Alloy A residual stress \u{2212}950.0 MPa (longitudinal).";
         assert_eq!(
-            supporting_quote_with_numeric_tolerance_or_refusal(
+            supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "residual_stress",
                 -950.0,
                 separator,
                 0.0,
+                &GuardPolicy::SILENT,
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::SeparatorDash,
@@ -2648,25 +2435,38 @@ mod tests {
             })
         );
 
-        let true_negative = "The residual stress in Alloy A was \u{2212}950.0 MPa.";
+        let true_negative = "The residual stress in Alloy A was \u{2212}350.0 MPa.";
         assert!(
             supporting_quote_with_numeric_tolerance(
                 "Alloy A",
                 "residual_stress",
-                -950.0,
+                -350.0,
                 true_negative,
                 0.0,
+                &GuardPolicy::SILENT,
             )
-            .is_some()
+            .is_ok()
         );
     }
 
     #[test]
     fn non_numeric_fact_needs_subject_and_object_in_one_span() {
         let block = "The Ti-6Al-4V microstructure contained an alpha-beta phase.";
-        assert!(supporting_quote("Ti-6Al-4V", "alpha-beta", None, block).is_some());
+        assert!(
+            supporting_quote("Ti-6Al-4V", "alpha-beta", None, block, &GuardPolicy::SILENT)
+                .is_some()
+        );
         // Object absent from the block: no support.
-        assert!(supporting_quote("Ti-6Al-4V", "omega phase", None, block).is_none());
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "omega phase",
+                None,
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2679,8 +2479,14 @@ mod tests {
     /// Mirrors the production flow in crates/cli/src/papers.rs: the quote
     /// is whatever `supporting_quote` finds in the block, and a claim with
     /// no quote must be refused by `validate_and_stamp`.
-    fn assert_dropped_end_to_end(subject: &str, object: &str, value: f64, block: &str) {
-        let quote = supporting_quote(subject, object, Some(value), block);
+    fn assert_dropped_end_to_end_with_policy(
+        subject: &str,
+        object: &str,
+        value: f64,
+        block: &str,
+        policy: &GuardPolicy,
+    ) {
+        let quote = supporting_quote(subject, object, Some(value), block, policy);
         assert!(
             quote.is_none(),
             "fabricated support found for {subject}/{object}={value}: {quote:?}"
@@ -2695,18 +2501,29 @@ mod tests {
             confidence: Some(0.9),
             kind: Some("measurement".to_string()),
             evidence_class: "research".to_string(),
+            verification: None,
+            verification_reason: None,
+            ontology: Default::default(),
             provenance: ClaimProvenance {
                 document_id: "10.1234/doc".to_string(),
                 document_url: "https://doi.org/10.1234/doc".to_string(),
                 source: "openalex".to_string(),
                 locator: locator(),
                 quote,
+                source_revision_id: None,
+                line_start: None,
+                line_end: None,
+                source_text_path: None,
             },
         };
         assert_eq!(
             validate_and_stamp(claim, block).unwrap_err(),
             ClaimRejection::MissingQuote
         );
+    }
+
+    fn assert_dropped_end_to_end(subject: &str, object: &str, value: f64, block: &str) {
+        assert_dropped_end_to_end_with_policy(subject, object, value, block, &GuardPolicy::SILENT);
     }
 
     /// Fabrication path 2: substring number matching. The matched number
@@ -2721,13 +2538,23 @@ mod tests {
         assert_dropped_end_to_end("CoCrFeNi", "thermal_conductivity", 1.5, conductivity_block);
 
         // The genuine values in the same blocks still stamp.
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), uts_block).is_some());
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                uts_block,
+                &GuardPolicy::SILENT
+            )
+            .is_some()
+        );
         assert!(
             supporting_quote(
                 "CoCrFeNi",
                 "thermal_conductivity",
                 Some(11.5),
-                conductivity_block
+                conductivity_block,
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -2745,11 +2572,38 @@ mod tests {
     fn decimal_point_guards_refuse_partial_number_matches() {
         let block = "The CoCrFeNi conductivity is 11.5 W/(m K).";
         // The fractional digit: only the before-'.' guard refuses it.
-        assert!(supporting_quote("CoCrFeNi", "conductivity", Some(5.0), block).is_none());
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "conductivity",
+                Some(5.0),
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
         // The integer part: only the after-'.' guard refuses it.
-        assert!(supporting_quote("CoCrFeNi", "conductivity", Some(11.0), block).is_none());
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "conductivity",
+                Some(11.0),
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
         // Positive control: 11.5 itself still stamps.
-        assert!(supporting_quote("CoCrFeNi", "conductivity", Some(11.5), block).is_some());
+        assert!(
+            supporting_quote(
+                "CoCrFeNi",
+                "conductivity",
+                Some(11.5),
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_some()
+        );
     }
 
     /// The sign is the finding: for residual stress, -950 vs +950 is the
@@ -2758,9 +2612,11 @@ mod tests {
     /// U+2212 MINUS SIGN prose — killed by removing either U+2212 producer
     /// in `number_needles` (the decimal push owns the decimal assert; the
     /// signs loop owns the integer asserts). (b) The sign-flipped positive
-    /// claim is dropped — killed by removing the before-minus guard in
+    /// claim is dropped — killed by the before-minus guard in
     /// `clean_number_boundary`. The last assert pins the symmetry: a
     /// negative claim never stamps against positive prose either.
+    /// CONTRACT CHANGE (de-hardcoding): all of this runs under the SILENT
+    /// policy — the structural sign rules never needed a quantity list.
     #[test]
     fn negative_value_claims_match_negative_prose_and_refuse_the_flip() {
         let unicode_minus = "The residual stress in Ti-6Al-4V was \u{2212}950 MPa.";
@@ -2768,12 +2624,25 @@ mod tests {
 
         // The true negative claim stamps under both minus glyphs.
         assert_eq!(
-            supporting_quote("Ti-6Al-4V", "residual_stress", Some(-950.0), unicode_minus)
-                .as_deref(),
+            supporting_quote(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-950.0),
+                unicode_minus,
+                &GuardPolicy::SILENT
+            )
+            .as_deref(),
             Some(unicode_minus)
         );
         assert!(
-            supporting_quote("Ti-6Al-4V", "residual_stress", Some(-950.0), ascii_minus).is_some()
+            supporting_quote(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-950.0),
+                ascii_minus,
+                &GuardPolicy::SILENT
+            )
+            .is_some()
         );
         // Grouped negative integer under U+2212 (the signs loop).
         assert!(
@@ -2781,7 +2650,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "residual_stress",
                 Some(-1140.0),
-                "The residual stress in Ti-6Al-4V was \u{2212}1,140 MPa."
+                "The residual stress in Ti-6Al-4V was \u{2212}1,140 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -2791,7 +2661,8 @@ mod tests {
                 "CoCrFeNi",
                 "seebeck_coefficient",
                 Some(-11.5),
-                "The CoCrFeNi Seebeck coefficient was \u{2212}11.5 uV/K."
+                "The CoCrFeNi Seebeck coefficient was \u{2212}11.5 uV/K.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -2802,7 +2673,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "temperature",
                 Some(-196.0),
-                "The Ti-6Al-4V samples were tested at \u{2212}196 \u{b0}C."
+                "The Ti-6Al-4V samples were tested at \u{2212}196 \u{b0}C.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -2820,15 +2692,9 @@ mod tests {
             "The residual stress in Ti-6Al-4V was 950 MPa.",
         );
 
-        // Round 10: the old assert here pinned 1100 of "batches 950-1100"
-        // as the joins_compound killer — but it stamped a batch
-        // identifier as a measurement, and `dash_range_endpoint` now
-        // refuses the whole digit/dash/digit class. joins_compound's
-        // surviving effect is LETTER-dash-digit compounds ("U-235"),
-        // itself a fabrication channel carried as a KNOWN row in the
-        // corpus rather than a green pin. The signed-needle half of an
-        // ASCII range still drops here: the "-1100" needle starts on
-        // the hyphen, and the digit before it is alphanumeric.
+        // The signed-needle half of an ASCII range still drops: the
+        // "-1100" needle starts on the hyphen, and the digit before it is
+        // alphanumeric.
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
             "UTS",
@@ -2839,14 +2705,13 @@ mod tests {
 
     /// Round 5: after a REJECTED U+2212-prefixed needle, the scan must
     /// advance by the needle's first character, not one byte. "950x" is
-    /// rejected because 'x' is deliberately not a unit initial; the old
-    /// `start + 1` advance then landed `hay[search_from..]` inside the
-    /// 3-byte U+2212 and panicked the whole ingest run on a non-char
-    /// boundary. The correct outcome is a drop: the zoom factor is not
-    /// evidence for a stress of -950. Round 12: the object is the SIGNED
-    /// quantity 'stress', not UTS — under UTS the new SignDomain guard
-    /// would refuse first and mask the boundary/'x' rejection this test
-    /// exists to exercise.
+    /// rejected because no supplied unit term redeems the glued 'x'
+    /// (CONTRACT CHANGE: the unit lexicon is gone, so an unclaimed glued
+    /// letter refuses under the SILENT policy); the old `start + 1`
+    /// advance then landed `hay[search_from..]` inside the 3-byte U+2212
+    /// and panicked the whole ingest run on a non-char boundary. The
+    /// correct outcome is a drop: the zoom factor is not evidence for a
+    /// stress of -950.
     #[test]
     fn rejected_unicode_minus_needle_advances_by_char_not_byte() {
         assert_eq!(
@@ -2854,7 +2719,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "stress",
                 Some(-950.0),
-                "Ti-6Al-4V at \u{2212}950x zoom had stress."
+                "Ti-6Al-4V at \u{2212}950x zoom had stress.",
+                &GuardPolicy::SILENT
             ),
             None
         );
@@ -2871,7 +2737,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "stress",
                 Some(-950.0),
-                "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa."
+                "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa.",
+                &GuardPolicy::SILENT
             ),
             None
         );
@@ -2889,130 +2756,141 @@ mod tests {
                 "\u{3b1}-phase",
                 "strength",
                 Some(950.0),
-                "\u{3b1}-phase strength was 950 MPa."
+                "\u{3b1}-phase strength was 950 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
     }
 
     /// Round 13 item 4: the same char-not-byte advance, second bite of
-    /// this bug class. The existing test above covers a MULTI-BYTE name
-    /// glyph matching a multi-byte hay glyph (2-byte U+03B1 <-> 2-byte).
-    /// This one covers a 1-BYTE name glyph that matches a MULTI-BYTE
-    /// hay glyph: subject "-" folding onto a U+2010 HYPHEN (3 bytes) in
-    /// the hay. The OLD advance `name.chars().next()` stepped 1 byte
-    /// (the needle's first char) and landed mid-glyph inside the U+2010,
-    /// panicking "byte index 3 is not a char boundary; it is inside
-    /// '‐'". The fix advances by the HAY glyph at name_start. subject/
-    /// object are model-supplied, so this is reachable from untrusted
-    /// LLM output — a panic aborts the ingest run, not one claim. At
-    /// HEAD this was invisible: 84 lib + 197 corpus stay green with the
-    /// fix reverted, so the fix was UNPINNED. Reverting the
-    /// `occurrence_inside_name` advance to `name.chars()` reddens this
-    /// assert (panic).
+    /// this bug class — a 1-BYTE name glyph matching a MULTI-BYTE hay
+    /// glyph: subject "-" folding onto a U+2010 HYPHEN (3 bytes) in the
+    /// hay. subject/object are model-supplied, so this is reachable from
+    /// untrusted LLM output — a panic aborts the ingest run, not one
+    /// claim.
     #[test]
     fn single_byte_dash_subject_matching_multibyte_hay_glyph_does_not_panic() {
-        let r = supporting_quote_or_refusal("-", "UTS", Some(950.0), "ti\u{2010}6al had 950 MPa");
+        let r = supporting_quote_or_refusal(
+            "-",
+            "UTS",
+            Some(950.0),
+            "ti\u{2010}6al had 950 MPa",
+            &GuardPolicy::SILENT,
+        );
         assert!(r.is_ok(), "must not panic and must find the support: {r:?}");
     }
 
-    /// Round 13 item 5 + round 14 items 2/3: the SignDomain guard matches
-    /// by head-noun SUFFIX (every *strength/*hardness/*grain size is
-    /// non-negative), with round-14 exceptions for differential phrasing
-    /// and signal/field-strength homographs. Pin BOTH directions: the
-    /// forward rows drop a negative under a non-negative spelling, and the
-    /// over-refusal rows stamp under a legitimately-signed one. No arm or
-    /// marker is cannot-fail — each reddens under its own revert.
+    /// CONTRACT CHANGE (de-hardcoding) — the replacement for the old
+    /// `sign_domain_matches_head_noun_suffix_without_over_refusal`
+    /// vocabulary test, which pinned a compiled English/materials table
+    /// (the hardcoding under review). The REAL property survives,
+    /// re-expressed: when the ONTOLOGY declares a quantity non-negative,
+    /// a negative claim against it refuses whatever the quantity is
+    /// NAMED — in any language, any spelling, because the name is never
+    /// consulted. When the ontology is silent, nothing refuses: silence
+    /// is inert, never a guess.
     #[test]
-    fn sign_domain_matches_head_noun_suffix_without_over_refusal() {
-        // Forward direction: a negative under a genuinely-non-negative
-        // spelling MUST be refused (is_err). Reverting the suffix rule to
-        // exact-match reddens every row. `ionic strength` / `dielectric
-        // strength` pin that the round-14 exceptions do NOT over-allow a
-        // genuinely-non-negative homograph.
-        for nonneg_spelling in [
+    fn sign_domain_reads_the_ontology_not_the_quantity_name() {
+        // Forward direction: under an ontology NonNegative declaration a
+        // negative refuses for EVERY spelling — including every spelling
+        // the old compiled list missed and every spelling in another
+        // language. The matcher cannot see the name at all.
+        for spelling in [
             "tensile strength",
             "ultimate tensile strength",
-            "microhardness",
-            "Vickers hardness",
+            "relative density",
             "average grain size",
-            "compressive strength",
-            "0.2% yield strength",
-            "ionic strength",
-            "dielectric strength",
-            // Round 14 item 4: a trailing unit (the table-header form) is
-            // stripped before the suffix/exact rules. Removing
-            // strip_trailing_unit reddens every row below.
-            "yield strength (MPa)",
-            "hardness (HV)",
-            "grain size (um)",
-            "tensile strength, MPa",
-            "microhardness, HV0.5",
-            "density (g/cm3)",
+            "Zugfestigkeit",
+            "duret\u{e9}",
+            "Dichte",
+            "Rm",
         ] {
-            let prose = format!("The Ti-6Al-4V {nonneg_spelling} was -950 MPa.");
-            let r = supporting_quote_or_refusal("Ti-6Al-4V", nonneg_spelling, Some(-950.0), &prose);
+            let prose = format!("The sample {spelling} was -950 MPa.");
+            let r = supporting_quote_or_refusal(
+                "sample",
+                spelling,
+                Some(-950.0),
+                &prose,
+                &nonnegative_policy(),
+            );
             assert!(
-                r.is_err(),
-                "suffix rule must drop a negative under {nonneg_spelling:?}: {r:?}"
+                matches!(
+                    r,
+                    Err(SupportRefusal::Guarded {
+                        guard: RefusalGuard::SignDomain,
+                        ..
+                    })
+                ),
+                "an ontology-declared non-negative quantity must refuse a negative \
+                 whatever its name: {spelling:?}: {r:?}"
             );
         }
-        // Over-refusal direction: a negative under a legitimately-SIGNED
-        // spelling MUST stamp (is_ok). The first six are the round-13
-        // controls (kept). The next ten pin the differential markers:
-        // removing any one marker from SIGNED_DIFFERENTIAL_MARKERS
-        // reddens its row. The last four pin the signal/field
-        // homographs: removing SIGNED_STRENGTH_HOMOGRAPHS (or the
-        // field-strength entry) reddens them.
-        for signed_spelling in [
+        // Silence direction: the SAME claims under a silent ontology all
+        // stamp. The old list's five canonical spellings included — no
+        // compiled residue of it survives anywhere in this crate.
+        for spelling in [
+            "uts",
+            "hardness",
+            "density",
+            "grain size",
+            "yield strength",
             "residual stress",
-            "Seebeck coefficient",
-            "charge density",
-            "current density",
-            "density change",
-            "grain size difference",
-            "change in yield strength",
-            "difference in hardness",
-            "delta grain size",
-            "reduction in strength",
-            "drop in strength",
-            "loss of strength",
-            "increase in tensile strength",
-            "deviation in strength",
-            "variation in grain size",
-            "gradient in hardness",
-            "signal strength",
-            "field strength",
-            "magnetic field strength",
-            "electric field strength",
+            "dissociation constant",
         ] {
-            let prose = format!("The Ti-6Al-4V {signed_spelling} was -950 MPa.");
-            let r = supporting_quote_or_refusal("Ti-6Al-4V", signed_spelling, Some(-950.0), &prose);
+            let prose = format!("The sample {spelling} was -950 MPa.");
+            let r = supporting_quote_or_refusal(
+                "sample",
+                spelling,
+                Some(-950.0),
+                &prose,
+                &GuardPolicy::SILENT,
+            );
             assert!(
                 r.is_ok(),
-                "over-refusal: a negative under {signed_spelling:?} must still stamp: {r:?}"
+                "a silent ontology must leave the sign check inert for {spelling:?}: {r:?}"
             );
         }
+        // An explicit Signed declaration stamps too — the guard only ever
+        // fires on NonNegative.
+        let signed = GuardPolicy {
+            quantity_sign: QuantitySignDomain::Signed,
+            unit_term: None,
+        };
+        let prose = "The sample residual stress was -950 MPa.";
+        assert!(
+            supporting_quote_or_refusal("sample", "residual stress", Some(-950.0), prose, &signed)
+                .is_ok()
+        );
     }
 
     /// Round 13 item 6.2: SignDomain is checked per-occurrence (inside the
     /// loop), not hoisted claim-level, so a non-occurring negative against
-    /// a non-negative quantity stays NoSpan (the model cited a value the
-    /// block never contained) rather than Guarded{SignDomain} (the
-    /// matcher's fault). Hoisting the check before the loop reddens this.
+    /// an ontology-declared non-negative quantity stays in the "the block
+    /// never contained the value" class rather than `Guarded{SignDomain}`
+    /// (the matcher's fault). Hoisting the check before the loop reddens
+    /// this.
+    ///
+    /// B9 CONTRACT CHANGE: that class used to be `NoSpan`; it is now the
+    /// finer `ValueNotRendered` — no needle form of the value occurred
+    /// anywhere in the block, which is exactly what this fixture builds.
+    /// The property under test (SignDomain does not mask the real cause)
+    /// is unchanged.
     #[test]
     fn sign_domain_does_not_mask_a_non_occurring_value_as_no_span() {
         // The block states +950; the claim -950 never occurs in any needle
-        // form. NoSpan (model's fault), not SignDomain (matcher's fault).
+        // form. ValueNotRendered (the block never contained the value),
+        // not SignDomain (matcher's fault).
         let r = supporting_quote_or_refusal(
             "Ti-6Al-4V",
             "UTS",
             Some(-950.0),
             "The Ti-6Al-4V UTS was 950 MPa.",
+            &nonnegative_policy(),
         );
         assert!(
-            matches!(r, Err(SupportRefusal::NoSpan)),
-            "non-occurring negative must be NoSpan, not SignDomain: {r:?}"
+            matches!(r, Err(SupportRefusal::ValueNotRendered)),
+            "non-occurring negative must be ValueNotRendered, not SignDomain: {r:?}"
         );
     }
 
@@ -3023,24 +2901,66 @@ mod tests {
     #[test]
     fn comma_grouped_number_digits_are_not_token_boundaries() {
         let block = "The Ti-6Al-4V UTS is 1,140 MPa.";
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(140.0), block).is_none());
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1.0), block).is_none());
+        assert!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(140.0), block, &GuardPolicy::SILENT)
+                .is_none()
+        );
+        assert!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(1.0), block, &GuardPolicy::SILENT).is_none()
+        );
         // Control: the same fact written without grouping already drops 140.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "UTS",
                 Some(140.0),
-                "The Ti-6Al-4V UTS is 1140 MPa."
+                "The Ti-6Al-4V UTS is 1140 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_none()
         );
         // The real value still stamps in the grouped form.
-        assert!(supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), block).is_some());
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                block,
+                &GuardPolicy::SILENT
+            )
+            .is_some()
+        );
 
-        assert!(supporting_quote("A", "UTS", Some(12.0), "A UTS is 12,345 MPa.").is_none());
-        assert!(supporting_quote("A", "UTS", Some(345.0), "A UTS is 12,345 MPa.").is_none());
-        assert!(supporting_quote("A", "UTS", Some(12345.0), "A UTS is 12,345 MPa.").is_some());
+        assert!(
+            supporting_quote(
+                "A",
+                "UTS",
+                Some(12.0),
+                "A UTS is 12,345 MPa.",
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
+        assert!(
+            supporting_quote(
+                "A",
+                "UTS",
+                Some(345.0),
+                "A UTS is 12,345 MPa.",
+                &GuardPolicy::SILENT
+            )
+            .is_none()
+        );
+        assert!(
+            supporting_quote(
+                "A",
+                "UTS",
+                Some(12345.0),
+                "A UTS is 12,345 MPa.",
+                &GuardPolicy::SILENT
+            )
+            .is_some()
+        );
 
         // Row form: the leading "1" is not a standalone value either.
         assert!(
@@ -3048,7 +2968,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "UTS",
                 Some(1.0),
-                "Alloy UTS\nTi-6Al-4V 1,140\n..."
+                "Alloy UTS\nTi-6Al-4V 1,140\n...",
+                &GuardPolicy::SILENT
             )
             .is_none()
         );
@@ -3061,223 +2982,121 @@ mod tests {
                 "Ti-6Al-4V",
                 "UTS",
                 Some(12.0),
-                "The Ti-6Al-4V samples measured 12, 15 and 950 MPa."
+                "The Ti-6Al-4V samples measured 12, 15 and 950 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
     }
 
-    /// F-2: in materials tables and PDF-extracted text the space between
-    /// a number and its unit is often lost. A number glued to a
-    /// unit-initial letter must still stamp; a number glued to any other
-    /// letter must not.
+    /// CONTRACT CHANGE (de-hardcoding) — the replacement for the old
+    /// glued-unit-initial tests, which pinned `UNIT_TOKENS` and its
+    /// derived initials (the hardcoding under review). The REAL property
+    /// survives, re-expressed: a letter GLUED to a number redeems only
+    /// when it begins the fact's OWN unit term — the term the
+    /// reader/ontology chose — and never otherwise. Rust holds no unit
+    /// lexicon; a silent fact refuses every glued letter.
     #[test]
-    fn numbers_glued_to_their_unit_still_stamp() {
+    fn glued_letters_redeem_only_through_the_facts_own_unit() {
+        // Mechanism pins, one per direction.
         assert!(
-            supporting_quote(
+            supporting_quote_or_refusal(
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "The Ti-6Al-4V UTS is 950MPa."
+                "The Ti-6Al-4V UTS is 950MPa.",
+                &unit_policy("MPa")
             )
-            .is_some()
+            .is_ok(),
+            "the fact's own unit term redeems its glued form"
         );
+        // The term is case-folded exactly like the text it is matched
+        // against: the reader's "MPa" redeems the normalized "mpa".
         assert!(
-            supporting_quote(
+            supporting_quote_or_refusal(
                 "Ti-6Al-4V",
-                "temperature",
-                Some(1073.0),
-                "Ti-6Al-4V was annealed at 1073K."
+                "UTS",
+                Some(950.0),
+                "The Ti-6Al-4V UTS is 950MPa.",
+                &unit_policy("mpa")
             )
-            .is_some()
+            .is_ok()
         );
-        assert!(
-            supporting_quote(
-                "CoCrFeNi",
-                "grain_size",
-                Some(50.0),
-                "CoCrFeNi grains of 50um were observed."
-            )
-            .is_some()
+        // Silence refuses the same sentence: no lexicon guesses "MPa".
+        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 950.0, "The Ti-6Al-4V UTS is 950MPa.");
+        // A DIFFERENT supplied unit does not redeem: the claim said kPa,
+        // the page says MPa — that disagreement belongs to the reader and
+        // the ontology, not to a Rust equivalence table.
+        assert_dropped_end_to_end_with_policy(
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            "The Ti-6Al-4V UTS is 950MPa.",
+            &unit_policy("kPa"),
         );
-        assert!(
-            supporting_quote(
-                "CoCrFeNi",
-                "grain_size",
-                Some(50.0),
-                "CoCrFeNi grains of 50\u{b5}m were observed."
-            )
-            .is_some()
+        // Glued NON-unit letters stay dropped with or without a unit
+        // ("950x" is magnification, "2e5" is scientific notation).
+        assert_dropped_end_to_end_with_policy(
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            "The Ti-6Al-4V image at 950x magnification.",
+            &unit_policy("MPa"),
         );
-        assert!(
-            supporting_quote(
-                "CoCrFeNi",
-                "content",
-                Some(5.0),
-                "The CoCrFeNi alloy contains 5wt% Cr."
-            )
-            .is_some()
+        assert_dropped_end_to_end(
+            "Ti-6Al-4V",
+            "strain_rate",
+            2.0,
+            "The Ti-6Al-4V strain rate was 2e5 per second.",
         );
-
+        // Digit glue is still the substring reject: 95 inside 950MPa.
+        assert_dropped_end_to_end_with_policy(
+            "Ti-6Al-4V",
+            "UTS",
+            95.0,
+            "The Ti-6Al-4V UTS is 950MPa.",
+            &unit_policy("MPa"),
+        );
+        // A supplied unit never redeems a digit inside a hyphen-joined
+        // designation, ASCII or en dash (the "6" of "Ti-6Al-4V").
+        assert_dropped_end_to_end_with_policy(
+            "Ti-6Al-4V",
+            "UTS",
+            6.0,
+            "The Ti-6Al-4V billets were 950MPa rated.",
+            &unit_policy("MPa"),
+        );
+        assert_dropped_end_to_end_with_policy(
+            "Ti-6Al-4V",
+            "UTS",
+            6.0,
+            "The Ti\u{2013}6Al\u{2013}4V billets were 950MPa rated.",
+            &unit_policy("MPa"),
+        );
         // Degree/percent glue was never broken (non-alphanumeric) and
-        // must keep stamping.
+        // must keep stamping under silence.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "temperature",
                 Some(500.0),
-                "Ti-6Al-4V was held at 500 \u{b0}C."
+                "Ti-6Al-4V was held at 500 \u{b0}C.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
-
-        // Glued NON-unit letter: still dropped ("950x" is magnification,
-        // not 950 + a unit).
+        // En-dash positive control: the dash class folds in NAME matching
+        // (find_name), so the en-dash typesetting of the designation
+        // matches the ASCII subject through the SUBJECT arm itself.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "The Ti-6Al-4V image at 950x magnification."
-            )
-            .is_none()
-        );
-        // Digit glue is still the substring reject: 95 inside 950MPa.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(95.0),
-                "The Ti-6Al-4V UTS is 950MPa."
-            )
-            .is_none()
-        );
-
-        // A glued unit letter never redeems a digit inside a hyphen-joined
-        // designation, ASCII or en dash (the "6" of "Ti-6Al-4V").
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(6.0),
-                "The Ti-6Al-4V billets were 950MPa rated."
-            )
-            .is_none()
-        );
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(6.0),
-                "The Ti\u{2013}6Al\u{2013}4V billets were 950MPa rated."
-            )
-            .is_none()
-        );
-
-        // En-dash positive control: since round 12 the dash class folds
-        // in NAME matching (find_name), so the en-dash typesetting of the
-        // designation matches the ASCII subject through the SUBJECT arm
-        // itself — before round 12 it survived ONLY through the object
-        // arm of the subject-OR-object rule, the object arm carrying a
-        // subject-matching failure. Either way the fact must stamp; do
-        // not flip that OR to AND.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(950.0),
-                "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa."
+                "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
-        );
-    }
-
-    /// Round 7: `UNIT_INITIALS` is DERIVED from `UNIT_TOKENS`, so it
-    /// cannot drift from the unit vocabulary the chain/`unit_follows`
-    /// checks already trust — plus the glyphs PDF extractors actually
-    /// emit. The round-6 hand-list was missing four: U+03BC GREEK MU
-    /// (extractors emit the Greek letter, not U+00B5 MICRO SIGN), 'o'
-    /// (the mangled degree sign of "980oC"), 'r' (though `rpm` IS a
-    /// unit token), and \u{e5} (angstrom). Round 8: 'o' left
-    /// `EXTRA_UNIT_INITIALS` — it rides on the "ohm" token's initial,
-    /// and listing it twice made an entry no mutation could kill — so
-    /// each stamp assert below reddens when the SOURCE of its initial
-    /// is removed: for 'o' that is the "ohm" token, for 'r' the
-    /// "rpm" token, for \u{e5} `EXTRA_UNIT_INITIALS`. Round 10: the
-    /// U+03BC source is the "\u{3bc}m" TOKEN in `UNIT_TOKENS` — the
-    /// EXTRA entry beside it would have been the same unkillable
-    /// duplicate 'o' was removed for, and only the token opens the
-    /// SPACED path (`unit_follows` reads the token list alone). The
-    /// trailing asserts pin the allow-list half — a glued NON-unit
-    /// letter must still drop.
-    #[test]
-    fn glued_units_with_pdf_glyphs_still_stamp() {
-        // U+03BC GREEK SMALL LETTER MU, the form PDF extractors emit.
-        // Deleting the "\u{3bc}m" token reddens BOTH asserts: the glued
-        // form loses its derived initial, the spaced form its unit.
-        assert!(
-            supporting_quote(
-                "AlSi10Mg",
-                "layer_thickness",
-                Some(30.0),
-                "AlSi10Mg was built with a 30\u{3bc}m layer thickness."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
-                "AlSi10Mg",
-                "scan_step_size",
-                Some(30.0),
-                "The AlSi10Mg scan step 30 \u{3bc}m was imaged."
-            )
-            .is_some()
-        );
-        // 'o' — the degree-sign mangle of "980 \u{b0}C".
-        assert!(
-            supporting_quote(
-                "Inconel 718",
-                "temperature",
-                Some(980.0),
-                "Inconel 718 was solution treated at 980oC."
-            )
-            .is_some()
-        );
-        // 'r' — rpm is a UNIT_TOKEN, so its initial must open a glued unit.
-        assert!(
-            supporting_quote(
-                "Inconel 718",
-                "rotation_speed",
-                Some(1000.0),
-                "The Inconel 718 powder was blended at 1000rpm for 30 min."
-            )
-            .is_some()
-        );
-        // \u{e5} ANGSTROM, lowercased by containment normalization.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "lattice_parameter",
-                Some(2.95),
-                "The Ti-6Al-4V beta lattice parameter was 2.95\u{c5}."
-            )
-            .is_some()
-        );
-
-        // Drop half: the allow-list is still an allow-list. A glued
-        // letter no unit token starts with stays rejected (mutation-
-        // proven red if unit_initial is broadened to every letter).
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            950.0,
-            "The Ti-6Al-4V coupon was imaged at 950x magnification.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            950.0,
-            "The Ti-6Al-4V coupon was indexed 950z in the log.",
         );
     }
 
@@ -3319,7 +3138,8 @@ mod tests {
                 "UTS",
                 Some(1150.0),
                 "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa and reached 1150 MPa \
-                 after annealing."
+                 after annealing.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -3333,7 +3153,8 @@ mod tests {
                 "UTS",
                 Some(950.0),
                 "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa and the annealed \
-                 sample reached 950 MPa."
+                 sample reached 950 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -3350,7 +3171,13 @@ mod tests {
         // Boundary.
         let hyphen_range = "The Ti-6Al-4V UTS ranged from 950\u{2010}1100 MPa.";
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(1100.0), hyphen_range),
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1100.0),
+                hyphen_range,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Range,
                 span: hyphen_range.to_string(),
@@ -3380,19 +3207,21 @@ mod tests {
         // MECHANISM, not ground truth (round 12 item 3). U+2013 is no
         // sign glyph, so the true negative constructs no signed needle,
         // the scan finds no needle form at all, and the drop surfaces as
-        // NoSpan. GROUND TRUTH for this exact tuple — the prose DOES
-        // assert -350 MPa, an engineer calls that supported, so a stamp
-        // is what SHOULD happen — belongs to the corpus KNOWN recall row
-        // (tests/claim_corpus.rs, the U+2013 \u{2013}350 entry); it is not
-        // restated here. Round 11's end-to-end drop assert contradicted
-        // that row: one owner per fact. When a separator-safe sign
-        // mechanism lands, THIS assert reddens and that KNOWN marker must
-        // be stripped in the same change — two coherent signals that the
-        // fix landed, not the old deadlock where the lib defended the
-        // drop the corpus called a loss.
+        // ValueNotRendered (B9: the value never rendered anywhere — the
+        // old conflated name for this class was NoSpan). GROUND TRUTH for
+        // this exact tuple — the prose DOES assert -350 MPa, an engineer
+        // calls that supported, so a stamp is what SHOULD happen — belongs
+        // to the corpus KNOWN recall row (tests/claim_corpus.rs, the
+        // U+2013 \u{2013}350 entry); it is not restated here.
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "residual_stress", Some(-350.0), minus),
-            Err(SupportRefusal::NoSpan)
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-350.0),
+                minus,
+                &GuardPolicy::SILENT
+            ),
+            Err(SupportRefusal::ValueNotRendered)
         );
         // Grouped form: the unsigned grouped needle is still refused...
         assert_dropped_end_to_end(
@@ -3401,21 +3230,20 @@ mod tests {
             1140.0,
             "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
         );
-        // ...and its signed twin drops the same way (round 12 item 3:
-        // MECHANISM, not ground truth). No '-'/'\u{2212}' needle matches the
-        // U+2013 spelling of the grouped form either, so the grouped true
-        // negative also surfaces as NoSpan. Ground truth (the prose
-        // asserts \u{2013}1,140 MPa, a stamp is what SHOULD happen) belongs
-        // to the corpus KNOWN grouped-recall row this round restores; the
-        // assert pins only the current mechanism.
+        // ...and its signed twin drops the same way (MECHANISM, not
+        // ground truth; the corpus carries the KNOWN grouped-recall row).
         assert_eq!(
             supporting_quote_or_refusal(
                 "Ti-6Al-4V",
                 "residual_stress",
                 Some(-1140.0),
-                "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa."
+                "The residual stress in Ti-6Al-4V was \u{2013}1,140 MPa.",
+                &GuardPolicy::SILENT
             ),
-            Err(SupportRefusal::NoSpan)
+            // B9: same class as the ungrouped twin above — no signed
+            // needle form of -1140 renders anywhere (U+2013 is not a sign
+            // glyph), so the drop is ValueNotRendered, not NoSpan.
+            Err(SupportRefusal::ValueNotRendered)
         );
 
         // Stamp direction: a genuine point value in the same sentence
@@ -3426,20 +3254,22 @@ mod tests {
                 "stress",
                 Some(400.0),
                 "The residual stress in Ti-6Al-4V was \u{2013}350 MPa as built and \
-                 400 MPa after annealing."
+                 400 MPa after annealing.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
 
         // The range rule keeps its name: the high endpoint of
         // "950\u{2013}1100" has a digit before the dash, so it is
-        // Range (checked first), not the new sign refusal.
+        // Range (checked first), not the sign refusal.
         assert_eq!(
             supporting_quote_or_refusal(
                 "Ti-6Al-4V",
                 "UTS",
                 Some(1100.0),
-                "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa."
+                "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.",
+                &GuardPolicy::SILENT
             ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Range,
@@ -3467,7 +3297,13 @@ mod tests {
         ] {
             let list = format!("Ti-6Al-4V has been studied extensively [11{dash}12, 14].");
             assert_eq!(
-                supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(14.0), &list),
+                supporting_quote_or_refusal(
+                    "Ti-6Al-4V",
+                    "UTS",
+                    Some(14.0),
+                    &list,
+                    &GuardPolicy::SILENT
+                ),
                 Err(SupportRefusal::Guarded {
                     guard: RefusalGuard::Citation,
                     span: list.clone(),
@@ -3478,61 +3314,63 @@ mod tests {
         }
     }
 
-    /// Fabrication path 3 (label form): a number immediately after
-    /// Table/Figure/Ref is a label, not a measurement.
+    /// CONTRACT CHANGE (de-hardcoding) — the replacement for the old
+    /// label-word tests (`table_figure_ref_label_numbers_are_not_support`,
+    /// `section_and_kindred_label_numbers_are_not_support`, the label-list
+    /// walks, `sample_and_run_label_numbers_are_not_support`,
+    /// `every_kept_label_word_refuses_its_number`), each of which pinned
+    /// an English vocabulary — the hardcoding under review. Which words
+    /// introduce citation labels is domain AND language knowledge: a
+    /// German paper writes "Tabelle 1", "Abb. 3", "Probe 5". No honest
+    /// structural rule replaces the list, so the check is DELETED and the
+    /// judgement moves to the ontology and the re-checking model: the
+    /// matcher honestly reports support, and the fact carries its
+    /// verification status. Bracketed citation markers remain refused —
+    /// that guard is punctuation, not vocabulary.
     #[test]
-    fn table_figure_ref_label_numbers_are_not_support() {
+    fn label_words_have_no_special_standing_in_the_matcher() {
+        for (block, value) in [
+            ("Ti-6Al-4V properties are listed in Table 3.", 3.0),
+            ("Ti-6Al-4V data appear in Figure 2.", 2.0),
+            ("UTS data for Ti-6Al-4V appears in Ref 25.", 25.0),
+            ("The Ti-6Al-4V results are in Section 4.", 4.0),
+            ("Sample 5 of Ti-6Al-4V was tested.", 5.0),
+            ("Run 12 of the Inconel 718 build failed.", 12.0),
+            ("Ti-6Al-4V data are listed in Tables 1 and 2.", 2.0),
+            ("Ti-6Al-4V is discussed in Refs. 25, 26 for UTS data.", 26.0),
+        ] {
+            // The subject is "Inconel 718" where the prose names it, else
+            // Ti-6Al-4V; both ride the subject-or-object arm.
+            let subject = if block.contains("Inconel 718") {
+                "Inconel 718"
+            } else {
+                "Ti-6Al-4V"
+            };
+            let object = if block.contains("UTS") {
+                "UTS"
+            } else {
+                "property"
+            };
+            let r = supporting_quote_or_refusal(
+                subject,
+                object,
+                Some(value),
+                block,
+                &GuardPolicy::SILENT,
+            );
+            assert!(
+                r.is_ok(),
+                "the matcher no longer encodes label vocabulary; {block:?} now reports \
+                 support and the fact carries its verification status: {r:?}"
+            );
+        }
+        // The structural guard that SURVIVES: bracketed citation markers
+        // are punctuation, not vocabulary, and stay refused.
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
             "UTS",
-            3.0,
-            "Ti-6Al-4V properties are listed in Table 3.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            2.0,
-            "Ti-6Al-4V data appear in Figure 2.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            25.0,
-            // No period after "Ref": with "Ref." the span split strands
-            // the 25 in a span holding neither subject nor object, so the
-            // label rule never fires. This form exercises it for real:
-            // mutation-proven red when ref/refs are removed from
-            // LABEL_WORDS.
-            "UTS data for Ti-6Al-4V appears in Ref 25.",
-        );
-    }
-
-    /// F-3: the label vocabulary also covers Section/Eq/Chapter/
-    /// Entry/Scheme labels. Mutation-proven: removing "section" from
-    /// LABEL_WORDS turns the first assert red. (Sample/Run are label
-    /// words again as of round 7 — the unit exemption in
-    /// `preceding_word_is_label` keeps methods prose stamping; their
-    /// fabrication direction is pinned in
-    /// `sample_and_run_label_numbers_are_not_support`.)
-    #[test]
-    fn section_and_kindred_label_numbers_are_not_support() {
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            4.0,
-            "The Ti-6Al-4V results are in Section 4.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            7.0,
-            "The Ti-6Al-4V model is given in Eq 7.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            2.0,
-            "The Ti-6Al-4V route is shown in Scheme 2.",
+            1140.0,
+            "Ti-6Al-4V has been widely studied (1140).",
         );
     }
 
@@ -3552,13 +3390,21 @@ mod tests {
                 "Inconel 718",
                 "UTS",
                 Some(718.0),
-                "Inconel 718 showed a UTS of 718 MPa."
+                "Inconel 718 showed a UTS of 718 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
         // Positive control: the genuine row still stamps verbatim.
         assert_eq!(
-            supporting_quote("Inconel 718", "UTS", Some(1375.0), table).as_deref(),
+            supporting_quote(
+                "Inconel 718",
+                "UTS",
+                Some(1375.0),
+                table,
+                &GuardPolicy::SILENT
+            )
+            .as_deref(),
             Some("Inconel 718 1375")
         );
     }
@@ -3596,7 +3442,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "The Ti-6Al-4V UTS (950 MPa) was reproducible."
+                "The Ti-6Al-4V UTS (950 MPa) was reproducible.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -3629,7 +3476,14 @@ mod tests {
         let ft = crate::fulltext::parse_jats(body.as_bytes()).unwrap();
         for block in &ft.blocks {
             assert!(
-                supporting_quote("Ti-6Al-4V", "UTS", Some(1140.0), &block.text).is_none(),
+                supporting_quote(
+                    "Ti-6Al-4V",
+                    "UTS",
+                    Some(1140.0),
+                    &block.text,
+                    &GuardPolicy::SILENT
+                )
+                .is_none(),
                 "block {:?} fabricated support from a superscript citation: {:?}",
                 block.locator.kind,
                 block.text
@@ -3641,232 +3495,16 @@ mod tests {
             .find(|b| b.locator.kind == BlockKind::Body)
             .unwrap();
         assert!(
-            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &body_block.text).is_some(),
-            "the real value after the citation must still stamp: {:?}",
-            body_block.text
-        );
-    }
-
-    /// The list form of label references: in "Tables 1 and 2" the
-    /// number after the conjunction is a label too, but only the
-    /// immediately preceding word was checked, so 2 stamped. Walk back
-    /// over the conjunction and the number before it, exactly once.
-    /// (Mid-list comma items like "Refs. 25, 26" stay an open gap.)
-    #[test]
-    fn label_list_numbers_after_a_conjunction_are_not_support() {
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            2.0,
-            "Ti-6Al-4V data are listed in Tables 1 and 2.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            26.0,
-            "Ti-6Al-4V is discussed in Refs. 25 and 26.",
-        );
-        // Positive control: a real measurement after "and <number>"
-        // still stamps when the word one number back is not a label.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(960.0),
-                "The Ti-6Al-4V samples measured 950 and 960 MPa."
-            )
-            .is_some()
-        );
-    }
-
-    /// Comma-separated reference lists: "Refs. 25, 26" stamped 26 in
-    /// round 3 because the walk-back covered one conjunction but not
-    /// comma items. The walk now steps back over ", <number>" repeatedly
-    /// before the conjunction step, and the label word at the head of
-    /// the list decides. Positive controls pin the distinguishing
-    /// feature: values in a comma list walk back to a non-label head
-    /// word and stamp — they are values, not references. Mutation-proven
-    /// red by deleting the comma walk-back loop (the two Refs asserts)
-    /// and by a one-token dash on its `ends_with(',')` condition.
-    #[test]
-    fn comma_separated_reference_list_numbers_are_not_support() {
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            26.0,
-            "Ti-6Al-4V is discussed in Refs. 25, 26 for UTS data.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            27.0,
-            "Ti-6Al-4V is discussed in Refs. 25, 26, 27 for UTS data.",
-        );
-        // Comma list ending in a conjunction: the walk-backs compose.
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            27.0,
-            "Ti-6Al-4V is discussed in Refs. 25, 26 and 27 for UTS data.",
-        );
-        // The first number after the label word stays refused too.
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            25.0,
-            "Ti-6Al-4V is discussed in Refs. 25, 26 for UTS data.",
-        );
-
-        // Positive controls: value lists are NOT reference lists; the
-        // head word, not the commas, is the distinguishing feature.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(970.0),
-                "The Ti-6Al-4V samples measured 950, 960 and 970 MPa."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(970.0),
-                "The Ti-6Al-4V samples measured 950, 960, 970 MPa."
-            )
-            .is_some()
-        );
-        // A mid-list value also stamps.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "UTS",
-                Some(960.0),
-                "The Ti-6Al-4V samples measured 950, 960, 970 MPa."
-            )
-            .is_some()
-        );
-    }
-
-    /// H7: an abbreviated label ("Fig. 2", "Ref. 25") used to defeat the
-    /// label rule: the abbreviating period ended the span, stranding the
-    /// number in a fresh span where the label word was invisible, so
-    /// `UTS = 2` stamped. The period of such an abbreviation must not end
-    /// a span. ("Table 3" / "Figure 2" without the period were already
-    /// blocked; the round-2 `Ref 25` fixture only worked because the
-    /// period was removed from it.)
-    #[test]
-    fn abbreviated_label_numbers_are_not_support() {
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            2.0,
-            "As shown in Fig. 2 Ti-6Al-4V was tested to failure.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            25.0,
-            "As reported in Ref. 25 Ti-6Al-4V is widely used.",
-        );
-        // "Eqs." joins the label family: the first number after it is a
-        // label, and the conjunction step takes the "and 8" tail with it
-        // (the walk trims the number-run before the conjunction, and a
-        // reference list carries no units, so it still walks).
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            7.0,
-            "The fits are given in Eqs. 7 and 8 for Ti-6Al-4V UTS.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            8.0,
-            "The fits are given in Eqs. 7 and 8 for Ti-6Al-4V UTS.",
-        );
-        // Positive control: a real value in the same sentence as an
-        // abbreviated label still stamps.
-        assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "As shown in Fig. 2 the Ti-6Al-4V UTS is 950 MPa."
+                &body_block.text,
+                &GuardPolicy::SILENT
             )
-            .is_some()
-        );
-    }
-
-    /// Round 7: dotted section/equation numbering is ubiquitous, and
-    /// reference lists can be space-separated. The round-6 bound (one
-    /// number-run per conjunction) stopped at the '.' of "3.1", stranded
-    /// "3" as the head word and never reached "sections" — the trailing
-    /// number stamped. Reverting the walk-back to the greedy trim fixes
-    /// these and reddens nothing: reference lists carry no units, value
-    /// lists with a unit never walk at all (`chain_ends_in_unit`), and
-    /// value lists without one land on their real head word. The first
-    /// three asserts each go red when the greedy trim is narrowed back
-    /// to one number-run; the fourth pins the dotted list's head number
-    /// (label-word rule) and its dotted sibling (boundary rule).
-    #[test]
-    fn dotted_and_space_separated_label_lists_are_not_support() {
-        assert_dropped_end_to_end(
-            "Inconel 718",
-            "UTS",
-            4.0,
-            "Inconel 718 data are in Sections 3.1 and 4.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            3.0,
-            "The Ti-6Al-4V fit is given in Eqs. 2.1 and 3.",
-        );
-        assert_dropped_end_to_end(
-            "Inconel 718",
-            "creep_rate",
-            27.0,
-            "Inconel 718 creep is discussed in Refs. 25 26 and 27.",
-        );
-        // The head number of a dotted list stays refused too: the "3" of
-        // "Sections 3 and 3.1" is refused by the label word itself, its
-        // dotted sibling by the boundary rule.
-        assert_dropped_end_to_end(
-            "Inconel 718",
-            "UTS",
-            3.0,
-            "Inconel 718 data are in Sections 3 and 3.1.",
-        );
-
-        // Round 10: a dash-joined reference range walks back through
-        // every glyph of the dash class, not just '-', U+2013 and
-        // U+2014; the conjunction tail is refused by Label, guard-named.
-        let dash_range = "The Ti-6Al-4V data are listed in Refs. 25\u{2010}27 and 28.";
-        assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(28.0), dash_range),
-            Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: dash_range.to_string(),
-            })
-        );
-
-        // Stamp direction: the greedy trim must not over-walk a VALUE
-        // list. Dotted values with no trailing unit walk back to their
-        // real head word, not a label, and stamp. Round 10: the old
-        // prose here was "batches were 3.1 and 4" — batch identifiers,
-        // which certified the plural leak as required behaviour (the
-        // corpus carries it as a KNOWN fabrication now). A genuine
-        // unitless value list pins the same mechanism honestly.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "strain",
-                Some(4.0),
-                "The Ti-6Al-4V strains were 3.1 and 4."
-            )
-            .is_some()
+            .is_some(),
+            "the real value after the citation must still stamp: {:?}",
+            body_block.text
         );
     }
 
@@ -3895,11 +3533,15 @@ mod tests {
     /// Fabrication path 1: a table must not act as one giant span. Rows
     /// are separate spans, so a number in one row cannot support a claim
     /// whose subject lives in another row (the 1375 assert, mutation-proven
-    /// by fusing all rows into one span). The caption line also exercises
-    /// the label rule: the "1" of "Table 1" sits in a span that holds the
-    /// subject AND the object, so only the label rule keeps it from
-    /// stamping (the 1.0 assert, mutation-proven by disabling
-    /// `preceding_word_is_label`).
+    /// by fusing all rows into one span).
+    ///
+    /// CONTRACT CHANGE (de-hardcoding): the caption digit "1" of "Table 1"
+    /// USED to be refused by the label vocabulary even though the caption
+    /// span holds the subject AND the object. That English list is gone,
+    /// so under a silent ontology the matcher honestly reports the
+    /// co-occurrence; the caption-vs-measurement judgement moves to the
+    /// ontology and the re-checking model, and the fact carries its
+    /// verification status.
     #[test]
     fn properties_table_rows_are_separate_spans() {
         let table = "Table 1 UTS of Ti-6Al-4V and Inconel 718\n\
@@ -3910,25 +3552,39 @@ mod tests {
         // Inconel's number cannot support a claim about Ti-6Al-4V: the
         // subject and 1375 never share a row.
         assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1375.0, table);
-        // The "1" of "Table 1" is a label, not a UTS value, even though
-        // the caption span holds both the subject and the object.
-        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 1.0, table);
+        // The caption digit now reports support under a silent ontology —
+        // the vocabulary that refused it was the hardcoding under review.
+        assert!(
+            supporting_quote("Ti-6Al-4V", "UTS", Some(1.0), table, &GuardPolicy::SILENT).is_some()
+        );
 
         // Genuine rows still stamp: the alloy and its own number share a row.
         assert_eq!(
-            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), table).as_deref(),
+            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), table, &GuardPolicy::SILENT)
+                .as_deref(),
             Some("Ti-6Al-4V 950")
         );
         assert_eq!(
-            supporting_quote("Inconel 718", "UTS", Some(1375.0), table).as_deref(),
+            supporting_quote(
+                "Inconel 718",
+                "UTS",
+                Some(1375.0),
+                table,
+                &GuardPolicy::SILENT
+            )
+            .as_deref(),
             Some("Inconel 718 1375")
         );
     }
 
     /// Fabrication path 1, end to end through the real JATS sink: from one
-    /// properties table, neither `Ti-6Al-4V UTS = 1375` (Inconel's number)
-    /// nor `Ti-6Al-4V UTS = 1` (the "1" of "Table 1", or the digit inside
-    /// "718") may find support in ANY block of the document.
+    /// properties table, `Ti-6Al-4V UTS = 1375` (Inconel's number) must
+    /// find no support in ANY block of the document.
+    ///
+    /// CONTRACT CHANGE (de-hardcoding): the label-digit probe (the "1" of
+    /// "Table 1") moved the other way — the caption sentence holds the
+    /// subject, so under a silent ontology the body block now reports
+    /// support for it; the vocabulary that refused it is gone.
     #[test]
     fn jats_properties_table_supports_no_cross_row_claim() {
         let body = r#"<?xml version="1.0"?>
@@ -3958,14 +3614,15 @@ mod tests {
         let ft = crate::fulltext::parse_jats(body.as_bytes()).unwrap();
         for block in &ft.blocks {
             assert!(
-                supporting_quote("Ti-6Al-4V", "UTS", Some(1375.0), &block.text).is_none(),
+                supporting_quote(
+                    "Ti-6Al-4V",
+                    "UTS",
+                    Some(1375.0),
+                    &block.text,
+                    &GuardPolicy::SILENT
+                )
+                .is_none(),
                 "block {:?} fabricated support for Inconel's number: {:?}",
-                block.locator.kind,
-                block.text
-            );
-            assert!(
-                supporting_quote("Ti-6Al-4V", "UTS", Some(1.0), &block.text).is_none(),
-                "block {:?} fabricated support from a label digit: {:?}",
                 block.locator.kind,
                 block.text
             );
@@ -3977,8 +3634,35 @@ mod tests {
             .find(|b| b.locator.kind == BlockKind::Table)
             .unwrap();
         assert_eq!(
-            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &table.text).as_deref(),
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                &table.text,
+                &GuardPolicy::SILENT
+            )
+            .as_deref(),
             Some("Ti-6Al-4V 950")
+        );
+        // The caption digit reports support in the body block under a
+        // silent ontology — recorded, not judged here.
+        let body_block = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Body)
+            .unwrap();
+        assert!(
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1.0),
+                &body_block.text,
+                &GuardPolicy::SILENT
+            )
+            .is_some(),
+            "the caption sentence names the subject, so the matcher reports the \
+             co-occurrence: {:?}",
+            body_block.text
         );
     }
 
@@ -4019,7 +3703,14 @@ mod tests {
         let ft = crate::fulltext::parse_jats(body.as_bytes()).unwrap();
         for block in &ft.blocks {
             assert!(
-                supporting_quote("Ti-6Al-4V", "UTS", Some(1375.0), &block.text).is_none(),
+                supporting_quote(
+                    "Ti-6Al-4V",
+                    "UTS",
+                    Some(1375.0),
+                    &block.text,
+                    &GuardPolicy::SILENT
+                )
+                .is_none(),
                 "block {:?} fabricated support for Inconel's number: {:?}",
                 block.locator.kind,
                 block.text
@@ -4031,170 +3722,101 @@ mod tests {
             .find(|b| b.locator.kind == BlockKind::Table)
             .unwrap();
         assert_eq!(
-            supporting_quote("Ti-6Al-4V", "UTS", Some(950.0), &table.text).as_deref(),
+            supporting_quote(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                &table.text,
+                &GuardPolicy::SILENT
+            )
+            .as_deref(),
             Some("Ti-6Al-4V 950")
         );
         assert_eq!(
-            supporting_quote("Inconel 718", "UTS", Some(1375.0), &table.text).as_deref(),
+            supporting_quote(
+                "Inconel 718",
+                "UTS",
+                Some(1375.0),
+                &table.text,
+                &GuardPolicy::SILENT
+            )
+            .as_deref(),
             Some("Inconel 718 1375")
         );
     }
 
-    /// Round 7: `sample`/`samples`/`run`/`runs` are back in
-    /// `LABEL_WORDS` — round 6 cut them and opened specimen-label
-    /// fabrications ("Sample 5 of Ti-6Al-4V was tested" stamped UTS =
-    /// 5). The idioms separate cleanly: a label number never has a unit
-    /// after it, a measurement always does, so the exemption at the top
-    /// of `preceding_word_is_label` pins the stamp direction and the
-    /// label words pin the drop direction. This test is the stamp half:
-    /// each assert reddens when the `unit_follows` exemption is removed
-    /// from `preceding_word_is_label` (NOT when the words leave
-    /// LABEL_WORDS — that mutation reddens the drop test instead).
+    /// The methods-prose recall family: spaced units after a number keep
+    /// stamping. CONTRACT CHANGE (de-hardcoding): these used to be the
+    /// EXEMPTION half of the label guard (a spaced unit redeemed a number
+    /// after "sample"/"run"). With the label vocabulary gone there is
+    /// nothing to exempt from — the numbers stamp on their own clean
+    /// boundaries, and the test documents the recall the removal keeps.
     #[test]
-    fn methods_prose_nouns_sample_and_run_do_not_label_numbers() {
-        assert!(
-            supporting_quote(
+    fn methods_prose_numbers_with_spaced_units_still_stamp() {
+        for (subject, object, value, prose) in [
+            (
                 "Ti-6Al-4V",
                 "thickness",
-                Some(3.0),
-                "Each Ti-6Al-4V sample 3 mm thick was ground and polished."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
+                3.0,
+                "Each Ti-6Al-4V sample 3 mm thick was ground and polished.",
+            ),
+            (
                 "Ti-6Al-4V",
                 "thickness",
-                Some(3.0),
-                "The Ti-6Al-4V samples 3 mm thick were ground and polished."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
+                3.0,
+                "The Ti-6Al-4V samples 3 mm thick were ground and polished.",
+            ),
+            (
                 "Ti-6Al-4V",
                 "duration",
-                Some(2.0),
-                "The Ti-6Al-4V run 2 h at 1073 K produced full densification."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "duration",
-                Some(2.0),
-                "The Ti-6Al-4V runs 2 h at 1073 K produced full densification."
-            )
-            .is_some()
-        );
-        // The reviewer corpus's literal recall cases, same mechanism.
-        assert!(
-            supporting_quote(
+                2.0,
+                "The Ti-6Al-4V run 2 h at 1073 K produced full densification.",
+            ),
+            (
                 "Inconel 718",
                 "duration",
-                Some(30.0),
-                "Each Inconel 718 run 30 min at 980 \u{b0}C was quenched."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
+                30.0,
+                "Each Inconel 718 run 30 min at 980 \u{b0}C was quenched.",
+            ),
+            (
                 "AlSi10Mg",
                 "thickness",
-                Some(5.0),
-                "The AlSi10Mg samples 5 mm thick were sectioned."
-            )
-            .is_some()
-        );
+                5.0,
+                "The AlSi10Mg samples 5 mm thick were sectioned.",
+            ),
+        ] {
+            assert!(
+                supporting_quote_or_refusal(
+                    subject,
+                    object,
+                    Some(value),
+                    prose,
+                    &GuardPolicy::SILENT
+                )
+                .is_ok(),
+                "recall lost for: {prose}"
+            );
+        }
         // The real temperature in the same sentence still stamps.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "temperature",
                 Some(1073.0),
-                "The Ti-6Al-4V run 2 h at 1073 K produced full densification."
+                "The Ti-6Al-4V run 2 h at 1073 K produced full densification.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
     }
 
-    /// Round 8 (H1): the unit exemption at the top of
-    /// `preceding_word_is_label` requires a SPACE before the unit.
-    /// UNIT_TOKENS holds eleven single letters (n m g s h k j w v a
-    /// t) — exactly the symbol letters of materials prose — so round
-    /// 7's spaceless exemption read a glued sub-panel letter or
-    /// symbol column as a unit and disabled the label guard for EVERY
-    /// label word: 242 label-letter combinations flipped DROP ->
-    /// STAMP, every one a fabrication ("Figure 2a shows...", "Table
-    /// 4a"). Both directions pinned: the spaced recall form stamps,
-    /// the glued panel letter drops. Mutations: deleting the
-    /// `starts_with(' ')` condition reddens the drop asserts;
-    /// deleting the exemption reddens the stamp asserts.
-    #[test]
-    fn unit_exemption_requires_a_space_before_the_unit() {
-        // Stamp direction: every win that needs the exemption is spaced.
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "thickness",
-                Some(3.0),
-                "Each Ti-6Al-4V sample 3 mm thick was ground and polished."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
-                "Inconel 718",
-                "duration",
-                Some(30.0),
-                "Each Inconel 718 run 30 min at 980 \u{b0}C was quenched."
-            )
-            .is_some()
-        );
-        // Drop direction: a glued single letter is a sub-panel letter
-        // or symbol column as often as it is a unit; the Label guard
-        // must survive it.
-        assert_dropped_end_to_end(
-            "AlSi10Mg",
-            "porosity",
-            2.0,
-            "Figure 2a shows the AlSi10Mg porosity.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "microstructure",
-            3.0,
-            "Fig. 3a shows the Ti-6Al-4V microstructure.",
-        );
-        // And the refusal keeps its name: the guard is Label, not
-        // Boundary (the glued 'a' passes the boundary check as a unit
-        // initial — only the label word refuses it).
-        assert_eq!(
-            supporting_quote_or_refusal(
-                "AlSi10Mg",
-                "porosity",
-                Some(2.0),
-                "Figure 2a shows the AlSi10Mg porosity."
-            ),
-            Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: "Figure 2a shows the AlSi10Mg porosity.".to_string(),
-            })
-        );
-    }
-
-    /// Round 8 (H2): the derivation of glued unit initials from
-    /// `UNIT_TOKENS` admitted 'e' via the "ev" token, reopening
-    /// scientific notation — "2e5 per second" stamped 2, "1e6 cycles"
-    /// stamped 1 — while the doc comment kept promising "2e5 stays
-    /// rejected". The derivation now subtracts `DENIED_UNIT_INITIALS`,
-    /// so the promise is enforced by the code, not by the token list
-    /// happening to lack the letter. Both directions pinned: the
-    /// glued-denial drops and the spaced form of the SAME unit still
-    /// stamps. Mutations: removing 'e' from `DENIED_UNIT_INITIALS`
-    /// reddens the 2e5/1e6 asserts; removing "ev" from `UNIT_TOKENS`
-    /// reddens the spaced control.
+    /// Scientific notation and magnification glue stay rejected — and now
+    /// for the honest reason: no supplied unit term redeems the glued
+    /// letter, so the Boundary guard refuses it. CONTRACT CHANGE
+    /// (de-hardcoding): this no longer depends on `DENIED_UNIT_INITIALS`
+    /// or on "ev" being a unit token; with the fact's own unit supplied,
+    /// the spaced and glued forms of that unit stamp while "2e5" still
+    /// refuses (the claim's unit is not "e5").
     #[test]
     fn scientific_notation_and_magnification_glue_stay_rejected() {
         assert_dropped_end_to_end(
@@ -4209,13 +3831,14 @@ mod tests {
             1.0,
             "Ti-6Al-4V ran 1e6 cycles to failure.",
         );
-        // One of the five designation-suffix fabrications round 7
-        // opened: denying 'e' closes it.
-        assert_dropped_end_to_end(
+        // A supplied unit does not reopen the glued-e form: the fact's
+        // unit is "ev", and "e5" is not "ev".
+        assert_dropped_end_to_end_with_policy(
             "Ti-6Al-4V",
-            "elongation",
-            16.0,
-            "The Ti-6Al-4V tensile tests followed ASTM E8-16e1.",
+            "strain_rate",
+            2.0,
+            "The Ti-6Al-4V strain rate was 2e5 per second.",
+            &unit_policy("ev"),
         );
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
@@ -4223,50 +3846,25 @@ mod tests {
             950.0,
             "The Ti-6Al-4V coupon was imaged at 950x magnification.",
         );
-        // Spaced control: denying the glued 'e' costs nothing — spaced
-        // "5 ev" still stamps, under a label locator so the exemption's
-        // `unit_follows` actually decides the outcome: deleting "ev"
-        // from UNIT_TOKENS reddens this. Round 9: the original sentence
-        // had no label word and proved nothing.
+        // Spaced "5 ev" stamps under silence: after the number comes a
+        // space, so no glued letter needs redeeming.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "band_gap",
                 Some(5.0),
-                "In Fig. 3, 5 ev was measured for the Ti-6Al-4V band gap."
+                "In Fig. 3, 5 ev was measured for the Ti-6Al-4V band gap.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
     }
 
-    /// Round 8 (H2): round 7's switch to pure derivation silently
-    /// lost 'f' and 'l' — the round-6 hand list's recall letters for
-    /// "72F" (Fahrenheit) and "50l" (litres) — and nothing tested
-    /// them. Restored in `EXTRA_UNIT_INITIALS`, pinned here. 'd'
-    /// (days, "30d") stays absent by decision: its removal let
-    /// "2D"/"3D projection" drop correctly, and the trade is pinned
-    /// by the last assert.
+    /// CONTRACT CHANGE (de-hardcoding): "2D"/"3D projection" stays
+    /// dropped — no supplied unit redeems the glued 'd', and nothing in
+    /// Rust special-cases the letter.
     #[test]
-    fn f_and_l_recall_initials_stamp_glued_units_again() {
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "storage_temperature",
-                Some(72.0),
-                "The Ti-6Al-4V coupons were stored at 72F."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
-                "Ti-6Al-4V",
-                "tank_volume",
-                Some(50.0),
-                "The Ti-6Al-4V powder tank holds 50l."
-            )
-            .is_some()
-        );
-        // The decision half: keeping 'd' absent lets 2D/3D drop.
+    fn projection_designators_stay_rejected_without_a_unit() {
         assert_dropped_end_to_end(
             "Ti-6Al-4V",
             "projection",
@@ -4275,224 +3873,23 @@ mod tests {
         );
     }
 
-    /// Round 7: the drop half of the sample/run restoration. With the
-    /// words back in `LABEL_WORDS`, a specimen/batch number that carries
-    /// NO unit is a label and drops — this is what round 6's cut opened:
-    /// six fabrications measured across two corpora. Each assert reddens
-    /// when its word leaves LABEL_WORDS; the stamp half lives in
-    /// `methods_prose_nouns_sample_and_run_do_not_label_numbers`. The
-    /// last two asserts are the free wins: a unit-bearing number after
-    /// "cross-section" (word "section") stamps again too.
-    #[test]
-    fn sample_and_run_label_numbers_are_not_support() {
-        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 5.0, "Sample 5 of Ti-6Al-4V was tested.");
-        assert_dropped_end_to_end(
-            "Inconel 718",
-            "build_failure",
-            12.0,
-            "Run 12 of the Inconel 718 build failed.",
-        );
-        // Both ends of a sample range are labels.
-        assert_dropped_end_to_end(
-            "AlSi10Mg",
-            "print_count",
-            1.0,
-            "Samples 1 to 6 of AlSi10Mg were printed.",
-        );
-        assert_dropped_end_to_end(
-            "AlSi10Mg",
-            "print_count",
-            6.0,
-            "Samples 1 to 6 of AlSi10Mg were printed.",
-        );
-        // "runs" keeps its own kill: both ends of a run range.
-        assert_dropped_end_to_end(
-            "Inconel 718",
-            "campaign",
-            7.0,
-            "Runs 7 to 12 of the Inconel 718 campaign failed.",
-        );
-        assert_dropped_end_to_end(
-            "Inconel 718",
-            "campaign",
-            12.0,
-            "Runs 7 to 12 of the Inconel 718 campaign failed.",
-        );
-
-        // Free wins from the unit exemption: measurement after
-        // "cross-section" carries a unit, so the label word "section"
-        // no longer refuses it.
-        assert!(
-            supporting_quote(
-                "AlSi10Mg",
-                "height",
-                Some(10.0),
-                "A cross-section 10 mm above the build plate was examined for AlSi10Mg."
-            )
-            .is_some()
-        );
-        assert!(
-            supporting_quote(
-                "AlSi10Mg",
-                "height",
-                Some(10.0),
-                "Cross-sections 10 mm above the build plate were examined for AlSi10Mg."
-            )
-            .is_some()
-        );
-    }
-
-    /// Round 6: every label word KEPT in `LABEL_WORDS` gets a
-    /// falsifiable assert — untested denylist words are the dangerous
-    /// ones, and this list carried sixteen of them — the twelve added
-    /// words plus figures/figs/reference/references. Each assert reddens
-    /// when its word is removed from LABEL_WORDS. Pre-existing tests
-    /// cover table/tables/figure/fig/ref/refs/section/eq/eqs/scheme.
-    #[test]
-    fn every_kept_label_word_refuses_its_number() {
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            3.0,
-            "The Ti-6Al-4V data appear in Figures 2 and 3.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            5.0,
-            "Ti-6Al-4V results are plotted in Figs. 4 and 5.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            12.0,
-            "Ti-6Al-4V data are taken from Reference 12.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            13.0,
-            "Ti-6Al-4V data are taken from References 12 and 13.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            5.0,
-            "The Ti-6Al-4V data appear in Sections 4 and 5.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            7.0,
-            "The Ti-6Al-4V fit is given in Equation 7.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            8.0,
-            "The Ti-6Al-4V fits are given in Equations 7 and 8.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            3.0,
-            "The Ti-6Al-4V model is given in Chapter 3.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            4.0,
-            "The Ti-6Al-4V models are given in Chapters 3 and 4.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            5.0,
-            "The Ti-6Al-4V data come from Entry 5.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            6.0,
-            "The Ti-6Al-4V data come from Entries 5 and 6.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            3.0,
-            "The Ti-6Al-4V routes are shown in Schemes 2 and 3.",
-        );
-    }
-
-    /// Round 6 read "30-50um" as a measurement because the glued unit
-    /// redeemed the high endpoint; round 9 picked the ground truth (a
-    /// range endpoint is not a point value) and round 10 enforces it —
-    /// `dash_range_endpoint` on the whole dash class owns digit/dash/
-    /// digit runs FIRST, whatever unit follows the second number. The
-    /// `clean_number_boundary` clause this test used to pin keeps its
-    /// OTHER job: LETTER-dash designation digits stay refused. The
-    /// en-dash object-arm assert is the deletion killer: with the clause
-    /// gone, the "6" of Ti\u{2013}6Al\u{2013}4V stamps via the object
-    /// arm (the subject's ASCII hyphens mismatch the en-dash text, and
-    /// occurrence_inside_name sees nothing). Mutations: deleting the
-    /// clause reddens the en-dash assert. Round 10 note: the clause's
-    /// digit-before-dash condition is defense-in-depth now — Range
-    /// refuses every digit/dash/digit occurrence before boundary runs.
-    #[test]
-    fn dash_range_endpoints_with_glued_units_are_not_point_values() {
-        // Round 10 ground truth: the endpoints of a digit/dash/digit run
-        // are range bounds, not measurements, even when the second
-        // number carries a glued unit.
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "layer_thickness",
-            50.0,
-            "Ti-6Al-4V powder layers of 30-50um were deposited.",
-        );
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "layer_thickness",
-            30.0,
-            "Ti-6Al-4V powder layers of 30-50um were deposited.",
-        );
-        assert_dropped_end_to_end(
-            "CoCrFeNi",
-            "grain_size",
-            10.0,
-            "CoCrFeNi grains of 5-10mm were observed.",
-        );
-        // Letter-dash designation digits stay refused. In the en-dash
-        // form ONLY this clause refuses the "6" — deletion turns it red.
-        assert_dropped_end_to_end(
-            "Ti-6Al-4V",
-            "UTS",
-            6.0,
-            "The Ti\u{2013}6Al\u{2013}4V UTS is 950 MPa.",
-        );
-        // ASCII form: double-covered by occurrence_inside_name; kept as
-        // documentation of the class.
-        assert_dropped_end_to_end("Ti-6Al-4V", "UTS", 6.0, "The Ti-6Al-4V UTS is 950 MPa.");
-    }
-
     /// Round 6: the walk-back used to compose comma steps with an
     /// unbounded conjunction trim, so a VALUE after a sentence's locator
     /// label ("In Table 5,") walked back over the label number and
     /// dropped the whole value list — measured drops, all stamped at
-    /// base. The chain continuing after the occurrence decides: it ends
-    /// in a unit -> value list, no walk; no unit -> reference list,
-    /// walk. Mutation-proven red by removing the gate, by removing the
-    /// comma step or the conjunction step of the forward chain scan, or
-    /// by removing the head-of-chain unit check. The reference-list
-    /// asserts above (Refs. 25, 26 / and 27 / Eqs. 7 and 8) kill
-    /// mutations that over-broaden `UNIT_TOKENS` ("for" as a unit would
-    /// stamp them).
+    /// base. CONTRACT CHANGE (de-hardcoding): the walk-back, its
+    /// unit-chain discriminator and the label vocabulary that drove it
+    /// are all deleted — Rust holds no label words and no unit lexicon.
+    /// The recall these cases pinned SURVIVES for the plain reason that
+    /// every value now sits on clean boundaries beside the subject:
+    /// there is no guard left to over-walk.
     #[test]
     fn value_lists_after_a_label_locator_still_stamp() {
         // Comma + conjunction list after "Table 5,": all three values.
         let list = "In Table 5, 950, 960 and 970 MPa were measured for Ti-6Al-4V.";
         for v in [950.0, 960.0, 970.0] {
             assert!(
-                supporting_quote("Ti-6Al-4V", "UTS", Some(v), list).is_some(),
+                supporting_quote("Ti-6Al-4V", "UTS", Some(v), list, &GuardPolicy::SILENT).is_some(),
                 "value {v} dropped from: {list}"
             );
         }
@@ -4501,19 +3898,18 @@ mod tests {
         let long = "Per Table 2, 950, 960, 970, 980 and 990 MPa were recorded for Ti-6Al-4V.";
         for v in [950.0, 960.0, 970.0, 980.0, 990.0] {
             assert!(
-                supporting_quote("Ti-6Al-4V", "UTS", Some(v), long).is_some(),
+                supporting_quote("Ti-6Al-4V", "UTS", Some(v), long, &GuardPolicy::SILENT).is_some(),
                 "value {v} dropped from: {long}"
             );
         }
-        // "Fig. N," clause opener — guard interaction: the H7 period fix
-        // keeps the value in one span with "fig", and the comma walk then
-        // traversed it. Neither guard alone did this.
+        // "Fig. N," clause opener.
         assert!(
             supporting_quote(
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "As shown in Fig. 5, 950 MPa was the peak Ti-6Al-4V UTS."
+                "As shown in Fig. 5, 950 MPa was the peak Ti-6Al-4V UTS.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -4523,7 +3919,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "UTS",
                 Some(1140.0),
-                "Per Table 3, 1,140 MPa was the Ti-6Al-4V peak."
+                "Per Table 3, 1,140 MPa was the Ti-6Al-4V peak.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -4533,7 +3930,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "surface_stress",
                 Some(-950.0),
-                "From Fig. 6, \u{2212}950 MPa was the Ti-6Al-4V surface stress."
+                "From Fig. 6, \u{2212}950 MPa was the Ti-6Al-4V surface stress.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -4544,7 +3942,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "Figure 3 shows a UTS of 950 MPa."
+                "Figure 3 shows a UTS of 950 MPa.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -4553,7 +3952,8 @@ mod tests {
                 "alloy",
                 "strength",
                 Some(1100.0),
-                "in Table 4 the alloy reached 1100 MPa"
+                "in Table 4 the alloy reached 1100 MPa",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -4562,7 +3962,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "UTS",
                 Some(950.0),
-                "In Fig. 4, the Ti-6Al-4V UTS of 950 MPa is marked."
+                "In Fig. 4, the Ti-6Al-4V UTS of 950 MPa is marked.",
+                &GuardPolicy::SILENT
             )
             .is_some()
         );
@@ -4580,21 +3981,16 @@ mod tests {
 
     #[test]
     fn guarded_refusals_name_the_guard_that_dropped_the_value() {
-        // Label: span holds subject + object + value; the label walk
-        // refuses the only occurrence.
-        let label = "Ti-6Al-4V properties are listed in Table 3.";
-        assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "properties", Some(3.0), label),
-            Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: label.to_string(),
-            })
-        );
-
         // Boundary: "95" inside "950" — digit continuation.
         let boundary = "The Ti-6Al-4V UTS is 950 MPa.";
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(95.0), boundary),
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(95.0),
+                boundary,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Boundary,
                 span: boundary.to_string(),
@@ -4604,7 +4000,13 @@ mod tests {
         // Citation: the number sits in a bracketed marker.
         let citation = "Ti-6Al-4V has been studied extensively in prior work [1140].";
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(1140.0), citation),
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                citation,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Citation,
                 span: citation.to_string(),
@@ -4614,7 +4016,13 @@ mod tests {
         // InsideName: the "718" of the claim's own subject name.
         let table = "Alloy UTS (MPa)\nTi-6Al-4V 950\nInconel 718 1375";
         assert_eq!(
-            supporting_quote_or_refusal("Inconel 718", "UTS", Some(718.0), table),
+            supporting_quote_or_refusal(
+                "Inconel 718",
+                "UTS",
+                Some(718.0),
+                table,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::InsideName,
                 span: "Inconel 718 1375".to_string(),
@@ -4624,21 +4032,33 @@ mod tests {
         // Range: en-dash digit range endpoint.
         let range = "The Ti-6Al-4V UTS ranged from 950\u{2013}1100 MPa.";
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(950.0), range),
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(950.0),
+                range,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Range,
                 span: range.to_string(),
             })
         );
 
-        // SignDomain: a negative claim against a quantity that is
-        // non-negative by physical definition — refused whatever the
-        // occurrence looks like (round 12 item 1c). Deleting the
-        // NONNEGATIVE_QUANTITIES check reddens this assert and lets the
-        // separator shape stamp a compressive value from a tensile source.
+        // SignDomain: the ontology declares the quantity non-negative, so
+        // a negative claim refuses whatever the occurrence looks like.
+        // CONTRACT CHANGE (de-hardcoding): the declaration arrives
+        // through `GuardPolicy`; under the silent policy this exact
+        // sentence stamps (the vocabulary that knew "UTS" is gone).
         let separator = "Ti-6Al-4V UTS -950 MPa (longitudinal)";
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(-950.0), separator),
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(-950.0),
+                separator,
+                &nonnegative_policy()
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::SignDomain,
                 span: separator.to_string(),
@@ -4648,15 +4068,18 @@ mod tests {
 
     /// Round 16: a dash in SEPARATOR or PARENTHETICAL role on a SIGNED
     /// predicate (residual stress) is refused — `SignDomain` cannot
-    /// help because the quantity is genuinely signed. Both shapes
-    /// (label-inline via the object name abutting the dash; bracketed
-    /// via a trailing dash glued to the unit) drop as `SeparatorDash`,
-    /// and BOTH directions are pinned: the forward rows are refused,
-    /// and the true-minus rows (a verb/preposition before the dash) still
-    /// stamp. Removing sub-condition (A) reddens the inline rows,
-    /// removing (B) reddens the bracketed rows; widening either (or
-    /// dropping the value<0 gate) reddens an over-refusal row. No
-    /// cannot-fail arm.
+    /// help because the quantity is genuinely signed. Both shapes drop
+    /// as `SeparatorDash`, and BOTH directions are pinned: the forward
+    /// rows are refused, and the true-minus rows (a verb/preposition
+    /// before the dash) still stamp. Removing sub-condition (A) reddens
+    /// the inline rows; removing (B) reddens the bracketed rows;
+    /// widening either (or dropping the value<0 gate) reddens an
+    /// over-refusal row. No cannot-fail arm.
+    ///
+    /// CONTRACT CHANGE (de-hardcoding): shape (B) now reads the fact's
+    /// OWN unit term from the policy instead of `UNIT_TOKENS` — the
+    /// bracketed rows below supply "MPa" exactly as the reader/ontology
+    /// would, and are inert without it (last assert).
     #[test]
     fn separator_dash_refuses_signed_predicate_separator_shapes() {
         // (A) label-inline: the object name abuts the dash. Both glyphs.
@@ -4665,26 +4088,55 @@ mod tests {
             "Ti-6Al-4V residual stress \u{2212}950 MPa (longitudinal)",
         ] {
             assert_eq!(
-                supporting_quote_or_refusal("Ti-6Al-4V", "residual_stress", Some(-950.0), prose),
+                supporting_quote_or_refusal(
+                    "Ti-6Al-4V",
+                    "residual_stress",
+                    Some(-950.0),
+                    prose,
+                    &GuardPolicy::SILENT
+                ),
                 Err(SupportRefusal::Guarded {
                     guard: RefusalGuard::SeparatorDash,
                     span: prose.to_string(),
                 })
             );
         }
-        // (B) bracketed: a dash glued to the unit right after the value.
+        // (B) bracketed: a dash glued to the fact's own unit right after
+        // the value. The unit arrives through the policy.
+        let bracketed = GuardPolicy {
+            quantity_sign: QuantitySignDomain::Unspecified,
+            unit_term: Some("MPa".to_string()),
+        };
         for prose in [
             "The Ti-6Al-4V result -950 MPa- matched the target.",
             "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
         ] {
             assert_eq!(
-                supporting_quote_or_refusal("Ti-6Al-4V", "residual_stress", Some(-950.0), prose),
+                supporting_quote_or_refusal(
+                    "Ti-6Al-4V",
+                    "residual_stress",
+                    Some(-950.0),
+                    prose,
+                    &bracketed
+                ),
                 Err(SupportRefusal::Guarded {
                     guard: RefusalGuard::SeparatorDash,
                     span: prose.to_string(),
                 })
             );
         }
+        // Without a supplied unit term shape (B) is inert — no lexicon
+        // guesses "MPa". The sentence then stamps: an honest weaker note.
+        assert!(
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "residual_stress",
+                Some(-950.0),
+                "The Ti-6Al-4V result -950 MPa- matched the target.",
+                &GuardPolicy::SILENT
+            )
+            .is_ok()
+        );
         // Over-refusal direction: a true minus MUST still stamp — the
         // dash follows a verb/preposition (never the object name) and no
         // dash is glued to the unit. These pin that the guard is precise.
@@ -4693,7 +4145,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "residual_stress",
                 Some(-350.0),
-                "The residual stress in Ti-6Al-4V was \u{2212}350 MPa."
+                "The residual stress in Ti-6Al-4V was \u{2212}350 MPa.",
+                &bracketed
             )
             .is_ok()
         );
@@ -4702,7 +4155,8 @@ mod tests {
                 "Ti-6Al-4V",
                 "surface_stress",
                 Some(-950.0),
-                "From Fig. 6, \u{2212}950 MPa was the Ti-6Al-4V surface stress."
+                "From Fig. 6, \u{2212}950 MPa was the Ti-6Al-4V surface stress.",
+                &bracketed
             )
             .is_ok()
         );
@@ -4714,57 +4168,53 @@ mod tests {
                 "Ti-6Al-4V",
                 "residual_stress",
                 Some(-350.0),
-                "\u{2212}350 MPa was the Ti-6Al-4V surface stress (Fig. 6)."
+                "\u{2212}350 MPa was the Ti-6Al-4V surface stress (Fig. 6).",
+                &bracketed
             )
             .is_ok()
         );
     }
 
-    /// Round 7: the reported guard is the FIRST refusal, not the last.
-    /// Last-wins reporting was positional, not causal: any block where
-    /// the value appears more than once (most real blocks) could flip
-    /// the name when two sentences swapped, and the natural
-    /// single-sentence case reported Boundary when the real refusal was
-    /// Label. An engineer chasing "Boundary" from last-wins would go
-    /// read `clean_number_boundary` and find nothing wrong. Mutations:
-    /// switching `supporting_quote_or_refusal` back to last-wins reddens
-    /// the first assert; switching `scan_number_evidence` reddens the
-    /// in-span assert.
+    /// The reported guard is the FIRST refusal, not the last. Last-wins
+    /// reporting was positional, not causal: any block where the value
+    /// appears more than once (most real blocks) could flip the name
+    /// when two sentences swapped. CONTRACT CHANGE (de-hardcoding): the
+    /// cross-span pair uses two STRUCTURAL guards (Citation and
+    /// Boundary) — the old Label/Boundary pair pinned the deleted label
+    /// vocabulary.
     #[test]
     fn guarded_refusals_report_the_first_refusal_not_the_last() {
         // Cross-span: the value occurs once per span, each span refused
         // by a different guard. First-wins makes the report follow the
         // text, so swapping the sentences swaps the reported guard.
-        let label_first =
-            "Table 2 lists the Inconel 718 data. The Inconel 718 modulus was 2.5 GPa.";
+        let citation_first =
+            "Prior work [2] covers the Inconel 718 modulus. The Inconel 718 modulus was 2.5 GPa.";
         assert_eq!(
-            supporting_quote_or_refusal("Inconel 718", "modulus", Some(2.0), label_first),
+            supporting_quote_or_refusal(
+                "Inconel 718",
+                "modulus",
+                Some(2.0),
+                citation_first,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: "Table 2 lists the Inconel 718 data.".to_string(),
+                guard: RefusalGuard::Citation,
+                span: "Prior work [2] covers the Inconel 718 modulus.".to_string(),
             })
         );
         let boundary_first =
-            "The Inconel 718 modulus was 2.5 GPa. Table 2 lists the Inconel 718 data.";
+            "The Inconel 718 modulus was 2.5 GPa. Prior work [2] covers the Inconel 718 modulus.";
         assert_eq!(
-            supporting_quote_or_refusal("Inconel 718", "modulus", Some(2.0), boundary_first),
+            supporting_quote_or_refusal(
+                "Inconel 718",
+                "modulus",
+                Some(2.0),
+                boundary_first,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::Guarded {
                 guard: RefusalGuard::Boundary,
                 span: "The Inconel 718 modulus was 2.5 GPa.".to_string(),
-            })
-        );
-
-        // Within ONE span: the standalone occurrence a reader meets is
-        // refused by Label ("cross-section 10"); the occurrence glued
-        // inside "alsi10mg" refuses Boundary later in the scan.
-        // Last-wins reported Boundary here; the real guard is Label.
-        let one_span =
-            "A cross-section 10 layers above the build plate showed 3% AlSi10Mg porosity.";
-        assert_eq!(
-            supporting_quote_or_refusal("AlSi10Mg", "porosity", Some(10.0), one_span),
-            Err(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
-                span: one_span.to_string(),
             })
         );
     }
@@ -4776,7 +4226,13 @@ mod tests {
     fn no_span_refusal_stays_missing_quote() {
         let block = "Discussion of prior work [1140] follows. No alloy data here.";
         assert_eq!(
-            supporting_quote_or_refusal("Ti-6Al-4V", "UTS", Some(1140.0), block),
+            supporting_quote_or_refusal(
+                "Ti-6Al-4V",
+                "UTS",
+                Some(1140.0),
+                block,
+                &GuardPolicy::SILENT
+            ),
             Err(SupportRefusal::NoSpan)
         );
         assert_eq!(
@@ -4785,11 +4241,11 @@ mod tests {
         );
         assert_eq!(
             ClaimRejection::from(SupportRefusal::Guarded {
-                guard: RefusalGuard::Label,
+                guard: RefusalGuard::Citation,
                 span: "s".to_string(),
             }),
             ClaimRejection::NoEvidentialOccurrence {
-                guard: RefusalGuard::Label,
+                guard: RefusalGuard::Citation,
                 span: "s".to_string(),
             }
         );

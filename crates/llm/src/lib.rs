@@ -17,9 +17,11 @@ use tracing::debug;
 mod local;
 mod minja;
 mod model_artifact;
+mod overflow;
 pub use local::{LOCAL_GGUF_URL, default_model_dir, is_local_gguf_url, resolve_model_path};
 pub use minja::render as render_minja_template;
 pub use model_artifact::{BUNDLED_GEMMA, ModelArtifactManifest, sha256_hex, verify_model_artifact};
+pub use overflow::{error_is_context_window_exceeded, is_context_window_exceeded};
 
 /// Canonical text and identity produced by the embedded GGUF's own template.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2422,24 +2424,29 @@ fn render_tools_as_text(tools: &[ToolDefinition]) -> String {
 /// parameters): on a 135-tool catalog the model saw ~40 bare names, so every
 /// other tool was only reachable via a `find_tools` hop. That summary is gone.
 ///
-/// What remains has no other code path: the retrieval-discipline carve-out and
-/// the domain guidance from PRs #109/#111/#114/#115 — where materials data
-/// actually lives, which hosts the `web` tool cannot reach, the composition
-/// patterns, and long-horizon discipline.
+/// CONTRACT CHANGE (dehardcoding): this block now carries ONLY the
+/// domain-neutral discipline — when not to call tools, failure recovery,
+/// composition habits, and the long-horizon loop (PRs #109/#111). The
+/// materials routing doctrine it used to compile in ("where materials data
+/// actually lives", vendor/search-engine blacklists, the
+/// materials-discovery composition cookbook) moved to where routing
+/// guidance belongs: the TOOLS' OWN DESCRIPTIONS in the registry
+/// (`app/tools/*.py`), which ride the request's real `tools` array. A
+/// non-materials deployment must never be told its questions are
+/// materials-discovery questions by a Rust constant.
 const TOOL_GUIDANCE_BLOCK: &str = "\
         ## IMPORTANT: When NOT to call tools\n\n\
         For greetings, casual conversation, conceptual explanations, \
         or anything that does not need live data — respond with plain text. \
         Do NOT call tools for simple chat like \"hello\", \"what can you do?\", or \"explain X\".\n\
         This is NOT a licence to answer from memory: a question about a specific \
-        MATERIAL, a source, or platform/job state always needs live data. Retrieve \
+        entity, fact, source, or platform/job state always needs live data. Retrieve \
         it. If retrieval comes back empty, say it was not found — never fill the \
         gap from memory.\n\n\
         **When a tool fails (recovery rules — DO NOT GIVE UP):**\n\
         - A tool returning an error is NORMAL. It is NOT a signal to stop.\n\
-        - If a tool returns a missing-API-key error (e.g. \"MP_API_KEY not set\"), \
-        immediately try a keyless alternative: `materials_search` (OPTIMADE federation, \
-        no key needed) or `prior_art_search` (literature) before giving up.\n\
+        - If a tool returns a missing-API-key error, immediately try a keyless \
+        alternative for the same goal (most catalogs have one) before giving up.\n\
         - If a tool returns \"unknown tool\", call `find_tools` to see real \
         names, then try the closest match. Do not give up.\n\
         - If two tools have failed for the same goal, call `find_tools` again, \
@@ -2449,59 +2456,21 @@ const TOOL_GUIDANCE_BLOCK: &str = "\
         try a different tool, or explicitly tell the user which tools you tried and \
         why none of them worked.\n\n\
         ## Tool-composition patterns (USE THESE for the common tasks)\n\n\
-        PRISM is a materials-discovery strategy engine, not just a chat model. \
         For non-trivial questions you should COMPOSE multiple tools instead of \
-        relying on a single one.\n\n\
-        **CRITICAL — where materials data actually lives:**\n\
-        - Materials property data (creep, modulus, density, band gap, etc.) \
-        lives in `materials_search` (federated DB across MP / OPTIMADE / 18 \
-        others) and in academic papers via `prior_art_search`. NOT on vendor \
-        websites.\n\
-        - Vendor PDFs (specialmetals.com, haynesintl.com, nickelinstitute.org, \
-        matweb.com, hightempmetals.com, …) are paywalled, robots-blocked, or \
-        gated. The `web` tool WILL return 403 / 404 / robots.txt on them. \
-        Do not chain guesses at vendor URLs — that loop never converges.\n\
-        - **Search engines + government repos block the `web` tool's User-Agent.** \
-        Do NOT call `web` GET on `google.com/search`, `bing.com/search`, \
-        `duckduckgo.com`, `osti.gov/servlets/*`, `osti.gov/biblio/*` — every one \
-        returns robots.txt or 403. Observed cost in real runs: ~15 wasted tool \
-        calls per question. Use `prior_art_search` (Semantic Scholar / arXiv / \
-        OpenAlex / PubMed) or `research` instead. The CrossRef API \
-        (`api.crossref.org/works`) IS accessible and is the right place for \
-        DOI-based citation lookups.\n\
-        - For ANY question of the form \"compare property X of alloys A, B, C\" \
-        or \"what is property Y of material Z\", your FIRST tool call should be \
-        `materials_search` or `prior_art_search` — never a `web` GET against a \
-        vendor domain.\n\
-        - `research` (the server-side RLM) is the right call when the question \
-        spans multiple alloy systems + multiple properties + needs synthesis. \
-        It already searches Semantic Scholar / arXiv / OpenAlex / the KG \
-        internally; you do not need to do that hop yourself.\n\n\
-        The most common patterns:\n\n\
-        - **Materials-discovery**: \
-        `materials_search` (federated DB lookup) → `prior_art_search` (literature \
-        cross-check on the candidates that came back) → `predict` (only if you \
-        need a property the DB didn't return). Output candidates with BOTH a \
-        DB id AND a paper citation. Never propose a composition without a \
-        traceable source.\n\
-        - **Property-prediction**: `predict` first, then validate with \
-        `prior_art_search` on the predicted property to see if literature \
-        agrees with the model output.\n\
-        - **Use-case scoping** (\"can material X be used for Y?\"): \
-        `prior_art_search` first (does anyone publish on this?), then \
-        `materials_search` for compositional alternatives, then `web` only \
-        for industry / regulatory context that isn't in academic papers.\n\
+        relying on a single one. Which tool serves which data is stated by each \
+        tool's own description — read them, and prefer the specialised tool over a \
+        general-purpose one.\n\n\
         - **Knowledge-graph queries**: `query_platform` (term or semantic \
         search) and `knowledge_entity` (one entity + its neighbours) for \
-        platform-internal provenance. Use them BEFORE `materials_search` if the \
-        user is asking about a specific project / dataset rather than a \
-        general material.\n\n\
-        For ANY recommendation you give the user: cite the source. \
-        \"Composition X has property Y\" must come with a tool result reference \
-        (DB id, paper DOI, predict() output id). \"It's a known refractory \
-        alloy\" without a citation is hallucination, not strategy.\n\n\
+        platform-internal provenance. Use them before external sources when \
+        the user is asking about a specific project / dataset rather than a \
+        general question.\n\n\
+        For ANY recommendation you give the user: cite the source. A claim that \
+        \"X has Y\" must come with a tool result reference (a database id, a paper \
+        DOI, a computation output id). An unsourced \"it's well known\" is \
+        hallucination, not strategy.\n\n\
         ## Long-horizon discipline (the difference between PRISM and a chatbot)\n\n\
-        Real materials questions take MANY tool calls — typically 8 to 30 — \
+        Real research questions take MANY tool calls — typically 8 to 30 — \
         and span minutes, not seconds. The literature shows that LLMs at long \
         horizons fail in two predictable ways: they (a) terminate early after \
         2–3 tool calls, returning a thin answer, or (b) forget the original \
@@ -2516,10 +2485,8 @@ const TOOL_GUIDANCE_BLOCK: &str = "\
         2. **Use `research` for deep multi-hop questions.** `research(question=...)` \
         runs a server-side Recursive Language Model that does iterative \
         decomposition + literature search + KG traversal in ONE call. Prefer \
-        ONE `research` call over five hand-rolled `prior_art_search` + `web` \
-        calls when the question is open-ended (\"design an alloy for X\", \
-        \"compare approaches to Y\"). It exists because of arxiv:2512.24601; \
-        you are the one calling it.\n\
+        ONE `research` call over five hand-rolled lookups when the question \
+        is open-ended.\n\
         3. **Persist past the urge to wrap up.** If you've made fewer than \
         five tool calls on a multi-part question, you are NOT done. Asking \
         yourself \"do I have enough?\" after two calls is the failure mode. \
@@ -2527,8 +2494,8 @@ const TOOL_GUIDANCE_BLOCK: &str = "\
         and call the next tool.\n\
         4. **Re-anchor on the original goal every ~5 turns.** Quote the \
         user's original ask back to yourself in your reasoning. The most \
-        common long-horizon failure is silently drifting from \"design an RHEA \
-        for LPBF at 2200 °C\" to \"list some refractory metals\".\n\
+        common long-horizon failure is silently drifting from the original \
+        goal to an easier adjacent one.\n\
         5. **Deliberate completion.** When you ARE done, emit the marker \
         `FINAL ANSWER:` followed by the synthesized answer with citations. \
         This is the only acceptable way to end a research turn. An empty \
@@ -4421,15 +4388,15 @@ mod tests {
     /// deleted along with the rest of the name-only surrogate — the request
     /// now carries real schemas, so a prose name list is both redundant and
     /// the only remaining way to ship a stale name.
+    // CONTRACT CHANGE (dehardcoding): the materials routing doctrine moved
+    // out of this block into the tools' own descriptions (see
+    // `guidance_block_carries_no_domain_vocabulary`), so the only names the
+    // block may still mention are the platform-generic ones.
     const GUIDANCE_TOOL_NAMES: &[&str] = &[
         "find_tools",
-        "materials_search",
-        "predict",
-        "prior_art_search",
         "research",
         "query_platform",
         "knowledge_entity",
-        "web",
     ];
 
     #[test]
@@ -4460,10 +4427,46 @@ mod tests {
         }
     }
 
+    /// CONTRACT CHANGE (dehardcoding): the guidance block must also never
+    /// re-grow DOMAIN vocabulary. "Where materials data actually lives", the
+    /// vendor/search-engine blacklists and the materials-discovery cookbook
+    /// moved to the tools' own descriptions — a Rust constant must not tell
+    /// a legal or pharma deployment that its questions are
+    /// materials-discovery questions. Same shape as the tool-inventory ban,
+    /// for domain words.
+    #[test]
+    fn guidance_block_carries_no_domain_vocabulary() {
+        for banned in [
+            "materials-discovery strategy engine",
+            "materials data",
+            "materials_search",
+            "prior_art_search",
+            "`predict`",
+            "web",
+            "creep",
+            "modulus",
+            "band gap",
+            "alloy",
+            "vendor",
+            "matweb",
+            "google.com/search",
+            "osti.gov",
+            "specialmetals",
+            "haynesintl",
+        ] {
+            assert!(
+                !TOOL_GUIDANCE_BLOCK.contains(banned),
+                "domain vocabulary `{banned}` is back in the guidance block — \
+                 routing doctrine belongs to the tools' own descriptions, and \
+                 domain words belong to the ontology"
+            );
+        }
+    }
+
     /// Pin the long-horizon orchestration patterns shipped in PRs #109 and #111.
     ///
-    /// These markers exist because the BimoTech / Fraunhofer end-to-end test
-    /// surfaced two real failure modes: (1) the LLM gave up after one tool
+    /// These markers exist because an end-to-end evaluation surfaced two real
+    /// failure modes: (1) the LLM gave up after one tool
     /// error, and (2) the LLM wrapped up after 2-3 tool calls on a question
     /// that needed 8-30. The fixes are SYSTEM PROMPT TEXT — they have no
     /// other code path. If a future refactor silently drops these strings,
@@ -4502,36 +4505,13 @@ mod tests {
                 "Use `research` for deep multi-hop questions",
                 "RLM-as-default rule from #111",
             ),
-            // PR #114 — vendor-PDF clarifier. Without these pins, the
-            // entire "where materials data actually lives" block can be
-            // silently deleted with green tests. The end-to-end Test 3
-            // trace (2026-05-10 ODS-alloy prompt) confirmed the agent
-            // genuinely changes behaviour when this section is present.
-            (
-                "where materials data actually lives",
-                "vendor-PDF clarifier section header from #114",
-            ),
-            ("Vendor PDFs", "vendor-PDF do-not-call rule from #114"),
-            (
-                "Do not chain guesses at vendor URLs",
-                "anti-URL-enumeration rule from #114",
-            ),
-            // PR #115 — search engine + OSTI blacklist. Concrete domain
-            // names are pinned because the rule's effectiveness depends on
-            // the agent reading them verbatim.
-            (
-                "Search engines + government repos block",
-                "search-engine blacklist section header from #115",
-            ),
-            (
-                "google.com/search",
-                "blacklisted Google search URL pattern from #115",
-            ),
-            ("osti.gov", "blacklisted OSTI repo pattern from #115"),
-            (
-                "CrossRef API",
-                "allowed-fallback CrossRef pointer from #115",
-            ),
+            // CONTRACT CHANGE (dehardcoding): the PR #114/#115 pins
+            // ("where materials data actually lives", the vendor-PDF and
+            // search-engine blacklists, the CrossRef pointer) were removed
+            // WITH the section they pinned — that routing doctrine now
+            // lives in the tools' own descriptions, where it cannot tell a
+            // non-materials deployment its questions are materials
+            // questions. See `guidance_block_carries_no_domain_vocabulary`.
         ];
         for (marker, why) in required_markers {
             assert!(

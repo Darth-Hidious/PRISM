@@ -40,11 +40,12 @@ pub use emmo::{
     ActivityDecoding, AssertionClassification, ClassRegionDistance, ClassifiedFactNodes,
     ClassifiedNode, ConditionValue, EmbeddingPartition, EntityGeometryCoverage,
     EntityGeometryNeighbor, EntityGeometryProbe, EvidenceClass, EvidenceContribution,
-    EvidenceSource, FactNodeLabels, FactPayload, GraphEdge, GraphNode, LOCAL_TENANT,
-    LocalAssertion, LocalFact, LocalProvenance, MaterialFact, MeasurementCondition,
-    OntologyClassification, QudtUnit, RecalledFact, RecalledMaterialFact, SemanticEntityHit,
-    StoreBusy, TraversalResult, TripleGeometryNeighbor, TripleGeometryProbe, assertion_id,
-    canonical_key, conditioned_assertion_id, evidence_for_result,
+    EvidenceSource, FactGraphShape, FactNodeLabels, FactPayload, GraphEdge, GraphNode,
+    LOCAL_TENANT, LocalAssertion, LocalFact, LocalProvenance, MaterialFact, MeasurementCondition,
+    OntologyBoundFactNodes, OntologyClassification, QuantitySignDomain, QudtUnit, RecalledFact,
+    RecalledMaterialFact, SemanticEntityHit, SourceCitation, StoreBusy, StoredAssertion,
+    TraversalResult, TripleGeometryNeighbor, TripleGeometryProbe, UnitTerm, VerificationFilter,
+    VerificationStatus, assertion_id, canonical_key, conditioned_assertion_id, evidence_for_result,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +354,121 @@ pub struct RepairDisposition {
     /// tell a deterministic repair from a model's judgement.
     pub dispositioner: String,
     pub decided_at: f64,
+}
+
+/// One pending ontology extension proposal — the durable half of what the
+/// paper reader proposes. `proposal_json` is the reader's complete proposal
+/// record (label, description, parent or endpoint IRIs); the CITATIONS live
+/// in [`OntologyProposalSighting`] rows keyed by `item_id`, because
+/// evidence accumulates across documents while identity does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OntologyProposalItem {
+    /// Stable identity of the PROPOSAL CONTENT (kind + label + parents or
+    /// endpoints) — NOT of the run or the document. Same concept re-proposed
+    /// from another paper is the same item with one more sighting.
+    pub item_id: String,
+    /// `class` or `relation`.
+    pub kind: String,
+    pub label: String,
+    /// The document whose reader first proposed this identity.
+    pub document: String,
+    pub tenant: String,
+    /// The complete proposal record as JSON (the paper agent's class or
+    /// relation proposal without its citation).
+    pub proposal_json: String,
+    pub enqueued_at: f64,
+}
+
+/// One citation backing a proposal: the exact lines the reader had read when
+/// it made the proposal. A proposal without its evidence is worthless for
+/// governance, so every sighting is retained, including sightings of an
+/// already-dispositioned proposal (the audit trail of what was proposed
+/// where survives the decision).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OntologyProposalSighting {
+    pub item_id: String,
+    pub document: String,
+    /// The reader's citation record as JSON: source revision id, line range,
+    /// and the quoted lines.
+    pub citation_json: String,
+    pub sighted_at: f64,
+}
+
+/// One recorded governance decision about an ontology proposal.
+///
+/// Append-only, mirroring [`RepairDisposition`]. `outcome` is `accepted` or
+/// `rejected`. Accepting feeds the existing induction promotion path — the
+/// draft artifact path is recorded in `artifact_path` — and REJECTING IS
+/// FINAL for the identity: the enqueue path refuses to re-queue any identity
+/// with a recorded disposition, so a rejected concept is not re-proposed
+/// forever.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OntologyProposalDisposition {
+    pub item_id: String,
+    pub document: String,
+    /// `class` or `relation`.
+    pub kind: String,
+    pub label: String,
+    /// `accepted` or `rejected`.
+    pub outcome: String,
+    /// The DRAFT ontology artifact an acceptance wrote (if any). Acceptance
+    /// never promotes — promotion is a separate deliberate act.
+    pub artifact_path: Option<String>,
+    pub reason: String,
+    /// Who decided: `human:<id>` or `agent:<model>`. An audit must be able
+    /// to tell a human governance decision from an agent's.
+    pub dispositioner: String,
+    pub decided_at: f64,
+}
+
+/// One recorded re-verification verdict about a stored assertion's source
+/// witness — the durable half of retrieval re-reading.
+///
+/// Append-only, mirroring [`RepairDisposition`]: one row per (assertion,
+/// source witness, run), never updated in place, so the history of a
+/// re-check is readable rather than replaced. `verdict` is `affirmed`,
+/// `denied`, `uncertain`, or `not_ready` — a witness that could not be
+/// safely reopened (source moved, cited lines changed, legacy citation)
+/// records `not_ready` with the reason, because a re-check that silently
+/// skipped a witness would report a clean bill of health it never gave.
+///
+/// Verdicts NEVER rewrite `prov_assertion.verification_status`: the status
+/// axis records what ingest-time checks established over real document
+/// witnesses (worst-wins per sighting, best-wins per assertion), and a
+/// post-hoc UPDATE would bypass exactly that laundering protection. The
+/// ledger is the audit axis.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReverifyVerdict {
+    pub assertion_id: String,
+    /// Which source witness (`prov_assertion_evidence.source_key`) this
+    /// verdict examined.
+    pub source_key: String,
+    /// `affirmed`, `denied`, `uncertain`, or `not_ready`.
+    pub verdict: String,
+    /// The model's reason tied to the cited lines, or the deterministic
+    /// reason a witness was not ready.
+    pub reason: String,
+    /// Who decided: `model:<id>` for affirmations, `code:reread` for
+    /// not-ready outcomes. An audit must be able to tell a model's
+    /// judgement from the re-reader's own refusal.
+    pub reviewer: String,
+    pub decided_at: f64,
+}
+
+/// What `enqueue_ontology_proposal` did, so callers can report honestly
+/// instead of counting rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OntologyProposalEnqueue {
+    /// First sighting of this identity: a queue row was inserted.
+    Queued,
+    /// The identity was already queued; this citation was recorded as a new
+    /// sighting (`true`) or had already been seen from this document
+    /// (`false` — a re-ingest).
+    Existing { new_sighting: bool },
+    /// The identity already has a recorded disposition (accepted or
+    /// rejected). NOTHING was stored: a rejected proposal must stay
+    /// rejected, and an accepted one is already on the governance path.
+    SupersededByDisposition,
 }
 
 /// Filters for [`ProvenanceStore::list_session_metadata`].
@@ -925,6 +1041,114 @@ impl ProvenanceStore {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_repair_disposition_document \
              ON repair_disposition(document, decided_at)",
+            (),
+        )
+        .await?;
+
+        // ── Ontology extension proposal queue and disposition ledger ─────
+        //
+        // Same shape as the repair queue above, answering the same two
+        // questions: `ontology_proposal_queue` is current state (what is
+        // still awaiting governance), `ontology_proposal_disposition` is an
+        // append-only ledger (what was decided, by whom, when). Population
+        // proposes; governance disposes — extraction NEVER mutates the
+        // active ontology, and these tables are the durable record that
+        // lets a later deliberate act do so.
+        //
+        // A third table, `ontology_proposal_sighting`, holds the CITATIONS.
+        // A proposal's identity is its content (kind, label, parents or
+        // endpoints) — the same concept proposed from two papers is ONE
+        // proposal, and its evidence ACCUMULATES exactly the way a
+        // `prov_assertion` accumulates `prov_assertion_evidence`
+        // contributions. A proposal without its citation is worthless for
+        // governance, so the sighting rows are the review surface's evidence
+        // view, never an afterthought.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS ontology_proposal_queue (
+                item_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL CHECK (kind IN ('class', 'relation')),
+                label TEXT NOT NULL,
+                document TEXT NOT NULL,
+                tenant TEXT NOT NULL,
+                proposal_json TEXT NOT NULL,
+                enqueued_at REAL NOT NULL
+            )"#,
+            (),
+        )
+        .await?;
+        // Append-only: one row per (proposal, document, citation) sighting.
+        // Re-ingesting the same document does not duplicate a citation; a
+        // DIFFERENT document proposing the same identity adds evidence.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS ontology_proposal_sighting (
+                item_id TEXT NOT NULL,
+                document TEXT NOT NULL,
+                citation_json TEXT NOT NULL,
+                sighted_at REAL NOT NULL,
+                PRIMARY KEY (item_id, document, citation_json)
+            )"#,
+            (),
+        )
+        .await?;
+        // Append-only disposition ledger, mirroring repair_disposition:
+        // one row per decision, never updated in place. `outcome` is
+        // 'accepted' or 'rejected'. A rejected identity STAYS rejected —
+        // enqueue refuses to re-queue any identity with a recorded
+        // disposition, so a concept cannot be re-proposed forever.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS ontology_proposal_disposition (
+                item_id TEXT NOT NULL,
+                document TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'rejected')),
+                artifact_path TEXT,
+                reason TEXT NOT NULL,
+                dispositioner TEXT NOT NULL,
+                decided_at REAL NOT NULL,
+                PRIMARY KEY (item_id, decided_at)
+            )"#,
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ontology_proposal_queue_enqueued \
+             ON ontology_proposal_queue(enqueued_at, item_id)",
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ontology_proposal_sighting_item \
+             ON ontology_proposal_sighting(item_id)",
+            (),
+        )
+        .await?;
+
+        // ── Re-verification verdict ledger ─────────────────────────────
+        //
+        // The audit trail of retrieval re-reading: what a model affirmed,
+        // denied, or could not assess when shown the EXACT cited lines of a
+        // stored assertion, per source witness. Append-only, mirroring
+        // `repair_disposition` — verdicts never rewrite the assertion's
+        // verification status (see `ReverifyVerdict`). No queue table:
+        // there is nothing to dequeue, because a re-check renders no
+        // store-mutating decision.
+        conn.execute(
+            r#"CREATE TABLE IF NOT EXISTS reverify_verdict (
+                assertion_id TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                verdict TEXT NOT NULL CHECK (verdict IN ('affirmed', 'denied', 'uncertain', 'not_ready')),
+                reason TEXT NOT NULL,
+                reviewer TEXT NOT NULL,
+                decided_at REAL NOT NULL,
+                PRIMARY KEY (assertion_id, source_key, decided_at)
+            )"#,
+            (),
+        )
+        .await?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reverify_verdict_assertion \
+             ON reverify_verdict(assertion_id, decided_at)",
             (),
         )
         .await?;
@@ -1596,6 +1820,321 @@ impl ProvenanceStore {
                 dispositioner: get_str(&row, 8)?,
                 decided_at: row
                     .get_value(9)
+                    .ok()
+                    .and_then(|v| v.as_real().copied())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    // ── Re-verification verdicts ─────────────────────────────────────
+
+    /// Append one re-verification verdict to the ledger. Append-only by
+    /// construction: a second run over the same witness is a new row at a
+    /// new `decided_at`, never an overwrite.
+    pub async fn record_reverify_verdict(&self, v: &ReverifyVerdict) -> Result<()> {
+        self.conn
+            .execute(
+                r#"INSERT INTO reverify_verdict
+                   (assertion_id, source_key, verdict, reason, reviewer, decided_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                vec![
+                    Value::Text(v.assertion_id.clone()),
+                    Value::Text(v.source_key.clone()),
+                    Value::Text(v.verdict.clone()),
+                    Value::Text(v.reason.clone()),
+                    Value::Text(v.reviewer.clone()),
+                    Value::Real(v.decided_at),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every verdict recorded for one assertion, oldest first — the audit
+    /// trail a reviewer reads before (and after) re-checking.
+    pub async fn reverify_verdicts(&self, assertion_id: &str) -> Result<Vec<ReverifyVerdict>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT assertion_id, source_key, verdict, reason, reviewer, decided_at \
+                 FROM reverify_verdict WHERE assertion_id = ?1 \
+                 ORDER BY decided_at, source_key",
+                vec![Value::Text(assertion_id.to_string())],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(ReverifyVerdict {
+                assertion_id: get_str(&row, 0)?,
+                source_key: get_str(&row, 1)?,
+                verdict: get_str(&row, 2)?,
+                reason: get_str(&row, 3)?,
+                reviewer: get_str(&row, 4)?,
+                decided_at: row
+                    .get_value(5)
+                    .ok()
+                    .and_then(|v| v.as_real().copied())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    // ── Ontology extension proposals ───────────────────────────────────
+
+    /// Queue one ontology extension proposal with its citation.
+    ///
+    /// Idempotent on `item_id` (the proposal's CONTENT identity, not the
+    /// run): re-ingesting the same document adds no rows; a different
+    /// document proposing the same identity adds a SIGHTING, not a second
+    /// queue item. An identity with ANY recorded disposition is never
+    /// re-queued — a rejected proposal must stay rejected, and an accepted
+    /// one is already on the governance path — and that suppression is
+    /// returned as [`OntologyProposalEnqueue::SupersededByDisposition`] so
+    /// the caller can count it loudly instead of losing it.
+    pub async fn enqueue_ontology_proposal(
+        &self,
+        item: &OntologyProposalItem,
+        citation_json: &str,
+        sighted_at: f64,
+    ) -> Result<OntologyProposalEnqueue> {
+        let _same_handle_guard = self.write_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM ontology_proposal_disposition WHERE item_id = ?1 LIMIT 1",
+                vec![Value::Text(item.item_id.clone())],
+            )
+            .await?;
+        let already_dispositioned = rows.next().await?.is_some();
+        drop(rows);
+        if already_dispositioned {
+            return Ok(OntologyProposalEnqueue::SupersededByDisposition);
+        }
+
+        let newly_queued = self
+            .conn
+            .execute(
+                r#"INSERT INTO ontology_proposal_queue
+                   (item_id, kind, label, document, tenant, proposal_json, enqueued_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   ON CONFLICT(item_id) DO NOTHING"#,
+                vec![
+                    Value::Text(item.item_id.clone()),
+                    Value::Text(item.kind.clone()),
+                    Value::Text(item.label.clone()),
+                    Value::Text(item.document.clone()),
+                    Value::Text(item.tenant.clone()),
+                    Value::Text(item.proposal_json.clone()),
+                    Value::Real(item.enqueued_at),
+                ],
+            )
+            .await?
+            == 1;
+
+        let new_sighting = self
+            .conn
+            .execute(
+                r#"INSERT INTO ontology_proposal_sighting
+                   (item_id, document, citation_json, sighted_at)
+                   VALUES (?1, ?2, ?3, ?4)
+                   ON CONFLICT(item_id, document, citation_json) DO NOTHING"#,
+                vec![
+                    Value::Text(item.item_id.clone()),
+                    Value::Text(item.document.clone()),
+                    Value::Text(citation_json.to_string()),
+                    Value::Real(sighted_at),
+                ],
+            )
+            .await?
+            == 1;
+
+        Ok(if newly_queued {
+            OntologyProposalEnqueue::Queued
+        } else {
+            OntologyProposalEnqueue::Existing { new_sighting }
+        })
+    }
+
+    /// Pending proposals, oldest first, with the number of citations backing
+    /// each. The review surface's work queue.
+    pub async fn pending_ontology_proposals(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(OntologyProposalItem, i64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT q.item_id, q.kind, q.label, q.document, q.tenant, q.proposal_json, \
+                 q.enqueued_at, COUNT(s.item_id) AS sightings \
+                 FROM ontology_proposal_queue q \
+                 LEFT JOIN ontology_proposal_sighting s ON s.item_id = q.item_id \
+                 GROUP BY q.item_id \
+                 ORDER BY q.enqueued_at, q.item_id LIMIT ?1",
+                vec![Value::Integer(limit)],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let sightings = row
+                .get_value(7)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or_default();
+            out.push((
+                OntologyProposalItem {
+                    item_id: get_str(&row, 0)?,
+                    kind: get_str(&row, 1)?,
+                    label: get_str(&row, 2)?,
+                    document: get_str(&row, 3)?,
+                    tenant: get_str(&row, 4)?,
+                    proposal_json: get_str(&row, 5)?,
+                    enqueued_at: row
+                        .get_value(6)
+                        .ok()
+                        .and_then(|v| v.as_real().copied())
+                        .unwrap_or_default(),
+                },
+                sightings,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// One pending proposal by id, for the show/accept/reject surface.
+    pub async fn ontology_proposal_by_id(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<OntologyProposalItem>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT item_id, kind, label, document, tenant, proposal_json, enqueued_at \
+                 FROM ontology_proposal_queue WHERE item_id = ?1",
+                vec![Value::Text(item_id.to_string())],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(OntologyProposalItem {
+            item_id: get_str(&row, 0)?,
+            kind: get_str(&row, 1)?,
+            label: get_str(&row, 2)?,
+            document: get_str(&row, 3)?,
+            tenant: get_str(&row, 4)?,
+            proposal_json: get_str(&row, 5)?,
+            enqueued_at: row
+                .get_value(6)
+                .ok()
+                .and_then(|v| v.as_real().copied())
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// Every citation recorded for one proposal identity, oldest first —
+    /// including sightings of an already-dispositioned proposal: the
+    /// evidence trail outlives the decision.
+    pub async fn ontology_proposal_sightings(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<OntologyProposalSighting>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT item_id, document, citation_json, sighted_at \
+                 FROM ontology_proposal_sighting WHERE item_id = ?1 \
+                 ORDER BY sighted_at, document, citation_json",
+                vec![Value::Text(item_id.to_string())],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(OntologyProposalSighting {
+                item_id: get_str(&row, 0)?,
+                document: get_str(&row, 1)?,
+                citation_json: get_str(&row, 2)?,
+                sighted_at: row
+                    .get_value(3)
+                    .ok()
+                    .and_then(|v| v.as_real().copied())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Record a governance decision and remove the item from the queue,
+    /// ledger-first exactly like [`Self::record_repair_disposition`]: a
+    /// crash between the two statements leaves a decided item still queued
+    /// (re-decidable, producing a second ledger row) rather than an item
+    /// silently dropped with no record of why. Sightings are deliberately
+    /// NOT deleted — they are the evidence trail of what was proposed
+    /// where, and they outlive the decision.
+    pub async fn record_ontology_proposal_disposition(
+        &self,
+        d: &OntologyProposalDisposition,
+    ) -> Result<()> {
+        let _same_handle_guard = self.write_lock.lock().await;
+        self.conn
+            .execute(
+                r#"INSERT INTO ontology_proposal_disposition
+                   (item_id, document, kind, label, outcome, artifact_path,
+                    reason, dispositioner, decided_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                   ON CONFLICT(item_id, decided_at) DO NOTHING"#,
+                vec![
+                    Value::Text(d.item_id.clone()),
+                    Value::Text(d.document.clone()),
+                    Value::Text(d.kind.clone()),
+                    Value::Text(d.label.clone()),
+                    Value::Text(d.outcome.clone()),
+                    d.artifact_path.clone().map_or(Value::Null, Value::Text),
+                    Value::Text(d.reason.clone()),
+                    Value::Text(d.dispositioner.clone()),
+                    Value::Real(d.decided_at),
+                ],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM ontology_proposal_queue WHERE item_id = ?1",
+                vec![Value::Text(d.item_id.clone())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every governance decision recorded for one proposal identity, oldest
+    /// first. The audit trail: what was decided, by whom, on what artifact.
+    pub async fn ontology_proposal_dispositions(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<OntologyProposalDisposition>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT item_id, document, kind, label, outcome, artifact_path, \
+                 reason, dispositioner, decided_at FROM ontology_proposal_disposition \
+                 WHERE item_id = ?1 ORDER BY decided_at",
+                vec![Value::Text(item_id.to_string())],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(OntologyProposalDisposition {
+                item_id: get_str(&row, 0)?,
+                document: get_str(&row, 1)?,
+                kind: get_str(&row, 2)?,
+                label: get_str(&row, 3)?,
+                outcome: get_str(&row, 4)?,
+                artifact_path: get_opt_str(&row, 5)?,
+                reason: get_str(&row, 6)?,
+                dispositioner: get_str(&row, 7)?,
+                decided_at: row
+                    .get_value(8)
                     .ok()
                     .and_then(|v| v.as_real().copied())
                     .unwrap_or_default(),
@@ -2470,6 +3009,230 @@ mod tests {
             ledger
                 .iter()
                 .any(|d| d.attempt == 1 && d.outcome == "accept")
+        );
+    }
+
+    // ── Ontology extension proposal queue ───────────────────────────────
+
+    fn proposal_item(id: &str, kind: &str, label: &str, document: &str) -> OntologyProposalItem {
+        OntologyProposalItem {
+            item_id: id.into(),
+            kind: kind.into(),
+            label: label.into(),
+            document: document.into(),
+            tenant: "local".into(),
+            proposal_json: format!(r#"{{"label":"{label}"}}"#),
+            enqueued_at: 1.0,
+        }
+    }
+
+    /// A proposal is identified by its CONTENT, not its citation: the same
+    /// identity proposed from two documents is one queue item with TWO
+    /// citations — evidence accumulates exactly the way assertion evidence
+    /// contributions do. This is the storage half of "the ontology is the
+    /// product": the loop can grow one only if proposals survive their run.
+    #[tokio::test]
+    async fn the_same_proposal_from_two_documents_is_one_item_with_two_citations() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let first = proposal_item(
+            "class|laser powder bed fusion",
+            "class",
+            "Laser Powder Bed Fusion",
+            "a.pdf",
+        );
+        assert_eq!(
+            store
+                .enqueue_ontology_proposal(&first, r#"{"from_line":3,"to_line":3}"#, 1.0)
+                .await
+                .unwrap(),
+            OntologyProposalEnqueue::Queued
+        );
+        // Re-ingest of the SAME document: same citation, nothing new.
+        assert_eq!(
+            store
+                .enqueue_ontology_proposal(&first, r#"{"from_line":3,"to_line":3}"#, 2.0)
+                .await
+                .unwrap(),
+            OntologyProposalEnqueue::Existing {
+                new_sighting: false
+            }
+        );
+        // A DIFFERENT document proposing the same identity: a second
+        // citation on the same item, never a second queue row.
+        let second = proposal_item(
+            "class|laser powder bed fusion",
+            "class",
+            "Laser Powder Bed Fusion",
+            "b.pdf",
+        );
+        assert_eq!(
+            store
+                .enqueue_ontology_proposal(&second, r#"{"from_line":9,"to_line":9}"#, 3.0)
+                .await
+                .unwrap(),
+            OntologyProposalEnqueue::Existing { new_sighting: true }
+        );
+
+        let pending = store.pending_ontology_proposals(10).await.unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].1, 2, "both citations must back the one item");
+        let sightings = store
+            .ontology_proposal_sightings("class|laser powder bed fusion")
+            .await
+            .unwrap();
+        assert_eq!(sightings.len(), 2, "{sightings:?}");
+        let documents: Vec<&str> = sightings.iter().map(|s| s.document.as_str()).collect();
+        assert!(documents.contains(&"a.pdf") && documents.contains(&"b.pdf"));
+    }
+
+    /// A REJECTED proposal stays rejected: re-proposing the same identity
+    /// after the decision stores nothing and says so, so a concept cannot
+    /// be re-proposed forever. The suppression is a returned value, not a
+    /// silent drop — the ingest summary counts it.
+    #[tokio::test]
+    async fn a_rejected_proposal_is_never_re_queued() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let item = proposal_item(
+            "relation| processed by laser",
+            "relation",
+            "processed by laser",
+            "a.pdf",
+        );
+        store
+            .enqueue_ontology_proposal(&item, r#"{"from_line":1,"to_line":1}"#, 1.0)
+            .await
+            .unwrap();
+        store
+            .record_ontology_proposal_disposition(&OntologyProposalDisposition {
+                item_id: item.item_id.clone(),
+                document: "a.pdf".into(),
+                kind: "relation".into(),
+                label: "processed by laser".into(),
+                outcome: "rejected".into(),
+                artifact_path: None,
+                reason: "already expressible with the existing process vocabulary".into(),
+                dispositioner: "human:reviewer".into(),
+                decided_at: 2.0,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .pending_ontology_proposals(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .enqueue_ontology_proposal(&item, r#"{"from_line":1,"to_line":1}"#, 3.0)
+                .await
+                .unwrap(),
+            OntologyProposalEnqueue::SupersededByDisposition,
+            "a dispositioned identity must not be re-queued"
+        );
+        assert!(
+            store
+                .pending_ontology_proposals(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the suppressed enqueue must have stored no queue row"
+        );
+        // The decision itself is still readable — rejection is an audit
+        // record, not a deletion.
+        let ledger = store
+            .ontology_proposal_dispositions(&item.item_id)
+            .await
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].outcome, "rejected");
+        // And the sighting from the ORIGINAL proposal survived the decision.
+        assert_eq!(
+            store
+                .ontology_proposal_sightings(&item.item_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Accepting records the artifact the acceptance produced (feeding the
+    /// existing promotion path) and clears the queue — the same
+    /// ledger-first, decision-survives contract as the repair queue.
+    #[tokio::test]
+    async fn an_acceptance_records_its_artifact_and_leaves_the_ledger_readable() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let item = proposal_item(
+            "class| feedstock powder",
+            "class",
+            "Feedstock Powder",
+            "c.pdf",
+        );
+        store
+            .enqueue_ontology_proposal(&item, r#"{"from_line":2,"to_line":2}"#, 1.0)
+            .await
+            .unwrap();
+        store
+            .record_ontology_proposal_disposition(&OntologyProposalDisposition {
+                item_id: item.item_id.clone(),
+                document: "c.pdf".into(),
+                kind: "class".into(),
+                label: "Feedstock Powder".into(),
+                outcome: "accepted".into(),
+                artifact_path: Some("ontology-customer-ext.ttl".into()),
+                reason: "corpus needs a powder-feed concept; parents resolve".into(),
+                dispositioner: "human:reviewer".into(),
+                decided_at: 4.0,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .pending_ontology_proposals(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let ledger = store
+            .ontology_proposal_dispositions(&item.item_id)
+            .await
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].outcome, "accepted");
+        assert_eq!(
+            ledger[0].artifact_path.as_deref(),
+            Some("ontology-customer-ext.ttl")
+        );
+    }
+
+    /// `ontology_proposal_by_id` is the accept/reject surface's loader: it
+    /// must return the pending row, and honestly `None` for an unknown or
+    /// already-dispositioned id.
+    #[tokio::test]
+    async fn a_proposal_is_loadable_by_id_until_decided() {
+        let store = ProvenanceStore::open(Path::new(":memory:")).await.unwrap();
+        let item = proposal_item("class| porosity", "class", "Porosity", "d.pdf");
+        store
+            .enqueue_ontology_proposal(&item, r#"{}"#, 1.0)
+            .await
+            .unwrap();
+        let loaded = store
+            .ontology_proposal_by_id(&item.item_id)
+            .await
+            .unwrap()
+            .expect("a queued proposal must be loadable");
+        assert_eq!(loaded.kind, "class");
+        assert_eq!(loaded.label, "Porosity");
+        assert!(
+            store
+                .ontology_proposal_by_id("no-such-id")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

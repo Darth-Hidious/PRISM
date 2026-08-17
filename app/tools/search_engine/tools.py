@@ -389,7 +389,18 @@ def create_search_engine_tools(
                 "user-installed providers). Returns deduplicated unified "
                 "Material records with per-property provider provenance. "
                 "Use this for 'find candidate materials with property X' "
-                "queries instead of picking a per-DB tool."
+                "queries instead of picking a per-DB tool. "
+                "Materials property data (creep, modulus, density, band "
+                "gap, ...) lives HERE and in academic papers via "
+                "prior_art_search — NOT on vendor websites: vendor PDF "
+                "(specialmetals.com, haynesintl.com, nickelinstitute.org, "
+                "matweb.com, hightempmetals.com, ...) are paywalled, "
+                "robots-blocked or gated and `web` WILL return 403/404/"
+                "robots.txt on them. For ANY question of the form 'compare "
+                "property X of alloys A, B, C' or 'what is property Y of "
+                "material Z', call THIS or prior_art_search FIRST — never "
+                "a `web` GET against a vendor domain, and do not chain "
+                "guesses at vendor URLs (that loop never converges)."
             ),
             input_schema=_MATERIALS_SEARCH_SCHEMA,
             func=_materials_search_factory(provider_registry),

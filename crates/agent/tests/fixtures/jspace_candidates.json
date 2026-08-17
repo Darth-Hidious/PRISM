@@ -24,5 +24,5 @@
   ],
   "selection_cardinality": 4,
   "max_final_prompt_tokens": 8192,
-  "expected_definitions_sha256": "caff87b1655e5dc4d3f61bdbb85fd7003b64233719ce3ae24493df5b72a12528"
+  "expected_definitions_sha256": "f1021ffce53ad90f12a10640c1a5f887a81ca2e315dd5f3b6a87907de9734d9c"
 }

@@ -9,7 +9,9 @@ use axum::response::Json;
 use axum::routing::post;
 use serde_json::{Value, json};
 
-use prism_campaign::{Campaign, CampaignConfig, CampaignGoal, DomainKind, EvidenceClass};
+use prism_campaign::{
+    ALLOY_DOMAIN_ID, Campaign, CampaignConfig, CampaignGoal, EvidenceClass, POLYMER_DOMAIN_ID,
+};
 
 const FOX_FLORY_CITATION: &str = "T. G. Fox and P. J. Flory, Journal of Applied Physics 21 (1950) 581-591, DOI 10.1063/1.1699711";
 
@@ -165,9 +167,9 @@ async fn spawn_boundary() -> String {
     .await
 }
 
-fn config(base: String, checkpoint_dir: &std::path::Path, domain: DomainKind) -> CampaignConfig {
+fn config(base: String, checkpoint_dir: &std::path::Path, domain: &str) -> CampaignConfig {
     CampaignConfig {
-        domain,
+        domain: domain.to_string(),
         max_iterations: 1,
         batch_size: 1,
         checkpoint_every: 1,
@@ -191,12 +193,15 @@ async fn nbmotaw_alloy_campaign_transcript_is_unchanged() {
             .map(str::to_string)
             .collect(),
         objective: "maximize melting point".into(),
+        // CONTRACT CHANGE: the reward property is declared, not parsed from
+        // the objective's English words.
+        target_property: Some("Tm_estimate_K".into()),
         constraints: Vec::new(),
         seeds: vec!["NbMoTaW".into()],
     };
     let mut campaign = Campaign::new(
         goal,
-        config(base, checkpoint_dir.path(), DomainKind::Alloy),
+        config(base, checkpoint_dir.path(), ALLOY_DOMAIN_ID),
         "domain-e2e-nbmotaw".into(),
     );
     let result = campaign.run().await.unwrap();
@@ -237,6 +242,9 @@ async fn absent_polymer_plugin_reports_the_rdkit_install_hint() {
         description: "Check polymer plugin availability".into(),
         elements: Vec::new(),
         objective: "maximize glass transition temperature".into(),
+        // CONTRACT CHANGE: the reward property is declared, not parsed from
+        // the objective's English words.
+        target_property: Some("glass_transition_temperature_k".into()),
         constraints: Vec::new(),
         seeds: vec![
             json!({
@@ -248,7 +256,7 @@ async fn absent_polymer_plugin_reports_the_rdkit_install_hint() {
     };
     let mut campaign = Campaign::new(
         goal,
-        config(base, checkpoint_dir.path(), DomainKind::Polymer),
+        config(base, checkpoint_dir.path(), POLYMER_DOMAIN_ID),
         "domain-e2e-polymer-unavailable".into(),
     );
     let error = campaign.run().await.unwrap_err();
@@ -279,15 +287,18 @@ async fn polymer_campaign_computes_only_cited_tg_and_reports_other_targets_unava
     })
     .to_string();
     let goal = CampaignGoal {
-        description: "Screen a polymer candidate for ABB electrical insulation".into(),
+        description: "Screen a polymer candidate for electrical insulation".into(),
         elements: Vec::new(),
         objective: "maximize glass transition temperature".into(),
+        // CONTRACT CHANGE: the reward property is declared, not parsed from
+        // the objective's English words.
+        target_property: Some("glass_transition_temperature_k".into()),
         constraints: Vec::new(),
         seeds: vec![seed],
     };
     let mut campaign = Campaign::new(
         goal,
-        config(base, checkpoint_dir.path(), DomainKind::Polymer),
+        config(base, checkpoint_dir.path(), POLYMER_DOMAIN_ID),
         "domain-e2e-polymer".into(),
     );
     let result = campaign.run().await.unwrap();
@@ -345,7 +356,7 @@ async fn polymer_campaign_computes_only_cited_tg_and_reports_other_targets_unava
     .unwrap();
 
     let restored = Campaign::from_checkpoint(&checkpoint).unwrap();
-    assert_eq!(restored.state().config.domain, DomainKind::Polymer);
+    assert_eq!(restored.state().config.domain, POLYMER_DOMAIN_ID);
     assert_eq!(restored.state().evidence_class, EvidenceClass::Screening);
     assert_eq!(
         restored.state().candidates[0].properties["glass_transition_temperature_k"],

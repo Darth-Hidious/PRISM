@@ -134,8 +134,7 @@ fn test_classification() -> OntologyClassification<'static> {
     }
 }
 
-/// An UnresolvedUnit refusal whose property is UNKNOWN to the quantity-kind
-/// table — the exact case the code tiers must queue instead of guessing at.
+/// An `UnresolvedUnit` item the structural code tier cannot decide.
 fn elongation_rejection(claimed_unit: &str) -> RejectedFact {
     let raw = json!({
         "subject": "steel", "predicate": "has_measurement", "object": "elongation",
@@ -175,15 +174,13 @@ async fn enqueue(
     item
 }
 
-/// THE HEADLINE: a queued UnresolvedUnit whose document prints a resolvable
-/// unit ends ACCEPT with that unit — decided by the model picking from the
-/// closed vocabulary, verified by the same grounding gate, written through
-/// the normal write path, and ledgered with the evidence that verified it.
-///
-/// The premise is pinned first: the code tiers really do queue this item
-/// (the property's quantity kind is unknown, so code cannot decide).
+/// A queued `UnresolvedUnit` whose document prints a term ends ACCEPT with
+/// that exact term, verified by the same grounding gate and ledgered with its
+/// evidence. Rust supplies no term menu.
 #[tokio::test]
-async fn a_queued_unresolved_unit_with_a_resolvable_printed_unit_is_accepted() {
+async fn a_queued_unresolved_unit_with_a_printed_term_is_accepted() {
+    // CONTRACT CHANGE: the repair model copies the paper term rather than
+    // choosing a canonical identifier from a Rust vocabulary.
     assert!(
         dispose(
             &elongation_rejection("QUDT:INVENTED"),
@@ -191,6 +188,7 @@ async fn a_queued_unresolved_unit_with_a_resolvable_printed_unit_is_accepted() {
             ELONGATION_DOC,
             &RepairPolicy::default(),
             NOW,
+            &crate::ontologies::EmmoOntology,
         )
         .is_none(),
         "test premise: the code tiers must queue this refusal for the model tier"
@@ -201,7 +199,7 @@ async fn a_queued_unresolved_unit_with_a_resolvable_printed_unit_is_accepted() {
 
     let (server, _harness) = scripted_server(
         vec![accept_reply(
-            elongation_correction("QUDT:PERCENT"),
+            elongation_correction("%"),
             "the document prints the value with a percent sign",
         )],
         1, // EXACTLY one model call for the one item
@@ -218,6 +216,7 @@ async fn a_queued_unresolved_unit_with_a_resolvable_printed_unit_is_accepted() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -241,15 +240,15 @@ async fn a_queued_unresolved_unit_with_a_resolvable_printed_unit_is_accepted() {
         .expect("an accept carries evidence");
     assert!(evidence.contains("elongation of 4.5 %"), "{evidence}");
 
-    // The repaired fact entered through the normal write path — with the
-    // unit the model picked from the closed list.
+    // The repaired fact entered through the normal write path with the exact
+    // term supported by the evidence.
     let recalled = store
         .recall_with_context("elongation", "local", 10)
         .await
         .unwrap();
     assert_eq!(recalled.len(), 1, "{recalled:?}");
     assert_eq!(recalled[0].value, Some(4.5));
-    assert_eq!(recalled[0].unit.as_deref(), Some("QUDT:PERCENT"));
+    assert_eq!(recalled[0].unit.as_deref(), Some("%"));
 
     // The queue is empty — the item was dequeued by its disposition.
     assert!(store.pending_repairs(DOC, 10).await.unwrap().is_empty());
@@ -262,7 +261,7 @@ async fn a_reply_that_changes_the_subject_is_auto_withdrawn() {
     let (_dir, store) = open_store().await;
     enqueue(&store, &elongation_rejection("QUDT:INVENTED"), NOW).await;
 
-    let mut corrected = elongation_correction("QUDT:PERCENT");
+    let mut corrected = elongation_correction("%");
     corrected["subject"] = json!("some other alloy");
     let (server, _harness) = scripted_server(vec![accept_reply(corrected, "trust me")], 1).await;
     let llm = client_for(&server);
@@ -276,6 +275,7 @@ async fn a_reply_that_changes_the_subject_is_auto_withdrawn() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -329,6 +329,7 @@ async fn exactly_one_attempt_per_item_and_a_second_failure_is_final() {
         test_classification(),
         &policy,
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -350,6 +351,7 @@ async fn exactly_one_attempt_per_item_and_a_second_failure_is_final() {
         test_classification(),
         &policy,
         NOW + 20.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -383,11 +385,11 @@ async fn a_repair_that_fails_the_grounding_gate_is_withdrawn() {
     let (_dir, store) = open_store().await;
     enqueue(&store, &elongation_rejection("QUDT:INVENTED"), NOW).await;
 
-    // The value appears, but with nothing resolvable as a unit after it.
+    // The value appears, but the proposed exact term is absent after it.
     let bare = "The steel samples reached an elongation of 4.5 before fracture.";
     let (server, _harness) = scripted_server(
         vec![accept_reply(
-            elongation_correction("QUDT:PERCENT"),
+            elongation_correction("%"),
             "a percent is plausible for elongation",
         )],
         1,
@@ -404,6 +406,7 @@ async fn a_repair_that_fails_the_grounding_gate_is_withdrawn() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -465,7 +468,7 @@ async fn every_decided_item_leaves_exactly_one_disposition_row() {
     let (server, _harness) = scripted_server(
         vec![
             accept_reply(
-                elongation_correction("QUDT:PERCENT"),
+                elongation_correction("%"),
                 "the document prints a percent sign",
             ),
             withdraw_reply("the document prints no unit beside the hardness value"),
@@ -485,6 +488,7 @@ async fn every_decided_item_leaves_exactly_one_disposition_row() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -529,6 +533,8 @@ async fn review_missing_accepts_only_an_explicit_asserted_verdict() {
         confidence: Some(0.8),
         kind: Some("phase".into()),
         evidence_class: Default::default(),
+        verification: None,
+        verification_reason: None,
     };
     let text = "The steel showed a ferrite phase throughout the sample.";
 
@@ -566,6 +572,7 @@ async fn review_missing_accepts_only_an_explicit_asserted_verdict() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -634,6 +641,7 @@ async fn review_missing_accepts_only_an_explicit_asserted_verdict() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 20.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -667,6 +675,8 @@ async fn a_rendered_judgement_never_reaches_the_model() {
         confidence: Some(0.7),
         kind: Some("phase".into()),
         evidence_class: Default::default(),
+        verification: None,
+        verification_reason: None,
     };
     // `queue_item` would panic for a rendered class — construct the row
     // directly to simulate one that bypassed the check.
@@ -694,6 +704,7 @@ async fn a_rendered_judgement_never_reaches_the_model() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -713,17 +724,18 @@ async fn a_rendered_judgement_never_reaches_the_model() {
 /// fact, the refusal reason, the value-bearing span and the closed
 /// vocabulary — and NOTHING else from the document (an unrelated line
 /// must not leak in). The vocabulary offered for an unknown-kind property
-/// is the full CLOSED list, never a minted identifier.
 #[tokio::test]
 async fn the_unresolved_unit_prompt_gives_access_without_stuffing_context() {
+    // CONTRACT CHANGE: the prompt supplies source access but no Rust-owned
+    // unit menu; the reader copies the exact non-empty source term.
     let (_dir, store) = open_store().await;
     enqueue(&store, &elongation_rejection("QUDT:INVENTED"), NOW).await;
     let text = format!("{ELONGATION_DOC}\nThe furnace schedule remained proprietary.");
 
     let (server, harness) = scripted_server(
         vec![accept_reply(
-            elongation_correction("QUDT:PERCENT"),
-            "percent",
+            elongation_correction("%"),
+            "the source prints this exact term",
         )],
         1,
     )
@@ -739,6 +751,7 @@ async fn the_unresolved_unit_prompt_gives_access_without_stuffing_context() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -754,28 +767,14 @@ async fn the_unresolved_unit_prompt_gives_access_without_stuffing_context() {
         !prompt.contains("furnace schedule"),
         "the prompt must carry access, not the whole document: {prompt}"
     );
-    // The closed vocabulary is offered; an unknown-kind property gets the
-    // whole declared list, all of it resolvable in the controlled
-    // vocabulary.
-    for identifier in ["QUDT:PERCENT", "QUDT:MegaPA", "QUDT:MilliM-PER-SEC"] {
-        assert!(prompt.contains(identifier), "{identifier}: {prompt}");
-    }
-    assert!(
-        !prompt.contains("QUDT:INVENTED-CHOICE"),
-        "no minted identifiers may be offered"
-    );
+    assert!(!prompt.contains("CLOSED UNIT VOCABULARY"), "{prompt}");
+    assert!(!prompt.contains("QUDT:MegaPA"), "{prompt}");
 }
 
-/// The closed list is KIND-FILTERED when the property's kind is known: a
-/// scan-speed repair sees speed units, not pressures. And a model that
-/// cannot decide withdraws explicitly — the ledger records its reason.
 #[tokio::test]
-async fn a_known_kind_filters_the_offered_vocabulary() {
-    assert_eq!(
-        crate::qudt_units::property_quantity_kind("scan speed"),
-        Some(crate::qudt_units::QuantityKind::Speed),
-        "test premise"
-    );
+async fn unresolved_unit_prompt_has_no_rust_vocabulary() {
+    // CONTRACT CHANGE: property words no longer select a hardcoded unit
+    // subset. A reader may still withdraw when the cited text is insufficient.
     let (_dir, store) = open_store().await;
     let rejection = RejectedFact {
         subject: RejectedSubject::Raw(Box::new(json!({
@@ -808,18 +807,16 @@ async fn a_known_kind_filters_the_offered_vocabulary() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
     assert_eq!(report.withdrawn, 1, "{report:?}");
 
     let prompt = harness.bodies.lock().unwrap()[0].clone();
-    assert!(prompt.contains("QUDT:MilliM-PER-SEC"), "{prompt}");
-    assert!(prompt.contains("QUDT:M-PER-SEC"), "{prompt}");
-    assert!(
-        !prompt.contains("QUDT:MegaPA"),
-        "a pressure unit must not be offered for a speed repair: {prompt}"
-    );
+    for removed_term in ["QUDT:MilliM-PER-SEC", "QUDT:M-PER-SEC", "QUDT:MegaPA"] {
+        assert!(!prompt.contains(removed_term), "{removed_term}: {prompt}");
+    }
     let ledger = store.repair_dispositions(DOC).await.unwrap();
     assert_eq!(ledger.len(), 1, "{ledger:?}");
     assert_eq!(ledger[0].outcome, "withdraw");
@@ -850,7 +847,7 @@ async fn a_malformed_shape_is_repaired_from_the_subject_spans() {
 
     let (server, harness) = scripted_server(
         vec![accept_reply(
-            elongation_correction("QUDT:PERCENT"),
+            elongation_correction("%"),
             "the span prints a percent sign after the value",
         )],
         1,
@@ -867,6 +864,7 @@ async fn a_malformed_shape_is_repaired_from_the_subject_spans() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -882,7 +880,7 @@ async fn a_malformed_shape_is_repaired_from_the_subject_spans() {
         .await
         .unwrap();
     assert_eq!(recalled.len(), 1, "{recalled:?}");
-    assert_eq!(recalled[0].unit.as_deref(), Some("QUDT:PERCENT"));
+    assert_eq!(recalled[0].unit.as_deref(), Some("%"));
 }
 
 /// ValuelessWithUnit (a converted fact): an explicit model withdraw is
@@ -900,6 +898,8 @@ async fn a_valueless_with_unit_item_withdraws_on_the_models_explicit_word() {
         confidence: Some(0.8),
         kind: None,
         evidence_class: Default::default(),
+        verification: None,
+        verification_reason: None,
     };
     enqueue(
         &store,
@@ -930,6 +930,7 @@ async fn a_valueless_with_unit_item_withdraws_on_the_models_explicit_word() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -975,10 +976,7 @@ async fn the_run_is_bounded_by_max_items() {
     enqueue(&store, &hardness, NOW + 1.0).await;
 
     let (server, _harness) = scripted_server(
-        vec![accept_reply(
-            elongation_correction("QUDT:PERCENT"),
-            "percent",
-        )],
+        vec![accept_reply(elongation_correction("%"), "percent")],
         1, // the second item must NOT be prompted in this run
     )
     .await;
@@ -997,6 +995,7 @@ async fn the_run_is_bounded_by_max_items() {
         test_classification(),
         &policy,
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -1005,10 +1004,12 @@ async fn the_run_is_bounded_by_max_items() {
     assert_eq!(store.pending_repairs(DOC, 10).await.unwrap().len(), 1);
 }
 
-/// A minted identifier in an accept is auto-WITHDRAWN as exceeding the
-/// mandate — the model cannot pick outside the offered closed list.
+/// A non-empty proposed term is not judged by a Rust vocabulary, but still
+/// must be present in the source span to pass the grounding check.
 #[tokio::test]
-async fn a_minted_unit_is_withdrawn_as_exceeding_the_mandate() {
+async fn an_unsupported_term_is_withdrawn_by_source_grounding() {
+    // CONTRACT CHANGE: vocabulary membership is gone; this is rejected only
+    // because the exact proposed term is absent from the evidence.
     let (_dir, store) = open_store().await;
     enqueue(&store, &elongation_rejection("QUDT:INVENTED"), NOW).await;
 
@@ -1031,6 +1032,7 @@ async fn a_minted_unit_is_withdrawn_as_exceeding_the_mandate() {
         test_classification(),
         &RepairWorkerPolicy::default(),
         NOW + 10.0,
+        &crate::ontologies::EmmoOntology,
     )
     .await
     .expect("the run completes");
@@ -1038,8 +1040,7 @@ async fn a_minted_unit_is_withdrawn_as_exceeding_the_mandate() {
     let ledger = store.repair_dispositions(DOC).await.unwrap();
     assert_eq!(ledger.len(), 1, "{ledger:?}");
     assert!(
-        ledger[0].reason.contains("exceeded its mandate")
-            && ledger[0].reason.contains("closed vocabulary"),
+        ledger[0].reason.contains("grounding gate"),
         "{}",
         ledger[0].reason
     );

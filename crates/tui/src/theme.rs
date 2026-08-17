@@ -62,7 +62,10 @@ pub static THEMES: &[Theme] = &[
     Theme {
         name: "prism",
         accent: Color::Rgb(255, 158, 64), // brighter orange #ff9e40 (brand)
-        text: Color::Rgb(238, 238, 238),  // #eeeeee
+        // True white: the transcript is the product surface, and the owner
+        // reads output on it all day. #eeeeee read grey next to the panel
+        // chrome; content should be the brightest thing on screen.
+        text: Color::Rgb(255, 255, 255),  // #ffffff
         dim: Color::Rgb(130, 139, 184),   // diffContext #828bb8 — blue-gray
         muted: Color::Rgb(128, 128, 128), // textMuted #808080
         divider: Color::Rgb(72, 72, 72),  // border #484848

@@ -560,6 +560,10 @@ pub enum FormTarget {
     /// same verify-then-store path (`write_skill`) the agent uses — the
     /// skill is executed once and only saved if it exits cleanly.
     SkillCreate,
+    /// Read one web page as text via agent-browser (palette `browse.open`).
+    /// Submit dispatches `/browse <url>`, which the backend runs through the
+    /// SAME `agent-browser` path the agent's `web_browse` tool uses.
+    Browse,
 }
 
 /// An open form pane: the widget plus what submit dispatches to.
@@ -1191,6 +1195,18 @@ impl App {
             KeyCode::Char('o') => self.open_link_picker(),
             KeyCode::Char('?') => self.open_which_key(),
             KeyCode::Backspace => self.new_session(),
+            // Same rule as the home screen: an unbound printable character
+            // means "I am writing", so focus the prompt and keep it rather
+            // than dropping it on the floor. The vim-style bindings above
+            // (j/k/g/G/i/o/?) are matched first and keep working.
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !c.is_control() =>
+            {
+                self.focus = Focus::Input;
+                self.handle_input_key(key);
+            }
             _ => {}
         }
     }
@@ -2055,6 +2071,19 @@ impl App {
                     self.form = Some(pane);
                 }
             },
+            FormTarget::Browse => match browse_command(&pane.form) {
+                Ok(cmd) => {
+                    let _ = self.backend.send_command(&cmd);
+                    self.toast(
+                        "reading the page in a headless browser — takes a few seconds",
+                        ToastKind::Info,
+                    );
+                }
+                Err(msg) => {
+                    self.toast(msg, ToastKind::Warn);
+                    self.form = Some(pane);
+                }
+            },
         }
     }
 
@@ -2146,6 +2175,19 @@ impl App {
             vec![FormField::text("name", "Workflow name", "").with_note("from Workflows: List")],
         );
         self.open_form(form, FormTarget::WorkflowShow);
+    }
+
+    /// Palette `browse.open` — read ONE web page as text via `agent-browser`,
+    /// the same path as the agent's `web_browse` tool. This is an HTTP fetch
+    /// with content extraction: it does NOT execute JavaScript, so a
+    /// client-rendered page will still come back empty.
+    pub fn open_browse_form(&mut self) {
+        let form = Form::new(
+            "Browse web page (text fetch)",
+            "browse",
+            vec![FormField::text("url", "URL", "").with_note("agent-browser; no JavaScript")],
+        );
+        self.open_form(form, FormTarget::Browse);
     }
 
     /// Palette `workflow.run` — name, optional `--set key=value` pairs, and
@@ -3298,6 +3340,25 @@ impl App {
                     ToastKind::Info,
                 );
             }
+            // START TYPING. Any other printable character means the user is
+            // writing a message, not reaching for a shortcut — so open the
+            // prompt and keep the character.
+            //
+            // Without this, `_ => {}` swallowed it and the letters that DO
+            // have bindings fired mid-sentence: typing "What is the yield
+            // strength…" opened the Tools panel on the `t` of "What", and
+            // "List 3 titanium alloys" opened Status on the `s` of "List".
+            // The rest of the sentence vanished with no error and no echo.
+            // The bound keys above still win, so `t`/`s`/`?`/`w`/`n` are
+            // unchanged; only the previously-dead keys now do the obvious
+            // thing.
+            KeyCode::Char(c)
+                if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
+            {
+                self.close_home();
+                self.focus = Focus::Input;
+                self.handle_input_key(key);
+            }
             _ => {}
         }
     }
@@ -3655,6 +3716,7 @@ impl App {
             "which_key.show" => self.open_which_key(),
             "theme.list" => self.open_theme_picker(),
             "gh.show" => self.open_gh(),
+            "browse.open" => self.open_browse_form(),
             "account.show" => self.open_account(),
             "sessions.show" => self.open_sessions(),
             "tools.show" => self.open_tools_window(),
@@ -4335,7 +4397,8 @@ impl App {
                 };
                 let token = evidence_token(evidence_class);
                 let clean_name = sanitize_for_render(&tool_name);
-                let clean_content = sanitize_for_render(&content);
+                let clean_content =
+                    sanitize_for_render(&crate::json_view::summarize_tool_json(&content));
                 let elapsed = elapsed_ms.unwrap_or(0);
                 let text = format!("{token} {clean_name}: {clean_content}");
                 if !success {
@@ -4966,6 +5029,16 @@ fn campaign_resume_command(form: &crate::form::Form) -> Result<String, &'static 
         id,
         "--detach".to_string(),
     ]))
+}
+
+/// Build `/browse <url>` from the `browse.open` form — the backend runs it
+/// through the same `agent-browser` path as the agent's `web_browse` tool.
+fn browse_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let url = form.text_value("url").trim().to_string();
+    if url.is_empty() {
+        return Err("enter a URL first");
+    }
+    Ok(build_slash_command(&["browse".to_string(), url]))
 }
 
 /// Build `/workflow show <name>` from the `workflow.show` form.
@@ -6065,6 +6138,49 @@ mod tests {
             workflow_show_command(&form).unwrap(),
             "/workflow show forge"
         );
+    }
+
+    // ── Browse (headless browser) palette ────────────────────────
+
+    /// `/browse` is the TUI user's direct path to the same `agent-browser`
+    /// capability the agent calls as `web_browse` — the form must reject an
+    /// empty URL and quote whatever survives so it survives the backend's
+    /// shlex split.
+    #[test]
+    fn browse_requires_url_and_quotes_it() {
+        let form = Form::new("t", "go", vec![FormField::text("url", "URL", "")]);
+        assert_eq!(browse_command(&form), Err("enter a URL first"));
+
+        let form = Form::new(
+            "t",
+            "go",
+            vec![FormField::text("url", "URL", "https://example.org/page")],
+        );
+        assert_eq!(
+            browse_command(&form).unwrap(),
+            "/browse https://example.org/page"
+        );
+
+        // A URL with a space must round-trip as ONE token.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![FormField::text("url", "URL", "https://example.org/a b")],
+        );
+        assert_eq!(
+            browse_command(&form).unwrap(),
+            "/browse 'https://example.org/a b'"
+        );
+    }
+
+    /// The palette entry must land on the Browse form, so the capability is
+    /// discoverable — never reachable only by knowing the `/browse` string.
+    #[test]
+    fn palette_browse_open_opens_the_browse_form() {
+        let mut app = fresh();
+        app.dispatch_command("browse.open");
+        let pane = app.form.as_ref().expect("browse form must open");
+        assert_eq!(pane.target, FormTarget::Browse);
     }
 
     #[test]

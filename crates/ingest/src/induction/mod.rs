@@ -38,6 +38,7 @@ pub mod ttl;
 pub mod validate;
 
 use anyhow::{Context, Result, bail};
+use prism_provenance::QuantitySignDomain;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -49,10 +50,93 @@ use corpus::Corpus;
 /// Version of the induction prompt. Bump on ANY change to
 /// [`induction_prompt`]'s text so artifact differences stay attributable:
 /// the value is stamped into every artifact as `prism:promptVersion`.
-pub const PROMPT_VERSION: &str = "1";
+/// v2: the prompt's examples are domain-abstract placeholders instead of
+/// metallurgy vocabulary — induction is the only door to a non-materials
+/// ontology, and it must not lean on materials English.
+pub const PROMPT_VERSION: &str = "2";
 
 /// Namespace of the PRISM annotation vocabulary (status, provenance keys).
 pub const PRISM_META_NS: &str = "https://prism.marc27.com/ontology/meta#";
+
+/// The artifact literal for a quantity sign-domain declaration.
+///
+/// The annotation lives in the ARTIFACT (`prism:signDomain` on a class —
+/// see [`ttl`]), so a promoted ontology supplies sign constraints with zero
+/// Rust edits; these two functions are the only place the literal form and
+/// [`QuantitySignDomain`] meet.
+#[must_use]
+pub fn sign_domain_as_stored(domain: QuantitySignDomain) -> &'static str {
+    match domain {
+        QuantitySignDomain::Unspecified => "unspecified",
+        QuantitySignDomain::NonNegative => "non_negative",
+        QuantitySignDomain::Signed => "signed",
+    }
+}
+
+/// Strict parse of the artifact literal: an unknown value is `None`, which
+/// callers turn into a loud refusal — a tampered or foreign annotation must
+/// not silently read as silence.
+#[must_use]
+pub fn sign_domain_from_stored(value: &str) -> Option<QuantitySignDomain> {
+    match value {
+        "unspecified" => Some(QuantitySignDomain::Unspecified),
+        "non_negative" => Some(QuantitySignDomain::NonNegative),
+        "signed" => Some(QuantitySignDomain::Signed),
+        _ => None,
+    }
+}
+
+/// Which TYPED FACT SHAPE a declared relation fills in the store.
+///
+/// The store's typed fact kinds are a closed surface — `measurement`,
+/// `phase`, `processing`, `contains` — but WHICH relation fills each one is
+/// the ontology's statement, never Rust's. EMMO answers it by looking up its
+/// own `HAS_PROPERTY`/`HAS_PHASE`/`PROCESSED_BY`/`CONTAINS` declarations; an
+/// induced ontology answers it with a `prism:factKind` annotation on the
+/// relation (see [`ttl`]).
+///
+/// Without this, a promoted ontology declares relations the store cannot
+/// type, and every numeric value it extracts is reported as unstorable —
+/// registration without parity. A relation carrying no annotation is simply
+/// a generic edge, which is the honest default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InducedFactKind {
+    /// Carries a measured quantity: a typed `value` plus its `unit`.
+    Measurement,
+    /// Relates a subject to a phase it exhibits.
+    Phase,
+    /// Relates a subject to the process that produced it.
+    Processing,
+    /// Relates a whole to a constituent it contains.
+    Contains,
+}
+
+/// The artifact literal for a relation's fact kind. As with
+/// [`sign_domain_as_stored`], these two functions are the only place the
+/// literal form and the enum meet.
+#[must_use]
+pub fn fact_kind_as_stored(kind: InducedFactKind) -> &'static str {
+    match kind {
+        InducedFactKind::Measurement => "measurement",
+        InducedFactKind::Phase => "phase",
+        InducedFactKind::Processing => "processing",
+        InducedFactKind::Contains => "contains",
+    }
+}
+
+/// Strict parse of the artifact literal: an unknown value is `None`, which
+/// callers turn into a loud refusal rather than silently reading as
+/// "generic edge" — a tampered annotation must not quietly lose typing.
+#[must_use]
+pub fn fact_kind_from_stored(value: &str) -> Option<InducedFactKind> {
+    match value {
+        "measurement" => Some(InducedFactKind::Measurement),
+        "phase" => Some(InducedFactKind::Phase),
+        "processing" => Some(InducedFactKind::Processing),
+        "contains" => Some(InducedFactKind::Contains),
+        _ => None,
+    }
+}
 
 /// Base IRI (no trailing `#`) of the ontology for `domain` — also the
 /// ontology's own IRI. Classes and relations mint under `{base}#{slug}`.
@@ -115,6 +199,12 @@ pub struct InducedClass {
     /// as a parent/domain/range, so the builder declared it to keep the
     /// artifact referentially closed. Recorded, never silent.
     pub declared_by_reference: bool,
+    /// Optional `prism:signDomain` annotation: the sign constraint the
+    /// domain declares for quantities of this kind (also served from a
+    /// dimensional parent — the adapter walks declared ancestors). `None`
+    /// is the artifact's silence and stays silence: the grounding sign
+    /// check does not apply.
+    pub sign_domain: Option<QuantitySignDomain>,
 }
 
 /// One induced relation (an `owl:ObjectProperty`).
@@ -128,6 +218,10 @@ pub struct InducedRelation {
     pub range: String,
     /// `skos:exactMatch` IRI from alignment, when found.
     pub aligned_iri: Option<String>,
+    /// Which typed fact shape this relation fills in the store, when the
+    /// artifact declares one. `None` means a generic edge — the honest
+    /// default for a relation the ontology never typed.
+    pub fact_kind: Option<InducedFactKind>,
 }
 
 /// Provenance of one induction run — stamped into the artifact so that two
@@ -412,6 +506,7 @@ impl OntologyBuilder {
                         parent,
                         aligned_iri: None,
                         declared_by_reference: false,
+                        sign_domain: None,
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut o) => {
@@ -450,6 +545,7 @@ impl OntologyBuilder {
                         domain,
                         range,
                         aligned_iri: None,
+                        fact_kind: None,
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut o) => {
@@ -499,6 +595,7 @@ impl OntologyBuilder {
                 parent: None,
                 aligned_iri: None,
                 declared_by_reference: true,
+                sign_domain: None,
             });
         }
 
@@ -621,8 +718,9 @@ pub fn induction_prompt(
          and the RELATIONS between classes.\n\
          \n\
          Rules:\n\
-         - Class labels are general kinds (\"Alloy\", \"Heat Treatment\"), NEVER \
-         specific instances (NOT \"Nb25Mo25Ta25W25\", NOT \"1400 C\").\n\
+         - Class labels are general kinds within the domain — the name of a CATEGORY \
+         of things the document discusses, NEVER a specific named individual or a \
+         specific value, reading or quantity found in the document.\n\
          - Each class may name at most ONE parent class for its is-a hierarchy; \
          use null for top-level classes. The parent must itself appear in \"classes\".\n\
          - Every relation's \"domain\" and \"range\" MUST be labels that appear in \
@@ -633,9 +731,9 @@ pub fn induction_prompt(
          \n\
          Return ONLY valid JSON with this structure:\n\
          {{\n\
-           \"classes\": [{{\"label\": \"...\", \"definition\": \"...\", \"parent\": null}}],\n\
-           \"relations\": [{{\"label\": \"has property\", \"definition\": \"...\", \
-         \"domain\": \"...\", \"range\": \"...\"}}]\n\
+           \"classes\": [{{\"label\": \"<general kind>\", \"definition\": \"...\", \"parent\": null}}],\n\
+           \"relations\": [{{\"label\": \"<relation label>\", \"definition\": \"...\", \
+         \"domain\": \"<general kind>\", \"range\": \"<general kind>\"}}]\n\
          }}\n\
          \n\
          ## Document ({doc_path})\n\
@@ -769,4 +867,44 @@ pub fn load_validated(path: &std::path::Path) -> Result<InducedOntology> {
         bail!(msg);
     }
     Ok(ontology)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CONTRACT CHANGE (PROMPT_VERSION 2): the induction prompt used to teach
+    /// the model with metallurgy examples ("Alloy", "Heat Treatment",
+    /// "Nb25Mo25Ta25W25", "1400 C", "has property"). Induction is the ONLY
+    /// door to a non-materials ontology, and a pharma or legal customer was
+    /// being shown a metallurgy lesson as the JSON template. The examples are
+    /// now domain-abstract placeholders; this test pins that no materials
+    /// vocabulary can creep back in.
+    #[test]
+    fn induction_prompt_is_domain_abstract() {
+        let prompt = induction_prompt(
+            "legal",
+            &["Statute", "Obligation"],
+            "corpus/doc.md",
+            "Body text.",
+        );
+        for banned in [
+            "Alloy",
+            "Heat Treatment",
+            "Nb25Mo25Ta25W25",
+            "1400 C",
+            "has property",
+        ] {
+            assert!(
+                !prompt.contains(banned),
+                "induction prompt carries domain vocabulary {banned:?} — it must stay \
+                 domain-abstract so any domain induces without a Rust edit"
+            );
+        }
+        // The structure is still taught, abstractly.
+        assert!(prompt.contains("<general kind>"));
+        assert!(prompt.contains("<relation label>"));
+        assert!(prompt.contains("domain 'legal'"));
+        assert!(prompt.contains("Statute, Obligation"), "{prompt}");
+    }
 }

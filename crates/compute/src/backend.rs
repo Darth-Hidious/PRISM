@@ -3,12 +3,13 @@
 //! Routes experiment plans to the appropriate compute backend based on
 //! configuration, resource requirements, and availability.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::byoc::{ByocBackend, ByocTarget};
+use crate::hyperqueue::{HyperQueueBackend, HyperQueueConfig, plan_is_task_set};
 use crate::job::{JobTarget, JobTracker};
 use crate::local::LocalBackend;
 use crate::marc27::{Marc27Auth, Marc27Backend};
@@ -20,6 +21,7 @@ pub enum BackendKind {
     Local,
     Marc27 { api_base: String, auth: Marc27Auth },
     Byoc(ByocTarget),
+    HyperQueue { server_dir: PathBuf },
 }
 
 /// Compute router — selects and dispatches to the right backend.
@@ -27,6 +29,7 @@ pub struct ComputeRouter {
     local: LocalBackend,
     marc27: Option<Marc27Backend>,
     byoc: Option<ByocBackend>,
+    hyperqueue: Option<HyperQueueBackend>,
     tracker: JobTracker,
     default_backend: BackendKind,
 }
@@ -47,6 +50,7 @@ impl ComputeRouter {
             local: LocalBackend::new(),
             marc27: None,
             byoc: None,
+            hyperqueue: None,
             tracker,
             default_backend: BackendKind::Local,
         }
@@ -78,6 +82,7 @@ impl ComputeRouter {
             local: LocalBackend::new(),
             marc27: Some(Marc27Backend::new(api_base, auth.clone())),
             byoc: None,
+            hyperqueue: None,
             tracker,
             default_backend: BackendKind::Marc27 {
                 api_base: api_base.to_string(),
@@ -90,6 +95,21 @@ impl ComputeRouter {
     pub fn with_byoc(mut self, target: ByocTarget) -> Self {
         self.default_backend = BackendKind::Byoc(target.clone());
         self.byoc = Some(ByocBackend::new(target));
+        self
+    }
+
+    /// Add a HyperQueue backend and make it the default.
+    ///
+    /// HyperQueue is the many-task path: independent task sets submitted as
+    /// one HQ job. Even when it is NOT the default, the router sends
+    /// task-set-shaped plans (`inputs.tasks` / `inputs.command`) here, and
+    /// everything else — a single long job that wants checkpoint/requeue —
+    /// stays on the default backend.
+    pub fn with_hyperqueue(mut self, config: HyperQueueConfig) -> Self {
+        self.default_backend = BackendKind::HyperQueue {
+            server_dir: config.server_dir.clone(),
+        };
+        self.hyperqueue = Some(HyperQueueBackend::new(config));
         self
     }
 
@@ -108,6 +128,16 @@ impl ComputeRouter {
             return m;
         }
 
+        // Many-task plans go to HyperQueue when one is configured: N
+        // independent tasks are one HQ job, where byoc would be N sbatch
+        // submissions. Single plans keep the caller's chosen default —
+        // notably byoc's checkpoint/requeue path, which HQ does not replace.
+        if plan_is_task_set(plan)
+            && let Some(ref hq) = self.hyperqueue
+        {
+            return hq;
+        }
+
         match &self.default_backend {
             BackendKind::Local => &self.local,
             BackendKind::Marc27 { .. } => self
@@ -120,6 +150,11 @@ impl ComputeRouter {
                 .as_ref()
                 .map(|b| b as &dyn ComputeBackend)
                 .unwrap_or(&self.local),
+            BackendKind::HyperQueue { .. } => self
+                .hyperqueue
+                .as_ref()
+                .map(|h| h as &dyn ComputeBackend)
+                .unwrap_or(&self.local),
         }
     }
 
@@ -128,6 +163,9 @@ impl ComputeRouter {
             && self.marc27.is_some()
         {
             return "marc27";
+        }
+        if plan_is_task_set(plan) && self.hyperqueue.is_some() {
+            return "hyperqueue";
         }
         match &self.default_backend {
             BackendKind::Local => "local",
@@ -145,6 +183,13 @@ impl ComputeRouter {
                     "local"
                 }
             }
+            BackendKind::HyperQueue { .. } => {
+                if self.hyperqueue.is_some() {
+                    "hyperqueue"
+                } else {
+                    "local"
+                }
+            }
         }
     }
 
@@ -156,12 +201,22 @@ impl ComputeRouter {
                 api_base: api_base.clone(),
             };
         }
+        if plan_is_task_set(plan)
+            && let BackendKind::HyperQueue { server_dir } = &self.default_backend
+        {
+            return JobTarget::HyperQueue {
+                server_dir: server_dir.clone(),
+            };
+        }
         match &self.default_backend {
             BackendKind::Local => JobTarget::Local,
             BackendKind::Marc27 { api_base, .. } => JobTarget::Marc27 {
                 api_base: api_base.clone(),
             },
             BackendKind::Byoc(target) => JobTarget::Byoc(target.clone()),
+            BackendKind::HyperQueue { server_dir } => JobTarget::HyperQueue {
+                server_dir: server_dir.clone(),
+            },
         }
     }
 
@@ -179,25 +234,50 @@ impl ComputeRouter {
         } else {
             None
         };
+        let hyperqueue_job_id = if backend_name == "hyperqueue" {
+            match &self.hyperqueue {
+                Some(hq) => hq.hq_job_id(job_id).await,
+                None => None,
+            }
+        } else {
+            None
+        };
 
-        self.tracker
-            .register_with_slurm_job_id(
-                job_id,
-                &plan.name,
-                &plan.image,
-                backend_name,
-                self.job_target(plan),
-                slurm_job_id,
+        let registration = match hyperqueue_job_id {
+            Some(hq_id) => {
+                self.tracker
+                    .register_with_hyperqueue_job_id(
+                        job_id,
+                        &plan.name,
+                        &plan.image,
+                        backend_name,
+                        self.job_target(plan),
+                        Some(hq_id),
+                    )
+                    .await
+            }
+            None => {
+                self.tracker
+                    .register_with_slurm_job_id(
+                        job_id,
+                        &plan.name,
+                        &plan.image,
+                        backend_name,
+                        self.job_target(plan),
+                        slurm_job_id,
+                    )
+                    .await
+            }
+        };
+        registration.with_context(|| {
+            let scheduler = slurm_job_id
+                .map(|id| format!(" (SLURM scheduler id {id})"))
+                .or_else(|| hyperqueue_job_id.map(|id| format!(" (HyperQueue job id {id})")))
+                .unwrap_or_default();
+            format!(
+                "job {job_id}{scheduler} was submitted via {backend_name} but its tracking record could not be persisted"
             )
-            .await
-            .with_context(|| {
-                let scheduler = slurm_job_id
-                    .map(|id| format!(" (SLURM scheduler id {id})"))
-                    .unwrap_or_default();
-                format!(
-                    "job {job_id}{scheduler} was submitted via {backend_name} but its tracking record could not be persisted"
-                )
-            })?;
+        })?;
 
         tracing::info!(%job_id, backend = backend_name, "job routed");
         Ok(job_id)
@@ -217,6 +297,11 @@ impl ComputeRouter {
                     .byoc
                     .as_ref()
                     .map(|b| b as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
+                "hyperqueue" => self
+                    .hyperqueue
+                    .as_ref()
+                    .map(|h| h as &dyn ComputeBackend)
                     .unwrap_or(&self.local),
                 _ => &self.local,
             };
@@ -241,6 +326,11 @@ impl ComputeRouter {
                     .as_ref()
                     .map(|b| b as &dyn ComputeBackend)
                     .unwrap_or(&self.local),
+                "hyperqueue" => self
+                    .hyperqueue
+                    .as_ref()
+                    .map(|h| h as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
                 _ => &self.local,
             };
             return backend.results(job_id).await;
@@ -261,6 +351,11 @@ impl ComputeRouter {
                     .byoc
                     .as_ref()
                     .map(|b| b as &dyn ComputeBackend)
+                    .unwrap_or(&self.local),
+                "hyperqueue" => self
+                    .hyperqueue
+                    .as_ref()
+                    .map(|h| h as &dyn ComputeBackend)
                     .unwrap_or(&self.local),
                 _ => &self.local,
             };
@@ -356,5 +451,80 @@ mod tests {
         // pointer is non-null by using it (it's a reference, always valid).
         // A trivial round-trip: the tracker must exist and be the same instance.
         let _ = tracker;
+    }
+
+    // --- HyperQueue routing tests ---
+
+    fn hq_router() -> ComputeRouter {
+        ComputeRouter::local_only()
+            .with_hyperqueue(HyperQueueConfig::standalone("/tmp/prism-hq-router-test", 1))
+    }
+
+    fn task_set_plan() -> ExperimentPlan {
+        ExperimentPlan {
+            name: "corpus-ingest".into(),
+            image: "ignored".into(),
+            inputs: serde_json::json!({"tasks": [{"command": ["true"]}]}),
+        }
+    }
+
+    #[test]
+    fn task_set_routes_to_hyperqueue_when_configured() {
+        assert_eq!(hq_router().backend_name(&task_set_plan()), "hyperqueue");
+    }
+
+    #[test]
+    fn task_set_stays_on_default_without_hyperqueue() {
+        let router = ComputeRouter::local_only();
+        assert_eq!(router.backend_name(&task_set_plan()), "local");
+    }
+
+    #[test]
+    fn hyperqueue_default_receives_non_task_set_plans_too() {
+        // When the caller chose HQ as the DEFAULT, even a plan without the
+        // task-set shape routes there and fails honestly at submit time.
+        // Silent fallback to local would hide the misconfiguration.
+        let plan = ExperimentPlan {
+            name: "long-job".into(),
+            image: "worker.sif".into(),
+            inputs: serde_json::json!({}),
+        };
+        assert_eq!(hq_router().backend_name(&plan), "hyperqueue");
+    }
+
+    #[test]
+    fn task_set_overrides_a_byoc_default() {
+        let router = ComputeRouter::local_only()
+            .with_hyperqueue(HyperQueueConfig::standalone("/tmp/prism-hq-router-test", 1))
+            .with_byoc(ByocTarget::default());
+        // Default is byoc now, but the many-task shape still goes to HQ.
+        assert_eq!(router.backend_name(&task_set_plan()), "hyperqueue");
+        let single = ExperimentPlan {
+            name: "long-job".into(),
+            image: "worker.sif".into(),
+            inputs: serde_json::json!({}),
+        };
+        assert_eq!(router.backend_name(&single), "byoc");
+    }
+
+    #[test]
+    fn hyperqueue_default_accepts_single_command_plans() {
+        let plan = ExperimentPlan {
+            name: "one-task".into(),
+            image: "ignored".into(),
+            inputs: serde_json::json!({"command": ["echo", "hi"]}),
+        };
+        assert_eq!(hq_router().backend_name(&plan), "hyperqueue");
+    }
+
+    #[test]
+    fn job_target_carries_the_hyperqueue_server_dir() {
+        let router = hq_router();
+        match router.job_target(&task_set_plan()) {
+            JobTarget::HyperQueue { server_dir } => {
+                assert_eq!(server_dir, Path::new("/tmp/prism-hq-router-test"))
+            }
+            other => panic!("expected HyperQueue target, got {other:?}"),
+        }
     }
 }

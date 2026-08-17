@@ -28,7 +28,6 @@
 //! and reads both the extraction prompt and graph validation from that one
 //! adapter, so instructing and validating cannot drift apart.
 
-pub mod alias;
 pub mod batching;
 pub mod classify;
 pub mod connectors;
@@ -46,8 +45,8 @@ pub mod mapping;
 pub mod matkg;
 pub mod ontologies;
 pub mod ontology;
+pub mod paper_agent;
 pub mod pipeline;
-pub mod qudt_units;
 pub mod repair;
 /// Phase 2: the model tier that drains the repair queue one item at a
 /// time, after the code tiers ([`repair`]) have decided everything code
@@ -109,18 +108,13 @@ pub struct Relationship {
     pub weight: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<u32>,
-    /// The measured value THIS relationship states — the per-subject
-    /// attribution channel for measurements. A value on the target entity
-    /// cannot say WHOSE value it is once several subjects reference the
-    /// same property node (measured live 2026-08-10: one "yield strength"
-    /// node carrying 880 was referenced by five alloys, and 880 MPa was
-    /// stored as every alloy's yield strength — four falsehoods); a value
-    /// on the relationship is per-edge by construction.
+    /// The measured value this relationship states. Keeping it on the edge
+    /// preserves which source entity made each observation even when several
+    /// sources reference the same target node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
-    /// Unit spelling for `value`, resolved through the ONE controlled
-    /// vocabulary (`prism_provenance::units::resolve_unit`) at fact
-    /// mapping — never stored raw.
+    /// Exact unit term for `value`; interpretation belongs to the active
+    /// ontology and the term is not rewritten by Rust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     /// Extractor-estimated probability that this relationship is correct.

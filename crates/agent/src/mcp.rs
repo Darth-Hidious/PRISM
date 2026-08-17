@@ -125,16 +125,23 @@ pub struct McpManager {
     /// a lookup here — no name parsing, so server names may contain anything.
     routes: HashMap<String, (String, String)>,
     tools: Vec<LoadedTool>,
+    /// STANDARD PLUGIN CONTRACT (rule 3): servers that failed to connect,
+    /// with the named error — recorded, not just logged, so the failure is
+    /// queryable state (`failed_servers()`) instead of a log line.
+    failures: Vec<(String, String)>,
 }
 
 impl McpManager {
-    /// Connect every configured server. Per-server failures are logged and
-    /// skipped — one broken server must not take down the rest (or startup).
+    /// Connect every configured server. Per-server failures are logged,
+    /// RECORDED, and skipped — one broken server must not take down the
+    /// rest (or startup).
     pub async fn connect(configs: Vec<McpServerConfig>) -> Self {
         let mut manager = Self::default();
         for cfg in configs {
             if manager.sessions.contains_key(&cfg.name) {
-                tracing::warn!(server = %cfg.name, "duplicate MCP server name — skipping");
+                let error = "duplicate MCP server name — skipping".to_string();
+                tracing::warn!(server = %cfg.name, "{error}");
+                manager.failures.push((cfg.name.clone(), error));
                 continue;
             }
             match connect_one(&cfg).await {
@@ -165,6 +172,9 @@ impl McpManager {
                         error = %err,
                         "MCP server connection failed — skipping",
                     );
+                    manager
+                        .failures
+                        .push((cfg.name.clone(), format!("{err:#}")));
                 }
             }
         }
@@ -204,6 +214,15 @@ impl McpManager {
         let mut names: Vec<String> = self.sessions.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Servers that failed to connect, with their named errors — the
+    /// standard plugin contract's recorded-failure rule. In connection
+    /// order (config order), not sorted: the order the user wrote is the
+    /// order they will debug in.
+    #[must_use]
+    pub fn failed_servers(&self) -> &[(String, String)] {
+        &self.failures
     }
 
     /// Catalog-shaped view of every connected server's tools, ready for

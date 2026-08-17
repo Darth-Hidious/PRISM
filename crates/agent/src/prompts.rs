@@ -219,29 +219,12 @@ pub fn append_runtime_tool_guidance(
         );
     }
 
-    // Free materials-informatics + HEA-alloy-design tools (E3-E12). Lean,
-    // tool-presence-gated hints that steer the agent toward the right tool
-    // for alloy-design / materials-discovery questions — the free Thermo-Calc
-    // / Citrine / Intellegens equivalent stack.
-    let has_hea = has_tool(&tool_names, "hea_descriptors");
-    let has_stability = has_tool(&tool_names, "phase_stability");
-    if has_hea && has_stability {
-        bullets.push(
-            "For alloy-design questions, start with `hea_descriptors` (is this composition a viable HEA? VEC/Ω/δ/ΔH_mix) and `phase_stability` (distance to the convex hull — is it stable?), then `hea_phase_stability`/`scheil_solidification` for CALPHAD thermodynamics if pycalphad is available. These are the free Thermo-Calc equivalents.".to_string(),
-        );
-    }
-    if has_any_tools(
-        &tool_names,
-        &[
-            "pareto_screen",
-            "suggest_next_experiments",
-            "predict_property",
-        ],
-    ) {
-        bullets.push(
-            "For multi-objective materials screening use `pareto_screen` (Pareto front across N properties), `suggest_next_experiments` (active-learning: what to test next), and `predict_property` (property prediction with uncertainty).".to_string(),
-        );
-    }
+    // CONTRACT CHANGE (dehardcoding): the alloy-design / materials-screening
+    // routing bullets that used to live here moved into the TOOLS' OWN
+    // DESCRIPTIONS (`app/tools/materials/hea.py`, `informatics.py`) — the
+    // tool registry is where per-tool routing doctrine belongs, so a
+    // non-materials deployment's system prompt carries no materials
+    // routing. The remaining bullets above are all platform-generic.
 
     if bullets.is_empty() {
         return base_prompt.to_string();
@@ -1248,10 +1231,15 @@ mod tests {
         assert!(!prompt.contains("report_bug"));
     }
 
+    /// CONTRACT CHANGE (dehardcoding): this used to pin the HEA/alloy-design
+    /// and materials-screening routing hints INSIDE the system prompt.
+    /// That routing doctrine now lives in the tools' own descriptions
+    /// (`app/tools/materials/hea.py`, `informatics.py`), which ride the
+    /// tool surface itself — so a non-materials deployment's system prompt
+    /// carries no materials routing. What must hold instead: the runtime
+    /// guidance section stays SILENT about domain routing.
     #[test]
-    fn runtime_guidance_mentions_hea_tools_when_present() {
-        // E14: the HEA / alloy-design hint appears only when hea_descriptors +
-        // phase_stability are loaded (the free Thermo-Calc stack).
+    fn runtime_guidance_carries_no_domain_routing_doctrine() {
         let mut catalog = ToolCatalog::default();
         catalog.extend(vec![
             LoadedTool {
@@ -1272,28 +1260,24 @@ mod tests {
                 source: None,
                 source_detail: None,
             },
+            LoadedTool {
+                name: "pareto_screen".to_string(),
+                description: "Pareto screen".to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: false,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                source: None,
+                source_detail: None,
+            },
         ]);
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
-        assert!(prompt.contains("hea_descriptors"), "must hint at HEA tools");
-        assert!(prompt.contains("Thermo-Calc"));
-    }
-
-    #[test]
-    fn runtime_guidance_mentions_pareto_when_present() {
-        // E14: the multi-objective screening hint appears when pareto_screen is loaded.
-        let mut catalog = ToolCatalog::default();
-        catalog.extend(vec![LoadedTool {
-            name: "pareto_screen".to_string(),
-            description: "Pareto screen".to_string(),
-            input_schema: json!({ "type": "object" }),
-            requires_approval: false,
-            permission_mode: PermissionMode::WorkspaceWrite,
-            source: None,
-            source_detail: None,
-        }]);
-        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
-        assert!(prompt.contains("pareto_screen"));
-        assert!(prompt.contains("multi-objective") || prompt.contains("suggest_next_experiments"));
+        for banned in ["Thermo-Calc", "alloy-design", "multi-objective materials"] {
+            assert!(
+                !prompt.contains(banned),
+                "domain routing {banned:?} leaked back into the runtime guidance — \
+                 it belongs to the tools' own descriptions"
+            );
+        }
     }
 
     // ---- Runtime instruction-file discovery ------------------------------

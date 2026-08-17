@@ -229,6 +229,15 @@ enum CommandToolKind {
     KnowledgePaths,
     KnowledgeCorpora,
     KnowledgeIngest,
+    // ── Ontology extension proposal governance ────────────────────────
+    OntologyProposalsList,
+    OntologyProposalsShow,
+    OntologyProposalsAccept,
+    OntologyProposalsReject,
+    // ── Stored-assertion re-verification ─────────────────────────────
+    ReverifyCandidates,
+    ReverifyAssertion,
+    ReverifyHistory,
     BillingBalance,
     BillingUsage,
     BillingHistory,
@@ -239,6 +248,8 @@ enum CommandToolKind {
     NotebookExec,
     NotebookStatus,
     NotebookReset,
+    // ── External headless browser (`agent-browser` on PATH) ──────────
+    WebBrowse,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -353,7 +364,11 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "query",
         aliases: &[],
         kind: CommandToolKind::QueryPlatform,
-        description: "Search the platform's OWN knowledge base — embedded corpora (NASA propulsion technical reports, Materials Project, JARVIS-DFT, MatKG, alloy/superalloy datasheets, additive-manufacturing and fatigue datasets) plus the materials knowledge graph. PREFER this before external literature searches (prior_art_search/web) for materials, alloy, propulsion, and manufacturing questions — the platform often already holds the answer with provenance. Plain text runs a graph-entity search ('find Ti-6Al-4V'); `semantic=true` searches corpus chunks by meaning ('materials for oxygen-rich preburner environments'). Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
+        // The corpus INVENTORY is deliberately not listed here: it is the
+        // operator's data moat, and this description ships in a public repo.
+        // The model does not need the manifest to choose the tool — "search
+        // what we already hold, before searching outside" is the whole rule.
+        description: "Search the platform's OWN knowledge base — the operator's embedded corpora plus the knowledge graph. PREFER this before external literature searches (prior_art_search/web) — the platform often already holds the answer with provenance. Plain text runs a graph-entity search; `semantic=true` searches corpus chunks by meaning. Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -404,6 +419,21 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         aliases: &[],
         kind: CommandToolKind::WorkflowList,
         description: "List PRISM YAML workflows discovered from built-ins, project `.prism/workflows`, and user workflow directories.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "plugins",
+        root: "plugins",
+        aliases: &[],
+        // TYPED umbrella (SPEC D3): the surface is exactly `prism plugins
+        // list [--json]` — the subcommand enum keeps the model on a real
+        // verb and the flag allowlist admits only `--json`.
+        kind: CommandToolKind::RootSubcommand {
+            subcommands: &["list"],
+            flags: FlagPolicy::Only(&["--json"]),
+        },
+        description: "Run `prism plugins list` — ONE inventory across every extension plane (Python plugins loaded/failed with their errors, configured MCP servers, skills, workflows, policies, ontologies). Use subcommand \"list\"; pass --json in args for machine-readable output. Same inventory as the TUI's `/plugins list`. Local and offline.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -713,7 +743,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "run",
         aliases: &[],
         kind: CommandToolKind::RunSubmit,
-        description: "Submit a compute job with typed fields instead of manually assembling `prism run` arguments. Use this for local, hosted-platform, or BYOC execution backends.",
+        description: "Submit a compute job with typed fields instead of manually assembling `prism run` arguments. Use this for local, hosted-platform, BYOC, or many-task HyperQueue execution backends.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -956,6 +986,78 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         permission_mode: PermissionMode::FullAccess,
         requires_approval: false,
     },
+    // ── Ontology extension proposal governance ─────────────────────────
+    // The review surface for what the paper reader proposed against the
+    // active ontology: list pending proposals with their citations, accept
+    // them into a DRAFT artifact (the ordinary promote gate still applies),
+    // or reject them (final for the identity).
+    CommandToolSpec {
+        name: "ontology_proposals",
+        root: "ontology",
+        aliases: &["ontology_proposals_list"],
+        kind: CommandToolKind::OntologyProposalsList,
+        description: "List pending ontology extension proposals queued by paper ingestion, with citation counts and full proposal content. The ontology is the product: these citations-backed proposals are how it grows. Follow with ontology_proposals_show for the exact cited lines, then accept or reject.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "ontology_proposals_show",
+        root: "ontology",
+        aliases: &[],
+        kind: CommandToolKind::OntologyProposalsShow,
+        description: "Show one pending ontology extension proposal in full: its content and every citation backing it (document, exact lines, quoted text). Use before accepting or rejecting.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "ontology_proposals_accept",
+        root: "ontology",
+        aliases: &[],
+        kind: CommandToolKind::OntologyProposalsAccept,
+        description: "Accept pending ontology extension proposals into a DRAFT ontology artifact. NEVER promotes: the draft still goes through the deliberate promotion gate (`prism ontology promote`). Requires `item_ids` plus `domain` (new artifact) or `output` (existing artifact to extend).",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "ontology_proposals_reject",
+        root: "ontology",
+        aliases: &[],
+        kind: CommandToolKind::OntologyProposalsReject,
+        description: "Reject pending ontology extension proposals. FINAL for each identity: a rejected proposal is never re-queued by later ingests. Requires `item_ids` and a `reason` (recorded in the disposition ledger).",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
+    },
+    // ── Stored-assertion re-verification ─────────────────────────────
+    // The re-check that makes annotate-don't-refuse honest: a weak fact is
+    // stored WITH its status precisely so a later reader can re-read its
+    // exact citation. These tools drive `prism reverify`.
+    CommandToolSpec {
+        name: "reverify_candidates",
+        root: "reverify",
+        aliases: &[],
+        kind: CommandToolKind::ReverifyCandidates,
+        description: "List stored assertions by verification status — the re-verification candidate population. `cited_by_reader` is the span-unchecked set paper ingestion produces (trusted, but no deterministic check compared the fact to its citation); `sample_disagreement`, `model_asserted`, `unit_unresolved` are the other re-checkable statuses. Follow with reverify_assertion on an id.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "reverify_assertion",
+        root: "reverify",
+        aliases: &[],
+        kind: CommandToolKind::ReverifyAssertion,
+        description: "Re-read one stored assertion's exact cited lines and ask the configured model whether they support it. Every verdict (affirmed / denied / uncertain / not_ready) is recorded in the reverify ledger; the assertion's own status is never rewritten. Refuses assertions whose judgement was already rendered — re-asking would re-roll denials into affirmations.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "reverify_history",
+        root: "reverify",
+        aliases: &[],
+        kind: CommandToolKind::ReverifyHistory,
+        description: "Show every recorded reverify verdict for one assertion, oldest first — the audit trail of prior re-checks, with no model call.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
     CommandToolSpec {
         name: "models",
         root: "models",
@@ -1184,6 +1286,32 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
+    // ── External headless browser ─────────────────────────────────────
+    // Shells out to the `agent-browser` CDP driver the same way PRISM
+    // shells out to `gh`/`git`/`hf`/`ollama`: a separate binary on PATH,
+    // never a linked crate. READ-only surface (`read <url>`); the
+    // interactive verbs (click/type/eval) write to the outside world and
+    // are deliberately not exposed through this read-only tool.
+    CommandToolSpec {
+        name: "web_browse",
+        root: "agent-browser",
+        aliases: &["browse", "browser_read"],
+        kind: CommandToolKind::WebBrowse,
+        // HONESTY: this description used to claim "JavaScript runs before
+        // extraction, so this succeeds on JS-heavy pages". It does not.
+        // `agent-browser read <url>` with an EXPLICIT url is an HTTP fetch
+        // (Accept: text/markdown, then `.md`, then llms.txt, then readable
+        // text extracted from HTML) — the vendor's own help says so. JS
+        // rendering requires `open <url>` followed by `read` with NO url,
+        // which reads the active tab's rendered DOM and needs a persistent
+        // browser session PRISM does not yet manage. Telling the model to
+        // escalate here when a page "looks empty" made it burn a call for an
+        // identical result and conclude the page had no content — a lie told
+        // to the reasoning process, which is the worst place to tell one.
+        description: "Read ONE URL and return its readable text, via the external `agent-browser` binary. This is an HTTP fetch with content extraction (prefers markdown, falls back to text extracted from HTML) — it does NOT execute JavaScript, so it will not rescue a page whose content is client-rendered. Prefer `web` first for ordinary pages: it is cheaper, and only `web` can SEARCH — this tool reads exactly one URL. Requires the `agent-browser` binary on PATH; when it is missing the tool says so with the install command and does NOT silently fall back to another fetcher. Page load failures, timeouts and non-zero exits are reported as failures. Output is bounded and says when it truncated.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -1209,6 +1337,9 @@ enum CommandExecution {
     },
     NotebookStatus,
     NotebookReset,
+    WebBrowse {
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1336,7 +1467,10 @@ fn gate_command_execution(
         | CommandExecution::WorkflowList
         | CommandExecution::WorkflowShow { .. }
         | CommandExecution::WorkflowRun { .. }
-        | CommandExecution::NotebookStatus => CommandExecutionAccessRequirement::LocalOnlyAllowed,
+        | CommandExecution::NotebookStatus
+        // Reads the outside world, mutates nothing — same posture as the
+        // other outward-facing read tools.
+        | CommandExecution::WebBrowse { .. } => CommandExecutionAccessRequirement::LocalOnlyAllowed,
         CommandExecution::NotebookExec { .. } | CommandExecution::NotebookReset => {
             CommandExecutionAccessRequirement::VerifiedNodeOwner
         }
@@ -1394,6 +1528,20 @@ fn notebook_exec_schema() -> Value {
             }
         },
         "required": ["code"],
+        "additionalProperties": false
+    })
+}
+
+fn web_browse_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Absolute URL to read (https://...). The page is fetched over HTTP and its text extracted; JavaScript is NOT executed, so a client-rendered page will come back empty."
+            }
+        },
+        "required": ["url"],
         "additionalProperties": false
     })
 }
@@ -2058,6 +2206,120 @@ fn knowledge_paths_schema() -> Value {
     })
 }
 
+fn ontology_proposals_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "limit": { "type": "integer", "description": "Max proposals to return (default 50)." }
+        },
+        "required": [],
+        "additionalProperties": false
+    })
+}
+
+fn ontology_proposals_show_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "item_id": { "type": "string", "description": "Proposal id from ontology_proposals." }
+        },
+        "required": ["item_id"],
+        "additionalProperties": false
+    })
+}
+
+fn ontology_proposals_accept_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "item_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Proposal ids to accept (from ontology_proposals)."
+            },
+            "domain": { "type": "string", "description": "Domain id for a NEW artifact (lowercase letters/digits/-/_). Required unless output names an existing artifact." },
+            "output": { "type": "string", "description": "Artifact path to write; an existing PRISM artifact there is extended." },
+            "reason": { "type": "string", "description": "Why these proposals are accepted (recorded in the ledger)." }
+        },
+        "required": ["item_ids"],
+        "additionalProperties": false
+    })
+}
+
+fn ontology_proposals_reject_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "item_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Proposal ids to reject."
+            },
+            "reason": { "type": "string", "description": "Why (required; recorded in the ledger)." }
+        },
+        "required": ["item_ids", "reason"],
+        "additionalProperties": false
+    })
+}
+
+fn reverify_candidates_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Exact verification status spelling: cited_by_reader, sample_disagreement, model_asserted, unit_unresolved, subject_not_verbatim, value_not_in_source, review_uncertain, review_denied, unit_from_page, grounded. Only statuses with no rendered judgement may be re-verified."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max assertions to return (default 20)."
+            }
+        },
+        "required": ["status"],
+        "additionalProperties": false
+    })
+}
+
+fn reverify_assertion_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "assertion_id": {
+                "type": "string",
+                "description": "Stable assertion id (from reverify_candidates)."
+            },
+            "model": {
+                "type": "string",
+                "description": "Override the LLM model that judges the cited lines."
+            },
+            "llm_url": {
+                "type": "string",
+                "description": "Override the LLM base URL."
+            },
+            "api_key": {
+                "type": "string",
+                "description": "API key for authenticated LLM providers."
+            }
+        },
+        "required": ["assertion_id"],
+        "additionalProperties": false
+    })
+}
+
+fn reverify_history_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "assertion_id": {
+                "type": "string",
+                "description": "Stable assertion id (from reverify_candidates)."
+            }
+        },
+        "required": ["assertion_id"],
+        "additionalProperties": false
+    })
+}
+
 fn knowledge_corpora_schema() -> Value {
     json!({
         "type": "object",
@@ -2096,7 +2358,7 @@ fn run_submit_schema() -> Value {
             },
             "backend": {
                 "type": "string",
-                "description": "Execution backend: `local`, `marc27`, or `byoc`."
+                "description": "Execution backend: `local`, `marc27`, `byoc`, or `hyperqueue`. Use `hyperqueue` for MANY independent tasks (e.g. a paper corpus): all tasks are one HQ job, load-balanced across workers."
             },
             "platform_url": {
                 "type": "string",
@@ -2178,6 +2440,32 @@ fn run_submit_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "description": "Run only after this numeric SLURM job id completes successfully."
+            },
+            "hq_tasks_path": {
+                "type": "string",
+                "description": "Path to a HyperQueue task-set file for the `hyperqueue` backend: a JSON array of `{\"command\": [\"...\"], \"cwd\"?: \"...\", \"env\"?: {}, \"stdin\"?: \"...\"}` objects. Required for `hyperqueue`; write the file with the file-writing tool first — a task set does not fit `inputs` string pairs."
+            },
+            "hq_workers": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Standalone HyperQueue worker count (default 2). Workers share one environment — the concurrency cap without N isolated setups."
+            },
+            "hq_server_dir": {
+                "type": "string",
+                "description": "HyperQueue server directory (default `<data_dir>/hyperqueue`)."
+            },
+            "hq_autoalloc": {
+                "type": "string",
+                "description": "`slurm` or `pbs`: run HQ workers inside scheduler allocations instead of standalone local workers."
+            },
+            "hq_time_limit": {
+                "type": "string",
+                "description": "Walltime for HyperQueue automatic allocations, e.g. `1h`."
+            },
+            "hq_extra": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Extra sbatch/qsub arguments for HyperQueue allocations, e.g. `[\"--partition=main\"]`."
             }
         },
         "required": ["image"],
@@ -2464,6 +2752,13 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::KnowledgeEntity => knowledge_entity_schema(),
         CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
         CommandToolKind::KnowledgeCorpora => knowledge_corpora_schema(),
+        CommandToolKind::OntologyProposalsList => ontology_proposals_list_schema(),
+        CommandToolKind::OntologyProposalsShow => ontology_proposals_show_schema(),
+        CommandToolKind::OntologyProposalsAccept => ontology_proposals_accept_schema(),
+        CommandToolKind::OntologyProposalsReject => ontology_proposals_reject_schema(),
+        CommandToolKind::ReverifyCandidates => reverify_candidates_schema(),
+        CommandToolKind::ReverifyAssertion => reverify_assertion_schema(),
+        CommandToolKind::ReverifyHistory => reverify_history_schema(),
         CommandToolKind::KnowledgeIngest => knowledge_ingest_schema(),
         CommandToolKind::BillingBalance
         | CommandToolKind::BillingUsage
@@ -2472,6 +2767,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::ReportBug => report_bug_schema(),
         CommandToolKind::NotebookExec => notebook_exec_schema(),
         CommandToolKind::NotebookStatus | CommandToolKind::NotebookReset => empty_schema(),
+        CommandToolKind::WebBrowse => web_browse_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
         CommandToolKind::NodeLogs => node_logs_schema(),
         CommandToolKind::MeshDiscover => mesh_discover_schema(),
@@ -2614,6 +2910,29 @@ fn parse_args(input: &Value) -> Result<Vec<String>> {
         .collect::<Result<_>>()?;
     reject_global_flag_override(&args)?;
     Ok(args)
+}
+
+/// Required non-empty array of non-empty strings — the shape proposal ids
+/// arrive in.
+fn required_strings(input: &Value, key: &str) -> Result<Vec<String>> {
+    let raw = input
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("`{key}` must be an array of strings"))?;
+    let values = raw
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("`{key}` entries must be non-empty strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.is_empty() {
+        anyhow::bail!("`{key}` must not be empty");
+    }
+    Ok(values)
 }
 
 fn required_string(input: &Value, key: &str) -> Result<String> {
@@ -2804,6 +3123,12 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
         }
         CommandExecution::NotebookStatus => "notebook status".to_string(),
         CommandExecution::NotebookReset => "notebook reset".to_string(),
+        CommandExecution::WebBrowse { url } => {
+            format!(
+                "agent-browser read {}",
+                shell_command_join(std::slice::from_ref(url))
+            )
+        }
     }
 }
 
@@ -2833,7 +3158,7 @@ fn command_timeout_for_root(root: &str) -> Duration {
     }
 }
 
-fn truncate_for_ui(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_for_ui(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
@@ -3786,6 +4111,33 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args.push("--slurm-dependency-afterok".to_string());
                 args.push(job_id.to_string());
             }
+            for (field, flag) in [
+                ("hq_tasks_path", "--hq-tasks"),
+                ("hq_server_dir", "--hq-server-dir"),
+                ("hq_autoalloc", "--hq-autoalloc"),
+                ("hq_time_limit", "--hq-time-limit"),
+            ] {
+                if let Some(value) = optional_string(input, field) {
+                    args.push(flag.to_string());
+                    args.push(value);
+                }
+            }
+            if let Some(workers) = optional_usize(input, "hq_workers") {
+                args.push("--hq-workers".to_string());
+                args.push(workers.to_string());
+            }
+            if let Some(raw_extra) = input.get("hq_extra") {
+                let extras = raw_extra
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("`hq_extra` must be an array of strings"))?;
+                for extra in extras {
+                    let extra = extra
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("`hq_extra` entries must be strings"))?;
+                    args.push("--hq-extra".to_string());
+                    args.push(extra.to_string());
+                }
+            }
             args.push(required_string(input, "image")?);
             args.push("--json".to_string());
             Ok(CommandExecution::Cli {
@@ -4221,6 +4573,132 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::OntologyProposalsList => {
+            let mut args = vec![
+                "proposals".to_string(),
+                "list".to_string(),
+                "--json".to_string(),
+            ];
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::OntologyProposalsShow => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec![
+                "proposals".to_string(),
+                "show".to_string(),
+                required_string(input, "item_id")?,
+            ],
+        }),
+        CommandToolKind::OntologyProposalsAccept => {
+            let item_ids = required_strings(input, "item_ids")?;
+            if item_ids.is_empty() {
+                bail!("ontology_proposals_accept requires at least one item_id");
+            }
+            let domain = optional_string(input, "domain");
+            let output = optional_string(input, "output");
+            if domain.is_none() && output.is_none() {
+                bail!(
+                    "ontology_proposals_accept requires `domain` (new artifact) or `output` \
+                     (existing artifact to extend)"
+                );
+            }
+            let mut args = vec!["proposals".to_string(), "accept".to_string()];
+            args.extend(item_ids);
+            if let Some(domain) = domain {
+                args.push("--domain".to_string());
+                args.push(domain);
+            }
+            if let Some(output) = output {
+                args.push("--output".to_string());
+                args.push(output);
+            }
+            if let Some(reason) = optional_string(input, "reason") {
+                args.push("--reason".to_string());
+                args.push(reason);
+            }
+            // The ledger must be able to tell an agent decision from a
+            // human one; the executing model's identity is not visible to
+            // this dispatch, so the dispositioner names the surface.
+            args.push("--by".to_string());
+            args.push("agent".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::OntologyProposalsReject => {
+            let item_ids = required_strings(input, "item_ids")?;
+            if item_ids.is_empty() {
+                bail!("ontology_proposals_reject requires at least one item_id");
+            }
+            let reason = required_string(input, "reason")?;
+            let mut args = vec!["proposals".to_string(), "reject".to_string()];
+            args.extend(item_ids);
+            args.push("--reason".to_string());
+            args.push(reason);
+            args.push("--by".to_string());
+            args.push("agent".to_string());
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::ReverifyCandidates => {
+            let mut args = vec![
+                "list".to_string(),
+                "--status".to_string(),
+                required_string(input, "status")?,
+                "--json".to_string(),
+            ];
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::ReverifyAssertion => {
+            let mut args = vec![
+                "run".to_string(),
+                "--assertion".to_string(),
+                required_string(input, "assertion_id")?,
+                "--json".to_string(),
+            ];
+            if let Some(model) = optional_string(input, "model") {
+                args.push("--model".to_string());
+                args.push(model);
+            }
+            if let Some(llm_url) = optional_string(input, "llm_url") {
+                args.push("--llm-url".to_string());
+                args.push(llm_url);
+            }
+            if let Some(api_key) = optional_string(input, "api_key") {
+                args.push("--api-key".to_string());
+                args.push(api_key);
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args,
+            })
+        }
+        CommandToolKind::ReverifyHistory => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: vec![
+                "history".to_string(),
+                "--assertion".to_string(),
+                required_string(input, "assertion_id")?,
+                "--json".to_string(),
+            ],
+        }),
         CommandToolKind::NodeProbe => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec!["probe".to_string()],
@@ -4348,6 +4826,9 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
         }),
         CommandToolKind::NotebookStatus => Ok(CommandExecution::NotebookStatus),
         CommandToolKind::NotebookReset => Ok(CommandExecution::NotebookReset),
+        CommandToolKind::WebBrowse => Ok(CommandExecution::WebBrowse {
+            url: required_string(input, "url")?,
+        }),
     }
 }
 
@@ -4584,6 +5065,187 @@ async fn execute_cli_command(
     Ok(result)
 }
 
+// ── External headless browser (`agent-browser`) ──────────────────────
+
+/// External binary backing `web_browse` and the TUI's `/browse` command.
+/// Shelled out to exactly like `gh`/`git`/`hf`/`ollama` — a separate
+/// process, never a linked crate.
+pub(crate) const AGENT_BROWSER_BIN: &str = "agent-browser";
+
+/// Wall-clock budget for one `agent-browser read`: cold browser start plus
+/// page load. Same convention as [`command_timeout_for_root`] — a runaway
+/// page must not hang the turn; the child is killed on drop and the timeout
+/// is reported honestly.
+const AGENT_BROWSER_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What one `agent-browser read` run produced. Every failure mode is its own
+/// variant so callers report each one as what it was — never an empty string
+/// standing in for an error.
+#[derive(Debug)]
+pub(crate) enum AgentBrowserOutcome {
+    /// `agent-browser` is not on PATH. Callers must say exactly this and name
+    /// the install command; PRISM never silently degrades to another fetcher.
+    MissingBinary,
+    /// The child did not return inside the window and was terminated.
+    TimedOut { secs: u64 },
+    /// The child spawned but errored before producing an outcome.
+    SpawnFailed(String),
+    /// The child exited; a non-zero code or non-2xx-style page failure is a
+    /// failure and must be reported as one.
+    Completed {
+        success: bool,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+}
+
+/// Honest text for the missing-binary case, shared by the `web_browse` tool
+/// and the `/browse` slash command so both surfaces say the same thing.
+pub(crate) fn agent_browser_missing_message() -> String {
+    format!(
+        "`{AGENT_BROWSER_BIN}` is not installed or not on PATH, so this page was NOT fetched. \
+         PRISM does not fall back to another fetch path for this tool. Install the browser \
+         driver (`brew install {AGENT_BROWSER_BIN}` or `cargo install {AGENT_BROWSER_BIN}`), \
+         then run `{AGENT_BROWSER_BIN} install` once to fetch its browser binary, and retry."
+    )
+}
+
+/// Read one URL through `agent-browser` with the production binary and
+/// timeout. Shared by the agent-facing `web_browse` command tool and the
+/// TUI's `/browse` slash command so the two paths can never drift.
+///
+/// The literal binary name at the spawn site is deliberate: the offline-guard
+/// regression test (`network_tools_are_offline_guarded`) greps for
+/// `Command::new("agent-browser")` to prove this spawner still consults the
+/// offline policy. Keep the literal here.
+///
+/// `Err` carries the offline-policy refusal (a remote URL under
+/// `PRISM_OFFLINE=1`); every child-process outcome is an [`AgentBrowserOutcome`].
+pub(crate) async fn agent_browser_read(url: &str) -> Result<AgentBrowserOutcome, String> {
+    agent_browser_read_cmd(
+        TokioCommand::new("agent-browser"),
+        url,
+        AGENT_BROWSER_READ_TIMEOUT,
+    )
+    .await
+}
+
+/// Testable core of [`agent_browser_read`]: the command and window are
+/// parameters, so absence, timeout, and output handling are verifiable with a
+/// substitute child (and without the real browser driver or any network).
+async fn agent_browser_read_cmd(
+    mut cmd: TokioCommand,
+    url: &str,
+    window: Duration,
+) -> Result<AgentBrowserOutcome, String> {
+    // Browsing reads the outside world, so the process-wide offline policy
+    // applies exactly as it does to every other outbound path. Loopback URLs
+    // stay allowed (local dashboards, local docs servers).
+    prism_runtime::offline::check_url(url)?;
+
+    cmd.arg("read")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // The browser reader has no use for node/platform credentials. Stripping
+    // them for EVERY caller means an untrusted page (or an untrusted HTTP
+    // caller who reaches this tool) can never exfiltrate them through the
+    // child's environment.
+    strip_platform_credentials(&mut cmd);
+
+    let secs = window.as_secs();
+    match timeout(window, cmd.output()).await {
+        Err(_) => Ok(AgentBrowserOutcome::TimedOut { secs }),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AgentBrowserOutcome::MissingBinary)
+        }
+        Ok(Err(error)) => Ok(AgentBrowserOutcome::SpawnFailed(error.to_string())),
+        Ok(Ok(output)) => Ok(AgentBrowserOutcome::Completed {
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
+}
+
+/// Agent-facing executor for `web_browse`. Returns the standard command-tool
+/// envelope with an honest failure body for every outcome — a missing binary,
+/// an offline refusal, a timeout, a non-zero exit, and an empty page are each
+/// reported as what they are.
+async fn execute_web_browse(
+    url: &str,
+    invocation: &str,
+    _execution_access: GatedCommandExecutionAccess,
+) -> Result<Value> {
+    let outcome = agent_browser_read(url).await;
+    Ok(web_browse_envelope(invocation, outcome))
+}
+
+/// The one shape a `web_browse` result reports through: the same envelope the
+/// CLI children use, bounded the same way ([`CLI_ENVELOPE_STREAM_MAX_CHARS`]
+/// with an explicit truncation marker).
+fn web_browse_envelope(invocation: &str, outcome: Result<AgentBrowserOutcome, String>) -> Value {
+    let (success, timed_out, exit_code, stdout, stderr) = match outcome {
+        Err(offline_refusal) => (false, false, Some(1), String::new(), offline_refusal),
+        Ok(AgentBrowserOutcome::MissingBinary) => (
+            false,
+            false,
+            None,
+            String::new(),
+            agent_browser_missing_message(),
+        ),
+        Ok(AgentBrowserOutcome::TimedOut { secs }) => (
+            false,
+            true,
+            None,
+            String::new(),
+            format!(
+                "`{invocation}` did not finish within {secs} seconds and was terminated; its \
+                 work was abandoned. The page may be slow or the browser may have hung; retry \
+                 once, then try `web` (action='read') instead."
+            ),
+        ),
+        Ok(AgentBrowserOutcome::SpawnFailed(error)) => (
+            false,
+            false,
+            None,
+            String::new(),
+            format!("failed to run `{AGENT_BROWSER_BIN}`: {error}"),
+        ),
+        Ok(AgentBrowserOutcome::Completed {
+            success,
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            // Exit 0 with no readable text is not an error, but an empty
+            // success reads like a broken fetch — say what actually happened.
+            let stderr = if success && stdout.trim().is_empty() && stderr.trim().is_empty() {
+                format!(
+                    "`{AGENT_BROWSER_BIN}` exited 0 but returned no readable text; the page is \
+                     empty or its content is not extractable text."
+                )
+            } else {
+                stderr
+            };
+            (success, false, exit_code, stdout, stderr)
+        }
+    };
+    json!({
+        "root": AGENT_BROWSER_BIN,
+        "invocation": invocation,
+        "success": success,
+        "timed_out": timed_out,
+        "exit_code": exit_code,
+        "stdout": truncate_for_ui(stdout.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
+        "stderr": truncate_for_ui(stderr.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
+    })
+}
+
 /// Mint a best-effort loopback session token so a workflow's `tool` steps can
 /// authenticate to the local node's `/api/tools/{name}/run` endpoint (auth- and
 /// `ExecuteTools`-gated when the node is online). Injected into the workflow
@@ -4767,7 +5429,8 @@ async fn execute_workflow_command(
         CommandExecution::Cli { .. }
         | CommandExecution::NotebookExec { .. }
         | CommandExecution::NotebookStatus
-        | CommandExecution::NotebookReset => {
+        | CommandExecution::NotebookReset
+        | CommandExecution::WebBrowse { .. } => {
             unreachable!("workflow executor only handles workflow commands")
         }
     };
@@ -5025,6 +5688,9 @@ pub async fn execute_command_tool_with_platform_access(
         }
         CommandExecution::NotebookReset => {
             Ok(notebook_reset_result(&invocation, execution_access.verified_node_owner()?).await)
+        }
+        CommandExecution::WebBrowse { url } => {
+            execute_web_browse(url, &invocation, execution_access).await
         }
     }
 }
@@ -5395,6 +6061,9 @@ mod tests {
             },
             CommandExecution::NotebookStatus,
             CommandExecution::NotebookReset,
+            CommandExecution::WebBrowse {
+                url: "https://example.org/".into(),
+            },
         ];
 
         for execution in &executions {
@@ -5415,6 +6084,10 @@ mod tests {
         assert!(
             gate_command_execution(&executions[6], CommandToolPlatformAccess::LocalOnly).is_err(),
             "shared notebook reset is owner-only"
+        );
+        assert!(
+            gate_command_execution(&executions[7], CommandToolPlatformAccess::LocalOnly).is_ok(),
+            "read-only browsing stays available to LocalOnly callers like the other outward reads"
         );
     }
 
@@ -5989,25 +6662,25 @@ RuntimeError: boom\n"
   |   File "/var/folders/g9/ctk1s9tx0j79d2_bq782vnpm0000gn/T/ipykernel_33660/2764102629.py", line 3, in <module>
   |     group_entry(0)
   |     ~~~~~~~~~~~^^^
-  |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 105, in group_entry
+  |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 105, in group_entry
   |     raise ExceptionGroup("several fakelib failures", errs)  # SECRET_SRC_GROUP_RAISE
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   | ExceptionGroup: several fakelib failures (2 sub-exceptions)
   +-+---------------- 1 ----------------
     | Traceback (most recent call last):
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
     |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
     |     ~~~~~~~~~~~~~~~~^^^
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
     |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     | ValueError: fakelib inner transform exploded
     +---------------- 2 ----------------
     | Traceback (most recent call last):
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
     |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
     |     ~~~~~~~~~~~~~~~~^^^
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
     |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     | ValueError: fakelib inner transform exploded
@@ -6021,25 +6694,25 @@ RuntimeError: boom\n"
   |   File "<string>", line 3, in <module>
   |     group_entry(0)
   |     ~~~~~~~~~~~^^^
-  |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 105, in group_entry
+  |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 105, in group_entry
   |     raise ExceptionGroup("several fakelib failures", errs)  # SECRET_SRC_GROUP_RAISE
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   | ExceptionGroup: several fakelib failures (2 sub-exceptions)
   +-+---------------- 1 ----------------
     | Traceback (most recent call last):
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
     |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
     |     ~~~~~~~~~~~~~~~~^^^
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
     |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     | ValueError: fakelib inner transform exploded
     +---------------- 2 ----------------
     | Traceback (most recent call last):
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 102, in group_entry
     |     _inner_transform(i)  # SECRET_SRC_GROUP_INNER
     |     ~~~~~~~~~~~~~~~~^^^
-    |   File "/private/tmp/claude-501/-Users-siddharthakovid-Downloads/8394e7bd-d04b-41d8-97bf-ff6832a752dc/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
+    |   File "/private/tmp/kernel-session/scratchpad/vs2fix3/site-packages/fakelib/core.py", line 39, in _inner_transform
     |     raise ValueError("fakelib inner transform exploded")  # SECRET_SRC_RAISE
     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     | ValueError: fakelib inner transform exploded
@@ -6975,6 +7648,36 @@ ValueError: boom\n";
         );
     }
 
+    /// STANDARD PLUGIN CONTRACT — LIST rule, agent door: the `plugins`
+    /// tool must exist, stay read-only and unattended (it only lists), and
+    /// declare the one flag the CLI subcommand takes. `prism plugins list`
+    /// is the single implementation; the TUI's `/plugins list` and this
+    /// tool both spawn it, so the surfaces cannot drift.
+    #[test]
+    fn plugins_inventory_tool_is_read_only_and_unattended() {
+        let spec = COMMAND_TOOLS
+            .iter()
+            .find(|spec| spec.name == "plugins")
+            .expect("the plugins inventory tool must be declared");
+        assert!(matches!(spec.permission_mode, PermissionMode::ReadOnly));
+        assert!(!spec.requires_approval);
+        assert_eq!(spec.root, "plugins");
+        assert!(
+            spec.description.contains("extension plane"),
+            "the description must name what it lists"
+        );
+        assert!(
+            matches!(
+                spec.kind,
+                CommandToolKind::RootSubcommand {
+                    subcommands: &["list"],
+                    flags: FlagPolicy::Only(_)
+                }
+            ),
+            "the plugins tool is the typed `list` umbrella with a flag allowlist"
+        );
+    }
+
     #[test]
     fn unattended_argv_tools_declare_every_flag_they_may_pass() {
         // The class invariant. A tool that skips the approval prompt
@@ -7042,7 +7745,9 @@ ValueError: boom\n";
         // definitions in crates/cli/src/main.rs. `status`, `tools`, `agent`
         // are unit variants (no flags); `job-status` takes one positional;
         // `doctor`'s only flag is the repair; `query` and `models` declare
-        // their read-path flags; `papers` declares its retrieval flags.
+        // their read-path flags; `papers` declares its retrieval flags;
+        // `plugins` admits only `--json` on its `list` subcommand (the
+        // standard plugin contract's inventory tool — read-only).
         assert_eq!(
             checked,
             vec![
@@ -7051,6 +7756,7 @@ ValueError: boom\n";
                 "doctor",
                 "query",
                 "job-status",
+                "plugins",
                 "papers",
                 "agent",
                 "models"
@@ -7445,6 +8151,52 @@ ValueError: boom\n";
     }
 
     #[test]
+    fn run_submit_schema_exposes_hyperqueue_fields() {
+        let schema = run_submit_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        for field in [
+            "hq_tasks_path",
+            "hq_workers",
+            "hq_server_dir",
+            "hq_autoalloc",
+            "hq_time_limit",
+            "hq_extra",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "missing schema field {field}"
+            );
+        }
+        // The backend enumeration must name the many-task path: an agent
+        // that cannot see the backend cannot route a task set to it.
+        let backend = properties["backend"]["description"].as_str().unwrap();
+        assert!(backend.contains("hyperqueue"), "backend enum: {backend}");
+    }
+
+    #[test]
+    fn run_submit_emits_hyperqueue_flags() {
+        let preview = command_tool_preview(
+            "run_submit",
+            &json!({
+                "image": "unused-by-hyperqueue",
+                "backend": "hyperqueue",
+                "hq_tasks_path": "/work/corpus/tasks.json",
+                "hq_workers": 2,
+                "hq_server_dir": "/work/hq",
+                "hq_autoalloc": "slurm",
+                "hq_time_limit": "4h",
+                "hq_extra": ["--partition=main", "--account=alloc"]
+            }),
+        )
+        .expect("HyperQueue run preview should render");
+
+        assert_eq!(
+            preview,
+            "prism run --backend hyperqueue --hq-tasks /work/corpus/tasks.json --hq-server-dir /work/hq --hq-autoalloc slurm --hq-time-limit 4h --hq-workers 2 --hq-extra --partition=main --hq-extra --account=alloc unused-by-hyperqueue --json"
+        );
+    }
+
+    #[test]
     fn run_submit_emits_all_slurm_resource_flags() {
         let preview = command_tool_preview(
             "run_submit",
@@ -7453,7 +8205,7 @@ ValueError: boom\n";
                 "backend": "byoc",
                 "slurm": "researcher@login.hpc",
                 "slurm_partition": "gpu",
-                "slurm_account": "esa-materials",
+                "slurm_account": "research-alloc",
                 "slurm_time": "02:00:00",
                 "slurm_gres": "gpu:a100:1",
                 "slurm_mem": "64G",
@@ -7468,7 +8220,7 @@ ValueError: boom\n";
 
         assert_eq!(
             preview,
-            "prism run --backend byoc --slurm researcher@login.hpc --slurm-partition gpu --slurm-account esa-materials --slurm-time 02:00:00 --slurm-gres gpu:a100:1 --slurm-mem 64G --slurm-cpus-per-task 8 --slurm-nodes 2 --slurm-ntasks 4 --slurm-array 0-15%4 --slurm-dependency-afterok 98765 /shared/prism-worker.sif --json"
+            "prism run --backend byoc --slurm researcher@login.hpc --slurm-partition gpu --slurm-account research-alloc --slurm-time 02:00:00 --slurm-gres gpu:a100:1 --slurm-mem 64G --slurm-cpus-per-task 8 --slurm-nodes 2 --slurm-ntasks 4 --slurm-array 0-15%4 --slurm-dependency-afterok 98765 /shared/prism-worker.sif --json"
         );
     }
 
@@ -7510,6 +8262,61 @@ ValueError: boom\n";
             preview,
             "prism publish models/mace.ckpt --to marc27 --repo team/mace --private --json"
         );
+    }
+
+    // ── Re-verification surface: dispatch drives the production CLI ────
+
+    #[test]
+    fn renders_reverify_candidates_preview() {
+        let preview = command_tool_preview(
+            "reverify_candidates",
+            &json!({ "status": "cited_by_reader", "limit": 5 }),
+        )
+        .expect("reverify_candidates preview should render");
+        assert_eq!(
+            preview,
+            "prism reverify list --status cited_by_reader --json --limit 5"
+        );
+    }
+
+    #[test]
+    fn renders_reverify_assertion_preview() {
+        let preview = command_tool_preview(
+            "reverify_assertion",
+            &json!({ "assertion_id": "tenant|abc", "model": "test-judge" }),
+        )
+        .expect("reverify_assertion preview should render");
+        assert_eq!(
+            preview,
+            "prism reverify run --assertion tenant|abc --json --model test-judge"
+        );
+    }
+
+    #[test]
+    fn renders_reverify_history_preview() {
+        let preview =
+            command_tool_preview("reverify_history", &json!({ "assertion_id": "tenant|abc" }))
+                .expect("reverify_history preview should render");
+        assert_eq!(
+            preview,
+            "prism reverify history --assertion tenant|abc --json"
+        );
+    }
+
+    /// The re-verification tools must stay approval-gated like their
+    /// store-writing neighbours: a tool that spends model calls and writes
+    /// ledger rows cannot silently become unattended.
+    #[test]
+    fn reverify_tools_are_permissioned_like_their_neighbours() {
+        let candidates = spec_by_name("reverify_candidates").expect("listed in the registry");
+        assert_eq!(candidates.permission_mode, PermissionMode::ReadOnly);
+        assert!(!candidates.requires_approval);
+        let run = spec_by_name("reverify_assertion").expect("listed in the registry");
+        assert_eq!(run.permission_mode, PermissionMode::WorkspaceWrite);
+        assert!(run.requires_approval);
+        let history = spec_by_name("reverify_history").expect("listed in the registry");
+        assert_eq!(history.permission_mode, PermissionMode::ReadOnly);
+        assert!(!history.requires_approval);
     }
 
     // ── TOOL_SURFACE_SPEC definition-of-ready gates (D2, D3) ─────────────
@@ -8016,6 +8823,315 @@ ValueError: boom\n";
                 .expect("stdout is a string")
                 .ends_with("[Output truncated]"),
             "a genuinely cut payload must say so inside itself"
+        );
+    }
+}
+
+#[cfg(test)]
+mod web_browse_tests {
+    //! Tests for the `web_browse` command tool and its `/browse` shared core.
+    //!
+    //! The capability shells out to the external `agent-browser` CDP driver.
+    //! These tests exercise the spawn/absence/timeout/offline/truncation
+    //! contract WITHOUT requiring the real binary or any network: the child
+    //! command and timeout are parameters ([`super::agent_browser_read_cmd`]),
+    //! and absence is asserted by naming a binary that cannot exist.
+
+    use super::*;
+
+    /// A read that reaches the outside world must be classified like PRISM's
+    /// other outward-facing READ tools: ReadOnly, and not approval-gated.
+    /// Browsing mutates nothing; it must not invent a new permission concept.
+    #[test]
+    fn web_browse_is_read_only_and_not_approval_gated() {
+        let spec = spec_by_name("web_browse").expect("web_browse must be registered");
+        assert_eq!(
+            spec.permission_mode,
+            PermissionMode::ReadOnly,
+            "browsing reads the outside world and must be ReadOnly"
+        );
+        assert!(
+            !spec.requires_approval,
+            "read-only browsing must not require approval"
+        );
+        // Offered in the catalog whether or not a local node is up — it does
+        // not depend on the node.
+        assert!(
+            command_tools_filtered(false)
+                .iter()
+                .any(|tool| tool.name == "web_browse"),
+            "web_browse must be offered with the node offline"
+        );
+        assert!(is_command_tool("web_browse"));
+    }
+
+    /// The schema demands a URL; building an execution without one must fail
+    /// honestly rather than spawn `agent-browser read` with nothing to read.
+    #[test]
+    fn web_browse_requires_a_url() {
+        let spec = spec_by_name("web_browse").expect("registered");
+        let error = build_execution(spec, &json!({})).expect_err("a URL is mandatory");
+        assert!(
+            error.to_string().contains("url"),
+            "the refusal must name the missing field: {error}"
+        );
+        let error =
+            build_execution(spec, &json!({"url": "   "})).expect_err("a blank URL is not a URL");
+        assert!(error.to_string().contains("url"));
+    }
+
+    /// The preview shown to a human approving/inspecting the call must be the
+    /// REAL invocation, not the generic `prism …` shape.
+    #[test]
+    fn web_browse_preview_names_the_real_binary() {
+        let preview = command_tool_preview("web_browse", &json!({"url": "https://example.org/x"}))
+            .expect("preview must build");
+        assert_eq!(preview, "agent-browser read https://example.org/x");
+    }
+
+    /// When `agent-browser` is not on PATH the tool must say exactly that and
+    /// name the install command — never an empty string, never a silent
+    /// fallback to another fetch path.
+    #[tokio::test]
+    async fn absent_agent_browser_is_reported_with_install_guidance() {
+        let outcome = agent_browser_read_cmd(
+            TokioCommand::new("prism-no-such-agent-browser-binary"),
+            "http://127.0.0.1:9/",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("absence is an outcome, not an Err");
+        assert!(
+            matches!(outcome, AgentBrowserOutcome::MissingBinary),
+            "a missing binary must be detected, got {outcome:?}"
+        );
+
+        let envelope = web_browse_envelope("agent-browser read https://example.org/", Ok(outcome));
+        assert_eq!(envelope["success"], json!(false));
+        let stderr = envelope["stderr"].as_str().expect("stderr string");
+        assert!(
+            stderr.contains("not installed or not on PATH"),
+            "must say the binary is absent: {stderr}"
+        );
+        assert!(
+            stderr.contains("brew install agent-browser") && stderr.contains("cargo install"),
+            "must name the install command: {stderr}"
+        );
+        assert!(
+            stderr.contains("NOT fetched") && stderr.contains("does not fall back"),
+            "must be an honest non-fallback failure, not a silent degradation: {stderr}"
+        );
+    }
+
+    /// Real outcomes pass through as what they were: a non-zero exit is a
+    /// failure carrying the child's stderr, and an empty exit-0 page is
+    /// flagged instead of reading as a silent blank success.
+    #[tokio::test]
+    async fn completed_outcomes_report_success_and_failure_as_they_are() {
+        let failure = AgentBrowserOutcome::Completed {
+            success: false,
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "net::ERR_NAME_NOT_RESOLVED".into(),
+        };
+        let envelope = web_browse_envelope("inv", Ok(failure));
+        assert_eq!(envelope["success"], json!(false));
+        assert_eq!(envelope["exit_code"], json!(1));
+        assert!(
+            envelope["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("ERR_NAME_NOT_RESOLVED")
+        );
+
+        let empty_page = AgentBrowserOutcome::Completed {
+            success: true,
+            exit_code: Some(0),
+            stdout: "   \n".into(),
+            stderr: String::new(),
+        };
+        let envelope = web_browse_envelope("inv", Ok(empty_page));
+        assert_eq!(envelope["success"], json!(true));
+        assert!(
+            envelope["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("no readable text"),
+            "an empty page must say so instead of looking like a broken fetch"
+        );
+    }
+
+    /// Page text can be enormous; the result is bounded the same way other
+    /// large command-tool results are, and a cut says so.
+    #[test]
+    fn enormous_page_text_is_bounded_and_marked() {
+        let huge = "z".repeat(CLI_ENVELOPE_STREAM_MAX_CHARS + 1024);
+        let envelope = web_browse_envelope(
+            "inv",
+            Ok(AgentBrowserOutcome::Completed {
+                success: true,
+                exit_code: Some(0),
+                stdout: huge,
+                stderr: String::new(),
+            }),
+        );
+        let stored = envelope["stdout"].as_str().expect("stdout string");
+        assert!(
+            stored.ends_with("[Output truncated]"),
+            "a truncated page must carry the marker"
+        );
+        assert!(stored.len() <= CLI_ENVELOPE_STREAM_MAX_CHARS + "[Output truncated]".len() + 2);
+    }
+
+    /// Hard offline mode must refuse a remote URL before any child spawns —
+    /// the same posture as every other outbound path. Takes the crate's single
+    /// env lock rather than inventing a second one.
+    ///
+    /// Deliberately no permissive half: proving the guard inert would mean
+    /// letting a real browser actually dial the URL, which a unit test must
+    /// not do. The inert direction is pinned by `prism_runtime::offline`'s
+    /// own tests.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn offline_mode_refuses_remote_browse() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let refused = agent_browser_read("https://example.org/")
+            .await
+            .expect_err("a remote URL must be refused under PRISM_OFFLINE=1");
+        assert!(
+            refused.contains("offline mode"),
+            "the refusal must identify the offline policy: {refused}"
+        );
+    }
+
+    /// A child that ignores its args and exits cleanly surfaces its stdout as
+    /// a successful read; one that fails surfaces the failure. Uses a real
+    /// temp script, no network.
+    ///
+    /// The timeout here is deliberately generous. This test asserts OUTCOME
+    /// PLUMBING, not latency — the scripts finish in milliseconds — so the
+    /// window only has to be wide enough that a loaded machine cannot turn a
+    /// completed child into a spurious `TimedOut`. It did exactly that once:
+    /// a 5-second window failed under a full-workspace run competing with a
+    /// corpus ingest, then passed 3/3 in ~0.2s alone. Timeout BEHAVIOUR is
+    /// covered by its own test, which keeps a short window on purpose.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_child_outcomes_flow_through_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ok_bin = dir.path().join("ab-ok");
+        std::fs::write(&ok_bin, "#!/bin/sh\nprintf 'PAGE TEXT'\n").expect("write");
+        let mut perms = std::fs::metadata(&ok_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ok_bin, perms).unwrap();
+
+        let outcome = agent_browser_read_cmd(
+            TokioCommand::new(ok_bin.to_str().unwrap()),
+            "http://127.0.0.1:9/",
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("offline check passes for a dummy check");
+        match outcome {
+            AgentBrowserOutcome::Completed {
+                success,
+                exit_code,
+                stdout,
+                ..
+            } => {
+                assert!(success);
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(stdout, "PAGE TEXT");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        let bad_bin = dir.path().join("ab-bad");
+        std::fs::write(&bad_bin, "#!/bin/sh\necho 'boom' >&2\nexit 7\n").expect("write");
+        let mut perms = std::fs::metadata(&bad_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bad_bin, perms).unwrap();
+
+        let outcome = agent_browser_read_cmd(
+            TokioCommand::new(bad_bin.to_str().unwrap()),
+            "http://127.0.0.1:9/",
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("spawn itself succeeds");
+        match outcome {
+            AgentBrowserOutcome::Completed {
+                success,
+                exit_code,
+                stderr,
+                ..
+            } => {
+                assert!(!success);
+                assert_eq!(exit_code, Some(7));
+                assert!(stderr.contains("boom"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// A child that never returns is killed at the window's edge and reported
+    /// as a timeout — not as a success, and not as a hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_browser_is_reported_as_a_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sleeper = dir.path().join("ab-sleep");
+        std::fs::write(&sleeper, "#!/bin/sh\nsleep 30\n").expect("write");
+        let mut perms = std::fs::metadata(&sleeper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sleeper, perms).unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = agent_browser_read_cmd(
+            TokioCommand::new(sleeper.to_str().unwrap()),
+            "http://127.0.0.1:9/",
+            Duration::from_millis(400),
+        )
+        .await
+        .expect("timeout is an outcome, not an Err");
+        assert!(
+            matches!(outcome, AgentBrowserOutcome::TimedOut { .. }),
+            "a hung child must be reported as timed out, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the window must actually bound the wait"
+        );
+
+        let envelope = web_browse_envelope("agent-browser read https://x/", Ok(outcome));
+        assert_eq!(envelope["timed_out"], json!(true));
+        assert_eq!(envelope["success"], json!(false));
+    }
+
+    /// End-to-end through the public executor entry point: a missing `url`
+    /// must fail at argument validation before any child could spawn.
+    #[tokio::test]
+    async fn executor_entry_point_rejects_a_missing_url() {
+        let error = execute_command_tool_with_platform_access(
+            &CommandToolRuntime::default(),
+            "web_browse",
+            &json!({}),
+            None,
+            CommandToolPlatformAccess::LocalOnly,
+        )
+        .await
+        .expect_err("web_browse without a url must fail");
+        assert!(
+            error.to_string().contains("url"),
+            "the refusal must name the missing field: {error}"
         );
     }
 }

@@ -36,6 +36,19 @@ impl SemanticValidationPolicy {
         Ok(())
     }
 
+    /// Fill the triple-plausibility prior's eligible fact kinds from the
+    /// ACTIVE ONTOLOGY's declaration when the policy does not pin its own
+    /// list. The default list is no longer a materials-shaped Rust constant:
+    /// EMMO's adapter declares `composition`/`contains`, an induced ontology
+    /// declares the kinds its artifact typed, and anything else stays empty —
+    /// in which case the check reports `Unavailable` over zero candidates
+    /// instead of silently passing. An explicit config override wins.
+    pub fn resolve_eligible_fact_kinds(&mut self, ontology: &dyn crate::ontologies::Ontology) {
+        if self.triple_plausibility.eligible_fact_kinds.is_empty() {
+            self.triple_plausibility.eligible_fact_kinds = ontology.numeric_prior_fact_kinds();
+        }
+    }
+
     fn any_enabled(&self) -> bool {
         self.near_duplicate.enabled || self.typing.enabled || self.triple_plausibility.enabled
     }
@@ -183,10 +196,14 @@ pub struct TriplePlausibilityPolicy {
     /// Smallest compatible prior neighborhood used for a judgement. `3`
     /// prevents one noisy stored assertion from masquerading as consensus.
     pub minimum_prior_examples: usize,
-    /// Fact kinds eligible for the numeric prior. The default restricts the
-    /// check to unconditioned composition fractions (`composition` and
-    /// `contains`); measurement conditions are not represented in
-    /// `LocalFact`, so comparing them would be unreliable.
+    /// Fact kinds eligible for the numeric prior. EMPTY BY DESIGN: the
+    /// default SOURCE is the active ontology's declaration
+    /// (`Ontology::numeric_prior_fact_kinds` — EMMO declares the two
+    /// fraction-like kinds), resolved by the caller before the run. A
+    /// non-empty value here is an explicit config override. An ontology
+    /// that declares no such kinds leaves the list empty and the check
+    /// reports `Unavailable` over zero candidates — honest, never a
+    /// materials-shaped Rust default.
     pub eligible_fact_kinds: Vec<String>,
     /// Relative numeric deviation that reduces value agreement to zero.
     /// `0.25` is intentionally tolerant of reporting/rounding variation; it
@@ -220,7 +237,7 @@ impl Default for TriplePlausibilityPolicy {
             maximum_neighbor_distance: 0.20,
             maximum_neighbors_per_triple: 8,
             minimum_prior_examples: 3,
-            eligible_fact_kinds: vec!["composition".into(), "contains".into()],
+            eligible_fact_kinds: Vec::new(),
             numeric_relative_tolerance: 0.25,
             numeric_scale_floor: 0.01,
             extractor_confidence_weight: 0.60,
@@ -255,14 +272,13 @@ impl TriplePlausibilityPolicy {
                 self.minimum_prior_examples, self.maximum_neighbors_per_triple
             ));
         }
-        if self.eligible_fact_kinds.is_empty()
-            || self
-                .eligible_fact_kinds
-                .iter()
-                .any(|kind| kind.trim().is_empty())
+        if self
+            .eligible_fact_kinds
+            .iter()
+            .any(|kind| kind.trim().is_empty())
         {
             return Err(
-                "triple_plausibility.eligible_fact_kinds must contain non-empty kinds".to_string(),
+                "triple_plausibility.eligible_fact_kinds must not contain empty kinds".to_string(),
             );
         }
         if !self.numeric_relative_tolerance.is_finite() || self.numeric_relative_tolerance <= 0.0 {
@@ -1287,6 +1303,26 @@ async fn check_triples<'a>(
         .enumerate()
         .filter(|(_, fact)| triple_candidate(fact, policy))
         .collect();
+    // A check that examined nothing has not passed — it did not run.
+    //
+    // `triple_candidate` admits a fact only if its kind is in
+    // `eligible_fact_kinds`, which is EMPTY BY DEFAULT and resolved from
+    // the active ontology's declaration before the run. For an ontology
+    // that declares no such kinds, `candidates` is empty, and reporting
+    // `Applied` + `passed: true` over zero facts tells the operator a
+    // plausibility check cleared their graph when it never looked at it.
+    // Saying "did not apply, and why" is the only honest answer.
+    if candidates.is_empty() {
+        return unfinished_check(
+            0,
+            SemanticValidationStatus::Unavailable,
+            format!(
+                "no fact of an eligible kind to check: this check reads kinds {:?}, \
+                 and the run produced none. It did NOT pass — it did not run.",
+                policy.eligible_fact_kinds
+            ),
+        );
+    }
     let probes: Vec<_> = candidates
         .iter()
         .filter_map(|(probe_id, fact)| {
@@ -2082,6 +2118,11 @@ mod tests {
             triple_plausibility: TriplePlausibilityPolicy {
                 minimum_prior_examples: 1,
                 minimum_combined_score: 0.40,
+                // CONTRACT CHANGE: eligible kinds default to EMPTY and are
+                // resolved from the active ontology's declaration in
+                // production. These tests pin fraction-kind behaviour, so
+                // they state the EMMO declaration the pipeline would resolve.
+                eligible_fact_kinds: vec!["composition".into(), "contains".into()],
                 ..TriplePlausibilityPolicy::default()
             },
         };
@@ -2146,6 +2187,11 @@ mod tests {
             },
             triple_plausibility: TriplePlausibilityPolicy {
                 minimum_prior_examples: 1,
+                // CONTRACT CHANGE: eligible kinds default to EMPTY and are
+                // resolved from the active ontology's declaration in
+                // production. These tests pin fraction-kind behaviour, so
+                // they state the EMMO declaration the pipeline would resolve.
+                eligible_fact_kinds: vec!["composition".into(), "contains".into()],
                 ..TriplePlausibilityPolicy::default()
             },
         };
@@ -2174,6 +2220,75 @@ mod tests {
         assert_eq!(batch.report.triple_plausibility.candidates, 1);
         assert_eq!(batch.report.triple_plausibility.evaluated, 0);
         assert_eq!(batch.report.triple_plausibility.passed, None);
+    }
+
+    /// A check that examined NOTHING must not report that it passed.
+    ///
+    /// `triple_candidate` admits only facts whose kind is in
+    /// `eligible_fact_kinds`. An ontology that does not use those kinds
+    /// yields zero candidates, and the check used to answer `Applied` with
+    /// `passed: Some(true)` — telling the operator their graph cleared a
+    /// plausibility check that never looked at a single fact. By the standing
+    /// rule, a lying check is worse than a missing one.
+    #[tokio::test]
+    async fn a_check_with_no_eligible_facts_reports_unavailable_not_passed() {
+        let (_dir, store) = open_store().await;
+        // A fact of a kind this check does not read — as any non-materials
+        // ontology's facts would be.
+        let ineligible = LocalFact {
+            subject: "Subject A".into(),
+            predicate: "HAS_OBLIGATION".into(),
+            object: "Obligation B".into(),
+            value: None,
+            unit: None,
+            confidence: Some(0.9),
+            kind: Some("obligation".into()),
+        };
+        let policy = SemanticValidationPolicy {
+            near_duplicate: NearDuplicatePolicy {
+                enabled: false,
+                ..NearDuplicatePolicy::default()
+            },
+            typing: TypingPolicy {
+                enabled: false,
+                ..TypingPolicy::default()
+            },
+            triple_plausibility: TriplePlausibilityPolicy::default(),
+        };
+
+        let batch = validate_write_with_backend(
+            &store,
+            &[
+                proposal("Subject A", "Alloy", None),
+                proposal("Obligation B", "Element", None),
+            ],
+            &[ineligible],
+            "local",
+            &policy,
+            Some(&CountingEmbed::new()),
+        )
+        .await;
+
+        assert_eq!(
+            batch.report.triple_plausibility.status,
+            SemanticValidationStatus::Unavailable,
+            "zero eligible facts means the check did not run"
+        );
+        assert_eq!(
+            batch.report.triple_plausibility.passed, None,
+            "it must NOT claim to have passed"
+        );
+        assert_eq!(batch.report.triple_plausibility.evaluated, 0);
+        let message = batch
+            .report
+            .triple_plausibility
+            .message
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            message.contains("did NOT pass"),
+            "the reason must say so plainly, got: {message:?}"
+        );
     }
 
     #[tokio::test]
@@ -2266,7 +2381,10 @@ mod tests {
             "the swapped fractions must evade sum-only arithmetic: {:?}",
             structural.issues
         );
-        let (facts, dropped) = crate::local_facts::to_local_facts(&extracted);
+        let (facts, dropped) = crate::local_facts::to_semantic_local_facts(
+            &extracted,
+            &crate::ontologies::EmmoOntology,
+        );
         assert!(dropped.is_empty());
         let entities: Vec<_> = extracted
             .entities
@@ -2283,12 +2401,23 @@ mod tests {
         let before_vectors = store.entity_embedding_count("local").await.unwrap();
         let backend = CountingEmbed::new();
 
+        // CONTRACT CHANGE: eligible kinds default to EMPTY and resolve from
+        // the active ontology's declaration in production; this test pins
+        // fraction-kind behaviour, so it states the EMMO declaration the
+        // pipeline would resolve.
+        let policy = SemanticValidationPolicy {
+            triple_plausibility: TriplePlausibilityPolicy {
+                eligible_fact_kinds: vec!["composition".into(), "contains".into()],
+                ..TriplePlausibilityPolicy::default()
+            },
+            ..SemanticValidationPolicy::default()
+        };
         let batch = validate_write_with_backend(
             &store,
             &entities,
             &facts,
             "local",
-            &SemanticValidationPolicy::default(),
+            &policy,
             Some(&backend),
         )
         .await;

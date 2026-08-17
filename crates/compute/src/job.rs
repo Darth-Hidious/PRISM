@@ -23,8 +23,15 @@ const JOBS_FILE: &str = "compute-jobs.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobTarget {
     Local,
-    Marc27 { api_base: String },
+    Marc27 {
+        api_base: String,
+    },
     Byoc(ByocTarget),
+    /// A HyperQueue server directory owned by PRISM; combined with
+    /// [`JobRecord::hyperqueue_job_id`] this is enough to resume polling.
+    HyperQueue {
+        server_dir: PathBuf,
+    },
 }
 
 /// Metadata for a tracked job.
@@ -38,6 +45,10 @@ pub struct JobRecord {
     /// Numeric scheduler id returned by `sbatch`; populated for SLURM jobs.
     #[serde(default)]
     pub slurm_job_id: Option<u64>,
+    /// Numeric job id returned by `hq job submit-file`; populated for
+    /// HyperQueue task sets.
+    #[serde(default)]
+    pub hyperqueue_job_id: Option<u32>,
     pub status: TrackedStatus,
     pub submitted_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -143,22 +154,54 @@ impl JobTracker {
         target: JobTarget,
         slurm_job_id: Option<u64>,
     ) -> Result<JobRecord> {
+        let mut record = Self::new_record(job_id, name, image, backend, target);
+        record.slurm_job_id = slurm_job_id;
+        self.insert(record.clone()).await?;
+        Ok(record)
+    }
+
+    /// Register a job together with the job id returned by `hq submit-file`.
+    pub async fn register_with_hyperqueue_job_id(
+        &self,
+        job_id: Uuid,
+        name: &str,
+        image: &str,
+        backend: &str,
+        target: JobTarget,
+        hyperqueue_job_id: Option<u32>,
+    ) -> Result<JobRecord> {
+        let mut record = Self::new_record(job_id, name, image, backend, target);
+        record.hyperqueue_job_id = hyperqueue_job_id;
+        self.insert(record.clone()).await?;
+        Ok(record)
+    }
+
+    fn new_record(
+        job_id: Uuid,
+        name: &str,
+        image: &str,
+        backend: &str,
+        target: JobTarget,
+    ) -> JobRecord {
         let now = Utc::now();
-        let record = JobRecord {
+        JobRecord {
             job_id,
             name: name.to_string(),
             image: image.to_string(),
             backend: backend.to_string(),
             target,
-            slurm_job_id,
+            slurm_job_id: None,
+            hyperqueue_job_id: None,
             status: TrackedStatus::Queued,
             submitted_at: now,
             updated_at: now,
-        };
+        }
+    }
+
+    async fn insert(&self, record: JobRecord) -> Result<()> {
         let mut jobs = self.jobs.write().await;
-        jobs.insert(job_id, record.clone());
-        self.persist(&jobs)?;
-        Ok(record)
+        jobs.insert(record.job_id, record);
+        self.persist(&jobs)
     }
 
     /// Update and persist the status of an existing job.
@@ -519,7 +562,7 @@ mod tests {
             user: "researcher".into(),
             partition: "gpu".into(),
             config: Box::new(SlurmJobConfig {
-                account: Some("esa-materials".into()),
+                account: Some("research-alloc".into()),
                 sif_path: "/shared/prism-worker.sif".into(),
                 ..SlurmJobConfig::default()
             }),
@@ -552,6 +595,73 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn job_target_hyperqueue_serde_roundtrip() {
+        let target = JobTarget::HyperQueue {
+            server_dir: PathBuf::from("/data/prism/hyperqueue"),
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        let parsed: JobTarget = serde_json::from_str(&json).unwrap();
+        match parsed {
+            JobTarget::HyperQueue { server_dir } => {
+                assert_eq!(server_dir, Path::new("/data/prism/hyperqueue"))
+            }
+            other => panic!("expected HyperQueue target, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hyperqueue_job_id_persists_across_process_instances() {
+        let data_dir =
+            std::env::temp_dir().join(format!("prism-compute-hq-test-{}", Uuid::new_v4()));
+        let id = Uuid::new_v4();
+        let target = JobTarget::HyperQueue {
+            server_dir: data_dir.join("hyperqueue"),
+        };
+
+        let first = JobTracker::persistent(&data_dir).unwrap();
+        first
+            .register_with_hyperqueue_job_id(
+                id,
+                "corpus-ingest",
+                "ignored-by-hyperqueue",
+                "hyperqueue",
+                target,
+                Some(7),
+            )
+            .await
+            .unwrap();
+        drop(first);
+
+        let second = JobTracker::persistent(&data_dir).unwrap();
+        let record = second.get(id).await.unwrap();
+        assert_eq!(record.backend, "hyperqueue");
+        assert_eq!(record.hyperqueue_job_id, Some(7));
+        assert!(matches!(record.target, JobTarget::HyperQueue { .. }));
+
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_records_deserialise_without_hyperqueue_fields() {
+        // compute-jobs.json written before HyperQueue existed has neither
+        // the record field nor the target variant; it must still load.
+        let record = serde_json::json!({
+            "job_id": Uuid::new_v4(),
+            "name": "legacy",
+            "image": "img",
+            "backend": "local",
+            "target": "Local",
+            "slurm_job_id": null,
+            "status": "Queued",
+            "submitted_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let parsed: JobRecord = serde_json::from_value(record).unwrap();
+        assert_eq!(parsed.hyperqueue_job_id, None);
+        assert!(matches!(parsed.target, JobTarget::Local));
     }
 
     #[tokio::test]

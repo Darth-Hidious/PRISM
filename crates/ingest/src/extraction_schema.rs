@@ -1,13 +1,8 @@
 //! The extraction JSON schema, derived from the ACTIVE ontology.
 //!
-//! Everything enum-locked here comes from the same declarations the prompt
-//! and the validator already read: entity types and relationship types from
-//! [`Ontology::classes`] / [`Ontology::relations`], the unit vocabulary from
-//! [`crate::qudt_units::EXTRACTION_UNITS`]. With `response_format:
-//! json_schema` the decoder becomes the third leg of the one-declaration
-//! contract — the model is structurally incapable of emitting an undeclared
-//! class, an undeclared relation, or a non-QUDT unit, instead of being asked
-//! nicely in prose and repaired downstream.
+//! Entity and relationship enums come from the same active-ontology
+//! declarations the prompt and validator read. Unit terms remain open strings:
+//! the active ontology and model own their vocabulary, not a Rust enum.
 //!
 //! What the schema deliberately does NOT lock: entity `properties` stays an
 //! open object (extra keys as primitive values) because compositions and
@@ -15,15 +10,12 @@
 //! `unit` members are typed. The one field-use rule the schema DOES enforce
 //! is per-type: the active ontology's quantitative classes
 //! ([`Ontology::quantitative_labels`]) get a `oneOf` variant REQUIRING the
-//! `value` and `unit` members (nullable — the authoritative home for a
+//! `value` member (nullable — the authoritative home for a
 //! measured number is the per-edge relationship channel), because "the
 //! vocabulary of each field" was never enough — the model satisfied the
-//! enum-locked schema by naming a Property `"1100 MPa"` with an empty
-//! properties bag. And form is all a grammar can give — a density carrying
-//! a legal-but-wrong pressure unit still decodes, which is why
-//! [`crate::graph_validation`] checks quantity kinds after the fact, and a
-//! measurement packed into the NAME still decodes, which is why it also
-//! rejects those.
+//! enum-locked schema by putting a numeric claim in an entity name with an
+//! empty properties bag. A grammar only constrains form; semantic
+//! interpretation remains the ontology-aware reader's job.
 //!
 //! Interop note: `additionalProperties` as a typed sub-schema is what
 //! llama-server and vLLM's converters accept; OpenAI's `strict` mode
@@ -35,7 +27,6 @@
 use prism_llm::JsonSchemaSpec;
 
 use crate::ontologies::Ontology;
-use crate::qudt_units;
 
 /// Build the tabular-extraction JSON schema for the ACTIVE ontology. The
 /// shape mirrors the wire format `crate::ontology`'s parser expects
@@ -56,11 +47,6 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
         .flat_map(|decl| decl.extraction_labels.iter())
         .map(String::as_str)
         .collect();
-    let units: Vec<&str> = qudt_units::EXTRACTION_UNITS
-        .iter()
-        .map(|(id, _)| *id)
-        .collect();
-
     // One entity-item builder for both variants below: `types` locks the
     // `type` enum, `required_members` is what the `properties` object must
     // carry. The value/unit member schemas and the primitive-extras rule
@@ -76,7 +62,7 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
                     "properties": {
                         "value": {"type": ["number", "string", "null"]},
                         "unit": {"anyOf": [
-                            {"type": "string", "enum": units},
+                            {"type": "string", "minLength": 1},
                             {"type": "null"}
                         ]},
                     },
@@ -94,8 +80,8 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
 
     // Per-type variants — the field-use half the enum lock alone cannot
     // give. The active ontology's quantitative classes (its declaration,
-    // `Ontology::quantitative_labels`) REQUIRE the `value` and `unit`
-    // members: the model can no longer satisfy the schema by naming a
+    // `Ontology::quantitative_labels`) REQUIRE the `value` member: the model
+    // can no longer satisfy the schema by naming a
     // Property "1100 MPa" with an empty properties bag (measured live
     // 2026-08-08 — value and unit stored as text inside the entity NAME,
     // nothing queryable as a number). Both members stay NULLABLE: the
@@ -103,9 +89,7 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
     // relationship `value`/`unit` below (a value on a SHARED property node
     // attributes to nobody — live 2026-08-10: one node's 880 was stored as
     // five alloys' yield strength), so a shared property node must be able
-    // to say `null` honestly, and a closed-enum unit must never be forced
-    // onto a quantity outside the vocabulary (Vickers hardness is absent
-    // deliberately). Everything else keeps the historical open shape, so an
+    // to say `null` honestly. Everything else keeps the historical open shape, so an
     // ontology with no quantitative classes emits a byte-identical schema.
     let quantitative: Vec<&str> = ontology.quantitative_labels();
     let other_types: Vec<&str> = entity_types
@@ -116,7 +100,7 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
     let entity_items = if quantitative.is_empty() {
         entity_item(&entity_types, &[])
     } else {
-        let quantitative_item = entity_item(&quantitative, &["value", "unit"]);
+        let quantitative_item = entity_item(&quantitative, &["value"]);
         if other_types.is_empty() {
             quantitative_item
         } else {
@@ -132,22 +116,19 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
     //
     // Relationship variants are split BY RELATION: the declared measurement
     // relations (`Ontology::measurement_relations`) become two dedicated
-    // variants — a measured edge whose typed `value` and enum-locked `unit`
-    // are REQUIRED and which has NO `weight`/`order` members at all, and a
+    // variants — a measured edge whose typed `value` is required, whose
+    // optional `unit` is either null or a non-empty exact term, and which has
+    // NO `weight`/`order` members at all, plus a
     // bare property link with endpoints plus optional confidence — while
     // every other relation keeps its historical data fields (weight/order,
     // no value/unit) plus optional confidence. Each
-    // exclusion is a measured escape hatch, closed: with `unit` merely
-    // optional the live 12B model emitted every per-row value and not one
-    // unit (2026-08-10 run 2 — all ten numeric facts honestly dropped
-    // unit-less), and with `weight` available on the same edge it put every
+    // exclusion is a measured escape hatch, closed: with `weight` available
+    // on the same edge a model can put every
     // number THERE and satisfied the grammar without ever entering the
     // measured variant (run 3 — all ten values silently unmappable). A
-    // measured quantity on an edge has exactly one domain-value channel, and
-    // that channel demands its unit from the ONE declared vocabulary; the
-    // separately named probability field is bounded to `[0, 1]`. A quantity
-    // with no unit in the vocabulary is stated as a bare link — no measured
-    // value, never a guessed unit.
+    // measured quantity on an edge has exactly one domain-value channel. Unit
+    // absence is representable without a semantic verdict; a supplied term
+    // must be non-empty. The separately named probability field is bounded.
     let measurement_rels: Vec<&str> = ontology.measurement_relations();
     let plain_rels: Vec<&str> = relationship_types
         .iter()
@@ -192,13 +173,16 @@ pub fn extraction_json_schema(ontology: &dyn Ontology) -> JsonSchemaSpec {
                 "rel": {"type": "string", "enum": measurement_rels},
                 "to": {"type": "string"},
                 "value": {"type": ["number", "string"]},
-                "unit": {"type": "string", "enum": units},
+                "unit": {"anyOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "null"}
+                ]},
                 "confidence": {"anyOf": [
                     {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     {"type": "null"}
                 ]},
             },
-            "required": ["from", "rel", "to", "value", "unit"],
+            "required": ["from", "rel", "to", "value"],
             "additionalProperties": false,
         });
         let bare_property_link = serde_json::json!({
@@ -265,6 +249,9 @@ mod tests {
                     .map(|(index, label)| RelationDecl {
                         iri: Iri::new(format!("https://example.test/chem#rel{index}")).unwrap(),
                         pref_label: Some((*label).into()),
+                        parents: Vec::new(),
+                        domains: Vec::new(),
+                        ranges: Vec::new(),
                         extraction_labels: vec![(*label).into()],
                     })
                     .collect(),
@@ -395,40 +382,37 @@ mod tests {
         }
     }
 
-    /// The unit enum is the ONE declared QUDT vocabulary — same table the
-    /// quantity-kind validator reads, so decoder and validator cannot drift.
-    /// Checked in BOTH per-type variants: the quantitative one and the open
-    /// one carry the same vocabulary.
     #[test]
-    fn unit_enum_is_the_shared_qudt_declaration() {
+    fn unit_terms_are_nonempty_and_vocabulary_neutral() {
+        // CONTRACT CHANGE: the schema used to enumerate a Rust-owned unit
+        // vocabulary. Both entity variants now admit any non-empty term so a
+        // promoted customer ontology needs no Rust edit.
         let spec = extraction_json_schema(&EmmoOntology);
-        let declared: Vec<String> = qudt_units::EXTRACTION_UNITS
-            .iter()
-            .map(|(id, _)| (*id).to_string())
-            .collect();
         for variant in 0..2 {
-            let unit_enum = enum_values(
-                &spec.schema,
-                &format!(
+            let unit = spec
+                .schema
+                .pointer(&format!(
                     "/properties/entities/items/oneOf/{variant}\
-                     /properties/properties/properties/unit/anyOf/0/enum"
-                ),
-            );
-            assert_eq!(unit_enum, declared, "variant {variant}");
-            // And the identifiers the wild emits unconstrained are NOT legal.
-            assert!(!unit_enum.iter().any(|u| u == "MPa" || u == "g/cm3"));
+                     /properties/properties/properties/unit/anyOf/0"
+                ))
+                .expect("entity unit string schema");
+            assert_eq!(unit["type"], "string", "variant {variant}");
+            assert_eq!(unit["minLength"], 1, "variant {variant}");
+            assert!(unit.get("enum").is_none(), "variant {variant}: {unit}");
         }
     }
 
     /// THE per-type contract, pinned at the production schema builder: the
     /// quantitative variant's `type` enum is exactly the active ontology's
-    /// quantitative declaration, its `properties` REQUIRES `value` and
-    /// `unit`, and its `value` admits no null — while the open variant
+    /// quantitative declaration, its `properties` requires `value`, and its
+    /// optional unit stays vocabulary-neutral — while the open variant
     /// keeps the historical no-requirement shape and excludes the
     /// quantitative labels. Dropping the requirement (the mutation that
     /// re-opens "Property named 1100 MPa with an empty bag") kills this.
     #[test]
-    fn quantitative_types_require_typed_value_and_unit() {
+    fn quantitative_types_require_value_but_leave_unit_absence_neutral() {
+        // CONTRACT CHANGE: an omitted/null unit is semantically neutral, so
+        // only the value field is required on this structural variant.
         let spec = extraction_json_schema(&EmmoOntology);
         let quant = spec
             .schema
@@ -451,13 +435,12 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             required,
-            ["value", "unit"],
-            "a quantitative entity must be REQUIRED to carry value and unit"
+            ["value"],
+            "a quantitative entity must carry value without requiring a unit"
         );
         // Both members stay NULLABLE: the per-edge relationship channel is
         // the authoritative home for a measured number (a shared property
-        // node must be able to say null honestly), and a closed-enum unit
-        // must never be forced onto an out-of-vocabulary quantity.
+        // node must be able to say null honestly).
         assert_eq!(
             quant.pointer("/properties/properties/properties/value/type"),
             Some(&serde_json::json!(["number", "string", "null"])),
@@ -479,11 +462,10 @@ mod tests {
         );
     }
 
-    /// The per-edge measurement channel is on the wire, and every measured-value
-    /// escape hatch is CLOSED: the measured-edge variant carries the
-    /// declared measurement relations only and REQUIRES a non-null `value`
-    /// with a non-null, enum-locked `unit` (with `unit` optional, the live
-    /// 12B model emitted every per-row value and not one unit — run 2);
+    /// The per-edge measurement channel is on the wire: the measured-edge
+    /// variant carries the declared measurement relations and requires a
+    /// non-null `value`; an absent/null unit is neutral, while a supplied
+    /// term must be non-empty.
     /// neither the measured edge nor the bare property link declares
     /// `weight`/`order` at all (with `weight` available, the same model put
     /// every number there and never entered the measured variant — run 3);
@@ -492,11 +474,9 @@ mod tests {
     /// tested optional bounded confidence field. Weakening any of these is
     /// the mutation this test exists to kill.
     #[test]
-    fn measured_edges_couple_value_to_unit_and_offer_no_numeric_escape() {
-        let declared_units: Vec<String> = qudt_units::EXTRACTION_UNITS
-            .iter()
-            .map(|(id, _)| (*id).to_string())
-            .collect();
+    fn measured_edges_keep_units_optional_and_vocabulary_neutral() {
+        // CONTRACT CHANGE: a measured value no longer universally requires a
+        // unit. Present terms are structurally non-empty and never enumerated.
         let spec = extraction_json_schema(&EmmoOntology);
         let items = spec
             .schema
@@ -511,18 +491,23 @@ mod tests {
         );
         assert_eq!(
             measured.pointer("/required"),
-            Some(&serde_json::json!(["from", "rel", "to", "value", "unit"])),
-            "stating a value must REQUIRE stating its unit"
+            Some(&serde_json::json!(["from", "rel", "to", "value"])),
+            "the schema must not turn unit absence into a semantic verdict"
         );
         assert_eq!(
             measured.pointer("/properties/value/type"),
             Some(&serde_json::json!(["number", "string"])),
             "a measured value admits no null"
         );
+        let unit = measured
+            .pointer("/properties/unit/anyOf/0")
+            .expect("measured unit string schema");
+        assert_eq!(unit["type"], "string");
+        assert_eq!(unit["minLength"], 1);
+        assert!(unit.get("enum").is_none(), "{unit}");
         assert_eq!(
-            enum_values(measured, "/properties/unit/enum"),
-            declared_units,
-            "the edge unit is the ONE declared vocabulary, non-null"
+            measured.pointer("/properties/unit/anyOf/1/type"),
+            Some(&serde_json::json!("null"))
         );
         assert!(
             measured.pointer("/properties/weight").is_none()

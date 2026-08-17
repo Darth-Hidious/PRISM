@@ -326,7 +326,10 @@ _PREDICT_DESCRIPTION = (
     "training holdout metrics, featurizer identity, `reproduce` string). "
     "A predicted value is only as good as those metrics — report them with "
     "the number. `unit: 'unknown'` means the model was trained on a column "
-    "whose unit PRISM was never told; do not invent one."
+    "whose unit PRISM was never told; do not invent one. After predicting, "
+    "cross-check the predicted property against the literature with "
+    "prior_art_search to see whether published values agree with the model "
+    "output — never present a prediction as settled fact."
 )
 
 _PREDICT_SCHEMA = {

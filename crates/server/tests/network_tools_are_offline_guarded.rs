@@ -45,6 +45,7 @@ const ACTIVE_MARKERS: &[&str] = &[
     "Command::new(\"gh\")",
     "Command::new(\"hf\")",
     "Command::new(\"ollama\")",
+    "Command::new(\"agent-browser\")",
     "args([\"pull\"",
     "\"-m\", \"pip\", \"install\"",
     "\"--pull\"",
@@ -92,6 +93,7 @@ const ALLOWED_UNGUARDED: &[(&str, &str)] = &[];
 /// fails here and forces the question "did the spawn move, or did the marker
 /// stop seeing it?" to be answered in review rather than by silence.
 const EXPECTED_SPAWNERS: &[&str] = &[
+    "agent/src/command_tools.rs",
     "agent/src/protocol.rs",
     "cli/src/main.rs",
     "cli/src/pyiron_cmd.rs",

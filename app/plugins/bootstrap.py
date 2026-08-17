@@ -354,7 +354,11 @@ def build_full_registry(
     except Exception:
         logger.exception("structure_desc tools registration failed")
 
-    # Plugins (entry points + local — can register into ANY sub-registry)
+    # Plugins (entry points + local — can register into ANY sub-registry).
+    # STANDARD PLUGIN CONTRACT: a failure here is loud and named (the
+    # loader logs + records per-plugin failures); this outer guard only
+    # covers the plugin SUBSYSTEM ITSELF failing to start, which must not
+    # take the tool registry down with it — but it may not be silent.
     if enable_plugins:
         try:
             from app.tools.data_collectors.base_collector import CollectorRegistry
@@ -372,7 +376,7 @@ def build_full_registry(
             )
             discover_all_plugins(plugin_reg)
         except Exception:
-            pass
+            logger.exception("plugin subsystem failed to start; continuing without plugins")
 
     # Spark data processing tools (optional — pyspark may not be installed)
     try:

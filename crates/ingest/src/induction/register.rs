@@ -16,13 +16,14 @@
 //! materialised TTL backing the declaration.
 
 use anyhow::{Context, Result, bail};
+use prism_provenance::QuantitySignDomain;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{
-    InducedOntology, OntologyStatus, class_slug, domain_namespace, rel_type_token, relation_slug,
-    validate,
+    InducedFactKind, InducedOntology, OntologyStatus, class_slug, domain_namespace, rel_type_token,
+    relation_slug, validate,
 };
 use crate::ontologies::{ClassDecl, Iri, Ontology, RelationDecl};
 
@@ -44,6 +45,35 @@ struct InducedVocabulary {
     relations: Vec<RelationDecl>,
     /// Direct-parent map (IRI string → parent IRI strings) for `is_a`.
     parents: HashMap<String, Vec<String>>,
+    /// `prism:signDomain` annotations from the artifact, keyed by class IRI.
+    sign_domains: HashMap<String, QuantitySignDomain>,
+    /// Class IRI by every name a reader may bind — the IRI itself, the
+    /// prefLabel and the extraction label — so [`Ontology::quantity_sign_domain`]
+    /// answers whichever identity the fact carried.
+    class_iri_by_name: HashMap<String, String>,
+    /// Extraction tokens of the relations the artifact typed, grouped by the
+    /// store's typed fact shape. Empty for a kind the ontology never
+    /// declared — those relations stay generic edges, which is honest.
+    fact_kind_relations: HashMap<InducedFactKind, Vec<String>>,
+    /// The RANGE class extraction label of the first relation declaring each
+    /// typed fact shape — the ontology's own class for that shape's object
+    /// node, served through [`Ontology::fact_graph_shape`].
+    fact_kind_ranges: HashMap<InducedFactKind, String>,
+    /// Extraction labels of the classes that STATE a measured quantity: the
+    /// ranges of the declared measurement relations, plus everything below
+    /// them in the declared hierarchy — the same at-or-below rule the
+    /// built-in vocabulary applies to its own property root.
+    quantitative_labels: Vec<String>,
+}
+
+impl InducedVocabulary {
+    /// The declared extraction tokens for one typed fact shape.
+    fn relations_of_kind(&self, kind: InducedFactKind) -> Vec<&str> {
+        self.fact_kind_relations
+            .get(&kind)
+            .map(|tokens| tokens.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
 }
 
 impl Ontology for InducedVocabulary {
@@ -92,6 +122,133 @@ impl Ontology for InducedVocabulary {
         }
         false
     }
+
+    /// Serves the artifact's `prism:factKind` declarations. WHICH relation
+    /// fills the store's `measurement` shape is the ontology's statement; if
+    /// it declares none, this is empty and every numeric claim is reported as
+    /// unstorable rather than guessed into a frozen English token.
+    fn measurement_relations(&self) -> Vec<&str> {
+        self.relations_of_kind(InducedFactKind::Measurement)
+    }
+
+    fn phase_relations(&self) -> Vec<&str> {
+        self.relations_of_kind(InducedFactKind::Phase)
+    }
+
+    fn processing_relations(&self) -> Vec<&str> {
+        self.relations_of_kind(InducedFactKind::Processing)
+    }
+
+    fn contains_relations(&self) -> Vec<&str> {
+        self.relations_of_kind(InducedFactKind::Contains)
+    }
+
+    /// The artifact's own `prism:factKind` declarations, shaped from its own
+    /// classes and relation tokens: the object node falls back to the
+    /// relation's declared RANGE class, and the typed edge carries the
+    /// relation's own token. The store's edge-prop conventions for the
+    /// value channel (`fraction`, `order`) are wire-format keys, not domain
+    /// vocabulary. A kind the artifact never declared answers `None` — the
+    /// honest generic edge, never a frozen built-in table.
+    fn fact_graph_shape(&self, kind: &str) -> Option<prism_provenance::FactGraphShape> {
+        let induced = super::fact_kind_from_stored(kind)?;
+        let edge_rel_type = self.fact_kind_relations.get(&induced)?.first()?.clone();
+        let object_storage_label = self.fact_kind_ranges.get(&induced)?.clone();
+        Some(match induced {
+            InducedFactKind::Measurement => prism_provenance::FactGraphShape {
+                object_storage_label,
+                edge_rel_type,
+                reified_measurement: true,
+                object_text_prop: None,
+                edge_value_prop: None,
+            },
+            InducedFactKind::Phase => prism_provenance::FactGraphShape {
+                object_storage_label,
+                edge_rel_type,
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: None,
+            },
+            InducedFactKind::Processing => prism_provenance::FactGraphShape {
+                object_storage_label,
+                edge_rel_type,
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: Some("order".into()),
+            },
+            InducedFactKind::Contains => prism_provenance::FactGraphShape {
+                object_storage_label,
+                edge_rel_type,
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: Some("fraction".into()),
+            },
+        })
+    }
+
+    /// Only the `contains` shape carries an unconditioned fraction this
+    /// ontology declared; a kind the artifact never typed is not eligible.
+    fn numeric_prior_fact_kinds(&self) -> Vec<String> {
+        if self
+            .fact_kind_relations
+            .contains_key(&InducedFactKind::Contains)
+        {
+            vec!["contains".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Derived from the declaration, never a frozen list: the range classes
+    /// of the declared measurement relations and their declared descendants.
+    fn quantitative_labels(&self) -> Vec<&str> {
+        self.quantitative_labels
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Serves the artifact's optional `prism:signDomain` annotations — the
+    /// sign constraint lives in the ontology, not in Rust. The query may
+    /// carry any identity the reader bound (class IRI, prefLabel or
+    /// extraction label), and a declaration on a DIMENSIONAL PARENT also
+    /// applies: the walk follows declared ancestors until one carries the
+    /// annotation. No declaration anywhere on that path answers `None` —
+    /// silence, never a guess.
+    ///
+    /// Name resolution is NORMALIZED ([`normalize_label`](super::normalize_label)),
+    /// exactly like every other induction lookup (duplicate detection,
+    /// validate): "Yield Strength", "yield strength" and "yield_strength"
+    /// are ONE class here, so a fact whose object spelling differs in
+    /// case/separators still resolves to the declared sign domain. The old
+    /// exact-match map was a silent false negative on this guard — duplicate
+    /// detection folded the spellings while the sign-domain lookup did not.
+    fn quantity_sign_domain(&self, quantity: &str) -> Option<QuantitySignDomain> {
+        // DEFECT FIX (Part 2): normalized lookup, like validate.rs. Keys in
+        // `class_iri_by_name` are inserted under `normalize_label` (see the
+        // adapter builder); the query folds the same way.
+        let normalized = super::normalize_label(quantity);
+        let root = self
+            .class_iri_by_name
+            .get(&normalized)
+            .map_or(quantity, String::as_str);
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![root];
+        while let Some(current) = stack.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(domain) = self.sign_domains.get(current) {
+                return Some(*domain);
+            }
+            if let Some(parents) = self.parents.get(current) {
+                for parent in parents {
+                    stack.push(parent.as_str());
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Build the registry adapter for a VALID, ACCEPTED ontology.
@@ -112,6 +269,8 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
 
     let mut classes = Vec::with_capacity(ontology.classes.len());
     let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sign_domains: HashMap<String, QuantitySignDomain> = HashMap::new();
+    let mut class_iri_by_name: HashMap<String, String> = HashMap::new();
     for class in &ontology.classes {
         let iri = class_iri(&class.label)?;
         let mut parent_iris = Vec::new();
@@ -125,6 +284,21 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
         }
         let extraction_label = class_slug(&class.label)
             .expect("class_iri above already proved the label mints a local name");
+        // DEFECT FIX (Part 2): keys are NORMALIZED so the lookup in
+        // `quantity_sign_domain` folds case/separators exactly like the
+        // rest of induction (duplicate detection, validate). Inserting the
+        // raw spellings made "yield strength" miss "Yield Strength"'s
+        // declared sign domain — a silent false negative on a guard.
+        for name in [
+            iri.as_str(),
+            class.label.as_str(),
+            extraction_label.as_str(),
+        ] {
+            class_iri_by_name.insert(super::normalize_label(name), iri.as_str().to_string());
+        }
+        if let Some(domain) = class.sign_domain {
+            sign_domains.insert(iri.as_str().to_string(), domain);
+        }
         classes.push(ClassDecl {
             iri,
             pref_label: Some(class.label.clone()),
@@ -140,16 +314,37 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
     }
 
     let mut relations = Vec::with_capacity(ontology.relations.len());
+    // Extraction tokens grouped by the typed fact shape the artifact declares
+    // for each relation, plus the range classes of the MEASUREMENT relations —
+    // those are the ontology's quantity classes, so `quantitative_labels`
+    // follows from the same declaration instead of a second annotation.
+    let mut by_fact_kind: HashMap<InducedFactKind, Vec<String>> = HashMap::new();
+    let mut fact_kind_ranges: HashMap<InducedFactKind, String> = HashMap::new();
+    let mut measured_range_labels: HashSet<String> = HashSet::new();
     for rel in &ontology.relations {
         let slug = relation_slug(&rel.label)
             .ok_or_else(|| anyhow::anyhow!("relation label {:?} mints no IRI", rel.label))?;
         let token = rel_type_token(&rel.label)
             .ok_or_else(|| anyhow::anyhow!("relation label {:?} mints no type token", rel.label))?;
+        if let Some(kind) = rel.fact_kind {
+            by_fact_kind.entry(kind).or_default().push(token.clone());
+            if let Some(range_label) = class_slug(&rel.range) {
+                fact_kind_ranges.entry(kind).or_insert(range_label.clone());
+            }
+            if kind == InducedFactKind::Measurement
+                && let Some(range_label) = class_slug(&rel.range)
+            {
+                measured_range_labels.insert(range_label);
+            }
+        }
         relations.push(RelationDecl {
             iri: Iri::new(format!("{ns}{slug}")).map_err(|e| {
                 anyhow::anyhow!("relation label {:?} mints an invalid IRI: {e}", rel.label)
             })?,
             pref_label: Some(rel.label.clone()),
+            parents: Vec::new(),
+            domains: Vec::new(),
+            ranges: Vec::new(),
             extraction_labels: vec![token],
         });
     }
@@ -161,6 +356,29 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
         )
     })?;
 
+    // A quantity class is the range of a measurement relation, OR anything
+    // declared below one — so an ontology that refines its quantity classes
+    // inherits the typed-value contract without re-annotating each child.
+    let mut quantitative_labels: Vec<String> = Vec::new();
+    for class in &classes {
+        let mut current = Some(class.iri.as_str().to_string());
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(iri) = current {
+            if !seen.insert(iri.clone()) {
+                break;
+            }
+            let is_quantity = class_slug_of_iri(&iri, &classes)
+                .is_some_and(|slug| measured_range_labels.contains(&slug));
+            if is_quantity {
+                quantitative_labels.extend(class.extraction_labels.iter().cloned());
+                break;
+            }
+            current = parents.get(&iri).and_then(|ps| ps.first().cloned());
+        }
+    }
+    quantitative_labels.sort();
+    quantitative_labels.dedup();
+
     Ok(Arc::new(InducedVocabulary {
         id: Box::leak(ontology.domain.clone().into_boxed_str()),
         version_iri,
@@ -168,7 +386,22 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
         classes,
         relations,
         parents,
+        sign_domains,
+        class_iri_by_name,
+        fact_kind_relations: by_fact_kind,
+        fact_kind_ranges,
+        quantitative_labels,
     }))
+}
+
+/// The extraction label (mint slug) of the class an IRI names, if it is one
+/// of `classes`. Used to test a class against the measurement-relation
+/// ranges, which are recorded as slugs.
+fn class_slug_of_iri(iri: &str, classes: &[ClassDecl]) -> Option<String> {
+    classes
+        .iter()
+        .find(|class| class.iri.as_str() == iri)
+        .and_then(|class| class.extraction_labels.first().cloned())
 }
 
 /// SHA-256 (64 lowercase hex chars, the registry's required shape) of the
@@ -194,6 +427,19 @@ pub fn register_induced(ontology: &InducedOntology) -> Result<()> {
 }
 
 fn register_induced_with_sha(ontology: &InducedOntology, artifact_sha256: String) -> Result<()> {
+    crate::ontologies::register_ontology(accepted_adapter_with_sha(ontology, artifact_sha256)?)
+}
+
+/// Build the registry adapter only after applying the same ACCEPTED-status
+/// and structural-validation gates used by process-wide registration.
+///
+/// Keeping this separate lets a fresh [`crate::ontologies::OntologyRegistry`]
+/// load an installed artifact in tests (and in embedders) without touching
+/// process-global state. There is still one adapter and one vocabulary path.
+fn accepted_adapter_with_sha(
+    ontology: &InducedOntology,
+    artifact_sha256: String,
+) -> Result<Arc<dyn Ontology>> {
     match ontology.status {
         OntologyStatus::Draft => bail!(
             "ontology '{}' is a DRAFT — a freshly induced ontology is a proposal and \
@@ -215,20 +461,27 @@ fn register_induced_with_sha(ontology: &InducedOntology, artifact_sha256: String
         }
         bail!(msg);
     }
-    crate::ontologies::register_ontology(adapter(ontology, artifact_sha256)?)
+    adapter(ontology, artifact_sha256)
+}
+
+/// Load one accepted artifact as the EXISTING [`Ontology`] adapter without
+/// choosing a registry. Callers can then register it either process-wide or
+/// in an explicitly owned [`crate::ontologies::OntologyRegistry`].
+pub fn load_induced_from_path(path: &std::path::Path) -> Result<Arc<dyn Ontology>> {
+    let ontology = super::load_validated(path)?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("cannot re-read ontology artifact {}", path.display()))?;
+    accepted_adapter_with_sha(&ontology, hex::encode(Sha256::digest(&bytes)))
 }
 
 /// Load an artifact file and register it — the production dispatch for
 /// "put this induced vocabulary on the extraction path". Parsing and
 /// validation run inside [`super::load_validated`]; the draft gate runs in
-/// [`register_induced_with_sha`]. The registered `artifact_sha256` is the
+/// [`load_induced_from_path`]. The registered `artifact_sha256` is the
 /// hash of the FILE BYTES as they exist on disk — the artifact as shipped,
 /// not a re-serialisation of it.
 pub fn register_induced_from_path(path: &std::path::Path) -> Result<()> {
-    let ontology = super::load_validated(path)?;
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("cannot re-read ontology artifact {}", path.display()))?;
-    register_induced_with_sha(&ontology, hex::encode(Sha256::digest(&bytes)))
+    crate::ontologies::register_ontology(load_induced_from_path(path)?)
 }
 
 #[cfg(test)]
@@ -251,6 +504,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
                 InducedClass {
                     label: "Polymer".into(),
@@ -258,6 +512,7 @@ mod tests {
                     parent: Some("Material".into()),
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
                 InducedClass {
                     label: "Glass Transition Temperature".into(),
@@ -265,6 +520,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
             ],
             relations: vec![InducedRelation {
@@ -273,6 +529,7 @@ mod tests {
                 domain: "Polymer".into(),
                 range: "Glass Transition Temperature".into(),
                 aligned_iri: None,
+                fact_kind: None,
             }],
             provenance: InductionProvenance {
                 corpus_hash: "sha256:deadbeef00".into(),
@@ -395,6 +652,44 @@ mod tests {
         assert!(instructions.contains("HAS_PROPERTY"), "{instructions}");
     }
 
+    /// CONTRACT CHANGE: promotion used to be useful only when the same
+    /// process immediately called `register_induced_from_path`. A promoted
+    /// project artifact is now sufficient state: two independent registries
+    /// (standing in for separate CLI processes) resolve the configured id
+    /// through the same accepted-artifact adapter and retain its exact hash.
+    #[test]
+    fn promoted_project_artifact_reloads_in_fresh_registries() {
+        // CONTRACT CHANGE: registration no longer depends on the promotion
+        // process still being alive; a later registry reloads the accepted
+        // artifact through the production adapter.
+        let project = tempfile::tempdir().unwrap();
+        let path =
+            crate::ontologies::project_ontology_artifact_path(project.path(), "indtest-persisted")
+                .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_artifact(&path, &ontology("indtest-persisted")).unwrap();
+        promote_artifact(&path).unwrap();
+
+        let expected_sha = {
+            let mut first_process = crate::ontologies::OntologyRegistry::builtin();
+            let first = first_process
+                .load_project(project.path(), "indtest-persisted")
+                .expect("first process loads the promoted project artifact");
+            first.artifact_sha256().to_string()
+        };
+
+        let mut later_process = crate::ontologies::OntologyRegistry::builtin();
+        let reloaded = later_process
+            .load_project(project.path(), "indtest-persisted")
+            .expect("later process reloads from project state only");
+        assert_eq!(reloaded.id(), "indtest-persisted");
+        assert_eq!(reloaded.artifact_sha256(), expected_sha);
+        assert!(
+            reloaded.class_for_label("Polymer").is_some(),
+            "the reloaded adapter exposes the promoted vocabulary"
+        );
+    }
+
     /// Registration honours the registry's two-call contract: a taken id is
     /// refused by `register`, not silently displaced.
     #[test]
@@ -422,5 +717,229 @@ mod tests {
                 .get("indtest-invalid")
                 .is_none()
         );
+    }
+
+    /// A promoted ontology must reach the store's TYPED fact shapes, not just
+    /// registration. Proven end-to-end through the artifact bytes: the TTL
+    /// carries `prism:factKind` on a relation, and the adapter promotion
+    /// installs serves it via `measurement_relations`, with
+    /// `quantitative_labels` following from that relation's RANGE class.
+    ///
+    /// REGRESSION: removing the hardcoded `"HAS_PROPERTY"` literal from
+    /// `local_facts` without giving induced ontologies a way to declare a
+    /// replacement made every promoted ontology store `value: None` — every
+    /// number in the document silently dropped while the run reported
+    /// success. Registration must buy parity, not just an entry.
+    #[test]
+    fn a_promoted_artifact_serves_its_declared_fact_kinds() {
+        let mut o = ontology("indtest-factkind");
+        o.relations[0].fact_kind = Some(InducedFactKind::Measurement);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("factkind.ttl");
+        write_artifact(&path, &o).unwrap();
+        promote_artifact(&path).unwrap();
+        let loaded =
+            load_induced_from_path(&path).expect("a promoted artifact with fact kinds loads");
+
+        assert_eq!(
+            loaded.measurement_relations(),
+            vec!["HAS_PROPERTY"],
+            "the declared measurement relation must reach the typed shape"
+        );
+        // The range of a measurement relation IS a quantity class, so the
+        // typed-value contract follows the declaration with no second
+        // annotation.
+        assert!(
+            loaded
+                .quantitative_labels()
+                .contains(&"GlassTransitionTemperature"),
+            "the measurement relation's range must be a quantity class, got {:?}",
+            loaded.quantitative_labels()
+        );
+        // Shapes the ontology never declared stay empty — silence, not a guess.
+        assert!(loaded.phase_relations().is_empty());
+        assert!(loaded.processing_relations().is_empty());
+        assert!(loaded.contains_relations().is_empty());
+
+        // CONTRACT CHANGE: the store no longer hardcodes the kind→(class,
+        // edge) table — the promoted artifact's own declaration shapes the
+        // typed write. The measurement shape reifies through the ontology's
+        // OWN class vocabulary, so a non-materials ontology's typed facts
+        // reach a correctly-typed graph with zero Rust edits.
+        let shape = loaded
+            .fact_graph_shape("measurement")
+            .expect("the declared measurement kind carries a graph shape");
+        assert!(shape.reified_measurement);
+        assert_eq!(
+            shape.object_storage_label, "GlassTransitionTemperature",
+            "the object falls back to the relation's declared RANGE class, not an EMMO label"
+        );
+        assert_eq!(shape.edge_rel_type, "HAS_PROPERTY");
+        // A kind the artifact never declared is nobody's shape.
+        assert!(loaded.fact_graph_shape("phase").is_none());
+        assert!(loaded.fact_graph_shape("obligation").is_none());
+        // And the numeric prior reads the declaration, not a Rust default.
+        assert!(loaded.numeric_prior_fact_kinds().is_empty());
+    }
+
+    /// A promoted artifact that declares a CONTAINS-kind relation serves the
+    /// contains graph shape from its own classes/tokens AND declares the
+    /// contains kind eligible for the numeric prior — the declaration is the
+    /// single source for both, exactly as EMMO's adapter is for its kinds.
+    #[test]
+    fn a_promoted_artifact_serves_contains_shapes_and_prior_kinds() {
+        let mut o = ontology("indtest-contains-kind");
+        o.relations[0].fact_kind = Some(InducedFactKind::Contains);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contains-kind.ttl");
+        write_artifact(&path, &o).unwrap();
+        promote_artifact(&path).unwrap();
+        let loaded = load_induced_from_path(&path).unwrap();
+
+        let shape = loaded
+            .fact_graph_shape("contains")
+            .expect("the declared contains kind carries a graph shape");
+        assert!(!shape.reified_measurement);
+        assert_eq!(shape.object_storage_label, "GlassTransitionTemperature");
+        assert_eq!(shape.edge_rel_type, "HAS_PROPERTY");
+        assert_eq!(shape.edge_value_prop.as_deref(), Some("fraction"));
+        assert_eq!(
+            loaded.numeric_prior_fact_kinds(),
+            vec!["contains".to_string()]
+        );
+        // Measurement was never declared by this artifact.
+        assert!(loaded.fact_graph_shape("measurement").is_none());
+    }
+
+    /// The honest half: an ontology that declares NO fact kinds types
+    /// nothing. It must not inherit a frozen English token by accident — the
+    /// lexical coincidence that used to make `"has property"` work.
+    #[test]
+    fn an_undeclared_relation_types_nothing() {
+        let o = ontology("indtest-nofactkind");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nofactkind.ttl");
+        write_artifact(&path, &o).unwrap();
+        promote_artifact(&path).unwrap();
+        let loaded = load_induced_from_path(&path).expect("a promoted artifact loads");
+
+        assert!(
+            loaded.measurement_relations().is_empty(),
+            "a relation labelled 'has property' must NOT be typed by its spelling"
+        );
+        assert!(loaded.quantitative_labels().is_empty());
+    }
+
+    /// A tampered or foreign `prism:factKind` is a loud refusal, never a
+    /// silent downgrade to an untyped edge.
+    #[test]
+    fn an_unknown_fact_kind_literal_is_refused() {
+        let mut o = ontology("indtest-badfactkind");
+        o.relations[0].fact_kind = Some(InducedFactKind::Measurement);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.ttl");
+        write_artifact(&path, &o).unwrap();
+        let tampered = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"measurement\"", "\"teleportation\"");
+        std::fs::write(&path, tampered).unwrap();
+
+        // `Arc<dyn Ontology>` is not Debug, so match rather than unwrap_err.
+        let Err(err) = load_induced_from_path(&path) else {
+            panic!("an unknown prism:factKind literal must be refused, not loaded");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("factKind"), "{msg}");
+        assert!(msg.contains("teleportation"), "{msg}");
+    }
+
+    /// The sign-domain channel the trait promises, proven end-to-end through
+    /// the artifact bytes: a promoted TTL carries optional `prism:signDomain`
+    /// annotations and the SAME adapter promotion installs serves them — by
+    /// prefLabel, by minted extraction label and by class IRI, including a
+    /// declaration inherited from a dimensional parent. Zero Rust edits.
+    #[test]
+    fn a_promoted_artifact_serves_its_declared_sign_domains() {
+        let mut o = ontology("indtest-signdomain");
+        // Material (dimensional parent) declares non-negative; Polymer
+        // declares nothing and must INHERIT it; Glass Transition
+        // Temperature declares signed directly.
+        o.classes[0].sign_domain = Some(QuantitySignDomain::NonNegative);
+        o.classes[2].sign_domain = Some(QuantitySignDomain::Signed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signdomain.ttl");
+        write_artifact(&path, &o).unwrap();
+        promote_artifact(&path).unwrap();
+        let loaded =
+            load_induced_from_path(&path).expect("a promoted artifact with sign annotations loads");
+
+        // Direct declaration, answered by every identity a reader may bind.
+        let gtt_iri =
+            "https://prism.marc27.com/ontology/indtest-signdomain#GlassTransitionTemperature";
+        for identity in [
+            "Glass Transition Temperature",
+            "GlassTransitionTemperature",
+            gtt_iri,
+        ] {
+            assert_eq!(
+                loaded.quantity_sign_domain(identity),
+                Some(QuantitySignDomain::Signed),
+                "identity {identity:?}"
+            );
+        }
+        // Inheritance from the dimensional parent.
+        assert_eq!(
+            loaded.quantity_sign_domain("Polymer"),
+            Some(QuantitySignDomain::NonNegative),
+            "an unannotated quantity inherits its dimensional parent's declaration"
+        );
+        // The annotated parent answers for itself too.
+        assert_eq!(
+            loaded.quantity_sign_domain("Material"),
+            Some(QuantitySignDomain::NonNegative)
+        );
+        // Silence where nothing on the path declares.
+        assert_eq!(loaded.quantity_sign_domain("UnbekanntenGroesse"), None);
+    }
+
+    /// DEFECT FIX (Part 2): the identity lookup used to be EXACT-MATCH
+    /// while every other induction lookup (duplicate detection, validate)
+    /// folds labels with `normalize_label`. "glass transition temperature"
+    /// (lowercase) or "glass_transition_temperature" (underscored) missed
+    /// the declared sign domain entirely — a silent false negative on a
+    /// guard. Both now resolve like their canonical spellings.
+    #[test]
+    fn sign_domain_lookup_folds_label_spellings_like_the_rest_of_induction() {
+        let mut o = ontology("indtest-signdomain-fold");
+        o.classes[2].sign_domain = Some(QuantitySignDomain::Signed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signdomain-fold.ttl");
+        write_artifact(&path, &o).unwrap();
+        promote_artifact(&path).unwrap();
+        let loaded =
+            load_induced_from_path(&path).expect("a promoted artifact with sign annotations loads");
+
+        for identity in [
+            "glass transition temperature",
+            "Glass_Transition_Temperature",
+            "glass-transition-temperature",
+        ] {
+            assert_eq!(
+                loaded.quantity_sign_domain(identity),
+                Some(QuantitySignDomain::Signed),
+                "identity {identity:?} must fold to the declared class like \
+                 duplicate detection folds it"
+            );
+        }
+        // A fully-concatenated lowercase word ("glasstransitiontemperature")
+        // does NOT fold — normalize_label splits only at case/separator
+        // boundaries — and that is consistent with duplicate detection's
+        // fold; not a regression of this fix.
+        // A truly unknown quantity is still silence, never a guess.
+        assert_eq!(loaded.quantity_sign_domain("Unbekannte Groesse"), None);
     }
 }

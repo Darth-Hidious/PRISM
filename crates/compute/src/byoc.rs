@@ -1435,7 +1435,7 @@ mod tests {
     fn slurm_script_emits_all_configured_resources_array_and_dependency() {
         let job_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         let config = SlurmJobConfig {
-            account: Some("esa-materials".into()),
+            account: Some("research-alloc".into()),
             time: Some("02:30:00".into()),
             gres: Some("gpu:a100:2".into()),
             mem: Some("128G".into()),
@@ -1453,7 +1453,7 @@ mod tests {
 
         for directive in [
             "#SBATCH --partition=gpu",
-            "#SBATCH --account=esa-materials",
+            "#SBATCH --account=research-alloc",
             "#SBATCH --time=02:30:00",
             "#SBATCH --gres=gpu:a100:2",
             "#SBATCH --mem=128G",

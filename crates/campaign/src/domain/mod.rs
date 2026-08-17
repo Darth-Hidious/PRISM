@@ -7,25 +7,23 @@
 pub(crate) mod alloy;
 pub(crate) mod polymer;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{CampaignConfig, CampaignGoal};
 
-/// Built-in discovery domains. Existing checkpoints omit this field and
-/// therefore continue as alloy campaigns.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DomainKind {
-    #[default]
-    Alloy,
-    Polymer,
+/// Stable id of the built-in alloy domain — the default `CampaignConfig::domain`
+/// value and the id legacy checkpoints carry (or omit, which also means this).
+pub const ALLOY_DOMAIN_ID: &str = "alloy";
+/// Stable id of the built-in polymer electrical-insulation domain.
+pub const POLYMER_DOMAIN_ID: &str = "polymer";
+
+pub(crate) fn default_domain_id() -> String {
+    ALLOY_DOMAIN_ID.to_string()
 }
 
-impl DomainKind {
-    pub(crate) fn is_alloy(&self) -> bool {
-        *self == Self::Alloy
-    }
+pub(crate) fn is_default_domain_id(domain: &str) -> bool {
+    domain == ALLOY_DOMAIN_ID
 }
 
 /// Comparison used by a user-configured, named property constraint.
@@ -159,13 +157,129 @@ pub trait Domain: Send + Sync {
     }
 }
 
-/// Resolve a stable built-in plugin for campaign construction, inspection, or
-/// testing. Checkpoints persist [`DomainKind`], so resume selects identically.
-pub fn builtin_domain(kind: DomainKind) -> &'static dyn Domain {
-    match kind {
-        DomainKind::Alloy => &alloy::ALLOY_DOMAIN,
-        DomainKind::Polymer => &polymer::POLYMER_DOMAIN,
+// ── Registry ──────────────────────────────────────────────────────────────
+
+/// Ordered registry of domain plugins — the ONE place a domain id resolves
+/// to its plugin, mirroring `prism_ingest::ontologies::OntologyRegistry`.
+/// Iteration order is registration order, which keeps error listings
+/// deterministic.
+pub struct DomainRegistry {
+    domains: Vec<&'static dyn Domain>,
+    ids: Vec<&'static str>,
+    by_id: std::collections::HashMap<&'static str, usize>,
+}
+
+impl DomainRegistry {
+    pub fn new() -> Self {
+        Self {
+            domains: Vec::new(),
+            ids: Vec::new(),
+            by_id: std::collections::HashMap::new(),
+        }
     }
+
+    /// The built-in domains, in canonical order.
+    pub fn builtin() -> Self {
+        let mut reg = Self::new();
+        reg.register(&alloy::ALLOY_DOMAIN)
+            .expect("built-in domain declarations are valid and unique");
+        reg.register(&polymer::POLYMER_DOMAIN)
+            .expect("built-in domain declarations are valid and unique");
+        reg
+    }
+
+    /// Add a domain under a FREE id. A taken id is a loud refusal — taking
+    /// over a registered domain is [`Self::replace`]. On refusal nothing
+    /// changes.
+    pub fn register(&mut self, domain: &'static dyn Domain) -> Result<()> {
+        let id = validated_domain_id(domain)?;
+        if self.by_id.contains_key(id) {
+            bail!(
+                "domain id '{id}' is already registered; swap it deliberately with \
+                 DomainRegistry::replace (replace_domain for the process-wide registry)"
+            );
+        }
+        self.by_id.insert(id, self.domains.len());
+        self.ids.push(id);
+        self.domains.push(domain);
+        Ok(())
+    }
+
+    /// Deliberately swap the domain registered under the SAME id. The id
+    /// must be taken; returns the displaced domain.
+    pub fn replace(&mut self, domain: &'static dyn Domain) -> Result<&'static dyn Domain> {
+        let id = validated_domain_id(domain)?;
+        let Some(&index) = self.by_id.get(id) else {
+            bail!(
+                "no domain '{id}' registered to replace; add it with \
+                 DomainRegistry::register (register_domain for the process-wide registry)"
+            );
+        };
+        Ok(std::mem::replace(&mut self.domains[index], domain))
+    }
+
+    /// Look up a domain by its stable id.
+    pub fn get(&self, id: &str) -> Option<&'static dyn Domain> {
+        self.by_id.get(id).map(|&index| self.domains[index])
+    }
+
+    /// All registered ids, in registration order.
+    pub fn ids(&self) -> Vec<&'static str> {
+        self.ids.clone()
+    }
+}
+
+impl Default for DomainRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+fn validated_domain_id(domain: &'static dyn Domain) -> Result<&'static str> {
+    let id = domain.name();
+    if id.trim().is_empty() {
+        bail!("a domain plugin must declare a non-empty id (name)");
+    }
+    Ok(id)
+}
+
+/// The process-wide registry: starts as [`DomainRegistry::builtin`] and is
+/// extendable at runtime through [`register_domain`].
+static REGISTRY: std::sync::LazyLock<std::sync::RwLock<DomainRegistry>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(DomainRegistry::builtin()));
+
+/// Register a domain plugin in the process-wide registry. A taken id is a
+/// loud refusal; swapping is [`replace_domain`].
+pub fn register_domain(domain: &'static dyn Domain) -> Result<()> {
+    REGISTRY
+        .write()
+        .expect("domain registry lock poisoned")
+        .register(domain)
+}
+
+/// Deliberately swap a domain registered in the process-wide registry.
+/// Returns the displaced domain — hand it back to restore.
+pub fn replace_domain(domain: &'static dyn Domain) -> Result<&'static dyn Domain> {
+    REGISTRY
+        .write()
+        .expect("domain registry lock poisoned")
+        .replace(domain)
+}
+
+/// Resolve a domain id through the process-wide registry. An id nothing
+/// registered is a LOUD error naming what is registered — never a silent
+/// fallback to the alloy domain, which would run the wrong physics while
+/// looking configured.
+pub fn resolve_domain(id: &str) -> Result<&'static dyn Domain> {
+    let registry = REGISTRY.read().expect("domain registry lock poisoned");
+    registry.get(id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no domain '{id}' is registered (registered: {}). Set \
+             CampaignConfig::domain to a registered id, or register yours with \
+             prism_campaign::domain::register_domain",
+            registry.ids().join(", ")
+        )
+    })
 }
 
 pub(crate) fn structured_constraint_descriptions(
@@ -234,4 +348,132 @@ pub(crate) fn structured_constraint_violations(
         }
     }
     violations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CONTRACT CHANGE (dehardcoding): the domain registry is OPEN — a new
+    /// domain registers at runtime with ZERO Rust edits (no enum variant,
+    /// no match arm), mirroring the ontology registry. This test registers
+    /// a synthetic LEGAL domain (arbitrary vocabulary, a stand-in) and
+    /// proves resolution, the two-call contract, and the loud refusal.
+    #[test]
+    fn the_domain_registry_is_open_and_refuses_loudly() {
+        struct LegalDomain;
+        impl Domain for LegalDomain {
+            fn name(&self) -> &'static str {
+                "dehardcode-test-legal"
+            }
+            fn candidate_plural(&self) -> &'static str {
+                "cases"
+            }
+            fn validate_goal(
+                &self,
+                _goal: &crate::CampaignGoal,
+            ) -> std::result::Result<(), String> {
+                Ok(())
+            }
+            fn apply_goal_implied_constraints(
+                &self,
+                _config: &mut crate::CampaignConfig,
+                _goal: &crate::CampaignGoal,
+            ) {
+            }
+            fn parse_candidate(
+                &self,
+                _candidate: &str,
+                _goal: &crate::CampaignGoal,
+            ) -> std::result::Result<ParsedCandidate, String> {
+                unreachable!("not exercised")
+            }
+            fn definition(&self, _config: &crate::CampaignConfig) -> Option<serde_json::Value> {
+                None
+            }
+            fn definition_label(&self) -> &'static str {
+                "Legal domain"
+            }
+            fn configured_constraints(&self, _config: &crate::CampaignConfig) -> Vec<String> {
+                Vec::new()
+            }
+            fn constraint_violations(
+                &self,
+                _parsed: &ParsedCandidate,
+                _properties: &serde_json::Value,
+                _config: &crate::CampaignConfig,
+            ) -> Vec<String> {
+                Vec::new()
+            }
+            fn evaluator_tool(&self) -> &'static str {
+                "unavailable"
+            }
+            fn evaluator_tiers(&self) -> &'static [EvaluatorTier] {
+                &[]
+            }
+            fn evaluator_inputs(&self, _parsed: &ParsedCandidate) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn decorate_properties(
+                &self,
+                _properties: &mut serde_json::Value,
+                _parsed: &ParsedCandidate,
+                _config: &crate::CampaignConfig,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn compute_reward(
+                &self,
+                _goal: &crate::CampaignGoal,
+                _config: &crate::CampaignConfig,
+                _properties: &serde_json::Value,
+            ) -> Result<f64> {
+                Ok(0.0)
+            }
+            fn summarize_properties(&self, _properties: &serde_json::Value) -> String {
+                String::new()
+            }
+            fn proposal_system_prompt(&self) -> &'static str {
+                ""
+            }
+            fn search_space_prompt(&self, _goal: &crate::CampaignGoal) -> String {
+                String::new()
+            }
+            fn improvement_prompt(&self, _batch: usize) -> String {
+                String::new()
+            }
+            fn initial_prompt(&self, _batch: usize) -> String {
+                String::new()
+            }
+        }
+
+        // Built-ins resolve by id.
+        assert_eq!(resolve_domain(ALLOY_DOMAIN_ID).unwrap().name(), "alloy");
+        assert_eq!(resolve_domain(POLYMER_DOMAIN_ID).unwrap().name(), "polymer");
+        // Unknown id: loud, names what is registered — never the alloy default.
+        let Err(error) = resolve_domain("obligation") else {
+            panic!("an unregistered domain id must not resolve");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("no domain 'obligation'"), "{message}");
+        assert!(message.contains("alloy"), "{message}");
+        // The registry contract: register refuses a taken id, replace
+        // refuses a free one.
+        let mut registry = DomainRegistry::builtin();
+        assert!(registry.register(&alloy::ALLOY_DOMAIN).is_err());
+        let Err(free_error) = registry.replace(&LegalDomain) else {
+            panic!("replacing a FREE id must be refused");
+        };
+        assert!(
+            format!("{free_error:#}").contains("no domain"),
+            "{free_error:#}"
+        );
+        registry
+            .register(&LegalDomain)
+            .expect("a free id registers");
+        assert_eq!(
+            registry.get("dehardcode-test-legal").unwrap().name(),
+            "dehardcode-test-legal"
+        );
+    }
 }

@@ -172,7 +172,7 @@ impl Domain for PolymerDomain {
         Some(serde_json::json!({
             "name": "abb_electrical_insulation_targets_v1",
             "target_properties": TARGET_PROPERTIES,
-            "source": "ABB pilot brief: electrical-insulation target-property set; this names targets only and does not imply physical thresholds",
+            "source": "electrical-insulation target-property set (v1); this names targets only and does not imply physical thresholds",
         }))
     }
 
@@ -196,7 +196,7 @@ impl Domain for PolymerDomain {
             .filter(|constraint| !TARGET_PROPERTIES.contains(&constraint.property.as_str()))
             .map(|constraint| {
                 format!(
-                    "[{}] property '{}' is not part of the ABB electrical-insulation target set",
+                    "[{}] property '{}' is not part of the electrical-insulation target set",
                     constraint.definition, constraint.property
                 )
             })
@@ -268,20 +268,26 @@ impl Domain for PolymerDomain {
             return weighted_reward(config, properties, EVALUATION_TOOL);
         }
 
-        let objective = goal.objective.to_ascii_lowercase();
-        let property = if objective.contains("glass transition") || objective.contains("tg") {
-            "glass_transition_temperature_k"
-        } else if objective.contains("breakdown") {
-            "dielectric_breakdown_strength_kv_per_mm"
-        } else if objective.contains("dielectric") {
-            "dielectric_constant"
-        } else if objective.contains("thermal conductivity") {
-            "thermal_conductivity_w_per_m_k"
-        } else {
-            bail!(
-                "polymer reward requires an objective naming one ABB target property or explicit reward_weights; no generic polymer fallback is scientifically defensible"
+        // CONTRACT CHANGE: the target property is the goal's DECLARED
+        // `target_property` (validated against the declared target set) —
+        // never English substring matching over the objective (the old
+        // `objective.contains("glass transition")` / `"tg"` / `"breakdown"`
+        // chain, which a differently-worded objective never matched). With
+        // neither a target property nor reward weights, refusal is the only
+        // defensible answer.
+        let property = goal.target_property.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "polymer reward requires goal.target_property (one of {TARGET_PROPERTIES:?}) \
+                 or explicit reward_weights; no generic polymer fallback is scientifically defensible"
             )
-        };
+        })?;
+        if !TARGET_PROPERTIES.contains(&property) {
+            bail!(
+                "goal.target_property {property:?} is not part of the declared \
+                 electrical-insulation target set {TARGET_PROPERTIES:?}"
+            );
+        }
+        let objective = goal.objective.to_ascii_lowercase();
         let value = properties
             .get(property)
             .and_then(serde_json::Value::as_f64)
@@ -294,11 +300,13 @@ impl Domain for PolymerDomain {
                     .unwrap_or("the evaluator supplied no citable method or measured value");
                 anyhow::anyhow!("{EVALUATION_TOOL} reported '{property}' unavailable: {reason}")
             })?;
-        Ok(if objective.contains("minimize") {
-            -value
-        } else {
-            value
-        })
+        Ok(
+            if objective.contains("minimize") || objective.contains("minimise") {
+                -value
+            } else {
+                value
+            },
+        )
     }
 
     fn summarize_properties(&self, properties: &serde_json::Value) -> String {
@@ -369,6 +377,7 @@ mod tests {
                         description: String::new(),
                         elements: Vec::new(),
                         objective: String::new(),
+                        target_property: None,
                         constraints: Vec::new(),
                         seeds: Vec::new(),
                     },

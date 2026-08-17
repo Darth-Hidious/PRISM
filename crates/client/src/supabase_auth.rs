@@ -150,7 +150,7 @@ pub struct SupabasePkceAttempt {
 /// authenticates the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsoSelector<'a> {
-    /// Email domain of the organisation, e.g. `arianegroup.com`. This is the
+    /// Email domain of the organisation, e.g. `example.com`. This is the
     /// "sign in with your work email" affordance.
     Domain(&'a str),
     /// Explicit connection id, for organisations with several or with none
@@ -887,8 +887,8 @@ mod tests {
     #[test]
     fn sso_domain_must_be_a_bare_domain() {
         assert_eq!(
-            SsoSelector::Domain("arianegroup.com").as_field().unwrap(),
-            ("domain", "arianegroup.com")
+            SsoSelector::Domain("example.com").as_field().unwrap(),
+            ("domain", "example.com")
         );
         // Whitespace is trimmed, not rejected — pasted input routinely carries it.
         assert_eq!(
@@ -922,7 +922,7 @@ mod tests {
     /// would carry the relay state in clear text.
     #[test]
     fn only_https_sso_redirects_are_accepted() {
-        let ok = Url::parse("https://login.arianegroup.com/sso/saml").unwrap();
+        let ok = Url::parse("https://login.example.com/sso/saml").unwrap();
         assert_eq!(ok.scheme(), "https");
         assert!(ok.host_str().is_some_and(|h| !h.is_empty()));
 

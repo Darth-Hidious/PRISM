@@ -17,26 +17,15 @@
 //! for one. Re-asking a rendered judgement keeps every "yes" and re-rolls
 //! every "no" — sampling noise ratcheting into acceptances.
 
-use std::collections::BTreeSet;
-
-use prism_provenance::{
-    EvidenceSource, MaterialFact, RepairDisposition, RepairItem, evidence_for_result,
-};
+use prism_provenance::{MaterialFact, RepairDisposition, RepairItem};
 use serde_json::Value;
 
-use crate::qudt_units::{property_quantity_kind, unit_quantity_kind};
+use crate::ontologies::Ontology;
 use crate::text_extract::{
-    DEFAULT_GROUNDING_NUMERIC_TOLERANCE, GroundingPolicy, RejectedFact, RejectedSubject,
-    RejectionClass, convert_fact, fact_identity, numeric_fact_grounding, sentence_spans,
-    subject_appears,
+    DEFAULT_GROUNDING_NUMERIC_TOLERANCE, GroundingPolicy, GroundingRefusal, RejectedFact,
+    RejectedSubject, RejectionClass, fact_identity, numeric_fact_grounding, subject_appears,
 };
 
-/// Tier A: the corrected unit was read off the document, adjacent to the
-/// fact's value, and the corrected fact passed the full grounding gate.
-pub const RULE_UNIT_RE_RESOLUTION: &str = "unit-re-resolution";
-/// The document's own printed unit spelling resolves to nothing — the
-/// maintainer feedback loop. Code never bridges a vocabulary gap by fiat.
-pub const RULE_VOCABULARY_GAP: &str = "vocabulary-gap";
 /// The value appears nowhere in the document in any rendered form: the
 /// number is the extractor's invention, withdrawn with zero calls.
 pub const RULE_NO_NEAR_MISS: &str = "no-near-miss";
@@ -148,10 +137,13 @@ pub fn dispose(
     text: &str,
     policy: &RepairPolicy,
     decided_at: f64,
+    ontology: &dyn Ontology,
 ) -> Option<RepairDisposition> {
     use RejectionClass::*;
     let disposition = match rejection.class {
-        UnresolvedUnit => tier_unit_re_resolution(rejection, document, text, policy, decided_at),
+        // Unit interpretation requires the active ontology and a reader.
+        // Code has no vocabulary-neutral correction to render.
+        UnresolvedUnit => None,
         // Disagreement between extraction passes is a statement about the
         // MODEL's consistency, not about the document. No code tier can
         // settle it — deciding would mean re-running extraction, which is a
@@ -162,7 +154,7 @@ pub fn dispose(
             rejection, document, text, policy, decided_at,
         )),
         SubjectNotNamed => Some(tier_subject_normalization(
-            rejection, document, text, policy, decided_at,
+            rejection, document, text, policy, decided_at, ontology,
         )),
         ReviewDenied | ReviewUncertain => {
             Some(tier_review_verdict_final(rejection, document, decided_at))
@@ -186,176 +178,6 @@ pub fn dispose(
         rejection.class.as_str()
     );
     disposition
-}
-
-/// Tier A — unit re-resolution, the deterministic repair for
-/// [`RejectionClass::UnresolvedUnit`].
-///
-/// Find the fact's value in the document (through the same evidential
-/// numeric matching the grounding gate uses — a citation or range endpoint
-/// cannot donate its neighbourhood), read the unit printed immediately
-/// after it, and resolve THAT. The model's claimed spelling never picks
-/// the identifier: the document does, which is what makes two different
-/// invented spellings converge on one stored identifier.
-///
-/// The quantity-kind guard is STRICT: a candidate is accepted only when
-/// the property's stated kind and the printed unit's kind are BOTH known
-/// and equal. A resolvable-but-wrong adjacent token ("30 s" next to a scan
-/// speed) would otherwise store a falsehood with a span attached — the
-/// worst outcome this design exists to prevent. Properties and units
-/// outside the kind vocabulary therefore queue for the model tier instead
-/// of being guessed at.
-///
-/// An accept additionally re-runs the FULL grounding gate on the corrected
-/// fact (`subject_appears` + [`numeric_fact_grounding`], the same
-/// functions Phase 1 runs), so a repaired fact is held to exactly the bar
-/// a normally-admitted fact met, and the recorded evidence is the span
-/// that gate returned.
-fn tier_unit_re_resolution(
-    rejection: &RejectedFact,
-    document: &str,
-    text: &str,
-    policy: &RepairPolicy,
-    decided_at: f64,
-) -> Option<RepairDisposition> {
-    // UnresolvedUnit is minted at conversion time, so the subject is the
-    // raw extraction. Anything else is unexpected — leave it for a model.
-    let RejectedSubject::Raw(raw) = &rejection.subject else {
-        return None;
-    };
-    let subject = raw.get("subject").and_then(Value::as_str)?;
-    let object = raw.get("object").and_then(Value::as_str)?;
-    // A unit on a value-less fact is a contradictory shape; there is no
-    // value to find a printed unit next to.
-    let value = raw.get("value").and_then(Value::as_f64)?;
-    let claimed = raw.get("unit").and_then(Value::as_str).unwrap_or("?");
-
-    let expected_kind = property_quantity_kind(object);
-    let mut consistent: Vec<String> = Vec::new();
-    let mut gap_spellings: Vec<String> = Vec::new();
-
-    for span in text.lines().flat_map(sentence_spans) {
-        // The span must name the PROPERTY, not merely the subject.
-        //
-        // `evidential_numeric_lexeme_satisfies` binds on subject OR object
-        // (`claims.rs`) — a deliberate Phase-1 tradeoff, made with a model in
-        // the loop that read the passage. Repair has no model: code accepts
-        // on its own authority, so it must demand more, not the same.
-        //
-        // Without this, a fact about "scan speed" bound to a sentence about
-        // the RECOATER — same subject, same number, kind-consistent unit —
-        // and was stored as evidenced. The paper stated no scan speed at all.
-        // A falsehood carrying a genuine verbatim quote is worse than a
-        // dropped fact, because it looks verified. Found by adversarial
-        // review; `a_span_naming_only_the_subject_cannot_repair_a_different_property`
-        // fails if this guard is removed.
-        if !object.trim().is_empty() && !span_names_the_property(span, object) {
-            continue;
-        }
-        // The callback always returns false: this is a COLLECTING pass over
-        // every evidential occurrence, not an accept-first search — the
-        // boolean result is therefore always false and carries nothing.
-        let _ = prism_retrieval::claims::evidential_numeric_lexeme_satisfies(
-            subject,
-            object,
-            value,
-            span,
-            policy.numeric_tolerance,
-            |hay, range| {
-                match prism_provenance::units::span_value_resolved_adjacent_unit(hay, range.end) {
-                    Some(unit) => {
-                        let kind_established = matches!(
-                            (expected_kind, unit_quantity_kind(unit.as_str())),
-                            (Some(expected), Some(printed)) if expected == printed
-                        );
-                        if kind_established {
-                            consistent.push(unit.as_str().to_string());
-                        }
-                    }
-                    None => {
-                        if let Some(spelling) = adjacent_spelling(hay, range.end, span) {
-                            gap_spellings.push(spelling);
-                        }
-                    }
-                }
-                false
-            },
-        );
-    }
-
-    let identifiers: BTreeSet<&str> = consistent.iter().map(String::as_str).collect();
-    match identifiers.len() {
-        1 => {
-            let identifier = identifiers
-                .first()
-                .expect("len() == 1 guarantees a first element");
-            let mut corrected_raw = raw.as_ref().clone();
-            corrected_raw["unit"] = Value::String((*identifier).to_string());
-            // The corrected fact must clear the SAME gates Phase 1 applies —
-            // conversion, the literature evidence cap, subject presence and
-            // full numeric grounding — or code has no business accepting it.
-            let Ok(mut corrected) = convert_fact(corrected_raw) else {
-                return None;
-            };
-            corrected.evidence_class = evidence_for_result(
-                EvidenceSource::LiteratureExtraction,
-                [corrected.evidence_class],
-            );
-            if !subject_appears(&corrected.subject, text) {
-                return None;
-            }
-            let grounding = GroundingPolicy {
-                numeric_tolerance: policy.numeric_tolerance,
-                ..Default::default()
-            };
-            let Ok(evidence_span) = numeric_fact_grounding(&corrected, text, grounding) else {
-                return None;
-            };
-            Some(accept(
-                rejection,
-                document,
-                RULE_UNIT_RE_RESOLUTION,
-                &corrected,
-                evidence_span,
-                format!(
-                    "the extractor's unit {claimed:?} resolves to nothing; the document \
-                     prints the value with a unit resolving to {identifier}, and the \
-                     corrected fact passes the full grounding gate"
-                ),
-                decided_at,
-            ))
-        }
-        0 if !gap_spellings.is_empty() => Some(withdraw(
-            rejection,
-            document,
-            RULE_VOCABULARY_GAP,
-            format!("vocabulary-gap:{}", gap_spellings[0]),
-            decided_at,
-        )),
-        0 if !prism_retrieval::claims::numeric_value_appears(
-            value,
-            text,
-            policy.numeric_tolerance,
-        ) =>
-        {
-            Some(withdraw(
-                rejection,
-                document,
-                RULE_NO_NEAR_MISS,
-                format!(
-                    "no-near-miss: value {value} appears nowhere in the document in any \
-                     rendered form — the number is the extractor's invention, and no \
-                     model call can change what the document does not say"
-                ),
-                decided_at,
-            ))
-        }
-        // Ambiguous (two different printed units beside equal values), a
-        // kind the guard could not establish, or a bare value with nothing
-        // printed after it: code cannot decide safely. UnresolvedUnit is an
-        // unrendered class, so the model tier may look.
-        _ => None,
-    }
 }
 
 /// Near-miss filter for [`RejectionClass::NumericUnsupported`] — a RENDERED
@@ -425,6 +247,15 @@ fn tier_numeric_near_miss(
 /// normalization only (Unicode dashes, whitespace; case was already folded
 /// by the original check), then the re-check — never a model call, ever.
 ///
+/// B4 WIRING: the normalization ALSO applies
+/// [`unwrap_soft_line_breaks`](crate::text_extract::unwrap_soft_line_breaks)
+/// BEFORE typography folding — a subject hyphen-wrapped across PDF lines
+/// ("Ti-6Al-\n4V") is a typesetting artifact, and without the unambiguous
+/// hyphen-wrap join such a fact could never ground through this tier even
+/// though the document plainly names the subject. The join's signature is
+/// deliberately closed (alphanumeric-hyphen-newline-alphanumeric); every
+/// other line boundary stays a record boundary.
+///
 /// A re-check that passes does NOT re-admit the fact on subject presence
 /// alone: the original pipeline stopped at the subject gate, so the value,
 /// unit and conditions were never grounded. The fact must pass the full
@@ -438,6 +269,7 @@ fn tier_subject_normalization(
     text: &str,
     policy: &RepairPolicy,
     decided_at: f64,
+    ontology: &dyn Ontology,
 ) -> RepairDisposition {
     let RejectedSubject::Converted(fact) = &rejection.subject else {
         return withdraw(
@@ -452,7 +284,9 @@ fn tier_subject_normalization(
             decided_at,
         );
     };
-    let normalized_text = normalize_typography(text);
+    // B4: unwrap FIRST (it reads raw line structure; typography folding
+    // would destroy the hyphen-wrap signature), then fold.
+    let normalized_text = normalize_typography(&crate::text_extract::unwrap_soft_line_breaks(text));
     let normalized_subject = normalize_typography(&fact.subject);
     if !subject_appears(&normalized_subject, &normalized_text) {
         return withdraw(
@@ -460,7 +294,8 @@ fn tier_subject_normalization(
             document,
             RULE_SUBJECT_NORMALIZATION,
             "the document does not name the subject even after deterministic typographic \
-             normalization (Unicode dashes, whitespace, case); the judgement stands"
+             normalization (hyphen-wrap joins, Unicode dashes, whitespace, case); the \
+             judgement stands"
                 .to_string(),
             decided_at,
         );
@@ -474,7 +309,8 @@ fn tier_subject_normalization(
             rejection,
             document,
             RULE_SUBJECT_NORMALIZATION,
-            "the subject appears once typography is normalized, but a value-less \
+            "the subject appears once typography is normalized (hyphen-wrap joins included), \
+             but a value-less \
              assertion needs a semantic polarity review and this rendered class never \
              returns to a model; a versioned gate change plus re-ingest re-judges it"
                 .to_string(),
@@ -488,28 +324,40 @@ fn tier_subject_normalization(
         numeric_tolerance: policy.numeric_tolerance,
         ..Default::default()
     };
-    match numeric_fact_grounding(&probe, &normalized_text, grounding) {
+    match numeric_fact_grounding(&probe, &normalized_text, grounding, ontology) {
         Ok(evidence_span) => accept(
             rejection,
             document,
             RULE_SUBJECT_NORMALIZATION,
             fact,
             evidence_span,
-            "the subject appears once Unicode dashes and whitespace are normalized, and \
+            "the subject appears once soft-wrap joins, Unicode dashes and whitespace \
+             are normalized, and \
              the fact passes the full grounding gate on the normalized text"
                 .to_string(),
             decided_at,
         ),
-        Err(reason) => withdraw(
-            rejection,
-            document,
-            RULE_SUBJECT_NORMALIZATION,
-            format!(
-                "the subject appears once typography is normalized, but the fact still \
-                 fails the grounding gate: {reason}"
-            ),
-            decided_at,
-        ),
+        Err(refusal) => {
+            // CONTRACT CHANGE (de-hardcoding): a guarded refusal persists the
+            // guard name and the exact examined span as the ledger's
+            // evidence — a note the re-checking model can act on, not prose.
+            let evidence = match &refusal {
+                GroundingRefusal::Guarded { span, .. } => Some(span.clone()),
+                GroundingRefusal::Unsupported(_) => None,
+            };
+            withdraw_with_evidence(
+                rejection,
+                document,
+                RULE_SUBJECT_NORMALIZATION,
+                format!(
+                    "the subject appears once typography is normalized (hyphen-wrap joins \
+                     included), but the fact still \
+                     fails the grounding gate: {refusal}"
+                ),
+                evidence,
+                decided_at,
+            )
+        }
     }
 }
 
@@ -548,6 +396,21 @@ fn withdraw(
     reason: String,
     decided_at: f64,
 ) -> RepairDisposition {
+    withdraw_with_evidence(rejection, document, rule, reason, None, decided_at)
+}
+
+/// A withdraw that also persists the matcher's evidence — the NAMED guard
+/// and the EXACT span it examined. CONTRACT CHANGE (de-hardcoding): this is
+/// the evidence a re-checking model needs; it rides the ledger's existing
+/// `evidence` column instead of being paraphrased into prose and lost.
+fn withdraw_with_evidence(
+    rejection: &RejectedFact,
+    document: &str,
+    rule: &str,
+    reason: String,
+    evidence: Option<String>,
+    decided_at: f64,
+) -> RepairDisposition {
     RepairDisposition {
         item_id: repair_item_id(document, rejection),
         attempt: 0,
@@ -555,7 +418,7 @@ fn withdraw(
         class: rejection.class.as_str().to_string(),
         outcome: "withdraw".to_string(),
         corrected_json: None,
-        evidence: None,
+        evidence,
         reason,
         dispositioner: format!("code:{rule}"),
         decided_at,
@@ -618,64 +481,10 @@ fn accept(
     }
 }
 
-/// The token printed immediately after a value that did NOT resolve as a
-/// unit — the vocabulary-gap report. Read from the normalized haystack
-/// (only whitespace may separate value and token), then mapped back to the
-/// document's own casing where the verbatim span allows it.
-fn adjacent_spelling(hay: &str, value_end: usize, verbatim_span: &str) -> Option<String> {
-    let after = hay.get(value_end..)?;
-    let offset = after.find(|c: char| !c.is_whitespace())?;
-    let token = after[offset..].split_whitespace().next()?;
-    let token = token
-        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
-        .trim_start_matches('(')
-        .trim_end_matches(')');
-    // A following number or bare punctuation is not a unit spelling.
-    if token.is_empty() || !token.chars().any(char::is_alphabetic) {
-        return None;
-    }
-    let lower = verbatim_span.to_lowercase();
-    if lower.len() == verbatim_span.len()
-        && let Some(position) = lower.find(token)
-        && verbatim_span.is_char_boundary(position)
-        && verbatim_span.is_char_boundary(position + token.len())
-    {
-        return Some(verbatim_span[position..position + token.len()].to_string());
-    }
-    Some(token.to_string())
-}
-
 /// Deterministic typographic normalization for the subject re-check:
 /// Unicode hyphens/dashes/minus to ASCII `-`, and horizontal whitespace
 /// runs to one space — WITHIN each line. Line boundaries are provenance
 /// boundaries in the grounding gate and are preserved, so normalization
-/// Whether a span actually names the PROPERTY the fact is about.
-///
-/// Repair accepts on code's own authority, with no model reading the passage,
-/// so it demands more than Phase-1 grounding does: the span must contain the
-/// property name, not merely the subject. Deliberately conservative — a
-/// paper writing "scanning speed" where the fact says "scan speed" fails
-/// this, and the item is QUEUED for the model tier rather than accepted.
-/// Failing safe here costs recall; failing open stores a falsehood carrying a
-/// verbatim quote, which is worse.
-///
-/// Matching mirrors the grounding scanner's own normalisation: lowercase and
-/// whitespace-collapsed, so line wrapping and double spaces in extracted PDF
-/// text do not hide a property that is genuinely present.
-fn span_names_the_property(span: &str, object: &str) -> bool {
-    fn folded(text: &str) -> String {
-        text.to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-    let needle = folded(object);
-    if needle.is_empty() {
-        return false;
-    }
-    folded(span).contains(&needle)
-}
-
 /// can never merge one record's value with another record's condition.
 /// Case is not touched here; the term matcher already folds it.
 fn normalize_typography(text: &str) -> String {
@@ -734,197 +543,28 @@ mod tests {
             confidence: Some(0.9),
             kind: value.is_some().then(|| "measurement".to_string()),
             evidence_class: Default::default(),
-        }
-    }
-
-    /// THE HEADLINE PROPERTY. Two rejections carrying DIFFERENT invented
-    /// identifiers for the same underlying unit converge on the SAME stored
-    /// identifier, because the document — not the model's claim — picks it.
-    ///
-    /// This is falsifiable at the obvious shortcut: `resolve_unit`
-    /// canonicalises `QUDT:Meter-Per-Second` to `QUDT:M-PER-SEC`, so an
-    /// implementation that consults the CLAIMED spelling stores M-PER-SEC
-    /// for one input and MilliM-PER-SEC for the other — and this fails.
-    #[test]
-    fn different_invented_identifiers_converge_on_the_documents_identifier() {
-        let text = "The AlSi10Mg parts were built at a scan speed of 1250 mm/s.";
-        let policy = RepairPolicy::default();
-
-        let mut stored = Vec::new();
-        for claimed in ["QUDT:Meter-Per-Second", "QUDT:MM-PER-S"] {
-            let rejection = raw_speed_rejection(claimed);
-            let disposition = dispose(&rejection, DOC, text, &policy, NOW)
-                .unwrap_or_else(|| panic!("{claimed} must be decided by code"));
-            assert_eq!(disposition.outcome, "accept", "{claimed}");
-            assert_eq!(disposition.dispositioner, "code:unit-re-resolution");
-            let corrected: MaterialFact =
-                serde_json::from_str(disposition.corrected_json.as_deref().unwrap()).unwrap();
-            // Field freeze held.
-            assert_eq!(corrected.subject, "AlSi10Mg");
-            assert_eq!(corrected.predicate, "has_measurement");
-            assert_eq!(corrected.object, "scan speed");
-            // Evidence is the verbatim span that justified the unit.
-            let evidence = disposition.evidence.as_deref().unwrap();
-            assert!(evidence.contains("1250 mm/s"), "{evidence}");
-            stored.push(corrected.unit.unwrap().as_str().to_string());
-        }
-        assert_eq!(stored[0], stored[1], "one unit, one identity");
-        assert_eq!(stored[0], "QUDT:MilliM-PER-SEC");
-    }
-
-    /// A resolvable-but-WRONG adjacent token must never be accepted: the
-    /// strict quantity-kind guard refuses a printed dwell time ("30 s")
-    /// sitting where a scan speed's unit would be. And an adjacent token
-    /// the vocabulary cannot resolve at all ("30 day") is the maintainer
-    /// feedback loop: withdrawn as a vocabulary gap naming the spelling,
-    /// never bridged by fiat.
-    /// The kind guard must fail CLOSED when the property's quantity kind is
-    /// unknown, not open.
-    ///
-    /// `a_resolvable_but_wrong_adjacent_token_is_never_accepted` covers the
-    /// case where both kinds are known and disagree. It does NOT cover an
-    /// unrecognised property, where `property_quantity_kind` returns None —
-    /// and that is the wider hole, because a paper may report any property
-    /// the table has never seen. Found by mutation: weakening the guard to
-    /// "reject only when both kinds are known AND differ" left every repair
-    /// test passing.
-    /// REPRODUCTION of an adversarial-review finding: Tier A could bind a
-    /// fact to the WRONG occurrence of its number and accept it with a real,
-    /// verbatim quote as evidence.
-    ///
-    /// The grounding predicate binds on subject OR object appearing in the
-    /// span (`claims.rs`), so a sentence naming only the SUBJECT satisfies it
-    /// — even when that sentence is about a different property entirely. For
-    /// Phase 1 that is a deliberate tradeoff with a model in the loop. For
-    /// repair it is not: code accepts here on its own authority, so it must
-    /// demand that the span names the PROPERTY too.
-    ///
-    /// Without that, this document yields "AlSi10Mg scan speed = 1250 mm/s"
-    /// sourced from a sentence about the RECOATER — a falsehood carrying
-    /// genuine evidence, which is worse than dropping the fact.
-    #[test]
-    fn a_span_naming_only_the_subject_cannot_repair_a_different_property() {
-        let policy = RepairPolicy::default();
-        let raw = serde_json::json!({
-            "subject": "AlSi10Mg", "predicate": "has_measurement",
-            "object": "scan speed", "value": 1250.0, "unit": "QUDT:MM-PER-S",
-            "kind": "measurement", "evidence_class": "research", "conditions": []
-        });
-        let rejection = RejectedFact {
-            subject: RejectedSubject::Raw(Box::new(raw)),
-            class: RejectionClass::UnresolvedUnit,
-            detail: "test: unresolved unit".into(),
-        };
-
-        // The number and a resolvable, kind-consistent unit are present — but
-        // the sentence is about the recoater, and never mentions scan speed.
-        // The paper states no scan speed value at all.
-        let doc = "For the AlSi10Mg builds the recoater cross-feed speed was \
-                   fixed at 1250 mm/s throughout the campaign.";
-        let decided = dispose(&rejection, DOC, doc, &policy, NOW);
-        if let Some(d) = &decided {
-            assert_ne!(
-                d.outcome, "accept",
-                "the span never names the property; accepting binds the fact to \
-                 another quantity and calls it evidenced: {d:?}"
-            );
+            verification: None,
+            verification_reason: None,
         }
     }
 
     #[test]
-    fn an_unknown_property_kind_is_never_silently_accepted() {
-        let policy = RepairPolicy::default();
-        // "acoustic damping ratio" is not in the quantity-kind table, so the
-        // expected kind is None — nothing can establish consistency.
-        assert!(
-            crate::qudt_units::property_quantity_kind("acoustic damping ratio").is_none(),
-            "test premise: this property must be unknown to the table"
-        );
-        let raw = serde_json::json!({
-            "subject": "AlSi10Mg", "predicate": "has_measurement",
-            "object": "acoustic damping ratio", "value": 30.0,
-            "unit": "QUDT:INVENTED", "kind": "measurement",
-            "evidence_class": "research", "conditions": []
-        });
-        let rejection = RejectedFact {
-            subject: RejectedSubject::Raw(Box::new(raw)),
-            class: RejectionClass::UnresolvedUnit,
-            detail: "test: unresolved unit".into(),
-        };
-
-        // "30 s" resolves to QUDT:SEC. With the property's kind unknown, code
-        // CANNOT establish that seconds is right for a damping ratio — so it
-        // must not accept. Storing it would attach a verbatim span to a unit
-        // nobody verified, which is worse than dropping the fact.
-        let doc = "The AlSi10Mg damping measurement settled after 30 s of ring-down.";
-        let decided = dispose(&rejection, DOC, doc, &policy, NOW);
-        if let Some(d) = &decided {
-            assert_ne!(
-                d.outcome, "accept",
-                "an unknown property kind must never yield a code ACCEPT: {d:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_resolvable_but_wrong_adjacent_token_is_never_accepted() {
-        let policy = RepairPolicy::default();
-        let raw = serde_json::json!({
-            "subject": "AlSi10Mg", "predicate": "has_measurement",
-            "object": "scan speed", "value": 30.0, "unit": "QUDT:MM-PER-S",
-            "kind": "measurement", "evidence_class": "research", "conditions": []
-        });
-        let rejection = RejectedFact {
-            subject: RejectedSubject::Raw(Box::new(raw)),
-            class: RejectionClass::UnresolvedUnit,
-            detail: "test: unresolved unit".into(),
-        };
-
-        // "30 s" resolves (QUDT:SEC) but its kind (time) contradicts the
-        // property (speed): NOT accepted — queued for the model tier, which
-        // is legal for this unrendered class.
-        let wrong_kind = "The AlSi10Mg scan speed run paused for 30 s before the next layer.";
-        assert!(
-            dispose(&rejection, DOC, wrong_kind, &policy, NOW).is_none(),
-            "a kind-inconsistent printed unit must not be accepted by code"
-        );
-
-        // "30 day" resolves to nothing: vocabulary gap, withdrawn with the
-        // document's verbatim spelling — zero model calls.
-        let unresolvable = "The AlSi10Mg scan speed run paused for 30 day intervals.";
-        let disposition = dispose(&rejection, DOC, unresolvable, &policy, NOW)
-            .expect("a vocabulary gap is a code decision");
-        assert_eq!(disposition.outcome, "withdraw");
-        assert_eq!(disposition.reason, "vocabulary-gap:day");
-        assert_eq!(disposition.dispositioner, "code:vocabulary-gap");
-
-        // Two DIFFERENT consistent units beside equal values is ambiguous:
-        // code must not pick one, so the item queues.
-        let ambiguous = "The AlSi10Mg scan speed was 30 mm/s. \
-                         Another AlSi10Mg scan speed was 30 m/s.";
-        assert!(
-            dispose(&rejection, DOC, ambiguous, &policy, NOW).is_none(),
-            "two candidate identifiers must not be resolved by coin flip"
-        );
-    }
-
-    /// An UnresolvedUnit whose value appears nowhere in the document is the
-    /// same invention the near-miss filter withdraws — no model call can
-    /// change what the document does not say.
-    #[test]
-    fn an_unresolved_unit_on_an_invented_value_is_withdrawn_not_queued() {
+    fn unresolved_units_are_deferred_without_a_rust_vocabulary() {
+        // CONTRACT CHANGE: all deterministic spelling/kind repair tests were
+        // removed with their tables. Code records no unit verdict; the queued
+        // reader receives source spans and preserves an exact term.
         let rejection = raw_speed_rejection("QUDT:MM-PER-S");
-        let text = "The AlSi10Mg parts were examined for scan speed effects, \
-                    described qualitatively.";
-        let disposition = dispose(&rejection, DOC, text, &RepairPolicy::default(), NOW)
-            .expect("an absent value is a code decision");
-        assert_eq!(disposition.outcome, "withdraw");
         assert!(
-            disposition.reason.starts_with("no-near-miss"),
-            "{}",
-            disposition.reason
+            dispose(
+                &rejection,
+                DOC,
+                "source",
+                &RepairPolicy::default(),
+                NOW,
+                &crate::ontologies::EmmoOntology
+            )
+            .is_none()
         );
-        assert_eq!(disposition.dispositioner, "code:no-near-miss");
     }
 
     /// The three invented accuracies (0.935/0.944/0.946): NumericUnsupported
@@ -946,8 +586,15 @@ mod tests {
                      fact's subject or property"
                 ),
             };
-            let disposition = dispose(&rejection, DOC, text, &RepairPolicy::default(), NOW)
-                .expect("a rendered judgement is always a code decision");
+            let disposition = dispose(
+                &rejection,
+                DOC,
+                text,
+                &RepairPolicy::default(),
+                NOW,
+                &crate::ontologies::EmmoOntology,
+            )
+            .expect("a rendered judgement is always a code decision");
             assert_eq!(disposition.outcome, "withdraw", "{value}");
             assert!(
                 disposition.reason.starts_with("no-near-miss"),
@@ -972,8 +619,15 @@ mod tests {
             class: RejectionClass::NumericUnsupported,
             detail: "test: numeric grounding failed".into(),
         };
-        let disposition = dispose(&rejection, DOC, text, &RepairPolicy::default(), NOW)
-            .expect("a rendered judgement is always a code decision");
+        let disposition = dispose(
+            &rejection,
+            DOC,
+            text,
+            &RepairPolicy::default(),
+            NOW,
+            &crate::ontologies::EmmoOntology,
+        )
+        .expect("a rendered judgement is always a code decision");
         assert_eq!(disposition.outcome, "withdraw");
         assert_eq!(disposition.dispositioner, "code:grounding-stands");
         assert!(
@@ -1004,6 +658,7 @@ mod tests {
                 "Alloy X showed no omega phase.",
                 &RepairPolicy::default(),
                 NOW,
+                &crate::ontologies::EmmoOntology,
             )
             .expect("a rendered review verdict must be decided by code, never queued");
             assert_eq!(disposition.outcome, "withdraw");
@@ -1035,13 +690,15 @@ mod tests {
     /// rewritten one).
     #[test]
     fn subject_normalization_readmits_a_dash_variant_with_fields_frozen() {
+        // CONTRACT CHANGE: the grounding tier matches a supplied exact term;
+        // it no longer translates a paper spelling through a Rust table.
         let text = "The Ti\u{2013}6Al\u{2013}4V specimens exhibited an ultimate tensile \
                     strength of 1140 MPa at room temperature.";
         let fact = converted_fact(
             "Ti-6Al-4V",
             "ultimate tensile strength",
             Some(1140.0),
-            Some("QUDT:MegaPA"),
+            Some("MPa"),
         );
         // The original gate really does refuse this subject — the repair is
         // re-checking a genuine refusal, not a fabricated one.
@@ -1051,9 +708,16 @@ mod tests {
             class: RejectionClass::SubjectNotNamed,
             detail: "the document never names that subject".into(),
         };
-        let disposition = dispose(&rejection, DOC, text, &RepairPolicy::default(), NOW)
-            .expect("subject normalization is a code decision");
-        assert_eq!(disposition.outcome, "accept");
+        let disposition = dispose(
+            &rejection,
+            DOC,
+            text,
+            &RepairPolicy::default(),
+            NOW,
+            &crate::ontologies::EmmoOntology,
+        )
+        .expect("subject normalization is a code decision");
+        assert_eq!(disposition.outcome, "accept", "{}", disposition.reason);
         assert_eq!(disposition.dispositioner, "code:subject-normalization");
         let corrected: MaterialFact =
             serde_json::from_str(disposition.corrected_json.as_deref().unwrap()).unwrap();
@@ -1063,6 +727,55 @@ mod tests {
         );
         let evidence = disposition.evidence.as_deref().unwrap();
         assert!(evidence.contains("1140 MPa"), "{evidence}");
+    }
+
+    /// B4 WIRING: a subject hyphen-wrapped across PDF lines ("Ti-6Al-\n4V")
+    /// could never ground through the repair tier before — the join the
+    /// extraction-side helper was built for was never applied here. The
+    /// unambiguous hyphen-wrap signature now joins in this tier's
+    /// normalization, and the fact is accepted with fields frozen.
+    #[test]
+    fn subject_normalization_joins_a_hyphen_wrapped_subject() {
+        let text = "The Ti-6Al-\n4V specimens exhibited an ultimate tensile \
+                    strength of 1140 MPa at room temperature.";
+        let fact = converted_fact(
+            "Ti-6Al-4V",
+            "ultimate tensile strength",
+            Some(1140.0),
+            Some("MPa"),
+        );
+        // The original gate really does refuse this subject on the raw
+        // text — the repair is re-checking a genuine refusal.
+        assert!(!subject_appears("Ti-6Al-4V", text));
+        let rejection = RejectedFact {
+            subject: RejectedSubject::Converted(Box::new(fact)),
+            class: RejectionClass::SubjectNotNamed,
+            detail: "the document never names that subject".into(),
+        };
+        let disposition = dispose(
+            &rejection,
+            DOC,
+            text,
+            &RepairPolicy::default(),
+            NOW,
+            &crate::ontologies::EmmoOntology,
+        )
+        .expect("subject normalization is a code decision");
+        assert_eq!(disposition.outcome, "accept", "{}", disposition.reason);
+        let corrected: MaterialFact =
+            serde_json::from_str(disposition.corrected_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            corrected.subject, "Ti-6Al-4V",
+            "the stored subject is frozen"
+        );
+        assert!(
+            disposition
+                .evidence
+                .as_deref()
+                .is_some_and(|span| span.contains("1140 MPa")),
+            "{:?}",
+            disposition.evidence
+        );
     }
 
     /// …and the two ways it stays withdrawn: a subject that is genuinely
@@ -1082,8 +795,15 @@ mod tests {
             detail: "the document never names that subject".into(),
         };
         let text = "The Ti\u{2013}6Al\u{2013}4V specimens reached a UTS of 950 MPa.";
-        let disposition =
-            dispose(&absent, DOC, text, &policy, NOW).expect("always a code decision");
+        let disposition = dispose(
+            &absent,
+            DOC,
+            text,
+            &policy,
+            NOW,
+            &crate::ontologies::EmmoOntology,
+        )
+        .expect("always a code decision");
         assert_eq!(disposition.outcome, "withdraw");
         assert!(
             disposition.reason.contains("stands"),
@@ -1104,14 +824,62 @@ mod tests {
             detail: "the document never names that subject".into(),
         };
         let text = "The Ti\u{2013}6Al\u{2013}4V specimens showed an alpha-beta structure.";
-        let disposition =
-            dispose(&assertion, DOC, text, &policy, NOW).expect("always a code decision");
+        let disposition = dispose(
+            &assertion,
+            DOC,
+            text,
+            &policy,
+            NOW,
+            &crate::ontologies::EmmoOntology,
+        )
+        .expect("always a code decision");
         assert_eq!(disposition.outcome, "withdraw");
         assert!(
             disposition.reason.contains("never returns to a model"),
             "{}",
             disposition.reason
         );
+    }
+
+    /// CONTRACT CHANGE (de-hardcoding): when the re-check's grounding gate
+    /// refuses every candidate occurrence, the withdraw persists the NAMED
+    /// guard and the EXACT span examined on the ledger row — the evidence a
+    /// re-checking reader needs, instead of a paraphrase that loses both.
+    #[test]
+    fn a_guarded_grounding_refusal_persists_the_guard_and_span_as_evidence() {
+        // The en-dash subject normalizes, but the value's only occurrence
+        // sits inside a citation marker — the Citation guard refuses it.
+        let text = "The Ti\u{2013}6Al\u{2013}4V strength was reported [1140] for a \
+                    related alloy.";
+        let fact = converted_fact("Ti-6Al-4V", "strength", Some(1140.0), Some("MPa"));
+        assert!(!subject_appears("Ti-6Al-4V", text));
+        let rejection = RejectedFact {
+            subject: RejectedSubject::Converted(Box::new(fact)),
+            class: RejectionClass::SubjectNotNamed,
+            detail: "the document never names that subject".into(),
+        };
+        let disposition = dispose(
+            &rejection,
+            DOC,
+            text,
+            &RepairPolicy::default(),
+            NOW,
+            &crate::ontologies::EmmoOntology,
+        )
+        .expect("subject normalization is a code decision");
+        assert_eq!(disposition.outcome, "withdraw", "{}", disposition.reason);
+        // The guard's name survives into the reason...
+        assert!(
+            disposition.reason.contains("Citation"),
+            "{}",
+            disposition.reason
+        );
+        // ...and the exact examined span rides the ledger's evidence column.
+        let evidence = disposition
+            .evidence
+            .expect("a guarded refusal keeps its span");
+        assert!(evidence.contains("[1140]"), "{evidence}");
+        assert!(evidence.contains("strength"), "{evidence}");
     }
 
     /// PolicyDeferred is recorded as a deferral — an operator's configured
@@ -1131,6 +899,7 @@ mod tests {
             "Alloy X contained an omega phase.",
             &RepairPolicy::default(),
             NOW,
+            &crate::ontologies::EmmoOntology,
         )
         .expect("a deferral is recorded, never queued");
         assert_eq!(disposition.outcome, "withdraw");
@@ -1183,7 +952,8 @@ mod tests {
                     DOC,
                     "The steel showed ferrite.",
                     &RepairPolicy::default(),
-                    NOW
+                    NOW,
+                    &crate::ontologies::EmmoOntology,
                 )
                 .is_none(),
                 "{} has no code tier",

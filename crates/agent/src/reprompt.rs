@@ -42,7 +42,121 @@
 //! up as materials science.
 
 use crate::types::AgentConfig;
+use prism_ingest::ontologies::Ontology;
 use prism_llm::{ChatMessage, LlmClient, UsageInfo};
+
+// ── Domain vocabulary (served from the ACTIVE ontology) ────────────
+
+/// The domain words the reprompt surfaces use, served from the ACTIVE
+/// ontology — never a Rust domain list. Rust keeps the STRUCTURE (three
+/// slots, "any one is enough", a numbered menu); the ontology supplies its
+/// own class and quantity vocabulary, so a legal deployment's menus name
+/// cases and obligations while a materials deployment's name alloys and
+/// properties.
+#[derive(Debug, Clone)]
+pub struct DomainVocabulary {
+    /// The ontology's subject-kind class labels (EMMO: `Alloy`, `Material`,
+    /// `Phase`, …; a legal ontology: `Case`, `Verdict`, …).
+    pub subject_kinds: Vec<String>,
+    /// The ontology's quantitative class labels — the measurable targets a
+    /// "make it better" direction can pick from.
+    pub quantity_kinds: Vec<String>,
+}
+
+impl DomainVocabulary {
+    /// Derive the vocabulary from the ontology's OWN declarations: every
+    /// extraction class label for subjects, every quantitative label for
+    /// quantities. An ontology that declares nothing serves empty menus —
+    /// the questions stay structural and name no kinds, rather than
+    /// inventing domain words in Rust.
+    #[must_use]
+    pub fn from_ontology(ontology: &dyn Ontology) -> Self {
+        let mut subject_kinds: Vec<String> = ontology
+            .classes()
+            .iter()
+            .flat_map(|class| class.extraction_labels.iter().cloned())
+            .collect();
+        subject_kinds.sort();
+        subject_kinds.dedup();
+        let mut quantity_kinds: Vec<String> = ontology
+            .quantitative_labels()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        quantity_kinds.sort();
+        Self {
+            subject_kinds,
+            quantity_kinds,
+        }
+    }
+
+    /// Resolve the vocabulary for a project: the ontology its `prism.toml`
+    /// selects, falling back to the built-in default when the project has
+    /// no readable configuration (menus then carry the default ontology's
+    /// words — logged, never silent, and still ontology-sourced).
+    #[must_use]
+    pub fn for_project(project_root: &std::path::Path) -> Self {
+        match prism_ingest::ontologies::active_for_project_config(project_root) {
+            Ok(ontology) => Self::from_ontology(ontology.as_ref()),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "reprompt: project ontology unresolvable — domain menus fall back to the default ontology"
+                );
+                let default = prism_ingest::ontologies::active(None)
+                    .expect("the built-in default ontology is always registered");
+                Self::from_ontology(default.as_ref())
+            }
+        }
+    }
+
+    /// The category nouns for the vagueness heuristic: the ontology's own
+    /// class labels (lowercased — "my alloy", "my case") plus the
+    /// language-level filler nouns below. These stand in for a subject
+    /// without being one: "my alloy" is not a material, "Hastelloy" is.
+    fn generic_nouns(&self) -> Vec<String> {
+        let mut nouns: Vec<String> = self
+            .subject_kinds
+            .iter()
+            .map(|kind| kind.to_lowercase())
+            .collect();
+        nouns.extend(LANGUAGE_FILLER_NOUNS.iter().map(|noun| (*noun).to_string()));
+        nouns
+    }
+
+    /// `"an alloy, a material, …"` — the subject kinds as a menu fragment.
+    fn subject_kind_list(&self) -> String {
+        self.subject_kinds
+            .iter()
+            .map(|kind| format!("a {kind}"))
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Language-level filler nouns — generic ENGLISH object words, not domain
+/// knowledge (they stand in for a subject in any domain). The domain half
+/// of the old hardcoded category-noun list (`alloy`, `material`, `metal`,
+/// …) now comes from the active ontology's declared classes instead.
+const LANGUAGE_FILLER_NOUNS: &[&str] = &[
+    "part",
+    "parts",
+    "sample",
+    "component",
+    "product",
+    "design",
+    "recipe",
+    "setup",
+    "system",
+    "model",
+    "thing",
+    "things",
+    "stuff",
+    "something",
+    "one",
+    "ones",
+];
 
 // ── Intent taxonomy ──────────────────────────────────────────────────
 
@@ -141,78 +255,109 @@ impl Intent {
     }
 
     /// The ONE consolidated question to ask when this intent is unserved, or
-    /// when its required subject is missing. Options are drawn from what PRISM
-    /// can actually do — a non-expert cannot answer "what tolerance?", but can
-    /// pick from a list.
-    fn question(self) -> &'static str {
+    /// when its required subject is missing. The STRUCTURE (three slots,
+    /// "any one is enough", a numbered menu) is Rust's; the KINDS are the
+    /// active ontology's own declarations — a legal deployment's menus name
+    /// cases and obligations, a materials deployment's name alloys and
+    /// properties. No grade names or property instances are invented here:
+    /// the ontology declares classes, not data.
+    fn question(self, vocabulary: &DomainVocabulary) -> String {
+        let kinds = vocabulary.subject_kind_list();
+        let kind_phrase = if kinds.is_empty() {
+            "a specific one if you know it".to_string()
+        } else {
+            format!("a specific one if you know it, otherwise the kind ({kinds})")
+        };
         match self {
             Intent::SupplierDiscovery => {
-                "That is a supplier-discovery question, not a materials question, and PRISM \
-                 cannot answer it. It has no company registry, no capability directory and no \
-                 procurement data — anything it told you about who can machine this would be a \
-                 guess dressed up as an answer.\n\n\
+                "That is a supplier-discovery question, and PRISM cannot answer it. It has \
+                 no company registry, no capability directory and no procurement data — \
+                 anything it told you about who can make this would be a guess dressed up \
+                 as an answer.\n\n\
                  Here is what it can actually do. Which one do you want?\n\
-                 1. Specify the part properly first — material, process, tolerance, quantity — \
-                 so you have something precise to send to shops you already know.\n\
-                 2. Prior art and literature on the process itself: what it takes to make this \
-                 part in this material, and where it usually goes wrong.\n\
+                 1. Specify the request properly first — subject, process, tolerance, \
+                 quantity — so you have something precise to send to shops you already know.\n\
+                 2. Prior art and literature on the process itself: what it takes to do \
+                 this work, and where it usually goes wrong.\n\
                  3. A plain web search, labelled as a plain web search — no vetting, no \
-                 materials judgement behind it.\n\n\
-                 Reply with 1, 2 or 3 (or tell me the part and material and I will start there)."
+                 technical judgement behind it.\n\n\
+                 Reply with 1, 2 or 3 (or tell me the subject and I will start there)."
+                    .to_string()
             }
             Intent::CompetitiveLandscape => {
-                "That is a market/competitive question, not a materials question, and PRISM \
-                 cannot answer it. It indexes materials data, literature and process knowledge \
-                 — not market share, pricing or company positioning.\n\n\
+                "That is a market/competitive question, and PRISM cannot answer it. It \
+                 indexes its configured domain's knowledge graph, literature and process \
+                 knowledge — not market share, pricing or company positioning.\n\n\
                  What it can do instead. Which one?\n\
-                 1. The published technical landscape: who has reported work on this material \
-                 or process, from the literature.\n\
-                 2. A capability comparison on technical grounds — what a given process can and \
-                 cannot achieve for this part.\n\
+                 1. The published technical landscape: who has reported work on this \
+                 subject or process, from the literature.\n\
+                 2. A capability comparison on technical grounds — what a given process can \
+                 and cannot achieve for this case.\n\
                  3. A plain web search, labelled as such, with no analysis behind it.\n\n\
                  Reply with 1, 2 or 3."
+                    .to_string()
             }
             Intent::MaterialsData => {
-                "Which material, and which property? Give me as much of this as you have — \
-                 partial is fine, one line:\n\
-                 1. The material — a grade if you know it (Inconel 718, Ti-6Al-4V, 316L), \
-                 otherwise the family (\"a nickel superalloy\") or just the application.\n\
-                 2. The property — strength, fatigue life, thermal conductivity, corrosion, \
-                 density, something else.\n\
-                 3. The condition it matters at — temperature, heat treatment, as-built vs \
-                 machined.\n\n\
-                 Any one of the three is enough for me to start."
+                let quantities = if vocabulary.quantity_kinds.is_empty() {
+                    "name the quantity you need directly".to_string()
+                } else {
+                    format!(
+                        "one of the kinds this deployment models ({}) — or name another",
+                        vocabulary.quantity_kinds.join(", ")
+                    )
+                };
+                format!(
+                    "Which subject, and which quantity? Give me as much of this as you \
+                     have — partial is fine, one line:\n\
+                     1. The subject — {kind_phrase}, or just the wider application.\n\
+                     2. The quantity — {quantities}.\n\
+                     3. The condition it matters under — any circumstance that changes it.\n\n\
+                     Any one of the three is enough for me to start."
+                )
             }
             Intent::Literature => {
-                "What should I search the literature for? Give me either:\n\
-                 1. a material or process (e.g. \"laser powder bed fusion of AlSi10Mg\"), or\n\
-                 2. the problem you are trying to solve (e.g. \"cracking in a thin-wall part\"), \
-                 or\n\
-                 3. a specific paper, author or DOI to start from.\n\n\
-                 Any one of those is enough to start."
+                format!(
+                    "What should I search the literature for? Give me either:\n\
+                     1. a subject or process ({kind_phrase}), or\n\
+                     2. the problem you are trying to solve, or\n\
+                     3. a specific paper, author or DOI to start from.\n\n\
+                     Any one of those is enough to start."
+                )
             }
             Intent::ProcessDesign => {
-                "\"Better\" needs a direction before I can do anything useful. Two things, one \
-                 line:\n\n\
-                 Which material — a grade if you have it, otherwise the application.\n\n\
-                 And better at what:\n\
-                 1. Strength or hardness\n\
-                 2. High-temperature life (creep, oxidation)\n\
-                 3. Corrosion or environmental resistance\n\
-                 4. Manufacturability — printability, machinability, weldability\n\
-                 5. Cost or supply risk\n\n\
-                 Pick a number, and say what must NOT get worse."
+                // The menu of improvement directions is the ontology's own
+                // quantity vocabulary — what this deployment can actually
+                // measure — plus an explicit "name another" slot, so the
+                // menu is never empty.
+                let mut options: Vec<String> = vocabulary
+                    .quantity_kinds
+                    .iter()
+                    .map(|kind| format!("{kind} (say which one)"))
+                    .collect();
+                options.push("Something else — name the quantity".to_string());
+                let menu = options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, option)| format!("{}. {option}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "\"Better\" needs a direction before I can do anything useful. Two \
+                     things, one line:\n\n\
+                     Which subject — {kind_phrase}.\n\n\
+                     And better at what:\n{menu}\n\n\
+                     Pick a number, and say what must NOT get worse."
+                )
             }
-            Intent::ComputeOps => {
-                "Which operation, and on what? Pick one:\n\
+            Intent::ComputeOps => "Which operation, and on what? Pick one:\n\
                  1. Run a workflow or job\n\
                  2. Deploy or serve something\n\
                  3. Check status — nodes, jobs, deployments, billing\n\
                  4. Provision or estimate compute\n\n\
                  Then name the target (workflow name, deployment, node, or job id)."
-            }
+                .to_string(),
             // Never asked: Other always proceeds.
-            Intent::Other => "",
+            Intent::Other => String::new(),
         }
     }
 }
@@ -253,7 +398,11 @@ pub enum Triage {
 /// feature exists to avoid. The routing rule is NOT suppressed — "find
 /// companies in Poland" is a misroute whenever it arrives.
 #[must_use]
-pub fn triage(user_message: &str, has_prior_context: bool) -> Triage {
+pub fn triage(
+    user_message: &str,
+    has_prior_context: bool,
+    vocabulary: &DomainVocabulary,
+) -> Triage {
     let lower = user_message.to_lowercase();
     let words = tokenize(&lower);
     if words.is_empty() {
@@ -262,12 +411,13 @@ pub fn triage(user_message: &str, has_prior_context: bool) -> Triage {
     if has_routing_marker(&lower, &words) {
         return Triage::Classify;
     }
+    let generic_nouns = vocabulary.generic_nouns();
     if !has_prior_context
         && words.len() >= VAGUE_MIN_WORDS
         && words.len() <= VAGUE_MAX_WORDS
         && is_vague_directive(&words)
-        && names_nothing(&words)
-        && !is_bare_speed_request(&words)
+        && names_nothing(&words, &generic_nouns)
+        && !is_bare_speed_request(&words, &generic_nouns)
     {
         return Triage::Classify;
     }
@@ -354,42 +504,16 @@ const BARE_COMPARATIVES: &[&str] = &[
     "better", "best", "good", "great", "improved", "faster", "cheaper", "stronger", "nicer", "more",
 ];
 
-/// Category nouns that stand in for a subject without being one. "My alloy" is
-/// not a material; "Hastelloy" is.
+/// CONTRACT CHANGE: the category nouns that stand in for a subject without
+/// being one ("my alloy", "my case") are no longer a hardcoded Rust domain
+/// list. The DOMAIN half is served from the active ontology's declared
+/// classes through [`DomainVocabulary::generic_nouns`]; only the
+/// language-level filler nouns ([`LANGUAGE_FILLER_NOUNS`]) stay in Rust.
+/// `code` is deliberately excluded from both — it is the object of the most
+/// ordinary terse request a coding-capable agent gets ("fix my code"), which
+/// PRISM serves by reading the repo, not by asking which property the user
+/// meant.
 ///
-/// Deliberately EXCLUDED: `code`. It is not a materials/process category noun —
-/// it is the object of the most ordinary terse request a coding-capable agent
-/// gets ("fix my code"), which PRISM serves by reading the repo, not by asking
-/// which property the user meant. Every entry below still stands in for a
-/// materials, process or artefact subject, so `make my alloy better` and
-/// `optimize my material` are unaffected. (`system` and `model` stay: an alloy
-/// SYSTEM and a thermodynamic MODEL are real metallurgy subjects.)
-const GENERIC_NOUNS: &[&str] = &[
-    "alloy",
-    "alloys",
-    "material",
-    "materials",
-    "metal",
-    "metals",
-    "part",
-    "parts",
-    "sample",
-    "component",
-    "product",
-    "design",
-    "process",
-    "recipe",
-    "setup",
-    "system",
-    "model",
-    "thing",
-    "things",
-    "stuff",
-    "something",
-    "one",
-    "ones",
-];
-
 /// Function words that carry no subject. Includes the fragments an apostrophe
 /// tokenizes to (`ve`, `s`, `t`, …).
 const FUNCTION_WORDS: &[&str] = &[
@@ -424,8 +548,11 @@ fn is_vague_directive(words: &[&str]) -> bool {
 /// "make my process faster" and "make the process faster" stop escalating —
 /// a regression an adversarial review caught and
 /// `narrowing_the_software_case_did_not_disarm_the_materials_case` now pins.
-fn is_bare_speed_request(words: &[&str]) -> bool {
-    words.contains(&"faster") && !words.iter().any(|w| GENERIC_NOUNS.contains(w))
+fn is_bare_speed_request(words: &[&str], generic_nouns: &[String]) -> bool {
+    words.contains(&"faster")
+        && !words
+            .iter()
+            .any(|w| generic_nouns.iter().any(|noun| noun == w))
 }
 
 /// Does the message name NOTHING — is every single word drawn from the closed
@@ -437,12 +564,12 @@ fn is_bare_speed_request(words: &[&str]) -> bool {
 /// treated as nameless and interrogated, while `MAKE MY ALLOY BETTER` was
 /// treated as specific and let through. A closed-vocabulary test has neither
 /// failure — an unknown word is a named thing, in any casing and any language.
-fn names_nothing(words: &[&str]) -> bool {
+fn names_nothing(words: &[&str], generic_nouns: &[String]) -> bool {
     words.iter().all(|w| {
         VAGUE_VERBS.contains(w)
             || VAGUE_OBJECTS.contains(w)
             || BARE_COMPARATIVES.contains(w)
-            || GENERIC_NOUNS.contains(w)
+            || generic_nouns.iter().any(|noun| noun == w)
             || FUNCTION_WORDS.contains(w)
     })
 }
@@ -591,8 +718,9 @@ pub const ROUTE_HINT_PREFIX: &str = "<system-reminder>PRE-FLIGHT ROUTING — ";
 /// `history` is the session's conversation, and carries BOTH pieces of session
 /// state this needs, with no extra plumbing and no separate ledger:
 /// - whether there is prior context (an anaphoric follow-up is not vague), and
-/// - which questions have already been asked — the questions are `'static`
-///   strings, so a previous ask is an exact match on an assistant message.
+/// - which questions have already been asked — the questions are built
+///   deterministically from the session's ontology vocabulary, so a previous
+///   ask is an exact match on an assistant message.
 ///
 /// It is deliberately not the scratchpad: `service.rs` builds a fresh
 /// `Scratchpad` per turn and `restore_history_and_transcript_from_messages`
@@ -611,11 +739,12 @@ pub async fn preflight(
     user_message: &str,
     history: &[ChatMessage],
     can_ask: bool,
+    vocabulary: &DomainVocabulary,
 ) -> (Preflight, Option<PreflightUsage>) {
     if !enabled() {
         return (Preflight::Proceed, None);
     }
-    if triage(user_message, has_prior_context(history)) == Triage::Proceed {
+    if triage(user_message, has_prior_context(history), vocabulary) == Triage::Proceed {
         return (Preflight::Proceed, None);
     }
     let model = classifier_model(config);
@@ -625,7 +754,13 @@ pub async fn preflight(
         return (Preflight::Proceed, usage);
     };
     (
-        decide(intent, user_message, &asked_before(history), can_ask),
+        decide(
+            intent,
+            user_message,
+            &asked_before(history, vocabulary),
+            can_ask,
+            vocabulary,
+        ),
         usage,
     )
 }
@@ -638,17 +773,19 @@ fn has_prior_context(history: &[ChatMessage]) -> bool {
 }
 
 /// Intents already asked about in this session, recovered from the questions
-/// themselves. Exact equality against `'static` question text — no marker to
-/// leak into the user's transcript, nothing extra to persist.
-fn asked_before(history: &[ChatMessage]) -> Vec<Intent> {
+/// themselves. Exact equality against the built question text — no marker to
+/// leak into the user's transcript, nothing extra to persist. The vocabulary
+/// is the session's own (resolved from the same project config each turn), so
+/// a re-ask under the same ontology matches exactly.
+fn asked_before(history: &[ChatMessage], vocabulary: &DomainVocabulary) -> Vec<Intent> {
     Intent::ALL
         .into_iter()
         .filter(|intent| {
-            let question = intent.question();
+            let question = intent.question(vocabulary);
             !question.is_empty()
-                && history
-                    .iter()
-                    .any(|m| m.role == "assistant" && m.content.as_deref() == Some(question))
+                && history.iter().any(|m| {
+                    m.role == "assistant" && m.content.as_deref() == Some(question.as_str())
+                })
         })
         .collect()
 }
@@ -662,6 +799,7 @@ pub fn decide(
     user_message: &str,
     asked_before: &[Intent],
     can_ask: bool,
+    vocabulary: &DomainVocabulary,
 ) -> Preflight {
     if intent == Intent::Other {
         return Preflight::Proceed;
@@ -680,9 +818,14 @@ pub fn decide(
     // Unserved: say so once, plainly, with what PRISM can do instead.
     // Served but naming nothing: one consolidated question.
     // Served and naming something: proceed — prefer a stated assumption.
-    if !intent.is_served() || names_nothing(&tokenize(&user_message.to_lowercase())) {
+    if !intent.is_served()
+        || names_nothing(
+            &tokenize(&user_message.to_lowercase()),
+            &vocabulary.generic_nouns(),
+        )
+    {
         return Preflight::Ask {
-            question: intent.question().to_string(),
+            question: intent.question(vocabulary),
             key: intent.tag(),
         };
     }
@@ -725,6 +868,14 @@ fn classifier_model(config: &AgentConfig) -> String {
 mod tests {
     use super::*;
 
+    // CONTRACT CHANGE: the domain words (menus, category nouns) come from
+    // the ACTIVE ontology. The EMMO adapter stands in for a materials
+    // deployment here; a synthetic legal vocabulary below pins that a
+    // non-materials deployment gets non-materials menus.
+    fn emmo_vocabulary() -> DomainVocabulary {
+        DomainVocabulary::from_ontology(&prism_ingest::ontologies::EmmoOntology)
+    }
+
     // ── The test that matters most: experts pass through untouched ──
 
     /// A well-formed expert query must never be escalated. If any of these
@@ -747,7 +898,7 @@ mod tests {
             "yes, go ahead",
         ] {
             assert_eq!(
-                triage(q, false),
+                triage(q, false, &emmo_vocabulary()),
                 Triage::Proceed,
                 "expert query escalated: {q}"
             );
@@ -774,6 +925,7 @@ mod tests {
             "What is the yield strength of Inconel 718 at 650 C?",
             &[],
             true,
+            &emmo_vocabulary(),
         )
         .await;
         let elapsed = started.elapsed();
@@ -794,7 +946,7 @@ mod tests {
                  solution and double-age heat treatment?";
         let started = std::time::Instant::now();
         for _ in 0..1000 {
-            std::hint::black_box(triage(std::hint::black_box(q), false));
+            std::hint::black_box(triage(std::hint::black_box(q), false, &emmo_vocabulary()));
         }
         let elapsed = started.elapsed();
         eprintln!("triage: {:?} per expert query", elapsed / 1000);
@@ -820,7 +972,11 @@ mod tests {
             // A concrete subject does NOT rescue a supplier question.
             "Find companies in Poland that can machine Inconel 718 to 0.02 mm",
         ] {
-            assert_eq!(triage(q, false), Triage::Classify, "not escalated: {q}");
+            assert_eq!(
+                triage(q, false, &emmo_vocabulary()),
+                Triage::Classify,
+                "not escalated: {q}"
+            );
         }
     }
 
@@ -833,7 +989,11 @@ mod tests {
             "make it stronger",
             "help me make this better",
         ] {
-            assert_eq!(triage(q, false), Triage::Classify, "not escalated: {q}");
+            assert_eq!(
+                triage(q, false, &emmo_vocabulary()),
+                Triage::Classify,
+                "not escalated: {q}"
+            );
         }
     }
 
@@ -860,7 +1020,11 @@ mod tests {
             "make it faster",
             "make my code faster",
         ] {
-            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
+            assert_eq!(
+                triage(q, false, &emmo_vocabulary()),
+                Triage::Proceed,
+                "over-escalated: {q}"
+            );
         }
     }
 
@@ -888,7 +1052,11 @@ mod tests {
             "make my recipe faster",
             "make my setup faster",
         ] {
-            assert_eq!(triage(q, false), Triage::Classify, "no longer caught: {q}");
+            assert_eq!(
+                triage(q, false, &emmo_vocabulary()),
+                Triage::Classify,
+                "no longer caught: {q}"
+            );
         }
     }
 
@@ -901,7 +1069,11 @@ mod tests {
             "optimize this for 316L",
             "help me fix crates/agent/src/reprompt.rs",
         ] {
-            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
+            assert_eq!(
+                triage(q, false, &emmo_vocabulary()),
+                Triage::Proceed,
+                "over-escalated: {q}"
+            );
         }
     }
 
@@ -914,6 +1086,7 @@ mod tests {
             "find companies in Poland that can machine Inconel 718",
             &[],
             true,
+            &emmo_vocabulary(),
         ) else {
             panic!("supplier discovery must be answered, not silently attempted");
         };
@@ -928,15 +1101,132 @@ mod tests {
     /// an interrogation.
     #[test]
     fn a_missing_subject_yields_exactly_one_question() {
-        let Preflight::Ask { question, key } =
-            decide(Intent::ProcessDesign, "Make my alloy better", &[], true)
-        else {
+        // CONTRACT CHANGE: this used to pin the five HARDCODED materials
+        // directions (strength, creep, corrosion, manufacturability, cost).
+        // The menu is now the ontology's own quantity vocabulary plus an
+        // explicit "name another" slot — for EMMO that is the declared
+        // `Property` class and one fallback — so the structural assertion is
+        // "a numbered menu with at least two options", not a fixed count.
+        let Preflight::Ask { question, key } = decide(
+            Intent::ProcessDesign,
+            "Make my alloy better",
+            &[],
+            true,
+            &emmo_vocabulary(),
+        ) else {
             panic!("expected a question");
         };
         assert_eq!(key, "process_design");
         // …and it offers options rather than an open "could you clarify?".
-        for option in ["1.", "2.", "3.", "4.", "5."] {
-            assert!(question.contains(option), "missing option {option}");
+        assert!(question.contains("1."), "missing first option: {question}");
+        assert!(question.contains("2."), "missing second option: {question}");
+        // The EMMO menu names its own declared quantity kind.
+        assert!(question.contains("Property"), "{question}");
+        assert!(question.contains("must NOT get worse"), "{question}");
+    }
+
+    /// CONTRACT CHANGE (dehardcoding): the menus and the vagueness nouns
+    /// come from the ACTIVE ontology. A synthetic LEGAL vocabulary — no
+    /// materials word anywhere — must produce legal menus and treat the
+    /// legal category nouns as generic, exactly as EMMO's treated
+    /// "alloy"/"material". Zero Rust edits, different domain, same
+    /// structure.
+    #[test]
+    fn a_non_materials_ontology_serves_non_materials_menus() {
+        struct LegalVocabulary {
+            classes: Vec<prism_ingest::ontologies::ClassDecl>,
+        }
+        impl LegalVocabulary {
+            fn new() -> Self {
+                let decl = |label: &str| prism_ingest::ontologies::ClassDecl {
+                    iri: prism_ingest::ontologies::Iri::new(format!(
+                        "https://example.test/legal/{label}"
+                    ))
+                    .unwrap(),
+                    pref_label: Some(label.to_string()),
+                    parents: Vec::new(),
+                    extraction_labels: vec![label.to_string()],
+                };
+                Self {
+                    classes: vec![decl("Case"), decl("Verdict")],
+                }
+            }
+        }
+        impl prism_ingest::ontologies::Ontology for LegalVocabulary {
+            fn id(&self) -> &'static str {
+                "reprompt-test-legal"
+            }
+            fn version_iri(&self) -> &prism_ingest::ontologies::Iri {
+                static IRI: std::sync::OnceLock<prism_ingest::ontologies::Iri> =
+                    std::sync::OnceLock::new();
+                IRI.get_or_init(|| {
+                    prism_ingest::ontologies::Iri::new(
+                        "https://example.test/ontology/legal/1".to_string(),
+                    )
+                    .unwrap()
+                })
+            }
+            fn artifact_sha256(&self) -> &str {
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+            fn classes(&self) -> &[prism_ingest::ontologies::ClassDecl] {
+                &self.classes
+            }
+            fn relations(&self) -> &[prism_ingest::ontologies::RelationDecl] {
+                &[]
+            }
+            fn is_a(
+                &self,
+                sub: &prism_ingest::ontologies::Iri,
+                sup: &prism_ingest::ontologies::Iri,
+            ) -> bool {
+                sub == sup
+            }
+            fn quantitative_labels(&self) -> Vec<&str> {
+                vec!["DamagesAmount", "SentenceLength"]
+            }
+        }
+        let legal = DomainVocabulary::from_ontology(&LegalVocabulary::new());
+
+        // The vague-directive rule fires on the LEGAL category noun where
+        // EMMO's fired on "alloy" — and materials nouns are no longer
+        // special under it.
+        assert_eq!(
+            triage("make my case better", false, &legal),
+            Triage::Classify,
+            "the ontology's own category nouns are the generic ones"
+        );
+        assert_eq!(
+            triage("make my case better", false, &emmo_vocabulary()),
+            Triage::Proceed,
+            "a materials vocabulary does not know \"case\" — it names something"
+        );
+
+        // The ProcessDesign menu names the LEGAL quantity kinds.
+        let Preflight::Ask { question, .. } = decide(
+            Intent::ProcessDesign,
+            "make my case better",
+            &[],
+            true,
+            &legal,
+        ) else {
+            panic!("expected a question");
+        };
+        assert!(question.contains("DamagesAmount"), "{question}");
+        assert!(question.contains("SentenceLength"), "{question}");
+        for banned in [
+            "alloy",
+            "material",
+            "Inconel",
+            "strength",
+            "creep",
+            "corrosion",
+            "property",
+        ] {
+            assert!(
+                !question.to_lowercase().contains(banned),
+                "materials vocabulary {banned:?} leaked into a legal menu: {question}"
+            );
         }
     }
 
@@ -948,7 +1238,7 @@ mod tests {
             if intent == Intent::Other {
                 continue;
             }
-            let q = intent.question();
+            let q = intent.question(&emmo_vocabulary());
             assert!(
                 q.matches('?').count() <= 1,
                 "{} asks more than one question: {q}",
@@ -974,6 +1264,7 @@ mod tests {
             "papers on hydrogen embrittlement in Inconel 718",
             &[],
             true,
+            &emmo_vocabulary(),
         ) else {
             panic!("a well-formed served request must not be interrogated");
         };
@@ -987,9 +1278,9 @@ mod tests {
     #[test]
     fn a_misfiring_keyword_is_corrected_by_the_classifier() {
         let q = "which companies have published on additive manufacturing of Inconel 718";
-        assert_eq!(triage(q, false), Triage::Classify);
+        assert_eq!(triage(q, false, &emmo_vocabulary()), Triage::Classify);
         assert!(matches!(
-            decide(Intent::Literature, q, &[], true),
+            decide(Intent::Literature, q, &[], true, &emmo_vocabulary()),
             Preflight::Route { .. }
         ));
     }
@@ -999,7 +1290,7 @@ mod tests {
         let q = "find companies in Poland that can do this machining";
         assert!(
             matches!(
-                decide(Intent::SupplierDiscovery, q, &[], true),
+                decide(Intent::SupplierDiscovery, q, &[], true, &emmo_vocabulary()),
                 Preflight::Ask { .. }
             ),
             "first ask expected"
@@ -1010,6 +1301,7 @@ mod tests {
             q,
             &[Intent::SupplierDiscovery],
             true,
+            &emmo_vocabulary(),
         );
         assert!(
             matches!(second, Preflight::Route { .. }),
@@ -1032,7 +1324,7 @@ mod tests {
             (Intent::SupplierDiscovery, "find companies in Poland"),
             (Intent::ProcessDesign, "make my alloy better"),
         ] {
-            let verdict = decide(intent, message, &[], false);
+            let verdict = decide(intent, message, &[], false, &emmo_vocabulary());
             assert!(
                 matches!(verdict, Preflight::Route { .. }),
                 "{} asked on an unattended path: {verdict:?}",
@@ -1044,7 +1336,13 @@ mod tests {
     #[test]
     fn other_never_asks() {
         assert_eq!(
-            decide(Intent::Other, "make my thing better", &[], true),
+            decide(
+                Intent::Other,
+                "make my thing better",
+                &[],
+                true,
+                &emmo_vocabulary(),
+            ),
             Preflight::Proceed
         );
     }
@@ -1072,10 +1370,14 @@ mod tests {
             if intent == Intent::Other {
                 continue;
             }
-            assert!(!intent.question().is_empty(), "{}", intent.tag());
+            assert!(
+                !intent.question(&emmo_vocabulary()).is_empty(),
+                "{}",
+                intent.tag()
+            );
             assert!(!intent.route_hint().is_empty(), "{}", intent.tag());
         }
-        assert!(Intent::Other.question().is_empty());
+        assert!(Intent::Other.question(&emmo_vocabulary()).is_empty());
     }
 
     #[test]
@@ -1105,7 +1407,10 @@ mod tests {
             "can you help fix this bug",
         ] {
             assert!(
-                !names_nothing(&tokenize(&names_something.to_lowercase())),
+                !names_nothing(
+                    &tokenize(&names_something.to_lowercase()),
+                    &emmo_vocabulary().generic_nouns(),
+                ),
                 "should be treated as naming something: {names_something}"
             );
         }
@@ -1117,7 +1422,10 @@ mod tests {
             "make the design better",
         ] {
             assert!(
-                names_nothing(&tokenize(&names_nothing_at_all.to_lowercase())),
+                names_nothing(
+                    &tokenize(&names_nothing_at_all.to_lowercase()),
+                    &emmo_vocabulary().generic_nouns(),
+                ),
                 "should be treated as naming nothing: {names_nothing_at_all}"
             );
         }
@@ -1135,7 +1443,11 @@ mod tests {
             "Check the manufacturer datasheet for AlSi10Mg mechanical properties",
             "Can you help fix this bug?",
         ] {
-            assert_eq!(triage(q, false), Triage::Proceed, "over-escalated: {q}");
+            assert_eq!(
+                triage(q, false, &emmo_vocabulary()),
+                Triage::Proceed,
+                "over-escalated: {q}"
+            );
         }
     }
 
@@ -1150,18 +1462,28 @@ mod tests {
             "ok, optimise it for cost instead",
         ] {
             assert_eq!(
-                triage(q, true),
+                triage(q, true, &emmo_vocabulary()),
                 Triage::Proceed,
                 "follow-up interrogated: {q}"
             );
         }
         // The same words as an OPENING message still escalate: with no history
         // behind them they genuinely name nothing.
-        assert_eq!(triage("Now make it stronger", false), Triage::Classify);
-        assert_eq!(triage("make it better", false), Triage::Classify);
+        assert_eq!(
+            triage("Now make it stronger", false, &emmo_vocabulary()),
+            Triage::Classify
+        );
+        assert_eq!(
+            triage("make it better", false, &emmo_vocabulary()),
+            Triage::Classify
+        );
         // A misroute is a misroute whenever it arrives — context never excuses it.
         assert_eq!(
-            triage("which companies in Poland can machine it", true),
+            triage(
+                "which companies in Poland can machine it",
+                true,
+                &emmo_vocabulary()
+            ),
             Triage::Classify
         );
     }
@@ -1184,16 +1506,22 @@ mod tests {
         };
 
         assert!(!has_prior_context(std::slice::from_ref(&user)));
-        assert!(asked_before(std::slice::from_ref(&user)).is_empty());
+        assert!(asked_before(std::slice::from_ref(&user), &emmo_vocabulary()).is_empty());
 
-        let after_ask = vec![user, assistant(Intent::SupplierDiscovery.question())];
+        let after_ask = vec![
+            user,
+            assistant(&Intent::SupplierDiscovery.question(&emmo_vocabulary())),
+        ];
         assert!(has_prior_context(&after_ask));
-        assert_eq!(asked_before(&after_ask), vec![Intent::SupplierDiscovery]);
+        assert_eq!(
+            asked_before(&after_ask, &emmo_vocabulary()),
+            vec![Intent::SupplierDiscovery]
+        );
 
         // An ordinary answer is not a ledger entry.
         let ordinary = vec![assistant("Inconel 718 yields about 1030 MPa at 650 C.")];
         assert!(has_prior_context(&ordinary));
-        assert!(asked_before(&ordinary).is_empty());
+        assert!(asked_before(&ordinary, &emmo_vocabulary()).is_empty());
     }
 
     /// An ambiguous classifier reply must NOT be resolved by a tie-break — a

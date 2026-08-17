@@ -2,15 +2,15 @@
 source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
- ‹ back  New ses│ Workspace
-response: PRISM▲│ [Ac] To Fi Ob St Ar
-TUI is running ║│
-in deterministi║│  1. prompt "Hello" •
-test mode.     █│
-               ▼│
-┌ Prompt ──────┐│
-│ Type a messag││
-│              ││
-│              ││
-└──────────────┘│
-  Ready  model: │
+ ‹ back  New session   ◆ fake-backend
+                                       ▲
+◆ PRISM                                ║
+  Fake backend response: PRISM TUI is  █
+running in deterministic test mode.    █
+                                       ▼
+┌ Prompt ──────────────────────────────┐
+│ Type a message... (Enter=send, /help,│
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+  Ready  model: fake-backend   [INPUT]

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use prism_embed::EmbedBackend;
@@ -348,22 +348,22 @@ async fn finish_root_agent_run(
     }
 }
 
-// ── Large-result handling ─────────────────────────────────────────
+// ── Large-result handling ─────────────────────────────────
+//
+// B2 RESOLUTION: the write-only in-memory `result_store` and the
+// `uuid_hex8` id it minted (B3) are DELETED. The truncation message's
+// promise — "the FULL result is in durable memory; call recall(...)" — is
+// fulfilled by the PROVENANCE STORE, not by an in-memory map: the post-hook
+// (h6) records every tool call's complete output BEFORE this truncation
+// runs (h8), and the `recall` meta-tool serves it by record id or query.
+// An in-memory HashMap dropped at turn end could never have served
+// "durable memory" across sessions anyway; keeping it was a parallel
+// half-path that lied about being the mechanism.
 
-fn uuid_hex8() -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:08x}", (ts ^ (ts >> 32)) & 0xFFFF_FFFF)
-}
-
-fn process_large_result(content: &str, result_store: &mut HashMap<String, String>) -> String {
+fn process_large_result(content: &str) -> String {
     if content.len() <= MAX_TOOL_RESULT_CHARS {
         return content.to_string();
     }
-    let result_id = uuid_hex8();
-    result_store.insert(result_id.clone(), content.to_string());
     // A 2000-char cliff made every oversized result look identical to the
     // agent (same first entries regardless of query) — keep enough of the
     // payload to be distinguishing, and say exactly how much was dropped.
@@ -375,7 +375,8 @@ fn process_large_result(content: &str, result_store: &mut HashMap<String, String
     let total = content.len();
     format!(
         "{truncated}\n\n[Showing first {end} of {total} chars — the FULL result is in \
-         durable memory; call recall(query=\"<keywords>\") to pull the rest back. \
+         durable memory; call recall(query=\"<keywords>\") to find its record, then \
+         recall(id=\"<id>\") to pull it back (up to 64k chars per fetch). \
          Refine the query or lower max_results for a result that fits whole.]"
     )
 }
@@ -702,11 +703,11 @@ fn summarize_tool_result(
                 return format!("{tool_name}: error — {err_short}");
             }
         }
-        let preview = if content.len() > 60 {
-            &content[..60]
-        } else {
-            content
-        };
+        // B1 FIX: byte-slicing at 60 panicked when the boundary landed
+        // mid-UTF-8 (a non-JSON error message with multibyte text near byte
+        // 60 aborted the whole turn). `first_line` is char-boundary-safe;
+        // the fallback branch now uses the same helper.
+        let preview = first_line(content, 80);
         return format!("{tool_name}: error — {preview}");
     }
     // Try to parse as JSON for richer summaries
@@ -870,7 +871,24 @@ pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, kee
         return;
     }
 
-    let split_at = history.len().saturating_sub(keep_last);
+    // Never split an assistant message away from the tool results answering
+    // it. A `tool` message refers to a `tool_call_id` announced by the
+    // assistant message before it; keeping the result while dropping its
+    // parent leaves a dangling reference that providers reject outright —
+    // and this runs at exactly the moment context is already under pressure,
+    // so the failure lands when recovery is hardest.
+    //
+    // Walking the boundary EARLIER only ever keeps more, so it cannot lose an
+    // assistant whose results are being retained. `keep_last` is a floor, not
+    // a ceiling.
+    //
+    // The paper-reading loop already respects this invariant deliberately (it
+    // blanks tool bodies instead of removing the messages, see
+    // ingest/src/paper_agent.rs) — this brings the main loop in line.
+    let mut split_at = history.len().saturating_sub(keep_last);
+    while split_at > 0 && history[split_at].role == "tool" {
+        split_at -= 1;
+    }
     let recent = history.split_off(split_at);
     history.clear();
     history.push(ChatMessage {
@@ -889,15 +907,15 @@ pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, kee
 /// (the model's latest reasoning / tool results). Lets the working set follow
 /// the task as it evolves instead of freezing on iteration 0.
 fn routing_query(user_message: &str, history: &[ChatMessage]) -> String {
-    let mut q = String::from(user_message);
+    let mut query = String::from(user_message);
     for msg in history.iter().rev().take(2) {
         if let Some(content) = &msg.content {
             let clip: String = content.chars().take(200).collect();
-            q.push(' ');
-            q.push_str(&clip);
+            query.push(' ');
+            query.push_str(&clip);
         }
     }
-    q
+    query
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1073,7 +1091,7 @@ fn pinned_by_relevance<'a>(
     let rank: std::collections::HashMap<&str, usize> = selected
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
+        .map(|(position, name)| (name.as_str(), position))
         .collect();
     let mut ordered: Vec<&String> = pinned.iter().collect();
     ordered.sort_by(|a, b| {
@@ -1766,12 +1784,24 @@ pub(crate) async fn run_turn_inner(
     // human on the other end, so its question would land as a dead tool result
     // — those get the routing hint, which carries the same honesty.
     let can_ask = task.is_none() && config.subagent_depth == 0;
+    // The domain words the pre-flight menus may use come from the project's
+    // ACTIVE ontology — never a Rust domain list. Resolved once per turn.
+    let domain_vocabulary =
+        crate::reprompt::DomainVocabulary::for_project(&command_tool_runtime.project_root);
     // An exhausted budget must not pay for a classifier call either.
     let preflight = if transcript.budget_exhausted() || turn_skill_context.has_explicit_selections()
     {
         (crate::reprompt::Preflight::Proceed, None)
     } else {
-        crate::reprompt::preflight(llm, config, user_message, history, can_ask).await
+        crate::reprompt::preflight(
+            llm,
+            config,
+            user_message,
+            history,
+            can_ask,
+            &domain_vocabulary,
+        )
+        .await
     };
     // The classifier is a real billed call. Fold it into the turn's usage and
     // the cost ledger like any other — an LLM call nobody accounts for is how a
@@ -1833,7 +1863,6 @@ pub(crate) async fn run_turn_inner(
         }
     }
 
-    let mut result_store: HashMap<String, String> = HashMap::new();
     // One line per executed tool step — feeds the deterministic TRAJECTORY
     // block injected into every iteration's context.
     let mut traj_steps: Vec<String> = Vec::new();
@@ -2373,11 +2402,12 @@ pub(crate) async fn run_turn_inner(
         };
 
         // ── 2h. Process each tool call ────────────────────────────
-        for tc in &tool_calls {
-            let tool_name = &tc.function.name;
-            let call_id = &tc.id;
+        for tool_call in &tool_calls {
+            let tool_name = &tool_call.function.name;
+            let call_id = &tool_call.id;
 
-            let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let args: Value =
+                serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
             let preview = tool_preview(tool_name, &args);
 
             // ── h1. Emit ToolCallStart ────────────────────────────
@@ -2862,8 +2892,7 @@ pub(crate) async fn run_turn_inner(
                     if let Some(directive) = code_repair_directive(canonical_tool, *streak) {
                         // h8/h12 haven't run yet (we're before them), so push
                         // the real filtered error ourselves first — never swallow it.
-                        let real_content =
-                            process_large_result(&content_after_hooks, &mut result_store);
+                        let real_content = process_large_result(&content_after_hooks);
                         let real_summary = summarize_tool_result(
                             canonical_tool,
                             preview.as_deref(),
@@ -2914,7 +2943,7 @@ pub(crate) async fn run_turn_inner(
             }
 
             // ── h8. Large-result handling ─────────────────────────
-            let content = process_large_result(&content_after_hooks, &mut result_store);
+            let content = process_large_result(&content_after_hooks);
 
             // ── h9. Log to scratchpad ─────────────────────────────
             let summary = summarize_tool_result(tool_name, preview.as_deref(), &content, is_error);
@@ -4161,24 +4190,34 @@ mod tests {
 
     #[test]
     fn test_process_large_result_small() {
-        let mut store = HashMap::new();
-        let content = "small result";
-        let result = process_large_result(content, &mut store);
+        // CONTRACT CHANGE (B2): `process_large_result` no longer takes a
+        // result-store map — the write-only in-memory store is deleted; the
+        // truncation pointer is fulfilled by the durable provenance store
+        // (the post-hook records the full output before truncation) and the
+        // `recall` meta-tool. This test now pins only the pass-through.
+        let result = process_large_result("small result");
         assert_eq!(result, "small result");
-        assert!(store.is_empty());
     }
 
     #[test]
     fn test_process_large_result_large() {
-        let mut store = HashMap::new();
+        // CONTRACT CHANGE (B2): same as above — no in-memory store to
+        // inspect; the promise lives in the message text and the provenance
+        // store behind it.
         let content = "x".repeat(40_000);
-        let result = process_large_result(&content, &mut store);
+        let result = process_large_result(&content);
         assert!(result.contains("[Showing first 8000 of 40000 chars"));
         assert!(result.contains("recall"));
-        assert_eq!(store.len(), 1);
-        // Stored value is the full content
-        let stored = store.values().next().unwrap();
-        assert_eq!(stored.len(), 40_000);
+    }
+
+    #[test]
+    fn test_summarize_tool_result_error_preview_is_char_safe() {
+        // B1 REGRESSION: a non-JSON error message whose byte 60 lands
+        // mid-multibyte-char used to panic on `&content[..60]` and abort
+        // the whole turn. The fallback preview must be char-boundary-safe.
+        let content = "失敗".repeat(40); // 3 bytes per char — byte 60 is mid-char
+        let summary = summarize_tool_result("web", None, &content, true);
+        assert!(summary.starts_with("web: error — "));
     }
 
     #[test]
@@ -4324,13 +4363,11 @@ mod tests {
         assert_eq!(summary, "$ cargo test -p prism-agent");
     }
 
-    #[test]
-    fn test_uuid_hex8_format() {
-        let id = uuid_hex8();
-        assert_eq!(id.len(), 8);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
+    // CONTRACT CHANGE (B3): `test_uuid_hex8_format` is deleted with
+    // `uuid_hex8` — it minted 32-bit timestamp-derived ids for the deleted
+    // in-memory result store (B2); "uuid" overstated the guarantee and the
+    // collision space was moot once the store went away. Durable records
+    // use the provenance store's real ids.
     #[test]
     fn test_doom_loop_signature() {
         let sig = doom_loop_signature("search", &serde_json::json!({"q": "test"}));
@@ -4369,8 +4406,21 @@ mod tests {
 
         compact_history(&mut history, "summary text", 2);
 
-        assert_eq!(history.len(), 3);
+        // CONTRACT CHANGE: `keep_last` is a FLOOR, not an exact count. This
+        // fixture's message at the old split index is a `tool` result, and
+        // cutting there strands it from the assistant message that called it —
+        // a dangling `tool_call_id` the provider rejects. Compaction now walks
+        // the boundary earlier until the pairing holds, so it retains one more
+        // message here (summary + 3) rather than the previous summary + 2.
+        // The property this test exists for — older messages collapse into a
+        // summary at the head — is unchanged.
+        assert_eq!(history.len(), 4);
         assert_eq!(history[0].role, "system");
+        assert_ne!(
+            history[1].role, "tool",
+            "compaction must not leave a tool result as the first message after \
+             the summary: its calling assistant message would be gone"
+        );
         assert!(
             history[0]
                 .content
@@ -4378,8 +4428,11 @@ mod tests {
                 .unwrap_or_default()
                 .contains("summary text")
         );
-        assert_eq!(history[1].content.as_deref(), Some("three"));
-        assert_eq!(history[2].content.as_deref(), Some("four"));
+        // The retained tail now begins one message earlier, at the assistant
+        // that owns the tool result rather than at the result itself.
+        assert_eq!(history[1].content.as_deref(), Some("two"));
+        assert_eq!(history[2].content.as_deref(), Some("three"));
+        assert_eq!(history[3].content.as_deref(), Some("four"));
     }
 
     #[test]
@@ -4564,5 +4617,42 @@ mod tests {
             !summary.contains("error"),
             "grep no-match must not be summarized as an error: {summary}"
         );
+    }
+
+    /// Compaction must not orphan a tool result from the assistant message
+    /// that requested it.
+    ///
+    /// The split was a blind index: with `keep_last` landing between an
+    /// assistant carrying `tool_calls` and its `tool` replies, the replies
+    /// survived and their parent was discarded, leaving dangling
+    /// `tool_call_id`s that a provider rejects — and it fired exactly when
+    /// context was already tight, so the request failed at the worst moment.
+    #[test]
+    fn compaction_never_orphans_a_tool_result_from_its_call() {
+        let msg = |role: &str, calls: bool, id: Option<&str>| ChatMessage {
+            role: role.to_string(),
+            content: Some("x".to_string()),
+            tool_calls: calls.then(Vec::new),
+            tool_call_id: id.map(str::to_string),
+        };
+        // user, assistant(tool_calls), tool, tool, user
+        let mut history = vec![
+            msg("user", false, None),
+            msg("assistant", true, None),
+            msg("tool", false, Some("a")),
+            msg("tool", false, Some("b")),
+            msg("user", false, None),
+        ];
+        // keep_last = 3 would split right onto the first `tool`, stranding it.
+        compact_history(&mut history, "summary", 3);
+
+        let first_tool = history.iter().position(|m| m.role == "tool");
+        if let Some(i) = first_tool {
+            let parent = history[..i].iter().rev().find(|m| m.role == "assistant");
+            assert!(
+                parent.is_some_and(|m| m.tool_calls.is_some()),
+                "a retained tool result lost the assistant message that called it"
+            );
+        }
     }
 }

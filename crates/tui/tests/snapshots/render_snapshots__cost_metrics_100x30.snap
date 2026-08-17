@@ -26,9 +26,9 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
-┌ Prompt ─────────────────────────────────────────────────────────┐│
-│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
-│                                                                 ││
-│                                                                 ││
-└─────────────────────────────────────────────────────────────────┘│
-  Ready  model: fake-backend  cost: $0.0500   [INPUT]    Ctrl-C qui│
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+  Ready  model: fake-backend  cost: $0.0500   [INPUT]    Ctrl-C qu │

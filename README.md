@@ -164,6 +164,7 @@ prism run --backend marc27 --gpu A100
 prism run --ssh user@host             # BYOC via SSH
 prism run --k8s-context prod          # BYOC via Kubernetes
 prism run --slurm head@cluster        # BYOC via SLURM
+prism run --backend hyperqueue --hq-tasks tasks.json img   # many-task sets (one HQ job, N tasks)
 prism deploy create --name my-service --image img:latest
 prism deploy list
 prism job-status <uuid>
@@ -244,6 +245,15 @@ model = "gemini-3.1-flash-lite-preview"
 # window — the WHOLE dataset/document is processed either way, in batches.
 # batch_rows = 50      # rows of tabular data per extraction call
 # chunk_bytes = 60000  # bytes of document text per (overlapping) window
+# Paper-loop reading standard: fraction of lines the reader must have seen
+# before a FIRST finish is accepted. Below it the finish is refused ONCE
+# with the largest unread ranges; the second finish always wins. 0 disables.
+# finish_coverage_floor = 0.25
+# Capability verdict: when every sample's proposal acceptance stays below
+# this floor (with a high degenerate rate or low coverage) the run is
+# reported model_insufficient instead of passing as a quiet paper.
+# model_acceptance_floor = 0.33
+# model_degenerate_ceiling = 0.5
 
 [node]
 name = "lab-alpha"

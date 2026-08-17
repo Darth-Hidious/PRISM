@@ -222,9 +222,17 @@ async fn marc27_injects_guidance_not_an_inventory() {
         !injected.contains("... and "),
         "the '… and N more' truncation is back in the prompt"
     );
+    // CONTRACT CHANGE (dehardcoding): the domain guidance (PR #114's
+    // "where materials data actually lives") moved out of the Rust block
+    // into the tools' own descriptions — what must survive in the injected
+    // block is the DOMAIN-NEUTRAL discipline, and no domain vocabulary.
     assert!(
-        injected.contains("where materials data actually lives"),
-        "domain guidance (PR #114) was lost"
+        injected.contains("Long-horizon discipline"),
+        "the long-horizon discipline was lost"
+    );
+    assert!(
+        !injected.contains("where materials data actually lives"),
+        "domain routing doctrine must live in tool descriptions, not a Rust constant"
     );
 }
 

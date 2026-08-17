@@ -4867,6 +4867,88 @@ fn char_safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// `/browse <url>` — read ONE web page as text via the external
+/// `agent-browser` binary. This is an HTTP fetch with content extraction; it
+/// does NOT execute JavaScript, so a client-rendered page still comes back
+/// empty. (The vendor's JS path is `open <url>` then `read` with no url,
+/// which needs a persistent browser session PRISM does not yet manage.) 100%
+/// parity with the agent's `web_browse` tool: both call
+/// [`command_tools::agent_browser_read`], so the human path and the agent
+/// path share one implementation and can never drift. Absence of the binary,
+/// offline refusals, timeouts and failed pages are each reported as what they
+/// are — never a blank success.
+async fn handle_browse_slash_command(args: &[String]) -> Result<bool> {
+    if args.first().map(String::as_str) != Some("browse") {
+        return Ok(false);
+    }
+    let emit = |text: String| {
+        emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
+        emit_notification("ui.turn.complete", serde_json::json!({}));
+    };
+    let Some(url) = args
+        .get(1)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
+        emit("usage: /browse <url> — read a web page as text (agent-browser). HTTP fetch with content extraction; JavaScript is NOT executed.".into());
+        return Ok(true);
+    };
+
+    // The transcript is scrollable but a whole rendered page can be enormous;
+    // bound what lands in it the same scale the agent loop shows the model.
+    const BROWSE_DISPLAY_MAX_CHARS: usize = 30_000;
+    let body = match command_tools::agent_browser_read(url).await {
+        Err(offline_refusal) => offline_refusal,
+        Ok(command_tools::AgentBrowserOutcome::MissingBinary) => {
+            command_tools::agent_browser_missing_message()
+        }
+        Ok(command_tools::AgentBrowserOutcome::TimedOut { secs }) => format!(
+            "`agent-browser read {url}` did not finish within {secs} seconds and was \
+             terminated; its work was abandoned."
+        ),
+        Ok(command_tools::AgentBrowserOutcome::SpawnFailed(error)) => {
+            format!("failed to run `agent-browser`: {error}")
+        }
+        Ok(command_tools::AgentBrowserOutcome::Completed {
+            success,
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            if success {
+                let text = stdout.trim();
+                if text.is_empty() {
+                    format!(
+                        "`agent-browser` exited 0 but returned no readable text for {url}; \
+                         the page is empty or its content is not extractable text."
+                    )
+                } else {
+                    format!(
+                        "── {url} ──\n\n{}",
+                        command_tools::truncate_for_ui(text, BROWSE_DISPLAY_MAX_CHARS)
+                    )
+                }
+            } else {
+                let detail = stderr.trim();
+                format!(
+                    "agent-browser failed for {url} (exit {}): {}",
+                    exit_code
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    if detail.is_empty() {
+                        "no error detail returned"
+                    } else {
+                        detail
+                    },
+                )
+            }
+        }
+    };
+    emit(body);
+    Ok(true)
+}
+
 async fn handle_deploy_slash_command(
     args: &[String],
     slash_ctx: &SlashCommandContext,
@@ -7816,6 +7898,9 @@ async fn handle_command(
             if handle_gh_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
+            if handle_browse_slash_command(&args).await? {
+                return Ok(true);
+            }
             if handle_deploy_slash_command(&args, slash_ctx).await? {
                 return Ok(true);
             }
@@ -10016,5 +10101,107 @@ mod card_payload_tests {
             CARD_ENTRY_LIMIT
         );
         assert_eq!(payload["entries_truncated"], true);
+    }
+}
+
+#[cfg(test)]
+mod browse_slash_tests {
+    //! `/browse <url>` is the TUI user's direct path to the `agent-browser`
+    //! capability the agent calls as `web_browse`. Both routes share
+    //! [`crate::command_tools::agent_browser_read`], so these tests pin the
+    //! slash-command surface only: dispatch, the usage line, and the honest
+    //! offline refusal (no spawn, no egress). The spawn/absence/timeout/
+    //! truncation contract itself is covered in `command_tools::web_browse_tests`.
+
+    use super::*;
+
+    /// Capture notifications the handler emits by installing a sink for the
+    /// duration of the call, then restoring the process-global slot so a
+    /// parallel test never reads this test's sink.
+    async fn capture<T>(future: impl std::future::Future<Output = T>) -> (T, Vec<Value>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        install_sink(tx);
+        let result = future.await;
+        // Drain everything queued; the handler sends synchronously.
+        let mut got = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            got.push(value);
+        }
+        reset_sink();
+        (result, got)
+    }
+
+    fn reset_sink() {
+        if let Some(slot) = SINK.get() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn texts(notifications: &[Value]) -> Vec<String> {
+        notifications
+            .iter()
+            .filter(|n| n.get("method").and_then(Value::as_str) == Some("ui.text.delta"))
+            .filter_map(|n| {
+                n.get("params")
+                    .and_then(|p| p.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn non_browse_commands_fall_through() {
+        for args in [
+            vec!["gh".to_string()],
+            vec!["browsex".to_string()],
+            vec!["web".to_string(), "read".to_string()],
+        ] {
+            let handled = handle_browse_slash_command(&args)
+                .await
+                .expect("handler must not error on foreign commands");
+            assert!(
+                !handled,
+                "`{args:?}` is not /browse and must fall through to other handlers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_browse_prints_usage_and_does_not_spawn() {
+        let (handled, notifications) =
+            capture(handle_browse_slash_command(&["browse".to_string()])).await;
+        let handled = handled.expect("/browse must not error on a bare invocation");
+        assert!(handled, "/browse with no URL is still handled");
+        let body = texts(&notifications).join("\n");
+        assert!(
+            body.contains("usage: /browse <url>"),
+            "a bare /browse must tell the user what it needs: {body}"
+        );
+    }
+
+    /// Under hard offline mode a remote URL must be refused by the policy
+    /// BEFORE any browser could spawn — the same guard every other outbound
+    /// path honors. Takes the crate's single env lock.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn offline_mode_refuses_remote_browse_in_the_tui() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _on = prism_runtime::offline::test_support::OfflineEnvGuard::set("1");
+
+        let (handled, notifications) = capture(handle_browse_slash_command(&[
+            "browse".to_string(),
+            "https://example.org/".to_string(),
+        ]))
+        .await;
+        let handled = handled.expect("/browse must not error on a remote URL under offline");
+        assert!(handled);
+        let body = texts(&notifications).join("\n");
+        assert!(
+            body.contains("offline mode"),
+            "the refusal must identify the offline policy: {body}"
+        );
     }
 }

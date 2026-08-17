@@ -36,11 +36,29 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
 
     // Columns: left content column + right Workspace panel (opencode-style).
-    let sidebar_w = (area.width / 3).clamp(24, 42);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(sidebar_w)])
-        .split(area);
+    // Below the threshold the sidebar is hidden entirely — a clipped sidebar
+    // is worse than none, and the content column needs the room.
+    const SIDEBAR_MIN_WIDTH: u16 = 100;
+    let sidebar_w = if area.width >= SIDEBAR_MIN_WIDTH {
+        (area.width / 3).clamp(24, 42)
+    } else {
+        0
+    };
+    let cols = if sidebar_w > 0 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            // One column of daylight between the content boxes and the
+            // sidebar divider — without it the prompt box border touches
+            // the divider and reads as a double-drawn rule.
+            .spacing(1)
+            .constraints([Constraint::Min(0), Constraint::Length(sidebar_w)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0)])
+            .split(area)
+    };
 
     // Left column: header / transcript / prompt / footer.
     let chunks = Layout::default()
@@ -57,7 +75,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_chat(f, app, chunks[1]);
     draw_prompt(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
-    draw_workspace(f, app, cols[1]);
+    if sidebar_w > 0 {
+        draw_workspace(f, app, cols[1]);
+    }
 
     // Overlays: approval popup (safety-critical) > command palette >
     // theme picker > which-key panel > modal.
@@ -100,7 +120,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else if app.apikey_window.open {
         draw_apikey_window(f, app);
     } else if app.home.open {
-        let home_bounds = Rect::new(area.x, chunks[1].y, area.width, chunks[1].height);
+        // The home panel lives in the content column so it shares an origin
+        // and a width with the prompt box and footer stacked around it —
+        // never over the workspace sidebar column.
+        let home_bounds = Rect::new(cols[0].x, chunks[1].y, cols[0].width, chunks[1].height);
         draw_home(f, app, home_bounds);
     } else if let Some(modal) = app.modal {
         draw_modal(f, modal, app);
@@ -264,7 +287,14 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     LineKind::ToolResult { success: false, .. } | LineKind::Error(_) => {
                         ("✗", t.err, Style::default().fg(t.err))
                     }
-                    LineKind::ToolResult { .. } => ("✓", t.ok, Style::default().fg(t.dim)),
+                    // Tool RESULTS are content the user reads, not chrome:
+                    // they carry the numbers and citations the whole product
+                    // exists to produce, so they get `text` like any other
+                    // body copy. `dim` made the most substantive thing on
+                    // screen the hardest to read.
+                    LineKind::ToolResult { .. } => ("✓", t.ok, Style::default().fg(t.text)),
+                    // The "⚙ Running x" progress line IS chrome — it stays
+                    // secondary so the eye goes to the result, not the noise.
                     _ => ("⚙", t.warn, Style::default().fg(t.dim)),
                 };
                 let evidence_class = match kind {
@@ -400,11 +430,19 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph.scroll((effective_scroll, 0)), area);
 
     // Scrollbar whenever the transcript overflows, so scrolling is discoverable.
+    //
+    // `ScrollbarState::new` takes the number of SCROLLABLE POSITIONS, not the
+    // content height. `position` ranges 0..=max_scroll, so passing
+    // `content_lines` made the thumb top out at
+    // `(content - viewport) / content` — never reaching the end of the track,
+    // and stopping further short the taller the viewport was relative to the
+    // transcript. It read as "the scrollbar stops in the middle and doesn't
+    // scale as the chat grows". The two numbers must describe the same range.
     if max_scroll > 0 {
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,
-            &mut ratatui::widgets::ScrollbarState::new(content_lines as usize)
+            &mut ratatui::widgets::ScrollbarState::new(max_scroll as usize)
                 .position(effective_scroll as usize),
         );
     }
@@ -1431,6 +1469,11 @@ fn help_lines(t: Theme) -> Vec<Line<'static>> {
             "/goal <text>",
             "standing goal, sent to the agent each turn",
         ),
+        kv_row(
+            t,
+            "/browse <url>",
+            "read a web page in a headless browser (JS renders)",
+        ),
         Line::raw(""),
         Line::from(Span::styled(
             "  press any key to close",
@@ -2179,14 +2222,10 @@ fn draw_status_window(f: &mut Frame, app: &App) {
 /// where a field isn't reported yet, it says so rather than inventing a number.
 fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
     let t = app.theme();
-    let panel_height = bounds.height.min(28);
-    let panel_bounds = Rect::new(
-        bounds.x,
-        bounds.y + bounds.height.saturating_sub(panel_height) / 2,
-        bounds.width,
-        panel_height,
-    );
-    let area = centered_rect(80, 100, panel_bounds);
+    // The panel fills the bounds it is given (the content column's transcript
+    // area), so it shares an origin and a width with the prompt box and
+    // footer stacked around it. No centering trickery — a panel that floats
+    // inset from its column reads as accidental, not composed.
     f.render_widget(Clear, bounds);
     f.render_widget(
         Block::default().style(Style::default().bg(t.overlay_bg)),
@@ -2286,8 +2325,16 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
         )),
     ]);
 
+    // On a short pane the blank spacer rows go first: drop them rather than
+    // clipping the key-hint footer off the bottom of the panel.
+    let inner_height = usize::from(bounds.height.saturating_sub(2));
+    if lines.len() > inner_height {
+        lines.retain(|l| l.width() > 0);
+    }
+
     let para = Paragraph::new(lines)
         .style(Style::default().bg(t.overlay_bg))
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2297,7 +2344,7 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )),
         );
-    f.render_widget(para, area);
+    f.render_widget(para, bounds);
 }
 
 fn draw_tools_window(f: &mut Frame, app: &App) {

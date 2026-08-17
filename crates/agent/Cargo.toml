@@ -17,6 +17,7 @@ local-inference-cuda = ["prism-llm/local-inference-cuda"]
 test-guard = []
 
 [dependencies]
+prism-core = { path = "../core" }
 prism-ingest = { path = "../ingest" }
 prism-llm = { path = "../llm" }
 prism-node = { path = "../node" }

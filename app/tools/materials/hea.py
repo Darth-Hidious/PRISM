@@ -570,7 +570,12 @@ def _hea_descriptors_tool() -> Tool:
             "Compute HEA formability descriptors (ΔH_mix, ΔS_mix, Ω, VEC, δ, Δχ) "
             "and flag solid-solution plausibility (Yang Ω+δ + Guo/Liu VEC "
             "empirical screening criteria). A first-pass screen — not a "
-            "phase-equilibria (CALPHAD) calculation."
+            "phase-equilibria (CALPHAD) calculation. For alloy-design "
+            "questions START HERE (is this composition a viable HEA?) and "
+            "with phase_stability (distance to the convex hull — is it "
+            "stable?), then hea_phase_stability/scheil_solidification for "
+            "CALPHAD thermodynamics if pycalphad is available — the free "
+            "Thermo-Calc equivalents."
         ),
         input_schema=_HEA_SCHEMA,
         func=_hea,

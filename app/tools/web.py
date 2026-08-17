@@ -312,7 +312,14 @@ _WEB_DESCRIPTION = (
     "(if configured) or DuckDuckGo.\n"
     "Typical sequence: action='search' → pick the best URL → action='read' on "
     "that URL. NOT for scientific papers (use prior_art_search for better "
-    "metadata + DOIs) and NOT for the platform KG (use query_platform)."
+    "metadata + DOIs) and NOT for the platform KG (use query_platform). "
+    "KNOWN BLOCKERS: search engines and government repositories block this "
+    "tool's User-Agent — do NOT call action='read' on google.com/search, "
+    "bing.com/search, duckduckgo.com, osti.gov/servlets/* or osti.gov/biblio/* "
+    "(every one returns robots.txt or 403; observed cost in real runs: ~15 "
+    "wasted calls per question). Use prior_art_search or research instead. "
+    "The CrossRef API (api.crossref.org/works) IS accessible and is the "
+    "right place for DOI-based citation lookups."
 )
 
 

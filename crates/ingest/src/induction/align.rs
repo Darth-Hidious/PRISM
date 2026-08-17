@@ -199,6 +199,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
                 InducedClass {
                     label: "heat treatment".into(),
@@ -206,6 +207,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
                 InducedClass {
                     label: "Unobtainium Widget".into(),
@@ -213,6 +215,7 @@ mod tests {
                     parent: None,
                     aligned_iri: None,
                     declared_by_reference: false,
+                    sign_domain: None,
                 },
             ],
             relations: vec![InducedRelation {
@@ -221,6 +224,7 @@ mod tests {
                 domain: "Alloy".into(),
                 range: "Alloy".into(),
                 aligned_iri: None,
+                fact_kind: None,
             }],
             provenance: InductionProvenance::default(),
         }

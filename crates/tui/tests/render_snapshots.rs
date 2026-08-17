@@ -162,8 +162,19 @@ fn first_screen_has_no_debug_text_stale_state_or_panel_overlap() {
     for (width, height) in [(150, 42), (100, 30), (200, 60), (40, 12)] {
         let rendered = render_app_to_string(&app, width, height);
         let lines = rendered.lines().collect::<Vec<_>>();
-        let sidebar_width = (width / 3).clamp(24, 42);
-        let prompt_right = usize::from(width - sidebar_width - 1);
+        // Mirror of the layout rule in render::draw — the sidebar is hidden
+        // below 100 columns, and where it is shown a 1-column gap separates
+        // it from the content boxes.
+        let sidebar_width = if width >= 100 {
+            (width / 3).clamp(24, 42)
+        } else {
+            0
+        };
+        let prompt_right = if sidebar_width > 0 {
+            usize::from(width - sidebar_width - 2)
+        } else {
+            usize::from(width - 1)
+        };
         let prompt_top = usize::from(height - 6);
         let prompt_bottom = usize::from(height - 2);
         assert_eq!(
@@ -571,11 +582,22 @@ fn snapshot_tiny_terminal_basic_chat_40x12() {
 /// With six tabs the ladder is three-letter labels, then two-letter initials
 /// (the full words can never fit the 42-column sidebar ceiling).
 ///
-/// Mutation: make `workspace_tabs_line` always use the SHORT labels and this
-/// fails at 40 columns.
+/// Below 100 columns the sidebar is hidden outright, so there is no strip to
+/// wrap; the invariant that matters there is absence, asserted first.
 #[test]
 fn workspace_tab_strip_never_wraps_at_any_width() {
-    for (w, h) in [(40, 12), (60, 20), (100, 30), (200, 60)] {
+    // Below 100 columns the sidebar is hidden entirely — degrade, don't clip.
+    for (w, h) in [(40, 12), (60, 20), (99, 30)] {
+        let app = fake_app();
+        let rendered = render_app_to_string(&app, w, h);
+        assert!(
+            !["[Activity]", "[Act]", "[Ac]"]
+                .iter()
+                .any(|s| rendered.contains(s)),
+            "sidebar must be hidden below 100 columns, but a tab strip rendered at {w}x{h}"
+        );
+    }
+    for (w, h) in [(100, 30), (200, 60)] {
         let app = fake_app();
         let rendered = render_app_to_string(&app, w, h);
         let strip = rendered

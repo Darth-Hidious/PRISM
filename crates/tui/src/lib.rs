@@ -35,6 +35,7 @@ pub mod backend;
 pub mod command;
 pub mod form;
 pub mod gh;
+pub mod json_view;
 pub mod keymap;
 pub mod knowledge;
 pub mod latex;

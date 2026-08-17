@@ -540,6 +540,7 @@ impl LlmOntologyConstructor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ontologies::Ontology;
 
     #[test]
     fn build_extraction_prompt_includes_schema() {
@@ -562,25 +563,14 @@ mod tests {
         assert!(prompt.contains("PROCESSED_BY"));
     }
 
-    /// The byte-identity contract, amended for explicit ingest invariants:
-    /// ontology active, the extraction prompt is EXACTLY the string the
-    /// pre-trait hardcoded builder produced PLUS the referential-integrity
-    /// line ("Every name used in \"from\" or \"to\" MUST also appear…")
-    /// PLUS the typed-value rule ("For \"Property\" entities: \"name\" is
-    /// the property NAME…") and the optional bounded relationship-confidence
-    /// rule. These divergences are deliberate: the verbatim
-    /// legacy text told the model nothing about declaring relationship
-    /// endpoints, while graph validation refuses undeclared endpoints
-    /// (`orphan_rel`, Error severity) — so the byte-identical prompt
-    /// reliably produced extractions that could not be stored (live
-    /// 2026-08-08: 13 entities, 13 relationships, 17 orphan errors, nothing
-    /// written). And it told the model nothing about which FIELD a
-    /// measurement belongs in, so the model satisfied the schema by naming
-    /// Properties after their measurements (live 2026-08-08: "1100 MPa" as
-    /// an entity name, `prov_assertion.value` null, nothing queryable as a
-    /// number). Everything else must still not shift by a byte.
+    /// EMMO now uses the same declaration-driven prompt as every promoted
+    /// ontology. The prompt exposes active labels and wire invariants, but no
+    /// hand-authored domain lesson or prose unit table.
     #[test]
-    fn emmo_prompt_is_the_legacy_prompt_plus_only_the_declared_ingest_rules() {
+    fn emmo_prompt_is_ontology_derived_and_domain_neutral() {
+        // CONTRACT CHANGE: this used to pin the entire materials-specific
+        // prompt byte-for-byte. It now pins the data-serving contract: schema,
+        // rows, active vocabulary, and structural response rules.
         let schema = SchemaAnalysis {
             columns: vec!["Composition".into(), "Hardness_HV".into()],
             detected_types: vec!["string".into(), "float".into()],
@@ -592,48 +582,30 @@ mod tests {
             &rows,
             None,
         );
-
-        let expected = concat!(
-            "You are a materials science data analyst. Given a dataset schema and sample rows, \
-             extract all entities and relationships into a structured JSON format.\n\n",
-            "## Schema\n",
-            "Columns: Composition (string), Hardness_HV (float)\n\n",
-            "## Sample Rows\n",
-            "Row 1: [\"Nb25Mo25Ta25W25\", \"542\"]\n",
-            "\n",
-            "## Instructions\n\
-             Identify ALL materials science entities:\n\
-             - Alloy/Material compositions (type: \"Alloy\" or \"Material\")\n\
-             - Elements with fractions (type: \"Element\")\n\
-             - Processing steps with parameters (type: \"Process\")\n\
-             - Measured properties with values and units (type: \"Property\")\n\
-             - Phases or crystal structures (type: \"Phase\")\n\n\
-             Identify ALL relationships:\n\
-             - CONTAINS (material → element, with weight = fraction)\n\
-             - PROCESSED_BY (material → process, with order)\n\
-             - HAS_PROPERTY (material → property)\n\
-             - HAS_PHASE (material → phase)\n\n\
-             Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".\n\
-             For each relationship, optionally set \"confidence\" to your estimated probability that the relationship is correct, as a finite number from 0 to 1. Omit it when you cannot assess the relationship; never invent a score just to fill the field.\n\
-             For \"Property\" entities: \"name\" is the property NAME (e.g. \"yield strength\"), \
-             NEVER the measured value — an entity named like \"1100 MPa\" is rejected, not \
-             stored. Each material's measured number goes on that material's OWN relationship \
-             to the property: set the relationship's \"value\" to the number and \"unit\" to \
-             one of the listed units (one value per material — never one shared number for \
-             several materials; if no listed unit fits, leave \"value\" and \"unit\" out of \
-             the relationship entirely). Units: QUDT:PA/QUDT:KiloPA/QUDT:MegaPA/QUDT:GigaPA \
-             for pressure/stress; QUDT:KiloGM-PER-M3/QUDT:GM-PER-CentiM3 for density; \
-             QUDT:K/QUDT:DEG_C for temperature; QUDT:W-PER-M-K for thermal conductivity; \
-             QUDT:PERCENT for fraction. Use the unit that measures the SAME quantity as the \
-             property — a density belongs in QUDT:GM-PER-CentiM3 or QUDT:KiloGM-PER-M3, \
-             never in a pressure unit.\n\n\
-             Return ONLY valid JSON with this structure:\n\
-             {\n\
-               \"entities\": [{\"type\": \"...\", \"name\": \"...\", \"properties\": {...}}],\n\
-               \"relationships\": [{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null, \"confidence\": null}]\n\
-             }\n",
+        assert!(prompt.contains("under the 'emmo' ontology"), "{prompt}");
+        assert!(prompt.contains("Composition (string)"), "{prompt}");
+        assert!(
+            prompt.contains("Row 1: [\"Nb25Mo25Ta25W25\", \"542\"]"),
+            "{prompt}"
         );
-        assert_eq!(prompt, expected);
+        for label in crate::ontologies::EmmoOntology.classes() {
+            for extraction_label in &label.extraction_labels {
+                assert!(prompt.contains(extraction_label), "{prompt}");
+            }
+        }
+        for relation in crate::ontologies::EmmoOntology.relations() {
+            for extraction_label in &relation.extraction_labels {
+                assert!(prompt.contains(extraction_label), "{prompt}");
+            }
+        }
+        assert!(prompt.contains("typed value/unit fields"), "{prompt}");
+        assert!(prompt.contains("structured response schema"), "{prompt}");
+        for removed in ["materials science", "yield strength", "density", "QUDT:"] {
+            assert!(
+                !prompt.contains(removed),
+                "removed prose {removed:?}:\n{prompt}"
+            );
+        }
     }
 
     #[test]
@@ -702,7 +674,8 @@ mod tests {
         assert_eq!(set.relationships[1].confidence, None);
         assert_eq!(set.relationships[2].confidence, None);
 
-        let (facts, dropped) = crate::local_facts::to_local_facts(&set);
+        let (facts, dropped) =
+            crate::local_facts::to_local_facts(&set, &crate::ontologies::EmmoOntology);
         assert!(dropped.is_empty(), "{dropped:?}");
         assert_eq!(facts[0].confidence, Some(0.36));
         assert_eq!(

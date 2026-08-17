@@ -20,15 +20,15 @@ expression: rendered
                │    Predict properties      ML prediction for a composition palette │
                │    Procure GPU compute     Live GPU catalog with prices    palette │
                │    Run simulation          Relax/MD via MACE + pyiron      palette │
+               │    Browse web page         Read a URL as text (HTTP fetch… palette │
                │    Goal status             Check a discovery campaign's p… palette │
                │    List goals              Discovery campaigns on this no… palette │
-               │    Node status             Local daemon + platform regist… palette │
-               │  … 56 more — ↓ to scroll or type to filter                         │
+               │  … 57 more — ↓ to scroll or type to filter                         │
                │                                                                    │
                └────────────────────────────────────────────────────────────────────┘
-┌ Prompt ─────────────────────────────────────────────────────────┐│
-│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
-│                                                                 ││
-│                                                                 ││
-└─────────────────────────────────────────────────────────────────┘│
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

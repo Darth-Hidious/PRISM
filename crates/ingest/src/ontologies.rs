@@ -21,20 +21,21 @@
 //! you meant to displace keeps running) and returns what it displaced.
 //!
 //! What is deliberately NOT pluggable here: the provenance store's typed EMMO
-//! shapes and [`prism_provenance::QudtUnit`]. Facts from a non-default
+//! shapes and [`prism_provenance::UnitTerm`]. Facts from a non-default
 //! ontology coexist with EMMO facts by landing under a composed storage
 //! tenant (see [`storage_tenant`]) — the store's tenant-qualified keys are
 //! what keep the two subgraphs from blending, exactly as they keep local and
-//! mesh-peer knowledge apart. A non-QUDT ontology would additionally need its
-//! own typed-unit path (today's `MaterialFact`/text extraction is QUDT by
-//! construction).
+//! mesh-peer knowledge apart. `UnitTerm` preserves the active ontology's
+//! non-empty term without imposing a store-owned unit vocabulary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard};
 
 use anyhow::{Result, bail};
 pub use prism_ontology::{ClassDecl, Iri, PropDecl as RelationDecl};
 use prism_ontology::{OntologyGraph, load_bundled_emmo, load_bundled_matkg};
+use prism_provenance::QuantitySignDomain;
 
 use crate::EntitySet;
 use crate::graph_validation::{GraphIssue, GraphSeverity};
@@ -43,14 +44,29 @@ use crate::graph_validation::{GraphIssue, GraphSeverity};
 /// with, and what an absent `[ontology] id` selects.
 pub const DEFAULT_ONTOLOGY_ID: &str = "emmo";
 
+/// Project-local catalog populated by `prism ontology promote`. The stable
+/// `<id>.ttl` convention lets a later CLI process resolve `[ontology] id`
+/// without retaining any state from the promotion process.
+pub const PROJECT_ONTOLOGY_DIR: &str = ".prism/ontologies";
+
+/// Canonical installed-artifact path for one ontology id.
+///
+/// Validation happens before composing the id into a path, so an ontology id
+/// can never traverse out of the project catalog.
+pub fn project_ontology_artifact_path(project_root: &Path, id: &str) -> Result<PathBuf> {
+    crate::induction::validate_domain_id(id)?;
+    Ok(project_root
+        .join(PROJECT_ONTOLOGY_DIR)
+        .join(format!("{id}.ttl")))
+}
+
 /// The referential-integrity rule, stated in EVERY extraction prompt: graph
 /// validation refuses a relationship whose `from`/`to` names no declared
 /// entity (`orphan_rel`), so a prompt that never states the rule instructs
 /// the model into unstorable output — the exact declaration-vs-enforcement
 /// drift this module exists to close (live case 2026-08-08: 13 entities and
 /// 13 relationships extracted, 17 `orphan_rel` errors, nothing stored).
-/// One constant shared by the trait default AND [`EmmoOntology`]'s legacy
-/// override, so the two prompts cannot drift on the invariant.
+/// One constant shared by every ontology-derived tabular prompt.
 const REFERENTIAL_INTEGRITY_RULE: &str =
     "Every name used in \"from\" or \"to\" MUST also appear as an entity in \"entities\".";
 
@@ -63,62 +79,42 @@ const RELATIONSHIP_CONFIDENCE_RULE: &str = "For each relationship, optionally se
      the relationship is correct, as a finite number from 0 to 1. Omit it when you cannot \
      assess the relationship; never invent a score just to fill the field.";
 
-/// The typed-measurement rule for the prompt, derived from the SAME
-/// [`Ontology::quantitative_labels`] declaration the extraction schema's
-/// per-type variant enforces structurally. The schema locks the SHAPE;
-/// this line states the INTENT the shape exists for — a schema cannot say
-/// which field a thing belongs in, which is exactly how a model came to
-/// satisfy it by naming a Property `"1100 MPa"` (live 2026-08-08: value and
-/// unit stored as text inside the entity NAME, `prov_assertion.value` null,
-/// nothing queryable as a number). And it states WHERE the number belongs:
-/// on the RELATIONSHIP, per material — a value on a shared property node
-/// attributes to nobody (live 2026-08-10: one node's 880 was stored as five
-/// alloys' yield strength). One builder shared by the trait default AND
-/// [`EmmoOntology`]'s legacy override, so the two prompts cannot drift on
-/// the invariant.
-fn typed_value_rule(labels: &[&str]) -> String {
-    let types = labels
+/// Describe the typed fields declared by the active ontology and response
+/// schema. This is a wire-format rule only: class and relationship labels
+/// come from the ontology, while the structured response schema only checks
+/// that a supplied unit term is non-empty.
+fn typed_field_rule(entity_labels: &[&str], relationship_labels: &[&str]) -> String {
+    let entity_types = entity_labels
         .iter()
         .map(|label| format!("\"{label}\""))
         .collect::<Vec<_>>()
-        .join("/");
-    format!(
-        "For {types} entities: \"name\" is the property NAME (e.g. \"yield strength\"), \
-         NEVER the measured value — an entity named like \"1100 MPa\" is rejected, not \
-         stored. Each material's measured number goes on that material's OWN relationship \
-         to the property: set the relationship's \"value\" to the number and \"unit\" to \
-         one of the listed units (one value per material — never one shared number for \
-         several materials; if no listed unit fits, leave \"value\" and \"unit\" out of \
-         the relationship entirely). Units: {}. Use the unit that measures the SAME \
-         quantity as the property — a density belongs in QUDT:GM-PER-CentiM3 or \
-         QUDT:KiloGM-PER-M3, never in a pressure unit.",
-        unit_roster()
-    )
-}
-
-/// Human-readable roster of the declared extraction units, grouped by the
-/// quantity kind each measures — derived from the ONE
-/// [`crate::qudt_units::EXTRACTION_UNITS`] table, never a second list. The
-/// prompt must carry this because the grammar shows the model NOTHING: the
-/// enum lock constrains the unit to the vocabulary but cannot say which
-/// member measures what, and the live enum-locked model completed its
-/// `g/cm3` intent as `QUDT:GigaPA` — a pressure unit on every density
-/// (2026-08-10 run 4; the quantity-kind gate dropped nothing because it
-/// did not yet cover the edge channel, and the falsehoods reached the
-/// store).
-fn unit_roster() -> String {
-    let mut groups: Vec<(crate::qudt_units::QuantityKind, Vec<&'static str>)> = Vec::new();
-    for (id, kind) in crate::qudt_units::EXTRACTION_UNITS {
-        match groups.iter_mut().find(|(existing, _)| existing == kind) {
-            Some((_, ids)) => ids.push(id),
-            None => groups.push((*kind, vec![id])),
-        }
-    }
-    groups
+        .join(", ");
+    let relationship_types = relationship_labels
         .iter()
-        .map(|(kind, ids)| format!("{} for {}", ids.join("/"), kind.label()))
+        .map(|label| format!("\"{label}\""))
         .collect::<Vec<_>>()
-        .join("; ")
+        .join(", ");
+
+    let mut rules = Vec::new();
+    if !entity_types.is_empty() {
+        rules.push(format!(
+            "Entity types whose properties use the response schema's typed value/unit fields: \
+             {entity_types}. Keep entity identity in \"name\" and follow that schema for the \
+             fields."
+        ));
+    }
+    if !relationship_types.is_empty() {
+        rules.push(format!(
+            "Relationship types whose response variants may carry typed value/unit fields: \
+             {relationship_types}. Keep each value on the relationship that states it."
+        ));
+    }
+    if !rules.is_empty() {
+        rules.push(
+            "Use only value and unit forms accepted by the structured response schema.".to_string(),
+        );
+    }
+    rules.join("\n")
 }
 
 /// One ontology vocabulary. The contract the ingest pipeline depends on:
@@ -157,6 +153,75 @@ pub trait Ontology: Send + Sync {
     ///
     /// Satisfies `REQ-OWL-S1-CANONICAL-RELATION-IDENTITY`.
     fn relations(&self) -> &[RelationDecl];
+
+    /// Every class available for read-only ontology navigation.
+    ///
+    /// This is deliberately distinct from [`Ontology::classes`], which is the
+    /// smaller extraction-facing declaration. Adapters backed by a richer
+    /// graph can expose ancestor-only classes here without silently widening
+    /// the vocabulary accepted by graph validation.
+    fn ontology_classes(&self) -> &[ClassDecl] {
+        self.classes()
+    }
+
+    /// Every object property available for read-only ontology navigation.
+    /// The default is the extraction-facing declaration.
+    fn ontology_properties(&self) -> &[RelationDecl] {
+        self.relations()
+    }
+
+    /// Resolve a canonical class IRI from the navigable declaration.
+    fn class(&self, iri: &Iri) -> Option<&ClassDecl> {
+        self.ontology_classes().iter().find(|decl| &decl.iri == iri)
+    }
+
+    /// Resolve a canonical object-property IRI from the navigable
+    /// declaration.
+    fn property(&self, iri: &Iri) -> Option<&RelationDecl> {
+        self.ontology_properties()
+            .iter()
+            .find(|decl| &decl.iri == iri)
+    }
+
+    /// All strict named ancestors reachable through direct class parents.
+    ///
+    /// The owned return value keeps the method object-safe and gives custom
+    /// adapters a useful default without requiring them to retain a separate
+    /// closure index.
+    fn ancestors(&self, iri: &Iri) -> Vec<Iri> {
+        let mut seen = BTreeSet::new();
+        let mut pending = self
+            .class(iri)
+            .map(|decl| decl.parents.clone())
+            .unwrap_or_default();
+        while let Some(parent) = pending.pop() {
+            if !seen.insert(parent.clone()) {
+                continue;
+            }
+            if let Some(decl) = self.class(&parent) {
+                pending.extend(decl.parents.iter().cloned());
+            }
+        }
+        seen.into_iter().collect()
+    }
+
+    /// All strict named descendants in the navigable declaration.
+    fn descendants(&self, iri: &Iri) -> Vec<Iri> {
+        let mut descendants = self
+            .ontology_classes()
+            .iter()
+            .filter(|decl| decl.iri != *iri && self.is_a(&decl.iri, iri))
+            .map(|decl| decl.iri.clone())
+            .collect::<Vec<_>>();
+        descendants.sort();
+        descendants.dedup();
+        descendants
+    }
+
+    /// Validated namespace prefixes advertised by the active ontology.
+    fn prefixes(&self) -> BTreeMap<String, Iri> {
+        BTreeMap::new()
+    }
 
     /// Resolve an exact extraction label to its canonical class declaration.
     fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
@@ -214,21 +279,36 @@ pub trait Ontology: Send + Sync {
     }
 
     /// Extraction labels whose entities state a MEASURED QUANTITY — the
-    /// vocabulary's property/measurement classes. THREE consumers read this
-    /// one declaration, so they cannot drift: the extraction JSON schema
-    /// emits a per-type variant REQUIRING typed `value`/`unit` members on
-    /// these types ([`crate::extraction_schema`]), the extraction prompt
-    /// states the same rule in prose ([`typed_value_rule`]), and graph
-    /// validation rejects such an entity whose NAME is itself a measurement
-    /// ([`crate::graph_validation::measurement_packed_in_name`]) — the
-    /// form-versus-field failure where the model satisfies the schema by
-    /// naming a Property `"1100 MPa"` and the graph holds the number as
-    /// unqueryable text.
+    /// vocabulary's property/measurement classes. The extraction JSON schema
+    /// and prompt both read this declaration, so their typed `value`/`unit`
+    /// variants cannot drift.
     ///
     /// Default: none — an ontology without measurement classes keeps the
     /// single unconstrained entity shape and an unchanged prompt.
     fn quantitative_labels(&self) -> Vec<&str> {
         Vec::new()
+    }
+
+    /// The sign domain the ontology declares for a quantity kind, keyed by
+    /// the quantity's canonical identity — the predicate IRI a reader bound,
+    /// or an extraction label. `None` is the only honest answer when the
+    /// ontology carries no such annotation: deterministic sign checks then
+    /// simply do not apply. They must never be replaced by a guess inferred
+    /// from the quantity's name, in any language.
+    ///
+    /// This is where the sign constraint lives, not in Rust: it is an
+    /// annotation on the quantity class or its dimensional parent, read at
+    /// grounding time. A promoted ontology artifact carries it as an
+    /// optional `prism:signDomain` annotation on a class (`"non_negative"`,
+    /// `"signed"` — see `crate::induction::ttl`), and the induced adapter
+    /// serves it, including declarations inherited from a dimensional
+    /// parent — so a promoted German-language pharma ontology supplies the
+    /// sign of a dissociation constant with zero Rust edits. Grounding
+    /// asks the RUN's selected ontology, never a hardcoded default id. An
+    /// ontology that declares nothing answers `None`, and the sign check
+    /// stays silent — silence, never a guess.
+    fn quantity_sign_domain(&self, _quantity: &str) -> Option<QuantitySignDomain> {
+        None
     }
 
     /// Extraction labels of the relationships that CARRY a measurement —
@@ -250,6 +330,59 @@ pub trait Ontology: Send + Sync {
         Vec::new()
     }
 
+    /// Extraction labels of the declared relationships [`crate::local_facts`]
+    /// maps to `phase` facts. The store's typed fact kinds are a closed
+    /// surface; these methods are how an ontology says which of ITS declared
+    /// relations fill it. Default: none — every such edge stays a generic
+    /// edge, and the mapper reports any numeric claim it cannot store as a
+    /// result. It never falls back to a frozen vocabulary.
+    fn phase_relations(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Same contract as [`Ontology::phase_relations`], for `processing`
+    /// facts: the relation's step `order` rides the fact's value channel.
+    fn processing_relations(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// Same contract as [`Ontology::phase_relations`], for `contains`
+    /// facts: the relation's `weight` fraction rides the fact's value
+    /// channel.
+    fn contains_relations(&self) -> Vec<&str> {
+        Vec::new()
+    }
+
+    /// The graph shape the provenance store writes for one typed fact kind,
+    /// when this ontology declares one — which class the OBJECT node falls
+    /// back to and which edge label the typed write uses. `None` means the
+    /// ontology declares no shape for that kind, and the store keeps the
+    /// fact as a generic edge (kept, never dropped) — never a frozen
+    /// built-in table.
+    ///
+    /// The kinds are the ontology's OWN vocabulary: EMMO declares the store's
+    /// seven legacy kind strings through its adapter; an induced ontology
+    /// serves the kinds its artifact declared via `prism:factKind`, shaped
+    /// from its own declared classes and relation tokens. This follows the
+    /// same pattern as [`Ontology::measurement_relations`] and friends: the
+    /// store's typed fact shapes are a closed surface, WHICH relations and
+    /// classes fill them is the ontology's statement, never Rust's.
+    fn fact_graph_shape(&self, _kind: &str) -> Option<prism_provenance::FactGraphShape> {
+        None
+    }
+
+    /// Fact kinds whose UNCONDITIONED numeric values the triple-plausibility
+    /// prior may compare (config knob: `triple_plausibility.eligible_fact_kinds`,
+    /// which defers to this declaration when unset). The Rust default is
+    /// EMPTY — the source of the default is the active ontology, not
+    /// materials English. EMMO declares the two fraction-like kinds
+    /// (`composition`, `contains`); an induced ontology declares the kinds
+    /// its artifact typed. An ontology that declares none yields an honest
+    /// `Unavailable` check, never a silently passed one.
+    fn numeric_prior_fact_kinds(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Opening sentence of the tabular extraction prompt.
     fn extraction_preamble(&self) -> String {
         format!(
@@ -265,14 +398,17 @@ pub trait Ontology: Send + Sync {
     /// so for an ontology that does not override this, prompt and validator
     /// cannot disagree. An override owns keeping the two aligned.
     fn extraction_instructions(&self) -> String {
-        // The typed-value rule appears exactly when the declaration names
-        // quantitative classes — an ontology without them keeps this prompt
-        // byte-identical to what it always produced.
+        // This wire-shape guidance is derived only from the active ontology;
+        // unit semantics remain in the structured schema/ontology data.
         let quantitative = self.quantitative_labels();
-        let typed_rule = if quantitative.is_empty() {
+        let measurement_relations = self.measurement_relations();
+        let typed_rule = if quantitative.is_empty() && measurement_relations.is_empty() {
             String::new()
         } else {
-            format!("{}\n", typed_value_rule(&quantitative))
+            format!(
+                "{}\n",
+                typed_field_rule(&quantitative, &measurement_relations)
+            )
         };
         format!(
             "## Instructions\n\
@@ -366,23 +502,28 @@ static EMMO_RELATIONS: LazyLock<Vec<RelationDecl>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The built-in EMMO materials-science ontology — the vocabulary this
-/// codebase always extracted and validated with, now declared through the
-/// same trait any other ontology plugs in through. Behaviour is deliberately
-/// byte-identical to the pre-trait hardcoding, with ONE deliberate
-/// exception: the instruction block now also states
-/// [`REFERENTIAL_INTEGRITY_RULE`]. The legacy text instructed relationships
-/// without requiring their endpoints be declared, while the validator
-/// refuses exactly that (`orphan_rel`, Error) — so the byte-identical
-/// prompt reliably produced unstorable extractions (2026-08-08 live run:
-/// 17 orphan errors, zero facts stored). Preserving those bytes preserved
-/// the defect; the rule is added, everything else stays verbatim.
-///
-/// `HAS_PHASE`, which the legacy validator list omitted, is now backed by a
-/// declared object-property IRI. The prompt bytes do not need to change, but
-/// the relationship is no longer reported as foreign.
+/// The built-in EMMO adapter. Its extraction vocabulary and prompt are read
+/// from the bundled ontology through the same trait as every other adapter;
+/// it does not maintain a separate prose vocabulary.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmmoOntology;
+
+impl EmmoOntology {
+    /// The extraction labels of the ONE declared relation an anchor label
+    /// resolves to — the declaration-rooted lookup the typed-fact mappings
+    /// share. Empty when the declaration carries no such relation.
+    fn declared_relation_labels(&self, anchor_label: &str) -> Vec<&str> {
+        self.relation_for_label(anchor_label)
+            .map(|relation| {
+                relation
+                    .extraction_labels
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
 
 impl Ontology for EmmoOntology {
     fn id(&self) -> &'static str {
@@ -403,6 +544,40 @@ impl Ontology for EmmoOntology {
 
     fn relations(&self) -> &[RelationDecl] {
         EMMO_RELATIONS.as_slice()
+    }
+
+    fn ontology_classes(&self) -> &[ClassDecl] {
+        EMMO_GRAPH.classes()
+    }
+
+    fn ontology_properties(&self) -> &[RelationDecl] {
+        EMMO_GRAPH.properties()
+    }
+
+    fn class(&self, iri: &Iri) -> Option<&ClassDecl> {
+        EMMO_GRAPH.class(iri)
+    }
+
+    fn property(&self, iri: &Iri) -> Option<&RelationDecl> {
+        EMMO_GRAPH.property(iri)
+    }
+
+    fn ancestors(&self, iri: &Iri) -> Vec<Iri> {
+        EMMO_GRAPH
+            .ancestors(iri)
+            .map(|iris| iris.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn descendants(&self, iri: &Iri) -> Vec<Iri> {
+        EMMO_GRAPH
+            .descendants(iri)
+            .map(|iris| iris.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn prefixes(&self) -> BTreeMap<String, Iri> {
+        EMMO_GRAPH.prefixes().clone()
     }
 
     fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
@@ -473,46 +648,36 @@ impl Ontology for EmmoOntology {
             .unwrap_or_default()
     }
 
-    /// The legacy prompt opening, verbatim (byte-identity contract).
-    fn extraction_preamble(&self) -> String {
-        "You are a materials science data analyst. Given a dataset schema and sample rows, \
-         extract all entities and relationships into a structured JSON format."
-            .to_string()
+    /// Rooted in the declaration exactly like `measurement_relations`: the
+    /// store's `phase`/`processing`/`contains` shapes are filled from the
+    /// relations the bundled artifact declares. Empty if the declaration
+    /// ever stops carrying them.
+    fn phase_relations(&self) -> Vec<&str> {
+        Self::declared_relation_labels(self, "HAS_PHASE")
     }
 
-    /// The legacy `## Instructions` block, verbatim EXCEPT for three added
-    /// rules — deliberate byte-identity breaks documented on
-    /// [`EmmoOntology`]: the [`REFERENTIAL_INTEGRITY_RULE`] (the verbatim
-    /// text produced extractions the validator refused wholesale) and the
-    /// [`typed_value_rule`] (the verbatim text let the model satisfy the
-    /// schema by naming a Property `"1100 MPa"`, storing the number as
-    /// unqueryable text — live 2026-08-08), and the
-    /// [`RELATIONSHIP_CONFIDENCE_RULE`] that asks for an optional bounded
-    /// model judgement without forcing fabricated certainty.
-    fn extraction_instructions(&self) -> String {
-        let typed_rule = typed_value_rule(&self.quantitative_labels());
-        format!(
-            "## Instructions\n\
-             Identify ALL materials science entities:\n\
-             - Alloy/Material compositions (type: \"Alloy\" or \"Material\")\n\
-             - Elements with fractions (type: \"Element\")\n\
-             - Processing steps with parameters (type: \"Process\")\n\
-             - Measured properties with values and units (type: \"Property\")\n\
-             - Phases or crystal structures (type: \"Phase\")\n\n\
-             Identify ALL relationships:\n\
-             - CONTAINS (material → element, with weight = fraction)\n\
-             - PROCESSED_BY (material → process, with order)\n\
-             - HAS_PROPERTY (material → property)\n\
-             - HAS_PHASE (material → phase)\n\n\
-             {REFERENTIAL_INTEGRITY_RULE}\n\
-             {RELATIONSHIP_CONFIDENCE_RULE}\n\
-             {typed_rule}\n\n\
-             Return ONLY valid JSON with this structure:\n\
-             {{\n\
-               \"entities\": [{{\"type\": \"...\", \"name\": \"...\", \"properties\": {{...}}}}],\n\
-               \"relationships\": [{{\"from\": \"...\", \"rel\": \"...\", \"to\": \"...\", \"weight\": null, \"order\": null, \"confidence\": null}}]\n\
-             }}\n"
-        )
+    fn processing_relations(&self) -> Vec<&str> {
+        Self::declared_relation_labels(self, "PROCESSED_BY")
+    }
+
+    fn contains_relations(&self) -> Vec<&str> {
+        Self::declared_relation_labels(self, "CONTAINS")
+    }
+
+    /// EMMO's seven legacy fact kinds, declared through the shared table the
+    /// writer used to hardcode. An unknown kind answers `None` — the honest
+    /// generic edge, not a guess.
+    fn fact_graph_shape(&self, kind: &str) -> Option<prism_provenance::FactGraphShape> {
+        prism_provenance::FactGraphShape::emmo(kind)
+    }
+
+    /// The two fraction-like kinds the numeric prior compares. Declared by
+    /// EMMO because the store's `composition`/`contains` shapes carry
+    /// unconditioned fractions; every other kind stays out (measurement
+    /// conditions are not represented in `LocalFact`, so comparing them
+    /// would be unreliable).
+    fn numeric_prior_fact_kinds(&self) -> Vec<String> {
+        vec!["composition".into(), "contains".into()]
     }
 
     /// EMMO's domain checks, moved verbatim from `graph_validation`
@@ -652,6 +817,40 @@ impl Ontology for MatKgOntology {
 
     fn relations(&self) -> &[RelationDecl] {
         MATKG_RELATIONS.as_slice()
+    }
+
+    fn ontology_classes(&self) -> &[ClassDecl] {
+        MATKG_GRAPH.classes()
+    }
+
+    fn ontology_properties(&self) -> &[RelationDecl] {
+        MATKG_GRAPH.properties()
+    }
+
+    fn class(&self, iri: &Iri) -> Option<&ClassDecl> {
+        MATKG_GRAPH.class(iri)
+    }
+
+    fn property(&self, iri: &Iri) -> Option<&RelationDecl> {
+        MATKG_GRAPH.property(iri)
+    }
+
+    fn ancestors(&self, iri: &Iri) -> Vec<Iri> {
+        MATKG_GRAPH
+            .ancestors(iri)
+            .map(|iris| iris.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn descendants(&self, iri: &Iri) -> Vec<Iri> {
+        MATKG_GRAPH
+            .descendants(iri)
+            .map(|iris| iris.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn prefixes(&self) -> BTreeMap<String, Iri> {
+        MATKG_GRAPH.prefixes().clone()
     }
 
     fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
@@ -870,6 +1069,44 @@ impl OntologyRegistry {
         self.by_id.get(id).map(|&idx| self.ontologies[idx].clone())
     }
 
+    /// Resolve `id`, loading its accepted project artifact when this fresh
+    /// registry does not already contain it. This is deliberately an
+    /// ordinary registry operation: the artifact becomes the same
+    /// [`Ontology`] adapter as a programmatic registration, not an alternate
+    /// vocabulary plane.
+    pub fn load_project(&mut self, project_root: &Path, id: &str) -> Result<Arc<dyn Ontology>> {
+        if let Some(ontology) = self.get(id) {
+            return Ok(ontology);
+        }
+
+        let path = project_ontology_artifact_path(project_root, id)?;
+        if !path.is_file() {
+            bail!(
+                "no ontology '{id}' is registered and no promoted artifact is installed at {} \
+                 (registered: {}). Promote the reviewed artifact with `prism ontology promote \
+                 <artifact.ttl>` using this project root",
+                path.display(),
+                self.ids().join(", ")
+            );
+        }
+
+        let ontology = crate::induction::register::load_induced_from_path(&path)?;
+        if ontology.id() != id {
+            bail!(
+                "promoted ontology artifact {} declares id '{}' but [ontology] selected '{id}'",
+                path.display(),
+                ontology.id()
+            );
+        }
+        self.register(ontology)?;
+        self.get(id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "ontology '{id}' passed registration from {} but did not resolve afterwards",
+                path.display()
+            )
+        })
+    }
+
     /// All registered ids, in registration order.
     pub fn ids(&self) -> Vec<&'static str> {
         self.ids.clone()
@@ -946,6 +1183,98 @@ pub fn active(id: Option<&str>) -> Result<Arc<dyn Ontology>> {
     })
 }
 
+/// Resolve the active process-wide ontology, lazily loading a project-local
+/// promoted artifact when the configured id is not built in or already
+/// registered.
+///
+/// Artifact parsing and adapter validation occur before taking the global
+/// write lock. A concurrent resolver that wins the registration race is
+/// reused; no adapter code runs while the lock is held.
+/// Resolve the active process-wide ontology from the PROJECT'S OWN CONFIG:
+/// reads `[ontology] id` from `prism.toml` with the same file search and
+/// precedence `prism_core::config::NodeConfig` uses (global
+/// `~/.prism/prism.toml`, then the project's `.prism/prism.toml` replacing
+/// it — `prism-core` sits above this crate in the dependency graph, so the
+/// id is read from the same section with a minimal reader instead of the
+/// full config type). Unset means the built-in default.
+///
+/// This is the resolution PROMPT-SERVING surfaces use (the pre-flight
+/// reprompter's domain menus): the words the user is offered come from the
+/// ontology the project actually runs, never a Rust domain list. An
+/// unresolvable id fails loudly through [`active_from_project`].
+pub fn active_for_project_config(project_root: &Path) -> Result<Arc<dyn Ontology>> {
+    #[derive(serde::Deserialize)]
+    struct OntologySection {
+        #[serde(default = "default_configured_id")]
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ConfigFile {
+        #[serde(default)]
+        ontology: OntologySection,
+    }
+    impl Default for OntologySection {
+        fn default() -> Self {
+            Self {
+                id: default_configured_id(),
+            }
+        }
+    }
+    fn default_configured_id() -> String {
+        DEFAULT_ONTOLOGY_ID.to_string()
+    }
+
+    let mut id = default_configured_id();
+    let mut sources = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        sources.push(PathBuf::from(home).join(".prism").join("prism.toml"));
+    }
+    sources.push(project_root.join(".prism").join("prism.toml"));
+    for path in sources {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(config) = toml::from_str::<ConfigFile>(&text)
+        {
+            id = config.ontology.id;
+        }
+    }
+    active_from_project(Some(&id), project_root)
+}
+
+pub fn active_from_project(id: Option<&str>, project_root: &Path) -> Result<Arc<dyn Ontology>> {
+    let id = id.unwrap_or(DEFAULT_ONTOLOGY_ID);
+    if let Some(ontology) = registry().get(id) {
+        return Ok(ontology);
+    }
+
+    let path = project_ontology_artifact_path(project_root, id)?;
+    if !path.is_file() {
+        let registered = registry().ids().join(", ");
+        bail!(
+            "no ontology '{id}' is registered and no promoted artifact is installed at {} \
+             (registered: {}). Promote the reviewed artifact with `prism ontology promote \
+             <artifact.ttl>` using this project root",
+            path.display(),
+            registered
+        );
+    }
+
+    let ontology = crate::induction::register::load_induced_from_path(&path)?;
+    let loaded_id = validated_id(ontology.as_ref())?;
+    if loaded_id != id {
+        bail!(
+            "promoted ontology artifact {} declares id '{loaded_id}' but [ontology] selected '{id}'",
+            path.display()
+        );
+    }
+
+    let mut registry = REGISTRY.write().expect("ontology registry lock poisoned");
+    if let Some(existing) = registry.get(id) {
+        return Ok(existing);
+    }
+    registry.insert_new(loaded_id, ontology.clone())?;
+    Ok(ontology)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1310,9 @@ mod tests {
                         iri: Iri::new(format!("https://example.test/property/{index}"))
                             .expect("test property IRI is valid"),
                         pref_label: Some((*label).to_string()),
+                        parents: Vec::new(),
+                        domains: Vec::new(),
+                        ranges: Vec::new(),
                         extraction_labels: vec![(*label).to_string()],
                     })
                     .collect(),
@@ -1061,6 +1393,31 @@ mod tests {
             emmo.class_for_label("Author").is_none(),
             "Author has no defensible class IRI in the vendored vocabularies"
         );
+    }
+
+    /// CONTRACT CHANGE (de-hardcoding): the sign domain of a quantity is the
+    /// ONTOLOGY's declaration, read at grounding time. The bundled EMMO
+    /// carries no such annotation, so it answers `None` for every identity —
+    /// and the deterministic sign check then does not apply. Silence is the
+    /// only honest default: no compiled materials table survives anywhere in
+    /// the crate, and a promoted ontology may supply its own declarations
+    /// with zero Rust edits.
+    #[test]
+    fn a_builtin_ontology_that_declares_no_sign_domain_says_so() {
+        let reg = OntologyRegistry::builtin();
+        let emmo = reg.get("emmo").expect("emmo is built in");
+        for identity in [
+            "uts",
+            "density",
+            "https://w3id.org/emmo#EMMO_some_quantity",
+            "Dissoziationskonstante",
+        ] {
+            assert_eq!(
+                emmo.quantity_sign_domain(identity),
+                None,
+                "a silent ontology must stay silent for {identity:?}"
+            );
+        }
     }
 
     /// The loud half of the two-call contract: `register` refuses a taken
@@ -1253,11 +1610,9 @@ mod tests {
 
     /// Every prompt states the invariant the validator enforces: a `from`/
     /// `to` name must be a declared entity (`orphan_rel` is Error severity).
-    /// Checked on BOTH instruction builders — the trait default any new
-    /// ontology inherits, and EMMO's legacy override (whose byte-identity
-    /// was deliberately broken for exactly this line: the verbatim text
-    /// produced unstorable extractions). The fragment is hardcoded here so
-    /// a reworded-away rule fails too.
+    /// Checked on both a custom ontology and EMMO, which now use the same
+    /// declaration-driven builder. The fragment is pinned so a
+    /// reworded-away rule fails too.
     #[test]
     fn every_instruction_builder_states_the_referential_integrity_rule() {
         let default_flavour =
@@ -1492,8 +1847,7 @@ mod tests {
     /// EMMO's quantitative declaration is DERIVED (classes at-or-below the
     /// class the `Property` label resolves to), and today that is exactly
     /// `["Property"]`. An ontology that declares no Property-like class —
-    /// the trait default — declares nothing quantitative, so its schema and
-    /// prompt stay byte-identical to what they always were.
+    /// the trait default — declares nothing quantitative.
     #[test]
     fn quantitative_labels_derive_from_the_declaration() {
         assert_eq!(EmmoOntology.quantitative_labels(), ["Property"]);
@@ -1512,22 +1866,101 @@ mod tests {
         assert!(fake.measurement_relations().is_empty());
     }
 
-    /// Both instruction builders state the typed-value rule exactly when the
-    /// declaration names quantitative classes: EMMO (and any default-flavour
-    /// ontology declaring them) must say the name is never the measurement;
-    /// an ontology without quantitative classes must NOT gain the line (its
-    /// prompt has no field the rule could bind to). Fragments are hardcoded
-    /// here so a reworded-away rule fails too.
+    /// The other typed-fact mappings follow the same declaration-rooted
+    /// contract: EMMO fills the store's closed phase/processing/contains
+    /// shapes from the relations its artifact declares; an ontology that
+    /// declares none of them maps every such edge to a generic edge —
+    /// silence from the declaration, never a literal fallback.
     #[test]
-    fn instruction_builders_state_the_typed_value_rule_iff_quantitative() {
+    fn typed_fact_relations_derive_from_the_declaration() {
+        assert_eq!(EmmoOntology.phase_relations(), ["HAS_PHASE"]);
+        assert_eq!(EmmoOntology.processing_relations(), ["PROCESSED_BY"]);
+        assert_eq!(EmmoOntology.contains_relations(), ["CONTAINS"]);
+        let fake = Fake::new("chem-t", &["Molecule"], &["REACTS_WITH"]);
+        assert!(fake.phase_relations().is_empty());
+        assert!(fake.processing_relations().is_empty());
+        assert!(fake.contains_relations().is_empty());
+    }
+
+    /// CONTRACT CHANGE: the store's graph writer no longer holds a closed
+    /// kind→(class, edge) table. EMMO declares its seven legacy shapes
+    /// through the trait — byte-identically to what the writer used to
+    /// hardcode — and any other kind (a legal ontology's `"obligation"`)
+    /// answers `None`, which the store keeps as a generic edge.
+    #[test]
+    fn fact_graph_shapes_are_emmo_declared_and_closed_onto_itself() {
+        let measurement = EmmoOntology
+            .fact_graph_shape("measurement")
+            .expect("EMMO declares the measurement shape");
+        assert!(measurement.reified_measurement);
+        assert_eq!(measurement.object_storage_label, "Property");
+        assert_eq!(measurement.edge_rel_type, "HAS_MEASUREMENT");
+
+        let contains = EmmoOntology.fact_graph_shape("contains").unwrap();
+        assert!(!contains.reified_measurement);
+        assert_eq!(contains.object_storage_label, "Element");
+        assert_eq!(contains.edge_rel_type, "CONTAINS_ELEMENT");
+        assert_eq!(contains.edge_value_prop.as_deref(), Some("fraction"));
+
+        let composition = EmmoOntology.fact_graph_shape("composition").unwrap();
+        assert_eq!(composition.object_storage_label, "Composition");
+        assert_eq!(composition.edge_rel_type, "HAS_COMPOSITION");
+        assert_eq!(
+            composition.object_text_prop.as_deref(),
+            Some("canonical_formula")
+        );
+
+        for kind in ["phase", "processing", "structure", "application"] {
+            assert!(
+                EmmoOntology.fact_graph_shape(kind).is_some(),
+                "EMMO declares its legacy {kind} shape"
+            );
+        }
+        // A foreign kind is nobody's declaration: the honest generic edge.
+        assert!(EmmoOntology.fact_graph_shape("obligation").is_none());
+        // The trait default is silence, never a built-in table.
+        let fake = Fake::new("chem-g", &["Molecule"], &["REACTS_WITH"]);
+        assert!(fake.fact_graph_shape("measurement").is_none());
+    }
+
+    /// The numeric prior's eligible kinds come from the declaration too:
+    /// EMMO declares the two fraction-like kinds, and an ontology without
+    /// such a declaration yields an honest empty list (the check then
+    /// reports `Unavailable`, never a silent pass).
+    #[test]
+    fn numeric_prior_fact_kinds_derive_from_the_declaration() {
+        assert_eq!(
+            EmmoOntology.numeric_prior_fact_kinds(),
+            vec!["composition".to_string(), "contains".to_string()]
+        );
+        let fake = Fake::new("chem-n", &["Molecule"], &["REACTS_WITH"]);
+        assert!(fake.numeric_prior_fact_kinds().is_empty());
+    }
+
+    /// The prompt names typed fields from the active ontology while leaving
+    /// unit meaning to ontology/schema data. An ontology without typed
+    /// declarations does not gain the rule.
+    #[test]
+    fn instructions_derive_typed_fields_without_a_domain_glossary() {
+        // CONTRACT CHANGE: EMMO no longer substitutes a bespoke materials
+        // prompt or a prose unit table; it uses the same ontology-derived
+        // builder as a promoted ontology.
         let emmo = EmmoOntology.extraction_instructions();
         assert!(
-            emmo.contains("NEVER the measured value") && emmo.contains("relationship's \"value\""),
-            "emmo instructions no longer state the typed-value rule:\n{emmo}"
+            emmo.contains("typed value/unit fields")
+                && emmo.contains("\"Property\"")
+                && emmo.contains("\"HAS_PROPERTY\""),
+            "emmo instructions no longer state the schema fields declared by its ontology:\n{emmo}"
         );
+        for removed in ["materials science", "yield strength", "density", "QUDT:"] {
+            assert!(
+                !emmo.contains(removed),
+                "domain-specific prose {removed:?} leaked back into the prompt:\n{emmo}"
+            );
+        }
         let none = Fake::new("chem-q2", &["Molecule"], &["REACTS_WITH"]).extraction_instructions();
         assert!(
-            !none.contains("NEVER the measured value"),
+            !none.contains("typed value/unit fields"),
             "an ontology with no quantitative classes must not gain the rule:\n{none}"
         );
     }
@@ -1563,5 +1996,21 @@ mod tests {
             EMMO_GRAPH.property(&relation.iri).is_some(),
             "HAS_PHASE resolved to a property absent from the bundled artifact"
         );
+    }
+}
+
+#[cfg(test)]
+mod emmo_label_dump {
+    use super::*;
+    #[test]
+    fn dump_labels() {
+        let emmo = EmmoOntology;
+        let mut labels: Vec<String> = emmo
+            .classes()
+            .iter()
+            .flat_map(|c| c.extraction_labels.iter().cloned())
+            .collect();
+        labels.sort();
+        eprintln!("CLASSES: {labels:?}");
     }
 }

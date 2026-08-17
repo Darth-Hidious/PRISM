@@ -86,7 +86,9 @@ pub struct OntologySection {
     /// Id of the ontology vocabulary local tabular ingest extracts and
     /// validates with, resolved through prism-ingest's process-wide
     /// ontology registry. Default: "emmo" (the built-in EMMO materials
-    /// vocabulary). An id nothing registered fails ingest loudly.
+    /// vocabulary). CLI ingest can lazily register an accepted artifact from
+    /// the project's `.prism/ontologies/<id>.ttl`; an id available from
+    /// neither source fails ingest loudly.
     #[serde(default = "default_ontology_id")]
     pub id: String,
     #[serde(default = "default_llm_provider")]
@@ -233,7 +235,7 @@ fn default_llm_timeout() -> u64 {
 /// exactly 10 rows of any dataset and the first 60,000 bytes of any document
 /// and silently discard the rest. These overrides exist for operators, not
 /// as protective caps — the whole input is processed either way, in batches.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestSection {
     /// Rows of tabular data per extraction batch. Unset ⇒ batches are packed
     /// to a byte budget derived from the model's context window.
@@ -244,6 +246,53 @@ pub struct IngestSection {
     /// spanning a boundary is still seen whole by one of them.
     #[serde(default)]
     pub chunk_bytes: Option<usize>,
+    /// The paper loop's READING STANDARD: the fraction of a document's lines
+    /// the reader must have seen before a FIRST `finish` is accepted. Below
+    /// it, the finish is refused ONCE with the largest unread ranges (the
+    /// second finish always succeeds). Lines, not content — it measures
+    /// reading, never what the lines say. `0` disables the gate.
+    #[serde(default = "default_finish_coverage_floor")]
+    pub finish_coverage_floor: f64,
+    /// Capability verdict (§D.5): when EVERY sample's proposal acceptance
+    /// rate stays below this floor — together with a degenerate-rate or
+    /// coverage failure — the extraction is reported `model_insufficient`
+    /// instead of masquerading as a quiet paper.
+    #[serde(default = "default_model_acceptance_floor")]
+    pub model_acceptance_floor: f64,
+    /// Capability verdict (§D.5): structural-degeneracy rate of a sample's
+    /// facts above this ceiling counts against the model.
+    #[serde(default = "default_model_degenerate_ceiling")]
+    pub model_degenerate_ceiling: f64,
+}
+
+impl Default for IngestSection {
+    fn default() -> Self {
+        Self {
+            batch_rows: None,
+            chunk_bytes: None,
+            finish_coverage_floor: default_finish_coverage_floor(),
+            model_acceptance_floor: default_model_acceptance_floor(),
+            model_degenerate_ceiling: default_model_degenerate_ceiling(),
+        }
+    }
+}
+
+/// Challenging a first finish below a quarter of the document is the
+/// measured-safe default; `0` turns the gate off entirely.
+fn default_finish_coverage_floor() -> f64 {
+    0.25
+}
+
+/// A healthy frontier model lands far above one third of its proposals; a
+/// model below this line in every sample is measurably not reading.
+fn default_model_acceptance_floor() -> f64 {
+    1.0 / 3.0
+}
+
+/// More than half of a sample's facts structurally degenerate (two of
+/// subject/predicate/object identical or blank) is beyond noise.
+fn default_model_degenerate_ceiling() -> f64 {
+    0.5
 }
 
 fn is_platform_llm_provider(provider: &str) -> bool {
@@ -618,6 +667,33 @@ mod tests {
     fn audit_can_be_opted_out() {
         let config: NodeConfig = toml::from_str("[audit]\nenabled = false\n").unwrap();
         assert!(!config.audit.enabled);
+    }
+
+    /// The paper-loop policy keys live in `[ingest]` and carry their
+    /// defaults when absent — including an `[ingest]` section that sets
+    /// OTHER knobs only. The gate must come from config, never from a
+    /// hardcoded number in the loop.
+    #[test]
+    fn ingest_reading_policy_defaults_and_overrides() {
+        let config: NodeConfig = toml::from_str("[ingest]\nchunk_bytes = 2000\n").unwrap();
+        assert_eq!(config.ingest.finish_coverage_floor, 0.25);
+        assert_eq!(config.ingest.model_acceptance_floor, 1.0 / 3.0);
+        assert_eq!(config.ingest.model_degenerate_ceiling, 0.5);
+
+        let config: NodeConfig = toml::from_str(
+            "[ingest]\nfinish_coverage_floor = 0.0\nmodel_acceptance_floor = 0.5\n\
+             model_degenerate_ceiling = 0.75\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.ingest.finish_coverage_floor, 0.0,
+            "0 disables the gate"
+        );
+        assert_eq!(config.ingest.model_acceptance_floor, 0.5);
+        assert_eq!(config.ingest.model_degenerate_ceiling, 0.75);
+
+        let config = NodeConfig::default();
+        assert_eq!(config.ingest.finish_coverage_floor, 0.25);
     }
 
     #[test]

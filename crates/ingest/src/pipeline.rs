@@ -504,18 +504,14 @@ impl IngestPipeline {
                             .await
                         {
                             Ok((update, fact_drops, semantic_report)) => {
-                                // Facts the fact-mapping refused (a numeric
-                                // value whose unit is missing or
-                                // unresolvable — never stored unit-less)
-                                // join the same reported drop list as
-                                // referential containment: a PARTIAL result
-                                // the caller must surface, never a silent
-                                // drop.
+                                // Mapping notes join the same surfaced list
+                                // as referential-containment notes. Unit
+                                // absence is not a drop condition.
                                 if !fact_drops.is_empty() {
                                     tracing::warn!(
                                         dropped = fact_drops.len(),
-                                        "numeric facts with unresolvable units were dropped; \
-                                         the valid remainder is stored"
+                                        "fact mapping produced review notes; all retained \
+                                         facts were stored"
                                     );
                                 }
                                 dropped_relationships.extend(fact_drops);
@@ -610,13 +606,9 @@ impl IngestPipeline {
     /// the synthetic `Measurement` node a measurement fact mints — a fact
     /// shape, not an extracted entity.
     ///
-    /// The second return value carries one reason per fact the mapping
-    /// REFUSED to write — a numeric value whose unit is missing or resolves
-    /// to no QUDT identifier is dropped whole, never stored unit-less (see
-    /// `to_local_facts`). The caller must surface these alongside
-    /// `dropped_relationships`. The dropped fact's endpoints still land as
-    /// standalone typed nodes below: the entities exist, only the
-    /// unit-less numeric claim is refused.
+    /// The second return value carries mapper notes the caller must surface
+    /// alongside `dropped_relationships`. Unit absence is semantically
+    /// neutral; present non-empty terms are preserved exactly.
     async fn write_local_graph(
         &self,
         ontology: &dyn crate::ontologies::Ontology,
@@ -702,12 +694,13 @@ impl IngestPipeline {
         };
         let store = ProvenanceStore::open(&db_path).await?;
 
-        let (facts, mut dropped_facts) = to_local_facts(entity_set);
+        let (facts, mut dropped_facts) = to_local_facts(entity_set, ontology);
         // The persisted facts keep the historical 0.8 fallback. Semantic
         // fusion uses the same mapper with raw optional confidence retained,
         // so repeated endpoint triples with different values/confidences
         // remain correctly paired and an omitted score stays honest.
-        let (semantic_facts, semantic_dropped_facts) = to_semantic_local_facts(entity_set);
+        let (semantic_facts, semantic_dropped_facts) =
+            to_semantic_local_facts(entity_set, ontology);
         debug_assert_eq!(
             dropped_facts, semantic_dropped_facts,
             "confidence handling cannot change the mapped write set"
@@ -732,7 +725,11 @@ impl IngestPipeline {
             .collect();
         // Geometry reads the PRE-WRITE graph. It is deliberately kept out of
         // `GraphWritePlan`: no distance or fused score below can merge, drop,
-        // rewrite, or block model-proposed data.
+        // rewrite, or block model-proposed data. The numeric prior's
+        // eligible fact kinds come from the ACTIVE ontology's declaration —
+        // the Rust default for that list is gone.
+        let mut semantic_policy = self.config.semantic_validation.clone();
+        semantic_policy.resolve_eligible_fact_kinds(ontology);
         let semantic = match semantic_backend {
             Some(backend) => {
                 validate_write_with_backend(
@@ -740,7 +737,7 @@ impl IngestPipeline {
                     &semantic_entities,
                     &semantic_facts,
                     tenant,
-                    &self.config.semantic_validation,
+                    &semantic_policy,
                     Some(backend),
                 )
                 .await
@@ -751,7 +748,7 @@ impl IngestPipeline {
                     &semantic_entities,
                     &semantic_facts,
                     tenant,
-                    &self.config.semantic_validation,
+                    &semantic_policy,
                 )
                 .await
             }
@@ -816,6 +813,13 @@ impl IngestPipeline {
                 subject: classification_of(&fact.subject)?,
                 object: classification_of(&fact.object)?,
             };
+            // The graph shape for this fact's kind is the ACTIVE ontology's
+            // declaration — the store no longer holds a kind→(class, edge)
+            // table, so a non-materials ontology's typed kinds stay typed.
+            let shape = fact
+                .kind
+                .as_deref()
+                .and_then(|kind| ontology.fact_graph_shape(kind));
             store
                 .write_classified_fact_with_evidence(
                     fact,
@@ -823,6 +827,7 @@ impl IngestPipeline {
                     EvidenceClass::Research,
                     nodes,
                     ontology_classification,
+                    shape,
                 )
                 .await?;
         }
@@ -959,20 +964,6 @@ enum GraphWritePlan {
 /// Returns the full report on the extraction AS THE MODEL EMITTED IT (the
 /// honest record, orphans included) plus the plan.
 ///
-/// Two error classes are containable, both by dropping exactly the claim
-/// they invalidate: `orphan_rel` (a relationship whose `from`/`to` was
-/// never declared — the edge is dropped) and `unit_kind_mismatch` (an
-/// entity whose measurement unit contradicts the quantity its name states,
-/// e.g. a density under `QUDT:GigaPA` — the entity is dropped, and any
-/// relationship referencing it dangles and is dropped with it). Dropping
-/// loses one claim; "repairing" the unit would fabricate a measurement the
-/// extraction never made, and failing the whole ingest discards every
-/// valid fact with it (the pre-containment behaviour that kept the graph
-/// empty — the same wholesale destruction the strict QudtUnit deserialiser
-/// inflicted on text ingest). Every other error-severity issue — empty
-/// names, zero entities, an ontology's own domain errors — still blocks
-/// the write, proven by RE-validating the reduced set rather than by
-/// trusting issue categories.
 /// Two error classes are containable. `orphan_rel`: a relationship whose
 /// `from`/`to` was never declared — dropping it loses one claim; inventing
 /// the endpoint would require fabricating a type, and failing the whole
@@ -1033,22 +1024,6 @@ fn validate_before_graph_write(
                     ontology.id(),
                     declared
                 ));
-            } else if let Some(reason) = crate::graph_validation::unit_kind_mismatch(e) {
-                // The quantity-kind contradiction (Check 11, Error): the
-                // POISONED claim is dropped and reported, the rest of the
-                // document is stored. The unit is never rewritten — that
-                // would fabricate a measurement the extraction never made.
-                dropped.push(reason);
-            } else if let Some(reason) =
-                crate::graph_validation::measurement_packed_in_name(ontology, e)
-            {
-                // The form-versus-field corruption (Check 12, Error): a
-                // quantitative entity NAMED after its measurement
-                // ("1100 MPa") is dropped and reported, never stored as a
-                // fake Property — the name is an identity key, and a number
-                // inside it is unqueryable text. Its relationships dangle
-                // and are dropped (and reported) below.
-                dropped.push(reason);
             } else {
                 kept.push(e.clone());
             }
@@ -1387,15 +1362,11 @@ mod tests {
         assert!(dropped_entities.is_empty());
     }
 
-    /// The measured live defect, contained at the production gate: a
-    /// Property NAMED "1100 MPa" (measurement packed into the name — the
-    /// form-versus-field failure) is dropped and REPORTED, never stored as
-    /// a fake Property; the relationship referencing it dangles and drops
-    /// with it; and the properly-typed sibling measurement is kept whole.
-    /// Removing the containment branch turns this Proceed into a Blocked —
-    /// this test dies either way a mutation leans.
     #[test]
-    fn validate_before_graph_write_drops_and_reports_measurement_named_properties() {
+    fn validate_before_graph_write_does_not_apply_unit_word_heuristics() {
+        // CONTRACT CHANGE: Rust no longer guesses from a numeric-looking
+        // name plus an English/unit suffix. The active ontology and reader
+        // decide semantics; structural validation preserves the proposal.
         use crate::{Entity, Relationship};
         let rel = |to: &str| Relationship {
             from: "Inconel 718".into(),
@@ -1432,40 +1403,21 @@ mod tests {
         };
         let (report, plan) =
             validate_before_graph_write(&crate::ontologies::EmmoOntology, &entity_set);
-        assert!(!report.passed, "the report records the packed name");
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|i| i.category == "measurement_in_name"),
-            "{:?}",
-            report.issues
-        );
+        assert!(report.passed, "{:?}", report.issues);
         let GraphWritePlan::Proceed {
             set,
             dropped,
             dropped_entities,
         } = plan
         else {
-            panic!("a packed-name Property must be contained, not block the ingest");
+            panic!("a structurally valid proposal must proceed");
         };
-        assert!(
-            !set.entities.iter().any(|e| e.name == "1100 MPa"),
-            "a Property named after a measurement must never reach the write set"
+        assert_eq!(
+            serde_json::to_value(&set).unwrap(),
+            serde_json::to_value(&entity_set).unwrap()
         );
-        assert_eq!(dropped_entities.len(), 1, "{dropped_entities:?}");
-        assert!(
-            dropped_entities[0].contains("1100 MPa"),
-            "{}",
-            dropped_entities[0]
-        );
-        // Its edge dangles and is dropped (and reported) with it…
-        assert_eq!(dropped.len(), 1, "{dropped:?}");
-        assert!(dropped[0].contains("1100 MPa"), "{}", dropped[0]);
-        // …while the typed sibling survives intact.
-        assert!(set.entities.iter().any(|e| e.name == "density"));
-        assert_eq!(set.relationships.len(), 1);
-        assert_eq!(set.relationships[0].to, "density");
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert!(dropped_entities.is_empty(), "{dropped_entities:?}");
     }
 
     #[test]
@@ -2038,10 +1990,8 @@ mod tests {
                 // subjects again (the old behaviour split `Fe` into an
                 // `Element` row and a `Matter` row).
                 entity("Element", "Fe", serde_json::json!({})),
-                // Raw paper spellings on purpose: the write path must
-                // RESOLVE them to QUDT identifiers (asserted below), not
-                // store them verbatim — this fixture once pinned verbatim
-                // storage as expected behaviour (F10).
+                // Source terms on purpose: the write path preserves them
+                // exactly instead of applying a Rust-owned vocabulary.
                 entity(
                     "Property",
                     "density",
@@ -2098,12 +2048,9 @@ mod tests {
             .await
             .unwrap();
 
-        // The raw fixture spellings landed RESOLVED — one unit vocabulary
-        // in the store, never the paper spelling and never unit-less.
-        for (property, expected_unit) in [
-            ("density", "QUDT:GM-PER-CentiM3"),
-            ("melting point", "QUDT:K"),
-        ] {
+        // CONTRACT CHANGE: the active reader/ontology owns the vocabulary;
+        // the store retains the supplied non-empty terms exactly.
+        for (property, expected_unit) in [("density", "g/cm3"), ("melting point", "kelvin")] {
             let recalled = store
                 .recall_with_context(property, "local", 10)
                 .await
@@ -2112,7 +2059,7 @@ mod tests {
             assert_eq!(
                 recalled[0].unit.as_deref(),
                 Some(expected_unit),
-                "{property} must store the canonical QUDT identifier"
+                "{property} must retain the selected exact unit term"
             );
         }
 
@@ -2745,16 +2692,10 @@ mod tests {
         server.verify().await;
     }
 
-    /// THE unit rule at PRODUCTION dispatch on the tabular path (F10),
-    /// through `ingest_file` itself: a numeric property whose unit is
-    /// missing or unresolvable is dropped WHOLE and REPORTED in
-    /// `dropped_relationships` (the surface the CLI prints), while a raw
-    /// resolvable spelling lands RESOLVED to its QUDT identifier — never
-    /// verbatim, never unit-less. Before this, the tabular path passed raw
-    /// unit strings through and the store filled missing ones with `""`,
-    /// re-opening the 880 GPa vs 880 MPa hazard the text path had closed.
     #[tokio::test]
-    async fn tabular_numeric_facts_resolve_units_or_are_dropped_and_reported() {
+    async fn tabular_numeric_facts_preserve_terms_and_leave_absence_neutral() {
+        // CONTRACT CHANGE: production dispatch has no unit vocabulary. Every
+        // non-empty term is exact, and absence is stored without a verdict.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
 
         let server = mock_llm(serde_json::json!({
@@ -2762,10 +2703,10 @@ mod tests {
                 {"type": "Alloy", "name": "Ti-6Al-4V", "properties": {}},
                 // Numeric value, NO unit — the CSV-shaped `{"value": 880}`.
                 {"type": "Property", "name": "UTS", "properties": {"value": 880}},
-                // Numeric value, unresolvable unit.
+                // Numeric value with an arbitrary source term.
                 {"type": "Property", "name": "hardness",
                  "properties": {"value": 349, "unit": "banana"}},
-                // Numeric value, raw resolvable spelling.
+                // Numeric value with another exact spelling.
                 {"type": "Property", "name": "density",
                  "properties": {"value": 4.43, "unit": "g/cm3"}}
             ],
@@ -2784,64 +2725,31 @@ mod tests {
 
         let result = pipeline.ingest_file(&csv).await.unwrap();
 
-        // A contained drop is a partial SUCCESS: no step failure, exit 0…
         assert!(result.errors.is_empty(), "{:?}", result.errors);
-        // …and the drops are REPORTED, naming fact, value and cause.
-        assert_eq!(
-            result.dropped_relationships.len(),
-            2,
+        assert!(
+            result.dropped_relationships.is_empty(),
             "{:?}",
             result.dropped_relationships
         );
-        let drops = result.dropped_relationships.join("\n");
-        assert!(
-            drops.contains("UTS") && drops.contains("880") && drops.contains("no unit at all"),
-            "{drops}"
-        );
-        assert!(
-            drops.contains("hardness") && drops.contains("banana"),
-            "{drops}"
-        );
 
-        // The count matches what the store received: 4 nodes (the dropped
-        // facts' endpoints still exist as typed nodes), 1 surviving edge.
-        let graph = result.graph.expect("the valid remainder must be written");
-        assert_eq!((graph.nodes_created, graph.edges_created), (4, 1));
+        let graph = result.graph.expect("the proposed graph must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (4, 3));
 
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .unwrap();
-        // The resolvable measurement landed with the CANONICAL identifier.
-        let density = store
-            .recall_with_context("density", "local", 10)
-            .await
-            .unwrap();
-        assert_eq!(density.len(), 1, "{density:?}");
-        assert_eq!(density[0].value, Some(4.43));
-        assert_eq!(
-            density[0].unit.as_deref(),
-            Some("QUDT:GM-PER-CentiM3"),
-            "the stored unit must be the resolved QUDT identifier, not the raw spelling"
-        );
-        // THE rule: neither refused number is anywhere in the store — not
-        // with a raw unit, not with an empty one.
-        for refused in ["UTS", "hardness"] {
+        for (property, value, unit) in [
+            ("UTS", 880.0, None),
+            ("hardness", 349.0, Some("banana")),
+            ("density", 4.43, Some("g/cm3")),
+        ] {
             let facts = store
-                .recall_with_context(refused, "local", 10)
+                .recall_with_context(property, "local", 10)
                 .await
                 .unwrap();
-            assert!(
-                facts.is_empty(),
-                "a numeric value without a resolvable unit must never be stored: {facts:?}"
-            );
-            // The entity itself still exists as a typed node — the claim
-            // was refused, not the entity.
-            let hits = store.graph_search(refused, "local", 10).await.unwrap();
-            assert!(
-                hits.iter()
-                    .any(|n| n.name == refused && n.label == "Property"),
-                "the dropped fact's endpoint must still land as a typed node: {hits:?}"
-            );
+            assert_eq!(facts.len(), 1, "{property}: {facts:?}");
+            assert_eq!(facts[0].value, Some(value), "{property}");
+            assert_eq!(facts[0].unit.as_deref(), unit, "{property}");
         }
         server.verify().await;
     }
@@ -3304,9 +3212,8 @@ mod tests {
         assert_eq!(body["seed"], prism_llm::EXTRACTION_SEED);
         let schema = &body["response_format"]["json_schema"]["schema"];
         // EMMO declares quantitative classes, so the entity items on the
-        // WIRE are per-type variants: the quantitative one (Property,
-        // value/unit REQUIRED — the field-use half the enum lock alone
-        // never gave) and the open one (everything else).
+        // WIRE are per-type variants: the quantitative one (Property, value
+        // required and unit optional) and the open one (everything else).
         let quant_enum = schema
             .pointer("/properties/entities/items/oneOf/0/properties/type/enum")
             .and_then(|v| v.as_array())
@@ -3314,8 +3221,8 @@ mod tests {
         assert!(quant_enum.iter().any(|v| v == "Property"), "{quant_enum:?}");
         assert_eq!(
             schema.pointer("/properties/entities/items/oneOf/0/properties/properties/required"),
-            Some(&serde_json::json!(["value", "unit"])),
-            "the request no longer REQUIRES typed value/unit on Property \
+            Some(&serde_json::json!(["value"])),
+            "the request no longer REQUIRES typed value on Property \
              entities — the model may again pack the measurement into the name"
         );
         let entity_enum = schema
@@ -3328,35 +3235,26 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("relationship enum present");
         assert!(rel_enum.iter().any(|v| v == "CONTAINS"), "{rel_enum:?}");
-        // The per-edge coupling reaches the wire: a measured edge must
-        // state value AND unit (with `unit` optional the live model emitted
-        // every value and no units — run 2), and it must offer no unitless
-        // numeric slot (with `weight` available the model put every number
-        // there — run 3).
+        // CONTRACT CHANGE: a measured edge requires its value but an absent
+        // unit is neutral. A supplied term remains non-empty and open.
         assert_eq!(
             schema.pointer("/properties/relationships/items/oneOf/0/required"),
-            Some(&serde_json::json!(["from", "rel", "to", "value", "unit"])),
+            Some(&serde_json::json!(["from", "rel", "to", "value"])),
         );
         assert!(
             schema
                 .pointer("/properties/relationships/items/oneOf/0/properties/weight")
                 .is_none(),
         );
-        let unit_enum = schema
+        let unit_schema = schema
             .pointer(
-                "/properties/entities/items/oneOf/0\
-                 /properties/properties/properties/unit/anyOf/0/enum",
+                "/properties/relationships/items/oneOf/0\
+                 /properties/unit/anyOf/0",
             )
-            .and_then(|v| v.as_array())
-            .expect("unit enum present");
-        assert!(
-            unit_enum.iter().any(|v| v == "QUDT:MegaPA"),
-            "{unit_enum:?}"
-        );
-        assert!(
-            !unit_enum.iter().any(|v| v == "MPa"),
-            "a bare unit spelling is legal to the schema: {unit_enum:?}"
-        );
+            .expect("open unit string schema present");
+        assert_eq!(unit_schema["type"], "string");
+        assert_eq!(unit_schema["minLength"], 1);
+        assert!(unit_schema.get("enum").is_none(), "{unit_schema}");
 
         let trace = result
             .extraction_decoding
@@ -3596,18 +3494,16 @@ mod tests {
         server.verify().await;
     }
 
-    /// The check constrained decoding cannot do, contained at production
-    /// dispatch: a density tagged with a pressure unit (grammar-legal,
-    /// false) is dropped and REPORTED, the rest of the document is stored,
-    /// and the poisoned claim never reaches the store.
     #[tokio::test]
-    async fn a_density_with_a_pressure_unit_is_dropped_and_reported_not_stored() {
+    async fn unit_semantics_are_not_hardcoded_at_production_dispatch() {
+        // CONTRACT CHANGE: the former verdict depended on English property
+        // words and a Rust unit-kind table. The mapper now preserves both
+        // exact terms and leaves their meaning to the active ontology.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
 
         let server = mock_llm(serde_json::json!({
             "entities": [
                 {"type": "Alloy", "name": "Inconel 718", "properties": {}},
-                // The owner's live case: 8.19 g/cm³ tagged as gigapascals.
                 {"type": "Property", "name": "density_g_cm3",
                  "properties": {"value": 8.19, "unit": "QUDT:GigaPA"}},
                 {"type": "Property", "name": "yield_strength_mpa",
@@ -3627,39 +3523,14 @@ mod tests {
 
         let result = pipeline.ingest_file(&csv).await.unwrap();
 
-        // Contained, not fatal: the run succeeds and says what it dropped.
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         let report = result.graph_validation.expect("validation ran");
-        assert!(!report.passed, "the honest report keeps the contradiction");
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|i| i.category == "unit_kind_mismatch"),
-            "{:?}",
-            report.issues
-        );
-        assert_eq!(
-            result.dropped_entities.len(),
-            1,
-            "{:?}",
-            result.dropped_entities
-        );
-        assert!(
-            result.dropped_entities[0].contains("QUDT:GigaPA"),
-            "{}",
-            result.dropped_entities[0]
-        );
-        assert_eq!(
-            result.dropped_relationships.len(),
-            1,
-            "the edge to the poisoned property dangles and is dropped: {:?}",
-            result.dropped_relationships
-        );
+        assert!(report.passed, "{:?}", report.issues);
+        assert!(result.dropped_entities.is_empty());
+        assert!(result.dropped_relationships.is_empty());
 
-        // The valid remainder was stored; the falsehood was not.
-        let graph = result.graph.expect("the valid remainder must be written");
-        assert_eq!((graph.nodes_created, graph.edges_created), (2, 1));
+        let graph = result.graph.expect("the proposed graph must be written");
+        assert_eq!((graph.nodes_created, graph.edges_created), (3, 2));
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .unwrap();
@@ -3669,15 +3540,15 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "the clean property must be stored"
+            "the first exact unit term must be stored"
         );
         assert!(
-            store
+            !store
                 .graph_search("density_g_cm3", "local", 10)
                 .await
                 .unwrap()
                 .is_empty(),
-            "a density under a pressure unit reached the store"
+            "the second exact unit term must be stored without a Rust verdict"
         );
     }
 
@@ -4063,6 +3934,9 @@ mod tests {
                 )
                 .expect("test property IRI is absolute"),
                 pref_label: Some("reactsWith".into()),
+                parents: Vec::new(),
+                domains: Vec::new(),
+                ranges: Vec::new(),
                 extraction_labels: vec!["REACTS_WITH".into()],
             }]
         });

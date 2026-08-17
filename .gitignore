@@ -168,3 +168,8 @@ WORK_LOG_*.md
 # Training/ingress corpora are MOAT — private engine repo only, never public
 data/ingress_dumps/
 data/training/
+
+# Isolated build dirs used to avoid dev-dependency feature leaks
+# (a `cargo test` in the shared target arms prism-agent/test-guard, which
+# then aborts the real backend). Build artefacts, never committed.
+target-*/

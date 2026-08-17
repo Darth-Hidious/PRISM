@@ -217,6 +217,7 @@ fn test_goal() -> CampaignGoal {
         description: "Refractory alloy with high mixing entropy".into(),
         elements: vec!["W".into(), "Mo".into(), "Ta".into(), "Nb".into()],
         objective: "maximize mixing entropy".into(),
+        target_property: None,
         constraints: vec![],
         seeds: vec![],
     }
@@ -259,6 +260,7 @@ async fn non_unit_llm_composition_never_reaches_evaluator_or_checkpoint() {
             .map(str::to_string)
             .collect(),
         objective: "maximize melting point".into(),
+        target_property: None,
         constraints: vec![],
         seeds: vec![],
     };
@@ -316,6 +318,7 @@ async fn hea_goal_rejects_near_pure_melting_point_exploit() {
             .map(str::to_string)
             .collect(),
         objective: "maximize melting point".into(),
+        target_property: None,
         constraints: vec![],
         seeds: vec![
             "W0.995 Re0.005".into(),

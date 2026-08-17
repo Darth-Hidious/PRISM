@@ -98,6 +98,14 @@ pub static CATALOG: &[Command] = &[
         suggested: true,
     },
     Command {
+        id: "browse.open",
+        title: "Browse web page",
+        description: "Read a URL as text (HTTP fetch, no JavaScript)",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
         id: "compute.gpus",
         title: "Procure GPU compute",
         description: "Live GPU catalog with prices",

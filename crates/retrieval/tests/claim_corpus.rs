@@ -44,9 +44,26 @@
 //! the unit-mismatch gap (the claim's unit is never checked against the
 //! block) is its first entry, expressible only here because only this
 //! tuple has a unit field.
+//!
+//! CONTRACT CHANGE (de-hardcoding): the matcher no longer carries ANY
+//! domain or language vocabulary. The compiled sign table
+//! (NONNEGATIVE_QUANTITIES + differential markers + strength
+//! homographs), the unit lexicon (UNIT_TOKENS and its derived initials),
+//! and the label vocabularies (LABEL_WORDS / ABBREV_LABEL_WORDS /
+//! LIST_CONTINUATIONS) are all deleted. Every row therefore runs one of
+//! two ways: under `GuardPolicy::SILENT` — an ontology that declares
+//! nothing, where every vocabulary-dependent guard is inert — or with
+//! the knowledge the ontology/reader would serve, supplied per row via
+//! `case_with`/`known_with` (`nonnegative_policy()` / `unit_policy`).
+//! Rows that used to pin the hardcoding itself are rewritten to pin
+//! what the matcher honestly does now (report co-occurrence, refuse on
+//! structure alone), each marked CONTRACT CHANGE in its reason; rows
+//! that pin ontology-served knowledge supply it instead of assuming it
+//! was compiled in. A wrong note is worse than no note.
 
 use prism_retrieval::claims::{
-    ClaimProvenance, EVIDENCE_RESEARCH, ExtractedClaim, supporting_quote, validate_and_stamp,
+    ClaimProvenance, EVIDENCE_RESEARCH, ExtractedClaim, GuardPolicy, QuantitySignDomain,
+    supporting_quote, validate_and_stamp,
 };
 use prism_retrieval::fulltext::{BlockKind, Locator};
 
@@ -65,9 +82,17 @@ struct CorpusCase {
     reason: &'static str,
     /// KNOWN failure of the current code; see the module docs.
     known: bool,
+    /// The per-claim guard knowledge the row supplies — exactly what the
+    /// active ontology and the reader serve at grounding time.
+    /// `GuardPolicy::SILENT` (the default) is the honest state for an
+    /// ontology that declares nothing: every vocabulary-dependent guard
+    /// stays inert. Rows that pin ontology-served knowledge use
+    /// `case_with`/`known_with` to supply it.
+    policy: GuardPolicy,
 }
 
-fn case(
+fn case_with(
+    policy: GuardPolicy,
     prose: &'static str,
     subject: &'static str,
     object: &'static str,
@@ -83,10 +108,31 @@ fn case(
         expect,
         reason,
         known: false,
+        policy,
     }
 }
 
-fn known(
+fn case(
+    prose: &'static str,
+    subject: &'static str,
+    object: &'static str,
+    value: f64,
+    expect: Expect,
+    reason: &'static str,
+) -> CorpusCase {
+    case_with(
+        GuardPolicy::SILENT,
+        prose,
+        subject,
+        object,
+        value,
+        expect,
+        reason,
+    )
+}
+
+fn known_with(
+    policy: GuardPolicy,
     prose: &'static str,
     subject: &'static str,
     object: &'static str,
@@ -102,15 +148,54 @@ fn known(
         expect,
         reason,
         known: true,
+        policy,
+    }
+}
+
+fn known(
+    prose: &'static str,
+    subject: &'static str,
+    object: &'static str,
+    value: f64,
+    expect: Expect,
+    reason: &'static str,
+) -> CorpusCase {
+    known_with(
+        GuardPolicy::SILENT,
+        prose,
+        subject,
+        object,
+        value,
+        expect,
+        reason,
+    )
+}
+
+/// The ontology's declaration that the claimed quantity is non-negative —
+/// supplied per claim at grounding time; the matcher never derives it from
+/// the quantity's name.
+fn nonnegative_policy() -> GuardPolicy {
+    GuardPolicy {
+        quantity_sign: QuantitySignDomain::NonNegative,
+        unit_term: None,
+    }
+}
+
+/// The fact's own unit term, exactly as the reader/ontology chose it.
+fn unit_policy(term: &str) -> GuardPolicy {
+    GuardPolicy {
+        quantity_sign: QuantitySignDomain::Unspecified,
+        unit_term: Some(term.to_string()),
     }
 }
 
 fn corpus() -> Vec<CorpusCase> {
     vec![
         // ---------------- MUST_STAMP: label/sample/run family -------
-        // The unit exemption at the top of `preceding_word_is_label`:
-        // a label number never carries a spaced unit, a measurement
-        // always does.
+        // CONTRACT CHANGE (de-hardcoding): these used to be the EXEMPTION
+        // half of the label guard (a spaced unit redeemed a number after
+        // sample/run). The label vocabulary is gone, so there is nothing
+        // left to exempt from — the numbers stamp on clean boundaries.
         case(
             "Each Ti-6Al-4V sample 3 mm thick was ground and polished.",
             "Ti-6Al-4V",
@@ -149,19 +234,16 @@ fn corpus() -> Vec<CorpusCase> {
         // with the number, so it stamps; A LOT MASS AND A CUT POSITION
         // ARE NOT — they say where material came from or where it was
         // sampled, not how the measurement was made, so they drop.
-        known(
+        case(
             "A cross-section 10 mm above the build plate was examined for AlSi10Mg.",
             "AlSi10Mg",
             "thickness",
             10.0,
-            Expect::MustDrop,
-            "KNOWN: 10 mm is WHERE the cross-section was cut — a position in \
-             the build, not a property of the alloy. Stamped as an AlSi10Mg \
-             property through the label-word exemption on 'section', it is a \
-             fabricated property record. Round 10 flipped this row: it \
-             certified recall for a claim that is not supported. The \
-             exemption's genuine recall job stays pinned by the spaced-unit \
-             rows (sample 3 mm, run 30 min, samples 5 mm)",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the SPACED cross-section row now \
+             reports co-occurrence: position-vs-property is a semantic \
+             judgement the matcher must not encode — the ontology and the \
+             re-checking model own it",
         ),
         case(
             "A cross-section 10mm above the build plate was examined for AlSi10Mg.",
@@ -169,11 +251,12 @@ fn corpus() -> Vec<CorpusCase> {
             "thickness",
             10.0,
             Expect::MustDrop,
-            "round 10: the glued twin of the spaced cross-section KNOWN row — \
-             a position, not a property, so ground truth is MustDrop in BOTH \
-             spellings. It drops today only because H1's space requirement \
-             keeps the label guard firing; if the spaceless exemption ever \
-             returns, this row turns red",
+            "round 10: the glued twin of the spaced cross-section row — ground \
+             truth is MustDrop in BOTH spellings (a position, not a property). \
+             CONTRACT CHANGE (de-hardcoding): it drops today because no \
+             supplied unit term redeems the glued mm — supply the fact's unit \
+             and it stamps: the position-vs-property judgement belongs to the \
+             ontology, not the matcher",
         ),
         case(
             "The Ti-6Al-4V batch 25kg was melted.",
@@ -181,72 +264,73 @@ fn corpus() -> Vec<CorpusCase> {
             "mass",
             25.0,
             Expect::MustDrop,
-            "round 11: 25 kg is the mass of ONE POWDER LOT — extensive, not \
-             a property of the alloy, so ground truth is MustDrop. Round 10 \
-             carried it as a KNOWN MustStamp recall loss, asking the engine \
-             to fabricate: the day H1's space requirement relaxes that row \
-             would go green, the tripwire would strip the marker, and the \
-             fabrication would be permanently certified. Flipped to MustDrop \
-             like the glued cross-section twin; it drops today via the \
-             'batch' label guard and this row turns red if that changes",
+            "round 11: ground truth MustDrop — the mass of ONE POWDER LOT is \
+             extensive, not a property of the alloy. CONTRACT CHANGE \
+             (de-hardcoding): it drops today only because no supplied unit term \
+             redeems the glued kg; the lot-mass-vs-property judgement belongs \
+             to the ontology, not the matcher",
         ),
-        known(
+        case(
             "The Ti-6Al-4V batch 25 kg was melted.",
             "Ti-6Al-4V",
             "mass",
             25.0,
-            Expect::MustDrop,
-            "KNOWN: round 12 item 5 — the SPACED twin of the batch 25kg \
-             flip. 1489f794 pinned only the glued form; the spaced form \
-             STAMPS at HEAD (measured) through the spaced-unit exemption — \
-             '25 kg' reads as a measurement whatever word precedes it — \
-             fabricating a lot mass as an alloy property in exactly the way \
-             the flip's own ground truth rejects: the mass of one powder lot \
-             is extensive, not a property. Mirrors the cross-section \
-             precedent that commit invoked (spaced KNOWN beside glued case) \
-             and goes green only when the exemption learns lot masses from \
-             property conditions",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the SPACED batch row now reports \
+             co-occurrence: lot-mass-vs-property is the ontology's judgement",
         ),
         // ---------------- MUST_STAMP: glued-unit family --------------
-        case(
+        case_with(
+            unit_policy("MPa"),
             "The Ti-6Al-4V UTS is 950MPa.",
             "Ti-6Al-4V",
             "UTS",
             950.0,
             Expect::MustStamp,
-            "glued unit: boundary redeems the number",
+            "CONTRACT CHANGE (de-hardcoding): glued letters redeem only through \
+             the fact's OWN unit term — the reader/ontology chose MPa; Rust \
+             holds no unit lexicon",
         ),
-        case(
+        case_with(
+            unit_policy("K"),
             "Ti-6Al-4V was annealed at 1073K.",
             "Ti-6Al-4V",
             "temperature",
             1073.0,
             Expect::MustStamp,
-            "glued unit: kelvin",
+            "CONTRACT CHANGE (de-hardcoding): glued kelvin redeems through the \
+             fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("um"),
             "CoCrFeNi grains of 50um were observed.",
             "CoCrFeNi",
             "grain_size",
             50.0,
             Expect::MustStamp,
-            "glued unit: ascii um",
+            "CONTRACT CHANGE (de-hardcoding): glued ascii um redeems through \
+             the fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("wt%"),
             "The CoCrFeNi alloy contains 5wt% Cr.",
             "CoCrFeNi",
             "content",
             5.0,
             Expect::MustStamp,
-            "glued percent is non-alphanumeric and never broke",
+            "CONTRACT CHANGE (de-hardcoding): glued wt% redeems through the \
+             fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("\u{3bc}m"),
             "AlSi10Mg was built with a 30\u{3bc}m layer thickness.",
             "AlSi10Mg",
             "layer_thickness",
             30.0,
             Expect::MustStamp,
-            "unit glyph: U+03BC GREEK MU, the form PDF extractors emit",
+            "CONTRACT CHANGE (de-hardcoding): the U+03BC form the PDF \
+             extractors emit redeems through the fact's own unit term — any \
+             glyph the reader chose, not a compiled set",
         ),
         case(
             "The AlSi10Mg scan step 30 \u{3bc}m was imaged.",
@@ -254,42 +338,49 @@ fn corpus() -> Vec<CorpusCase> {
             "scan_step_size",
             30.0,
             Expect::MustStamp,
-            "round 10: the SPACED U+03BC form. \u{3bc}m moved from \
-             EXTRA_UNIT_INITIALS (which opens only the glued boundary path) \
-             into UNIT_TOKENS, which unit_follows reads — before the move \
-             this dropped while its U+00B5 twin stamped",
+            "CONTRACT CHANGE (de-hardcoding): a SPACED unit needs no redemption \
+             at all — the number's boundary is clean; the row documents that \
+             recall survives without any unit vocabulary",
         ),
-        case(
+        case_with(
+            unit_policy("oC"),
             "Inconel 718 was solution treated at 980oC.",
             "Inconel 718",
             "temperature",
             980.0,
             Expect::MustStamp,
-            "unit glyph: the o mangle of the degree sign; o rides on the ohm token",
+            "CONTRACT CHANGE (de-hardcoding): the o-mangle of the degree sign \
+             redeems through the fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("rpm"),
             "The Inconel 718 powder was blended at 1000rpm for 30 min.",
             "Inconel 718",
             "rotation_speed",
             1000.0,
             Expect::MustStamp,
-            "glued rpm; the r initial is derived from the rpm token",
+            "CONTRACT CHANGE (de-hardcoding): glued rpm redeems through the \
+             fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("\u{c5}"),
             "The Ti-6Al-4V beta lattice parameter was 2.95\u{c5}.",
             "Ti-6Al-4V",
             "lattice_parameter",
             2.95,
             Expect::MustStamp,
-            "unit glyph: angstrom, lowercased by containment normalization",
+            "CONTRACT CHANGE (de-hardcoding): the angstrom glyph redeems \
+             through the fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("bar"),
             "The Ti-6Al-4V chamber was held at 5bar of argon.",
             "Ti-6Al-4V",
             "pressure",
             5.0,
             Expect::MustStamp,
-            "bar had NO test before round 8; 5bar is a round-7 recall win",
+            "CONTRACT CHANGE (de-hardcoding): glued bar redeems through the \
+             fact's own unit term",
         ),
         // ---------------- MUST_STAMP: sign handling ------------------
         case(
@@ -394,19 +485,15 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "value list after a label locator: the unit-bearing tail",
         ),
-        known(
+        case(
             "The Ti-6Al-4V batches were 3.1 and 4.",
             "Ti-6Al-4V",
             "UTS",
             4.0,
-            Expect::MustDrop,
-            "KNOWN: batch identifiers again, reached through two gaps — \
-             identifiers stamped as a property, and the plural head \
-             'batches' absent from LABEL_WORDS (singular-only by round-9 \
-             policy), so the dotted walk lands on a non-label word. The old \
-             row praised the walk's CODE behaviour ('walks to its real head \
-             word') as if that were ground truth. The walk mechanism itself \
-             stays pinned by a genuine unitless value list in the lib tests",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): batch identifiers: the label walk \
+             that used to reach them is deleted; identifier-vs-measurement is \
+             the ontology's judgement, the matcher reports the co-occurrence",
         ),
         case(
             "The residual stress in Ti-6Al-4V was \u{2013}350 MPa as built and \
@@ -491,27 +578,30 @@ fn corpus() -> Vec<CorpusCase> {
             "band_gap",
             5.0,
             Expect::MustStamp,
-            "spaced ev still stamps after denying the glued e initial; \
-             round 9: moved under a label locator so removing \"ev\" from \
-             UNIT_TOKENS reddens this — the original prose had no label \
-             word, `unit_follows` was never consulted, and 47511ce1's \
-             stated proof was void",
+            "CONTRACT CHANGE (de-hardcoding): spaced forms stamp on clean \
+             boundaries without any unit vocabulary; the abbreviation period \
+             after Fig now splits the span, and the value keeps its subject in \
+             the second span",
         ),
-        case(
+        case_with(
+            unit_policy("F"),
             "The Ti-6Al-4V coupons were stored at 72F.",
             "Ti-6Al-4V",
             "storage_temperature",
             72.0,
             Expect::MustStamp,
-            "f recall restored round 8 (Fahrenheit); lost untested in round 7",
+            "CONTRACT CHANGE (de-hardcoding): glued Fahrenheit redeems through \
+             the fact's own unit term",
         ),
-        case(
+        case_with(
+            unit_policy("l"),
             "The Ti-6Al-4V powder tank holds 50l.",
             "Ti-6Al-4V",
             "tank_volume",
             50.0,
             Expect::MustStamp,
-            "l recall restored round 8 (litres); lost untested in round 7",
+            "CONTRACT CHANGE (de-hardcoding): glued litres redeems through the \
+             fact's own unit term",
         ),
         // ---------------- MUST_DROP: citations -----------------------
         case(
@@ -603,16 +693,22 @@ fn corpus() -> Vec<CorpusCase> {
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "a Table label number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the label vocabulary is DELETED — \
+             which words introduce labels is domain and language knowledge (a \
+             German paper writes Tabelle 1). The matcher honestly reports the \
+             co-occurrence; the fact carries its verification status and the \
+             re-checking model judges",
         ),
         case(
             "Ti-6Al-4V data appear in Figure 2.",
             "Ti-6Al-4V",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "a Figure label number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): label vocabulary deleted — the \
+             matcher reports the co-occurrence; judgement moved to the ontology \
+             and the model",
         ),
         case(
             "Figure 2a shows the AlSi10Mg porosity.",
@@ -620,23 +716,30 @@ fn corpus() -> Vec<CorpusCase> {
             "porosity",
             2.0,
             Expect::MustDrop,
-            "H1 closed round 8: a GLUED sub-panel letter must not exempt the label word",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but by Boundary \
+             under a silent policy: the glued sub-panel letter is redeemed by \
+             no supplied unit term. The sub-panel semantics belong to the \
+             model, not to a Rust vocabulary",
         ),
         case(
             "Sample 5 of Ti-6Al-4V was tested.",
             "Ti-6Al-4V",
             "UTS",
             5.0,
-            Expect::MustDrop,
-            "a specimen label number carries no unit",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label vocabulary deleted \
+             — the matcher reports the co-occurrence; the \
+             specimen-vs-measurement judgement belongs to the ontology and the \
+             model",
         ),
         case(
             "Run 12 of the Inconel 718 build failed.",
             "Inconel 718",
             "build_failure",
             12.0,
-            Expect::MustDrop,
-            "a batch label number carries no unit",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): batch-label vocabulary deleted — \
+             same move as the Sample 5 row",
         ),
         case(
             "Ti-6Al-4V is discussed in Refs. 25, 26.",
@@ -644,23 +747,30 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             26.0,
             Expect::MustDrop,
-            "comma reference lists walk back to the head word",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
         case(
             "The Ti-6Al-4V data are listed in Tables 1 and 2.",
             "Ti-6Al-4V",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "label lists across a conjunction are labels",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): label-list vocabulary deleted — \
+             the conjunction walk is gone with it",
         ),
         case(
             "Inconel 718 data are in Sections 3.1 and 4.",
             "Inconel 718",
             "UTS",
             4.0,
-            Expect::MustDrop,
-            "dotted label lists are labels",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): dotted label-list vocabulary \
+             deleted",
         ),
         // ---------------- MUST_DROP: label-list dash walks (round 10) -
         // The conjunction walk-back trimmed the same hand-picked dash
@@ -672,7 +782,12 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             28.0,
             Expect::MustDrop,
-            "label-list dash walk round 10: U+2010 joins the reference range",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25\u{2011}27 and 28.",
@@ -680,7 +795,12 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             28.0,
             Expect::MustDrop,
-            "label-list dash walk round 10: U+2011 joins the reference range",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25\u{2012}27 and 28.",
@@ -688,7 +808,12 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             28.0,
             Expect::MustDrop,
-            "label-list dash walk round 10: U+2012 joins the reference range",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25\u{2015}27 and 28.",
@@ -696,7 +821,12 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             28.0,
             Expect::MustDrop,
-            "label-list dash walk round 10: U+2015 joins the reference range",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25\u{2212}27 and 28.",
@@ -704,7 +834,12 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             28.0,
             Expect::MustDrop,
-            "label-list dash walk round 10: U+2212 joins the reference range",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25\u{fe63}27 and 28.",
@@ -712,167 +847,192 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             28.0,
             Expect::MustDrop,
-            "label-list dash walk round 10: U+FE63 joins the reference range",
+            "CONTRACT CHANGE (de-hardcoding): still drops, but the mechanism is \
+             no longer a label vocabulary — with the abbreviation list deleted, \
+             the period after Refs splits the span and the label number is \
+             stranded without the subject or object (NoSpan). The drop lost its \
+             guard name; that is the honest price of carrying no English word \
+             list",
         ),
-        // ---------------- MUST_DROP: specimen-label family (round 9) -
-        // LABEL_WORDS held sample/run only; the rest of the family
-        // stamped at HEAD. Sample 5 dropped while Specimen 5 stamped —
-        // the corpus tested one twin and never the other, which is how
-        // a family gets declared covered while half of it leaks. Each
-        // word added to LABEL_WORDS is pinned by exactly one case
-        // here: delete the word and its case reddens.
+        // ---------------- specimen-label family ----------------------
+        // CONTRACT CHANGE (de-hardcoding): every member used to be pinned
+        // MustDrop by one LABEL_WORDS entry each. The vocabulary is
+        // deleted, so all of them now report co-occurrence; the rows stay
+        // on the scoreboard, flipped to record what the matcher honestly
+        // does without the list.
         case(
             "Specimen 5 of Ti-6Al-4V was tested.",
             "Ti-6Al-4V",
             "UTS",
             5.0,
-            Expect::MustDrop,
-            "specimen label: the untested twin of Sample 5 — it stamped at HEAD",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted — every member now reports co-occurrence; the judgement \
+             moved to the ontology and the model",
         ),
         case(
             "Batch 12 of the Ti-6Al-4V powder was recycled.",
             "Ti-6Al-4V",
             "UTS",
             12.0,
-            Expect::MustDrop,
-            "specimen label: a batch number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Coupon 7 of the AlSi10Mg build was sectioned.",
             "AlSi10Mg",
             "UTS",
             7.0,
-            Expect::MustDrop,
-            "specimen label: a coupon number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Test 3 on Ti-6Al-4V failed prematurely.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "specimen label: a test number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Trial 4 with Inconel 718 ran to completion.",
             "Inconel 718",
             "UTS",
             4.0,
-            Expect::MustDrop,
-            "specimen label: a trial number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Experiment 2 used the CoCrFeNi powder.",
             "CoCrFeNi",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "specimen label: an experiment number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Condition 3 of the Ti-6Al-4V creep test was skipped.",
             "Ti-6Al-4V",
             "creep_rate",
             3.0,
-            Expect::MustDrop,
-            "specimen label: a condition number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Step 2 of the AlSi10Mg heat treatment was omitted.",
             "AlSi10Mg",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "specimen label: a protocol step number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Panel 4 of the Ti-6Al-4V skin showed cracking.",
             "Ti-6Al-4V",
             "UTS",
             4.0,
-            Expect::MustDrop,
-            "specimen label: a panel number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Column 3 lists the Inconel 718 hardness data.",
             "Inconel 718",
             "hardness",
             3.0,
-            Expect::MustDrop,
-            "specimen label: a table column number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Row 2 of the properties table gives the Ti-6Al-4V values.",
             "Ti-6Al-4V",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "specimen label: a table row number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Plot 2 shows the CoCrFeNi fatigue data.",
             "CoCrFeNi",
             "fatigue_life",
             2.0,
-            Expect::MustDrop,
-            "specimen label: a plot number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Image 4 shows the Ti-6Al-4V fracture surface.",
             "Ti-6Al-4V",
             "UTS",
             4.0,
-            Expect::MustDrop,
-            "specimen label: an image number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Micrograph 3 shows the AlSi10Mg melt pool.",
             "AlSi10Mg",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "specimen label: a micrograph number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Curve 3 fits the Ti-6Al-4V fatigue data.",
             "Ti-6Al-4V",
             "fatigue_life",
             3.0,
-            Expect::MustDrop,
-            "specimen label: a curve number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Inset 2 shows the Inconel 718 grain structure.",
             "Inconel 718",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "specimen label: an inset number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "The Ti-6Al-4V data appear on page 12.",
             "Ti-6Al-4V",
             "UTS",
             12.0,
-            Expect::MustDrop,
-            "specimen label: a page number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Appendix 2 lists the CoCrFeNi composition data.",
             "CoCrFeNi",
             "UTS",
             2.0,
-            Expect::MustDrop,
-            "specimen label: an appendix number is not a measurement",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): specimen-label family vocabulary \
+             deleted",
         ),
         case(
             "Grade 5 Ti-6Al-4V was fatigue tested.",
             "Ti-6Al-4V",
             "UTS",
             5.0,
-            Expect::MustDrop,
-            "designation doubly wrong: Ti-6Al-4V IS grade 5 — the number \
-             names the alloy, it measures nothing",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the grade designator row loses \
+             its vocabulary-based refusal too — the InsideName guard does not \
+             fire (5 is not inside the claim's own name); \
+             designation-vs-measurement is the ontology's judgement",
         ),
         // ---------------- MUST_DROP: designation digits --------------
         case(
@@ -1376,54 +1536,50 @@ fn corpus() -> Vec<CorpusCase> {
              MECHANISM — a LIVE fabrication the engine cannot yet refuse; same \
              path as the ASCII twin",
         ),
-        case(
+        case_with(
+            unit_policy("MPa"),
             "The Ti-6Al-4V result -950 MPa- matched the target.",
             "Ti-6Al-4V",
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 16 item 2: GROUND TRUTH — the bracketing dashes separate \
-             'result' from '950 MPa', source +950, -950 fabricates the sign; \
-             weaker than the UTS twin (compressive residual is plausible). \
-             MECHANISM — the SeparatorDash guard (round 16) refuses it: a dash \
-             glued to the unit right after the value ('MPa-') is the closing \
-             parenthetical a minus never carries; deleting sub-condition (B) \
-             reddens this row",
+            "CONTRACT CHANGE (de-hardcoding): SeparatorDash shape (B) now reads \
+             the fact's OWN unit term from the policy instead of the deleted \
+             UNIT_TOKENS — the bracketed parenthetical refuses with the unit \
+             supplied, and is inert without it",
         ),
-        case(
+        case_with(
+            unit_policy("MPa"),
             "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
             "Ti-6Al-4V",
             "residual_stress",
             -950.0,
             Expect::MustDrop,
-            "round 16 item 2: GROUND TRUTH as the ASCII twin above (bracketing \
-             dashes, source +950, -950 fabricates the sign; weaker than UTS). \
-             MECHANISM — SeparatorDash via the same trailing-paren-dash path \
-             (B)",
+            "CONTRACT CHANGE (de-hardcoding): the U+2212 bracketed twin refuses \
+             through the same policy-served unit term",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "Ti-6Al-4V UTS -950 MPa (longitudinal)",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: the ASCII spelling of the longitudinal separator — \
-             RED at item 1(b), green at 1(c): the SignDomain guard refuses \
-             a negative claim against UTS (non-negative by definition), so \
-             the shape drops for the right reason under the glyph round 11 \
-             could not separate. Deleting 'uts' from NONNEGATIVE_QUANTITIES \
-             reddens it",
+            "CONTRACT CHANGE (de-hardcoding): the ontology declares UTS \
+             non-negative, so the SignDomain guard refuses the ASCII separator \
+             shape — the declaration arrives through GuardPolicy; under a \
+             silent ontology this exact row stamps (the compiled \
+             NONNEGATIVE_QUANTITIES entry is gone)",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "Ti-6Al-4V UTS \u{2212}950 MPa (longitudinal)",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: the U+2212 spelling — RED at 1(b), green at 1(c) \
-             through the same SignDomain refusal; the glyph's typographic \
-             role as the real minus sign never was a discriminator the code \
-             could read, the predicate's sign domain is",
+            "CONTRACT CHANGE (de-hardcoding): the U+2212 spelling refuses \
+             through the same ontology-served SignDomain declaration",
         ),
         case(
             "Ti-6Al-4V residual stress \u{2013}950 MPa (longitudinal)",
@@ -1454,25 +1610,26 @@ fn corpus() -> Vec<CorpusCase> {
              it refuses NoSpan (needle-set decision, not a guard); re-add \
              U+2014 to number_needles and it stamps",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "-950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: the ASCII line-start separator — RED at 1(b), green \
-             at 1(c) via SignDomain; the preceding-word candidate could \
-             never read this shape (no word before the dash at line \
-             start), the sign domain does",
+            "CONTRACT CHANGE (de-hardcoding): the ASCII line-start separator — \
+             the ontology's NonNegative declaration refuses it; under silence \
+             it would stamp, honestly",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "\u{2212}950 MPa was recorded for Ti-6Al-4V.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: the U+2212 line-start separator — RED at 1(b), \
-             green at 1(c) via SignDomain",
+            "CONTRACT CHANGE (de-hardcoding): the U+2212 line-start separator — \
+             refused through the ontology-served declaration",
         ),
         case(
             "\u{2013}950 MPa was recorded for Ti-6Al-4V.",
@@ -1499,23 +1656,25 @@ fn corpus() -> Vec<CorpusCase> {
              MECHANISM — U+2014 is no sign glyph, no needle, refuses NoSpan \
              (needle-set decision, not a guard)",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V result -950 MPa- matched the target.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: the ASCII bracketed separator — RED at 1(b), green \
-             at 1(c) via SignDomain",
+            "CONTRACT CHANGE (de-hardcoding): the ASCII bracketed separator on \
+             UTS — refused through the ontology-served declaration",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V result \u{2212}950 MPa\u{2212} matched the target.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: the U+2212 bracketed separator — RED at 1(b), green \
-             at 1(c) via SignDomain",
+            "CONTRACT CHANGE (de-hardcoding): the U+2212 bracketed separator on \
+             UTS — refused through the ontology-served declaration",
         ),
         case(
             "The Ti-6Al-4V result \u{2013}950 MPa\u{2013} matched the target.",
@@ -1540,54 +1699,54 @@ fn corpus() -> Vec<CorpusCase> {
              MECHANISM — U+2014 is no sign glyph, no needle, refuses NoSpan \
              (needle-set decision, not a guard)",
         ),
-        // ---------------- MUST_DROP: the sign-domain pins (round 12) ---
-        // Item 1(c)'s discriminator, measured not guessed: the
-        // predicate's SIGN DOMAIN. Every entry of
-        // NONNEGATIVE_QUANTITIES is pinned by one row — delete the
-        // entry and its row stamps a nonsense negative. 'uts' is
-        // pinned by the separator shapes above, 'yield strength' by
-        // the Inconel separator row; these three pin the rest.
-        case(
+        // ---------------- the sign-domain pins -----------------------
+        // CONTRACT CHANGE (de-hardcoding): the sign domain is no longer a
+        // compiled table — it is the ontology's declaration, supplied per
+        // row by nonnegative_policy(). The rows keep their ground truth
+        // (a nonsense negative drops) and now pin the READ PATH: the
+        // matcher refuses because the policy says NonNegative, never
+        // because the quantity's name matched a list.
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V hardness was -200 HV.",
             "Ti-6Al-4V",
             "hardness",
             -200.0,
             Expect::MustDrop,
-            "round 12 item 1(c): hardness is non-negative by definition — \
-             the row STAMPED at HEAD before the SignDomain guard landed \
-             (measured); deleting 'hardness' from NONNEGATIVE_QUANTITIES \
-             reopens it",
+            "CONTRACT CHANGE (de-hardcoding): hardness refuses a negative \
+             through the ONTOLOGY's NonNegative declaration, not a compiled \
+             entry — silent ontology, same sentence, stamps",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The AlSi10Mg density was -4.4 g/cm3.",
             "AlSi10Mg",
             "density",
             -4.4,
             Expect::MustDrop,
-            "round 12 item 1(c): density cannot be negative — measured \
-             stamping before the guard and dropping through it; pins the \
-             'density' entry",
+            "CONTRACT CHANGE (de-hardcoding): density refuses a negative \
+             through the ontology's declaration; the old compiled entry is gone",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The CoCrFeNi grain size was -12 um.",
             "CoCrFeNi",
             "grain_size",
             -12.0,
             Expect::MustDrop,
-            "round 12 item 1(c): grain size cannot be negative — pins the \
-             'grain size' entry of NONNEGATIVE_QUANTITIES",
+            "CONTRACT CHANGE (de-hardcoding): grain size refuses a negative \
+             through the ontology's declaration",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "Inconel 718 - yield strength -1100 MPa - as built",
             "Inconel 718",
             "yield_strength",
             -1100.0,
             Expect::MustDrop,
-            "round 12 item 1(c): the reviewer's Inconel shape — yield \
-             strength cannot be negative, so -1100 is nonsense under every \
-             glyph; STAMPED at HEAD before the SignDomain guard landed \
-             (measured). Pins the 'yield strength' entry; without it this \
-             row is a cannot-fail constant",
+            "CONTRACT CHANGE (de-hardcoding): the reviewer's Inconel shape \
+             refuses through the ontology's declaration — the name is never \
+             consulted",
         ),
         // ROUND 13 ITEM 6.1 — SignDomain's recall cost, made visible.
         // The branch files every other recall price as a KNOWN row; this
@@ -1597,17 +1756,17 @@ fn corpus() -> Vec<CorpusCase> {
         // literally states — a defensible drop (strength is a magnitude
         // by convention) carried as a KNOWN recall price so it shows on
         // the scoreboard.
-        known(
+        case(
             "The Ti-6Al-4V compressive yield strength was -250 MPa.",
             "Ti-6Al-4V",
             "compressive yield strength",
             -250.0,
             Expect::MustStamp,
-            "KNOWN: SignDomain recall cost — the source states -250 under \
-             the compressive convention, but 'compressive yield strength' \
-             ends in 'strength' so the guard refuses; strength is a \
-             magnitude by convention so the drop is defensible, recorded \
-             here as a recall price",
+            "CONTRACT CHANGE (de-hardcoding): the old SignDomain recall cost is \
+             GONE: no compiled suffix rule refuses it, a silent ontology stamps \
+             the value the source states. If an ontology declares the quantity \
+             non-negative it refuses through GuardPolicy instead — the \
+             declaration is the ontology's, in any language",
         ),
         // ROUND 14 ITEM 5 — the SignDomain OPEN SET, pinned as KNOWN
         // tripwires (they redden the suite the day a fix lands). Every
@@ -1617,64 +1776,96 @@ fn corpus() -> Vec<CorpusCase> {
         // (density, magnitude, symbol); the full enumeration is in the
         // claims.rs module doc — a sample reported as a total is how
         // round 13's "6 of 22" became a false closure claim.
+        case_with(
+            nonnegative_policy(),
+            "The AlSi10Mg apparent density was -4.4 g/cm3.",
+            "AlSi10Mg",
+            "apparent density",
+            -4.4,
+            Expect::MustDrop,
+            "CONTRACT CHANGE (de-hardcoding): round-14 open-set tripwire \
+             re-expressed on the ontology path: when the ontology declares the \
+             quantity non-negative the negative drops — for EVERY spelling, \
+             including the symbols and compounds no Rust list ever enumerated. \
+             The silent-ontology twin below records the other half",
+        ),
+        case_with(
+            nonnegative_policy(),
+            "The AlSi10Mg porosity was -0.5 percent.",
+            "AlSi10Mg",
+            "porosity",
+            -0.5,
+            Expect::MustDrop,
+            "CONTRACT CHANGE (de-hardcoding): round-14 open-set tripwire \
+             re-expressed on the ontology path: when the ontology declares the \
+             quantity non-negative the negative drops — for EVERY spelling, \
+             including the symbols and compounds no Rust list ever enumerated. \
+             The silent-ontology twin below records the other half",
+        ),
+        case_with(
+            nonnegative_policy(),
+            "The Ti-6Al-4V surface roughness was -1.2 um.",
+            "Ti-6Al-4V",
+            "surface roughness",
+            -1.2,
+            Expect::MustDrop,
+            "CONTRACT CHANGE (de-hardcoding): round-14 open-set tripwire \
+             re-expressed on the ontology path: when the ontology declares the \
+             quantity non-negative the negative drops — for EVERY spelling, \
+             including the symbols and compounds no Rust list ever enumerated. \
+             The silent-ontology twin below records the other half",
+        ),
+        case_with(
+            nonnegative_policy(),
+            "The Ti-6Al-4V Young's modulus was -110 GPa.",
+            "Ti-6Al-4V",
+            "Young's modulus",
+            -110.0,
+            Expect::MustDrop,
+            "CONTRACT CHANGE (de-hardcoding): round-14 open-set tripwire \
+             re-expressed on the ontology path: when the ontology declares the \
+             quantity non-negative the negative drops — for EVERY spelling, \
+             including the symbols and compounds no Rust list ever enumerated. \
+             The silent-ontology twin below records the other half",
+        ),
+        case_with(
+            nonnegative_policy(),
+            "The AlSi10Mg thermal conductivity was -150 W/mK.",
+            "AlSi10Mg",
+            "thermal conductivity",
+            -150.0,
+            Expect::MustDrop,
+            "CONTRACT CHANGE (de-hardcoding): round-14 open-set tripwire \
+             re-expressed on the ontology path: when the ontology declares the \
+             quantity non-negative the negative drops — for EVERY spelling, \
+             including the symbols and compounds no Rust list ever enumerated. \
+             The silent-ontology twin below records the other half",
+        ),
+        case_with(
+            nonnegative_policy(),
+            "The Ti-6Al-4V Rm was -950 MPa.",
+            "Ti-6Al-4V",
+            "Rm",
+            -950.0,
+            Expect::MustDrop,
+            "CONTRACT CHANGE (de-hardcoding): round-14 open-set tripwire \
+             re-expressed on the ontology path: when the ontology declares the \
+             quantity non-negative the negative drops — for EVERY spelling, \
+             including the symbols and compounds no Rust list ever enumerated. \
+             The silent-ontology twin below records the other half",
+        ),
         known(
             "The AlSi10Mg apparent density was -4.4 g/cm3.",
             "AlSi10Mg",
             "apparent density",
             -4.4,
             Expect::MustDrop,
-            "KNOWN: round 14 item 5 open set — the density family. \
-             'apparent density' is non-negative (no signed homograph) but \
-             is not exact 'density', so SignDomain does not fire and the \
-             negative stamps; representative of relative/bulk/theoretical/\
-             packing/sintered/mass density",
-        ),
-        known(
-            "The AlSi10Mg porosity was -0.5 percent.",
-            "AlSi10Mg",
-            "porosity",
-            -0.5,
-            Expect::MustDrop,
-            "KNOWN: round 14 item 5 open set — porosity is non-negative \
-             and matched by no rule, so a negative stamps",
-        ),
-        known(
-            "The Ti-6Al-4V surface roughness was -1.2 um.",
-            "Ti-6Al-4V",
-            "surface roughness",
-            -1.2,
-            Expect::MustDrop,
-            "KNOWN: round 14 item 5 open set — roughness is non-negative, \
-             matched by no rule, so a negative stamps",
-        ),
-        known(
-            "The Ti-6Al-4V Young's modulus was -110 GPa.",
-            "Ti-6Al-4V",
-            "Young's modulus",
-            -110.0,
-            Expect::MustDrop,
-            "KNOWN: round 14 item 5 open set — Young's modulus is \
-             non-negative, matched by no rule, so a negative stamps",
-        ),
-        known(
-            "The AlSi10Mg thermal conductivity was -150 W/mK.",
-            "AlSi10Mg",
-            "thermal conductivity",
-            -150.0,
-            Expect::MustDrop,
-            "KNOWN: round 14 item 5 open set — thermal conductivity is \
-             non-negative, matched by no rule, so a negative stamps",
-        ),
-        known(
-            "The Ti-6Al-4V Rm was -950 MPa.",
-            "Ti-6Al-4V",
-            "Rm",
-            -950.0,
-            Expect::MustDrop,
-            "KNOWN: round 14 item 5 open set — 'Rm' (a tensile-strength \
-             symbol the extractor emits verbatim) is non-negative but \
-             matched by no rule, so a negative stamps; representative of \
-             Rp0.2/sigma_UTS/flow stress/ultimate tensile stress",
+            "KNOWN, the other half of the open-set record: under a SILENT \
+             ontology the negative STAMPS — the matcher says what it \
+             knows, which is nothing. The drop arrives only when the \
+             ontology declares the quantity non-negative (the \
+             nonnegative_policy twin above). A wrong note is worse than \
+             no note",
         ),
         // ---------------- round 11: signed needles vs dash ranges ------
         // Only '-' and U+2212 are sign glyphs — round 11 reverted
@@ -1688,14 +1879,11 @@ fn corpus() -> Vec<CorpusCase> {
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 11 rewrite of the round-10 VACUOUS row: the old \
-             \u{2013}1100 shape dropped NoSpan because the -1100 needle is \
-             never constructed un-grouped (|value| >= 1000), so the row \
-             proved nothing. The signed \u{2212}950 needle IS constructed \
-             (U+2212 stays a sign glyph); round 12: the SignDomain guard \
-             refuses it FIRST now (UTS is non-negative) — before round 12 \
-             the boundary clause owned it (the range's left digit 300 \
-             glues before the dash), and still owns the positive shape",
+            "round 11 rewrite of the round-10 VACUOUS row: the signed \
+             \u{2212}950 needle IS constructed (U+2212 stays a sign glyph); \
+             CONTRACT CHANGE (de-hardcoding): under a SILENT ontology the \
+             Boundary clause owns the refusal (the range's left digit 300 glues \
+             before the dash) — no compiled sign table runs",
         ),
         case(
             "The Ti-6Al-4V data are listed in Refs. 25-27.",
@@ -1704,10 +1892,9 @@ fn corpus() -> Vec<CorpusCase> {
             -27.0,
             Expect::MustDrop,
             "round 11: a signed needle must not match a reference range — \
-             pinned under the ASCII hyphen now that U+2013 is no sign \
-             glyph; round 12: SignDomain refuses it first (UTS is \
-             non-negative) — the boundary clause (25 before the dash \
-             glues) still owns the positive shape",
+             pinned under the ASCII hyphen now that U+2013 is no sign glyph; \
+             CONTRACT CHANGE (de-hardcoding): under a silent ontology the \
+             boundary clause (25 before the dash glues) owns the refusal",
         ),
         // ---------------- MUST_DROP: refused U+2212 needles ----------
         // The round-5 UTF-8 advance panic: a rejected U+2212 occurrence
@@ -1724,10 +1911,8 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustDrop,
             "round-5 regression, missed until round 9: the refused \u{2212}950x \
              needle must advance by char; a byte advance panics the scan. \
-             Round 12: the tuple moved off UTS to the signed 'stress' — \
-             under UTS the SignDomain guard now refuses first, which would \
-             leave the boundary's 'x' refusal (the point of this row) \
-             unexercised",
+             CONTRACT CHANGE (de-hardcoding): the glued x refuses through \
+             Boundary under a silent policy — no unit lexicon redeems it",
         ),
         case(
             "Ti-6Al-4V stress \u{2212}950\u{2013}1100 MPa.",
@@ -1766,28 +1951,32 @@ fn corpus() -> Vec<CorpusCase> {
             "Ti-6Al-4V",
             "UTS",
             1.0,
-            Expect::MustDrop,
-            "the 1 of Table 1 is a label, not a UTS value",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the caption digit used to be refused by the label vocabulary even though the caption span holds subject AND object; that English list is gone, so under a silent ontology the matcher reports the co-occurrence",
         ),
         // ---------------- KNOWN failures ------------------------------
         // Documented, deliberately not fixed. If one starts passing,
         // this test fails until the marker is removed.
-        known(
+        case(
             "Table 4 K values for the Inconel 718 conductivity are listed.",
             "Inconel 718",
             "conductivity",
             4.0,
-            Expect::MustDrop,
-            "KNOWN: a SPACED single-letter unit still exempts the label word; \
-             the round-8 space fix closes the glued form only",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the spaced single-letter unit \
+             exemption and the label word it exempted are both deleted — the \
+             matcher reports the co-occurrence",
         ),
-        known(
+        case(
             "In Eq. 3 n denotes the Ti-6Al-4V cycle count.",
             "Ti-6Al-4V",
             "cycle_count",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: same residue — spaced single-letter unit exempts a label number",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the abbreviation vocabulary is \
+             deleted too, so the period after Eq now splits the span and the \
+             value keeps its subject in the second span — the matcher reports \
+             the co-occurrence",
         ),
         known(
             "The AlSi10Mg UTS was 300 MPa.",
@@ -1932,13 +2121,16 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "KNOWN: glued recall lost to H1's space requirement — run 30min",
         ),
-        known(
+        case(
             "The Ti-6Al-4V sample 980\u{b0}C cycle was logged.",
             "Ti-6Al-4V",
             "temperature",
             980.0,
             Expect::MustStamp,
-            "KNOWN: glued recall lost to H1's space requirement — sample 980\u{b0}C",
+            "CONTRACT CHANGE (de-hardcoding): the KNOWN glued-recall gap closed \
+             by removal, not by growth — the degree sign is not alphanumeric, \
+             so 980 always had a clean boundary; it was the deleted label word \
+             'sample' that refused it. Under a silent ontology it stamps",
         ),
         known(
             "The AlSi10Mg samples 5mm thick were sectioned.",
@@ -2107,55 +2299,65 @@ fn corpus() -> Vec<CorpusCase> {
         // adjacency gap itself stays open — the spaced and
         // spaced-dash POSITIVE ranges still stamp their endpoints, and
         // a SIGNED quantity's negative range would too.
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V UTS ranged from -950--400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: was the KNOWN low-endpoint leak of the negative \
-             dash-range — the SignDomain guard closed it: a negative UTS \
-             claim is nonsense whatever the range shape, so the endpoint \
-             drops without the adjacency guard ever seeing the run",
+            "CONTRACT CHANGE (de-hardcoding): a negative claim against an \
+             ontology-declared non-negative quantity drops whatever the range \
+             shape — the adjacency gap stays open for signed quantities, \
+             honestly",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V UTS ranged from -950 to -400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: was the KNOWN word-form negative range LOW endpoint \
-             — closed by SignDomain, not by the adjacency guard ('to' is \
-             still not a dash; the gap stays open for signed quantities)",
+            "CONTRACT CHANGE (de-hardcoding): a negative claim against an \
+             ontology-declared non-negative quantity drops whatever the range \
+             shape — the adjacency gap stays open for signed quantities, \
+             honestly",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V UTS ranged from -950 to -400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -400.0,
             Expect::MustDrop,
-            "round 12: was the KNOWN word-form negative range HIGH \
-             endpoint — closed by SignDomain",
+            "CONTRACT CHANGE (de-hardcoding): a negative claim against an \
+             ontology-declared non-negative quantity drops whatever the range \
+             shape — the adjacency gap stays open for signed quantities, \
+             honestly",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V UTS ranged from \u{2212}950 to \u{2212}400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -950.0,
             Expect::MustDrop,
-            "round 12: was the KNOWN U+2212 twin of the negative \
-             word-range — closed by SignDomain",
+            "CONTRACT CHANGE (de-hardcoding): a negative claim against an \
+             ontology-declared non-negative quantity drops whatever the range \
+             shape — the adjacency gap stays open for signed quantities, \
+             honestly",
         ),
-        case(
+        case_with(
+            nonnegative_policy(),
             "The Ti-6Al-4V UTS ranged from \u{2212}950 to \u{2212}400 MPa.",
             "Ti-6Al-4V",
             "UTS",
             -400.0,
             Expect::MustDrop,
-            "round 12 item 7 (L1) then round 12 item 1(c): pinned as the \
-             missing high endpoint of the U+2212 word-range, then closed \
-             by SignDomain — one round as a KNOWN tripwire, marker \
-             stripped the day the guard landed",
+            "CONTRACT CHANGE (de-hardcoding): a negative claim against an \
+             ontology-declared non-negative quantity drops whatever the range \
+             shape — the adjacency gap stays open for signed quantities, \
+             honestly",
         ),
         // ROUND 13 ITEM 3 — a tripwire RETIRED by a promotion. The four
         // word-form range rows above were promoted known( -> case( at
@@ -2177,76 +2379,72 @@ fn corpus() -> Vec<CorpusCase> {
              adjacency guard never fires, so the low endpoint of a \
              signed word-range stamps as a point value",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
             "Ti-6Al-4V",
             "UTS",
             950.0,
             Expect::MustDrop,
-            "KNOWN: the SPACED-DASH range stamps its low endpoint — journal \
-             typesetting and pdf-extract both commonly emit this shape; the \
-             guard needs the digits glued to the dash",
+            "B12 FIX: the SPACED-DASH range's low endpoint now drops — the \
+             range guard tolerates whitespace around the dash glyph (the \
+             whole dash class, both endpoints); was a KNOWN row until the \
+             spaces defeated the glued-only guard",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS was 950 \u{2013} 1100 MPa.",
             "Ti-6Al-4V",
             "UTS",
             1100.0,
             Expect::MustDrop,
-            "KNOWN: the spaced-dash range stamps its high endpoint too",
+            "B12 FIX: the spaced-dash high endpoint drops too",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS was 950 - 1100 MPa.",
             "Ti-6Al-4V",
             "UTS",
             950.0,
             Expect::MustDrop,
-            "KNOWN: the ASCII spaced-dash twin stamps — the gap is the \
-             spaces, not the glyph",
+            "B12 FIX: the ASCII spaced-dash twin's low endpoint — the gap was \
+             the spaces, not the glyph, and the guard now skips them",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS was 950 - 1100 MPa.",
             "Ti-6Al-4V",
             "UTS",
             1100.0,
             Expect::MustDrop,
-            "KNOWN: round 12 item 7 (L1) — the HIGH endpoint of the ASCII \
-             spaced-dash range stamps too (measured); round 11 pinned only \
-             the low endpoint, while the en-dash twin has carried both \
-             endpoints since round 11",
+            "B12 FIX: the HIGH endpoint of the ASCII spaced-dash range (round \
+             12 item 7 pinned it KNOWN; both endpoints now carry the guard)",
         ),
-        known(
+        case(
             "The Ti-6Al-4V microstructures are shown in 4a and 4b.",
             "Ti-6Al-4V",
             "UTS",
             4.0,
             Expect::MustDrop,
-            "KNOWN: sub-panel letters without the label word in the span — \
-             'Figure' sits in an earlier sentence, the label guard never \
-             sees it, and the glued 'a' redeems 4 through unit_initial",
+            "CONTRACT CHANGE (de-hardcoding): the KNOWN sub-panel gap closed by \
+             removal — 'a' redeemed 4 only because the deleted unit lexicon \
+             listed ampere; with no lexicon the glued letter refuses through \
+             Boundary under a silent policy",
         ),
-        known(
+        case(
             "Specimens 3 and 4 of Ti-6Al-4V were tested.",
             "Ti-6Al-4V",
             "UTS",
             4.0,
-            Expect::MustDrop,
-            "KNOWN: the plural leak at the conjunction tail — LABEL_WORDS \
-             carries singulars only, 'specimens' is not a label word, so \
-             the walk lands on a non-label head and 4 stamps. claims.rs \
-             argues against adding the WORD unpinned; that is not an \
-             argument against pinning the gap, and a KNOWN row cannot \
-             itself be a cannot-fail item — the tripwire fires the day the \
-             plural closes",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the plural leak closed the only \
+             way a vocabulary leak can — the vocabulary is deleted; the matcher \
+             reports the co-occurrence",
         ),
-        known(
+        case(
             "Specimens 3 and 4 of Ti-6Al-4V were tested.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: the same plural leak at the list head — 3 sits directly \
-             after 'specimens', no conjunction walk involved",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the plural leak's list head, same \
+             move as its twin",
         ),
         known(
             "The Ti-6Al-4V powder came from U-235 stock.",
@@ -2267,24 +2465,25 @@ fn corpus() -> Vec<CorpusCase> {
         // the corpus returned ZERO: the engine stamps the TOLERANCE as
         // the value. Digit-dash-LETTER is likewise unguarded: the
         // U-235 row covers only the mirror (letter-dash-digit) shape.
-        known(
+        case(
             "The Ti-6Al-4V UTS was 950 +/- 30 MPa.",
             "Ti-6Al-4V",
             "UTS",
             30.0,
             Expect::MustDrop,
-            "KNOWN: 30 is the UNCERTAINTY, not the value — '950 +/- 30 MPa' \
-             stamps the tolerance as Ti-6Al-4V UTS = 30 MPa, an uncertainty \
-             figure promoted to a property",
+            "B8 FIX (the ± half): 30 is the UNCERTAINTY — the number whose \
+             left neighbour is the plus-minus notation (both spellings, \\u{b1} \
+             and ASCII +/-) is refused as an uncertainty figure, not \
+             promoted to a property; the 950 it decorates still stamps \
+             (control row below)",
         ),
-        known(
+        case(
             "The Ti-6Al-4V UTS was 950 \u{b1} 30 MPa.",
             "Ti-6Al-4V",
             "UTS",
             30.0,
             Expect::MustDrop,
-            "KNOWN: the U+00B1 PLUS-MINUS SIGN twin stamps the tolerance too \
-             — the glyph appears nowhere in claims.rs",
+            "B8 FIX: the U+00B1 PLUS-MINUS SIGN twin refuses the tolerance too",
         ),
         case(
             "The Ti-6Al-4V UTS was 950 +/- 30 MPa.",
@@ -2350,46 +2549,52 @@ fn corpus() -> Vec<CorpusCase> {
         // stamps) AND close the 25kg leak (batch 25kg MustDrop) before
         // it may replace the word list. Recorded, deliberately not
         // implemented, round 10.
-        known(
+        case(
             "Layer 3 of Ti-6Al-4V was examined.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: the label-word horizon — Layer is likelier in an AM paper \
-             than Inset 2, and it stamps",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): the label-word horizon WON: the \
+             measured-open word list is deleted rather than grown — every paper \
+             coins labels no list carries, so the matcher reports co-occurrence \
+             and the ontology/model judge",
         ),
-        known(
+        case(
             "Track 3 of Ti-6Al-4V was examined.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: the label-word horizon — Track stamps",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): label-word horizon: the \
+             vocabulary is deleted, not grown",
         ),
-        known(
+        case(
             "Build 3 of Ti-6Al-4V was examined.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: the label-word horizon — Build stamps",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): label-word horizon: the \
+             vocabulary is deleted, not grown",
         ),
-        known(
+        case(
             "Heat 3 of Ti-6Al-4V was examined.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: the label-word horizon — Heat stamps",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): label-word horizon: the \
+             vocabulary is deleted, not grown",
         ),
-        known(
+        case(
             "Lot 3 of Ti-6Al-4V was examined.",
             "Ti-6Al-4V",
             "UTS",
             3.0,
-            Expect::MustDrop,
-            "KNOWN: the label-word horizon — Lot stamps",
+            Expect::MustStamp,
+            "CONTRACT CHANGE (de-hardcoding): label-word horizon: the \
+             vocabulary is deleted, not grown",
         ),
     ]
 }
@@ -2421,10 +2626,17 @@ fn validation_claim(case: &ValidationCase) -> ExtractedClaim {
         confidence: None,
         kind: None,
         evidence_class: EVIDENCE_RESEARCH.to_string(),
+        verification: None,
+        verification_reason: None,
+        ontology: Default::default(),
         provenance: ClaimProvenance {
             document_id: "10.0000/corpus".to_string(),
             document_url: String::new(),
             source: "corpus".to_string(),
+            source_revision_id: None,
+            line_start: None,
+            line_end: None,
+            source_text_path: None,
             locator: Locator {
                 kind: BlockKind::Body,
                 section_path: Vec::new(),
@@ -2535,8 +2747,14 @@ fn claim_corpus_two_sided_scoreboard() {
     };
 
     for case in corpus() {
-        let stamped =
-            supporting_quote(case.subject, case.object, Some(case.value), case.prose).is_some();
+        let stamped = supporting_quote(
+            case.subject,
+            case.object,
+            Some(case.value),
+            case.prose,
+            &case.policy,
+        )
+        .is_some();
         let line = format!(
             "  {} / {} = {} in {:?}\n    reason: {}",
             case.subject, case.object, case.value, case.prose, case.reason

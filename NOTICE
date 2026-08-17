@@ -26,6 +26,21 @@ Modifications to ForgeCode in this distribution:
     - The retained templates, shell plugin, and configuration schema listed
       above are carried substantially unmodified.
 
+Runtime dependency — HyperQueue (not distributed with PRISM):
+
+    PRISM's many-task compute backend (`--backend hyperqueue`) drives the
+    `hq` binary at runtime. HyperQueue is NOT bundled with, linked into, or
+    distributed by PRISM; users install it themselves (cargo install
+    hyperqueue, or a release binary). For attribution:
+
+    HyperQueue
+    Copyright (c) 2021-present, Ada Böhm, Jakub Beranek
+    (https://github.com/It4innovations/hyperqueue)
+    Licensed under the MIT License (https://opensource.org/license/MIT).
+
+    If a PRISM distribution ever bundles the `hq` binary, the MIT license
+    text and this notice must ship with it.
+
 All PRISM Rust crates are licensed under the Mirdyne Source-Available License
 documented in LICENSE-MIRDYNE:
 
@@ -37,6 +52,19 @@ documented in LICENSE-MIRDYNE:
     crates/proto           crates/provenance      crates/python-bridge
     crates/runtime         crates/server          crates/tui
     crates/workflows
+
+This product includes software derived from the DeepSeek harness
+(https://github.com/deepseek-ai/deepseek-harness), licensed under the MIT
+License (Copyright (c) 2026 DeepSeek). See LICENSES/DEEPSEEK_MIT for the full
+license text.
+
+The following file is derived from the DeepSeek harness and remains under the
+MIT License:
+
+    crates/llm/src/overflow.rs   — the context-window-overflow recognition
+                                   patterns, translated from
+                                   packages/llm/llm/src/error.ts
+                                   (isContextWindowExceededError)
 
 The Python components enumerated in LICENSE are licensed under the MIT License
 documented in LICENSE-MIT. Where this notice and LICENSE differ, LICENSE

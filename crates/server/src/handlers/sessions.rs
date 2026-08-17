@@ -398,28 +398,52 @@ mod tests {
                 "use": "sig"
             }]
         });
-        let app = Router::new().route(
-            "/auth/v1/.well-known/jwks.json",
-            get(move |headers: HeaderMap| {
-                let jwks = jwks.clone();
-                async move {
-                    let authorized = headers.get("apikey").and_then(|value| value.to_str().ok())
-                        == Some(TEST_SUPABASE_ANON_KEY);
-                    if authorized {
-                        (StatusCode::OK, Json(jwks))
-                    } else {
-                        (
-                            StatusCode::UNAUTHORIZED,
-                            Json(serde_json::json!({ "error": "missing anon key" })),
-                        )
-                    }
-                }
-            }),
-        );
+        // Bind BEFORE building the router: the discovery document has to name
+        // its own issuer, and the issuer is not known until the ephemeral port
+        // is assigned.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind Supabase JWKS stub");
         let base = format!("http://{}", listener.local_addr().unwrap());
+
+        // Verification no longer assumes where an issuer keeps its keys — it
+        // asks, via OIDC discovery, and refuses if the document's `issuer`
+        // does not equal the issuer it was fetched for (OIDC Discovery §4.3).
+        // A stub that serves only JWKS therefore fails verification outright,
+        // which is what broke these tests: the production change was right and
+        // this stub had not caught up.
+        let discovery = serde_json::json!({
+            "issuer": format!("{base}/auth/v1"),
+            "jwks_uri": format!("{base}/auth/v1/.well-known/jwks.json"),
+        });
+
+        let app = Router::new()
+            .route(
+                "/auth/v1/.well-known/openid-configuration",
+                get(move || {
+                    let discovery = discovery.clone();
+                    async move { (StatusCode::OK, Json(discovery)) }
+                }),
+            )
+            .route(
+                "/auth/v1/.well-known/jwks.json",
+                get(move |headers: HeaderMap| {
+                    let jwks = jwks.clone();
+                    async move {
+                        let authorized =
+                            headers.get("apikey").and_then(|value| value.to_str().ok())
+                                == Some(TEST_SUPABASE_ANON_KEY);
+                        if authorized {
+                            (StatusCode::OK, Json(jwks))
+                        } else {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                Json(serde_json::json!({ "error": "missing anon key" })),
+                            )
+                        }
+                    }
+                }),
+            );
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });

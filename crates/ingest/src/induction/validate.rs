@@ -222,6 +222,7 @@ mod tests {
             parent: parent.map(str::to_string),
             aligned_iri: None,
             declared_by_reference: false,
+            sign_domain: None,
         }
     }
 
@@ -232,6 +233,7 @@ mod tests {
             domain: domain.to_string(),
             range: range.to_string(),
             aligned_iri: None,
+            fact_kind: None,
         }
     }
 

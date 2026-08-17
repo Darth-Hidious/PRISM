@@ -33,6 +33,7 @@ llama-cpp-sys-2 = { workspace = true, optional = true }
 # Shared offline and retry policies.
 prism-runtime = { path = "../runtime" }
 reqwest.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

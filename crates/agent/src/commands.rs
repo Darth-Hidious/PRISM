@@ -327,6 +327,10 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     // Durable wake-ups for long-running goals — reachable as `/schedule …`
     // inside the TUI, never "go run the CLI" (memory prism-no-exit-to-cli).
     "schedule",
+    // The standard plugin contract's LIST surface, in-app: `/plugins list`
+    // runs `prism plugins list` (same inventory as the agent's `plugins`
+    // tool — one implementation, three doors).
+    "plugins",
     "notebook",
     "pyiron",
     "billing",
@@ -363,6 +367,7 @@ pub fn builtin_help_text() -> String {
     lines.push("  /schedule create --goal <id> --every 6h   (wake a goal back up)".to_string());
     lines.push("  /schedule list | cancel <id> | tick".to_string());
     lines.push("  /skills list".to_string());
+    lines.push("  /plugins list   (every extension plane: loaded + failed)".to_string());
     lines.push("  /node up [--name x] | stop | status  (supervised in-app)".to_string());
 
     lines.join("\n")
@@ -390,6 +395,9 @@ mod tests {
         // A goal that runs for months needs its wake-ups reachable INSIDE
         // the TUI — never "go run the prism CLI".
         assert!(help.contains("/schedule create"));
+        // Standard plugin contract: the LIST surface must be discoverable
+        // from /help in-app, not just from the source.
+        assert!(help.contains("/plugins list"));
     }
 
     #[test]
@@ -398,6 +406,9 @@ mod tests {
         assert!(is_cli_backed_slash_root("status"));
         assert!(is_cli_backed_slash_root("gpus"));
         assert!(is_cli_backed_slash_root("schedule"));
+        // The plugin inventory is a first-class in-app surface (standard
+        // plugin contract, LIST rule).
+        assert!(is_cli_backed_slash_root("plugins"));
         assert!(!is_cli_backed_slash_root("session"));
         assert!(!is_cli_backed_slash_root("permissions"));
     }

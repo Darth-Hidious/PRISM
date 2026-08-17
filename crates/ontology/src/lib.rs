@@ -42,6 +42,9 @@ use thiserror::Error;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_SUBCLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const RDFS_SUBPROPERTY_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subPropertyOf";
+const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
+const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
 const SKOS_PREF_LABEL: &str = "http://www.w3.org/2004/02/skos/core#prefLabel";
 const OWL_CLASS: &str = "http://www.w3.org/2002/07/owl#Class";
 const OWL_OBJECT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ObjectProperty";
@@ -89,6 +92,12 @@ pub struct PropDecl {
     pub iri: Iri,
     /// Upstream `skos:prefLabel`, if the source supplies one.
     pub pref_label: Option<String>,
+    /// Direct named `rdfs:subPropertyOf` parents.
+    pub parents: Vec<Iri>,
+    /// Named `rdfs:domain` declarations retained verbatim from the artifact.
+    pub domains: Vec<Iri>,
+    /// Named `rdfs:range` declarations retained verbatim from the artifact.
+    pub ranges: Vec<Iri>,
     /// Curated relation labels accepted from PRISM extraction.
     pub extraction_labels: Vec<String>,
 }
@@ -187,6 +196,16 @@ pub enum OntologyError {
         /// Child class IRI.
         class: String,
         /// Missing parent class IRI.
+        parent: String,
+    },
+    /// A retained object property points to a parent omitted from the artifact.
+    #[error(
+        "object property {property} has parent {parent}, which is not declared in the artifact"
+    )]
+    MissingPropertyParent {
+        /// Child object-property IRI.
+        property: String,
+        /// Missing parent object-property IRI.
         parent: String,
     },
     /// A retained declaration has no human-facing upstream preferred label.
@@ -301,6 +320,9 @@ impl OntologyGraph {
         let mut property_iris = BTreeSet::new();
         let mut labels: BTreeMap<String, Vec<(u8, String)>> = BTreeMap::new();
         let mut direct_parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut property_parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut property_domains: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut property_ranges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut declares_ontology = false;
         let mut declares_version = false;
 
@@ -348,9 +370,34 @@ impl OntologyGraph {
             }
 
             if predicate.as_deref() == Some(RDFS_SUBCLASS_OF)
+                && let (Some(subject), Some(object)) = (subject.as_ref(), object.as_ref())
+            {
+                direct_parents
+                    .entry(subject.clone())
+                    .or_default()
+                    .insert(object.clone());
+            }
+
+            if predicate.as_deref() == Some(RDFS_SUBPROPERTY_OF)
+                && let (Some(subject), Some(object)) = (subject.as_ref(), object.as_ref())
+            {
+                property_parents
+                    .entry(subject.clone())
+                    .or_default()
+                    .insert(object.clone());
+            }
+            if predicate.as_deref() == Some(RDFS_DOMAIN)
+                && let (Some(subject), Some(object)) = (subject.as_ref(), object.as_ref())
+            {
+                property_domains
+                    .entry(subject.clone())
+                    .or_default()
+                    .insert(object.clone());
+            }
+            if predicate.as_deref() == Some(RDFS_RANGE)
                 && let (Some(subject), Some(object)) = (subject, object)
             {
-                direct_parents.entry(subject).or_default().insert(object);
+                property_ranges.entry(subject).or_default().insert(object);
             }
         }
 
@@ -449,13 +496,49 @@ impl OntologyGraph {
         let mut properties = Vec::with_capacity(property_iris.len());
         for iri_text in property_iris {
             let pref_label = preferred_label(&labels, &iri_text, "object property")?;
+            let parents = property_parents
+                .remove(&iri_text)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|iri| validated_iri(&iri, "rdfs:subPropertyOf parent"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let domains = property_domains
+                .remove(&iri_text)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|iri| validated_iri(&iri, "rdfs:domain"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ranges = property_ranges
+                .remove(&iri_text)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|iri| validated_iri(&iri, "rdfs:range"))
+                .collect::<Result<Vec<_>, _>>()?;
             let mut extraction_labels = property_aliases.remove(&iri_text).unwrap_or_default();
             extraction_labels.sort();
             properties.push(PropDecl {
                 iri: validated_iri(&iri_text, "owl:ObjectProperty")?,
                 pref_label: Some(pref_label),
+                parents,
+                domains,
+                ranges,
                 extraction_labels,
             });
+        }
+
+        let known_properties: BTreeSet<Iri> = properties
+            .iter()
+            .map(|property| property.iri.clone())
+            .collect();
+        for property in &properties {
+            for parent in &property.parents {
+                if !known_properties.contains(parent) {
+                    return Err(OntologyError::MissingPropertyParent {
+                        property: property.iri.as_str().to_owned(),
+                        parent: parent.as_str().to_owned(),
+                    });
+                }
+            }
         }
 
         let prefixes = manifest
@@ -1060,6 +1143,89 @@ mod tests {
         assert!(graph.is_a(&a, &a));
         assert!(graph.is_a(&a, &b));
         assert!(graph.is_a(&b, &a));
+    }
+
+    /// A customer-supplied ontology may use any language. Navigation retains
+    /// its RDF declarations rather than relying on extraction aliases or a
+    /// built-in vocabulary.
+    #[test]
+    fn object_property_navigation_retains_named_rdf_declarations() {
+        let artifact = br#"@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+<https://beispiel.invalid/ontologie> a owl:Ontology ;
+    owl:versionIRI <https://beispiel.invalid/ontologie/7> .
+<https://beispiel.invalid/klasse/Stoff> a owl:Class ;
+    skos:prefLabel "Stoff"@de .
+<https://beispiel.invalid/klasse/Arzneistoff> a owl:Class ;
+    rdfs:subClassOf <https://beispiel.invalid/klasse/Stoff> ;
+    skos:prefLabel "Arzneistoff"@de .
+<https://beispiel.invalid/klasse/Krankheit> a owl:Class ;
+    skos:prefLabel "Krankheit"@de .
+<https://beispiel.invalid/relation/wirktAuf> a owl:ObjectProperty ;
+    skos:prefLabel "wirkt auf"@de .
+<https://beispiel.invalid/relation/behandelt> a owl:ObjectProperty ;
+    rdfs:subPropertyOf <https://beispiel.invalid/relation/wirktAuf> ;
+    rdfs:domain <https://beispiel.invalid/klasse/Arzneistoff> ;
+    rdfs:range <https://beispiel.invalid/klasse/Krankheit> ;
+    skos:prefLabel "behandelt"@de .
+"#;
+        let manifest = serde_json::to_vec(&json!({
+            "ontology_iri": "https://beispiel.invalid/ontologie",
+            "version_iri": "https://beispiel.invalid/ontologie/7",
+            "materialised_sha256": sha256_hex(artifact),
+            "prefixes": { "de": "https://beispiel.invalid/" },
+            "class_mappings": [],
+            "relation_mappings": []
+        }))
+        .unwrap();
+
+        let graph = OntologyGraph::from_bytes(artifact, &manifest).unwrap();
+        let relation = Iri::new("https://beispiel.invalid/relation/behandelt".to_owned()).unwrap();
+        let declaration = graph.property(&relation).unwrap();
+
+        assert_eq!(declaration.pref_label.as_deref(), Some("behandelt"));
+        assert_eq!(
+            declaration
+                .parents
+                .iter()
+                .map(Iri::as_str)
+                .collect::<Vec<_>>(),
+            ["https://beispiel.invalid/relation/wirktAuf"]
+        );
+        assert_eq!(
+            declaration
+                .domains
+                .iter()
+                .map(Iri::as_str)
+                .collect::<Vec<_>>(),
+            ["https://beispiel.invalid/klasse/Arzneistoff"]
+        );
+        assert_eq!(
+            declaration
+                .ranges
+                .iter()
+                .map(Iri::as_str)
+                .collect::<Vec<_>>(),
+            ["https://beispiel.invalid/klasse/Krankheit"]
+        );
+    }
+
+    #[test]
+    fn undeclared_object_property_parent_is_rejected() {
+        let artifact = br#"@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+<https://example.test/ontology> a owl:Ontology ;
+    owl:versionIRI <https://example.test/1/ontology> .
+<https://example.test/relation> a owl:ObjectProperty ;
+    rdfs:subPropertyOf <https://example.test/missing> ;
+    skos:prefLabel "relation"@en .
+"#;
+        let manifest = synthetic_manifest(artifact);
+
+        let error = OntologyGraph::from_bytes(artifact, &manifest).unwrap_err();
+        assert!(matches!(error, OntologyError::MissingPropertyParent { .. }));
     }
 
     #[test]

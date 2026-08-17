@@ -17,8 +17,10 @@ mod notebook;
 mod onboarding;
 mod ontology_cmd;
 mod papers;
+mod plugins_cmd;
 use prism_core::providers;
 mod pyiron_cmd;
+mod reverify_cmd;
 mod tool_sync;
 mod use_command;
 
@@ -92,6 +94,104 @@ struct Cli {
 }
 
 // Deliberately no `Debug`: `Login` owns secret-bearing command/env values.
+/// Arguments for `prism run`. A named struct (rather than inline
+/// variant fields) so the enum stays small next to its one-word variants.
+#[derive(Debug, clap::Args)]
+struct RunArgs {
+    /// Container image to run, or a pre-staged .sif path for SLURM.
+    image: String,
+    /// Job name.
+    #[arg(long, default_value = "experiment")]
+    name: String,
+    /// JSON inputs (key=value pairs merged into inputs object).
+    #[arg(long, value_delimiter = ',')]
+    input: Vec<String>,
+    /// Backend: local, marc27, byoc, or hyperqueue.
+    #[arg(long, default_value = "local")]
+    backend: String,
+    /// Platform API URL (for the `marc27` backend). When omitted, resolve
+    /// PRISM_API_URL, config, or the endpoint stored by `prism login`.
+    #[arg(long)]
+    platform_url: Option<String>,
+    /// BYOC SSH target: user@host (enables SSH backend).
+    #[arg(long)]
+    ssh: Option<String>,
+    /// SSH key path for BYOC SSH.
+    #[arg(long, default_value = "~/.ssh/id_ed25519")]
+    ssh_key: String,
+    /// SSH port (default 22).
+    #[arg(long, default_value_t = 22)]
+    ssh_port: u16,
+    /// Kubernetes context for BYOC K8s.
+    #[arg(long)]
+    k8s_context: Option<String>,
+    /// Kubernetes namespace (default: "default").
+    #[arg(long, default_value = "default")]
+    k8s_namespace: String,
+    /// SLURM head node (user@host) for BYOC SLURM.
+    #[arg(long)]
+    slurm: Option<String>,
+    /// SLURM partition.
+    #[arg(long, default_value = "default")]
+    slurm_partition: String,
+    /// SLURM allocation account.
+    #[arg(long)]
+    slurm_account: Option<String>,
+    /// SLURM wall time, for example 02:00:00.
+    #[arg(long)]
+    slurm_time: Option<String>,
+    /// SLURM generic resources, for example gpu:a100:1.
+    #[arg(long)]
+    slurm_gres: Option<String>,
+    /// Total SLURM memory per node, for example 64G.
+    #[arg(long, conflicts_with = "slurm_mem_per_cpu")]
+    slurm_mem: Option<String>,
+    /// SLURM memory per allocated CPU, for example 8G.
+    #[arg(long, conflicts_with = "slurm_mem")]
+    slurm_mem_per_cpu: Option<String>,
+    /// SLURM CPUs per task.
+    #[arg(long)]
+    slurm_cpus_per_task: Option<u32>,
+    /// SLURM node count.
+    #[arg(long)]
+    slurm_nodes: Option<u32>,
+    /// SLURM task count.
+    #[arg(long)]
+    slurm_ntasks: Option<u32>,
+    /// SLURM array expression, for example 0-15%4.
+    #[arg(long)]
+    slurm_array: Option<String>,
+    /// Run only after this SLURM job id completes successfully.
+    #[arg(long)]
+    slurm_dependency_afterok: Option<u64>,
+    /// HyperQueue task-set file: a JSON array of task objects
+    /// `[{{"command": ["..."], "cwd": "...", "env": {{...}}}}, ...]`.
+    /// Required for `--backend hyperqueue`; task sets do not fit
+    /// `--input key=value` strings.
+    #[arg(long)]
+    hq_tasks: Option<String>,
+    /// HyperQueue worker count for standalone mode (default 2).
+    #[arg(long, default_value_t = 2)]
+    hq_workers: u32,
+    /// HyperQueue server directory (default <data_dir>/hyperqueue).
+    #[arg(long)]
+    hq_server_dir: Option<String>,
+    /// HyperQueue automatic allocation scheduler: `slurm` or `pbs`.
+    /// Switches from standalone local workers to HQ-managed allocations.
+    #[arg(long)]
+    hq_autoalloc: Option<String>,
+    /// Walltime for HyperQueue automatic allocations, e.g. `1h`.
+    #[arg(long, default_value = "1h")]
+    hq_time_limit: String,
+    /// Extra sbatch/qsub argument for HyperQueue allocations; repeatable
+    /// (e.g. `--hq-extra --partition=main`).
+    #[arg(long = "hq-extra", allow_hyphen_values = true)]
+    hq_extra: Vec<String>,
+    /// Emit machine-readable JSON instead of human-readable status lines.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run first-time native setup and platform login.
@@ -299,6 +399,24 @@ enum Commands {
         #[command(subcommand)]
         command: crate::ontology_cmd::OntologyCommands,
     },
+    /// Re-read a stored assertion's exact cited source lines and ask the
+    /// configured model whether they support it — the re-check that makes
+    /// annotate-don't-refuse honest. Lists the span-unchecked population
+    /// (`cited_by_reader`) and other re-checkable statuses; every verdict is
+    /// recorded in the reverify ledger. Local + one LLM call per witness.
+    Reverify {
+        #[command(subcommand)]
+        command: crate::reverify_cmd::ReverifyCommands,
+    },
+    /// List every extension plane's inventory — loaded and failed plugins,
+    /// configured MCP servers, skills, workflows, policies, ontologies.
+    /// ONE list surface for the standard plugin contract; the same view is
+    /// reachable in the TUI (`/plugins list`) and by the agent (`plugins`
+    /// tool). Local and offline.
+    Plugins {
+        #[command(subcommand)]
+        command: crate::plugins_cmd::PluginsCommands,
+    },
     /// Ingest a data file into the knowledge graph.
     Ingest {
         /// Path to a file or directory to ingest. Omit with `--status`.
@@ -418,84 +536,22 @@ enum Commands {
         /// Max results to return.
         #[arg(long, default_value = "10")]
         limit: usize,
+        /// Also show facts whose ingest checks did NOT verify them against
+        /// their source (stored with a verification status such as
+        /// `subject_not_verbatim`). The default shows only the trusted
+        /// subset; unverified facts are present and findable, not promoted.
+        #[arg(long)]
+        include_unverified: bool,
         /// Dashboard URL for federated query peer discovery.
         #[arg(long, default_value = "http://127.0.0.1:7327")]
         dashboard_url: String,
     },
     /// Print available commands for AI agents. Pipe-friendly, grep-friendly.
     Agent,
-    /// Submit a compute job (local Docker, the hosted platform, or BYOC).
-    Run {
-        /// Container image to run, or a pre-staged .sif path for SLURM.
-        image: String,
-        /// Job name.
-        #[arg(long, default_value = "experiment")]
-        name: String,
-        /// JSON inputs (key=value pairs merged into inputs object).
-        #[arg(long, value_delimiter = ',')]
-        input: Vec<String>,
-        /// Backend: local, marc27, or byoc.
-        #[arg(long, default_value = "local")]
-        backend: String,
-        /// Platform API URL (for the `marc27` backend). When omitted, resolve
-        /// PRISM_API_URL, config, or the endpoint stored by `prism login`.
-        #[arg(long)]
-        platform_url: Option<String>,
-        /// BYOC SSH target: user@host (enables SSH backend).
-        #[arg(long)]
-        ssh: Option<String>,
-        /// SSH key path for BYOC SSH.
-        #[arg(long, default_value = "~/.ssh/id_ed25519")]
-        ssh_key: String,
-        /// SSH port (default 22).
-        #[arg(long, default_value_t = 22)]
-        ssh_port: u16,
-        /// Kubernetes context for BYOC K8s.
-        #[arg(long)]
-        k8s_context: Option<String>,
-        /// Kubernetes namespace (default: "default").
-        #[arg(long, default_value = "default")]
-        k8s_namespace: String,
-        /// SLURM head node (user@host) for BYOC SLURM.
-        #[arg(long)]
-        slurm: Option<String>,
-        /// SLURM partition.
-        #[arg(long, default_value = "default")]
-        slurm_partition: String,
-        /// SLURM allocation account.
-        #[arg(long)]
-        slurm_account: Option<String>,
-        /// SLURM wall time, for example 02:00:00.
-        #[arg(long)]
-        slurm_time: Option<String>,
-        /// SLURM generic resources, for example gpu:a100:1.
-        #[arg(long)]
-        slurm_gres: Option<String>,
-        /// Total SLURM memory per node, for example 64G.
-        #[arg(long, conflicts_with = "slurm_mem_per_cpu")]
-        slurm_mem: Option<String>,
-        /// SLURM memory per allocated CPU, for example 8G.
-        #[arg(long, conflicts_with = "slurm_mem")]
-        slurm_mem_per_cpu: Option<String>,
-        /// SLURM CPUs per task.
-        #[arg(long)]
-        slurm_cpus_per_task: Option<u32>,
-        /// SLURM node count.
-        #[arg(long)]
-        slurm_nodes: Option<u32>,
-        /// SLURM task count.
-        #[arg(long)]
-        slurm_ntasks: Option<u32>,
-        /// SLURM array expression, for example 0-15%4.
-        #[arg(long)]
-        slurm_array: Option<String>,
-        /// Run only after this SLURM job id completes successfully.
-        #[arg(long)]
-        slurm_dependency_afterok: Option<u64>,
-        /// Emit machine-readable JSON instead of human-readable status lines.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Submit a compute job (local Docker, the hosted platform, BYOC, or
+    /// HyperQueue many-task sets). Boxed so the enum stays small next to
+    /// its one-word variants — same pattern as ScheduleCreateArgs.
+    Run(Box<RunArgs>),
     /// Check status of a compute job.
     JobStatus {
         /// Job UUID.
@@ -876,6 +932,12 @@ enum CampaignCommands {
         /// What to optimize (e.g. "maximize creep resistance").
         #[arg(long)]
         objective: Option<String>,
+        /// The DECLARED property the reward ranks on, keyed exactly as the
+        /// evaluator reports it (e.g. "Tm_estimate_K"). Reward-property
+        /// selection is by declaration, never by parsing the objective's
+        /// English words.
+        #[arg(long)]
+        target_property: Option<String>,
         /// Maximum number of discovery iterations.
         #[arg(long, default_value_t = 50)]
         max_iterations: usize,
@@ -2184,6 +2246,7 @@ async fn main() -> Result<()> {
                     goal,
                     elements,
                     objective,
+                    target_property,
                     max_iterations,
                     batch_size,
                     budget,
@@ -2214,6 +2277,7 @@ async fn main() -> Result<()> {
                         description: goal.clone(),
                         elements: elements_vec,
                         objective: objective.clone().unwrap_or_default(),
+                        target_property: target_property.clone(),
                         constraints: Vec::new(),
                         seeds: Vec::new(),
                     };
@@ -3983,6 +4047,13 @@ async fn main() -> Result<()> {
         Commands::Ontology { command } => {
             crate::ontology_cmd::handle(command, &cli.project_root).await?;
         }
+        Commands::Reverify { command } => {
+            crate::reverify_cmd::run(command, &cli.project_root).await?;
+        }
+        Commands::Plugins { command } => {
+            crate::plugins_cmd::handle(command, &cli.python.to_string_lossy(), &cli.project_root)
+                .await?;
+        }
         Commands::Ingest {
             path,
             corpus,
@@ -4125,6 +4196,7 @@ async fn main() -> Result<()> {
             model: _,
             api_key: _,
             limit,
+            include_unverified,
             dashboard_url,
         } => {
             if platform {
@@ -4133,37 +4205,52 @@ async fn main() -> Result<()> {
             } else if federated {
                 handle_federated_query(&text, &dashboard_url, &paths).await?;
             } else {
-                handle_query(&text, semantic, limit).await?;
+                handle_query(&text, semantic, limit, include_unverified).await?;
             }
         }
         Commands::Agent => {
             print_agent_guide();
         }
-        Commands::Run {
-            image,
-            name,
-            input,
-            backend,
-            platform_url,
-            ssh,
-            ssh_key,
-            ssh_port,
-            k8s_context,
-            k8s_namespace,
-            slurm,
-            slurm_partition,
-            slurm_account,
-            slurm_time,
-            slurm_gres,
-            slurm_mem,
-            slurm_mem_per_cpu,
-            slurm_cpus_per_task,
-            slurm_nodes,
-            slurm_ntasks,
-            slurm_array,
-            slurm_dependency_afterok,
-            json,
-        } => {
+        Commands::Run(run) => {
+            let RunArgs {
+                image,
+                name,
+                input,
+                backend,
+                platform_url,
+                ssh,
+                ssh_key,
+                ssh_port,
+                k8s_context,
+                k8s_namespace,
+                slurm,
+                slurm_partition,
+                slurm_account,
+                slurm_time,
+                slurm_gres,
+                slurm_mem,
+                slurm_mem_per_cpu,
+                slurm_cpus_per_task,
+                slurm_nodes,
+                slurm_ntasks,
+                slurm_array,
+                slurm_dependency_afterok,
+                hq_tasks,
+                hq_workers,
+                hq_server_dir,
+                hq_autoalloc,
+                hq_time_limit,
+                hq_extra,
+                json,
+            } = *run;
+            let hq = HqRunFlags {
+                tasks: hq_tasks.as_deref(),
+                workers: hq_workers,
+                server_dir: hq_server_dir.as_deref(),
+                autoalloc: hq_autoalloc.as_deref(),
+                time_limit: hq_time_limit.as_str(),
+                extra: &hq_extra,
+            };
             handle_run(
                 &paths.data_dir,
                 &name,
@@ -4188,6 +4275,7 @@ async fn main() -> Result<()> {
                 slurm_ntasks,
                 slurm_array.as_deref(),
                 slurm_dependency_afterok,
+                &hq,
                 json,
             )
             .await?;
@@ -6220,7 +6308,7 @@ fn provider_endpoint(registry: &crate::providers::Registry, provider: &str) -> S
 ///
 /// Precedence: CLI flags > config.toml [chat] > prism.toml [llm] > built-in defaults.
 /// Returns a helpful error if no model is configured anywhere.
-fn build_llm_config(
+pub(crate) fn build_llm_config(
     project_root: &Path,
     url_override: Option<&str>,
     model_override: Option<&str>,
@@ -7002,9 +7090,9 @@ async fn submit_platform_ingest_chunk(
 }
 
 /// Resolve the active ontology id for local ingest from `prism.toml`
-/// (`[ontology] id`, default "emmo"), refusing unimplemented `[ontology]
-/// engine` values loudly — that knob used to be read by nothing, so any
-/// value silently behaved like "llm".
+/// (`[ontology] id`, default "emmo"), loading a project-local promoted
+/// artifact into the process registry when needed. Unimplemented `[ontology]
+/// engine` values remain loud refusals.
 fn active_ontology_from_config(project_root: &Path) -> Result<String> {
     let node_config = prism_core::config::NodeConfig::load(Some(project_root));
     let engine = node_config.ontology.engine;
@@ -7014,7 +7102,24 @@ fn active_ontology_from_config(project_root: &Path) -> Result<String> {
              Remove the setting or set engine = \"llm\"."
         );
     }
-    Ok(node_config.ontology.id)
+    let id = node_config.ontology.id;
+    prism_ingest::ontologies::active_from_project(Some(&id), project_root)?;
+    Ok(id)
+}
+
+/// The paper loop's policy, loaded from the project's `prism.toml`
+/// (`[ingest]`). These are policy choices — the reading standard a first
+/// `finish` must clear and the capability-verdict thresholds — so they live
+/// in config and the loop receives values, never hardcoded numbers.
+pub(crate) fn paper_agent_policy(
+    project_root: &Path,
+) -> prism_ingest::paper_agent::PaperAgentPolicy {
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    prism_ingest::paper_agent::PaperAgentPolicy {
+        finish_coverage_floor: config.ingest.finish_coverage_floor,
+        model_acceptance_floor: config.ingest.model_acceptance_floor,
+        model_degenerate_ceiling: config.ingest.model_degenerate_ceiling,
+    }
 }
 
 async fn run_local_ingest_file(
@@ -7138,45 +7243,6 @@ async fn run_platform_ingest_file(
     }))
 }
 
-/// Classify a chunk's entities, using whatever prior corpus is already loaded.
-///
-/// The prior is looked up in the store's own graph — `local@matkg` when MatKG
-/// has been loaded (`prism matkg load`), nothing otherwise. Absence is not an
-/// error: with no prior the model classifies unaided, which it does well; the
-/// prior's job is to supply corpus evidence the model can weigh and, where the
-/// corpus is wrong, override.
-async fn classify_ingested_entities(
-    store: &prism_provenance::ProvenanceStore,
-    llm: &prism_ingest::llm::LlmClient,
-    ontology: &dyn prism_ingest::ontologies::Ontology,
-    names: &[String],
-) -> anyhow::Result<std::collections::HashMap<String, prism_ingest::classify::EntityClass>> {
-    // The prior tenant is DERIVED from the ontology registry, never spelled
-    // out here, so a renamed or replaced prior ontology cannot leave this
-    // lookup pointing at a tenant nothing writes to.
-    let tenant = prism_ingest::ontologies::storage_tenant(
-        prism_provenance::LOCAL_TENANT,
-        prism_ingest::ontologies::MATKG_ONTOLOGY_ID,
-    );
-    let prior = prism_ingest::classify::GraphPrior::fetch(store, &tenant, names).await;
-    let prior = match prior {
-        Ok(prior) => Some(prior),
-        Err(error) => {
-            tracing::debug!(%error, "no class prior available");
-            None
-        }
-    };
-    prism_ingest::classify::classify_entities(
-        llm,
-        ontology,
-        names,
-        prior
-            .as_ref()
-            .map(|p| p as &dyn prism_ingest::classify::ClassPrior),
-    )
-    .await
-}
-
 /// Describe the exact subject/object identities the text writer is about to
 /// persist, so advisory semantic validation measures the proposal rather than
 /// reconstructing it after the graph has changed.
@@ -7211,26 +7277,15 @@ fn semantic_entities_for_text_facts(
                 }
             }
             None => {
-                // This mirrors `write_fact_as`: when either endpoint lacks a
-                // model class the writer deliberately falls back for BOTH.
-                // No class IRI is invented, so typing remains unavailable for
-                // these nodes instead of presenting a legacy label as an
-                // ontology judgement.
-                let object_label = match fact.kind.as_deref() {
-                    Some("measurement") => "Property",
-                    Some("phase") => "Phase",
-                    Some("composition") => "Composition",
-                    Some("contains") => "Element",
-                    Some("processing") => "Manufacturing",
-                    Some("structure") => "CrystalStructure",
-                    Some("application") => "Application",
-                    _ => "Entity",
-                };
-                for (name, label) in [(&fact.subject, "Matter"), (&fact.object, object_label)] {
+                // The active ontology supplied no endpoint classification.
+                // Record that absence generically; inferring a domain class
+                // from a closed Rust `kind` list made this paper path specific
+                // to one vocabulary and silently mistyped customer ontologies.
+                for name in [&fact.subject, &fact.object] {
                     let proposal = SemanticEntityProposal {
                         name: name.clone(),
-                        entity_type: label.to_string(),
-                        storage_label: label.to_string(),
+                        entity_type: "Entity".to_string(),
+                        storage_label: "Entity".to_string(),
                         class_iri: None,
                     };
                     let identity = (
@@ -7374,9 +7429,57 @@ async fn read_document_text(path: &Path, runtime_url: &str) -> Result<(String, O
     }
 }
 
-/// Ingest a text document entirely on-device: extract EMMO facts with the
-/// local LLM and write them (with one PROV-O activity) into the bundled
-/// Turso provenance store. Nothing leaves the machine.
+/// Persist the exact UTF-8 representation whose line coordinates are stored
+/// on assertions. A PDF cannot be reread by treating its binary bytes as
+/// text, and a later document-reader upgrade might produce different lines;
+/// the content-addressed snapshot keeps the original witness reopenable.
+pub(crate) fn persist_source_text_snapshot(
+    prism_home: &Path,
+    source_text: &str,
+) -> Result<PathBuf> {
+    use sha2::{Digest as _, Sha256};
+
+    let revision = Sha256::digest(source_text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let directory = prism_home.join("source-text");
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "creating source-text snapshot directory {}",
+            directory.display()
+        )
+    })?;
+    let path = directory.join(format!("{revision}.txt"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => file
+            .write_all(source_text.as_bytes())
+            .with_context(|| format!("writing source-text snapshot {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading source-text snapshot {}", path.display()))?;
+            if existing != source_text {
+                bail!(
+                    "source-text snapshot {} does not match its SHA-256 address",
+                    path.display()
+                );
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("creating source-text snapshot {}", path.display()));
+        }
+    }
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// Ingest a text document entirely on-device with the active registered
+/// ontology and write the resulting facts (with one PROV-O activity) into
+/// the bundled Turso provenance store. Nothing leaves the machine.
 #[allow(clippy::too_many_arguments)]
 async fn run_local_text_ingest_file(
     path: &Path,
@@ -7390,19 +7493,7 @@ async fn run_local_text_ingest_file(
     sampling: prism_ingest::text_extract::SamplingPolicy,
     vision: VisionModelChoice<'_>,
 ) -> Result<serde_json::Value> {
-    // Text-document extraction is wired to the built-in EMMO ontology only
-    // (EMMO prompt, QUDT-typed MaterialFacts). Refuse honestly under any
-    // other active ontology rather than extracting with the wrong
-    // vocabulary — only the tabular pipeline consults the ontology registry
-    // today.
     let ontology_id = active_ontology_from_config(project_root)?;
-    if ontology_id != prism_ingest::ontologies::DEFAULT_ONTOLOGY_ID {
-        bail!(
-            "text-document ingest currently extracts with the built-in EMMO ontology only; \
-             the active ontology '{ontology_id}' has no text extractor. Ingest tabular data \
-             (CSV/Parquet), or set [ontology] id = \"emmo\"."
-        );
-    }
     let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
 
     if mapping_path.is_some() {
@@ -7437,7 +7528,7 @@ async fn run_local_text_ingest_file(
     // `page_ranges` carries the document's structural units (byte ranges of
     // pages in `text`) into segmentation; empty means "no page structure
     // known" and segmentation falls back to blank-line paragraphs.
-    let (text, page_ranges, warning) = if ingest_format(path) == "pdf" {
+    let (text, _page_ranges, warning) = if ingest_format(path) == "pdf" {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read PDF {}", path.display()))?;
         // Read through the document-understanding plane rather than calling
@@ -7511,65 +7602,41 @@ async fn run_local_text_ingest_file(
         .and_then(|value| value.to_str())
         .unwrap_or("untitled");
 
-    // Window plan: the WHOLE document is processed — in overlapping windows
-    // sized by `[ingest] chunk_bytes` or derived from the model's context
-    // window (the binding constraint, which the local runtime reports).
-    // This used to be a hard 60,000-byte truncation with no chunking: a
-    // 362,000-character NASA deck yielded facts from its first sixth only.
-    let chunk_override = prism_core::config::NodeConfig::load(Some(project_root))
-        .ingest
-        .chunk_bytes;
-    let (window_bytes, window_note) = match chunk_override.filter(|n| *n > 0) {
-        Some(bytes) => (
-            bytes,
-            format!("{bytes}-byte windows ([ingest] chunk_bytes override)"),
-        ),
-        None => {
-            let context_window = llm.probe_context_window().await;
-            let budget = prism_ingest::batching::input_byte_budget(context_window);
-            let note = match context_window {
-                Some(cw) => format!(
-                    "{budget}-byte windows derived from the model's {cw}-token context window"
-                ),
-                None => format!(
-                    "context window UNKNOWN (neither configured nor reported by the \
-                     backend) — assuming the documented {}-token fallback ({budget}-byte \
-                     windows); set [ingest] chunk_bytes in prism.toml to override",
-                    prism_ingest::batching::FALLBACK_CONTEXT_TOKENS
-                ),
-            };
-            (budget, note)
-        }
-    };
-    // Structure-aware segmentation: whole pages, then blank-line paragraphs,
-    // packed to the budget; an oversized unit falls back to overlapped byte
-    // windows for that unit only. A chunk that starts mid-sentence hands the
-    // model a fragment whose subject lives in the previous window — cutting
-    // on structure instead is free precision.
-    let windows = prism_ingest::batching::chunk_structured(&text, &page_ranges, window_bytes);
+    // CONTRACT CHANGE (agentic paper reading): prompt context size no longer
+    // partitions the source. One bounded loop owns the complete document and
+    // pulls only the ontology entries and numbered paper lines it needs.
+    // Repeating that loop once per old prompt window would multiply cost and
+    // produce duplicate ontology-extension proposals without exposing any
+    // additional data.
+    let windows = [(0usize, text.len())];
     let chunks_total = windows.len();
-    // The grounding corpus: the WHOLE document with soft line breaks
-    // unwrapped, computed ONCE per run. Every chunk's facts are grounded
-    // against this, not against the chunk — a subject correctly resolved to
-    // a name from another section must not be refused as invented, while a
-    // fabricated name is still absent from all of it.
-    let corpus = prism_ingest::text_extract::unwrap_soft_line_breaks(&text);
+    // The agentic reader receives the complete RAW document below. Raw line
+    // boundaries are the stable coordinates carried into provenance and must
+    // never be defined by PDF-wrap heuristics.
     // Cost, said BEFORE the run starts: input at the client's ~4-bytes/token
     // estimate. Output is metered and billed per token — counting is the
     // control, and the actual usage is reported at the end.
     eprintln!(
-        "  extraction plan: {} bytes of text in {chunks_total} chunk(s); {window_note}; \
-         ~{} tokens of document input will be sent (plus per-chunk prompt scaffold); \
-         output is metered and billed per token",
+        "  extraction plan: {} bytes and {} raw line(s) in one tool-driven paper workspace; \
+         the model fetches bounded ranges on demand; output is metered and billed per token",
         text.len(),
-        text.len() / 4,
+        text.lines().count().max(1),
     );
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let db_path = PathBuf::from(home).join(".prism/provenance.db");
+    let prism_home = PathBuf::from(home).join(".prism");
+    let db_path = prism_home.join("provenance.db");
     let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
+    // Keep the original document as the independence/origin identity, while
+    // retrieval reopens the exact text representation whose hash and lines
+    // the population agent cited. This is essential for PDFs (binary source,
+    // extracted-text coordinates) and also freezes evidence across reader
+    // upgrades or later edits to a text file.
+    let source_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let document_id = source_path.display().to_string();
+    let source_text_snapshot = persist_source_text_snapshot(&prism_home, &text)?;
     let prov = prism_provenance::LocalProvenance {
         activity_id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.clone(),
@@ -7579,15 +7646,24 @@ async fn run_local_text_ingest_file(
         // source (`origin_source_key`), so two windows of the SAME document
         // asserting one fact contribute ONE evidence row: chunking cannot
         // fabricate corroboration or inflate confidence.
-        source_entity_id: path.display().to_string(),
+        source_entity_id: source_text_snapshot.display().to_string(),
         source_kind: "Document".into(),
-        // Local single-user store — no per-run tenancy (yet).
-        tenant: "local".into(),
+        // CONTRACT CHANGE: the text path used to write every ontology into
+        // the bare "local" tenant, blending a promoted ontology's facts
+        // into EMMO's keyspace while the tabular path isolated them.
+        // Compose the per-ontology tenant exactly as the tabular path does;
+        // the default ontology keeps the bare "local" every existing store
+        // was written with.
+        tenant: prism_ingest::ontologies::storage_tenant(
+            prism_provenance::LOCAL_TENANT,
+            ontology.id(),
+        ),
         started_at: now.clone(),
         ended_at: now,
         locality: "local".into(),
-        // Local ingest reads the source itself — the locator IS the origin.
-        origin_source_id: None,
+        // Corroboration still keys on the original paper, not on a derived
+        // text snapshot or a particular extraction run.
+        origin_source_id: Some(document_id.clone()),
     };
     store.record_activity(&prov).await?;
 
@@ -7603,51 +7679,54 @@ async fn run_local_text_ingest_file(
     let mut written_facts: Vec<prism_provenance::MaterialFact> = Vec::new();
     let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped_facts: Vec<String> = Vec::new();
-    let mut rejections: Vec<prism_ingest::text_extract::RejectedFact> = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut peer_echoes: Vec<serde_json::Value> = Vec::new();
     let mut peer_echo_check_errors: Vec<String> = Vec::new();
     let mut semantic_validation = Vec::new();
+    let mut agent_traces: Vec<prism_ingest::paper_agent::PaperAgentTrace> = Vec::new();
+    // Samples that lost their agreement vote because they never had a fair
+    // chance to read the document, and chunks where EVERY sample showed the
+    // routed model was not capable — both reported, never silent.
+    let mut agreement_exclusions: Vec<prism_ingest::text_extract::SampleExclusion> = Vec::new();
+    let mut model_insufficient: Vec<prism_ingest::text_extract::ModelInsufficiency> = Vec::new();
+    let mut agent_turns = 0usize;
+    let mut agent_tool_calls = 0usize;
+    let mut proposed_classes: Vec<prism_ingest::paper_agent::OntologyClassProposal> = Vec::new();
+    let mut proposed_relations: Vec<prism_ingest::paper_agent::OntologyRelationProposal> =
+        Vec::new();
     let mut chunks_processed = 0usize;
     let mut llm_usage: Option<prism_ingest::llm::UsageInfo> = None;
-    let semantic_policy = prism_ingest::semantic_validation::SemanticValidationPolicy::default();
+    let mut semantic_policy =
+        prism_ingest::semantic_validation::SemanticValidationPolicy::default();
+    // The numeric prior's eligible fact kinds come from the active
+    // ontology's declaration, not a materials-shaped Rust default.
+    semantic_policy.resolve_eligible_fact_kinds(ontology.as_ref());
 
     // ── The extraction funnel, counted where each fact leaves it ──
     //
-    // "58 extracted, 4 stored" is an anecdote until every lost fact is
-    // attributed to the stage that refused it. These counters partition
-    // every proposed fact: facts_proposed = dropped_ungrounded +
-    // dropped_units + dropped_malformed + dropped_disagreement + deduped +
-    // store_failed + facts_written, asserted by test. `store_failed` covers facts stranded
-    // by a mid-chunk store-write failure (also on the errors spine) so the
-    // identity holds even on a partial run.
+    // "58 extracted, 4 stored" is an anecdote until every proposed fact is
+    // attributed to where it ended up. Under annotate-not-refuse a failed
+    // check no longer drops the fact — it is STORED carrying a weak
+    // verification status — so the funnel partitions by destination:
+    // facts_proposed = stored_trusted + stored_unverified +
+    // dropped_malformed + deduped + store_failed, asserted by test.
+    // `dropped_malformed` is the one refusal left (shapes the store cannot
+    // represent); `store_failed` covers facts stranded by a mid-chunk
+    // store-write failure (also on the errors spine) so the identity holds
+    // even on a partial run.
     let mut facts_proposed = 0usize;
-    let mut dropped_ungrounded = 0usize;
-    // Its own bucket, deliberately. A sampling refusal is a statement about
-    // the MODEL disagreeing with itself; the document was never consulted.
-    // Counting it as "ungrounded" would claim the text refused a fact the
-    // text never saw.
-    let mut dropped_disagreement = 0usize;
-    let mut dropped_units = 0usize;
+    let mut stored_trusted = 0usize;
+    let mut stored_unverified = 0usize;
+    // Per-status counts of the unverified facts — the review surface's
+    // work queue, visible in the summary rather than buried in the store.
+    let mut unverified_by_status: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
     let mut dropped_malformed = 0usize;
     let mut deduped = 0usize;
     let mut store_failed = 0usize;
 
-    // Entity names from facts that SURVIVED grounding, offered to later
-    // chunks as the KNOWN ENTITIES block so "Ti64" in results reuses the
-    // "Ti-6Al-4V" of methods instead of minting a second node. Grounded-only
-    // entry is load-bearing (see `EntityRegistry`): seeding from raw
-    // extraction would let one hallucinated name echo forward through every
-    // later chunk.
-    let mut registry = prism_ingest::text_extract::EntityRegistry::default();
-    // Every entity class any chunk resolved, so the alias pass at the end
-    // can write its `same_as` edges under the SAME labels the entities were
-    // written with — a different label is a different node key, and the edge
-    // would connect two freshly minted strangers instead.
-    let mut all_classes: std::collections::HashMap<String, prism_ingest::classify::EntityClass> =
-        std::collections::HashMap::new();
-
+    let paper_policy = crate::paper_agent_policy(project_root);
     for (index, (start, end)) in windows.iter().enumerate() {
         let chunk_no = index + 1;
         eprintln!(
@@ -7659,11 +7738,13 @@ async fn run_local_text_ingest_file(
             title,
             &text[*start..*end],
             prism_ingest::text_extract::DocumentContext {
-                document: &corpus,
-                known_entities: &registry,
+                document: &text,
+                chunk_start_byte: *start,
+                ontology: ontology.as_ref(),
             },
             prism_ingest::text_extract::GroundingPolicy::default(),
             sampling,
+            paper_policy,
         )
         .await
         {
@@ -7680,7 +7761,21 @@ async fn run_local_text_ingest_file(
                 continue;
             }
         };
-        if let Some(usage) = extraction.usage {
+        let prism_ingest::text_extract::TextExtraction {
+            facts,
+            citations,
+            ontology_bindings,
+            parse_error,
+            dropped_facts: chunk_dropped_facts,
+            rejections: chunk_rejections,
+            usage,
+            agent_traces: chunk_agent_traces,
+            agreement_exclusions: chunk_agreement_exclusions,
+            model_insufficient: chunk_model_insufficient,
+            proposed_classes: chunk_proposed_classes,
+            proposed_relations: chunk_proposed_relations,
+        } = extraction;
+        if let Some(usage) = usage {
             let total = llm_usage.get_or_insert(prism_ingest::llm::UsageInfo {
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -7690,49 +7785,77 @@ async fn run_local_text_ingest_file(
             total.completion_tokens += usage.completion_tokens;
             total.total_tokens += usage.total_tokens;
         }
-        if let Some(parse_error) = extraction.parse_error {
+        if let Some(parse_error) = parse_error {
             parse_errors.push(format!("chunk {chunk_no}/{chunks_total}: {parse_error}"));
         }
+        agent_turns += chunk_agent_traces
+            .iter()
+            .map(|trace| trace.turns)
+            .sum::<usize>();
+        agent_tool_calls += chunk_agent_traces
+            .iter()
+            .flat_map(|trace| &trace.samples)
+            .map(|turn| turn.tool_calls.len())
+            .sum::<usize>();
+        agent_traces.extend(chunk_agent_traces);
+        agreement_exclusions.extend(chunk_agreement_exclusions);
+        model_insufficient.extend(chunk_model_insufficient);
+        proposed_classes.extend(chunk_proposed_classes);
+        proposed_relations.extend(chunk_proposed_relations);
         // Funnel: everything the model proposed for this chunk either
-        // survived into `extraction.facts` or is in `extraction.rejections`.
-        facts_proposed += extraction.facts.len() + extraction.rejections.len();
-        for rejection in &extraction.rejections {
-            use prism_ingest::text_extract::RejectionClass;
-            match rejection.class {
-                RejectionClass::UnresolvedUnit => dropped_units += 1,
-                RejectionClass::MalformedShape | RejectionClass::ValuelessWithUnit => {
-                    dropped_malformed += 1;
-                }
-                RejectionClass::SubjectNotNamed
-                | RejectionClass::NumericUnsupported
-                | RejectionClass::PolicyDeferred
-                | RejectionClass::ReviewDenied
-                | RejectionClass::ReviewUncertain
-                | RejectionClass::ReviewMissing => dropped_ungrounded += 1,
-                RejectionClass::SampleDisagreement => dropped_disagreement += 1,
-            }
+        // survived into `extraction.facts` (annotated with a verification
+        // status) or is in `extraction.rejections` (shapes the store cannot
+        // represent — the one refusal left).
+        facts_proposed += facts.len() + chunk_rejections.len();
+        dropped_malformed += chunk_rejections.len();
+        dropped_facts.extend(chunk_dropped_facts);
+
+        if facts.len() != citations.len() || facts.len() != ontology_bindings.len() {
+            // This is an internal contract breach, not a grounding verdict.
+            // A fact without its exact witness cannot enter the cited write
+            // path, so surface the whole chunk as failed rather than pairing
+            // unrelated entries by position.
+            store_failed += facts.len();
+            errors.push(format!(
+                "chunk {chunk_no}/{chunks_total}: extractor returned {} facts, {} citations, and {} ontology bindings",
+                facts.len(),
+                citations.len(),
+                ontology_bindings.len()
+            ));
+            continue;
         }
-        dropped_facts.extend(extraction.dropped_facts);
-        rejections.extend(extraction.rejections);
-        // These facts survived grounding — and ONLY these may feed the
-        // known-entities registry for later chunks.
-        registry.record_grounded_facts(&extraction.facts);
 
         // De-duplicate across windows: the overlap re-reads boundary text by
         // design, so both neighbours may extract the same fact — it is ONE
         // fact. (The store would refuse the duplicate evidence anyway; this
-        // keeps `facts_written` honest and skips redundant writes.)
-        let grounded_count = extraction.facts.len();
-        let new_facts: Vec<prism_provenance::MaterialFact> = extraction
-            .facts
+        // keeps the stored counts honest and skips redundant writes.) The
+        // dedup key is the FACT identity with the verification stamp
+        // cleared: the same fact judged differently at a window seam is
+        // still one fact, and the store's best-wins aggregation is the
+        // right place to reconcile the two verdicts — but only the first
+        // sighting is written here, so the seam duplicate is simply skipped.
+        let annotated_count = facts.len();
+        let new_facts: Vec<(
+            prism_provenance::MaterialFact,
+            prism_provenance::SourceCitation,
+            prism_ingest::paper_agent::FactOntologyBinding,
+        )> = facts
             .into_iter()
-            .filter(|fact| {
-                serde_json::to_string(fact)
+            .zip(citations)
+            .zip(ontology_bindings)
+            .map(|((fact, citation), binding)| (fact, citation, binding))
+            .filter(|(fact, _, _)| {
+                let mut identity = fact.clone();
+                identity.verification = None;
+                identity.verification_reason = None;
+                serde_json::to_string(&identity)
                     .map(|key| seen_facts.insert(key))
                     .unwrap_or(true)
             })
             .collect();
-        deduped += grounded_count - new_facts.len();
+        deduped += annotated_count - new_facts.len();
+        let new_fact_values: Vec<prism_provenance::MaterialFact> =
+            new_facts.iter().map(|(fact, _, _)| fact.clone()).collect();
 
         // Peer-echo tripwire, BEFORE this chunk's writes: an agent that read
         // a peer fact out of `prism query` and fed it back through `prism
@@ -7742,7 +7865,7 @@ async fn run_local_text_ingest_file(
         // indistinguishable from a genuinely independent source stating the
         // same fact), so the collision is reported LOUDLY instead of
         // absorbed silently. DETECTION, not prevention: the write proceeds.
-        let (echoes, check_errors) = collect_peer_echoes(&store, &new_facts).await;
+        let (echoes, check_errors) = collect_peer_echoes(&store, &new_fact_values).await;
         if !echoes.is_empty() {
             eprintln!(
                 "  WARNING: {} extracted fact(s) already exist under mesh peer tenant(s).",
@@ -7767,46 +7890,25 @@ async fn run_local_text_ingest_file(
         peer_echoes.extend(echoes);
         peer_echo_check_errors.extend(check_errors);
 
-        // Ask the model what each entity IS, before writing any of them.
-        //
-        // Without this every subject is written under the store's default
-        // `Matter` (`EntityWrite::legacy`), which recorded `Laser Powder Bed
-        // Fusion` as a MATERIAL in a real NASA rocket-engine ingest. The
-        // tabular and MatKG paths have always classified their entities; this
-        // is the document path joining them.
-        //
-        // ONE call for the chunk's distinct names, informed by whatever prior
-        // corpus is loaded (MatKG under `local@matkg`). A classification
-        // failure is NOT fatal: the facts are still written under the
-        // established shape, exactly as before, and the reason is reported.
-        let names: Vec<String> = new_facts
-            .iter()
-            .flat_map(|f| [f.subject.clone(), f.object.clone()])
-            .collect();
-        let classes = classify_ingested_entities(&store, &llm, ontology.as_ref(), &names).await;
-        let classes = match classes {
-            Ok(classes) => classes,
-            Err(error) => {
-                eprintln!(
-                    "  Note: entity classification unavailable ({error:#}); facts are stored \
-                     under the default shape and their classes may be wrong."
-                );
-                Default::default()
-            }
-        };
-        for (name, class) in &classes {
-            all_classes
-                .entry(name.clone())
-                .or_insert_with(|| class.clone());
-        }
+        // Ontology navigation and semantic judgement belong to the bounded
+        // paper loop above. Do not follow it with a second one-shot
+        // classifier or a fixed corpus prior. Until a proposed ontology
+        // extension is governed and applied, the storage adapter uses its
+        // generic node shape while the assertion and ontology-version stamp
+        // remain complete.
+        let classes: std::collections::HashMap<String, prism_ingest::classify::EntityClass> =
+            std::collections::HashMap::new();
 
         // The model proposes; geometry measures. This runs once for the
         // chunk's whole batch BEFORE its first fact write. Its report cannot
         // alter, merge, drop, or block a proposal, and unavailable geometry
         // remains an explicit status in the returned ingest summary.
         use prism_provenance::FactPayload as _;
-        let local_facts: Vec<_> = new_facts.iter().map(|fact| fact.to_local_fact()).collect();
-        let semantic_entities = semantic_entities_for_text_facts(&new_facts, &classes);
+        let local_facts: Vec<_> = new_fact_values
+            .iter()
+            .map(|fact| fact.to_local_fact())
+            .collect();
+        let semantic_entities = semantic_entities_for_text_facts(&new_fact_values, &classes);
         let semantic = prism_ingest::semantic_validation::validate_write_best_effort(
             &store,
             &semantic_entities,
@@ -7820,46 +7922,54 @@ async fn run_local_text_ingest_file(
         let mut chunk_written = 0usize;
         let mut write_error = None;
         let planned_writes = new_facts.len();
-        for fact in new_facts {
-            let nodes = classes
-                .get(&fact.subject)
-                .zip(classes.get(&fact.object))
-                .map(|(subject, object)| prism_provenance::ClassifiedFactNodes {
-                    subject: prism_provenance::ClassifiedNode {
-                        entity_type: &subject.entity_type,
-                        storage_label: &subject.storage_label,
-                        class_iri: &subject.class_iri,
-                    },
-                    object: prism_provenance::ClassifiedNode {
-                        entity_type: &object.entity_type,
-                        storage_label: &object.storage_label,
-                        class_iri: &object.class_iri,
-                    },
-                });
-            let write = match nodes {
-                // Both endpoints classified: the fact carries real classes.
-                Some(nodes) => {
-                    store
-                        .write_classified_fact_with_evidence(
-                            &fact,
-                            &prov,
-                            fact.evidence_class,
-                            nodes,
-                            classification,
-                        )
-                        .await
-                }
-                // Either endpoint unclassified — fall back rather than
-                // half-classify, so a fact's two endpoints never disagree
-                // about which vocabulary they were written under.
-                None => {
-                    store
-                        .write_fact_with_classification(&fact, &prov, classification)
-                        .await
-                }
+        for (fact, citation, binding) in new_facts {
+            let subject = binding
+                .subject_class_iri
+                .as_deref()
+                .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology.as_ref(), iri))
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let object = binding
+                .object_class_iri
+                .as_deref()
+                .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology.as_ref(), iri))
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let nodes = prism_provenance::OntologyBoundFactNodes {
+                subject: subject
+                    .as_ref()
+                    .map(|node| prism_provenance::ClassifiedNode {
+                        entity_type: &node.entity_type,
+                        storage_label: &node.storage_label,
+                        class_iri: &node.class_iri,
+                    }),
+                object: object
+                    .as_ref()
+                    .map(|node| prism_provenance::ClassifiedNode {
+                        entity_type: &node.entity_type,
+                        storage_label: &node.storage_label,
+                        class_iri: &node.class_iri,
+                    }),
             };
+            let write = store
+                .write_ontology_bound_fact_with_citation(
+                    &fact,
+                    &prov,
+                    fact.evidence_class,
+                    nodes,
+                    classification,
+                    &citation,
+                )
+                .await;
             match write {
                 Ok(()) => {
+                    match fact.verification {
+                        Some(status) if !status.is_trusted() => {
+                            stored_unverified += 1;
+                            *unverified_by_status.entry(status.as_str()).or_insert(0) += 1;
+                        }
+                        _ => stored_trusted += 1,
+                    }
                     written_facts.push(fact);
                     chunk_written += 1;
                 }
@@ -7911,208 +8021,89 @@ async fn run_local_text_ingest_file(
     }
 
     eprintln!(
-        "  extraction funnel: {facts_proposed} proposed → {} written \
-         ({dropped_ungrounded} ungrounded, {dropped_units} unit-refused, \
-         {dropped_malformed} malformed, {dropped_disagreement} sample-disagreement, \
-         {deduped} duplicate, {store_failed} store-failed)",
+        "  extraction funnel: {facts_proposed} proposed → {} stored \
+         ({stored_trusted} verified, {stored_unverified} stored-unverified \
+         [excluded from default reads, awaiting review], \
+         {dropped_malformed} malformed, {deduped} duplicate, \
+         {store_failed} store-failed)",
         written_facts.len(),
     );
+    if !unverified_by_status.is_empty() {
+        let breakdown: Vec<String> = unverified_by_status
+            .iter()
+            .map(|(status, count)| format!("{count} {status}"))
+            .collect();
+        eprintln!("  unverified by status: {}", breakdown.join(", "));
+    }
 
-    // ── Verified alias pass: reconnect the identities chunking split ──
+    // ── Persist the ontology-extension proposals ───────────────────────
     //
-    // ONE small call over the distinct entity NAMES actually written (no
-    // document text). The model only PROPOSES pairs; code accepts exactly
-    // deterministic normalisation or a defining span found in the document
-    // ("Ti-6Al-4V (Ti64)", "hereafter", "denoted", "also known as") — mere
-    // co-occurrence is rejected. Verified pairs become `same_as` EDGES
-    // between the existing nodes, never destructive merges. A failure here
-    // degrades the run (reported under `alias`), never fails it: every
-    // extracted fact is already stored.
-    let mut alias_written = 0usize;
-    let mut alias_accepted: Vec<serde_json::Value> = Vec::new();
-    let mut alias_rejected: Vec<serde_json::Value> = Vec::new();
-    let alias_error: Option<String>;
+    // Until now these were PRINT-ONLY: `ontology_extensions` in the summary
+    // JSON was the only place a proposal ever landed, and a 91-paper corpus
+    // run lost every one of its 3,947 citation-backed class proposals that
+    // way. The loop can read an ontology; it cannot grow one without this.
+    // Proposals go to the durable governance queue with their citations;
+    // identities already dispositioned (accepted or rejected) are suppressed
+    // and COUNTED, never silently dropped. A store failure is on the errors
+    // spine — a proposal that cannot be stored must say so, not vanish.
+    let mut proposals_enqueued = 0usize;
+    let mut proposals_suppressed = 0usize;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
     {
-        let mut names: Vec<String> = Vec::new();
-        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for fact in &written_facts {
-            for name in [fact.subject.as_str(), fact.object.as_str()] {
-                if seen_names.insert(name) {
-                    names.push(name.to_string());
-                }
-            }
+        use prism_ingest::paper_agent::{class_proposal_queue_item, relation_proposal_queue_item};
+        let document_label = path.display().to_string();
+        let mut queued = Vec::new();
+        for proposal in &proposed_classes {
+            queued.push(class_proposal_queue_item(
+                proposal,
+                &document_label,
+                &prov.tenant,
+                now_secs,
+            ));
         }
-        let pass = prism_ingest::alias::link_aliases(&llm, &names, &corpus).await;
-        if let Some(usage) = pass.usage {
-            let total = llm_usage.get_or_insert(prism_ingest::llm::UsageInfo {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-            });
-            total.prompt_tokens += usage.prompt_tokens;
-            total.completion_tokens += usage.completion_tokens;
-            total.total_tokens += usage.total_tokens;
+        for proposal in &proposed_relations {
+            queued.push(relation_proposal_queue_item(
+                proposal,
+                &document_label,
+                &prov.tenant,
+                now_secs,
+            ));
         }
-        alias_error = pass.error;
-        if let Some(error) = &alias_error {
-            eprintln!("  Note: alias pass unavailable — {error}");
-        }
-        for rejected in &pass.rejected {
-            alias_rejected.push(serde_json::json!({
-                "a": rejected.a,
-                "b": rejected.b,
-                "reason": rejected.reason,
-            }));
-        }
-        for verified in pass.accepted {
-            // Same label rule as the fact writes above: classified when BOTH
-            // endpoints have a class this run resolved, legacy fallback for
-            // both otherwise — the edge must land on the nodes the facts
-            // were written under.
-            let fact = &verified.fact;
-            let nodes = all_classes
-                .get(&fact.subject)
-                .zip(all_classes.get(&fact.object))
-                .map(|(subject, object)| prism_provenance::ClassifiedFactNodes {
-                    subject: prism_provenance::ClassifiedNode {
-                        entity_type: &subject.entity_type,
-                        storage_label: &subject.storage_label,
-                        class_iri: &subject.class_iri,
-                    },
-                    object: prism_provenance::ClassifiedNode {
-                        entity_type: &object.entity_type,
-                        storage_label: &object.storage_label,
-                        class_iri: &object.class_iri,
-                    },
-                });
-            let write = match nodes {
-                Some(nodes) => {
-                    store
-                        .write_classified_fact_with_evidence(
-                            fact,
-                            &prov,
-                            fact.evidence_class,
-                            nodes,
-                            classification,
-                        )
-                        .await
+        for (item, citation_json) in queued {
+            match store
+                .enqueue_ontology_proposal(&item, &citation_json, now_secs)
+                .await
+            {
+                Ok(prism_provenance::OntologyProposalEnqueue::SupersededByDisposition) => {
+                    proposals_suppressed += 1;
                 }
-                None => {
-                    store
-                        .write_fact_with_classification(fact, &prov, classification)
-                        .await
+                Ok(_) => {
+                    proposals_enqueued += 1;
                 }
-            };
-            match write {
-                Ok(()) => {
-                    alias_written += 1;
-                    alias_accepted.push(serde_json::json!({
-                        "a": fact.subject,
-                        "b": fact.object,
-                        "evidence": verified.evidence.describe(),
-                    }));
-                }
-                Err(e) => {
+                Err(error) => {
                     errors.push(format!(
-                        "alias edge write failed ('{} same_as {}'): {e:#}",
-                        fact.subject, fact.object
+                        "persisting ontology proposal '{}' failed: {error:#}",
+                        item.label
                     ));
                 }
             }
         }
-        if !names.is_empty() && alias_error.is_none() {
-            eprintln!(
-                "  alias pass: {} name(s) → {} same_as edge(s) written, {} proposal(s) rejected",
-                names.len(),
-                alias_written,
-                alias_rejected.len(),
-            );
-        }
+    }
+    if proposals_enqueued > 0 || proposals_suppressed > 0 {
+        eprintln!(
+            "  ontology proposals: {proposals_enqueued} queued for governance \
+             (with citations), {proposals_suppressed} suppressed (already \
+             accepted or rejected) — review with `prism ontology proposals list`"
+        );
     }
 
     if let Some(usage) = &llm_usage {
         eprintln!(
             "  LLM usage (billed): {} prompt + {} completion = {} tokens",
             usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        );
-    }
-
-    // ── Repair pass: code tiers first; models never see rendered judgements ──
-    //
-    // Phase 1 ends with the graph built and every refusal in `rejections`.
-    // A deterministic rule decides everything it can — recorded in the
-    // append-only disposition ledger with `code:<rule>` as the
-    // dispositioner and ZERO model calls — and ONLY what code could not
-    // decide is enqueued for the model tier (Phase 2). `dispose` itself
-    // enforces the anti-ratchet invariant: a rendered judgement can never
-    // take the queue path.
-    let repair_policy = prism_ingest::repair::RepairPolicy::default();
-    let document_id = path.display().to_string();
-    let decided_at = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-    let mut repair_dispositions: Vec<serde_json::Value> = Vec::new();
-    let mut repairs_accepted = 0usize;
-    let mut repairs_withdrawn = 0usize;
-    let mut repairs_enqueued = 0usize;
-    // Overlapping windows re-report a boundary refusal by design; it is ONE
-    // refusal, keyed by its item id.
-    let mut seen_repair_items: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for rejection in &rejections {
-        let item_id = prism_ingest::repair::repair_item_id(&document_id, rejection);
-        if !seen_repair_items.insert(item_id.clone()) {
-            continue;
-        }
-        // The repair tier re-checks refusals against the SAME corpus the
-        // grounding gate used — the unwrapped document — or its bar would
-        // silently be narrower than Phase 1's for every wrap-rescued fact
-        // ("same functions, same bar" is repair's own stated invariant).
-        match prism_ingest::repair::dispose(
-            rejection,
-            &document_id,
-            &corpus,
-            &repair_policy,
-            decided_at,
-        ) {
-            Some(disposition) => {
-                if let Err(e) = store.record_repair_disposition(&disposition).await {
-                    errors.push(format!("repair ledger write failed for {item_id}: {e:#}"));
-                    continue;
-                }
-                if disposition.outcome == "accept" {
-                    repairs_accepted += 1;
-                } else {
-                    repairs_withdrawn += 1;
-                }
-                repair_dispositions.push(serde_json::json!({
-                    "item_id": disposition.item_id,
-                    "class": disposition.class,
-                    "outcome": disposition.outcome,
-                    "reason": disposition.reason,
-                    "dispositioner": disposition.dispositioner,
-                    "evidence": disposition.evidence,
-                }));
-            }
-            None => {
-                let item = prism_ingest::repair::queue_item(
-                    rejection,
-                    &document_id,
-                    &prov.tenant,
-                    decided_at,
-                );
-                if let Err(e) = store.enqueue_repair(&item).await {
-                    errors.push(format!("repair enqueue failed for {item_id}: {e:#}"));
-                    continue;
-                }
-                repairs_enqueued += 1;
-            }
-        }
-    }
-    if !rejections.is_empty() {
-        eprintln!(
-            "  repair queue: {} refusal(s) — {} decided by code ({repairs_accepted} accepted, \
-             {repairs_withdrawn} withdrawn, zero model calls), {repairs_enqueued} enqueued \
-             for model repair",
-            seen_repair_items.len(),
-            repairs_accepted + repairs_withdrawn,
         );
     }
 
@@ -8126,6 +8117,14 @@ async fn run_local_text_ingest_file(
         Some(parse_errors.join("; "))
     };
 
+    // LOUD capability refusal (§D.5): a document that EVERY sample showed
+    // the routed model could not read must say so on stderr as well as in
+    // the machine-readable summary — a thin result must not pass quietly
+    // as a quiet paper.
+    for verdict in &model_insufficient {
+        eprintln!("  WARNING: {}", verdict.detail);
+    }
+
     Ok(serde_json::json!({
         "backend": "local_text",
         "path": path.display().to_string(),
@@ -8135,6 +8134,7 @@ async fn run_local_text_ingest_file(
         "facts_written": written_facts.len(),
         "model": agent_id,
         "store": db_path.display().to_string(),
+        "source_text_snapshot": source_text_snapshot.display().to_string(),
         "warning": warning,
         // Coverage, reported where a log line cannot be lost: the subscriber
         // is built with `EnvFilter::from_default_env()`, whose default
@@ -8143,50 +8143,44 @@ async fn run_local_text_ingest_file(
         // accompanied by entries in `errors` (→ FAILED STEPS, non-zero exit).
         "chunks_total": chunks_total,
         "chunks_processed": chunks_processed,
-        // The extraction funnel: every proposed fact attributed to the stage
-        // that refused it (or to the write). The counters PARTITION
-        // facts_proposed — dropped_ungrounded + dropped_units +
-        // dropped_malformed + deduped + store_failed + facts_written =
-        // facts_proposed — so "58 extracted, 4 stored" stops being an
-        // anecdote and becomes a diagnosis.
+        // The extraction funnel: every proposed fact attributed to where it
+        // ended up. The counters PARTITION facts_proposed —
+        // stored_trusted + stored_unverified + dropped_malformed + deduped
+        // + store_failed = facts_proposed — so "58 extracted, 4 stored"
+        // stops being an anecdote and becomes a diagnosis. Under
+        // annotate-not-refuse a failed check stores the fact with a weak
+        // verification status (`stored_unverified`, broken down by status)
+        // instead of dropping it; only unstorable shapes are dropped.
         "funnel": {
             "facts_proposed": facts_proposed,
-            "dropped_ungrounded": dropped_ungrounded,
-            "dropped_disagreement": dropped_disagreement,
-            "dropped_units": dropped_units,
+            "stored_trusted": stored_trusted,
+            "stored_unverified": stored_unverified,
+            "unverified_by_status": unverified_by_status,
             "dropped_malformed": dropped_malformed,
             "deduped": deduped,
             "store_failed": store_failed,
             "facts_written": written_facts.len(),
         },
-        // The verified alias pass: `same_as` edges written (with the
-        // evidence that justified each), proposals code rejected, and the
-        // degradation reason when the pass could not run. Alias edges are
-        // additive to `facts_written` and outside the funnel — they are not
-        // extraction proposals.
-        "alias": {
-            "written": alias_written,
-            "accepted": alias_accepted,
-            "rejected": alias_rejected,
-            "error": alias_error,
-        },
         "parse_error": parse_error,
-        // Facts dropped ONE BY ONE during extraction: malformed shape, or a
-        // unit that resolves to no QUDT identifier (a numeric value is never
-        // stored with its unit discarded — that once made 880 GPa
-        // indistinguishable from 880 MPa). Same contract as the tabular
-        // pipeline's `dropped_relationships`: a PARTIAL result the summary
-        // must surface, never a silent drop.
+        // Facts dropped ONE BY ONE during extraction — only shapes the
+        // store cannot represent (for example, undeserializable fact JSON).
+        // Non-empty unit terms are preserved; absent or empty numeric units
+        // are stored under `unit_unresolved`, not dropped. A
+        // failed CHECK no longer drops a fact: it stores it under a weak
+        // verification status (see `funnel.stored_unverified`). Same
+        // contract as the tabular pipeline's `dropped_relationships`: a
+        // PARTIAL result the summary must surface, never a silent drop.
         "dropped_facts": dropped_facts,
-        // The repair pass over those refusals: what code decided alone
-        // (ledgered, zero model calls) and what was enqueued for Phase 2's
-        // model tier. Rendered judgements are never enqueued — the code
-        // tiers enforce that, not this summary.
+        // Compatibility counters for clients that consumed the old summary.
+        // Fresh paper-agent proposals never enter the legacy repair queue:
+        // malformed tool calls receive retryable errors inside the bounded
+        // loop, and any still-unrepresentable result is reported above with
+        // its complete tool trace rather than handed to a second domain prompt.
         "repairs": {
-            "code_accepted": repairs_accepted,
-            "code_withdrawn": repairs_withdrawn,
-            "enqueued_for_model": repairs_enqueued,
-            "dispositions": repair_dispositions,
+            "code_accepted": 0,
+            "code_withdrawn": 0,
+            "enqueued_for_model": 0,
+            "dispositions": [],
         },
         // Chunk-level step failures: extraction or store-write failures for
         // individual chunks. The OTHER chunks' facts are already stored — a
@@ -8194,6 +8188,40 @@ async fn run_local_text_ingest_file(
         "errors": errors,
         // What the run actually cost, when the backend reports usage.
         "llm_usage": llm_usage,
+        // The complete population-loop audit surface. `traces` retains every
+        // tool name, argument and result; the totals make budget behaviour
+        // easy to inspect without first traversing the nested trace.
+        "paper_agent": {
+            "loops": agent_traces.len(),
+            "turns": agent_turns,
+            "tool_calls": agent_tool_calls,
+            // Samples that got no agreement vote because they never had a
+            // fair chance to read the document, each with the measured
+            // reason.
+            "agreement_exclusions": agreement_exclusions,
+            "traces": agent_traces,
+        },
+        // Non-empty means EVERY sample of those chunks showed the routed
+        // model was not capable of reading the document. The annotated facts
+        // are retained; the verdict names the model, the numbers, and what
+        // to change — a thin result must not masquerade as a quiet paper.
+        "model_insufficient": model_insufficient,
+        // Ontology evolution is a separate governed product. Population only
+        // records what the reader proposed against the selected ontology; it
+        // never mutates that ontology during extraction.
+        "ontology_extensions": {
+            "classes": proposed_classes,
+            "relations": proposed_relations,
+        },
+        // The durable half of the same record: every proposal above is also
+        // queued (with its citations) in the governance store, so review —
+        // not stdout — is where a proposal lives or dies. `suppressed`
+        // counts identities already accepted or rejected, which are never
+        // re-queued.
+        "ontology_proposal_queue": {
+            "enqueued": proposals_enqueued,
+            "suppressed": proposals_suppressed,
+        },
         // Facts that already exist under a mesh peer tenant — the loud
         // half of the laundering tripwire (see the WARNING above).
         "peer_echoes": peer_echoes,
@@ -8206,16 +8234,12 @@ async fn run_local_text_ingest_file(
     }))
 }
 
-/// Phase 2 of the document path: drain the document's repair queue ONE
-/// ITEM AT A TIME through the model tier ([`prism_ingest::repair_worker`]).
+/// Drain a legacy document repair queue one item at a time.
 ///
-/// Phase 1 ([`run_local_text_ingest_file`]) builds the graph, decides every
-/// refusal the code tiers can decide, and enqueues the rest. THIS is the
-/// only thing that works that queue. The document text is re-read with the
-/// SAME reader Phase 1 used, the worker makes at most one model call per
-/// item, and every item ends in an explicit accept or withdraw — ledgered
-/// with who decided and on what evidence. An accepted repair is written
-/// through the normal write path.
+/// Fresh paper-agent population never writes this queue: invalid tool calls
+/// receive retryable errors inside the bounded loop, and valid cited facts
+/// are stored directly. This command remains solely so installations with
+/// pre-agent queue rows can finish or withdraw that already-persisted work.
 async fn run_local_repair_pass(
     path: &Path,
     project_root: &Path,
@@ -8242,9 +8266,12 @@ async fn run_local_repair_pass(
         bail!("No readable text found in {}", path.display());
     }
 
-    // The queue is keyed by the path Phase 1 SHOWED — the same display
-    // string, so the same path must be passed here.
-    let document_id = path.display().to_string();
+    // Phase 1 records a canonical absolute path so retrieval can re-open the
+    // cited source. Resolve the same key here when draining its repair queue.
+    let document_id = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string();
 
     let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
     let agent_id = if llm_cfg.model.is_empty() {
@@ -8288,8 +8315,14 @@ async fn run_local_repair_pass(
         agent_kind: "SoftwareAgent".into(),
         source_entity_id: document_id.clone(),
         source_kind: "Document".into(),
-        // Local single-user store — same tenancy as Phase 1.
-        tenant: "local".into(),
+        // Same composed tenancy as Phase 1 — one isolation contract for
+        // every path. Today the repair pass refuses non-default ontologies,
+        // so this still composes to the bare "local"; the shape is here so
+        // the contract does not regress the day that gate opens.
+        tenant: prism_ingest::ontologies::storage_tenant(
+            prism_provenance::LOCAL_TENANT,
+            ontology.id(),
+        ),
         started_at: now.clone(),
         ended_at: now,
         locality: "local".into(),
@@ -8319,6 +8352,7 @@ async fn run_local_repair_pass(
         classification,
         &policy,
         decided_at,
+        ontology.as_ref(),
     )
     .await?;
 
@@ -8647,16 +8681,34 @@ fn print_ingest_summary(summary: &serde_json::Value) {
                                 .unwrap_or(0)
                         };
                         println!(
-                            "  Funnel: {} proposed -> {} written ({} ungrounded, {} \
-                             unit-refused, {} malformed, {} duplicate, {} store-failed)",
+                            "  Funnel: {} proposed -> {} stored ({} verified, {} \
+                             stored-unverified, {} malformed, {} duplicate, {} store-failed)",
                             count("facts_proposed"),
                             count("facts_written"),
-                            count("dropped_ungrounded"),
-                            count("dropped_units"),
+                            count("stored_trusted"),
+                            count("stored_unverified"),
                             count("dropped_malformed"),
                             count("deduped"),
                             count("store_failed"),
                         );
+                        // The unverified facts are excluded from default
+                        // reads and awaiting review — say so, by status,
+                        // where the user can see it.
+                        if let Some(by_status) = funnel
+                            .get("unverified_by_status")
+                            .and_then(|value| value.as_object())
+                            .filter(|map| !map.is_empty())
+                        {
+                            let breakdown: Vec<String> = by_status
+                                .iter()
+                                .map(|(status, count)| format!("{count} {status}"))
+                                .collect();
+                            println!(
+                                "  Unverified (excluded from default reads, findable \
+                                 with `prism query --include-unverified`): {}",
+                                breakdown.join(", ")
+                            );
+                        }
                     }
                     if let Some(alias) = summary.get("alias") {
                         let written = alias
@@ -8839,20 +8891,19 @@ fn dropped_entities_report(result: &serde_json::Value) -> Option<String> {
 
 /// The per-fact drop report for one local TEXT ingest, same contract as
 /// [`dropped_relationships_report`]: extracted facts that were NOT written
-/// because they were malformed or carried a unit that resolves to no QUDT
-/// identifier — one entry per dropped fact, with the reason. A numeric
-/// value whose unit cannot be resolved is dropped WHOLE, never stored
-/// unit-less (unit-less floats once made 880 GPa indistinguishable from
-/// 880 MPa). A drop is a PARTIAL result (the valid remainder was stored,
-/// exit stays 0), never a silent one. `None` when nothing was dropped.
+/// because their shape cannot be represented — one entry per dropped fact,
+/// with the reason. Unit vocabulary is not a drop gate: non-empty terms are
+/// preserved exactly, while missing or empty numeric units are stored with a
+/// `unit_unresolved` annotation. A drop is a PARTIAL result (the valid
+/// remainder was stored, exit stays 0), never a silent one. `None` when
+/// nothing was dropped.
 fn dropped_facts_report(summary: &serde_json::Value) -> Option<String> {
     let dropped = summary.get("dropped_facts")?.as_array()?;
     if dropped.is_empty() {
         return None;
     }
     let mut out = format!(
-        "  Dropped: {} extracted fact(s) NOT stored (a value whose unit cannot be \
-         resolved to a QUDT identifier is dropped whole, never stored unit-less):",
+        "  Dropped: {} extracted fact(s) NOT stored because their shape could not be represented:",
         dropped.len(),
     );
     for reason in dropped.iter().filter_map(|value| value.as_str()) {
@@ -12422,6 +12473,7 @@ async fn run_batch_campaign_entrypoint(project_root: &Path) -> Result<bool> {
                 description: inputs.goal,
                 elements: inputs.elements.into_vec(),
                 objective: inputs.objective,
+                target_property: None,
                 constraints: inputs.constraints.into_vec(),
                 seeds: inputs.seeds.into_vec(),
             },
@@ -12987,6 +13039,7 @@ async fn local_ontology_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
+    verification: prism_provenance::VerificationFilter,
 ) -> Option<LocalOntologyResults> {
     let store = match prism_provenance::ProvenanceStore::open(db_path).await {
         Ok(store) => store,
@@ -13024,10 +13077,12 @@ async fn local_ontology_lookup(
     }
 
     // Provenance-backed assertions mentioning the query term — the
-    // complete shape, so evidence class and owning tenant reach the
-    // printer instead of being fetched and thrown away.
+    // complete shape, so evidence class, verification status, and owning
+    // tenant reach the printer instead of being fetched and thrown away.
+    // The default filter is the TRUSTED subset; `--include-unverified`
+    // widens it to everything, statuses shown.
     let facts = match store
-        .recall_with_context_scoped(text, &tenants, limit)
+        .recall_with_context_filtered(text, &tenants, limit, verification)
         .await
     {
         Ok(facts) => facts,
@@ -13197,9 +13252,19 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
     if !results.facts.is_empty() {
         let _ = writeln!(out, "\n  {} recalled fact(s):\n", results.facts.len());
         for fact in &results.facts {
+            // An unverified fact is NEVER printed bare: its status (and the
+            // check's reason, when recorded) rides the line, so nothing
+            // weak can pose as verified in the output.
+            let verification = match fact.verification_status {
+                Some(status) if !status.is_trusted() => match &fact.verification_reason {
+                    Some(reason) => format!(", UNVERIFIED {} — {reason}", status.as_str()),
+                    None => format!(", UNVERIFIED {}", status.as_str()),
+                },
+                _ => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "  {} -[{}]-> {}  (confidence {:.2}, evidence {}, source {}){}",
+                "  {} -[{}]-> {}  (confidence {:.2}, evidence {}, source {}{verification}){}",
                 fact.subject,
                 fact.predicate,
                 fact.object,
@@ -13213,7 +13278,12 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
     out
 }
 
-async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
+async fn handle_query(
+    text: &str,
+    semantic: bool,
+    limit: usize,
+    include_unverified: bool,
+) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let turso_db = PathBuf::from(home).join(".prism/provenance.db");
 
@@ -13245,10 +13315,21 @@ async fn handle_query(text: &str, semantic: bool, limit: usize) -> Result<()> {
         // backend; no running services required.
         println!("Querying knowledge graph: \"{text}\"\n");
 
-        if let Some(local) = local_ontology_lookup(&turso_db, text, limit).await {
-            print!("{}", format_local_ontology(&local));
+        let filter = if include_unverified {
+            prism_provenance::VerificationFilter::Any
         } else {
+            prism_provenance::VerificationFilter::Trusted
+        };
+        if let Some(local) = local_ontology_lookup(&turso_db, text, limit, filter).await {
+            print!("{}", format_local_ontology(&local));
+        } else if include_unverified {
             println!("  No direct matches. Try --semantic for vector search.");
+        } else {
+            println!(
+                "  No direct matches. Try --semantic for vector search, or \
+                 --include-unverified to also search facts whose ingest checks \
+                 did not verify them."
+            );
         }
     }
 
@@ -14442,6 +14523,87 @@ fn validate_run_backend_target(
     Ok(())
 }
 
+/// HyperQueue flags for `prism run`, bundled so `handle_run`'s signature does
+/// not grow five more positional parameters.
+struct HqRunFlags<'a> {
+    tasks: Option<&'a str>,
+    workers: u32,
+    server_dir: Option<&'a str>,
+    autoalloc: Option<&'a str>,
+    time_limit: &'a str,
+    extra: &'a [String],
+}
+
+impl HqRunFlags<'_> {
+    fn any_set(&self) -> bool {
+        self.tasks.is_some()
+            || self.server_dir.is_some()
+            || self.autoalloc.is_some()
+            || !self.extra.is_empty()
+    }
+}
+
+/// Validate the HyperQueue flag set against the chosen backend. HyperQueue
+/// is many independent tasks in one HQ job — a task-set file is mandatory,
+/// and mixing BYOC target flags in is a misconfiguration, not a fallback.
+fn validate_run_hyperqueue(
+    backend: &str,
+    hq: &HqRunFlags<'_>,
+    ssh: Option<&str>,
+    k8s_context: Option<&str>,
+    slurm: Option<&str>,
+) -> Result<()> {
+    let byoc_target_given = ssh.is_some() || k8s_context.is_some() || slurm.is_some();
+    if backend == "hyperqueue" || backend == "hq" {
+        if byoc_target_given {
+            // `handle_run` dispatches on --ssh/--k8s-context/--slurm BEFORE
+            // the backend string, so this combination would silently run on
+            // BYOC and drop the task set on the floor. Refuse it instead.
+            anyhow::bail!(
+                "--backend hyperqueue cannot be combined with --ssh, --k8s-context, \
+                 or --slurm (those select a BYOC target); a task set is one HQ job, \
+                 not a Slurm submission"
+            );
+        }
+        if hq.tasks.is_none() {
+            anyhow::bail!(
+                "--backend hyperqueue requires --hq-tasks <FILE>: a JSON array of \
+                 task objects such as [{{\"command\":[\"python3\",\"ingest.py\",\"paper.pdf\"]}}] \
+                 — a task set does not fit --input key=value strings"
+            );
+        }
+        if hq.workers == 0 {
+            anyhow::bail!("--hq-workers must be at least 1");
+        }
+        if let Some(scheduler) = hq.autoalloc
+            && scheduler != "slurm"
+            && scheduler != "pbs"
+        {
+            anyhow::bail!("--hq-autoalloc must be `slurm` or `pbs`, got {scheduler:?}");
+        }
+        return Ok(());
+    }
+    if hq.any_set() || hq.workers != 2 {
+        anyhow::bail!(
+            "--hq-* flags belong to --backend hyperqueue; this run uses backend {backend:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Read and parse a HyperQueue task-set file. Fails with the file path and
+/// the serde context so a malformed task is fixable from the error alone.
+fn load_hq_tasks(path: &str) -> Result<Vec<prism_compute::HqTask>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read the HyperQueue task file {path:?}"))?;
+    serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "{path:?} is not a HyperQueue task set: expected a JSON array of \
+             {{\"command\": [\"...\"], \"cwd\"?: \"...\", \"env\"?: {{...}}, \"stdin\"?: \"...\"}} objects"
+        )
+    })
+}
+
 fn run_job_status_hint(resolved_backend: &str, job_id: uuid::Uuid) -> Option<String> {
     (resolved_backend != "local").then(|| format!("Check status:  prism job-status {job_id}"))
 }
@@ -14476,6 +14638,7 @@ async fn handle_run(
     slurm_ntasks: Option<u32>,
     slurm_array: Option<&str>,
     slurm_dependency_afterok: Option<u64>,
+    hq: &HqRunFlags<'_>,
     json: bool,
 ) -> Result<()> {
     use prism_compute::ExperimentPlan;
@@ -14483,6 +14646,7 @@ async fn handle_run(
     use prism_compute::byoc::{ByocTarget, SlurmJobConfig};
 
     validate_run_backend_target(backend, ssh, k8s_context, slurm)?;
+    validate_run_hyperqueue(backend, hq, ssh, k8s_context, slurm)?;
 
     // Parse key=value inputs into JSON
     let mut input_map = serde_json::Map::new();
@@ -14490,6 +14654,17 @@ async fn handle_run(
         if let Some((k, v)) = kv.split_once('=') {
             input_map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
         }
+    }
+
+    // A HyperQueue run carries its task set as a real JSON array, not a
+    // string — `--input key=value` can only produce strings, so task sets
+    // arrive via --hq-tasks and are spliced in here.
+    if let Some(tasks_path) = hq.tasks {
+        let tasks = load_hq_tasks(tasks_path)?;
+        input_map.insert(
+            "tasks".to_string(),
+            serde_json::to_value(&tasks).context("failed to serialise the HyperQueue task set")?,
+        );
     }
 
     let inputs_json = serde_json::Value::Object(input_map);
@@ -14591,6 +14766,46 @@ async fn handle_run(
                     }),
                 )
             }
+            "hyperqueue" | "hq" => {
+                use prism_compute::hyperqueue::{HqMode, HqScheduler, HyperQueueConfig};
+
+                let server_dir = hq
+                    .server_dir
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| data_dir.join("hyperqueue"));
+                let mode = match hq.autoalloc {
+                    Some(scheduler) => HqMode::AutoAlloc {
+                        scheduler: match scheduler {
+                            "slurm" => HqScheduler::Slurm,
+                            "pbs" => HqScheduler::Pbs,
+                            other => anyhow::bail!(
+                                "--hq-autoalloc must be `slurm` or `pbs`, got {other:?}"
+                            ),
+                        },
+                        time_limit: hq.time_limit.to_string(),
+                        extra_args: hq.extra.to_vec(),
+                    },
+                    None => HqMode::Standalone {
+                        workers: hq.workers,
+                    },
+                };
+                let config = HyperQueueConfig {
+                    binary: "hq".into(),
+                    server_dir: server_dir.clone(),
+                    mode,
+                    startup_timeout: prism_compute::hyperqueue::DEFAULT_STARTUP_TIMEOUT,
+                };
+                (
+                    ComputeRouter::local_only_persistent(data_dir)?.with_hyperqueue(config),
+                    "hyperqueue",
+                    serde_json::json!({
+                        "kind": "hyperqueue",
+                        "mode": hq.autoalloc.unwrap_or("standalone"),
+                        "server_dir": server_dir.display().to_string(),
+                        "workers": hq.workers,
+                    }),
+                )
+            }
             _ => (
                 ComputeRouter::local_only_persistent(data_dir)?,
                 "local",
@@ -14617,6 +14832,7 @@ async fn handle_run(
         .await
         .context("submitted job is missing its tracking record")?;
     let slurm_job_id = submitted_record.slurm_job_id;
+    let hyperqueue_job_id = submitted_record.hyperqueue_job_id;
 
     // Brief poll for initial status
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -14635,6 +14851,9 @@ async fn handle_run(
             if let Some(slurm_job_id) = slurm_job_id {
                 object.insert("slurm_job_id".to_string(), slurm_job_id.into());
             }
+            if let Some(hq_job_id) = hyperqueue_job_id {
+                object.insert("hyperqueue_job_id".to_string(), hq_job_id.into());
+            }
             match status_result {
                 Ok(status) => {
                     object.insert("initial_status".to_string(), serde_json::to_value(status)?);
@@ -14652,6 +14871,9 @@ async fn handle_run(
         println!("Job submitted: {job_id}");
         if let Some(slurm_job_id) = slurm_job_id {
             println!("SLURM job id: {slurm_job_id}");
+        }
+        if let Some(hq_job_id) = hyperqueue_job_id {
+            println!("HyperQueue job id: {hq_job_id}");
         }
         if let Some(hint) = run_job_status_hint(resolved_backend, job_id) {
             println!("{hint}");
@@ -14702,6 +14924,16 @@ async fn handle_job_status(paths: &PrismPaths, job_id_str: &str) -> Result<()> {
             job_id,
             record.slurm_job_id,
         )),
+        JobTarget::HyperQueue { server_dir } => {
+            // The tracker persisted the HQ job id at submit time; resuming
+            // the backend with it is all cross-process status needs. If the
+            // `hq` binary or the server is gone, `status` says so honestly.
+            Box::new(prism_compute::HyperQueueBackend::resume(
+                prism_compute::HyperQueueConfig::standalone(server_dir, 1),
+                job_id,
+                record.hyperqueue_job_id,
+            ))
+        }
         JobTarget::Local => anyhow::bail!(
             "job {job_id} used local compute; cross-process local container status is not supported"
         ),
@@ -15374,28 +15606,32 @@ mod tests {
         assert_eq!(extraction_decoding_report(&serde_json::json!({})), None);
     }
 
-    /// Facts the TEXT extractor dropped one by one (unresolvable unit,
-    /// malformed shape) must reach the user's summary — count AND per-fact
-    /// reason, same contract as dropped relationships/entities on the
-    /// tabular path. A drop only visible in `--json` is silent for everyone
-    /// else, and a silently vanished measurement is exactly the failure
-    /// mode this path exists to prevent.
+    /// Facts whose malformed shape the TEXT extractor cannot represent must
+    /// reach the user's summary — count AND per-fact reason, same contract as
+    /// dropped relationships/entities on the tabular path. Unit vocabulary
+    /// does not enter this bucket: non-empty terms are preserved and absent
+    /// terms are annotated on stored facts.
     #[test]
     fn dropped_facts_reach_the_ingest_summary() {
+        // CONTRACT CHANGE (agentic paper reading): this fixture used to call
+        // an arbitrary unit spelling a drop. The only drop contract left is
+        // an actually unrepresentable proposal shape.
         let summary = serde_json::json!({
             "backend": "local_text",
             "facts_written": 2,
             "dropped_facts": [
-                "'steel has_measurement hardness': unit \"banana\" is neither a QUDT \
-                 identifier nor a recognised unit spelling carrying numeric value 250"
+                "'sample has_property ?': malformed fact: missing field `object`"
             ],
         });
         let report =
             dropped_facts_report(&summary).expect("a non-empty drop list must produce a report");
         assert!(report.contains("1 extracted fact(s)"), "{report}");
-        assert!(report.contains("banana"), "{report}");
+        assert!(report.contains("missing field `object`"), "{report}");
         assert!(report.contains("NOT stored"), "{report}");
-        assert!(report.contains("never stored unit-less"), "{report}");
+        assert!(
+            report.contains("shape could not be represented"),
+            "{report}"
+        );
 
         // Nothing dropped (or a shape without the field) ⇒ no report line.
         assert_eq!(
@@ -15594,6 +15830,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn exact_source_text_snapshot_is_hash_addressed_and_reopenable() {
+        let home = tempfile::tempdir().unwrap();
+        let text = "first line\nsecond line\n";
+
+        let first = persist_source_text_snapshot(home.path(), text).unwrap();
+        let second = persist_source_text_snapshot(home.path(), text).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), text);
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("c2097f55f01fc297fc7f4acf21438123e06e4d409a818524428534e850642f4f.txt")
+        );
+    }
 
     #[test]
     fn campaign_rewards_include_text_evidence_tokens() {
@@ -16892,6 +17144,147 @@ mod tests {
         }
     }
 
+    const NO_HQ_EXTRA: &[String] = &[];
+
+    fn hq_flags(
+        tasks: Option<&'static str>,
+        autoalloc: Option<&'static str>,
+    ) -> HqRunFlags<'static> {
+        HqRunFlags {
+            tasks,
+            workers: 2,
+            server_dir: None,
+            autoalloc,
+            time_limit: "1h",
+            extra: NO_HQ_EXTRA,
+        }
+    }
+
+    #[test]
+    fn hyperqueue_backend_requires_a_tasks_file() {
+        let hq = hq_flags(None, None);
+        let error = validate_run_hyperqueue("hyperqueue", &hq, None, None, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("--hq-tasks"), "{message}");
+    }
+
+    #[test]
+    fn hyperqueue_backend_rejects_byoc_target_flags() {
+        // --slurm would silently win dispatch over --backend hyperqueue and
+        // drop the task set; validation must refuse the combination.
+        let hq = hq_flags(Some("tasks.json"), None);
+        let error =
+            validate_run_hyperqueue("hyperqueue", &hq, None, None, Some("u@h")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("cannot be combined"), "{message}");
+    }
+
+    #[test]
+    fn hyperqueue_backend_rejects_unknown_autoalloc_scheduler() {
+        let hq = hq_flags(Some("tasks.json"), Some("lsf"));
+        let error = validate_run_hyperqueue("hyperqueue", &hq, None, None, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("slurm"), "{message}");
+        assert!(message.contains("pbs"), "{message}");
+    }
+
+    #[test]
+    fn hyperqueue_flags_are_rejected_on_other_backends() {
+        let hq = hq_flags(Some("tasks.json"), None);
+        let error = validate_run_hyperqueue("local", &hq, None, None, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("--hq-* flags belong to"), "{message}");
+    }
+
+    #[test]
+    fn hyperqueue_flags_absent_is_fine_on_other_backends() {
+        let hq = hq_flags(None, None);
+        assert!(validate_run_hyperqueue("byoc", &hq, Some("u@h"), None, None).is_ok());
+    }
+
+    #[test]
+    fn hyperqueue_task_file_parses_and_reports_its_path() {
+        let dir = std::env::temp_dir().join(format!("prism-cli-hq-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tasks_path = dir.join("tasks.json");
+        std::fs::write(
+            &tasks_path,
+            r#"[{"command":["python3","ingest.py","paper-47.pdf"],"cwd":"/work/corpus",
+               "env":{"VENV":"/work/venv"}}]"#,
+        )
+        .unwrap();
+
+        let tasks = load_hq_tasks(tasks_path.to_str().unwrap()).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].command, ["python3", "ingest.py", "paper-47.pdf"]);
+        assert_eq!(tasks[0].cwd.as_deref(), Some("/work/corpus"));
+        assert_eq!(
+            tasks[0].env.get("VENV").map(String::as_str),
+            Some("/work/venv")
+        );
+
+        std::fs::write(&tasks_path, "[{\"command\": \"not-an-array\"}]").unwrap();
+        let error = load_hq_tasks(tasks_path.to_str().unwrap()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("tasks.json"), "{message}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cli_parses_hyperqueue_options() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "run",
+            "--backend",
+            "hyperqueue",
+            "--hq-tasks",
+            "/work/corpus/tasks.json",
+            "--hq-workers",
+            "2",
+            "--hq-server-dir",
+            "/work/hq",
+            "--hq-autoalloc",
+            "slurm",
+            "--hq-time-limit",
+            "4h",
+            "--hq-extra",
+            "--partition=main",
+            "--hq-extra",
+            "--account=alloc",
+            "unused-by-hyperqueue",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Run(run) => {
+                let RunArgs {
+                    hq_tasks,
+                    hq_workers,
+                    hq_server_dir,
+                    hq_autoalloc,
+                    hq_time_limit,
+                    hq_extra,
+                    backend,
+                    ..
+                } = *run;
+                assert_eq!(backend, "hyperqueue");
+                assert_eq!(hq_tasks.as_deref(), Some("/work/corpus/tasks.json"));
+                assert_eq!(hq_workers, 2);
+                assert_eq!(hq_server_dir.as_deref(), Some("/work/hq"));
+                assert_eq!(hq_autoalloc.as_deref(), Some("slurm"));
+                assert_eq!(hq_time_limit, "4h");
+                assert_eq!(
+                    hq_extra,
+                    [
+                        "--partition=main".to_string(),
+                        "--account=alloc".to_string()
+                    ]
+                );
+            }
+            _ => panic!("expected Run command"),
+        }
+    }
+
     #[test]
     fn cli_parses_run_json_command() {
         let cli = Cli::try_parse_from([
@@ -16906,13 +17299,14 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Commands::Run {
-                image,
-                name,
-                backend,
-                json,
-                ..
-            } => {
+            Commands::Run(run) => {
+                let RunArgs {
+                    image,
+                    name,
+                    backend,
+                    json,
+                    ..
+                } = *run;
                 assert_eq!(image, "ghcr.io/acme/model:latest");
                 assert_eq!(name, "trial");
                 assert_eq!(backend, "marc27");
@@ -16932,7 +17326,7 @@ mod tests {
             "--slurm-partition",
             "gpu",
             "--slurm-account",
-            "esa-materials",
+            "research-alloc",
             "--slurm-time",
             "02:00:00",
             "--slurm-gres",
@@ -16954,19 +17348,20 @@ mod tests {
         .unwrap();
 
         match cli.command.unwrap() {
-            Commands::Run {
-                slurm_account,
-                slurm_time,
-                slurm_gres,
-                slurm_mem,
-                slurm_cpus_per_task,
-                slurm_nodes,
-                slurm_ntasks,
-                slurm_array,
-                slurm_dependency_afterok,
-                ..
-            } => {
-                assert_eq!(slurm_account.as_deref(), Some("esa-materials"));
+            Commands::Run(run) => {
+                let RunArgs {
+                    slurm_account,
+                    slurm_time,
+                    slurm_gres,
+                    slurm_mem,
+                    slurm_cpus_per_task,
+                    slurm_nodes,
+                    slurm_ntasks,
+                    slurm_array,
+                    slurm_dependency_afterok,
+                    ..
+                } = *run;
+                assert_eq!(slurm_account.as_deref(), Some("research-alloc"));
                 assert_eq!(slurm_time.as_deref(), Some("02:00:00"));
                 assert_eq!(slurm_gres.as_deref(), Some("gpu:a100:1"));
                 assert_eq!(slurm_mem.as_deref(), Some("64G"));
@@ -17687,6 +18082,8 @@ data:\n\
             source: "doc:test".into(),
             agent: "prism-ingest".into(),
             tenant: tenant.into(),
+            verification_status: None,
+            verification_reason: None,
         }
     }
 
@@ -17873,6 +18270,8 @@ data:\n\
             confidence: Some(0.9),
             kind: Some("phase".into()),
             evidence_class: prism_provenance::EvidenceClass::Research,
+            verification: None,
+            verification_reason: None,
         };
         let facts = vec![
             material_fact("Ti-6Al-4V", "beta"),      // the peer's fact, echoed
@@ -17895,9 +18294,14 @@ data:\n\
 
         // Fresh (empty) store: clean miss, never an error.
         assert!(
-            local_ontology_lookup(&db.path, "titanium", 10)
-                .await
-                .is_none(),
+            local_ontology_lookup(
+                &db.path,
+                "titanium",
+                10,
+                prism_provenance::VerificationFilter::Trusted
+            )
+            .await
+            .is_none(),
             "empty store must be a clean miss"
         );
 
@@ -17919,8 +18323,12 @@ data:\n\
             origin_source_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
+        // CONTRACT CHANGE: `write_fact` no longer resolves typed graph shapes
+        // from the kind string — the shape is the ontology's declaration.
+        // Write the way the ingest pipeline now does: with the EMMO-declared
+        // shape for the "contains" kind.
         store
-            .write_fact(
+            .write_fact_with_classification(
                 &prism_provenance::LocalFact {
                     subject: "Ti-6Al-4V".into(),
                     predicate: "hasPart".into(),
@@ -17931,15 +18339,25 @@ data:\n\
                     kind: Some("contains".into()),
                 },
                 &prov,
+                prism_provenance::OntologyClassification {
+                    version_iri: "urn:test:ontology:local-lookup",
+                    artifact_sha256: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                },
+                prism_provenance::FactGraphShape::emmo("contains"),
             )
             .await
             .expect("write fact");
 
         // Exact name → neighbor traversal (nodes + edge). A "contains"
         // fact is written as a CONTAINS_ELEMENT edge (see emmo write_fact).
-        let hit = local_ontology_lookup(&db.path, "Ti-6Al-4V", 10)
-            .await
-            .expect("ingested entity must be queryable");
+        let hit = local_ontology_lookup(
+            &db.path,
+            "Ti-6Al-4V",
+            10,
+            prism_provenance::VerificationFilter::Trusted,
+        )
+        .await
+        .expect("ingested entity must be queryable");
         assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
         assert!(
             hit.edges
@@ -17948,23 +18366,38 @@ data:\n\
         );
 
         // Substring → graph_search fallback still finds the node.
-        let hit = local_ontology_lookup(&db.path, "6Al", 10)
-            .await
-            .expect("substring match must be queryable");
+        let hit = local_ontology_lookup(
+            &db.path,
+            "6Al",
+            10,
+            prism_provenance::VerificationFilter::Trusted,
+        )
+        .await
+        .expect("substring match must be queryable");
         assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
 
         // Unknown term → clean miss (caller renders "no matches").
         assert!(
-            local_ontology_lookup(&db.path, "no-such-entity-xyz", 10)
-                .await
-                .is_none()
+            local_ontology_lookup(
+                &db.path,
+                "no-such-entity-xyz",
+                10,
+                prism_provenance::VerificationFilter::Trusted
+            )
+            .await
+            .is_none()
         );
 
         // Unopenable path (directory) → clean miss, never an error.
         assert!(
-            local_ontology_lookup(&std::env::temp_dir(), "titanium", 10)
-                .await
-                .is_none(),
+            local_ontology_lookup(
+                &std::env::temp_dir(),
+                "titanium",
+                10,
+                prism_provenance::VerificationFilter::Trusted
+            )
+            .await
+            .is_none(),
             "store open failure must degrade to a miss"
         );
     }
@@ -18011,9 +18444,14 @@ data:\n\
         store.write_fact(&fact("alpha"), &local).await.unwrap();
         store.write_fact(&fact("beta"), &peer).await.unwrap();
 
-        let hit = local_ontology_lookup(&db.path, "Ti-6Al-4V", 10)
-            .await
-            .expect("both tenants' knowledge must be readable");
+        let hit = local_ontology_lookup(
+            &db.path,
+            "Ti-6Al-4V",
+            10,
+            prism_provenance::VerificationFilter::Trusted,
+        )
+        .await
+        .expect("both tenants' knowledge must be readable");
 
         // The same-named entity appears once PER TENANT — the shadowing
         // trap: if either row disappears, a sync became invisible.
@@ -18295,19 +18733,50 @@ data:\n\
         assert!(msg.contains("llm"), "{msg}");
     }
 
-    /// Text-document ingest is EMMO-wired (EMMO prompt, QUDT-typed facts):
-    /// under any other active ontology it must refuse honestly BEFORE any
-    /// model or runtime is contacted, not extract with the wrong vocabulary.
+    /// CONTRACT CHANGE (agentic paper reading): text ingest now discovers a
+    /// promoted project artifact in a fresh CLI process instead of requiring
+    /// an in-memory registration from the promotion process. A schema-only
+    /// run proves selection without contacting a model/runtime; the reader's
+    /// tool loop receives this same adapter on real runs.
     #[tokio::test]
-    async fn text_ingest_refuses_a_non_default_ontology_honestly() {
-        let dir = project_with_ontology_config("[ontology]\nid = \"chem\"\n");
+    async fn text_ingest_loads_a_promoted_non_default_ontology_from_project() {
+        // CONTRACT CHANGE: the old test expected an early non-EMMO refusal.
+        // Promotion now installs an artifact that a fresh ingest process can
+        // resolve through the same registry used by the paper tools.
+        let dir = project_with_ontology_config("[ontology]\nid = \"text-custom\"\n");
         let root = dir.path();
+        let candidate = root.join("text-custom-candidate.ttl");
+        let draft = prism_ingest::induction::InducedOntology {
+            domain: "text-custom".to_string(),
+            status: prism_ingest::induction::OntologyStatus::Draft,
+            classes: vec![prism_ingest::induction::InducedClass {
+                label: "Compound".to_string(),
+                definition: "A concept supplied by the promoted ontology.".to_string(),
+                parent: None,
+                aligned_iri: None,
+                declared_by_reference: false,
+                sign_domain: None,
+            }],
+            relations: Vec::new(),
+            provenance: prism_ingest::induction::InductionProvenance {
+                corpus_hash: "sha256:text-project-load-test".to_string(),
+                prompt_version: "test".to_string(),
+                ..Default::default()
+            },
+        };
+        prism_ingest::induction::ttl::write_artifact(&candidate, &draft)
+            .expect("write draft ontology artifact");
+        let promoted = prism_ingest::induction::ttl::promote_artifact(&candidate)
+            .expect("promote ontology artifact");
+        crate::ontology_cmd::install_promoted_artifact(root, &promoted)
+            .expect("install promoted ontology for future processes");
+
         let md = root.join("notes.md");
         std::fs::write(&md, "# title\nbody text\n").unwrap();
 
-        // TEST-NET-1 runtime URL: the guard fires before anything is
-        // contacted, so an unreachable address is part of the proof.
-        let err = run_local_text_ingest_file(
+        // TEST-NET-1 runtime URL: schema-only returns before anything is
+        // contacted, so an unreachable address proves selection is local.
+        let out = run_local_text_ingest_file(
             &md,
             root,
             None,
@@ -18320,10 +18789,13 @@ data:\n\
             VisionModelChoice::default(),
         )
         .await
-        .expect_err("a non-default ontology must refuse text ingest");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("EMMO"), "{msg}");
-        assert!(msg.contains("chem"), "{msg}");
+        .expect("a project-installed non-default ontology must reach text ingest");
+        assert_eq!(out["backend"], "local_text");
+        assert_eq!(out["schema_only"], true);
+        assert!(
+            prism_ingest::ontologies::active(Some("text-custom")).is_ok(),
+            "config resolution must register the project artifact for the paper reader"
+        );
     }
 
     /// Build a minimal one-page PDF whose content stream draws `text` —
@@ -18439,14 +18911,12 @@ data:\n\
     /// End-to-end through the PRODUCTION text-ingest path
     /// (`run_local_text_ingest_file` against a mocked OpenAI-shaped LLM):
     ///
-    /// 1. plain unit spellings (`MPa`, `g/cm3`) — what the default local
-    ///    model actually writes — are normalised to QUDT identifiers and
-    ///    STORED, instead of one of them failing the whole document with a
-    ///    bogus "could not be parsed as JSON" report;
-    /// 2. a numeric fact whose unit resolves to nothing is dropped WHOLE —
-    ///    it must not reach the store with a null unit (unit-less floats
-    ///    once made 880 GPa indistinguishable from 880 MPa here);
-    /// 3. the drop arrives in the summary (`dropped_facts`), with a reason.
+    /// 1. non-empty unit terms selected by the reading model, including a
+    ///    customer's non-QUDT term, are STORED exactly instead of translated
+    ///    through a Rust vocabulary;
+    /// 2. an explicitly blank selected term is still stored, explicitly
+    ///    annotated `unit_unresolved` and excluded from trusted reads;
+    /// 3. neither case becomes a per-fact drop or a second repair prompt.
     ///
     /// HOME is overridden under the shared env lock because the production
     /// path derives the store location from `$HOME/.prism` — the point is
@@ -18518,27 +18988,30 @@ data:\n\
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn text_ingest_normalises_units_and_reports_per_fact_drops() {
+    async fn text_ingest_preserves_selected_unit_terms_and_annotates_a_blank_one() {
+        // CONTRACT CHANGE (vocabulary-neutral units): this test formerly
+        // expected Rust to recognise two QUDT identifiers and reject an
+        // arbitrary spelling. It now pins exact preservation of a customer
+        // term and reserves `unit_unresolved` for an explicitly blank term;
+        // absence alone is a semantic choice Rust cannot judge.
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut server = mockito::Server::new_async().await;
         let extraction = r#"{"facts":[
-            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":880.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
-            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"density","value":4.43,"unit":"g/cm3","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
-            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"hardness","value":349.0,"unit":"banana","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":880.0,"unit":"QUDT:MegaPA","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"density","value":4.43,"unit":"customer:U-42","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
+            {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"hardness","value":349.0,"unit":"   ","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
         ]}"#;
+        // Unit terms come from the ontology-reading model. Rust neither
+        // translates them through a glossary nor rejects an unfamiliar
+        // non-empty vocabulary term.
         let _mock = server
             .mock("POST", "/chat/completions")
             .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!({
-                    "choices": [{"message": {"role": "assistant", "content": extraction}}]
-                })
-                .to_string(),
-            )
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extraction_responder(extraction))
             .create_async()
             .await;
 
@@ -18551,7 +19024,7 @@ data:\n\
         let md = root.join("alloy-datasheet.md");
         std::fs::write(
             &md,
-            "Ti-6Al-4V: UTS 880 MPa, density 4.43 g/cm3, hardness 349 banana.",
+            "Ti-6Al-4V: UTS 880 QUDT:MegaPA, density 4.43 customer:U-42, hardness 349.",
         )
         .unwrap();
 
@@ -18570,16 +19043,22 @@ data:\n\
         .await
         .expect("a document with one bad fact must still ingest the good ones");
 
-        // The two normalisable facts landed; the envelope parsed, so the
-        // old "could not be parsed as JSON" misreport must be gone.
-        assert_eq!(summary["facts_written"], 2, "summary: {summary}");
+        // All three facts landed; the envelope parsed, so the old "could
+        // not be parsed as JSON" misreport must be gone.
+        //
+        // The blank-term fact is stored under `unit_unresolved` — excluded
+        // from default reads, findable by filter — so the funnel counts it as
+        // stored-unverified instead of silently losing it.
+        assert_eq!(summary["facts_written"], 3, "summary: {summary}");
         assert_eq!(summary["parse_error"], serde_json::Value::Null);
-        // The funnel partitions every proposal: 3 proposed = 1 unit-refused
-        // + 2 written, nothing unattributed.
         let funnel = &summary["funnel"];
         assert_eq!(funnel["facts_proposed"], 3, "summary: {summary}");
-        assert_eq!(funnel["dropped_units"], 1, "summary: {summary}");
-        assert_eq!(funnel["facts_written"], 2, "summary: {summary}");
+        assert_eq!(funnel["stored_trusted"], 2, "summary: {summary}");
+        assert_eq!(funnel["stored_unverified"], 1, "summary: {summary}");
+        assert_eq!(
+            funnel["unverified_by_status"]["unit_unresolved"], 1,
+            "summary: {summary}"
+        );
         assert_funnel_partitions(funnel);
         let semantic = summary["semantic_validation"]
             .as_array()
@@ -18596,19 +19075,11 @@ data:\n\
                 "an unavailable check cannot pose as passed: {summary}"
             );
         }
-        // The drop is REPORTED, with a reason a human can act on…
+        // Nothing was dropped — the defect travels ON the stored fact.
         let dropped = summary["dropped_facts"]
             .as_array()
             .expect("dropped_facts must be in the summary");
-        assert_eq!(dropped.len(), 1, "summary: {summary}");
-        let reason = dropped[0].as_str().unwrap();
-        assert!(
-            reason.contains("banana") && reason.contains("hardness"),
-            "the reason must name the offending unit and fact: {reason}"
-        );
-        // …and the summary printer renders it (count + reason line).
-        let report = dropped_facts_report(&summary).expect("the printer must surface the drop");
-        assert!(report.contains("banana"), "{report}");
+        assert!(dropped.is_empty(), "summary: {summary}");
 
         // The store the production path wrote is under the overridden HOME.
         let db_path = home.path().join(".prism/provenance.db");
@@ -18626,7 +19097,7 @@ data:\n\
         assert_eq!(
             uts[0].unit.as_deref(),
             Some("QUDT:MegaPA"),
-            "the stored unit must be the NORMALISED identifier"
+            "the selected term must survive byte-for-byte"
         );
         let density = store
             .recall_with_context("density", "local", 10)
@@ -18634,24 +19105,50 @@ data:\n\
             .unwrap();
         assert_eq!(density.len(), 1, "{density:?}");
         assert_eq!(density[0].value, Some(4.43));
-        assert_eq!(density[0].unit.as_deref(), Some("QUDT:GM-PER-CentiM3"));
-        // THE rule: the unresolvable-unit fact is nowhere in the store —
-        // not with a null unit, not with any unit.
+        assert_eq!(density[0].unit.as_deref(), Some("customer:U-42"));
+        // A structurally blank term is invisible to the default (trusted)
+        // read, while its cited fact remains available for review.
         let hardness = store
             .recall_with_context("hardness", "local", 10)
             .await
             .unwrap();
         assert!(
             hardness.is_empty(),
-            "a numeric value whose unit could not be resolved must never be stored: {hardness:?}"
+            "a fact carrying an explicitly blank term must not appear in the \
+             default read: {hardness:?}"
+        );
+        // …but it is PRESENT and findable, with no unit and the status +
+        // reason that say exactly what happened.
+        let quarantined = store
+            .recall_with_context_filtered(
+                "hardness",
+                &["local"],
+                10,
+                prism_provenance::VerificationFilter::Status(
+                    prism_provenance::VerificationStatus::UnitUnresolved,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].value, Some(349.0));
+        assert_eq!(
+            quarantined[0].unit, None,
+            "a blank term becomes absent; no unit may be guessed"
+        );
+        assert!(
+            quarantined[0]
+                .verification_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("is empty")),
+            "{:?}",
+            quarantined[0].verification_reason
         );
 
-        // The repair pass ran at the end of Phase 1: the banana refusal was
-        // decided BY CODE — the document's own spelling ("349 banana")
-        // resolves to nothing, a vocabulary gap withdrawn with zero model
-        // calls — recorded in the ledger, and NOT enqueued for a model.
+        // Nothing reached the repair machinery: no refusal, no ledger row,
+        // no queue item — the record to review lives in the store itself.
         assert_eq!(
-            summary["repairs"]["code_withdrawn"], 1,
+            summary["repairs"]["code_withdrawn"], 0,
             "summary: {summary}"
         );
         assert_eq!(summary["repairs"]["code_accepted"], 0, "summary: {summary}");
@@ -18659,75 +19156,48 @@ data:\n\
             summary["repairs"]["enqueued_for_model"], 0,
             "summary: {summary}"
         );
-        let document_id = md.display().to_string();
-        let ledger = store.repair_dispositions(&document_id).await.unwrap();
-        assert_eq!(ledger.len(), 1, "{ledger:?}");
-        assert_eq!(ledger[0].outcome, "withdraw");
-        assert_eq!(ledger[0].reason, "vocabulary-gap:banana");
+        let document_id = std::fs::canonicalize(&md).unwrap().display().to_string();
         assert!(
-            ledger[0].dispositioner.starts_with("code:"),
-            "an audit must see this was a code rule: {}",
-            ledger[0].dispositioner
+            store
+                .repair_dispositions(&document_id)
+                .await
+                .unwrap()
+                .is_empty()
         );
-        let pending = store.pending_repairs(&document_id, 10).await.unwrap();
         assert!(
-            pending.is_empty(),
-            "a code-decided refusal must not also be queued: {pending:?}"
+            store
+                .pending_repairs(&document_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
     /// THE FULL LOOP through production dispatch: Phase 1 enqueues a
-    /// refusal the code tiers cannot decide (an unknown-kind property, so
-    /// no deterministic unit pick is legal), and `run_local_repair_pass`
-    /// — the `prism ingest --repair` handler — drains it: ONE model call,
-    /// an explicit accept whose correction clears the same gates, the fact
-    /// written through the normal write path, one ledger row by
-    /// `model:<id>`, and an empty queue.
-    ///
-    /// Falsifiable at the shortcut: if the repair pass never ran (or
-    /// batched, or accepted without the gates), the store lacks the fact,
-    /// the ledger lacks the model row, or the mock's `.expect(1)` trips.
+    /// CONTRACT CHANGE: a value-less legacy `measurement` hint is no longer
+    /// a population refusal. The generic relation stores immediately, so a
+    /// later repair run sees no debt and makes no model call.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn repair_pass_drains_the_queue_phase_one_enqueued() {
+    async fn agentic_population_does_not_enqueue_a_representable_relation() {
+        // CONTRACT CHANGE: a closed `measurement` dispatch used to create a
+        // repair item for this value-less relation. The generic cited fact is
+        // representable and fresh agent output never enters the legacy queue.
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Phase 1: the extractor's unit resolves to nothing, and the
-        // property ("elongation") is unknown to the quantity-kind table —
-        // code cannot pick a unit legally, so the item must be ENQUEUED.
-        //
-        // The document prints the SAME value with TWO different units, which
-        // is the refusal that still reaches the queue.
-        //
-        // This fixture used to read "4.5 %" once. Document-first unit
-        // resolution now reads that `%` off the page and stores the fact at
-        // Phase 1 — correctly — so it never reached repair and this test had
-        // nothing to drain. Printing it with no unit at all does not work
-        // either: the page then genuinely cannot answer, and the code tier
-        // WITHDRAWS as a vocabulary gap, which is also correct.
-        //
-        // Ambiguity is what neither can settle. Two resolvable units beside
-        // the same value means document-first refuses to pick (one printed
-        // unit or nothing), and the code tier sees two candidate identifiers
-        // and declines to guess — so it queues for the model tier, which is
-        // exactly the path under test.
         let mut ingest_server = mockito::Server::new_async().await;
         let extraction = r#"{"facts":[
-            {"subject":"steel","predicate":"has_measurement","object":"elongation","value":4.5,"unit":"QUDT:INVENTED","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+            {"subject":"steel","predicate":"has_measurement","object":"elongation","value":null,"unit":null,"conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
         ]}"#;
+        // The two-turn responder forces a read before the cited proposal.
         let _ingest_mock = ingest_server
             .mock("POST", "/chat/completions")
             .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!({
-                    "choices": [{"message": {"role": "assistant", "content": extraction}}]
-                })
-                .to_string(),
-            )
-            .expect(1)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extraction_responder(extraction))
+            .expect(2)
             .create_async()
             .await;
 
@@ -18758,115 +19228,42 @@ data:\n\
             VisionModelChoice::default(),
         )
         .await
-        .expect("the document ingests; the refusal is queued, not lost");
-        assert_eq!(summary["facts_written"], 0, "{summary}");
+        .expect("the representable relation ingests");
+        assert_eq!(summary["facts_written"], 1, "{summary}");
         assert_eq!(summary["repairs"]["code_accepted"], 0, "{summary}");
         assert_eq!(summary["repairs"]["code_withdrawn"], 0, "{summary}");
-        assert_eq!(
-            summary["repairs"]["enqueued_for_model"], 1,
-            "the unknown-kind refusal must queue for the model tier: {summary}"
-        );
+        assert_eq!(summary["repairs"]["enqueued_for_model"], 0, "{summary}");
 
-        let document_id = md.display().to_string();
+        let document_id = std::fs::canonicalize(&md).unwrap().display().to_string();
         let db_path = home.path().join(".prism/provenance.db");
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .expect("the store Phase 1 wrote must open");
         assert_eq!(
             store.pending_repairs(&document_id, 10).await.unwrap().len(),
-            1,
-            "the queue holds the refusal Phase 1 could not decide"
+            0,
+            "a representable relation must not become repair debt"
         );
-
-        // Phase 2: the repair pass picks the unit the document prints,
-        // from the closed vocabulary. ONE call — `.expect(1)` kills a
-        // retry loop or a batch re-prompt.
-        let mut repair_server = mockito::Server::new_async().await;
-        let repair_reply = serde_json::json!({
-            "decision": "accept",
-            "corrected": {
-                "subject": "steel", "predicate": "has_measurement", "object": "elongation",
-                "value": 4.5, "unit": "QUDT:PERCENT", "kind": "measurement",
-                "confidence": 0.9, "evidence_class": "research", "conditions": []
-            },
-            "reason": "the document prints the value with a percent sign"
-        })
-        .to_string();
-        let _repair_mock = repair_server
-            .mock("POST", "/chat/completions")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!({
-                    "choices": [{"message": {"role": "assistant", "content": repair_reply}}]
-                })
-                .to_string(),
-            )
-            .expect(1)
-            .create_async()
-            .await;
 
         let repair_summary = run_local_repair_pass(
             &md,
             root,
             Some("test-repairer"),
-            Some(&repair_server.url()),
+            Some(&ingest_server.url()),
             None,
             "http://192.0.2.1:1",
         )
         .await
-        .expect("the repair pass completes");
+        .expect("an empty repair queue is not an error");
         assert_eq!(repair_summary["backend"], "local_repair");
-        assert_eq!(repair_summary["items_seen"], 1, "{repair_summary}");
-        assert_eq!(repair_summary["accepted"], 1, "{repair_summary}");
+        assert_eq!(repair_summary["items_seen"], 0, "{repair_summary}");
+        assert_eq!(repair_summary["accepted"], 0, "{repair_summary}");
         assert_eq!(repair_summary["withdrawn"], 0, "{repair_summary}");
-        assert_eq!(repair_summary["model_calls"], 1, "{repair_summary}");
+        assert_eq!(repair_summary["model_calls"], 0, "{repair_summary}");
         assert!(
             repair_summary["errors"].as_array().unwrap().is_empty(),
             "{repair_summary}"
         );
-
-        // The repaired fact is in the graph with the corrected unit…
-        let recalled = store
-            .recall_with_context("elongation", "local", 10)
-            .await
-            .unwrap();
-        assert_eq!(recalled.len(), 1, "{recalled:?}");
-        assert_eq!(recalled[0].value, Some(4.5));
-        assert_eq!(recalled[0].unit.as_deref(), Some("QUDT:PERCENT"));
-
-        // …the ledger shows WHO decided and on WHAT evidence…
-        let ledger = store.repair_dispositions(&document_id).await.unwrap();
-        assert_eq!(ledger.len(), 1, "{ledger:?}");
-        assert_eq!(ledger[0].outcome, "accept");
-        assert_eq!(ledger[0].dispositioner, "model:test-repairer");
-        let evidence = ledger[0].evidence.as_deref().expect("evidence recorded");
-        assert!(evidence.contains("elongation of 4.5 %"), "{evidence}");
-
-        // …and the queue is drained — nothing left owed.
-        assert!(
-            store
-                .pending_repairs(&document_id, 10)
-                .await
-                .unwrap()
-                .is_empty(),
-            "the repair pass must drain what it decides"
-        );
-
-        // A second run says "nothing to do" honestly — zero model calls,
-        // no re-judging of what was already decided.
-        let rerun = run_local_repair_pass(
-            &md,
-            root,
-            Some("test-repairer"),
-            Some(&repair_server.url()),
-            None,
-            "http://192.0.2.1:1",
-        )
-        .await
-        .expect("an empty queue is not an error");
-        assert_eq!(rerun["items_seen"], 0, "{rerun}");
-        assert_eq!(rerun["model_calls"], 0, "{rerun}");
     }
 
     /// `--repair` parses as an ingest flag carrying the document, and it
@@ -18893,17 +19290,15 @@ data:\n\
         }
     }
 
-    /// F1, at PRODUCTION dispatch (`run_local_text_ingest_file` against a
-    /// mocked OpenAI-shaped LLM): a `measurement` with no value is a shape
-    /// the store REFUSES — its writer returns `Ok(())` having written
-    /// nothing — so a summary that counted it in `facts_written` reported a
-    /// fact that is not in the graph, listed in no drop list, behind no
-    /// warning. The count the user sees must be the count the store
-    /// received: `facts_written` 0, and the drop reported with a reason
-    /// naming the cause.
+    /// CONTRACT CHANGE: `kind` is no longer a closed paper-fact switch. A
+    /// value-less relation is representable and is stored as the generic edge
+    /// the model proposed, with its exact citation, rather than disappearing.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn a_valueless_measurement_is_dropped_with_a_reason_not_counted_as_written() {
+    async fn a_valueless_legacy_kind_hint_is_stored_as_a_generic_cited_fact() {
+        // CONTRACT CHANGE: the old store silently discarded this shape after
+        // extraction counted it. Paper `kind` is no longer a Rust dispatch
+        // enum, so the cited relation is stored generically.
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -18914,16 +19309,13 @@ data:\n\
         let extraction = r#"{"facts":[
             {"subject":"Ti-6Al-4V","predicate":"has_measurement","object":"UTS","value":null,"unit":null,"conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
         ]}"#;
+        // The legacy `kind`/`evidence_class` fields are deliberately present:
+        // the generic propose_fact tool normalizes them away.
         let _mock = server
             .mock("POST", "/chat/completions")
             .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!({
-                    "choices": [{"message": {"role": "assistant", "content": extraction}}]
-                })
-                .to_string(),
-            )
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extraction_responder(extraction))
             .create_async()
             .await;
 
@@ -18949,69 +19341,43 @@ data:\n\
             VisionModelChoice::default(),
         )
         .await
-        .expect("a document whose one fact is refused must still ingest cleanly");
+        .expect("a representable value-less relation must ingest cleanly");
 
-        // The refused fact is NOT counted as written…
-        assert_eq!(summary["facts_written"], 0, "summary: {summary}");
+        assert_eq!(summary["facts_written"], 1, "summary: {summary}");
         assert_eq!(summary["parse_error"], serde_json::Value::Null);
-        // …and the drop is REPORTED, with a reason naming the cause.
         let dropped = summary["dropped_facts"]
             .as_array()
             .expect("dropped_facts must be in the summary");
-        assert_eq!(dropped.len(), 1, "summary: {summary}");
-        let reason = dropped[0].as_str().unwrap();
-        assert!(
-            reason.contains("measurement") && reason.contains("no numeric value"),
-            "the reason must name the cause: {reason}"
-        );
-        assert!(
-            reason.contains("UTS"),
-            "the reason must identify the fact: {reason}"
-        );
-        // …and the summary printer renders it.
-        let report = dropped_facts_report(&summary).expect("the printer must surface the drop");
-        assert!(report.contains("no numeric value"), "{report}");
+        assert!(dropped.is_empty(), "summary: {summary}");
+        assert_eq!(summary["repairs"]["enqueued_for_model"], 0, "{summary}");
 
-        // Nothing about the fact is in the store: no assertion, and no
-        // entity node minted for its subject or object.
         let db_path = home.path().join(".prism/provenance.db");
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .expect("the store the ingest opened must open");
-        for name in ["UTS", "Ti-6Al-4V"] {
-            let facts = store.recall_with_context(name, "local", 10).await.unwrap();
-            assert!(facts.is_empty(), "{name} must not be recallable: {facts:?}");
-            let hits = store.graph_search(name, "local", 10).await.unwrap();
-            assert!(
-                hits.is_empty(),
-                "no node may be minted for a refused fact's endpoint: {hits:?}"
-            );
-        }
-
-        // A malformed shape has no code tier: the refusal is ENQUEUED for
-        // the model tier — the queue half of the Phase-1 repair wiring.
-        assert_eq!(
-            summary["repairs"]["enqueued_for_model"], 1,
-            "summary: {summary}"
-        );
-        let document_id = md.display().to_string();
-        let pending = store.pending_repairs(&document_id, 10).await.unwrap();
-        assert_eq!(pending.len(), 1, "{pending:?}");
-        assert_eq!(pending[0].class, "malformed_shape");
-        assert!(
-            store
-                .repair_dispositions(&document_id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "an undecided item must not carry a disposition"
-        );
+        let facts = store
+            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1, "generic fact was not stored: {facts:?}");
+        assert_eq!(facts[0].predicate, "has_measurement");
+        let evidence = store
+            .assertion_evidence("local", "Ti-6Al-4V", "has_measurement", "UTS")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].line_start, Some(1));
     }
 
-    /// THE funnel invariant: the six counters PARTITION `facts_proposed`.
+    /// THE funnel invariant: the counters PARTITION `facts_proposed`.
     /// Any fact leaving the pipeline without incrementing exactly one bucket
     /// breaks this — which is the point: an unattributed loss is how "58
-    /// extracted, 4 stored" stayed an anecdote.
+    /// extracted, 4 stored" stayed an anecdote. (Annotate-not-refuse folded
+    /// the old per-check drop buckets into `stored_unverified` — a failed
+    /// check stores the fact under a weak status — so the destinations are
+    /// now: trusted, unverified, malformed, duplicate, store-failed. The
+    /// stored halves must also sum to `facts_written`, and the per-status
+    /// breakdown must sum to `stored_unverified`.)
     fn assert_funnel_partitions(funnel: &serde_json::Value) {
         let count = |key: &str| {
             funnel[key]
@@ -19020,24 +19386,40 @@ data:\n\
         };
         assert_eq!(
             count("facts_proposed"),
-            count("dropped_ungrounded")
-                + count("dropped_units")
+            count("stored_trusted")
+                + count("stored_unverified")
                 + count("dropped_malformed")
                 + count("deduped")
-                + count("store_failed")
-                + count("facts_written"),
+                + count("store_failed"),
             "the funnel must partition every proposed fact: {funnel}"
+        );
+        assert_eq!(
+            count("facts_written"),
+            count("stored_trusted") + count("stored_unverified"),
+            "every written fact is either trusted or explicitly unverified: {funnel}"
+        );
+        let by_status: u64 = funnel["unverified_by_status"]
+            .as_object()
+            .expect("unverified_by_status must be a map")
+            .values()
+            .map(|value| value.as_u64().expect("status counts are counts"))
+            .sum();
+        assert_eq!(
+            by_status,
+            count("stored_unverified"),
+            "the per-status breakdown must account for every unverified fact: {funnel}"
         );
     }
 
-    /// End to end through the PRODUCTION path: the verified alias pass
-    /// connects the two nodes chunk-split identity produced — "Ti-6Al-4V"
-    /// and "Ti64" — with a `same_as` EDGE justified by the document's own
-    /// parenthetical, while "IN718 outperformed IN625"-style co-occurrence
-    /// is REJECTED and reported. A wrong merge is worse than no merge.
+    /// CONTRACT CHANGE: paper population no longer follows the reading loop
+    /// with an orphan one-shot alias prompt. Names remain exactly as proposed;
+    /// an alias must come through ontology navigation or an explicit fact.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn alias_pass_writes_a_verified_same_as_edge_and_rejects_co_occurrence() {
+    async fn paper_population_does_not_run_a_second_alias_prompt() {
+        // CONTRACT CHANGE: the reader's proposed identities go directly to
+        // cited storage. This test now proves that no deleted alias-model
+        // pass is invoked after the tool loop.
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -19049,25 +19431,17 @@ data:\n\
             {"subject":"IN718","predicate":"has_measurement","object":"UTS","value":1100.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"},
             {"subject":"IN625","predicate":"has_measurement","object":"UTS","value":900.0,"unit":"MPa","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
         ]}"#;
+        // CONTRACT CHANGE (agentic paper reading): this mock returns the
+        // reader's tool calls, including exact citation coordinates.
         let extraction_mock = server
             .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("Extract structured facts".into()))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(extraction))
-            .expect(1)
-            .create_async()
-            .await;
-        // The model proposes one real alias and one co-occurrence trap.
-        let alias_mock = server
-            .mock("POST", "/chat/completions")
-            .match_body(mockito::Matcher::Regex("alias auditor".into()))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(
-                r#"{"aliases":[{"a":"Ti-6Al-4V","b":"Ti64"},{"a":"IN718","b":"IN625"}]}"#,
+            .match_body(mockito::Matcher::Regex(
+                "Use the tools to read the paper".into(),
             ))
-            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extraction_responder(extraction))
+            .expect(2)
             .create_async()
             .await;
 
@@ -19103,7 +19477,6 @@ data:\n\
         .expect("the alias-bearing document must ingest");
 
         extraction_mock.assert_async().await;
-        alias_mock.assert_async().await;
 
         // All four extraction facts landed, and the funnel partitions them.
         assert_eq!(summary["facts_written"], 4, "summary: {summary}");
@@ -19112,59 +19485,21 @@ data:\n\
         assert_eq!(funnel["facts_written"], 4, "summary: {summary}");
         assert_funnel_partitions(funnel);
 
-        // The verified pair became ONE same_as edge, evidence = the
-        // document's own parenthetical; the co-occurrence pair is rejected
-        // with the reason. Alias edges stay OUT of the extraction funnel.
-        let alias = &summary["alias"];
-        assert_eq!(alias["written"], 1, "summary: {summary}");
-        assert_eq!(alias["error"], serde_json::Value::Null);
-        let accepted = alias["accepted"].as_array().unwrap();
-        assert_eq!(accepted.len(), 1, "summary: {summary}");
-        assert_eq!(accepted[0]["a"], "Ti-6Al-4V");
-        assert_eq!(accepted[0]["b"], "Ti64");
         assert!(
-            accepted[0]["evidence"]
-                .as_str()
-                .unwrap()
-                .contains("Ti-6Al-4V (Ti64)"),
-            "the evidence must be the defining span: {summary}"
+            summary.get("alias").is_none(),
+            "orphan alias pass ran: {summary}"
         );
-        let rejected = alias["rejected"].as_array().unwrap();
-        assert_eq!(rejected.len(), 1, "summary: {summary}");
-        assert_eq!(rejected[0]["a"], "IN718");
-        assert_eq!(rejected[0]["b"], "IN625");
-        assert!(
-            rejected[0]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("co-occurrence"),
-            "the rejection must say why: {summary}"
-        );
-        // A refused alias is not a failed step — nothing else may be either.
         assert_eq!(ingest_summary_errors(&summary), 0, "summary: {summary}");
 
-        // END TO END: the edge connects the two nodes in the store.
         let db_path = home.path().join(".prism/provenance.db");
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
             .unwrap();
-        let ti64 = store
-            .recall_with_context("Ti64", "local", 10)
-            .await
-            .unwrap();
-        let edge = ti64
-            .iter()
-            .find(|fact| fact.predicate == "same_as")
-            .unwrap_or_else(|| panic!("the same_as edge must be recallable from Ti64: {ti64:?}"));
-        assert_eq!(edge.subject, "Ti-6Al-4V");
-        assert_eq!(edge.object, "Ti64");
-        assert_eq!(edge.value, None, "same_as is value-less");
-        // And the REJECTED pair produced no edge in either direction.
-        for name in ["IN718", "IN625"] {
+        for name in ["Ti-6Al-4V", "Ti64", "IN718", "IN625"] {
             let facts = store.recall_with_context(name, "local", 10).await.unwrap();
             assert!(
                 facts.iter().all(|fact| fact.predicate != "same_as"),
-                "a co-occurrence pair must never be linked: {facts:?}"
+                "a second prompt invented an alias edge: {facts:?}"
             );
         }
     }
@@ -19216,143 +19551,591 @@ data:\n\
         .to_string()
     }
 
-    /// Match one text-extraction request for a particular chunk without also
-    /// matching the semantic assertion-review request for that same text.
-    fn extraction_request_for(marker: &str) -> mockito::Matcher {
-        mockito::Matcher::AllOf(vec![
-            mockito::Matcher::Regex(marker.to_owned()),
-            mockito::Matcher::Regex("Extract structured facts".into()),
-        ])
-    }
-
-    /// Match the semantic assertion-review request for a particular chunk.
-    fn assertion_review_request_for(marker: &str) -> mockito::Matcher {
-        mockito::Matcher::AllOf(vec![
-            mockito::Matcher::Regex(marker.to_owned()),
-            mockito::Matcher::Regex("semantic grounding reviewer".into()),
-        ])
-    }
-
-    fn asserted_review_body(fact_indices: &[usize]) -> String {
-        let decisions: Vec<_> = fact_indices
-            .iter()
-            .map(|fact_index| {
-                serde_json::json!({
-                    "fact_index": fact_index,
-                    "verdict": "asserted",
-                    "reason": "the source positively states the phase",
+    /// Dynamic OpenAI SSE responder for a two-turn paper-agent fixture. The
+    /// first request reads line 1; only the next request proposes facts from
+    /// that returned line and finishes. This pins the real agent contract: a
+    /// citation cannot be manufactured beside an unread sibling tool call.
+    fn agentic_extraction_responder(
+        facts_json: &str,
+    ) -> impl Fn(&mockito::Request) -> Vec<u8> + Send + Sync + 'static {
+        let envelope: serde_json::Value = serde_json::from_str(facts_json).expect("facts fixture");
+        let facts = envelope["facts"]
+            .as_array()
+            .expect("facts fixture array")
+            .clone();
+        let read_event = serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "read-1",
+                "type": "function",
+                "function": {
+                    "name": "read_paper",
+                    "arguments": serde_json::json!({"from_line": 1, "to_line": 1}).to_string(),
+                }
+            }]}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        });
+        let read_body = format!("data: {read_event}\n\ndata: [DONE]\n\n");
+        let mut calls = Vec::new();
+        for (offset, fact) in facts.iter().enumerate() {
+            calls.push(serde_json::json!({
+                "index": offset,
+                "id": format!("fact-{offset}"),
+                "type": "function",
+                "function": {
+                    "name": "propose_fact",
+                    "arguments": serde_json::json!({
+                        "fact": fact,
+                        "from_line": 1,
+                        "to_line": 1,
+                    }).to_string(),
+                }
+            }));
+        }
+        calls.push(serde_json::json!({
+            "index": calls.len(),
+            "id": "finish-1",
+            "type": "function",
+            "function": {"name": "finish", "arguments": "{}"},
+        }));
+        let proposal_event = serde_json::json!({
+            "choices": [{"delta": {"tool_calls": calls}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        });
+        let proposal_body = format!("data: {proposal_event}\n\ndata: [DONE]\n\n");
+        move |request: &mockito::Request| {
+            let has_tool_result = request
+                .body()
+                .ok()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                .and_then(|body| {
+                    body.get("messages")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
                 })
-            })
-            .collect();
-        chat_body(&serde_json::json!({"decisions": decisions}).to_string())
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["role"].as_str() == Some("tool"))
+                });
+            if has_tool_result {
+                proposal_body.as_bytes().to_vec()
+            } else {
+                read_body.as_bytes().to_vec()
+            }
+        }
     }
 
-    fn classification_request_for(terms: &[&str]) -> mockito::Matcher {
-        let mut matchers = vec![mockito::Matcher::Regex(
-            "classifying materials-science terms into an ontology".into(),
-        )];
-        matchers.extend(
-            terms
-                .iter()
-                .map(|term| mockito::Matcher::Regex((*term).to_owned())),
-        );
-        mockito::Matcher::AllOf(matchers)
+    /// Paper text is no longer copied into the initial prompt. Chunk mocks
+    /// therefore key on the source-revision hash advertised in metadata.
+    fn agent_request_for_document(document: &str) -> mockito::Matcher {
+        use sha2::{Digest as _, Sha256};
+        let revision = Sha256::digest(document.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex("Use the tools to read the paper".into()),
+            mockito::Matcher::Regex(revision),
+        ])
     }
 
-    fn classification_body(material: &str, phase: &str) -> String {
-        let reply = serde_json::json!({"classifications": [
-            {"term": material, "class": "Material"},
-            {"term": phase, "class": "Phase"},
-        ]});
-        chat_body(&reply.to_string())
-    }
-
-    /// The whole document is processed in windows and MERGED: facts from
-    /// the LAST window land in the store (the old truncation never read
-    /// it), a fact asserted by TWO windows of the same document counts as
-    /// ONE evidence contribution with UNINFLATED confidence, and the
-    /// summary reports chunks processed of total. Restoring the 60K
-    /// truncation, or making windows corroborate each other, kills this.
+    /// CONTRACT CHANGE: the text path used to put every ontology's facts in
+    /// the bare `local` tenant. A promoted ontology must instead use the same
+    /// composed tenant as tabular ingest, or two vocabularies blend in one
+    /// keyspace. Restoring the old literal makes the scoped read below empty
+    /// and the bare-tenant read non-empty.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn text_ingest_windows_the_whole_document_and_merges_without_corroboration() {
+    async fn text_ingest_scopes_facts_to_the_promoted_ontology_tenant() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let ontology_id = "tenant-custom";
+        let project =
+            project_with_ontology_config(&format!("[ontology]\nid = \"{ontology_id}\"\n"));
+        let root = project.path();
+        let candidate = root.join("tenant-custom-candidate.ttl");
+        let draft = prism_ingest::induction::InducedOntology {
+            domain: ontology_id.to_string(),
+            status: prism_ingest::induction::OntologyStatus::Draft,
+            classes: vec![prism_ingest::induction::InducedClass {
+                label: "NeutralEntity".to_string(),
+                definition: "A neutral test concept.".to_string(),
+                parent: None,
+                aligned_iri: None,
+                declared_by_reference: false,
+                sign_domain: None,
+            }],
+            relations: Vec::new(),
+            provenance: prism_ingest::induction::InductionProvenance {
+                corpus_hash: "sha256:text-tenant-isolation-test".to_string(),
+                prompt_version: "test".to_string(),
+                ..Default::default()
+            },
+        };
+        prism_ingest::induction::ttl::write_artifact(&candidate, &draft)
+            .expect("write tenant-isolation ontology artifact");
+        let promoted = prism_ingest::induction::ttl::promote_artifact(&candidate)
+            .expect("promote tenant-isolation ontology artifact");
+        crate::ontology_cmd::install_promoted_artifact(root, &promoted)
+            .expect("install tenant-isolation ontology artifact");
+
+        let text = "ScopeAlpha links ScopeBeta.";
+        let document = root.join("tenant-scope.md");
+        std::fs::write(&document, text).unwrap();
+        let proposals = r#"{"facts":[
+            {"subject":"ScopeAlpha","predicate":"links","object":"ScopeBeta","conditions":[],"confidence":0.9}
+        ]}"#;
+        let mut server = mockito::Server::new_async().await;
+        let extraction = server
+            .mock("POST", "/chat/completions")
+            .match_body(agent_request_for_document(text))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extraction_responder(proposals))
+            .expect(2)
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+        let summary = run_local_text_ingest_file(
+            &document,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await
+        .expect("the promoted ontology's text fact must ingest");
+        extraction.assert_async().await;
+        assert_eq!(summary["facts_written"], 1, "{summary}");
+
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let scoped_tenant =
+            prism_ingest::ontologies::storage_tenant(prism_provenance::LOCAL_TENANT, ontology_id);
+        assert_eq!(scoped_tenant, "local@tenant-custom");
+        let scoped = store
+            .recall_with_context("ScopeAlpha", &scoped_tenant, 10)
+            .await
+            .unwrap();
+        assert_eq!(scoped.len(), 1, "scoped tenant missed its fact: {scoped:?}");
+        let bare = store
+            .recall_with_context("ScopeAlpha", prism_provenance::LOCAL_TENANT, 10)
+            .await
+            .unwrap();
+        assert!(
+            bare.is_empty(),
+            "custom ontology leaked into local: {bare:?}"
+        );
+    }
+
+    /// Dynamic OpenAI SSE responder for a two-turn paper-agent fixture whose
+    /// SECOND turn proposes an ontology CLASS and RELATION extension (with
+    /// valid parents/endpoints against the active ontology) and finishes.
+    /// Cites the line the first turn read, exactly as the citation gate
+    /// requires.
+    fn agentic_extension_responder(
+        parent_iri: &str,
+    ) -> impl Fn(&mockito::Request) -> Vec<u8> + Send + Sync + 'static {
+        let read_event = serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "read-1",
+                "type": "function",
+                "function": {
+                    "name": "read_paper",
+                    "arguments": serde_json::json!({"from_line": 1, "to_line": 1}).to_string(),
+                }
+            }]}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        });
+        let read_body = format!("data: {read_event}\n\ndata: [DONE]\n\n");
+        let calls = vec![
+            serde_json::json!({
+                "index": 0,
+                "id": "class-1",
+                "type": "function",
+                "function": {
+                    "name": "propose_class",
+                    "arguments": serde_json::json!({
+                        "label": "Feedstock Powder",
+                        "parent_iris": [parent_iri],
+                        "description": "Powder fed into a process.",
+                        "from_line": 1,
+                        "to_line": 1,
+                    }).to_string(),
+                }
+            }),
+            serde_json::json!({
+                "index": 1,
+                "id": "relation-1",
+                "type": "function",
+                "function": {
+                    "name": "propose_relation",
+                    "arguments": serde_json::json!({
+                        "label": "processed from powder",
+                        "source_class_iri": parent_iri,
+                        "target_class_iri": parent_iri,
+                        "from_line": 1,
+                        "to_line": 1,
+                    }).to_string(),
+                }
+            }),
+            serde_json::json!({
+                "index": 2,
+                "id": "finish-1",
+                "type": "function",
+                "function": {"name": "finish", "arguments": "{}"},
+            }),
+        ];
+        let proposal_event = serde_json::json!({
+            "choices": [{"delta": {"tool_calls": calls}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        });
+        let proposal_body = format!("data: {proposal_event}\n\ndata: [DONE]\n\n");
+        move |request: &mockito::Request| {
+            let has_tool_result = request
+                .body()
+                .ok()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                .and_then(|body| {
+                    body.get("messages")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                })
+                .is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["role"].as_str() == Some("tool"))
+                });
+            if has_tool_result {
+                proposal_body.as_bytes().to_vec()
+            } else {
+                read_body.as_bytes().to_vec()
+            }
+        }
+    }
+
+    /// THE deliverable of the proposal-persistence patch, end-to-end through
+    /// the PRODUCTION text-ingest path: a reader that proposes ontology
+    /// extensions leaves them — WITH their citations — in the governance
+    /// store, not only in the printed summary. Before this, a 91-paper
+    /// corpus run lost every one of its 3,947 citation-backed class
+    /// proposals to stdout.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn text_ingest_persists_ontology_proposals_with_citations() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Same setup as the tenant-isolation test: a promoted induced
+        // ontology so the proposal's parent IRI resolves against something
+        // real through the production config path.
+        let ontology_id = "proposal-custom";
+        let project =
+            project_with_ontology_config(&format!("[ontology]\nid = \"{ontology_id}\"\n"));
+        let root = project.path();
+        let candidate = root.join("proposal-custom-candidate.ttl");
+        let draft = prism_ingest::induction::InducedOntology {
+            domain: ontology_id.to_string(),
+            status: prism_ingest::induction::OntologyStatus::Draft,
+            classes: vec![prism_ingest::induction::InducedClass {
+                label: "NeutralEntity".to_string(),
+                definition: "A neutral test concept.".to_string(),
+                parent: None,
+                aligned_iri: None,
+                declared_by_reference: false,
+                sign_domain: None,
+            }],
+            relations: Vec::new(),
+            provenance: prism_ingest::induction::InductionProvenance {
+                corpus_hash: "sha256:proposal-persistence-test".to_string(),
+                prompt_version: "test".to_string(),
+                ..Default::default()
+            },
+        };
+        prism_ingest::induction::ttl::write_artifact(&candidate, &draft)
+            .expect("write proposal-persistence ontology artifact");
+        let promoted = prism_ingest::induction::ttl::promote_artifact(&candidate)
+            .expect("promote proposal-persistence ontology artifact");
+        crate::ontology_cmd::install_promoted_artifact(root, &promoted)
+            .expect("install proposal-persistence ontology artifact");
+
+        let text = "Feedstock powders were sieved before use.";
+        let document = root.join("proposal-source.md");
+        std::fs::write(&document, text).unwrap();
+        let parent_iri = format!("https://prism.marc27.com/ontology/{ontology_id}#NeutralEntity");
+        let mut server = mockito::Server::new_async().await;
+        let extraction = server
+            .mock("POST", "/chat/completions")
+            .match_body(agent_request_for_document(text))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extension_responder(&parent_iri))
+            .expect(2)
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+
+        let summary = run_local_text_ingest_file(
+            &document,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await
+        .expect("an extension-proposing reader must ingest");
+        extraction.assert_async().await;
+
+        // The printed surface still reports the proposals …
+        assert_eq!(
+            summary["ontology_extensions"]["classes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{summary}"
+        );
+        // … and the durable surface now holds them, with citations.
+        assert_eq!(
+            summary["ontology_proposal_queue"]["enqueued"], 2,
+            "one class + one relation must be counted: {summary}"
+        );
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let pending = store.pending_ontology_proposals(10).await.unwrap();
+        assert_eq!(pending.len(), 2, "{pending:?}");
+        let class = pending
+            .iter()
+            .find(|(item, _)| item.kind == "class")
+            .expect("the class proposal is queued");
+        assert_eq!(class.0.label, "Feedstock Powder");
+        assert_eq!(class.1, 1, "its citation is a sighting");
+        let sightings = store
+            .ontology_proposal_sightings(&class.0.item_id)
+            .await
+            .unwrap();
+        assert_eq!(sightings.len(), 1);
+        let citation: serde_json::Value =
+            serde_json::from_str(&sightings[0].citation_json).unwrap();
+        assert_eq!(
+            citation["quoted_text"], "Feedstock powders were sieved before use.",
+            "the evidence must ride with the proposal: {citation}"
+        );
+        assert_eq!(citation["from_line"], 1);
+        assert_eq!(citation["to_line"], 1);
+    }
+
+    /// The re-verification surface, driven through the production entry
+    /// point `prism reverify` dispatches to (and the agent tools call):
+    /// LIST finds the span-unchecked population through the production
+    /// read scope, RUN affirms from the exact cited lines against a mocked
+    /// judge, and the durable effect is the LEDGER — a run that printed a
+    /// verdict but recorded nothing would be the evaporation failure again.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn reverify_cli_lists_runs_and_ledgers_the_verdict() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+
+        let source_text = "Header\nThe exact cited statement.\n";
+        let source = home.path().join("paper.txt");
+        std::fs::write(&source, source_text).unwrap();
+
+        let db_path = home.path().join(".prism/provenance.db");
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
+        let citation = prism_provenance::SourceCitation::new(
+            2,
+            2,
+            "The exact cited statement.",
+            prism_retrieval::text_revision_id(source_text),
+            None,
+        )
+        .unwrap();
+        let prov = prism_provenance::LocalProvenance {
+            activity_id: "activity".into(),
+            agent_id: "agent".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: source.display().to_string(),
+            source_kind: "Document".into(),
+            tenant: "local".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: "2026-01-01T00:00:01Z".into(),
+            locality: "local".into(),
+            origin_source_id: None,
+        };
+        let ontology = prism_provenance::OntologyClassification {
+            version_iri: "urn:test:ontology:v1",
+            artifact_sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        };
+        let fact = prism_provenance::MaterialFact {
+            subject: "Alloy X".into(),
+            predicate: "has_measurement".into(),
+            object: "UTS".into(),
+            value: None,
+            unit: None,
+            conditions: vec![],
+            confidence: Some(0.8),
+            kind: Some("relation".into()),
+            evidence_class: prism_provenance::EvidenceClass::Research,
+            // The fresh paper path's status: trusted-but-unverified, the
+            // re-verification target population.
+            verification: Some(prism_provenance::VerificationStatus::CitedByReader),
+            verification_reason: None,
+        };
+        store
+            .write_fact_with_classification_and_citation(&fact, &prov, ontology, None, &citation)
+            .await
+            .unwrap();
+        let id = prism_provenance::conditioned_assertion_id(
+            "local",
+            "Alloy X",
+            "has_measurement",
+            "UTS",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let project = tempfile::tempdir().expect("project tempdir");
+        use crate::reverify_cmd::ReverifyCommands;
+
+        // LIST: the production read scope finds the candidate.
+        crate::reverify_cmd::run(
+            ReverifyCommands::List {
+                status: "cited_by_reader".into(),
+                limit: 10,
+                json: true,
+            },
+            project.path(),
+        )
+        .await
+        .expect("list must succeed over the real store");
+
+        // An unknown status fails honestly, naming the valid spellings —
+        // generated from the enum, never a hardcoded list.
+        let error = crate::reverify_cmd::run(
+            ReverifyCommands::List {
+                status: "bogus".into(),
+                limit: 10,
+                json: true,
+            },
+            project.path(),
+        )
+        .await
+        .expect_err("an unknown status must fail, not fall back");
+        assert!(
+            format!("{error:#}").contains("cited_by_reader"),
+            "the error must list valid spellings: {error:#}"
+        );
+
+        // RUN: a mocked judge affirms from the exact cited lines; the
+        // verdict lands in the ledger.
+        let mut server = mockito::Server::new_async().await;
+        let affirmation = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"verdict\":\"affirmed\",\"reason\":\"line 2 states it exactly\"}"
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        crate::reverify_cmd::run(
+            ReverifyCommands::Run {
+                assertion: id.clone(),
+                model: Some("test-judge".into()),
+                llm_url: Some(server.url()),
+                api_key: None,
+                json: true,
+            },
+            project.path(),
+        )
+        .await
+        .expect("the re-verification run must succeed");
+        affirmation.assert_async().await;
+        let ledger = store.reverify_verdicts(&id).await.unwrap();
+        assert_eq!(ledger.len(), 1, "{ledger:?}");
+        assert_eq!(ledger[0].verdict, "affirmed");
+        assert_eq!(ledger[0].reviewer, "model:test-judge");
+        assert_eq!(ledger[0].reason, "line 2 states it exactly");
+
+        // HISTORY: the audit trail reads back with no model call.
+        crate::reverify_cmd::run(
+            ReverifyCommands::History {
+                assertion: id.clone(),
+                json: true,
+            },
+            project.path(),
+        )
+        .await
+        .expect("history must succeed");
+    }
+
+    /// CONTRACT CHANGE: tools make prompt windows obsolete. One bounded loop
+    /// receives the complete document as a searchable workspace, so material
+    /// at both ends is available without multiplying model cost or evidence.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn text_ingest_reads_the_whole_document_in_one_agent_loop() {
+        // CONTRACT CHANGE: old prompt windows launched several independent
+        // completions. The single bounded loop now owns one searchable paper
+        // workspace and records its two turns below.
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut server = mockito::Server::new_async().await;
-        // Each extraction is keyed to its window marker and prompt role;
-        // categorical windows also have a separately matched review call.
-        let mid = server
-            .mock("POST", "/chat/completions")
-            .match_body(extraction_request_for("MIDMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(r#"{"facts":[]}"#))
-            .expect(1)
-            .create_async()
-            .await;
-        let early = r#"{"facts":[
-            {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
+        let text = three_chunk_text();
+        let proposals = r#"{"facts":[
+            {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9},
+            {"subject":"LateFactium","predicate":"has_phase","object":"omega","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
         ]}"#;
-        let early_extraction = server
+        let extraction = server
             .mock("POST", "/chat/completions")
-            .match_body(extraction_request_for("AAAMARKER"))
+            .match_body(agent_request_for_document(&text))
             .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(early))
-            .expect(1)
-            .create_async()
-            .await;
-        let early_review = server
-            .mock("POST", "/chat/completions")
-            .match_body(assertion_review_request_for("AAAMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(asserted_review_body(&[0]))
-            .expect(1)
-            .create_async()
-            .await;
-        let early_classification = server
-            .mock("POST", "/chat/completions")
-            .match_body(classification_request_for(&["EarlyFactium", "alpha"]))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(classification_body("EarlyFactium", "alpha"))
-            .expect(1)
-            .create_async()
-            .await;
-        // The LAST window's reply also re-asserts the early fact — the
-        // overlap makes that shape realistic — and it must count ONCE.
-        let late = r#"{"facts":[
-            {"subject":"LateFactium","predicate":"has_phase","object":"omega","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"},
-            {"subject":"EarlyFactium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
-        ]}"#;
-        let late_extraction = server
-            .mock("POST", "/chat/completions")
-            .match_body(extraction_request_for("ZZZMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(late))
-            .expect(1)
-            .create_async()
-            .await;
-        let late_review = server
-            .mock("POST", "/chat/completions")
-            .match_body(assertion_review_request_for("ZZZMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(asserted_review_body(&[0, 1]))
-            .expect(1)
-            .create_async()
-            .await;
-        let late_classification = server
-            .mock("POST", "/chat/completions")
-            .match_body(classification_request_for(&["LateFactium", "omega"]))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(classification_body("LateFactium", "omega"))
-            .expect(1)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(agentic_extraction_responder(proposals))
+            .expect(2)
             .create_async()
             .await;
 
@@ -19367,10 +20150,8 @@ data:\n\
         );
         let root = project.path();
         let md = root.join("long-deck.md");
-        let text = three_chunk_text();
         std::fs::write(&md, &text).unwrap();
-        let expected_chunks = prism_ingest::batching::chunk_windows(&text, 2000).len();
-        assert!(expected_chunks >= 3, "fixture must window into 3+ chunks");
+        let expected_chunks = 1usize;
 
         let summary = run_local_text_ingest_file(
             &md,
@@ -19387,13 +20168,7 @@ data:\n\
         .await
         .expect("a multi-window document must ingest");
 
-        mid.assert_async().await;
-        early_extraction.assert_async().await;
-        early_review.assert_async().await;
-        early_classification.assert_async().await;
-        late_extraction.assert_async().await;
-        late_review.assert_async().await;
-        late_classification.assert_async().await;
+        extraction.assert_async().await;
 
         assert_eq!(
             summary["chunks_total"].as_u64().unwrap() as usize,
@@ -19405,14 +20180,34 @@ data:\n\
             "every window must be processed: {summary}"
         );
         assert_eq!(
+            summary["paper_agent"]["loops"],
+            serde_json::json!(expected_chunks),
+            "one bounded reader loop per extraction sample: {summary}"
+        );
+        assert_eq!(
+            summary["paper_agent"]["turns"],
+            serde_json::json!(2),
+            "the fixture reads first, then proposes and finishes: {summary}"
+        );
+        assert!(
+            summary["paper_agent"]["tool_calls"]
+                .as_u64()
+                .is_some_and(|count| count >= (expected_chunks * 2) as u64),
+            "each loop must at least read and finish: {summary}"
+        );
+        assert_eq!(
+            summary["ontology_extensions"]["classes"],
+            serde_json::json!([]),
+            "the fixture proposed no ontology extension: {summary}"
+        );
+        assert_eq!(
             summary["facts_written"], 2,
             "the duplicated fact must merge, not double: {summary}"
         );
-        // Funnel across windows: 3 proposed (1 early + 2 late), 1 deduped
-        // (the overlap re-assertion), 2 written — and the partition holds.
+        // One loop proposed both endpoint facts and wrote both.
         let funnel = &summary["funnel"];
-        assert_eq!(funnel["facts_proposed"], 3, "summary: {summary}");
-        assert_eq!(funnel["deduped"], 1, "summary: {summary}");
+        assert_eq!(funnel["facts_proposed"], 2, "summary: {summary}");
+        assert_eq!(funnel["deduped"], 0, "summary: {summary}");
         assert_eq!(funnel["facts_written"], 2, "summary: {summary}");
         assert_funnel_partitions(funnel);
         assert_eq!(summary["errors"].as_array().unwrap().len(), 0);
@@ -19434,9 +20229,12 @@ data:\n\
             .recall_with_context("LateFactium", "local", 10)
             .await
             .unwrap();
-        assert_eq!(late.len(), 1, "the LAST window's fact must land: {late:?}");
-        // And the fact asserted by TWO windows of one document counts ONCE:
-        // one evidence contribution, confidence NOT inflated by noisy-OR.
+        assert_eq!(
+            late.len(),
+            1,
+            "the end-of-document fact must land: {late:?}"
+        );
+        // One document contributes one exact evidence witness.
         let evidence = store
             .assertion_evidence("local", "EarlyFactium", "has_phase", "alpha")
             .await
@@ -19444,16 +20242,46 @@ data:\n\
         assert_eq!(
             evidence.len(),
             1,
-            "two windows of one document must contribute ONE evidence row: {evidence:?}"
+            "one document must contribute one evidence row: {evidence:?}"
         );
-        // The evidence is attributed to the DOCUMENT, never to a window: a
-        // per-chunk source identity (e.g. "…/long-deck.md#chunk1") would
-        // slip past the in-run dedup and corroborate across runs whose
-        // window boundaries shift — silent confidence inflation.
+        // CONTRACT CHANGE (agentic paper reading): that source contribution
+        // now retains the exact raw line witness and full-document revision
+        // selected by the paper agent.
+        assert_eq!(evidence[0].line_start, Some(1));
+        assert_eq!(evidence[0].line_end, Some(1));
+        assert!(
+            evidence[0]
+                .evidence_span
+                .as_deref()
+                .is_some_and(|span| span.contains("EarlyFactium")),
+            "agent citation was not persisted: {evidence:?}"
+        );
+        use sha2::{Digest as _, Sha256};
+        let expected_revision = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         assert_eq!(
-            evidence[0].source_entity_id,
-            md.display().to_string(),
-            "evidence must be keyed on the document, not the chunk"
+            evidence[0].source_revision_id.as_deref(),
+            Some(expected_revision.as_str())
+        );
+        // CONTRACT CHANGE (exact-source rereading): the reopen locator is an
+        // immutable snapshot of the complete text representation, never a
+        // per-window fragment and never binary PDF bytes. Independence still
+        // keys on the original canonical document path via origin_source_id,
+        // so chunk boundaries and text snapshots cannot fabricate support.
+        let snapshot = summary["source_text_snapshot"]
+            .as_str()
+            .expect("summary reports the exact reopenable source text");
+        assert_eq!(
+            evidence[0].source_entity_id, snapshot,
+            "evidence must reopen the exact full text snapshot"
+        );
+        assert_eq!(std::fs::read_to_string(snapshot).unwrap(), text);
+        assert_eq!(
+            evidence[0].source_key,
+            format!("file:{}", std::fs::canonicalize(&md).unwrap().display()),
+            "corroboration must remain keyed on the original document"
         );
         let early = store
             .recall_with_context("EarlyFactium", "local", 10)
@@ -19462,67 +20290,29 @@ data:\n\
         assert_eq!(early.len(), 1);
         assert!(
             (early[0].confidence - 0.9).abs() < 1e-9,
-            "same-document windows inflated confidence: {}",
+            "one paper read changed the proposed confidence: {}",
             early[0].confidence
         );
     }
 
-    /// A chunk failing MID-RUN costs that chunk: earlier chunks' facts are
-    /// already stored, the failure is on the errors spine (→ FAILED STEPS,
-    /// non-zero exit via `ingest_summary_errors`), and the coverage says
-    /// what was and was not processed. Reverting to one-shot
-    /// extract-then-write kills this — nothing would be stored.
+    /// CONTRACT CHANGE: there is one whole-document loop rather than several
+    /// independent chunk loops. A provider failure is reported against that
+    /// one loop and cannot masquerade as partial paper coverage.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn text_ingest_keeps_earlier_chunks_when_a_late_chunk_fails() {
+    async fn text_ingest_reports_a_failed_document_loop_without_partial_facts() {
+        // CONTRACT CHANGE: there is no later prompt chunk that can succeed
+        // after this provider failure; coverage honestly reports one failed
+        // whole-document loop and no partial paper result.
         let _guard = boot_checks::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut server = mockito::Server::new_async().await;
-        let mid = server
+        let text = three_chunk_text();
+        let failed_loop = server
             .mock("POST", "/chat/completions")
-            .match_body(extraction_request_for("MIDMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(r#"{"facts":[]}"#))
-            .expect(1)
-            .create_async()
-            .await;
-        let early = r#"{"facts":[
-            {"subject":"Survivium","predicate":"has_phase","object":"alpha","conditions":[],"confidence":0.9,"kind":"phase","evidence_class":"research"}
-        ]}"#;
-        let early_extraction = server
-            .mock("POST", "/chat/completions")
-            .match_body(extraction_request_for("AAAMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(chat_body(early))
-            .expect(1)
-            .create_async()
-            .await;
-        let early_review = server
-            .mock("POST", "/chat/completions")
-            .match_body(assertion_review_request_for("AAAMARKER"))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(asserted_review_body(&[0]))
-            .expect(1)
-            .create_async()
-            .await;
-        let early_classification = server
-            .mock("POST", "/chat/completions")
-            .match_body(classification_request_for(&["Survivium", "alpha"]))
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(classification_body("Survivium", "alpha"))
-            .expect(1)
-            .create_async()
-            .await;
-        // The LAST window fails hard (400 is not retried).
-        let late_extraction = server
-            .mock("POST", "/chat/completions")
-            .match_body(extraction_request_for("ZZZMARKER"))
+            .match_body(agent_request_for_document(&text))
             .with_status(400)
             .with_body("boom")
             .expect(1)
@@ -19538,10 +20328,7 @@ data:\n\
         );
         let root = project.path();
         let md = root.join("long-deck.md");
-        let text = three_chunk_text();
         std::fs::write(&md, &text).unwrap();
-        let expected_chunks = prism_ingest::batching::chunk_windows(&text, 2000).len();
-
         let summary = run_local_text_ingest_file(
             &md,
             root,
@@ -19555,33 +20342,27 @@ data:\n\
             VisionModelChoice::default(),
         )
         .await
-        .expect("a partial run is a reported partial result, not a crash");
+        .expect("a failed loop is a reported result, not a crash");
 
-        mid.assert_async().await;
-        early_extraction.assert_async().await;
-        early_review.assert_async().await;
-        early_classification.assert_async().await;
-        late_extraction.assert_async().await;
+        failed_loop.assert_async().await;
 
         let errors = summary["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1, "{summary}");
         let error = errors[0].as_str().unwrap();
         assert!(
-            error.contains(&format!("chunk {expected_chunks}/{expected_chunks}")),
-            "the failure must name the chunk: {error}"
+            error.contains("chunk 1/1"),
+            "the failure must name the loop: {error}"
         );
-        assert_eq!(
-            summary["chunks_processed"].as_u64().unwrap() as usize,
-            expected_chunks - 1,
-            "{summary}"
-        );
+        assert_eq!(summary["chunks_total"], 1, "{summary}");
+        assert_eq!(summary["chunks_processed"], 0, "{summary}");
+        assert_eq!(summary["facts_written"], 0, "{summary}");
         // The exit-code spine sees the failure…
         assert_eq!(ingest_summary_errors(&summary), 1);
         // …and the coverage line says it.
         let report = chunk_coverage_report(&summary).expect("chunk fields present");
         assert!(report.contains("FAILED"), "{report}");
 
-        // Earlier chunks' facts are already stored.
+        // No fictional partial coverage or endpoint survives a failed loop.
         let db_path = home.path().join(".prism/provenance.db");
         let store = prism_provenance::ProvenanceStore::open(&db_path)
             .await
@@ -19590,10 +20371,9 @@ data:\n\
             .recall_with_context("Survivium", "local", 10)
             .await
             .unwrap();
-        assert_eq!(
-            survivor.len(),
-            1,
-            "a late-chunk failure discarded earlier chunks' stored facts"
+        assert!(
+            survivor.is_empty(),
+            "failed loop stored a fact: {survivor:?}"
         );
     }
 

@@ -496,7 +496,10 @@ def _pareto_screen_tool() -> Tool:
             "objectives (e.g. minimise density while maximising modulus), each "
             "with its objective values, plus the dominated count. Exact O(n^2) "
             "dominance over supplied candidates — max 200, and any candidate "
-            "missing an objective value is dropped rather than guessed."
+            "missing an objective value is dropped rather than guessed. For "
+            "multi-objective materials screening, compose this with "
+            "suggest_next_experiments (active-learning: what to test next) "
+            "and predict_property (property prediction with uncertainty)."
         ),
         input_schema=schema, func=_run, requires_approval=False,
         source="builtin", source_detail="materials.informatics",

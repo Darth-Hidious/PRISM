@@ -43,22 +43,23 @@ pub struct LocalFact {
     pub kind: Option<String>,
 }
 
-/// A QUDT unit identifier such as `QUDT:K` or `QUDT:W-PER-M-K`.
+/// The exact non-empty unit term selected by an extraction source.
 ///
-/// This is deliberately an identifier newtype, not a PRISM-specific unit
-/// enum: QUDT is the vocabulary, and accepting its open identifier space
-/// avoids creating a second, inevitably incomplete unit taxonomy here.
+/// A term may be an ontology IRI, a prefixed name, or the spelling printed in
+/// a paper. Its vocabulary and interpretation belong to the active ontology
+/// and the reading model; this storage type deliberately does not embed a
+/// QUDT-only gate or a Rust-maintained spelling table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct QudtUnit(String);
+pub struct UnitTerm(String);
 
-impl QudtUnit {
-    pub fn new(identifier: impl Into<String>) -> Result<Self> {
-        let identifier = identifier.into();
-        if !identifier.starts_with("QUDT:") || identifier.len() == "QUDT:".len() {
-            anyhow::bail!("unit must be a QUDT identifier such as QUDT:K");
+impl UnitTerm {
+    pub fn new(term: impl Into<String>) -> Result<Self> {
+        let term = term.into();
+        if term.trim().is_empty() {
+            anyhow::bail!("unit term must not be empty");
         }
-        Ok(Self(identifier))
+        Ok(Self(term))
     }
 
     #[must_use]
@@ -67,14 +68,50 @@ impl QudtUnit {
     }
 }
 
-impl<'de> Deserialize<'de> for QudtUnit {
+impl std::ops::Deref for UnitTerm {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for UnitTerm {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let identifier = String::deserialize(deserializer)?;
-        Self::new(identifier).map_err(serde::de::Error::custom)
+        let term = String::deserialize(deserializer)?;
+        Self::new(term).map_err(serde::de::Error::custom)
     }
+}
+
+/// Compatibility name for callers that still use the former type name.
+/// Construction follows [`UnitTerm`]'s vocabulary-neutral contract.
+pub type QudtUnit = UnitTerm;
+
+/// The sign domain an ONTOLOGY declares for a quantity kind.
+///
+/// Whether a quantity can be negative is a property of the quantity kind
+/// itself (a boolean/annotation on the quantity class or its dimensional
+/// parent), so it belongs to the active ontology, never to Rust: PRISM is a
+/// harness with pluggable ontologies, and a sign table compiled into the
+/// matcher would be one domain's physics forced onto every customer. The
+/// matcher reads this value at grounding time; the default is silence, and a
+/// silent ontology leaves the sign check INERT — it never applies by
+/// inference from the quantity's name, in any language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QuantitySignDomain {
+    /// The ontology declares nothing about this quantity's sign. This is the
+    /// only honest answer when the ontology has no such annotation: the sign
+    /// check does not apply, and no guess replaces it.
+    #[default]
+    Unspecified,
+    /// The quantity is non-negative by definition; a negative claim against
+    /// it is nonsense under every notation.
+    NonNegative,
+    /// The quantity is legitimately signed; negative claims are in-domain.
+    Signed,
 }
 
 /// A numerical or categorical boundary-condition value.
@@ -85,15 +122,15 @@ pub enum ConditionValue {
     Text(String),
 }
 
-/// One solver-consumable measurement condition. Numerical conditions carry
-/// a QUDT unit; categorical conditions (for example atmosphere=`air`) carry
-/// `unit: null` rather than smuggling the condition into prose.
+/// One solver-consumable measurement condition. A supplied unit term is
+/// preserved exactly; absence is represented as `unit: null` without the
+/// store inferring what the condition should require.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeasurementCondition {
     pub name: String,
     pub value: ConditionValue,
     #[serde(default)]
-    pub unit: Option<QudtUnit>,
+    pub unit: Option<UnitTerm>,
 }
 
 /// The shared four-level evidence vocabulary, aligned with RHEA-JAX
@@ -185,9 +222,227 @@ pub fn evidence_for_result(
     })
 }
 
+/// How thoroughly the deterministic ingest checks verified one stored fact
+/// against its source document.
+///
+/// ANNOTATE, DON'T REFUSE. These used to be refusal reasons: a fact that
+/// failed a grounding check was dropped, and a model that fabricated nothing
+/// stored nothing (measured: glm-5.2 extracted 74 facts from one LPBF paper,
+/// fabricated 0, stored 0 — 63 refused as "subject not named" because it
+/// wrote a MORE precise subject than the paper's spelling). The checks were
+/// good signal calibrated into a bad gate. Now the fact is STORED and the
+/// check's verdict rides with it as this status; reads default to the
+/// trusted subset ([`Self::is_trusted`]) so nothing unverified is promoted,
+/// and everything unverified stays findable for later review.
+///
+/// This is a SEPARATE axis from [`EvidenceClass`]: the class says how the
+/// knowledge was produced (literature vs execution — monotone ceiling,
+/// worst-wins), the status says how far deterministic checks verified this
+/// particular extraction against its source. A weak status never upgrades
+/// the class, and the class ceiling still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationStatus {
+    /// Every deterministic check passed: the subject is named, the value,
+    /// unit and conditions are carried by one supporting span (numeric
+    /// facts), and semantic review affirmed the polarity (value-less facts).
+    Grounded,
+    /// The model's unit spelling resolved to nothing, so the unit was taken
+    /// from the DOCUMENT (printed adjacent to the value), and every check
+    /// then passed with that unit. Trusted: the unit is page-attested.
+    UnitFromPage,
+    /// The reading agent proposed this fact together with an exact,
+    /// bounds-checked citation it had just read, and NO deterministic check
+    /// compared the fact's value, unit, subject or conditions to that span.
+    /// Trusted-but-unverified: the fresh paper path mints exactly this —
+    /// re-running the retired lexical gates there would re-install the
+    /// muzzle that was measured and removed (~44% of quarantines came from
+    /// checks that could not pass). Because the span was never checked, no
+    /// judgement about span-support was rendered, so a later re-read
+    /// ([`crate::reverify`]-style affirmation from the exact cited lines)
+    /// is a FIRST ask, not a re-roll — this is the population re-verification
+    /// targets.
+    CitedByReader,
+    /// The document never names the fact's subject verbatim. Not proof of
+    /// fabrication — the measured failure mode is a subject MORE precise
+    /// than the paper's spelling ("LPBF Ti-6Al-4V fatigue bar (as-built)"
+    /// for a paper that says "Ti-6Al-4V").
+    SubjectNotVerbatim,
+    /// No single span carries the value together with its subject, unit and
+    /// conditions. The strongest fabrication signal a deterministic check
+    /// renders.
+    ValueNotInSource,
+    /// A producer supplied an explicitly unusable unit term, such as a blank
+    /// string. Mere absence is neutral and does not imply this status.
+    /// The fact is stored so the check remains an annotation, not a drop.
+    UnitUnresolved,
+    /// Too few independent extraction passes produced this fact (see the
+    /// ingest sampling policy). A statement about the MODEL's consistency;
+    /// the document was never consulted.
+    SampleDisagreement,
+    /// Nothing beyond the model's own assertion vouches for this fact: the
+    /// review was skipped by policy, the reviewer rendered no verdict, or
+    /// the shape was self-contradictory (a value-less fact carrying a unit).
+    ModelAsserted,
+    /// Semantic review examined the fact and abstained.
+    ReviewUncertain,
+    /// Semantic review examined the fact and found the source DENIES it.
+    /// The least trusted status: stored so the denial is auditable, never
+    /// shown by default.
+    ReviewDenied,
+}
+
+impl VerificationStatus {
+    /// Every status, once, for schema generation and parsing.
+    pub const ALL: [Self; 10] = [
+        Self::Grounded,
+        Self::UnitFromPage,
+        Self::CitedByReader,
+        Self::SubjectNotVerbatim,
+        Self::ValueNotInSource,
+        Self::UnitUnresolved,
+        Self::SampleDisagreement,
+        Self::ModelAsserted,
+        Self::ReviewUncertain,
+        Self::ReviewDenied,
+    ];
+
+    /// Stable identifier — the stored column value and the serde form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Grounded => "grounded",
+            Self::UnitFromPage => "unit_from_page",
+            Self::CitedByReader => "cited_by_reader",
+            Self::SubjectNotVerbatim => "subject_not_verbatim",
+            Self::ValueNotInSource => "value_not_in_source",
+            Self::UnitUnresolved => "unit_unresolved",
+            Self::SampleDisagreement => "sample_disagreement",
+            Self::ModelAsserted => "model_asserted",
+            Self::ReviewUncertain => "review_uncertain",
+            Self::ReviewDenied => "review_denied",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. `None` for anything this enum does not
+    /// declare — including the stored NULL, which means "written before
+    /// verification statuses existed, or by a path that runs its own guards".
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|status| status.as_str() == text)
+    }
+
+    /// Trust rank, higher = more verified. Total order, used two ways:
+    /// WORST-wins when one sighting trips several checks (the most
+    /// disqualifying defect names the fact), BEST-wins when several
+    /// sightings of one assertion disagree (a grounding witness in any
+    /// source is a real witness — a later sloppy extraction must not
+    /// un-ground a fact a document supports, and the upgrade can only come
+    /// from a deterministic pass over a real document, so it launders
+    /// nothing).
+    #[must_use]
+    pub fn rank(self) -> i64 {
+        match self {
+            Self::ReviewDenied => 0,
+            Self::ValueNotInSource => 1,
+            Self::UnitUnresolved => 2,
+            Self::SubjectNotVerbatim => 3,
+            Self::ReviewUncertain => 4,
+            Self::SampleDisagreement => 5,
+            Self::ModelAsserted => 6,
+            Self::CitedByReader => 7,
+            Self::UnitFromPage => 8,
+            Self::Grounded => 9,
+        }
+    }
+
+    /// Whether default (user-facing) reads include this status: the statuses
+    /// whose every deterministic check passed against the source, plus
+    /// [`Self::CitedByReader`] — trusted-but-unverified, the reading agent's
+    /// cited proposal with no span check run. Everything else is present and
+    /// findable, never promoted.
+    #[must_use]
+    pub fn is_trusted(self) -> bool {
+        matches!(
+            self,
+            Self::Grounded | Self::UnitFromPage | Self::CitedByReader
+        )
+    }
+
+    /// Whether a judgement about the fact was actually RENDERED — the
+    /// anti-ratchet rule, carried over from the refusal-era
+    /// `RejectionClass::judgement_was_rendered`: a reviewer that re-asks
+    /// where an answer already exists keeps every "yes" and re-rolls every
+    /// "no", converting sampling noise into acceptances. A follow-on model
+    /// pass over weak-status facts may re-ask ONLY where this is `false`.
+    #[must_use]
+    pub fn judgement_was_rendered(self) -> bool {
+        match self {
+            Self::Grounded
+            | Self::UnitFromPage
+            | Self::SubjectNotVerbatim
+            | Self::ValueNotInSource
+            | Self::ReviewUncertain
+            | Self::ReviewDenied => true,
+            Self::CitedByReader
+            | Self::UnitUnresolved
+            | Self::SampleDisagreement
+            | Self::ModelAsserted => false,
+        }
+    }
+}
+
+/// Which verification statuses a fact read returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerificationFilter {
+    /// The DEFAULT for anything user-facing: statuses that passed every
+    /// check ([`VerificationStatus::is_trusted`]) plus rows with no recorded
+    /// status (written before statuses existed, or by a path with its own
+    /// guard regime — hiding those would silently vanish existing data).
+    #[default]
+    Trusted,
+    /// Everything, whatever its status. The review surface.
+    Any,
+    /// Exactly one status — how a reviewer pulls, say, every
+    /// `subject_not_verbatim` fact.
+    Status(VerificationStatus),
+}
+
+impl VerificationFilter {
+    /// The SQL predicate this filter puts on a `prov_assertion` read.
+    /// Status spellings come from [`VerificationStatus::as_str`] — fixed
+    /// identifiers, never caller input.
+    fn sql_clause(self, column: &str) -> String {
+        match self {
+            Self::Trusted => {
+                let trusted: Vec<String> = VerificationStatus::ALL
+                    .into_iter()
+                    .filter(|status| status.is_trusted())
+                    .map(|status| format!("'{}'", status.as_str()))
+                    .collect();
+                format!("({column} IS NULL OR {column} IN ({}))", trusted.join(", "))
+            }
+            Self::Any => "1=1".to_string(),
+            Self::Status(status) => format!("{column} = '{}'", status.as_str()),
+        }
+    }
+}
+
+/// SQL CASE expression mapping a stored status column to its trust rank
+/// ([`VerificationStatus::rank`]); NULL and unknown strings rank below
+/// everything, so any recorded status replaces them. Generated from the one
+/// enum so the SQL can never drift from the Rust ordering.
+fn verification_rank_case(column: &str) -> String {
+    let arms: Vec<String> = VerificationStatus::ALL
+        .into_iter()
+        .map(|status| format!("WHEN '{}' THEN {}", status.as_str(), status.rank()))
+        .collect();
+    format!("CASE {column} {} ELSE -1 END", arms.join(" "))
+}
+
 /// New extraction/storage contract. The legacy [`LocalFact`] remains source
-/// compatible for CLI/server/mesh callers, while all new text extraction uses
-/// this type so conditions and QUDT units cannot be omitted from the path.
+/// compatible for CLI/server/mesh callers, while new extraction uses this
+/// type to preserve conditions and any unit terms it supplied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterialFact {
     pub subject: String,
@@ -196,7 +451,7 @@ pub struct MaterialFact {
     #[serde(default)]
     pub value: Option<f64>,
     #[serde(default)]
-    pub unit: Option<QudtUnit>,
+    pub unit: Option<UnitTerm>,
     #[serde(default)]
     pub conditions: Vec<MeasurementCondition>,
     #[serde(default)]
@@ -205,6 +460,18 @@ pub struct MaterialFact {
     pub kind: Option<String>,
     #[serde(default)]
     pub evidence_class: EvidenceClass,
+    /// How far the deterministic ingest checks verified this fact against
+    /// its source. `None` means no verification was recorded — a write
+    /// from before statuses existed, or from a path with its own guard
+    /// regime (claims, tabular, mesh relay) — and reads treat that as
+    /// visible-by-default, not as trusted-by-verification.
+    #[serde(default)]
+    pub verification: Option<VerificationStatus>,
+    /// Why the status is what it is, in the check's own words — the reason
+    /// that used to die in a drop report. `None` for facts whose status
+    /// needs no explanation (a clean `grounded`).
+    #[serde(default)]
+    pub verification_reason: Option<String>,
 }
 
 /// The node labels ONE tabular fact write persists its subject and object
@@ -247,6 +514,18 @@ pub struct ClassifiedFactNodes<'a> {
     pub object: ClassifiedNode<'a>,
 }
 
+/// Optional endpoint identities selected by an ontology-reading agent.
+///
+/// Paper facts may classify either endpoint independently. Missing bindings
+/// remain generic; present bindings retain their canonical class IRI. This
+/// path always writes a generic graph edge so a model-supplied legacy `kind`
+/// hint cannot silently select a built-in domain shape.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OntologyBoundFactNodes<'a> {
+    pub subject: Option<ClassifiedNode<'a>>,
+    pub object: Option<ClassifiedNode<'a>>,
+}
+
 /// Immutable ontology artifact identity used to classify one assertion.
 ///
 /// @req REQ-OWL-1.5 - Record ontology version IRI and artifact SHA-256.
@@ -256,12 +535,115 @@ pub struct OntologyClassification<'a> {
     pub artifact_sha256: &'a str,
 }
 
+/// A validated, source-revision-specific witness for one extracted fact.
+///
+/// Line numbers are one-based and inclusive. The evidence span is kept
+/// byte-for-byte as supplied so retrieval can re-open the source, read those
+/// exact lines, and compare them with the witness that was originally stored.
+/// `source_revision_id` is the lowercase hexadecimal SHA-256 of the complete
+/// source text; it identifies which revision the line coordinates address.
+///
+/// Fields are private so every value persisted through the public API has
+/// passed [`Self::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceCitation {
+    line_start: i64,
+    line_end: i64,
+    evidence_span: String,
+    source_revision_id: String,
+    locator_json: Option<String>,
+}
+
+impl SourceCitation {
+    /// Validate and construct an exact source witness.
+    ///
+    /// `locator_json`, when present, must be valid JSON. Its original text is
+    /// retained rather than normalized so source-specific locator details are
+    /// not rewritten by the provenance layer.
+    pub fn new(
+        line_start: i64,
+        line_end: i64,
+        evidence_span: impl Into<String>,
+        source_revision_id: impl Into<String>,
+        locator_json: Option<String>,
+    ) -> Result<Self> {
+        if line_start < 1 {
+            bail!("citation line_start must be one-based, got {line_start}");
+        }
+        if line_end < line_start {
+            bail!(
+                "citation line_end must be inclusive and no earlier than line_start \
+                 ({line_start}), got {line_end}"
+            );
+        }
+
+        let evidence_span = evidence_span.into();
+        if evidence_span.trim().is_empty() {
+            bail!("citation evidence_span cannot be empty");
+        }
+
+        let source_revision_id = source_revision_id.into();
+        if source_revision_id.len() != 64
+            || source_revision_id
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("citation source_revision_id must be a lowercase hexadecimal SHA-256");
+        }
+
+        if let Some(locator) = locator_json.as_deref() {
+            serde_json::from_str::<serde_json::Value>(locator)
+                .map_err(|error| anyhow::anyhow!("citation locator_json is invalid: {error}"))?;
+        }
+
+        Ok(Self {
+            line_start,
+            line_end,
+            evidence_span,
+            source_revision_id,
+            locator_json,
+        })
+    }
+
+    #[must_use]
+    pub fn line_start(&self) -> i64 {
+        self.line_start
+    }
+
+    #[must_use]
+    pub fn line_end(&self) -> i64 {
+        self.line_end
+    }
+
+    #[must_use]
+    pub fn evidence_span(&self) -> &str {
+        &self.evidence_span
+    }
+
+    #[must_use]
+    pub fn source_revision_id(&self) -> &str {
+        &self.source_revision_id
+    }
+
+    #[must_use]
+    pub fn locator_json(&self) -> Option<&str> {
+        self.locator_json.as_deref()
+    }
+}
+
 /// Common storage view implemented by both the additive conditioned contract
 /// and the source-compatible legacy fact.
 pub trait FactPayload {
     fn to_local_fact(&self) -> LocalFact;
     fn conditions(&self) -> &[MeasurementCondition];
     fn evidence_class(&self) -> EvidenceClass;
+    /// The verification status and reason this write carries, if the
+    /// producing path recorded one. Defaults to `None` — "no status
+    /// recorded", the honest answer for every payload that predates
+    /// verification statuses.
+    fn verification(&self) -> Option<(VerificationStatus, Option<&str>)> {
+        None
+    }
 }
 
 impl FactPayload for LocalFact {
@@ -282,12 +664,6 @@ fn validate_conditions(conditions: &[MeasurementCondition]) -> Result<()> {
     for condition in conditions {
         if condition.name.trim().is_empty() {
             anyhow::bail!("measurement condition name cannot be empty");
-        }
-        if matches!(&condition.value, ConditionValue::Number(_)) && condition.unit.is_none() {
-            anyhow::bail!(
-                "numerical measurement condition '{}' requires a QUDT unit",
-                condition.name
-            );
         }
     }
     Ok(())
@@ -312,6 +688,11 @@ impl FactPayload for MaterialFact {
 
     fn evidence_class(&self) -> EvidenceClass {
         self.evidence_class
+    }
+
+    fn verification(&self) -> Option<(VerificationStatus, Option<&str>)> {
+        self.verification
+            .map(|status| (status, self.verification_reason.as_deref()))
     }
 }
 
@@ -456,6 +837,41 @@ pub struct RecalledMaterialFact {
     /// Tenant that owns the assertion (see [`RecalledFact::tenant`]).
     #[serde(default)]
     pub tenant: String,
+    /// How far the deterministic ingest checks verified this fact against
+    /// its source (best sighting so far). `None` = no status recorded —
+    /// legacy rows and non-text write paths. `#[serde(default)]` keeps
+    /// payloads serialized before this field deserializable.
+    #[serde(default)]
+    pub verification_status: Option<VerificationStatus>,
+    /// The check's own words for why the status is what it is.
+    #[serde(default)]
+    pub verification_reason: Option<String>,
+}
+
+/// One stored assertion addressed by its stable id.
+///
+/// Unlike text search recall, this shape preserves every conditioned fact
+/// field and returns weak-status assertions as stored. Retrieval uses it with
+/// a selected [`EvidenceContribution`] to re-open the exact source witness;
+/// this method is an identity lookup, not a trust filter.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct StoredAssertion {
+    pub id: String,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub value: Option<f64>,
+    pub unit: Option<String>,
+    pub conditions: Vec<MeasurementCondition>,
+    pub evidence_class: EvidenceClass,
+    pub confidence: f64,
+    pub corroborations: i64,
+    pub activity_id: String,
+    pub source: String,
+    pub agent: String,
+    pub tenant: String,
+    pub verification_status: Option<VerificationStatus>,
+    pub verification_reason: Option<String>,
 }
 
 /// One semantic entity hit, attributed to the tenant whose entity row it
@@ -562,7 +978,7 @@ pub struct EntityGeometryCoverage {
 /// `recall` reports only the immutable FIRST attribution on the parent row;
 /// every corroborating source lives here (see
 /// [`ProvenanceStore::assertion_evidence`]).
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct EvidenceContribution {
     /// Canonical independence key (`doi:…` / `url:…` / `file:…` /
     /// `document:…` / `opaque:…`; relays are `mesh:<origin key>` when the
@@ -570,10 +986,32 @@ pub struct EvidenceContribution {
     pub source_key: String,
     /// The locator/display string exactly as this contribution supplied it.
     pub source_entity_id: String,
+    /// SHA-256 of the source text whose coordinates the citation addresses.
+    /// `None` is explicit legacy/uncited evidence.
+    #[serde(default)]
+    pub source_revision_id: Option<String>,
+    /// Exact source text retained when this contribution was written.
+    #[serde(default)]
+    pub evidence_span: Option<String>,
+    /// One-based inclusive source line range. Both values are `None` for an
+    /// uncited or legacy contribution.
+    #[serde(default)]
+    pub line_start: Option<i64>,
+    #[serde(default)]
+    pub line_end: Option<i64>,
+    /// Optional source-specific locator metadata, stored as JSON text.
+    #[serde(default)]
+    pub locator_json: Option<String>,
     pub activity_id: String,
     pub agent_id: String,
     pub confidence: f64,
     pub evidence_class: EvidenceClass,
+    /// Verification result for THIS source contribution, separate from the
+    /// best-wins aggregate cached on `prov_assertion`.
+    #[serde(default)]
+    pub verification_status: Option<VerificationStatus>,
+    #[serde(default)]
+    pub verification_reason: Option<String>,
     /// `"source"` for a real per-source contribution; `"legacy_aggregate"`
     /// for a pre-v5 row whose confidence may contain phantom
     /// self-corroboration (old count preserved in `legacy_corroborations`).
@@ -1762,6 +2200,13 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // the v5 evidence migration chose.
     crate::add_column_if_absent(conn, "prov_assertion", "confidence_doubt", "REAL").await?;
     crate::add_column_if_absent(conn, "prov_assertion", "confidence_max", "REAL").await?;
+    // Verification status: how far the deterministic ingest checks verified
+    // the fact against its source (annotate-not-refuse — see
+    // [`VerificationStatus`]). NULL on legacy rows and on every path that
+    // records no status; the default read treats NULL as visible, so no
+    // pre-existing row vanishes when this column appears.
+    crate::add_column_if_absent(conn, "prov_assertion", "verification_status", "TEXT").await?;
+    crate::add_column_if_absent(conn, "prov_assertion", "verification_reason", "TEXT").await?;
 
     // One row per (assertion, distinct origin source) — the AUTHORITATIVE
     // record corroboration is computed from. Keyed by `source_key`
@@ -1770,12 +2215,17 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // defect the v5 migration exists to fix. `source_revision_id` (e.g. a
     // content SHA-256) is attribution metadata, deliberately OUTSIDE the
     // primary key: a file edited in place stays the same source.
-    // Rows are never updated (except an evidence-class downgrade) or
-    // deleted through the API — subtracting a contribution from noisy-OR
-    // needs a full recompute, so mutation is prohibited rather than half
-    // supported. The FK keeps evidence attached to its assertion across the
-    // id re-key migrations (ON UPDATE CASCADE); it is enforced because
-    // `open()` sets `PRAGMA foreign_keys=ON` on every connection.
+    // Contribution confidence is never updated or deleted through the API —
+    // subtracting a contribution from noisy-OR needs a full recompute, so that
+    // mutation is prohibited rather than half supported. Duplicate-source
+    // writes may downgrade the evidence class. They may atomically replace an
+    // entirely uncited legacy locator/attribution with the first complete
+    // citation, or improve verification for the same exact witness; a partial
+    // or complete witness is never combined with or overwritten by another.
+    // The FK keeps
+    // evidence attached to its assertion across the id re-key migrations (ON
+    // UPDATE CASCADE); it is enforced because `open()` sets
+    // `PRAGMA foreign_keys=ON` on every connection.
     conn.execute(
         r#"CREATE TABLE IF NOT EXISTS prov_assertion_evidence (
             assertion_id TEXT NOT NULL,
@@ -1783,6 +2233,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
 
             source_entity_id TEXT NOT NULL,
             source_revision_id TEXT,
+            evidence_span TEXT,
+            line_start INTEGER,
+            line_end INTEGER,
+            locator_json TEXT,
             activity_id TEXT NOT NULL,
             agent_id TEXT NOT NULL,
 
@@ -1795,6 +2249,8 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
                     'screening',
                     'reference_validated'
                 )),
+            verification_status TEXT,
+            verification_reason TEXT,
 
             confidence_kind TEXT NOT NULL DEFAULT 'source'
                 CHECK (confidence_kind IN ('source', 'legacy_aggregate')),
@@ -1812,6 +2268,27 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
                 ON DELETE CASCADE
         )"#,
         (),
+    )
+    .await?;
+    // Citation and per-source verification columns are nullable on purpose:
+    // old contributions remain honest uncited evidence instead of gaining an
+    // invented span, revision, locator, or check result during migration.
+    crate::add_column_if_absent(conn, "prov_assertion_evidence", "evidence_span", "TEXT").await?;
+    crate::add_column_if_absent(conn, "prov_assertion_evidence", "line_start", "INTEGER").await?;
+    crate::add_column_if_absent(conn, "prov_assertion_evidence", "line_end", "INTEGER").await?;
+    crate::add_column_if_absent(conn, "prov_assertion_evidence", "locator_json", "TEXT").await?;
+    crate::add_column_if_absent(
+        conn,
+        "prov_assertion_evidence",
+        "verification_status",
+        "TEXT",
+    )
+    .await?;
+    crate::add_column_if_absent(
+        conn,
+        "prov_assertion_evidence",
+        "verification_reason",
+        "TEXT",
     )
     .await?;
     conn.execute(
@@ -2118,11 +2595,129 @@ impl<'a> EntityWrite<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// The graph shape ONE typed fact kind writes — the ACTIVE ontology's
+/// declaration, never the store's. The writer used to hold a closed
+/// seven-entry kind→shape table in Rust, so an ontology whose fact kinds
+/// differ from EMMO's (a legal `"obligation"`, a pharma `"assay"`) had every
+/// typed fact degraded to untyped `Entity` endpoints by the fallback arm:
+/// zero Rust edits bought a degraded graph, not a working one. The table
+/// now belongs to the ontology adapters (`prism_ingest`'s
+/// `Ontology::fact_graph_shape`; EMMO declares its seven legacy shapes
+/// there), and this writer executes exactly the shape it is handed — one
+/// generic path, no domain vocabulary of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactGraphShape {
+    /// Storage label for the OBJECT node when the caller supplied no
+    /// ontology-classified identity for it. Classified metadata still wins:
+    /// the ontology's declared endpoint class is identity, this label is the
+    /// established fallback for unclassified writes.
+    pub object_storage_label: String,
+    /// The typed edge's rel_type (EMMO: `HAS_PHASE`, `CONTAINS_ELEMENT`, …;
+    /// an induced ontology: its own declared relation token).
+    pub edge_rel_type: String,
+    /// Whether this shape reifies a measurement node between the endpoints:
+    /// subject —[`edge_rel_type`]→ Measurement(value/unit/conditions/evidence)
+    /// —`OF_PROPERTY`→ object. The reified node, its props and the
+    /// `OF_PROPERTY` edge are the store's own audit shape (they are what
+    /// `graph_search` reads); the object label still comes from this
+    /// declaration.
+    pub reified_measurement: bool,
+    /// Prop key under which the OBJECT NODE carries the fact's object text
+    /// (EMMO composition: `canonical_formula`; EMMO structure: `system`).
+    /// `None` writes no object-node prop.
+    pub object_text_prop: Option<String>,
+    /// Prop key under which the typed EDGE carries the fact's numeric value
+    /// (EMMO contains: `fraction`; EMMO processing: `order`). `None` writes
+    /// no edge-value prop; the value still rides the assertion.
+    pub edge_value_prop: Option<String>,
+}
+
+impl FactGraphShape {
+    /// The EMMO shape for one of the store's seven legacy fact kinds, as the
+    /// EMMO adapter declares it. Kept here so every writer test (and the
+    /// EMMO adapter in `prism_ingest`) shares the one declaration instead
+    /// of restating it — this is EMMO's own table, resident where EMMO's
+    /// compatibility shapes live.
+    #[must_use]
+    pub fn emmo(kind: &str) -> Option<Self> {
+        Some(match kind {
+            "measurement" => Self {
+                object_storage_label: "Property".into(),
+                edge_rel_type: "HAS_MEASUREMENT".into(),
+                reified_measurement: true,
+                object_text_prop: None,
+                edge_value_prop: None,
+            },
+            "phase" => Self {
+                object_storage_label: "Phase".into(),
+                edge_rel_type: "HAS_PHASE".into(),
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: None,
+            },
+            "composition" => Self {
+                object_storage_label: "Composition".into(),
+                edge_rel_type: "HAS_COMPOSITION".into(),
+                reified_measurement: false,
+                object_text_prop: Some("canonical_formula".into()),
+                edge_value_prop: None,
+            },
+            "contains" => Self {
+                object_storage_label: "Element".into(),
+                edge_rel_type: "CONTAINS_ELEMENT".into(),
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: Some("fraction".into()),
+            },
+            "processing" => Self {
+                object_storage_label: "Manufacturing".into(),
+                edge_rel_type: "PROCESSED_BY".into(),
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: Some("order".into()),
+            },
+            "structure" => Self {
+                object_storage_label: "CrystalStructure".into(),
+                edge_rel_type: "HAS_STRUCTURE".into(),
+                reified_measurement: false,
+                object_text_prop: Some("system".into()),
+                edge_value_prop: None,
+            },
+            "application" => Self {
+                object_storage_label: "Application".into(),
+                edge_rel_type: "USED_IN".into(),
+                reified_measurement: false,
+                object_text_prop: None,
+                edge_value_prop: None,
+            },
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FactWriteMetadata<'a> {
     subject: Option<EntityWrite<'a>>,
     object: Option<EntityWrite<'a>>,
     ontology: Option<OntologyClassification<'a>>,
+    /// The ontology-declared graph shape for this fact's kind, when the
+    /// caller resolved one (`Ontology::fact_graph_shape`). `None` means no
+    /// declared shape: the fact is kept as a generic edge — same honest
+    /// default as an undeclared kind, never a frozen built-in table.
+    shape: Option<FactGraphShape>,
+    force_generic_graph: bool,
+}
+
+/// The object write's classified identity when the caller supplied one, else
+/// the established fallback label the resolved shape declares for this fact
+/// kind. Identity is the ontology's declaration; the fallback is the shape's.
+fn object_entity_write<'a>(
+    metadata: Option<&FactWriteMetadata<'a>>,
+    legacy: &'a str,
+) -> EntityWrite<'a> {
+    metadata
+        .and_then(|details| details.object)
+        .unwrap_or_else(|| EntityWrite::legacy(legacy))
 }
 
 fn validate_classified_node(node: ClassifiedNode<'_>) -> Result<()> {
@@ -2263,12 +2858,17 @@ impl ProvenanceStore {
     /// exactly like core's typed `write_*_fact` writers, then reify it as a
     /// PROV-O assertion so graph and audit trail stay consistent.
     pub async fn write_fact<F: FactPayload>(&self, fact: &F, prov: &LocalProvenance) -> Result<()> {
-        self.write_fact_as(fact, prov, fact.evidence_class(), None)
+        self.write_fact_as(fact, prov, fact.evidence_class(), None, None)
             .await
     }
 
     /// Write a fact using the store's established graph shape and stamp the
     /// assertion with the ontology artifact that classified it.
+    ///
+    /// `shape` is the ACTIVE ontology's declared graph shape for this fact's
+    /// kind (`FactGraphShape`, resolved by the caller through the ontology
+    /// adapter). `None` keeps the fact as a generic edge — the honest
+    /// default for a kind the ontology does not declare.
     ///
     /// This is the classified text/paper path: its synthetic `Matter`,
     /// `Measurement`, and related storage nodes remain byte-compatible while
@@ -2281,6 +2881,7 @@ impl ProvenanceStore {
         fact: &F,
         prov: &LocalProvenance,
         ontology: OntologyClassification<'_>,
+        shape: Option<FactGraphShape>,
     ) -> Result<()> {
         validate_ontology_classification(ontology)?;
         self.write_fact_as(
@@ -2291,7 +2892,37 @@ impl ProvenanceStore {
                 subject: None,
                 object: None,
                 ontology: Some(ontology),
+                shape,
+                force_generic_graph: false,
             }),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_fact_with_classification`] with an exact, revision-bound
+    /// source witness persisted on this contribution.
+    pub async fn write_fact_with_classification_and_citation<F: FactPayload>(
+        &self,
+        fact: &F,
+        prov: &LocalProvenance,
+        ontology: OntologyClassification<'_>,
+        shape: Option<FactGraphShape>,
+        citation: &SourceCitation,
+    ) -> Result<()> {
+        validate_ontology_classification(ontology)?;
+        self.write_fact_as(
+            fact,
+            prov,
+            fact.evidence_class(),
+            Some(FactWriteMetadata {
+                subject: None,
+                object: None,
+                ontology: Some(ontology),
+                shape,
+                force_generic_graph: false,
+            }),
+            Some(citation),
         )
         .await
     }
@@ -2312,6 +2943,7 @@ impl ProvenanceStore {
         prov: &LocalProvenance,
         evidence_class: EvidenceClass,
         labels: FactNodeLabels<'_>,
+        shape: Option<FactGraphShape>,
     ) -> Result<()> {
         if labels.subject.trim().is_empty() || labels.object.trim().is_empty() {
             bail!(
@@ -2329,7 +2961,10 @@ impl ProvenanceStore {
                 subject: Some(EntityWrite::legacy(labels.subject)),
                 object: Some(EntityWrite::legacy(labels.object)),
                 ontology: None,
+                shape,
+                force_generic_graph: false,
             }),
+            None,
         )
         .await
     }
@@ -2357,6 +2992,7 @@ impl ProvenanceStore {
         evidence_class: EvidenceClass,
         nodes: ClassifiedFactNodes<'_>,
         ontology: OntologyClassification<'_>,
+        shape: Option<FactGraphShape>,
     ) -> Result<()> {
         validate_classified_node(nodes.subject)?;
         validate_classified_node(nodes.object)?;
@@ -2369,7 +3005,81 @@ impl ProvenanceStore {
                 subject: Some(EntityWrite::classified(nodes.subject)),
                 object: Some(EntityWrite::classified(nodes.object)),
                 ontology: Some(ontology),
+                shape,
+                force_generic_graph: false,
             }),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_classified_fact_with_evidence`] with an exact,
+    /// revision-bound source witness persisted on this contribution.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_classified_fact_with_evidence_and_citation<F: FactPayload>(
+        &self,
+        fact: &F,
+        prov: &LocalProvenance,
+        evidence_class: EvidenceClass,
+        nodes: ClassifiedFactNodes<'_>,
+        ontology: OntologyClassification<'_>,
+        shape: Option<FactGraphShape>,
+        citation: &SourceCitation,
+    ) -> Result<()> {
+        validate_classified_node(nodes.subject)?;
+        validate_classified_node(nodes.object)?;
+        validate_ontology_classification(ontology)?;
+        self.write_fact_as(
+            fact,
+            prov,
+            evidence_class,
+            Some(FactWriteMetadata {
+                subject: Some(EntityWrite::classified(nodes.subject)),
+                object: Some(EntityWrite::classified(nodes.object)),
+                ontology: Some(ontology),
+                shape,
+                force_generic_graph: false,
+            }),
+            Some(citation),
+        )
+        .await
+    }
+
+    /// Persist a paper-agent fact with whatever canonical endpoint classes
+    /// the active ontology supplied and its exact source witness.
+    ///
+    /// Unlike the compatibility writers, this path deliberately uses the
+    /// generic edge shape. Ontology identity comes from the proposed
+    /// predicate and endpoint bindings; a legacy closed `kind` hint is not a
+    /// second vocabulary and cannot steer storage here.
+    pub async fn write_ontology_bound_fact_with_citation<F: FactPayload>(
+        &self,
+        fact: &F,
+        prov: &LocalProvenance,
+        evidence_class: EvidenceClass,
+        nodes: OntologyBoundFactNodes<'_>,
+        ontology: OntologyClassification<'_>,
+        citation: &SourceCitation,
+    ) -> Result<()> {
+        if let Some(subject) = nodes.subject {
+            validate_classified_node(subject)?;
+        }
+        if let Some(object) = nodes.object {
+            validate_classified_node(object)?;
+        }
+        validate_ontology_classification(ontology)?;
+        self.write_fact_as(
+            fact,
+            prov,
+            evidence_class,
+            Some(FactWriteMetadata {
+                subject: nodes.subject.map(EntityWrite::classified),
+                object: nodes.object.map(EntityWrite::classified),
+                ontology: Some(ontology),
+                shape: None,
+                force_generic_graph: true,
+            }),
+            Some(citation),
         )
         .await
     }
@@ -2463,7 +3173,7 @@ impl ProvenanceStore {
         let _same_handle_guard = self.write_lock.lock().await;
         let txn = begin_immediate(&self.conn).await?;
         let result: Result<()> = async {
-            let (confidence, _class) = self
+            let (confidence, _class, _status) = self
                 .record_assertion_in_open_txn(
                     &LocalAssertion {
                         subject: name.to_string(),
@@ -2476,6 +3186,8 @@ impl ProvenanceStore {
                     None,
                     &[],
                     EvidenceClass::Indeterminate,
+                    None,
+                    None,
                     None,
                 )
                 .await?;
@@ -2572,56 +3284,30 @@ impl ProvenanceStore {
         prov: &LocalProvenance,
         evidence_class: EvidenceClass,
         metadata: Option<FactWriteMetadata<'_>>,
+        citation: Option<&SourceCitation>,
     ) -> Result<()> {
         let conditions = payload.conditions().to_vec();
-        validate_conditions(&conditions)?;
         let fact = payload.to_local_fact();
         let tenant = prov.tenant.as_str();
 
-        // Mirror core: a measurement without a value fails schema validation
-        // and is dropped (not written half-typed, not recorded as an
-        // assertion). Checked before the transaction so a dropped fact never
-        // takes the write lock. Defence in depth only: every ingest path
-        // rejects this shape upstream WITH a reported reason, so a caller
-        // whose fact vanishes here has already miscounted.
-        if fact.kind.as_deref() == Some("measurement") && fact.value.is_none() {
-            return Ok(());
-        }
-
-        // Defence in depth for the unit, through the same controlled
-        // vocabulary every ingest path uses (`crate::units::resolve_unit` —
-        // never a second table): a measurement's number is meaningless
-        // without its unit (880 GPa vs 880 MPa), so a missing or
-        // unresolvable unit refuses the write LOUDLY — the old
-        // `unwrap_or_default()` here stored an empty-string unit instead.
-        // Ingest drops and reports this shape before it gets here; reaching
-        // this bail means a caller bypassed that contract. Raw spellings
-        // that DO resolve (`"MPa"`) are canonicalised so the store holds
-        // one unit vocabulary, not one per path.
-        let canonical_unit = match fact.kind.as_deref() {
-            Some("measurement") => match fact.unit.as_deref() {
-                Some(raw) => match crate::units::resolve_unit(raw) {
-                    Some(unit) => Some(unit.as_str().to_string()),
-                    None => bail!(
-                        "refusing to store measurement '{} {} {}': unit {raw:?} is neither \
-                         a QUDT identifier nor a recognised unit spelling — a number stored \
-                         without its unit is a wrong number, never stored unit-less",
-                        fact.subject,
-                        fact.predicate,
-                        fact.object
-                    ),
-                },
-                None => bail!(
-                    "refusing to store measurement '{} {} {}' carrying value {:?} with no \
-                     unit — a unit-less number is a wrong number, never stored unit-less",
-                    fact.subject,
-                    fact.predicate,
-                    fact.object,
-                    fact.value
-                ),
-            },
-            _ => fact.unit.clone(),
-        };
+        // Defence in depth checks only the non-empty term carried by the
+        // typed payload. The paper agent navigates the active ontology; the
+        // store must not second-guess that result with a closed Rust table.
+        //
+        let verification = payload.verification();
+        validate_conditions(&conditions)?;
+        // A present term must be non-empty, but absence has no universal
+        // semantic meaning the store can decide. The active ontology and
+        // reader own that judgement; persistence records the supplied shape.
+        let stored_unit = fact
+            .unit
+            .as_deref()
+            .map(|raw| UnitTerm::new(raw.to_string()))
+            .transpose()?
+            .map(|unit| unit.as_str().to_string());
+        let force_generic_graph = metadata
+            .as_ref()
+            .is_some_and(|details| details.force_generic_graph);
 
         // One fact commits atomically: EMMO entities/edges, the PROV-O
         // activity, the assertion, its evidence contribution, and the
@@ -2638,15 +3324,18 @@ impl ProvenanceStore {
         let txn = begin_immediate(&self.conn).await?;
         let result: Result<()> = async {
             // The assertion runs FIRST, and the graph writes below reuse the
-            // aggregates it returns: `confidence` and `evidence_class` are
-            // REBOUND here from this one write's own values to the parent
-            // row's post-update state. That is what keeps the graph on the
-            // same evidence gate as the assertion — a duplicate source
-            // cannot move an edge's confidence, a re-record cannot upgrade a
-            // Measurement node's class, and a genuine corroboration lifts
-            // the edge to the combined (noisy-OR) confidence instead of the
-            // last writer's own number.
-            let (confidence, evidence_class) = self
+            // aggregates it returns: `confidence`, `evidence_class`, and
+            // `verification_status` are REBOUND here from this one write's
+            // own values to the parent row's post-update state. That is what
+            // keeps the graph on the same evidence gate as the assertion — a
+            // duplicate source cannot move an edge's confidence, a re-record
+            // cannot upgrade a Measurement node's class, and a genuine
+            // corroboration lifts the edge to the combined (noisy-OR)
+            // confidence instead of the last writer's own number. The
+            // verification status mirrored onto the graph is likewise the
+            // best-wins aggregate, so the edge and the assertion can never
+            // disagree about how verified the fact is.
+            let (confidence, evidence_class, verification_status) = self
                 .record_assertion_in_open_txn(
                     &LocalAssertion {
                         subject: fact.subject.clone(),
@@ -2656,35 +3345,74 @@ impl ProvenanceStore {
                     },
                     prov,
                     fact.value,
-                    canonical_unit.as_deref(),
+                    stored_unit.as_deref(),
                     &conditions,
                     evidence_class,
-                    metadata.and_then(|details| details.ontology),
+                    verification,
+                    metadata.as_ref().and_then(|details| details.ontology),
+                    citation,
                 )
                 .await?;
+
+            // The status half of every edge/node props write below: merge
+            // the aggregate verification status into a props object, or
+            // leave the props exactly as they were (including None) when no
+            // status is recorded — a pure-tabular or mesh write keeps its
+            // historical byte shape.
+            let props_with_status = |base: Option<serde_json::Value>| -> Option<String> {
+                match (base, verification_status) {
+                    (Some(serde_json::Value::Object(mut map)), Some(status)) => {
+                        map.insert(
+                            "verification_status".to_string(),
+                            serde_json::Value::String(status.as_str().to_string()),
+                        );
+                        Some(serde_json::Value::Object(map).to_string())
+                    }
+                    (Some(base), None) => Some(base.to_string()),
+                    (None, Some(status)) => Some(
+                        serde_json::json!({ "verification_status": status.as_str() }).to_string(),
+                    ),
+                    (Some(base), Some(_)) => Some(base.to_string()),
+                    (None, None) => None,
+                }
+            };
 
             // One binding per node role: caller-supplied classified identity
             // when present, the established storage shape otherwise. Every
             // fact arm uses these bindings so identity semantics do not drift
             // between dispatch paths.
-            let subject_entity = metadata
-                .and_then(|details| details.subject)
-                .unwrap_or_else(|| EntityWrite::legacy("Matter"));
-            let object_entity = |legacy: &'static str| {
+            let metadata = metadata.as_ref();
+            let subject_entity =
                 metadata
-                    .and_then(|details| details.object)
-                    .unwrap_or_else(|| EntityWrite::legacy(legacy))
-            };
+                    .and_then(|details| details.subject)
+                    .unwrap_or_else(|| {
+                        EntityWrite::legacy(if force_generic_graph {
+                            "Entity"
+                        } else {
+                            "Matter"
+                        })
+                    });
 
-            match fact.kind.as_deref() {
-                Some("measurement") => {
-                    // Guarded above; destructure the value the guard proved.
-                    let Some(value) = fact.value else {
-                        return Ok(());
-                    };
-                    let unit = canonical_unit
-                        .clone()
-                        .expect("guarded above: a measurement's unit is resolved or refused");
+            // ONE generic path. The graph shape for a typed fact kind is the
+            // ACTIVE ONTOLOGY's declaration, resolved by the caller and
+            // carried here as metadata — the store no longer owns a closed
+            // kind→(class, edge) table, so a non-materials ontology's kinds
+            // are first-class typed shapes, not degraded `Entity` endpoints.
+            // A fact with no declared shape (or a measurement-shaped proposal
+            // without a value) is kept as a generic edge — never dropped.
+            let shape = if force_generic_graph {
+                None
+            } else {
+                metadata.and_then(|details| details.shape.clone())
+            };
+            match shape {
+                Some(shape) if shape.reified_measurement && fact.value.is_some() => {
+                    // The guard selects the reified shape only when a numeric
+                    // value exists. A value-less proposal falls through to
+                    // the generic edge arm, retaining its assertion instead
+                    // of disappearing because of a model-supplied hint.
+                    let value = fact.value.expect("measurement guard checked value");
+                    let unit = stored_unit.clone();
                     let meas_name = format!(
                         "meas_{}_{}_{value}",
                         canonical_key(&fact.subject),
@@ -2706,20 +3434,25 @@ impl ProvenanceStore {
                             &meas_name,
                             EntityWrite::legacy("Measurement"),
                             tenant,
-                            Some(props.to_string()),
+                            props_with_status(Some(props)),
                         )
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_entity("Property"), tenant, None)
+                        .upsert_entity(
+                            &fact.object,
+                            object_entity_write(metadata, &shape.object_storage_label),
+                            tenant,
+                            None,
+                        )
                         .await?;
                     self.upsert_edge(
                         &subj_key,
                         &meas_key,
-                        "HAS_MEASUREMENT",
+                        &shape.edge_rel_type,
                         &fact.predicate,
                         confidence,
                         tenant,
-                        None,
+                        props_with_status(None).as_deref(),
                     )
                     .await?;
                     self.upsert_edge(
@@ -2729,147 +3462,57 @@ impl ProvenanceStore {
                         &fact.predicate,
                         confidence,
                         tenant,
-                        None,
+                        props_with_status(None).as_deref(),
                     )
                     .await?;
                 }
-                Some("phase") => {
-                    let subj_key = self
-                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
-                        .await?;
-                    let obj_key = self
-                        .upsert_entity(&fact.object, object_entity("Phase"), tenant, None)
-                        .await?;
-                    self.upsert_edge(
-                        &subj_key,
-                        &obj_key,
-                        "HAS_PHASE",
-                        &fact.predicate,
-                        confidence,
-                        tenant,
-                        None,
-                    )
-                    .await?;
-                }
-                Some("composition") => {
-                    let props = serde_json::json!({ "canonical_formula": &fact.object });
+                Some(shape) if !shape.reified_measurement => {
+                    let props = shape
+                        .object_text_prop
+                        .as_ref()
+                        .map(|key| serde_json::json!({ key.clone(): &fact.object }));
+                    let edge_props = props_with_status(
+                        shape
+                            .edge_value_prop
+                            .as_deref()
+                            .zip(fact.value)
+                            .map(|(key, value)| serde_json::json!({ key: value })),
+                    );
                     let subj_key = self
                         .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
                         .upsert_entity(
                             &fact.object,
-                            object_entity("Composition"),
+                            object_entity_write(metadata, &shape.object_storage_label),
                             tenant,
-                            Some(props.to_string()),
+                            props.map(|props| props.to_string()),
                         )
                         .await?;
                     self.upsert_edge(
                         &subj_key,
                         &obj_key,
-                        "HAS_COMPOSITION",
+                        &shape.edge_rel_type,
                         &fact.predicate,
                         confidence,
                         tenant,
-                        None,
+                        edge_props.as_deref(),
                     )
                     .await?;
                 }
-                // Mirrors core's Element node + CONTAINS_ELEMENT edge; the
-                // composition fraction (when `value` carries it) rides on the
-                // edge props, not on the nodes.
-                Some("contains") => {
-                    let props = fact
-                        .value
-                        .map(|f| serde_json::json!({ "fraction": f }).to_string());
-                    let subj_key = self
-                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
-                        .await?;
-                    let obj_key = self
-                        .upsert_entity(&fact.object, object_entity("Element"), tenant, None)
-                        .await?;
-                    self.upsert_edge(
-                        &subj_key,
-                        &obj_key,
-                        "CONTAINS_ELEMENT",
-                        &fact.predicate,
-                        confidence,
-                        tenant,
-                        props.as_deref(),
-                    )
-                    .await?;
-                }
-                Some("processing") => {
-                    // The step order (when `value` carries it) rides on the edge.
-                    let props = fact
-                        .value
-                        .map(|o| serde_json::json!({ "order": o }).to_string());
-                    let subj_key = self
-                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
-                        .await?;
-                    let obj_key = self
-                        .upsert_entity(&fact.object, object_entity("Manufacturing"), tenant, None)
-                        .await?;
-                    self.upsert_edge(
-                        &subj_key,
-                        &obj_key,
-                        "PROCESSED_BY",
-                        &fact.predicate,
-                        confidence,
-                        tenant,
-                        props.as_deref(),
-                    )
-                    .await?;
-                }
-                Some("structure") => {
-                    let props = serde_json::json!({ "system": &fact.object });
-                    let subj_key = self
-                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
-                        .await?;
-                    let obj_key = self
-                        .upsert_entity(
-                            &fact.object,
-                            object_entity("CrystalStructure"),
-                            tenant,
-                            Some(props.to_string()),
-                        )
-                        .await?;
-                    self.upsert_edge(
-                        &subj_key,
-                        &obj_key,
-                        "HAS_STRUCTURE",
-                        &fact.predicate,
-                        confidence,
-                        tenant,
-                        None,
-                    )
-                    .await?;
-                }
-                Some("application") => {
-                    let subj_key = self
-                        .upsert_entity(&fact.subject, subject_entity, tenant, None)
-                        .await?;
-                    let obj_key = self
-                        .upsert_entity(&fact.object, object_entity("Application"), tenant, None)
-                        .await?;
-                    self.upsert_edge(
-                        &subj_key,
-                        &obj_key,
-                        "USED_IN",
-                        &fact.predicate,
-                        confidence,
-                        tenant,
-                        None,
-                    )
-                    .await?;
-                }
-                // Unknown kind: keep the fact as a generic edge, don't drop it.
+                // No declared shape (or a value-less measurement proposal):
+                // keep the fact as a generic edge, don't drop it.
                 _ => {
                     let subj_key = self
                         .upsert_entity(&fact.subject, subject_entity, tenant, None)
                         .await?;
                     let obj_key = self
-                        .upsert_entity(&fact.object, object_entity("Entity"), tenant, None)
+                        .upsert_entity(
+                            &fact.object,
+                            object_entity_write(metadata, "Entity"),
+                            tenant,
+                            None,
+                        )
                         .await?;
                     self.upsert_edge(
                         &subj_key,
@@ -2878,7 +3521,7 @@ impl ProvenanceStore {
                         &fact.predicate,
                         confidence,
                         tenant,
-                        None,
+                        props_with_status(None).as_deref(),
                     )
                     .await?;
                 }
@@ -3007,7 +3650,17 @@ impl ProvenanceStore {
         let _same_handle_guard = self.write_lock.lock().await;
         let txn = begin_immediate(&self.conn).await?;
         let result = self
-            .record_assertion_in_open_txn(a, prov, value, unit, conditions, evidence_class, None)
+            .record_assertion_in_open_txn(
+                a,
+                prov,
+                value,
+                unit,
+                conditions,
+                evidence_class,
+                None,
+                None,
+                None,
+            )
             .await
             .map(|_aggregates| ());
         finish_write_txn(txn, result).await
@@ -3021,9 +3674,11 @@ impl ProvenanceStore {
     /// sensitive to interleaved statements on one connection).
     ///
     /// Returns the parent row's POST-update aggregates
-    /// `(confidence, evidence_class)` so `write_fact_as` can mirror them
-    /// into the EMMO graph in the same transaction — the graph must follow
-    /// the evidence gate and `WORST_CLASS_CASE`, never the last writer.
+    /// `(confidence, evidence_class, verification_status)` so
+    /// `write_fact_as` can mirror them into the EMMO graph in the same
+    /// transaction — the graph must follow the evidence gate,
+    /// `WORST_CLASS_CASE`, and the best-wins verification aggregate, never
+    /// the last writer.
     ///
     /// Why not one UPSERT: a single statement on `prov_assertion` cannot
     /// tell a duplicate assertion from the same source apart from the same
@@ -3040,8 +3695,10 @@ impl ProvenanceStore {
         unit: Option<&str>,
         conditions: &[MeasurementCondition],
         evidence_class: EvidenceClass,
+        verification: Option<(VerificationStatus, Option<&str>)>,
         ontology: Option<OntologyClassification<'_>>,
-    ) -> Result<(f64, EvidenceClass)> {
+        citation: Option<&SourceCitation>,
+    ) -> Result<(f64, EvidenceClass, Option<VerificationStatus>)> {
         // Normalize before any write. `None` keeps the historical "asserted
         // without a stated confidence = full confidence" contract; NaN and
         // infinity are rejected rather than clamped because they are always
@@ -3134,29 +3791,96 @@ impl ProvenanceStore {
         // independence decision: 1 = genuinely new origin source, 0 = this
         // source already contributed and must not corroborate again. No
         // SELECT-first — the count answers it atomically. On a duplicate the
-        // stored contribution's confidence and provenance stay immutable: a
-        // later extraction from the same source cannot raise or replace its
-        // numeric contribution.
+        // stored contribution's confidence stays immutable: a later
+        // extraction from the same source cannot raise or replace its numeric
+        // contribution. Attribution to an existing witness is immutable too;
+        // the sole exception below is a wholly uncited legacy row receiving
+        // its first complete witness and that witness's locator/activity.
         let inserted = self
             .conn
             .execute(
                 r#"INSERT INTO prov_assertion_evidence
                    (assertion_id, source_key, source_entity_id, source_revision_id,
+                    evidence_span, line_start, line_end, locator_json,
                     activity_id, agent_id, confidence, evidence_class,
+                    verification_status, verification_reason,
                     confidence_kind, legacy_corroborations)
-                   VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, 'source', NULL)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                           ?9, ?10, ?11, ?12, ?13, ?14, 'source', NULL)
                    ON CONFLICT(assertion_id, source_key) DO NOTHING"#,
                 [
                     Value::Text(id.clone()),
                     Value::Text(source_key.clone()),
                     Value::Text(prov.source_entity_id.clone()),
+                    citation.map_or(Value::Null, |citation| {
+                        Value::Text(citation.source_revision_id().to_string())
+                    }),
+                    citation.map_or(Value::Null, |citation| {
+                        Value::Text(citation.evidence_span().to_string())
+                    }),
+                    citation.map_or(Value::Null, |citation| {
+                        Value::Integer(citation.line_start())
+                    }),
+                    citation.map_or(Value::Null, |citation| Value::Integer(citation.line_end())),
+                    citation
+                        .and_then(SourceCitation::locator_json)
+                        .map_or(Value::Null, |locator| Value::Text(locator.to_string())),
                     Value::Text(prov.activity_id.clone()),
                     Value::Text(prov.agent_id.clone()),
                     Value::Real(confidence_evidence),
                     Value::Text(evidence_class.as_str().to_string()),
+                    verification.map_or(Value::Null, |(status, _)| {
+                        Value::Text(status.as_str().to_string())
+                    }),
+                    verification
+                        .and_then(|(_, reason)| reason)
+                        .map_or(Value::Null, |reason| Value::Text(reason.to_string())),
                 ],
             )
             .await?;
+
+        // A source may have been stored before citation support existed, or
+        // first observed by an uncited path and later re-read exactly. A
+        // citation is one indivisible witness: replace a legacy row only when
+        // ALL core citation cells are NULL. Updating fields independently
+        // could combine revision/span/coordinates from different reads into
+        // a witness that never existed. The source locator and attribution
+        // move with the citation so retrieval opens the exact snapshot and
+        // audits the activity/agent that produced it.
+        if let Some(citation) = citation {
+            self.conn
+                .execute(
+                    r#"UPDATE prov_assertion_evidence
+                       SET source_entity_id = ?3,
+                           source_revision_id = ?4,
+                           evidence_span = ?5,
+                           line_start = ?6,
+                           line_end = ?7,
+                           locator_json = ?8,
+                           activity_id = ?9,
+                           agent_id = ?10
+                       WHERE assertion_id = ?1 AND source_key = ?2
+                         AND source_revision_id IS NULL
+                         AND evidence_span IS NULL
+                         AND line_start IS NULL
+                         AND line_end IS NULL"#,
+                    [
+                        Value::Text(id.clone()),
+                        Value::Text(source_key.clone()),
+                        Value::Text(prov.source_entity_id.clone()),
+                        Value::Text(citation.source_revision_id().to_string()),
+                        Value::Text(citation.evidence_span().to_string()),
+                        Value::Integer(citation.line_start()),
+                        Value::Integer(citation.line_end()),
+                        citation
+                            .locator_json()
+                            .map_or(Value::Null, |locator| Value::Text(locator.to_string())),
+                        Value::Text(prov.activity_id.clone()),
+                        Value::Text(prov.agent_id.clone()),
+                    ],
+                )
+                .await?;
+        }
 
         // The evidence class may DOWNGRADE — even from a duplicate source —
         // and never upgrades: agreement cannot turn literature into GREEN,
@@ -3186,7 +3910,7 @@ impl ProvenanceStore {
                 ),
                 [
                     Value::Text(id.clone()),
-                    Value::Text(source_key),
+                    Value::Text(source_key.clone()),
                     Value::Text(evidence_class.as_str().to_string()),
                 ],
             )
@@ -3203,6 +3927,88 @@ impl ProvenanceStore {
                 ],
             )
             .await?;
+
+        // Verification status: BEST-wins, the opposite direction from the
+        // evidence class, deliberately. The class records how knowledge was
+        // produced and can only get worse; the status records what the check
+        // established about one exact source witness. A duplicate may improve
+        // that status only when it names the SAME stored citation (including
+        // its reopenable source locator and optional locator metadata), or
+        // when both the stored and incoming writes are uncited. Otherwise a
+        // conclusion from a different revision/span could launder the stored
+        // witness. Newly inserted source evidence qualifies by construction
+        // and still participates in the parent BEST-wins aggregate. A write
+        // carrying NO status leaves both rows untouched; status and reason
+        // always move together.
+        if let Some((status, reason)) = verification {
+            let stored_rank = verification_rank_case("verification_status");
+            let cited = i64::from(citation.is_some());
+            let citation_params = || {
+                [
+                    Value::Text(id.clone()),
+                    Value::Text(source_key.clone()),
+                    Value::Integer(status.rank()),
+                    Value::Text(status.as_str().to_string()),
+                    reason.map_or(Value::Null, |reason| Value::Text(reason.to_string())),
+                    Value::Integer(cited),
+                    citation.map_or(Value::Null, |_| Value::Text(prov.source_entity_id.clone())),
+                    citation.map_or(Value::Null, |citation| {
+                        Value::Text(citation.source_revision_id().to_string())
+                    }),
+                    citation.map_or(Value::Null, |citation| {
+                        Value::Text(citation.evidence_span().to_string())
+                    }),
+                    citation.map_or(Value::Null, |citation| {
+                        Value::Integer(citation.line_start())
+                    }),
+                    citation.map_or(Value::Null, |citation| Value::Integer(citation.line_end())),
+                    citation
+                        .and_then(SourceCitation::locator_json)
+                        .map_or(Value::Null, |locator| Value::Text(locator.to_string())),
+                ]
+            };
+            let same_witness = r#"(
+                    (?6 = 0
+                     AND source_revision_id IS NULL
+                     AND evidence_span IS NULL
+                     AND line_start IS NULL
+                     AND line_end IS NULL)
+                    OR
+                    (?6 = 1
+                     AND source_entity_id = ?7
+                     AND source_revision_id = ?8
+                     AND evidence_span = ?9
+                     AND line_start = ?10
+                     AND line_end = ?11
+                     AND locator_json IS ?12)
+                )"#;
+            self.conn
+                .execute(
+                    &format!(
+                        "UPDATE prov_assertion_evidence \
+                         SET verification_reason = ?5, verification_status = ?4 \
+                         WHERE assertion_id = ?1 AND source_key = ?2 \
+                           AND ?3 > {stored_rank} AND {same_witness}"
+                    ),
+                    citation_params(),
+                )
+                .await?;
+            self.conn
+                .execute(
+                    &format!(
+                        "UPDATE prov_assertion \
+                         SET verification_reason = ?5, verification_status = ?4 \
+                         WHERE id = ?1 AND ?3 > {stored_rank} \
+                           AND EXISTS ( \
+                               SELECT 1 FROM prov_assertion_evidence \
+                               WHERE assertion_id = ?1 AND source_key = ?2 \
+                                 AND {same_witness} \
+                           )"
+                    ),
+                    citation_params(),
+                )
+                .await?;
+        }
 
         // The aggregate runs ONLY when the evidence INSERT actually inserted
         // a row. Entirely in SQL under the held write lock — no application-
@@ -3270,7 +4076,8 @@ impl ProvenanceStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT confidence, evidence_class FROM prov_assertion WHERE id = ?1",
+                "SELECT confidence, evidence_class, verification_status \
+                 FROM prov_assertion WHERE id = ?1",
                 [Value::Text(id)],
             )
             .await?;
@@ -3283,8 +4090,11 @@ impl ProvenanceStore {
             .and_then(|v| v.as_real().copied())
             .unwrap_or(0.0);
         let aggregate_class = EvidenceClass::from_stored(&get_str(&row, 1)?);
+        let aggregate_status = get_opt_str(&row, 2)?
+            .as_deref()
+            .and_then(VerificationStatus::parse);
         while rows.next().await?.is_some() {}
-        Ok((aggregate_confidence, aggregate_class))
+        Ok((aggregate_confidence, aggregate_class, aggregate_status))
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -3632,11 +4442,31 @@ impl ProvenanceStore {
 
     /// [`Self::recall_with_context`] over a set of tenants, each fact
     /// attributed to its owner via `tenant`.
+    ///
+    /// Returns the TRUSTED subset ([`VerificationFilter::Trusted`]): facts
+    /// whose deterministic checks all passed, plus rows with no recorded
+    /// status. Unverified facts are present and findable through
+    /// [`Self::recall_with_context_filtered`], never promoted here.
     pub async fn recall_with_context_scoped(
         &self,
         query: &str,
         tenants: &[&str],
         limit: i64,
+    ) -> Result<Vec<RecalledMaterialFact>> {
+        self.recall_with_context_filtered(query, tenants, limit, VerificationFilter::Trusted)
+            .await
+    }
+
+    /// [`Self::recall_with_context_scoped`] with an explicit verification
+    /// filter — the review surface: `Any` reads everything,
+    /// `Status(s)` pulls exactly one status (say, every
+    /// `subject_not_verbatim` fact awaiting a reviewer).
+    pub async fn recall_with_context_filtered(
+        &self,
+        query: &str,
+        tenants: &[&str],
+        limit: i64,
+        filter: VerificationFilter,
     ) -> Result<Vec<RecalledMaterialFact>> {
         if tenants.is_empty() {
             return Ok(Vec::new());
@@ -3644,13 +4474,16 @@ impl ProvenanceStore {
         let pattern = format!("%{query}%");
         let sql = format!(
             "SELECT subject, predicate, object, value, unit, conditions_json, \
-                    evidence_class, confidence, source, agent, tenant \
+                    evidence_class, confidence, source, agent, tenant, \
+                    verification_status, verification_reason \
              FROM prov_assertion \
              WHERE tenant IN ({}) AND (subject LIKE ?{} OR object LIKE ?{}) \
+               AND {} \
              ORDER BY confidence DESC LIMIT ?{}",
             tenant_placeholders(1, tenants.len()),
             tenants.len() + 1,
             tenants.len() + 2,
+            filter.sql_clause("verification_status"),
             tenants.len() + 3,
         );
         let mut params = tenant_params(tenants);
@@ -3686,6 +4519,10 @@ impl ProvenanceStore {
                 source: get_str(&row, 8)?,
                 agent: get_str(&row, 9)?,
                 tenant: get_str(&row, 10)?,
+                verification_status: get_opt_str(&row, 11)?
+                    .as_deref()
+                    .and_then(VerificationStatus::parse),
+                verification_reason: get_opt_str(&row, 12)?,
             });
         }
         Ok(facts)
@@ -3707,6 +4544,65 @@ impl ProvenanceStore {
             .await
     }
 
+    /// Load one assertion by its stable id without applying a verification
+    /// filter.
+    ///
+    /// The full value/unit/condition identity is returned so a retrieval
+    /// caller can pair the fact with one of its per-source citations and
+    /// re-check exactly the assertion that citation originally supported.
+    pub async fn assertion_by_id(&self, id: &str) -> Result<Option<StoredAssertion>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject, predicate, object, value, unit, conditions_json, \
+                        evidence_class, confidence, corroborations, activity_id, source, \
+                        agent, tenant, verification_status, verification_reason \
+                 FROM prov_assertion WHERE id = ?1",
+                [Value::Text(id.to_string())],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let conditions_json = get_str(&row, 6)?;
+        let conditions = serde_json::from_str(&conditions_json).map_err(|error| {
+            anyhow::anyhow!("stored assertion has invalid conditions_json: {error}")
+        })?;
+        let assertion = StoredAssertion {
+            id: get_str(&row, 0)?,
+            subject: get_str(&row, 1)?,
+            predicate: get_str(&row, 2)?,
+            object: get_str(&row, 3)?,
+            value: row
+                .get_value(4)
+                .ok()
+                .and_then(|value| value.as_real().copied()),
+            unit: get_opt_str(&row, 5)?.filter(|unit| !unit.is_empty()),
+            conditions,
+            evidence_class: EvidenceClass::from_stored(&get_str(&row, 7)?),
+            confidence: row
+                .get_value(8)
+                .ok()
+                .and_then(|value| value.as_real().copied())
+                .unwrap_or(0.0),
+            corroborations: row
+                .get_value(9)
+                .ok()
+                .and_then(|value| value.as_integer().copied())
+                .unwrap_or(0),
+            activity_id: get_str(&row, 10)?,
+            source: get_str(&row, 11)?,
+            agent: get_str(&row, 12)?,
+            tenant: get_str(&row, 13)?,
+            verification_status: get_opt_str(&row, 14)?
+                .as_deref()
+                .and_then(VerificationStatus::parse),
+            verification_reason: get_opt_str(&row, 15)?,
+        };
+        while rows.next().await?.is_some() {}
+        Ok(Some(assertion))
+    }
+
     /// [`Self::assertion_evidence`] by assertion id, for CONDITIONED
     /// assertions (value/unit/conditions are part of their identity —
     /// compute the id with [`conditioned_assertion_id`]). Before this
@@ -3717,8 +4613,10 @@ impl ProvenanceStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT source_key, source_entity_id, activity_id, agent_id, \
-                        confidence, evidence_class, confidence_kind, legacy_corroborations \
+                "SELECT source_key, source_entity_id, source_revision_id, evidence_span, \
+                        line_start, line_end, locator_json, activity_id, agent_id, \
+                        confidence, evidence_class, verification_status, verification_reason, \
+                        confidence_kind, legacy_corroborations \
                  FROM prov_assertion_evidence WHERE assertion_id = ?1 \
                  ORDER BY source_key",
                 [Value::Text(id)],
@@ -3729,19 +4627,105 @@ impl ProvenanceStore {
             contributions.push(EvidenceContribution {
                 source_key: get_str(&row, 0)?,
                 source_entity_id: get_str(&row, 1)?,
-                activity_id: get_str(&row, 2)?,
-                agent_id: get_str(&row, 3)?,
-                confidence: row
+                source_revision_id: get_opt_str(&row, 2)?,
+                evidence_span: get_opt_str(&row, 3)?,
+                line_start: row
                     .get_value(4)
+                    .ok()
+                    .and_then(|value| value.as_integer().copied()),
+                line_end: row
+                    .get_value(5)
+                    .ok()
+                    .and_then(|value| value.as_integer().copied()),
+                locator_json: get_opt_str(&row, 6)?,
+                activity_id: get_str(&row, 7)?,
+                agent_id: get_str(&row, 8)?,
+                confidence: row
+                    .get_value(9)
                     .ok()
                     .and_then(|v| v.as_real().copied())
                     .unwrap_or(0.0),
-                evidence_class: EvidenceClass::from_stored(&get_str(&row, 5)?),
-                confidence_kind: get_str(&row, 6)?,
-                legacy_corroborations: row.get_value(7).ok().and_then(|v| v.as_integer().copied()),
+                evidence_class: EvidenceClass::from_stored(&get_str(&row, 10)?),
+                verification_status: get_opt_str(&row, 11)?
+                    .as_deref()
+                    .and_then(VerificationStatus::parse),
+                verification_reason: get_opt_str(&row, 12)?,
+                confidence_kind: get_str(&row, 13)?,
+                legacy_corroborations: row.get_value(14).ok().and_then(|v| v.as_integer().copied()),
             });
         }
         Ok(contributions)
+    }
+
+    /// Assertions whose recorded verification status is exactly `status`,
+    /// scoped to the read tenants — the CANDIDATE list for re-verification
+    /// review (`cited_by_reader` is the span-unchecked population the
+    /// fresh paper path produces). Ordered by id for deterministic paging.
+    /// Rows with no recorded status are not returned; they predate the
+    /// status axis and are reached by `assertion_by_id`.
+    pub async fn assertions_by_verification(
+        &self,
+        status: VerificationStatus,
+        tenants: &[&str],
+        limit: i64,
+    ) -> Result<Vec<StoredAssertion>> {
+        if tenants.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, subject, predicate, object, value, unit, conditions_json, \
+                    evidence_class, confidence, corroborations, activity_id, source, \
+                    agent, tenant, verification_status, verification_reason \
+             FROM prov_assertion \
+             WHERE tenant IN ({}) AND verification_status = ?{} \
+             ORDER BY id LIMIT ?{}",
+            tenant_placeholders(1, tenants.len()),
+            tenants.len() + 1,
+            tenants.len() + 2,
+        );
+        let mut params = tenant_params(tenants);
+        params.push(Value::Text(status.as_str().to_string()));
+        params.push(Value::Integer(limit.max(0)));
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let conditions_json = get_str(&row, 6)?;
+            let conditions = serde_json::from_str(&conditions_json).map_err(|error| {
+                anyhow::anyhow!("stored assertion has invalid conditions_json: {error}")
+            })?;
+            out.push(StoredAssertion {
+                id: get_str(&row, 0)?,
+                subject: get_str(&row, 1)?,
+                predicate: get_str(&row, 2)?,
+                object: get_str(&row, 3)?,
+                value: row
+                    .get_value(4)
+                    .ok()
+                    .and_then(|value| value.as_real().copied()),
+                unit: get_opt_str(&row, 5)?.filter(|unit| !unit.is_empty()),
+                conditions,
+                evidence_class: EvidenceClass::from_stored(&get_str(&row, 7)?),
+                confidence: row
+                    .get_value(8)
+                    .ok()
+                    .and_then(|value| value.as_real().copied())
+                    .unwrap_or(0.0),
+                corroborations: row
+                    .get_value(9)
+                    .ok()
+                    .and_then(|value| value.as_integer().copied())
+                    .unwrap_or(0),
+                activity_id: get_str(&row, 10)?,
+                source: get_str(&row, 11)?,
+                agent: get_str(&row, 12)?,
+                tenant: get_str(&row, 13)?,
+                verification_status: get_opt_str(&row, 14)?
+                    .as_deref()
+                    .and_then(VerificationStatus::parse),
+                verification_reason: get_opt_str(&row, 15)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Return every ontology artifact that classified the stable assertion
@@ -3929,8 +4913,7 @@ impl ProvenanceStore {
     /// and store one vector per matching `emmo_entity` row. Names are
     /// resolved to their label-qualified keys via the entity table itself
     /// (no duplicate of `write_fact`'s kind→label routing), so names that
-    /// never landed there (e.g. value-less measurements dropped by
-    /// `write_fact`) are skipped. Returns the number of vectors stored.
+    /// never landed there are skipped. Returns the number of vectors stored.
     ///
     /// Like `embed_and_store`, deliberately NOT part of `write_fact`:
     /// graph writes must never wait on (or fail because of) an embedding
@@ -4557,7 +5540,11 @@ impl ProvenanceStore {
             out.push(SemanticEntityHit {
                 name,
                 tenant,
-                similarity: 1.0 - distance as f32,
+                // SQLite's vector extension may return a distance a few
+                // ulps outside its documented [0, 2] interval. Keep the
+                // public cosine-similarity contract bounded despite that
+                // numeric approximation.
+                similarity: (1.0 - distance as f32).clamp(-1.0, 1.0),
             });
         }
         Ok(out)
@@ -4894,6 +5881,41 @@ mod tests {
         }
     }
 
+    /// CONTRACT CHANGE: bare `write_fact` no longer resolves a typed graph
+    /// shape from the kind STRING — the store's closed kind→(class, edge)
+    /// table is gone, and the shape is the ontology's declaration resolved
+    /// by the caller. Tests that pin typed shapes write through the same
+    /// shape-resolving call every production caller uses, with the EMMO
+    /// declaration standing in for the EMMO adapter.
+    async fn write_emmo_shaped<F: FactPayload>(
+        store: &ProvenanceStore,
+        fact: &F,
+        prov: &LocalProvenance,
+    ) {
+        store
+            .write_fact_with_classification(
+                fact,
+                prov,
+                test_ontology_classification(),
+                fact.to_local_fact()
+                    .kind
+                    .as_deref()
+                    .and_then(FactGraphShape::emmo),
+            )
+            .await
+            .unwrap();
+    }
+
+    const TEST_ONTOLOGY_SHA: &str =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+    fn test_ontology_classification() -> OntologyClassification<'static> {
+        OntologyClassification {
+            version_iri: "urn:test:ontology:citation",
+            artifact_sha256: TEST_ONTOLOGY_SHA,
+        }
+    }
+
     async fn count(store: &ProvenanceStore, sql: &str) -> i64 {
         let mut rows = store.conn.query(sql, ()).await.unwrap();
         let row = rows.next().await.unwrap().unwrap();
@@ -5011,9 +6033,21 @@ mod tests {
 
     #[tokio::test]
     async fn write_fact_each_kind_is_searchable_and_traversable() {
+        // CONTRACT CHANGE: this test used to pin the store's CLOSED
+        // kind→(class, edge) table by writing bare `write_fact` calls and
+        // letting the kind STRING select the shape. The store no longer owns
+        // that table — the graph shape is the ACTIVE ontology's declaration
+        // (`FactGraphShape::emmo` here stands in for the EMMO adapter every
+        // production caller resolves through). Each kind is now written WITH
+        // its declared shape, exactly as pipeline/repair/papers do, and the
+        // same edges must result.
         let db = TempDb::new();
         let store = ProvenanceStore::open(&db.path).await.unwrap();
         let prov = test_prov();
+        let classification = OntologyClassification {
+            version_iri: "urn:test:ontology:shapes",
+            artifact_sha256: TEST_ONTOLOGY_SHA,
+        };
 
         let cases = [
             (
@@ -5066,7 +6100,15 @@ mod tests {
                 f.value = Some(1140.0);
                 f.unit = Some("MPa".into());
             }
-            store.write_fact(&f, &prov).await.unwrap();
+            store
+                .write_fact_with_classification(
+                    &f,
+                    &prov,
+                    classification,
+                    FactGraphShape::emmo(kind),
+                )
+                .await
+                .unwrap();
 
             let hits = store.graph_search(s, "t1", 10).await.unwrap();
             assert!(
@@ -5099,6 +6141,26 @@ mod tests {
             .unwrap();
         assert!(tr.edges.iter().any(|e| e.rel_type == "related_to"));
 
+        // CONTRACT CHANGE: a fact whose kind the ontology does NOT declare
+        // (a legal ontology's "obligation") used to hit the closed table's
+        // `_` arm and degrade to `Entity` endpoints while EMMO kinds got
+        // first-class shapes. The table is the ontology's now: with no
+        // declared shape the fact is still kept — as a generic edge — and
+        // the ONTOLOGY declares its own shape to make the kind typed.
+        let foreign = fact("obligation", "Contract 7", "imposes", "Duty to pay");
+        store
+            .write_fact_with_classification(&foreign, &prov, classification, None)
+            .await
+            .unwrap();
+        let obligation_tr = store
+            .get_neighbors("Contract 7", None, "t1", 10)
+            .await
+            .unwrap();
+        assert!(
+            obligation_tr.edges.iter().any(|e| e.rel_type == "imposes"),
+            "an undeclared kind is kept as a generic edge, never dropped"
+        );
+
         // Tenant scoping: nothing leaks into another tenant.
         assert!(
             store
@@ -5117,69 +6179,122 @@ mod tests {
         );
     }
 
-    /// Defence in depth at the store boundary (F10): a measurement's number
-    /// is meaningless without its unit, so the writer REFUSES — loudly,
-    /// never with a silent `Ok` — a measurement whose unit is missing or
-    /// resolves to no QUDT identifier, and canonicalises raw spellings that
-    /// do resolve so the store holds ONE unit vocabulary. Before this,
-    /// `unwrap_or_default()` stored an empty-string unit: a CSV `880` was
-    /// indistinguishable from 880 MPa or 880 GPa. Every ingest path drops
-    /// and reports these shapes upstream; this guard is for callers that
-    /// bypass that contract.
+    /// CONTRACT CHANGE (annotate, don't refuse): `kind` is only a graph
+    /// shape hint. A model may label a value-less assertion "measurement";
+    /// without a number there is no Measurement node to construct, but the
+    /// assertion and its generic predicate edge must still be retained.
     #[tokio::test]
-    async fn measurement_units_are_resolved_or_refused_never_stored_unitless() {
+    async fn a_valueless_measurement_hint_is_stored_as_a_generic_edge() {
+        // CONTRACT CHANGE: this legacy `kind` hint used to make the writer
+        // return success without storing anything. It now falls back to the
+        // representable generic relation and keeps the verification note.
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let fact = MaterialFact {
+            subject: "ValueLessSubject".into(),
+            predicate: "has_reported_property".into(),
+            object: "ductility".into(),
+            value: None,
+            unit: None,
+            conditions: vec![],
+            confidence: Some(0.7),
+            kind: Some("measurement".into()),
+            evidence_class: EvidenceClass::Research,
+            verification: Some(VerificationStatus::ModelAsserted),
+            verification_reason: Some("the proposal supplied no numeric value".into()),
+        };
+        store.write_fact(&fact, &test_prov()).await.unwrap();
+
+        let id = conditioned_assertion_id(
+            "t1",
+            &fact.subject,
+            &fact.predicate,
+            &fact.object,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let stored = store
+            .assertion_by_id(&id)
+            .await
+            .unwrap()
+            .expect("the value-less assertion must not disappear");
+        assert_eq!(stored.verification_status, fact.verification);
+        assert_eq!(stored.verification_reason, fact.verification_reason);
+
+        let traversal = store
+            .get_neighbors(&fact.subject, None, "t1", 10)
+            .await
+            .unwrap();
+        assert!(
+            traversal
+                .edges
+                .iter()
+                .any(|edge| edge.rel_type == fact.predicate),
+            "the value-less proposal must use the generic predicate edge"
+        );
+        assert!(
+            traversal
+                .nodes
+                .iter()
+                .all(|node| node.label != "Measurement"),
+            "only a numeric measurement may mint a Measurement node"
+        );
+    }
+
+    #[tokio::test]
+    async fn measurement_unit_terms_are_nonempty_and_preserved() {
+        // CONTRACT CHANGE: persistence no longer decides whether a numeric
+        // value semantically requires a unit. It preserves absence, rejects
+        // only a present-but-empty term, and keeps every non-empty term exact.
         let db = TempDb::new();
         let store = ProvenanceStore::open(&db.path).await.unwrap();
         let prov = test_prov();
 
-        // No unit at all → refused loudly.
+        // No unit at all is a representable source shape, not a Rust verdict.
         let mut unitless = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
         unitless.value = Some(880.0);
+        write_emmo_shaped(&store, &unitless, &prov).await;
+        let recalled = store.recall_with_context("UTS", "t1", 10).await.unwrap();
+        assert_eq!(recalled.len(), 1, "{recalled:?}");
+        assert_eq!(recalled[0].unit, None);
+
+        // Whitespace carries no source or ontology identity and is refused.
+        let mut empty = fact("measurement", "Ti-6Al-4V", "has_measurement", "hardness");
+        empty.value = Some(349.0);
+        empty.unit = Some("  \t".into());
         let err = store
-            .write_fact(&unitless, &prov)
+            .write_fact(&empty, &prov)
             .await
-            .expect_err("a unit-less measurement must be refused, never stored");
+            .expect_err("an empty unit term must be refused, never stored");
         assert!(
-            format!("{err:#}").contains("no unit"),
+            format!("{err:#}").contains("must not be empty"),
             "the refusal must name the cause: {err:#}"
         );
 
-        // A unit that resolves to nothing → refused loudly, naming it.
-        let mut gibberish = fact("measurement", "Ti-6Al-4V", "has_measurement", "hardness");
-        gibberish.value = Some(349.0);
-        gibberish.unit = Some("banana".into());
-        let err = store
-            .write_fact(&gibberish, &prov)
-            .await
-            .expect_err("an unresolvable unit must be refused, never stored raw");
-        assert!(
-            format!("{err:#}").contains("banana"),
-            "the refusal must name the spelling: {err:#}"
-        );
-
-        // Neither refused fact left a trace in the graph.
+        // The present-but-empty fact left no trace; the absent-term fact did.
         assert!(
             store
-                .graph_search("Ti-6Al-4V", "t1", 10)
+                .graph_search("hardness", "t1", 10)
                 .await
                 .unwrap()
                 .is_empty(),
-            "a refused measurement must write nothing"
+            "a refused empty term must write nothing"
         );
 
-        // A raw spelling that DOES resolve is canonicalised on the way in:
-        // the stored unit is the QUDT identifier, not the paper spelling.
-        let mut raw_spelling = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
-        raw_spelling.value = Some(880.0);
-        raw_spelling.unit = Some("MPa".into());
-        store.write_fact(&raw_spelling, &prov).await.unwrap();
-        let recalled = store.recall_with_context("UTS", "t1", 10).await.unwrap();
+        let unit_iri = "https://pharma.example/ontology/unit/mg-per-kg";
+        let mut ontology_term = fact("measurement", "compound", "ex:hasDose", "dose");
+        ontology_term.value = Some(5.0);
+        ontology_term.unit = Some(unit_iri.into());
+        write_emmo_shaped(&store, &ontology_term, &prov).await;
+        let recalled = store.recall_with_context("dose", "t1", 10).await.unwrap();
         assert_eq!(recalled.len(), 1, "{recalled:?}");
-        assert_eq!(recalled[0].value, Some(880.0));
+        assert_eq!(recalled[0].value, Some(5.0));
         assert_eq!(
             recalled[0].unit.as_deref(),
-            Some("QUDT:MegaPA"),
-            "the store must hold the canonical identifier, not the raw spelling"
+            Some(unit_iri),
+            "the assertion must retain the exact customer ontology term"
         );
         // BOTH stored shapes agree: `recall_with_context` reads the
         // assertion row; the synthetic Measurement NODE keeps its own copy
@@ -5189,14 +6304,15 @@ mod tests {
         let props: serde_json::Value = serde_json::from_str(
             &query_str(
                 &store,
-                "SELECT props_json FROM emmo_entity WHERE label = 'Measurement'",
+                "SELECT props_json FROM emmo_entity \
+                 WHERE label = 'Measurement' AND name LIKE 'meas_compound_dose_%'",
             )
             .await,
         )
         .unwrap();
         assert_eq!(
-            props["unit"], "QUDT:MegaPA",
-            "the Measurement node's props must carry the canonical unit too"
+            props["unit"], unit_iri,
+            "the Measurement node must carry the same exact term"
         );
     }
 
@@ -5248,9 +6364,6 @@ mod tests {
             };
             if *kind == Some("measurement") {
                 f.value = Some(42.0);
-                // The store refuses unit-less measurements (defence in
-                // depth for F10); the labeling under test is orthogonal.
-                f.unit = Some("QUDT:MegaPA".into());
             }
             store
                 .write_fact_with_evidence(
@@ -5261,6 +6374,7 @@ mod tests {
                         subject: "Molecule",
                         object: "Reaction",
                     },
+                    kind.and_then(FactGraphShape::emmo),
                 )
                 .await
                 .unwrap();
@@ -5275,7 +6389,12 @@ mod tests {
                 "arm {kind:?}: object label must be the caller's, not hardcoded"
             );
 
-            // Legacy write of the same shape: the store's EMMO labels, unchanged.
+            // CONTRACT CHANGE: the second half used to prove the kind STRING
+            // alone selected EMMO labels through bare `write_fact`. The
+            // store no longer holds that table; the shape is declared by the
+            // ontology and resolved by the caller. Writing with the shape
+            // through the unclassified path must produce the SAME established
+            // EMMO labels, byte-for-byte — that is what this half pins now.
             let subj = format!("leg-subj-{i}");
             let obj = format!("leg-obj-{i}");
             let mut f = LocalFact {
@@ -5289,11 +6408,19 @@ mod tests {
             };
             if *kind == Some("measurement") {
                 f.value = Some(42.0);
-                // The store refuses unit-less measurements (defence in
-                // depth for F10); the labeling under test is orthogonal.
-                f.unit = Some("QUDT:MegaPA".into());
             }
-            store.write_fact(&f, &prov).await.unwrap();
+            store
+                .write_fact_with_classification(
+                    &f,
+                    &prov,
+                    OntologyClassification {
+                        version_iri: "urn:test:ontology:legacy",
+                        artifact_sha256: TEST_ONTOLOGY_SHA,
+                    },
+                    kind.and_then(FactGraphShape::emmo),
+                )
+                .await
+                .unwrap();
             assert_eq!(label_of(&subj).await, "Matter", "legacy arm {kind:?}");
             assert_eq!(
                 label_of(&obj).await,
@@ -5326,10 +6453,81 @@ mod tests {
                     subject: "",
                     object: "Phase",
                 },
+                FactGraphShape::emmo("phase"),
             )
             .await
             .expect_err("an empty node label must be refused");
         assert!(format!("{err:#}").contains("empty node label"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn ontology_bound_paper_fact_keeps_partial_class_identity_and_generic_edge() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let mut paper_fact = verified_fact("Wirkstoff A", Some(VerificationStatus::Grounded), None);
+        paper_fact.predicate = "urn:pharma:behandelt".into();
+        paper_fact.object = "Krankheit B".into();
+        paper_fact.value = None;
+        paper_fact.unit = None;
+        // CONTRACT CHANGE: a paper-agent write ignores this legacy domain
+        // hint; the active ontology's canonical predicate is the graph edge.
+        paper_fact.kind = Some("phase".into());
+        let citation =
+            SourceCitation::new(1, 1, "Wirkstoff A behandelt Krankheit B.", SHA, None).unwrap();
+
+        store
+            .write_ontology_bound_fact_with_citation(
+                &paper_fact,
+                &prov_from("doc:pharma", "act-pharma"),
+                EvidenceClass::Research,
+                OntologyBoundFactNodes {
+                    subject: Some(ClassifiedNode {
+                        entity_type: "Wirkstoff",
+                        storage_label: "Wirkstoff",
+                        class_iri: "urn:pharma:Wirkstoff",
+                    }),
+                    object: None,
+                },
+                OntologyClassification {
+                    version_iri: "urn:pharma:ontology:v1",
+                    artifact_sha256: SHA,
+                },
+                &citation,
+            )
+            .await
+            .unwrap();
+
+        let subject = store
+            .graph_search("Wirkstoff A", "t1", 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let object = store
+            .graph_search("Krankheit B", "t1", 10)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(subject.class_iri.as_deref(), Some("urn:pharma:Wirkstoff"));
+        assert_eq!(object.label, "Entity");
+        assert_eq!(
+            query_str(
+                &store,
+                "SELECT rel_type FROM emmo_edge WHERE predicate = 'urn:pharma:behandelt'"
+            )
+            .await,
+            "urn:pharma:behandelt"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM emmo_edge WHERE rel_type = 'HAS_PHASE'"
+            )
+            .await,
+            0
+        );
     }
 
     /// Classified writes keep all three type concepts distinct and stamp the
@@ -5364,6 +6562,7 @@ mod tests {
                     version_iri: "urn:test:ontology:v1",
                     artifact_sha256: SHA_A,
                 },
+                FactGraphShape::emmo("phase"),
             )
             .await
             .unwrap();
@@ -5426,6 +6625,7 @@ mod tests {
                     version_iri: "urn:test:ontology:v2",
                     artifact_sha256: SHA_B,
                 },
+                FactGraphShape::emmo("phase"),
             )
             .await
             .unwrap();
@@ -5465,6 +6665,7 @@ mod tests {
                     version_iri: "urn:test:ontology:text",
                     artifact_sha256: SHA,
                 },
+                FactGraphShape::emmo("phase"),
             )
             .await
             .unwrap();
@@ -5490,6 +6691,7 @@ mod tests {
                     version_iri: "urn:test:ontology:text",
                     artifact_sha256: "NOT-A-SHA",
                 },
+                FactGraphShape::emmo("phase"),
             )
             .await
             .expect_err("an invalid artifact identity must be refused before writing");
@@ -5567,14 +6769,13 @@ mod tests {
 
         // "alpha" as a Phase (object) and as Matter (subject) — with
         // unqualified keys these collapsed into one label-churning row.
-        store
-            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
-            .await
-            .unwrap();
-        store
-            .write_fact(&fact("phase", "alpha", "has_phase", "beta"), &prov)
-            .await
-            .unwrap();
+        write_emmo_shaped(
+            &store,
+            &fact("phase", "Ti-6Al-4V", "has_phase", "alpha"),
+            &prov,
+        )
+        .await;
+        write_emmo_shaped(&store, &fact("phase", "alpha", "has_phase", "beta"), &prov).await;
 
         assert_eq!(
             count(
@@ -5629,7 +6830,7 @@ mod tests {
 
         let mut f = fact("contains", "Nb25Mo25Ta25W25", "contains", "Nb");
         f.value = Some(0.25);
-        store.write_fact(&f, &prov).await.unwrap();
+        write_emmo_shaped(&store, &f, &prov).await;
 
         assert_eq!(
             count(
@@ -5649,7 +6850,7 @@ mod tests {
 
         // Re-upsert WITHOUT a fraction must keep the stored props (COALESCE).
         f.value = None;
-        store.write_fact(&f, &prov).await.unwrap();
+        write_emmo_shaped(&store, &f, &prov).await;
         let props = query_str(
             &store,
             "SELECT props_json FROM emmo_edge WHERE rel_type = 'CONTAINS_ELEMENT'",
@@ -5674,7 +6875,7 @@ mod tests {
 
         let mut f = fact("contains", "Nb25Mo25Ta25W25", "contains", "Nb");
         f.value = Some(0.25);
-        store.write_fact(&f, &prov).await.unwrap();
+        write_emmo_shaped(&store, &f, &prov).await;
 
         let tr = store
             .get_neighbors("Nb25Mo25Ta25W25", Some("CONTAINS_ELEMENT"), "t1", 10)
@@ -5707,7 +6908,7 @@ mod tests {
 
         let mut f = fact("processing", "Inconel 718", "processed_by", "annealing");
         f.value = Some(2.0);
-        store.write_fact(&f, &prov).await.unwrap();
+        write_emmo_shaped(&store, &f, &prov).await;
 
         let props = query_str(
             &store,
@@ -5725,8 +6926,8 @@ mod tests {
         let prov = test_prov();
         let f = fact("phase", "Ti-6Al-4V", "has_phase", "alpha-beta");
 
-        store.write_fact(&f, &prov).await.unwrap();
-        store.write_fact(&f, &prov).await.unwrap();
+        write_emmo_shaped(&store, &f, &prov).await;
+        write_emmo_shaped(&store, &f, &prov).await;
 
         // Re-ingest never duplicates: 2 entities (Matter + Phase), 1 edge,
         // 1 assertion (same source — merged, not corroborated), 1 agent,
@@ -6169,24 +7370,24 @@ mod tests {
             confidence: Some(confidence),
             kind: Some("measurement".into()),
             evidence_class,
+            verification: None,
+            verification_reason: None,
         };
 
-        store
-            .write_fact(
-                &measurement(0.8, EvidenceClass::Research),
-                &prov_from("doc:paper_a", "act_1"),
-            )
-            .await
-            .unwrap();
+        write_emmo_shaped(
+            &store,
+            &measurement(0.8, EvidenceClass::Research),
+            &prov_from("doc:paper_a", "act_1"),
+        )
+        .await;
         // The SAME source re-recorded "better" but weaker: the assertion
         // keeps Research/0.8, so the graph must too.
-        store
-            .write_fact(
-                &measurement(0.2, EvidenceClass::ReferenceValidated),
-                &prov_from("doc:paper_a", "act_2"),
-            )
-            .await
-            .unwrap();
+        write_emmo_shaped(
+            &store,
+            &measurement(0.2, EvidenceClass::ReferenceValidated),
+            &prov_from("doc:paper_a", "act_2"),
+        )
+        .await;
 
         for rel in ["HAS_MEASUREMENT", "OF_PROPERTY"] {
             let confidence = query_f64(
@@ -6220,13 +7421,12 @@ mod tests {
         // A genuinely NEW source corroborates: the graph follows the
         // assertion's combined aggregate (noisy-OR 0.96), not the last
         // writer's own 0.8.
-        store
-            .write_fact(
-                &measurement(0.8, EvidenceClass::Research),
-                &prov_from("doc:paper_b", "act_3"),
-            )
-            .await
-            .unwrap();
+        write_emmo_shaped(
+            &store,
+            &measurement(0.8, EvidenceClass::Research),
+            &prov_from("doc:paper_b", "act_3"),
+        )
+        .await;
         for rel in ["HAS_MEASUREMENT", "OF_PROPERTY"] {
             let confidence = query_f64(
                 &store,
@@ -8219,6 +9419,8 @@ mod tests {
             confidence: Some(0.9),
             kind: Some("measurement".into()),
             evidence_class,
+            verification: None,
+            verification_reason: None,
         };
 
         let at_1200 = measurement(1200.0, EvidenceClass::Research);
@@ -8355,7 +9557,7 @@ mod tests {
         let mut measurement = fact("measurement", "Ti-6Al-4V", "has_measurement", "UTS");
         measurement.value = Some(880.0);
         measurement.unit = Some("QUDT:MegaPA".into());
-        store.write_fact(&measurement, &test_prov()).await.unwrap();
+        write_emmo_shaped(&store, &measurement, &test_prov()).await;
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM emmo_entity").await,
             3,
@@ -8737,10 +9939,12 @@ mod tests {
         let db = TempDb::new();
         let store = ProvenanceStore::open(&db.path).await.unwrap();
         let prov = test_prov();
-        store
-            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
-            .await
-            .unwrap();
+        write_emmo_shaped(
+            &store,
+            &fact("phase", "Ti-6Al-4V", "has_phase", "alpha"),
+            &prov,
+        )
+        .await;
 
         store
             .store_entity_embedding(
@@ -8778,10 +9982,12 @@ mod tests {
         let db = TempDb::new();
         let store = ProvenanceStore::open(&db.path).await.unwrap();
         let prov = test_prov();
-        store
-            .write_fact(&fact("phase", "Ti-6Al-4V", "has_phase", "alpha"), &prov)
-            .await
-            .unwrap();
+        write_emmo_shaped(
+            &store,
+            &fact("phase", "Ti-6Al-4V", "has_phase", "alpha"),
+            &prov,
+        )
+        .await;
         store
             .store_entity_embedding(
                 &entity_key("t1", "Matter", "Ti-6Al-4V"),
@@ -9500,5 +10706,1011 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tenant, "local");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Exact source citations and assertion identity reads
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn source_citation_rejects_coordinates_hashes_and_locators_it_cannot_address() {
+        const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let citation = SourceCitation::new(
+            3,
+            4,
+            "  exact supporting sentence  ",
+            SHA,
+            Some(r#"{"page":2,"section":"results"}"#.into()),
+        )
+        .unwrap();
+        assert_eq!(citation.line_start(), 3);
+        assert_eq!(citation.line_end(), 4);
+        assert_eq!(
+            citation.evidence_span(),
+            "  exact supporting sentence  ",
+            "validation must not normalize the exact witness"
+        );
+        assert_eq!(citation.source_revision_id(), SHA);
+        assert_eq!(
+            citation.locator_json(),
+            Some(r#"{"page":2,"section":"results"}"#)
+        );
+
+        assert!(SourceCitation::new(0, 1, "span", SHA, None).is_err());
+        assert!(SourceCitation::new(2, 1, "span", SHA, None).is_err());
+        assert!(SourceCitation::new(1, 1, "  ", SHA, None).is_err());
+        assert!(SourceCitation::new(1, 1, "span", "short", None).is_err());
+        assert!(
+            SourceCitation::new(
+                1,
+                1,
+                "span",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                None,
+            )
+            .is_err(),
+            "the source revision contract is lowercase hexadecimal SHA-256"
+        );
+        assert!(
+            SourceCitation::new(1, 1, "span", SHA, Some("not-json".into())).is_err(),
+            "locator_json must be queryable JSON rather than mislabeled text"
+        );
+    }
+
+    /// Citation belongs to a SOURCE CONTRIBUTION, not the aggregate
+    /// assertion. Two papers supporting one conditioned fact therefore keep
+    /// two distinct witnesses and two source-specific check results. A repeat
+    /// read of paper A cannot silently replace A's first stored witness.
+    #[tokio::test]
+    async fn distinct_sources_keep_distinct_citations_and_duplicates_do_not_overwrite() {
+        const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const SHA_REPLACEMENT: &str =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let first_fact = verified_fact("CitedAlloy", Some(VerificationStatus::Grounded), None);
+        let second_fact = verified_fact(
+            "CitedAlloy",
+            Some(VerificationStatus::SubjectNotVerbatim),
+            Some("paper B uses a shorter subject name"),
+        );
+        let citation_a = SourceCitation::new(
+            7,
+            7,
+            "CitedAlloy has an UTS of 1140 MPa.",
+            SHA_A,
+            Some(r#"{"page":1}"#.into()),
+        )
+        .unwrap();
+        let citation_b = SourceCitation::new(
+            42,
+            43,
+            "The reported value was 1140 MPa under the stated conditions.",
+            SHA_B,
+            None,
+        )
+        .unwrap();
+
+        store
+            .write_fact_with_classification_and_citation(
+                &first_fact,
+                &prov_from("doc:paper-a", "act-citation-a"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_a,
+            )
+            .await
+            .unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &second_fact,
+                &prov_from("doc:paper-b", "act-citation-b"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_b,
+            )
+            .await
+            .unwrap();
+
+        // Same origin source, later run, different proposed witness. This is
+        // not a third observation and must not rewrite the first witness.
+        let replacement = SourceCitation::new(
+            99,
+            100,
+            "a later, incompatible proposed witness",
+            SHA_REPLACEMENT,
+            Some(r#"{"page":99}"#.into()),
+        )
+        .unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &first_fact,
+                &prov_from("doc:paper-a", "act-citation-a-repeat"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &replacement,
+            )
+            .await
+            .unwrap();
+
+        let id = conditioned_assertion_id(
+            "t1",
+            "CitedAlloy",
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &[],
+        )
+        .unwrap();
+        let evidence = store.assertion_evidence_by_id(&id).await.unwrap();
+        assert_eq!(evidence.len(), 2, "one row per source, not per read");
+        let paper_a = evidence
+            .iter()
+            .find(|item| item.source_entity_id == "doc:paper-a")
+            .unwrap();
+        assert_eq!(paper_a.source_revision_id.as_deref(), Some(SHA_A));
+        assert_eq!(paper_a.line_start, Some(7));
+        assert_eq!(paper_a.line_end, Some(7));
+        assert_eq!(
+            paper_a.evidence_span.as_deref(),
+            Some("CitedAlloy has an UTS of 1140 MPa.")
+        );
+        assert_eq!(paper_a.locator_json.as_deref(), Some(r#"{"page":1}"#));
+        assert_eq!(
+            paper_a.verification_status,
+            Some(VerificationStatus::Grounded)
+        );
+
+        let paper_b = evidence
+            .iter()
+            .find(|item| item.source_entity_id == "doc:paper-b")
+            .unwrap();
+        assert_eq!(paper_b.source_revision_id.as_deref(), Some(SHA_B));
+        assert_eq!(paper_b.line_start, Some(42));
+        assert_eq!(paper_b.line_end, Some(43));
+        assert_eq!(
+            paper_b.verification_status,
+            Some(VerificationStatus::SubjectNotVerbatim)
+        );
+        assert_eq!(
+            paper_b.verification_reason.as_deref(),
+            Some("paper B uses a shorter subject name")
+        );
+    }
+
+    /// The old write method now delegates with NO citation. Missing citation
+    /// fields are returned as explicit `None`, preserving the meaning of old
+    /// rows. If that same source is later re-opened exactly, the duplicate
+    /// write fills only those previously missing cells without corroborating.
+    #[tokio::test]
+    async fn uncited_evidence_is_explicit_none_and_a_reread_fills_missing_citation() {
+        const SHA: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let fact = verified_fact("LegacyCitationAlloy", None, None);
+        store
+            .write_fact_with_classification(
+                &fact,
+                &prov_from("doc:legacy-paper", "act-legacy"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+            )
+            .await
+            .unwrap();
+        let id = conditioned_assertion_id(
+            "t1",
+            "LegacyCitationAlloy",
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &[],
+        )
+        .unwrap();
+        let before = store.assertion_evidence_by_id(&id).await.unwrap();
+        assert_eq!(before.len(), 1);
+        let before = &before[0];
+        assert_eq!(before.source_revision_id, None);
+        assert_eq!(before.evidence_span, None);
+        assert_eq!(before.line_start, None);
+        assert_eq!(before.line_end, None);
+        assert_eq!(before.locator_json, None);
+        assert_eq!(before.verification_status, None);
+        assert_eq!(before.verification_reason, None);
+
+        let citation = SourceCitation::new(12, 12, "1140 MPa", SHA, None).unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &fact,
+                &prov_from("doc:legacy-paper", "act-reread"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation,
+            )
+            .await
+            .unwrap();
+        let after = store.assertion_evidence_by_id(&id).await.unwrap();
+        assert_eq!(after.len(), 1, "a re-read is not corroboration");
+        assert_eq!(after[0].source_revision_id.as_deref(), Some(SHA));
+        assert_eq!(after[0].evidence_span.as_deref(), Some("1140 MPa"));
+        assert_eq!(after[0].line_start, Some(12));
+        assert_eq!(after[0].line_end, Some(12));
+    }
+
+    /// A legacy contribution can be upgraded when a later re-read supplies
+    /// its first complete citation. The evidence row must then point at the
+    /// exact reopenable snapshot and at the activity/agent that created that
+    /// witness, while retaining one source contribution under the stable
+    /// original-source key.
+    #[tokio::test]
+    async fn a_complete_citation_atomically_upgrades_a_legacy_source_locator() {
+        const SHA: &str = "abababababababababababababababababababababababababababababababab";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let subject = "LegacyLocatorAlloy";
+        let fact = verified_fact(subject, None, None);
+        let original_source = "/papers/legacy-locator.pdf";
+        store
+            .write_fact_with_classification(
+                &fact,
+                &prov_from(original_source, "act-before-reread"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+            )
+            .await
+            .unwrap();
+
+        let mut reread_prov = prov_from(
+            "/snapshots/abababababababababababababababababababababababababababababababab.txt",
+            "act-exact-reread",
+        );
+        reread_prov.origin_source_id = Some(original_source.into());
+        reread_prov.agent_id = "citation-rereader".into();
+        let grounded = verified_fact(subject, Some(VerificationStatus::Grounded), None);
+        let citation = SourceCitation::new(
+            17,
+            18,
+            "The exact source witness spans two lines.",
+            SHA,
+            Some(r#"{"source_kind":"text_snapshot"}"#.into()),
+        )
+        .unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &grounded,
+                &reread_prov,
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation,
+            )
+            .await
+            .unwrap();
+
+        let id = conditioned_assertion_id(
+            "t1",
+            subject,
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &[],
+        )
+        .unwrap();
+        let evidence = store.assertion_evidence_by_id(&id).await.unwrap();
+        assert_eq!(evidence.len(), 1, "a re-read is not corroboration");
+        let contribution = &evidence[0];
+        assert_eq!(contribution.source_key, "file:/papers/legacy-locator.pdf");
+        assert_eq!(contribution.source_entity_id, reread_prov.source_entity_id);
+        assert_eq!(contribution.activity_id, "act-exact-reread");
+        assert_eq!(contribution.agent_id, "citation-rereader");
+        assert_eq!(contribution.source_revision_id.as_deref(), Some(SHA));
+        assert_eq!(
+            contribution.evidence_span.as_deref(),
+            Some(citation.evidence_span())
+        );
+        assert_eq!(contribution.line_start, Some(17));
+        assert_eq!(contribution.line_end, Some(18));
+        assert_eq!(
+            contribution.locator_json,
+            citation.locator_json().map(str::to_string)
+        );
+        assert_eq!(
+            contribution.verification_status,
+            Some(VerificationStatus::Grounded)
+        );
+        assert_eq!(
+            store
+                .assertion_by_id(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .verification_status,
+            Some(VerificationStatus::Grounded),
+            "the eligible source-specific upgrade must also update the aggregate"
+        );
+    }
+
+    /// Citation coordinates are one indivisible witness. A partially
+    /// populated legacy/corrupt row cannot borrow only its missing endpoint
+    /// from a later, different citation, because that would manufacture a
+    /// span that neither extraction actually observed.
+    #[tokio::test]
+    async fn a_partial_citation_is_never_hybridized_with_a_later_citation() {
+        const SHA_A: &str = "acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac";
+        const SHA_B: &str = "bdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbdbd";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let subject = "PartialCitationAlloy";
+        let weak = verified_fact(
+            subject,
+            Some(VerificationStatus::ValueNotInSource),
+            Some("the first witness was weak"),
+        );
+        let first_prov = prov_from("/snapshots/partial-a.txt", "act-partial-a");
+        let citation_a =
+            SourceCitation::new(4, 5, "first witness", SHA_A, Some(r#"{"page":1}"#.into()))
+                .unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &weak,
+                &first_prov,
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_a,
+            )
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE prov_assertion_evidence SET line_end = NULL", ())
+            .await
+            .unwrap();
+
+        let grounded = verified_fact(subject, Some(VerificationStatus::Grounded), None);
+        let citation_b = SourceCitation::new(
+            40,
+            41,
+            "different later witness",
+            SHA_B,
+            Some(r#"{"page":9}"#.into()),
+        )
+        .unwrap();
+        let mut later_prov = prov_from("/snapshots/partial-b.txt", "act-partial-b");
+        later_prov.origin_source_id = Some("/snapshots/partial-a.txt".into());
+        later_prov.agent_id = "later-agent".into();
+        store
+            .write_fact_with_classification_and_citation(
+                &grounded,
+                &later_prov,
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_b,
+            )
+            .await
+            .unwrap();
+
+        let id = conditioned_assertion_id(
+            "t1",
+            subject,
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &[],
+        )
+        .unwrap();
+        let evidence = store.assertion_evidence_by_id(&id).await.unwrap();
+        assert_eq!(evidence.len(), 1);
+        let contribution = &evidence[0];
+        assert_eq!(contribution.source_entity_id, first_prov.source_entity_id);
+        assert_eq!(contribution.activity_id, "act-partial-a");
+        assert_eq!(contribution.agent_id, first_prov.agent_id);
+        assert_eq!(contribution.source_revision_id.as_deref(), Some(SHA_A));
+        assert_eq!(contribution.evidence_span.as_deref(), Some("first witness"));
+        assert_eq!(contribution.line_start, Some(4));
+        assert_eq!(
+            contribution.line_end, None,
+            "the missing cell stays missing"
+        );
+        assert_eq!(contribution.locator_json.as_deref(), Some(r#"{"page":1}"#));
+        assert_eq!(
+            contribution.verification_status,
+            Some(VerificationStatus::ValueNotInSource),
+            "a different citation cannot improve this evidence row"
+        );
+    }
+
+    /// A stronger conclusion from the same source key is not evidence about
+    /// the stored witness when its revision/span/coordinates differ. Neither
+    /// the per-source row nor the parent assertion may be upgraded by that
+    /// mismatched re-read.
+    #[tokio::test]
+    async fn a_mismatched_later_citation_cannot_upgrade_verification() {
+        const SHA_A: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        const SHA_B: &str = "dededededededededededededededededededededededededededededededede";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let subject = "MismatchedCitationAlloy";
+        let source = "/snapshots/mismatch.txt";
+        let weak = verified_fact(
+            subject,
+            Some(VerificationStatus::ValueNotInSource),
+            Some("the stored witness does not ground the value"),
+        );
+        let citation_a = SourceCitation::new(8, 8, "stored witness", SHA_A, None).unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &weak,
+                &prov_from(source, "act-mismatch-a"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_a,
+            )
+            .await
+            .unwrap();
+
+        let grounded = verified_fact(subject, Some(VerificationStatus::Grounded), None);
+        let citation_b = SourceCitation::new(88, 88, "different witness", SHA_B, None).unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &grounded,
+                &prov_from(source, "act-mismatch-b"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_b,
+            )
+            .await
+            .unwrap();
+
+        let id = conditioned_assertion_id(
+            "t1",
+            subject,
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &[],
+        )
+        .unwrap();
+        let contribution = store.assertion_evidence_by_id(&id).await.unwrap().remove(0);
+        assert_eq!(contribution.source_revision_id.as_deref(), Some(SHA_A));
+        assert_eq!(
+            contribution.evidence_span.as_deref(),
+            Some("stored witness")
+        );
+        assert_eq!(contribution.line_start, Some(8));
+        assert_eq!(contribution.line_end, Some(8));
+        assert_eq!(
+            contribution.verification_status,
+            Some(VerificationStatus::ValueNotInSource)
+        );
+        assert_eq!(
+            contribution.verification_reason.as_deref(),
+            Some("the stored witness does not ground the value")
+        );
+        let assertion = store.assertion_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(
+            assertion.verification_status,
+            Some(VerificationStatus::ValueNotInSource)
+        );
+        assert_eq!(
+            assertion.verification_reason.as_deref(),
+            Some("the stored witness does not ground the value")
+        );
+
+        // Control: the stronger result is allowed when it is explicitly tied
+        // to the exact witness already stored.
+        store
+            .write_fact_with_classification_and_citation(
+                &grounded,
+                &prov_from(source, "act-mismatch-exact"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation_a,
+            )
+            .await
+            .unwrap();
+        let contribution = store.assertion_evidence_by_id(&id).await.unwrap().remove(0);
+        assert_eq!(
+            contribution.verification_status,
+            Some(VerificationStatus::Grounded)
+        );
+        assert_eq!(contribution.verification_reason, None);
+        let assertion = store.assertion_by_id(&id).await.unwrap().unwrap();
+        assert_eq!(
+            assertion.verification_status,
+            Some(VerificationStatus::Grounded)
+        );
+        assert_eq!(assertion.verification_reason, None);
+    }
+
+    /// A database that already has the pre-citation evidence table receives
+    /// nullable columns in place. Its existing contribution survives and
+    /// reports no witness or source-specific verification rather than an
+    /// invented default.
+    #[tokio::test]
+    async fn pre_citation_evidence_schema_migrates_existing_rows_to_explicit_none() {
+        let db = TempDb::new();
+        {
+            let database = turso::Builder::new_local(db.path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            conn.execute(
+                r#"CREATE TABLE prov_assertion_evidence (
+                    assertion_id TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    source_entity_id TEXT NOT NULL,
+                    source_revision_id TEXT,
+                    activity_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    evidence_class TEXT NOT NULL,
+                    confidence_kind TEXT NOT NULL DEFAULT 'source',
+                    legacy_corroborations INTEGER,
+                    PRIMARY KEY (assertion_id, source_key)
+                )"#,
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO prov_assertion_evidence \
+                 (assertion_id, source_key, source_entity_id, source_revision_id, \
+                  activity_id, agent_id, confidence, evidence_class, confidence_kind) \
+                 VALUES ('legacy-assertion', 'document:legacy', 'doc:legacy', NULL, \
+                         'act-legacy', 'agent-legacy', 0.4, 'research', 'source')",
+                (),
+            )
+            .await
+            .unwrap();
+            // This fixture is already on the evidence-table generation; only
+            // the new nullable columns should be added on open.
+            conn.execute("PRAGMA user_version = 5", ()).await.unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let evidence = store
+            .assertion_evidence_by_id("legacy-assertion")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        let contribution = &evidence[0];
+        assert_eq!(contribution.source_entity_id, "doc:legacy");
+        assert_eq!(contribution.source_revision_id, None);
+        assert_eq!(contribution.evidence_span, None);
+        assert_eq!(contribution.line_start, None);
+        assert_eq!(contribution.line_end, None);
+        assert_eq!(contribution.locator_json, None);
+        assert_eq!(contribution.verification_status, None);
+        assert_eq!(contribution.verification_reason, None);
+    }
+
+    /// Identity lookup did not exist before retrieval re-verification: a
+    /// conditioned assertion could be found only by fuzzy subject/object
+    /// search. The id read now returns the exact value, unit, conditions,
+    /// source ownership, and annotation even when that status is untrusted.
+    #[tokio::test]
+    async fn assertion_by_id_loads_the_complete_conditioned_fact() {
+        const SHA: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let conditions = vec![
+            MeasurementCondition {
+                name: "temperature".into(),
+                value: ConditionValue::Number(700.0),
+                unit: Some(QudtUnit::new("QUDT:K").unwrap()),
+            },
+            MeasurementCondition {
+                name: "atmosphere".into(),
+                value: ConditionValue::Text("argon".into()),
+                unit: None,
+            },
+        ];
+        let mut fact = verified_fact(
+            "ConditionedAlloy",
+            Some(VerificationStatus::ValueNotInSource),
+            Some("no single span carried every condition"),
+        );
+        fact.conditions = conditions.clone();
+        let citation =
+            SourceCitation::new(21, 23, "1140 MPa at 700 K in argon", SHA, None).unwrap();
+        store
+            .write_fact_with_classification_and_citation(
+                &fact,
+                &prov_from("file:/papers/conditioned.txt", "act-conditioned"),
+                test_ontology_classification(),
+                FactGraphShape::emmo("measurement"),
+                &citation,
+            )
+            .await
+            .unwrap();
+        let id = conditioned_assertion_id(
+            "t1",
+            "ConditionedAlloy",
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &conditions,
+        )
+        .unwrap();
+
+        let stored = store
+            .assertion_by_id(&id)
+            .await
+            .unwrap()
+            .expect("conditioned assertion must be addressable by id");
+        assert_eq!(stored.id, id);
+        assert_eq!(stored.subject, "ConditionedAlloy");
+        assert_eq!(stored.predicate, "has_measurement");
+        assert_eq!(stored.object, "UTS");
+        assert_eq!(stored.value, Some(1140.0));
+        assert_eq!(stored.unit.as_deref(), Some("QUDT:MegaPA"));
+        assert_eq!(stored.conditions, conditions);
+        assert_eq!(stored.evidence_class, EvidenceClass::Research);
+        assert_eq!(stored.corroborations, 1);
+        assert_eq!(stored.activity_id, "act-conditioned");
+        assert_eq!(stored.source, "file:/papers/conditioned.txt");
+        assert_eq!(stored.tenant, "t1");
+        assert_eq!(
+            stored.verification_status,
+            Some(VerificationStatus::ValueNotInSource),
+            "identity lookup must not hide a weak stored annotation"
+        );
+        assert_eq!(
+            stored.verification_reason.as_deref(),
+            Some("no single span carried every condition")
+        );
+        assert!(store.assertion_by_id("missing-id").await.unwrap().is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Verification status (annotate-not-refuse)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn verified_fact(
+        subject: &str,
+        verification: Option<VerificationStatus>,
+        reason: Option<&str>,
+    ) -> MaterialFact {
+        MaterialFact {
+            subject: subject.into(),
+            predicate: "has_measurement".into(),
+            object: "UTS".into(),
+            value: Some(1140.0),
+            unit: Some(QudtUnit::new("QUDT:MegaPA").unwrap()),
+            conditions: vec![],
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+            evidence_class: EvidenceClass::Research,
+            verification,
+            verification_reason: reason.map(str::to_string),
+        }
+    }
+
+    /// The core read contract of annotate-not-refuse: a weak fact is
+    /// STORED, excluded from the default (trusted) read, and findable by
+    /// explicit filter — with the check's reason intact. Rows with no
+    /// recorded status stay visible by default, or every fact written
+    /// before this column existed would silently vanish.
+    #[tokio::test]
+    async fn weak_facts_are_stored_findable_and_excluded_from_the_default_read() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        store
+            .write_fact(
+                &verified_fact("GroundedAlloy", Some(VerificationStatus::Grounded), None),
+                &prov,
+            )
+            .await
+            .unwrap();
+        store
+            .write_fact(
+                &verified_fact(
+                    "PreciseAlloy",
+                    Some(VerificationStatus::SubjectNotVerbatim),
+                    Some("the document never names that subject"),
+                ),
+                &prov,
+            )
+            .await
+            .unwrap();
+        // No status at all — a legacy/tabular-shaped write.
+        store
+            .write_fact(&verified_fact("LegacyAlloy", None, None), &prov)
+            .await
+            .unwrap();
+
+        let trusted = store.recall_with_context("Alloy", "t1", 10).await.unwrap();
+        let names: Vec<&str> = trusted.iter().map(|f| f.subject.as_str()).collect();
+        assert!(names.contains(&"GroundedAlloy"), "{names:?}");
+        assert!(
+            names.contains(&"LegacyAlloy"),
+            "a row with no recorded status must stay visible: {names:?}"
+        );
+        assert!(
+            !names.contains(&"PreciseAlloy"),
+            "a weak-status fact must not be promoted into the default read: {names:?}"
+        );
+
+        let all = store
+            .recall_with_context_filtered("Alloy", &["t1"], 10, VerificationFilter::Any)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "everything is present: {all:?}");
+        let weak = store
+            .recall_with_context_filtered(
+                "Alloy",
+                &["t1"],
+                10,
+                VerificationFilter::Status(VerificationStatus::SubjectNotVerbatim),
+            )
+            .await
+            .unwrap();
+        assert_eq!(weak.len(), 1, "{weak:?}");
+        assert_eq!(weak[0].subject, "PreciseAlloy");
+        assert_eq!(
+            weak[0].verification_reason.as_deref(),
+            Some("the document never names that subject"),
+            "the refusal-era reason must survive as a queryable field"
+        );
+    }
+
+    /// Status aggregation is BEST-wins across sightings (a grounding
+    /// witness in any source is a real witness), while a later weaker
+    /// sighting or a status-less write can never downgrade or clear it.
+    /// This is the opposite direction from the evidence class, on purpose —
+    /// the class ceiling is asserted untouched at the end.
+    #[tokio::test]
+    async fn verification_upgrades_on_a_grounding_witness_and_never_downgrades() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        store
+            .write_fact(
+                &verified_fact(
+                    "Ti-6Al-4V",
+                    Some(VerificationStatus::ValueNotInSource),
+                    Some("no span carries the value"),
+                ),
+                &prov_from("doc:paper_a", "act_a"),
+            )
+            .await
+            .unwrap();
+        // A different source grounds the SAME assertion.
+        store
+            .write_fact(
+                &verified_fact("Ti-6Al-4V", Some(VerificationStatus::Grounded), None),
+                &prov_from("doc:paper_b", "act_b"),
+            )
+            .await
+            .unwrap();
+        // A third source's sloppy extraction must not un-ground it, and a
+        // status-less write must not clear it.
+        store
+            .write_fact(
+                &verified_fact(
+                    "Ti-6Al-4V",
+                    Some(VerificationStatus::SubjectNotVerbatim),
+                    Some("later sloppy sighting"),
+                ),
+                &prov_from("doc:paper_c", "act_c"),
+            )
+            .await
+            .unwrap();
+        store
+            .write_fact(
+                &verified_fact("Ti-6Al-4V", None, None),
+                &prov_from("doc:paper_d", "act_d"),
+            )
+            .await
+            .unwrap();
+
+        let facts = store
+            .recall_with_context_filtered("Ti-6Al-4V", &["t1"], 10, VerificationFilter::Any)
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1, "one assertion, four sightings: {facts:?}");
+        assert_eq!(
+            facts[0].verification_status,
+            Some(VerificationStatus::Grounded),
+            "best sighting wins and sticks"
+        );
+        assert_eq!(
+            facts[0].verification_reason, None,
+            "the reason moves with the status it explains"
+        );
+        // The monotone evidence ceiling is a separate axis and still holds:
+        // four literature sightings stay Research, however verified.
+        assert_eq!(facts[0].evidence_class, EvidenceClass::Research);
+    }
+
+    #[tokio::test]
+    async fn an_absent_unit_is_not_a_store_level_semantic_verdict() {
+        // CONTRACT CHANGE: absence is representable independently of status.
+        // The store preserves a caller's verification annotation when one is
+        // present, but no longer invents or requires that semantic judgement.
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let mut silent = verified_fact("QuietAlloy", None, None);
+        silent.unit = None;
+        write_emmo_shaped(&store, &silent, &prov).await;
+        let silent_facts = store
+            .recall_with_context_filtered("QuietAlloy", &["t1"], 10, VerificationFilter::Any)
+            .await
+            .unwrap();
+        assert_eq!(silent_facts.len(), 1);
+        assert_eq!(silent_facts[0].unit, None);
+        assert_eq!(silent_facts[0].verification_status, None);
+
+        let mut annotated = verified_fact(
+            "HonestAlloy",
+            Some(VerificationStatus::UnitUnresolved),
+            Some("unit \"MPa·strangeness\" resolved to nothing"),
+        );
+        annotated.unit = None;
+        write_emmo_shaped(&store, &annotated, &prov).await;
+
+        let facts = store
+            .recall_with_context_filtered(
+                "HonestAlloy",
+                &["t1"],
+                10,
+                VerificationFilter::Status(VerificationStatus::UnitUnresolved),
+            )
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].value, Some(1140.0), "the number is not lost");
+        assert_eq!(facts[0].unit, None, "and it never wears a fake unit");
+        // Excluded from the trusted default, of course.
+        assert!(
+            store
+                .recall_with_context("HonestAlloy", "t1", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The Measurement node's props carry the status and the null unit.
+        // The node name derives from canonical keys, so find the Measurement
+        // neighbor instead of assuming the exact spelling.
+        let traversal = store
+            .get_neighbors("HonestAlloy", None, "t1", 10)
+            .await
+            .unwrap();
+        let meas = traversal
+            .nodes
+            .iter()
+            .find(|node| node.label == "Measurement")
+            .expect("the measurement node exists");
+        let props: serde_json::Value = serde_json::from_str(
+            &store
+                .entity_props_json(&meas.name, "t1")
+                .await
+                .unwrap()
+                .expect("measurement props exist"),
+        )
+        .unwrap();
+        assert_eq!(props["verification_status"], "unit_unresolved");
+        assert!(props["unit"].is_null(), "honest null, never \"\": {props}");
+    }
+
+    /// The status lands on the graph EDGE, not only in a report: a weak
+    /// phase fact's HAS_PHASE edge carries `verification_status` in its
+    /// props, and a status-less write keeps its historical byte shape
+    /// (props absent).
+    #[tokio::test]
+    async fn the_verification_status_rides_the_graph_edge_props() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+
+        let mut weak_phase = verified_fact(
+            "WeakAlloy",
+            Some(VerificationStatus::ReviewDenied),
+            Some("the source denies this phase"),
+        );
+        weak_phase.kind = Some("phase".into());
+        weak_phase.value = None;
+        weak_phase.unit = None;
+        weak_phase.object = "omega".into();
+        write_emmo_shaped(&store, &weak_phase, &prov).await;
+
+        let traversal = store
+            .get_neighbors("WeakAlloy", None, "t1", 10)
+            .await
+            .unwrap();
+        let edge = traversal
+            .edges
+            .iter()
+            .find(|edge| edge.rel_type == "HAS_PHASE")
+            .expect("the phase edge exists — annotated, not refused");
+        let props: serde_json::Value =
+            serde_json::from_str(edge.props_json.as_deref().expect("edge carries props")).unwrap();
+        assert_eq!(props["verification_status"], "review_denied");
+
+        // Control: a status-less write of another fact leaves props absent.
+        let mut plain = verified_fact("PlainAlloy", None, None);
+        plain.kind = Some("phase".into());
+        plain.value = None;
+        plain.unit = None;
+        plain.object = "alpha".into();
+        write_emmo_shaped(&store, &plain, &prov).await;
+        let traversal = store
+            .get_neighbors("PlainAlloy", None, "t1", 10)
+            .await
+            .unwrap();
+        let edge = traversal
+            .edges
+            .iter()
+            .find(|edge| edge.rel_type == "HAS_PHASE")
+            .unwrap();
+        assert_eq!(edge.props_json, None, "no status, no invented props");
+    }
+
+    /// The anti-ratchet rule survives the vocabulary change: exactly the
+    /// statuses that came from a RENDERED judgement refuse per-item model
+    /// re-asking, and the trusted set is exactly the top of the rank order.
+    #[test]
+    fn verification_rank_trust_and_ratchet_are_consistent() {
+        use VerificationStatus::*;
+        // Ranks are a total order (used by SQL best-wins): all distinct.
+        let mut ranks: Vec<i64> = VerificationStatus::ALL.iter().map(|s| s.rank()).collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+        assert_eq!(ranks.len(), VerificationStatus::ALL.len());
+        // Trusted = the top of the order, nothing else.
+        // CONTRACT CHANGE: `CitedByReader` joined the trusted set — the
+        // fresh paper path stamps it for every cited proposal, and keeping
+        // those facts out of default reads would re-install the measured
+        // muzzle (~44% of quarantines came from checks that could not
+        // pass). It ranks BELOW `UnitFromPage`/`Grounded` (no deterministic
+        // check ran), so the trusted set is still exactly the top of the
+        // rank order — now three statuses, not two.
+        for status in VerificationStatus::ALL {
+            assert_eq!(
+                status.is_trusted(),
+                status.rank() >= CitedByReader.rank(),
+                "{status:?}"
+            );
+        }
+        // Rendered judgements (deterministic doc checks and review verdicts)
+        // may not be re-rolled; lookup failures, sampling noise, and
+        // never-reviewed assertions may.
+        for status in [
+            Grounded,
+            UnitFromPage,
+            SubjectNotVerbatim,
+            ValueNotInSource,
+            ReviewUncertain,
+            ReviewDenied,
+        ] {
+            assert!(status.judgement_was_rendered(), "{status:?}");
+        }
+        // CONTRACT CHANGE: `CitedByReader` joins the re-askable set — no
+        // deterministic check or review judged span-support for it, so an
+        // affirmation pass over its exact citation is a first ask.
+        for status in [
+            CitedByReader,
+            UnitUnresolved,
+            SampleDisagreement,
+            ModelAsserted,
+        ] {
+            assert!(!status.judgement_was_rendered(), "{status:?}");
+        }
+        // The stored spelling round-trips.
+        for status in VerificationStatus::ALL {
+            assert_eq!(VerificationStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(VerificationStatus::parse("anything_else"), None);
     }
 }

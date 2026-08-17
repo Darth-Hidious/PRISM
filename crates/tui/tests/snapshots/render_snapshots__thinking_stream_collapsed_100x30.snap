@@ -26,9 +26,9 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
-┌ Prompt ─────────────────────────────────────────────────────────┐│
-│ Type a message... (Enter=send, /help, Ctrl-C=quit)              ││
-│                                                                 ││
-│                                                                 ││
-└─────────────────────────────────────────────────────────────────┘│
-  Ready  model: fake-backend  [thinking · Ctrl-T]   [INPUT]    Ctrl│
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+  Ready  model: fake-backend  [thinking · Ctrl-T]   [INPUT]    Ctr │

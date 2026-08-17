@@ -26,9 +26,9 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
-┌ Prompt ─────────────────────────────────────────────────────────┐│
-│tool approval pending…  (y allow · a always allow this tool · n d││
-│                                                                 ││
-│                                                                 ││
-└─────────────────────────────────────────────────────────────────┘│
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│tool approval pending…  (y allow · a always allow this tool · n │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [APPROVAL]    Ctrl-C quit           │

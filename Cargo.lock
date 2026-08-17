@@ -5068,6 +5068,7 @@ dependencies = [
  "prism-agent",
  "prism-campaign",
  "prism-client",
+ "prism-core",
  "prism-embed",
  "prism-ingest",
  "prism-llm",
@@ -5220,6 +5221,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -5307,6 +5309,7 @@ dependencies = [
  "sophia",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
  "wiremock",
@@ -5337,6 +5340,7 @@ dependencies = [
  "llama-cpp-sys-2",
  "mockito",
  "prism-runtime",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -5504,6 +5508,8 @@ dependencies = [
  "mockito",
  "pdf-extract",
  "prism-embed",
+ "prism-llm",
+ "prism-provenance",
  "prism-runtime",
  "quick-xml",
  "reqwest",
@@ -5514,6 +5520,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "wiremock",
 ]
 

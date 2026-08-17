@@ -320,7 +320,11 @@ def create_search_tools(registry: ToolRegistry) -> None:
             "`papers_relevance` report also says whether literature results "
             "were filtered, how many off-topic papers were dropped (with "
             "examples), or whether embeddings were unavailable and the "
-            "papers therefore came back unfiltered."
+            "papers therefore came back unfiltered. This is also the "
+            "literature cross-check for candidates that came out of "
+            "materials_search or predict: cite what comes back (DB id + "
+            "paper DOI), never propose a composition without a traceable "
+            "source."
         ),
         input_schema={
             "type": "object",

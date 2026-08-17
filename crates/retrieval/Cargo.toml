@@ -9,6 +9,8 @@ authors.workspace = true
 [dependencies]
 # Hard-offline policy covers both source retrieval and embedding adapters.
 prism-embed = { path = "../embed" }
+prism-llm = { path = "../llm" }
+prism-provenance = { path = "../provenance" }
 prism-runtime = { path = "../runtime" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -26,6 +28,7 @@ sha2 = { workspace = true }
 tar = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 mockito = { workspace = true }

@@ -796,6 +796,9 @@ pub async fn load(
                 EvidenceClass::Research,
                 nodes,
                 classification,
+                // MatKG facts carry no kind — COOCCURS_WITH stays a generic
+                // edge under the MatKG declaration, never an EMMO shape.
+                None,
             )
             .await?;
         for endpoint in [&pair.subject, &pair.object] {

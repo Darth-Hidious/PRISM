@@ -139,8 +139,16 @@ impl MetaTool {
 
 /// How many matches `recall(query)` returns by default.
 const DEFAULT_RECALL_LIMIT: usize = 5;
-/// Cap (chars) on a single recalled output echoed back to the model.
-const RECALL_OUTPUT_CHARS: usize = 8_000;
+/// Cap (chars) on a BY-ID fetch. The by-id path is the model's explicit
+/// "pull the full result back" move after the agent loop truncated an
+/// oversized tool result inline (an 8k preview of a >30k result). Clipping
+/// the by-id fetch at the same 8k as the preview made that pointer useless:
+/// the model asked for the rest and got exactly what it already had.
+/// 64k (a little over 2x the loop's 30k inline threshold) returns whole
+/// every result the loop would have kept inline, bounds a pathological
+/// multi-megabyte child output, and still names the remainder honestly
+/// when a record exceeds it.
+const RECALL_BY_ID_MAX_CHARS: usize = 64_000;
 /// Per-match preview length (chars) in a keyword search.
 const RECALL_PREVIEW_CHARS: usize = 240;
 /// Minimum cosine similarity for a semantic match. Measured on the native
@@ -798,7 +806,7 @@ async fn recall_with_backend(
                 "id": rec.id,
                 "tool_name": rec.tool_name,
                 "input": rec.input_json,
-                "output": clip_value(rec.output_json),
+                "output": clip_value(rec.output_json, RECALL_BY_ID_MAX_CHARS),
                 "status": rec.status,
                 "exit_code": rec.exit_code,
             }),
@@ -999,16 +1007,20 @@ async fn list_failures(
 }
 
 /// Echo a stored output back to the model, preserving JSON structure when it
-/// fits and clipping to a string when it would bloat the context.
-fn clip_value(v: Option<Value>) -> Value {
+/// fits and clipping to a string when it exceeds `max_chars`. The by-id
+/// fetch path passes [`RECALL_BY_ID_MAX_CHARS`] — see that constant for why
+/// an explicit single-record fetch must be able to return more than the
+/// preview the model already saw.
+fn clip_value(v: Option<Value>, max_chars: usize) -> Value {
     match v {
         None => Value::Null,
         Some(value) => {
             let serialized = value.to_string();
-            if serialized.chars().count() <= RECALL_OUTPUT_CHARS {
+            if serialized.chars().count() <= max_chars {
                 value
             } else {
-                Value::String(clip_str(&serialized, RECALL_OUTPUT_CHARS))
+                let total = serialized.chars().count();
+                Value::String(clip_str_with_remainder(&serialized, max_chars, total))
             }
         }
     }
@@ -1020,6 +1032,17 @@ fn clip_str(s: &str, max_chars: usize) -> String {
     }
     let head: String = s.chars().take(max_chars).collect();
     format!("{head}…[clipped]")
+}
+
+/// Like [`clip_str`], but names how much of the record remains unread —
+/// a still-clipped by-id fetch must say so instead of presenting itself
+/// as the whole record.
+fn clip_str_with_remainder(s: &str, max_chars: usize, total_chars: usize) -> String {
+    let head: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!(
+        "{head}…[record is {total_chars} chars; showing first {max_chars} — refine the \
+         original query or lower max_results for a smaller result]"
+    )
 }
 
 #[cfg(test)]
@@ -1415,6 +1438,52 @@ mod tests {
         assert_eq!(out["id"], json!(id));
         assert_eq!(out["tool_name"], json!("file"));
         assert_eq!(out["output"], json!("titanium aluminide rows: 42"));
+    }
+
+    /// B2: the truncation pointer in `agent_loop::process_large_result`
+    /// promises the model it can pull an oversized result back with
+    /// `recall(id=...)`. The by-id cap (64k) must sit far ABOVE the 8k
+    /// inline preview, or the pointer returns exactly what the model
+    /// already saw; and a record that still exceeds the cap must say how
+    /// much remains instead of presenting itself as whole.
+    #[tokio::test]
+    async fn recall_by_id_pulls_back_more_than_the_inline_preview() {
+        let store = ProvenanceStore::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut rec = new_record(
+            "sess-big",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("papers"),
+            None,
+            json!({ "q": "full-text" }),
+        );
+        let payload = "x".repeat(40_000);
+        rec.output_json = Some(json!(payload.clone()));
+        store.record(&rec).await.unwrap();
+
+        let out = recall(&json!({ "id": rec.id.clone() }), Some(&store), "sess-big")
+            .await
+            .unwrap();
+        // 40k fits whole under the 64k by-id cap — "pull it back" is
+        // literally true for this record.
+        assert_eq!(out["output"], json!(payload));
+
+        // A record past the cap is honestly marked, never silently cut.
+        let mut huge = rec.clone();
+        huge.id = "rec-huge".to_string();
+        let payload2 = "y".repeat(100_000);
+        huge.output_json = Some(json!(payload2));
+        store.record(&huge).await.unwrap();
+        let out2 = recall(&json!({ "id": "rec-huge" }), Some(&store), "sess-big")
+            .await
+            .unwrap();
+        let clipped = out2["output"].as_str().unwrap();
+        assert!(
+            clipped.contains("record is 100002 chars; showing first 64000"),
+            "{clipped}"
+        );
     }
 
     #[tokio::test]

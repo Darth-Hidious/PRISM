@@ -66,7 +66,7 @@ pub enum PapersCommands {
         #[arg(long, value_parser = ["jats", "pdf"])]
         format: Option<String>,
     },
-    /// Extract EMMO-typed claims from a paper's full text via the local LLM.
+    /// Extract active-ontology-bound claims from a paper via the local LLM.
     /// With no LLM configured this returns zero claims and says so — it
     /// never invents any.
     Claims {
@@ -325,6 +325,8 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             }
 
             let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
+            let ontology_id = crate::active_ontology_from_config(project_root)?;
+            let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
             let title = paper.title.clone();
             let document_id = paper
                 .doi
@@ -335,107 +337,153 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             let source = paper.source.clone();
 
             let mut claims = Vec::new();
-            let mut rejected = Vec::new();
-            let mut blocks_extracted = 0usize;
-            // A block whose extraction could not be parsed yields zero claims,
-            // which is indistinguishable from a block that genuinely contained
-            // none. `TextExtraction` reports the reason precisely so that stops
-            // being invisible — but this loop was discarding it with `.facts`,
-            // leaving the literature path exactly as silent as before.
+            // Retained in the response schema for compatibility. Agentic
+            // population records failed checks on each claim instead of
+            // moving the claim into this refusal list.
+            let rejected: Vec<serde_json::Value> = Vec::new();
+            let mut agreement_exclusions: Vec<prism_ingest::text_extract::SampleExclusion> =
+                Vec::new();
+            let mut model_insufficient: Option<prism_ingest::text_extract::ModelInsufficiency> =
+                None;
+            // The paper agent gets one workspace containing every selected
+            // source block. Blocks retain their locator and line range for
+            // human navigation, but search_paper/read_paper address the same
+            // complete text throughout the loop.
+            use prism_retrieval::fulltext::BlockKind;
+            let selected_blocks = fulltext
+                .blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.locator.kind,
+                        BlockKind::Body | BlockKind::Table | BlockKind::Caption
+                    )
+                })
+                .take(if max_blocks == 0 {
+                    usize::MAX
+                } else {
+                    max_blocks
+                })
+                .collect::<Vec<_>>();
+            let blocks_extracted = selected_blocks.len();
+            let mut paper_text = String::new();
+            let mut located_lines = Vec::with_capacity(selected_blocks.len());
+            for block in &selected_blocks {
+                if !paper_text.is_empty() {
+                    paper_text.push('\n');
+                }
+                let line_start = paper_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                paper_text.push_str(&block.text);
+                let line_end = line_start + block.text.lines().count().max(1) - 1;
+                located_lines.push((line_start, line_end, &block.locator));
+            }
+
             let mut extraction_failures: Vec<serde_json::Value> = Vec::new();
-            // Facts the extractor dropped ONE BY ONE (malformed shape, or a
-            // unit no QUDT identifier could be resolved for). Distinct from
-            // `extraction_failures` (a whole block yielding nothing) and
-            // from `rejected` (claims refused at validation): these never
-            // became claims at all, and only this list says why.
+            let mut agent_traces: Vec<prism_ingest::paper_agent::PaperAgentTrace> = Vec::new();
+            let mut agent_turns = 0usize;
+            let mut agent_tool_calls = 0usize;
+            let mut proposed_classes: Vec<prism_ingest::paper_agent::OntologyClassProposal> =
+                Vec::new();
+            let mut proposed_relations: Vec<prism_ingest::paper_agent::OntologyRelationProposal> =
+                Vec::new();
+            let source_snapshot_home = store.then(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                std::path::PathBuf::from(home).join(".prism")
+            });
+            // Only structurally unrepresentable proposals reach this list.
+            // Source checks stay attached to claims as verification notes.
             let mut dropped_facts: Vec<serde_json::Value> = Vec::new();
-            // Extract per located block so every claim inherits a locator a
-            // human can follow back into the document.
-            for block in &fulltext.blocks {
-                use prism_retrieval::fulltext::BlockKind;
-                if !matches!(
-                    block.locator.kind,
-                    BlockKind::Body | BlockKind::Table | BlockKind::Caption
-                ) {
-                    continue;
-                }
-                if max_blocks > 0 && blocks_extracted >= max_blocks {
-                    break;
-                }
-                blocks_extracted += 1;
+            if !paper_text.trim().is_empty() {
                 let extraction =
-                    prism_ingest::text_extract::extract_facts_from_text(&llm, &title, &block.text)
-                        .await
-                        .with_context(|| "LLM fact extraction failed")?;
+                    prism_ingest::text_extract::extract_facts_from_text_with_ontology_and_policy(
+                        &llm,
+                        ontology.as_ref(),
+                        &title,
+                        &paper_text,
+                        prism_ingest::text_extract::GroundingPolicy::default(),
+                        crate::paper_agent_policy(project_root),
+                    )
+                    .await
+                    .with_context(|| "agentic paper extraction failed")?;
+                agreement_exclusions = extraction.agreement_exclusions.clone();
+                model_insufficient = extraction.model_insufficient.clone();
                 if let Some(reason) = &extraction.parse_error {
                     extraction_failures.push(json!({
-                        "section": block.locator.section_path,
                         "reason": reason,
                     }));
                 }
                 for reason in &extraction.dropped_facts {
                     dropped_facts.push(json!({
-                        "section": block.locator.section_path,
                         "reason": reason,
                     }));
                 }
-                for fact in extraction.facts {
-                    // Containment: find the verbatim span of THIS block that
-                    // supports the fact. Facts with no supporting span cannot
-                    // become claims — stamping them would record provenance a
-                    // document never gave (extractor prompt examples included).
-                    let support = prism_retrieval::claims::supporting_quote_or_refusal(
-                        &fact.subject,
-                        &fact.object,
-                        fact.value,
-                        &block.text,
-                    );
-                    let quote = support.as_ref().ok().cloned();
-                    // Clone the drop-record fields BEFORE `fact` moves into
-                    // `claim_from_fact` and `claim` into `validate_and_stamp`:
-                    // without them the rejected entries carry only a reason,
-                    // and the over-refusal histogram cannot be built from
-                    // production output at all.
-                    let subject = fact.subject.clone();
-                    let object = fact.object.clone();
-                    let value = fact.value;
-                    let claim = claim_from_fact(
-                        fact,
-                        &document_id,
-                        &document_url,
-                        &source,
-                        &block.locator,
-                        quote,
-                    );
-                    match prism_retrieval::claims::validate_and_stamp(claim, &block.text) {
-                        Ok(stamped) => claims.push(stamped),
-                        Err(reason) => {
-                            // A MissingQuote drop is refined by `support`: a
-                            // missing quote is the model's fault only when no
-                            // span held the fact at all (NoSpan maps back to
-                            // MissingQuote). When a span held it but a guard
-                            // refused every occurrence of the value, record
-                            // WHICH guard: that drop is the matcher's refusal,
-                            // and the guard name is the only observable signal
-                            // of over-refusal. MissingQuote implies `support`
-                            // is Err — Ok support gave the claim a quote, and
-                            // only a quote-less claim is refused as
-                            // MissingQuote — so no Ok arm exists here.
-                            let reason = match (reason, support) {
-                                (
-                                    prism_retrieval::claims::ClaimRejection::MissingQuote,
-                                    Err(refusal),
-                                ) => prism_retrieval::claims::ClaimRejection::from(refusal),
-                                (reason, _) => reason,
-                            };
-                            rejected.push(json!({
-                                "reason": reason,
-                                "subject": subject,
-                                "object": object,
-                                "value": value,
-                                "locator": block.locator,
-                            }));
-                        }
+                agent_turns += extraction
+                    .agent_traces
+                    .iter()
+                    .map(|trace| trace.turns)
+                    .sum::<usize>();
+                agent_tool_calls += extraction
+                    .agent_traces
+                    .iter()
+                    .flat_map(|trace| &trace.samples)
+                    .map(|turn| turn.tool_calls.len())
+                    .sum::<usize>();
+                agent_traces.extend(extraction.agent_traces);
+                proposed_classes.extend(extraction.proposed_classes);
+                proposed_relations.extend(extraction.proposed_relations);
+                if extraction.facts.len() != extraction.citations.len()
+                    || extraction.facts.len() != extraction.ontology_bindings.len()
+                {
+                    extraction_failures.push(json!({
+                        "reason": format!(
+                            "extractor returned {} facts, {} citations, and {} ontology bindings",
+                            extraction.facts.len(),
+                            extraction.citations.len(),
+                            extraction.ontology_bindings.len()
+                        ),
+                    }));
+                } else {
+                    let source_text_path = if extraction.facts.is_empty() {
+                        None
+                    } else {
+                        source_snapshot_home
+                            .as_deref()
+                            .map(|home| crate::persist_source_text_snapshot(home, &paper_text))
+                            .transpose()?
+                            .map(|path| path.display().to_string())
+                    };
+                    for ((fact, citation), ontology_binding) in extraction
+                        .facts
+                        .into_iter()
+                        .zip(extraction.citations)
+                        .zip(extraction.ontology_bindings)
+                    {
+                        let locator = located_lines
+                            .iter()
+                            .find(|(start, end, _)| {
+                                citation.line_start() as usize >= *start
+                                    && citation.line_start() as usize <= *end
+                            })
+                            .map(|(_, _, locator)| *locator)
+                            .or_else(|| selected_blocks.first().map(|block| &block.locator))
+                            .expect("a non-empty paper workspace has a source locator");
+                        // CONTRACT CHANGE (annotate-not-refuse): propose_fact
+                        // selected and bounds-checked these exact lines. Do not
+                        // run a second lexical refusal over the model's read.
+                        let mut claim = claim_from_fact(
+                            fact,
+                            &document_id,
+                            &document_url,
+                            &source,
+                            locator,
+                            source_text_path.as_deref(),
+                            &citation,
+                            ontology_binding,
+                        );
+                        claim.evidence_class =
+                            prism_retrieval::claims::cap_at_literature(&claim.evidence_class)
+                                .to_string();
+                        claims.push(claim);
                     }
                 }
             }
@@ -447,7 +495,16 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 Some({
                     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                     let db_path = std::path::PathBuf::from(home).join(".prism/provenance.db");
-                    store_claims(&claims, &fulltext.source_url, &extractor_model, &db_path).await?
+                    store_claims(
+                        &claims,
+                        &fulltext.source_url,
+                        &extractor_model,
+                        &db_path,
+                        ontology.as_ref(),
+                        &proposed_classes,
+                        &proposed_relations,
+                    )
+                    .await?
                 })
             } else {
                 None
@@ -463,13 +520,35 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     "blocks_extracted": blocks_extracted,
                     "max_blocks": max_blocks,
                     "stored": stored,
+                    "ontology": ontology_id,
+                    "paper_agent": {
+                        "loops": agent_traces.len(),
+                        "turns": agent_turns,
+                        "tool_calls": agent_tool_calls,
+                        // Samples that got no agreement vote because they
+                        // never had a fair chance to read the document, each
+                        // with the measured reason.
+                        "agreement_exclusions": agreement_exclusions,
+                        "traces": agent_traces,
+                    },
+                    // Non-null means EVERY sample showed the routed model was
+                    // not capable of reading this document; the annotated
+                    // facts are retained, and the verdict names the model,
+                    // the numbers, and what to change.
+                    "model_insufficient": model_insufficient,
+                    "ontology_extensions": {
+                        "classes": proposed_classes,
+                        "relations": proposed_relations,
+                    },
                     // Non-empty means some blocks produced nothing because the
                     // model misbehaved, NOT because the paper was silent there.
                     "extraction_failures": extraction_failures,
-                    // Facts dropped individually during extraction (bad shape
-                    // or an unresolvable unit) — they never became claims,
-                    // and a numeric value is never kept with its unit
-                    // discarded. One entry per fact, with the reason.
+                    // Facts dropped individually during extraction because
+                    // their JSON shape cannot become a fact. Unit vocabulary
+                    // is not a Rust gate: non-empty terms are preserved, and
+                    // an absent term remains absent while an explicitly blank
+                    // term is stored with a unit-unresolved annotation. One
+                    // entry per actual drop.
                     "dropped_facts": dropped_facts,
                     // Every block is read WHOLE now (the extractor no longer
                     // truncates its input); the key stays for consumers of
@@ -486,48 +565,39 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
 ///
 /// `ExtractedClaim` and `MaterialFact` are structurally the same fact in two
 /// crates; the only real conversion is the unit, which is a plain `String` on
-/// the retrieval side and a validated `QudtUnit` on the storage side.
+/// the retrieval side and a validated non-empty `UnitTerm` on the storage
+/// side.
 ///
-/// A claim whose unit fails QUDT validation is REJECTED and counted, never
-/// written with the unit quietly dropped: a measurement that loses its unit is
-/// a wrong number, not a slightly poorer one.
+/// Every non-empty unit term is retained exactly as selected by the reading
+/// model, whether it is an IRI, a prefixed name, or source spelling. An absent
+/// term is also preserved as absence: Rust cannot infer whether the active
+/// ontology considers a numeric value dimensionless. An explicitly blank
+/// term is a structural defect and is recorded as `unit_unresolved`.
 ///
 /// Evidence class is re-capped through `evidence_for_result` on the way in.
-/// `validate_and_stamp` already caps at literature, but this store call is a
-/// separate entry point and must not depend on an upstream promise.
+/// This store call is a separate entry point and does not depend on an
+/// upstream evidence-class promise.
 fn semantic_entities_for_claim_facts(
     facts: &[prism_provenance::LocalFact],
 ) -> Vec<prism_ingest::semantic_validation::SemanticEntityProposal> {
     use prism_ingest::semantic_validation::SemanticEntityProposal;
 
-    // `write_fact_with_classification` stamps the assertion with the active
-    // ontology artifact but deliberately writes the established legacy node
-    // shapes; the claim payload proposes no endpoint class. Mirror those
-    // exact labels and keep every class IRI absent. This makes typing
-    // explicitly unavailable instead of inventing a model judgement from a
-    // fact kind or confusing an ontology provenance stamp with node typing.
-    let proposal = |name: &str, legacy_label: &str| SemanticEntityProposal {
+    // The claim payload carries no endpoint class IRI. Keep typing explicitly
+    // unavailable instead of deriving a domain class from a closed Rust
+    // `kind` list; the active ontology and the reading model, not this CLI,
+    // own that vocabulary.
+    let proposal = |name: &str| SemanticEntityProposal {
         name: name.to_string(),
-        entity_type: legacy_label.to_string(),
-        storage_label: legacy_label.to_string(),
+        entity_type: "Entity".to_string(),
+        storage_label: "Entity".to_string(),
         class_iri: None,
     };
 
     let mut entities = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for fact in facts {
-        let subject = proposal(&fact.subject, "Matter");
-        let object_label = match fact.kind.as_deref() {
-            Some("measurement") => "Property",
-            Some("phase") => "Phase",
-            Some("composition") => "Composition",
-            Some("contains") => "Element",
-            Some("processing") => "Manufacturing",
-            Some("structure") => "CrystalStructure",
-            Some("application") => "Application",
-            _ => "Entity",
-        };
-        let object = proposal(&fact.object, object_label);
+        let subject = proposal(&fact.subject);
+        let object = proposal(&fact.object);
 
         for entity in [subject, object] {
             let identity = (
@@ -549,13 +619,16 @@ async fn store_claims(
     document_url: &str,
     model: &str,
     db_path: &std::path::Path,
+    ontology: &dyn prism_ingest::ontologies::Ontology,
+    proposed_classes: &[prism_ingest::paper_agent::OntologyClassProposal],
+    proposed_relations: &[prism_ingest::paper_agent::OntologyRelationProposal],
 ) -> Result<serde_json::Value> {
     use prism_provenance::{
         EvidenceSource, FactPayload as _, LocalProvenance, MaterialFact, MeasurementCondition,
-        ProvenanceStore, QudtUnit, evidence_for_result,
+        ProvenanceStore, UnitTerm, evidence_for_result,
     };
 
-    if claims.is_empty() {
+    if claims.is_empty() && proposed_classes.is_empty() && proposed_relations.is_empty() {
         return Ok(json!({
             "written": 0,
             "rejected": 0,
@@ -565,14 +638,8 @@ async fn store_claims(
     }
 
     let store = ProvenanceStore::open(db_path).await?;
-    // Literature claims use the same built-in EMMO classification contract
-    // as text ingest. Resolve it through the production registry so the
-    // assertion records the exact version IRI and vendored artifact hash
-    // (REQ-OWL-S1-CLASSIFICATION-PROVENANCE).
-    let ontology = prism_ingest::ontologies::active(None)?;
-
     let now = chrono::Utc::now().to_rfc3339();
-    let prov = LocalProvenance {
+    let base_prov = LocalProvenance {
         activity_id: uuid::Uuid::new_v4().to_string(),
         agent_id: if model.is_empty() {
             "prism-papers".to_string()
@@ -582,61 +649,53 @@ async fn store_claims(
         agent_kind: "SoftwareAgent".into(),
         source_entity_id: document_url.to_string(),
         source_kind: "Document".into(),
-        tenant: "local".into(),
+        // Same composed tenancy as every other ingest path — a promoted
+        // ontology's claims must not blend into EMMO's keyspace.
+        tenant: prism_ingest::ontologies::storage_tenant(
+            prism_provenance::LOCAL_TENANT,
+            ontology.id(),
+        ),
         started_at: now.clone(),
         ended_at: now,
         locality: "local".into(),
-        // Local extraction reads the document itself — not a relay.
+        // Legacy/uncached claims fall back to this URL. New population runs
+        // replace it per claim with the exact cached source-text block while
+        // retaining this URL as origin_source_id.
         origin_source_id: None,
     };
     let mut rejected: Vec<serde_json::Value> = Vec::new();
+    let mut citation_warnings: Vec<serde_json::Value> = Vec::new();
     let mut prepared = Vec::with_capacity(claims.len());
 
     for claim in claims {
-        let unit = match claim.unit.as_deref() {
-            Some(raw) => match QudtUnit::new(raw) {
-                Ok(unit) => Some(unit),
-                Err(e) => {
-                    rejected.push(json!({
-                        "subject": claim.subject,
-                        "object": claim.object,
-                        "reason": format!("unit {raw:?} is not a valid QUDT identifier: {e}"),
-                    }));
-                    continue;
-                }
+        let mut verification = claim.verification;
+        let mut verification_reason = claim.verification_reason.clone();
+        let (unit, unit_error) = match claim.unit.as_deref() {
+            Some(raw) => match UnitTerm::new(raw) {
+                Ok(unit) => (Some(unit), None),
+                Err(error) => (None, Some(format!("unit term {raw:?} is empty: {error}"))),
             },
-            None => None,
+            None => (None, None),
         };
-
-        // A `measurement` with no value is DROPPED by the store —
-        // `write_fact` returns Ok(()) having written nothing (see the
-        // `Some("measurement")` arm in prism-provenance: "a measurement
-        // without a value fails schema validation and is dropped"). Counting
-        // that as written reports facts that are not in the graph.
-        //
-        // `validate_and_stamp` does not catch it: it rejects a value with no
-        // unit, not a measurement with no value. The kind and the value come
-        // from the model independently, so nothing upstream ties them.
-        if claim.kind.as_deref() == Some("measurement") && claim.value.is_none() {
-            rejected.push(json!({
-                "subject": claim.subject,
-                "object": claim.object,
-                "reason": "kind is `measurement` but no value was extracted; the store drops \
-                           such a fact, so writing it would report a fact that is not there",
-            }));
-            continue;
+        if let Some(reason) = unit_error {
+            let status = prism_provenance::VerificationStatus::UnitUnresolved;
+            if verification.is_none_or(|current| status.rank() < current.rank()) {
+                verification = Some(status);
+                verification_reason = Some(reason);
+            }
         }
 
         let mut conditions = Vec::with_capacity(claim.conditions.len());
-        let mut bad_condition = None;
+        let mut condition_unit_defect = None;
         for condition in &claim.conditions {
             let cond_unit = match condition.unit.as_deref() {
-                Some(raw) => match QudtUnit::new(raw) {
+                Some(raw) => match UnitTerm::new(raw) {
                     Ok(unit) => Some(unit),
                     Err(e) => {
-                        bad_condition =
-                            Some(format!("condition {:?} unit {raw:?}: {e}", condition.name));
-                        break;
+                        condition_unit_defect.get_or_insert_with(|| {
+                            format!("condition {:?} unit {raw:?}: {e}", condition.name)
+                        });
+                        None
                     }
                 },
                 None => None,
@@ -654,13 +713,12 @@ async fn store_claims(
                 unit: cond_unit,
             });
         }
-        if let Some(reason) = bad_condition {
-            rejected.push(json!({
-                "subject": claim.subject,
-                "object": claim.object,
-                "reason": reason,
-            }));
-            continue;
+        if let Some(reason) = condition_unit_defect {
+            let status = prism_provenance::VerificationStatus::UnitUnresolved;
+            if verification.is_none_or(|current| status.rank() < current.rank()) {
+                verification = Some(status);
+                verification_reason = Some(reason);
+            }
         }
 
         let fact = MaterialFact {
@@ -676,9 +734,65 @@ async fn store_claims(
                 [serde_json::from_value(json!(claim.evidence_class)).unwrap_or_default()],
             ),
             kind: claim.kind.clone(),
+            // Preserve the reader's verification annotation. `None` is kept
+            // only for legacy claims that predate the paper-agent status and
+            // remains included in compatibility reads.
+            verification,
+            verification_reason,
         };
 
-        prepared.push((claim, fact));
+        // Claim provenance used to die at this conversion: the quote and
+        // locator were present on `ExtractedClaim`, then only the document
+        // URL survived into `LocalProvenance`. A complete citation now rides
+        // the per-source evidence row. An incomplete/invalid citation is a
+        // NOTE, not a verdict: the fact still follows the normal write path.
+        let citation = match (
+            claim.provenance.source_revision_id.as_deref(),
+            claim.provenance.line_start,
+            claim.provenance.line_end,
+            claim.provenance.quote.as_deref(),
+        ) {
+            (Some(revision), Some(line_start), Some(line_end), Some(span)) => {
+                let locator_json = serde_json::to_string(&claim.provenance.locator).ok();
+                match prism_provenance::SourceCitation::new(
+                    line_start,
+                    line_end,
+                    span,
+                    revision,
+                    locator_json,
+                ) {
+                    Ok(citation) => Some(citation),
+                    Err(error) => {
+                        citation_warnings.push(json!({
+                            "subject": claim.subject,
+                            "object": claim.object,
+                            "reason": error.to_string(),
+                        }));
+                        None
+                    }
+                }
+            }
+            fields => {
+                citation_warnings.push(json!({
+                    "subject": claim.subject,
+                    "object": claim.object,
+                    "reason": if fields == (None, None, None, None) {
+                        "claim has no exact source revision, line range, or evidence span"
+                    } else {
+                        "claim citation is incomplete; revision, both line bounds, and span are all required"
+                    },
+                }));
+                None
+            }
+        };
+
+        let mut claim_prov = base_prov.clone();
+        claim_prov.activity_id = uuid::Uuid::new_v4().to_string();
+        if let Some(source_text_path) = claim.provenance.source_text_path.as_deref() {
+            claim_prov.source_entity_id = source_text_path.to_string();
+            claim_prov.origin_source_id = Some(document_url.to_string());
+        }
+        prepared.push((claim, fact, citation, claim_prov));
     }
 
     // The model proposes; geometry measures. Every structurally accepted
@@ -689,34 +803,90 @@ async fn store_claims(
     // or block a claim.
     let local_facts: Vec<_> = prepared
         .iter()
-        .map(|(_, fact)| fact.to_local_fact())
+        .map(|(_, fact, _, _)| fact.to_local_fact())
         .collect();
     let semantic_entities = semantic_entities_for_claim_facts(&local_facts);
-    let semantic_policy = prism_ingest::semantic_validation::SemanticValidationPolicy::default();
+    let mut semantic_policy =
+        prism_ingest::semantic_validation::SemanticValidationPolicy::default();
+    // The numeric prior's eligible kinds come from the active ontology's
+    // declaration, not a materials-shaped Rust default.
+    semantic_policy.resolve_eligible_fact_kinds(ontology);
     let semantic = prism_ingest::semantic_validation::validate_write_best_effort(
         &store,
         &semantic_entities,
         &local_facts,
-        &prov.tenant,
+        &base_prov.tenant,
         &semantic_policy,
     )
     .await;
 
-    store.record_activity(&prov).await?;
-
     let mut written = 0usize;
-    for (claim, fact) in &prepared {
-        match store
-            .write_fact_with_classification(
-                fact,
-                &prov,
-                prism_provenance::OntologyClassification {
-                    version_iri: ontology.version_iri().as_str(),
-                    artifact_sha256: ontology.artifact_sha256(),
-                },
-            )
-            .await
-        {
+    for (claim, fact, citation, claim_prov) in &prepared {
+        store.record_activity(claim_prov).await?;
+        let classification = prism_provenance::OntologyClassification {
+            version_iri: ontology.version_iri().as_str(),
+            artifact_sha256: ontology.artifact_sha256(),
+        };
+        let write = match citation {
+            Some(citation) => {
+                let subject = claim
+                    .ontology
+                    .subject_class_iri
+                    .as_deref()
+                    .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology, iri))
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?;
+                let object = claim
+                    .ontology
+                    .object_class_iri
+                    .as_deref()
+                    .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology, iri))
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?;
+                let nodes = prism_provenance::OntologyBoundFactNodes {
+                    subject: subject
+                        .as_ref()
+                        .map(|node| prism_provenance::ClassifiedNode {
+                            entity_type: &node.entity_type,
+                            storage_label: &node.storage_label,
+                            class_iri: &node.class_iri,
+                        }),
+                    object: object
+                        .as_ref()
+                        .map(|node| prism_provenance::ClassifiedNode {
+                            entity_type: &node.entity_type,
+                            storage_label: &node.storage_label,
+                            class_iri: &node.class_iri,
+                        }),
+                };
+                store
+                    .write_ontology_bound_fact_with_citation(
+                        fact,
+                        claim_prov,
+                        fact.evidence_class,
+                        nodes,
+                        classification,
+                        citation,
+                    )
+                    .await
+            }
+            None => {
+                store
+                    .write_fact_with_classification(
+                        fact,
+                        claim_prov,
+                        classification,
+                        // The graph shape for the claim's kind is the active
+                        // ontology's declaration — the store holds no
+                        // kind→(class, edge) table of its own.
+                        fact.kind
+                            .as_deref()
+                            .and_then(|kind| ontology.fact_graph_shape(kind)),
+                    )
+                    .await
+            }
+        };
+        match write {
             Ok(()) => written += 1,
             Err(e) => rejected.push(json!({
                 "subject": claim.subject,
@@ -734,7 +904,7 @@ async fn store_claims(
             .store_precomputed_name_embeddings(
                 semantic.embedding_names(),
                 semantic.embedding_vectors(),
-                &prov.tenant,
+                &base_prov.tenant,
                 embedding_model,
             )
             .await
@@ -742,12 +912,67 @@ async fn store_claims(
         tracing::warn!(%error, "papers claim embeddings were not stored");
     }
 
+    // Persist the ontology-extension proposals with their citations — the
+    // same governance queue the text-ingest path writes. Until now this
+    // command PRINTED them into its JSON blob and nothing else: a proposal
+    // died with the terminal it was printed to. Identities already
+    // dispositioned are suppressed and counted, never silently dropped.
+    let mut proposals_enqueued = 0usize;
+    let mut proposals_suppressed = 0usize;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+    {
+        use prism_ingest::paper_agent::{class_proposal_queue_item, relation_proposal_queue_item};
+        let mut queued = Vec::new();
+        for proposal in proposed_classes {
+            queued.push(class_proposal_queue_item(
+                proposal,
+                document_url,
+                &base_prov.tenant,
+                now_secs,
+            ));
+        }
+        for proposal in proposed_relations {
+            queued.push(relation_proposal_queue_item(
+                proposal,
+                document_url,
+                &base_prov.tenant,
+                now_secs,
+            ));
+        }
+        for (item, citation_json) in queued {
+            match store
+                .enqueue_ontology_proposal(&item, &citation_json, now_secs)
+                .await
+            {
+                Ok(prism_provenance::OntologyProposalEnqueue::SupersededByDisposition) => {
+                    proposals_suppressed += 1;
+                }
+                Ok(_) => proposals_enqueued += 1,
+                Err(error) => {
+                    rejected.push(json!({
+                        "subject": item.label,
+                        "object": "ontology-proposal",
+                        "reason": format!("governance queue write failed: {error}"),
+                    }));
+                }
+            }
+        }
+    }
+
     Ok(json!({
         "written": written,
         "rejected": rejected.len(),
         "rejections": rejected,
+        "citation_warnings": citation_warnings,
+        "ontology_proposals": {
+            "enqueued": proposals_enqueued,
+            "suppressed": proposals_suppressed,
+        },
         "store": db_path.display().to_string(),
-        "tenant": "local",
+        "tenant": base_prov.tenant,
         "semantic_validation": semantic.report,
     }))
 }
@@ -800,17 +1025,20 @@ fn probe_endpoint(base_url: &str) -> Result<(), String> {
         .map_err(|e| format!("LLM endpoint {addr} unreachable: {e}."))
 }
 
-/// Convert one extracted `MaterialFact` into a provenance-carrying claim.
-/// `quote` is the verbatim supporting span found in the cited block (see
-/// `supporting_quote`); evidence is stamped by `validate_and_stamp`
-/// (ceiling: research).
+/// Convert one extracted `MaterialFact` into a provenance-carrying claim,
+/// retaining the exact source revision, line range, and span the paper agent
+/// read before it proposed the fact. Literature evidence keeps its research
+/// ceiling; no second lexical validator replaces the agent's cited read.
+#[allow(clippy::too_many_arguments)]
 fn claim_from_fact(
     fact: prism_provenance::MaterialFact,
     document_id: &str,
     document_url: &str,
     source: &str,
     locator: &prism_retrieval::Locator,
-    quote: Option<String>,
+    source_text_path: Option<&str>,
+    citation: &prism_provenance::SourceCitation,
+    ontology_binding: prism_ingest::paper_agent::FactOntologyBinding,
 ) -> prism_retrieval::claims::ExtractedClaim {
     use prism_provenance::FactPayload;
     use prism_retrieval::claims::{ConditionValue, MeasurementCondition};
@@ -839,12 +1067,23 @@ fn claim_from_fact(
         confidence: fact.confidence,
         kind: fact.kind,
         evidence_class,
+        verification: fact.verification,
+        verification_reason: fact.verification_reason,
+        ontology: prism_retrieval::claims::ClaimOntologyBinding {
+            subject_class_iri: ontology_binding.subject_class_iri,
+            predicate_iri: ontology_binding.predicate_iri,
+            object_class_iri: ontology_binding.object_class_iri,
+        },
         provenance: prism_retrieval::claims::ClaimProvenance {
             document_id: document_id.to_string(),
             document_url: document_url.to_string(),
             source: source.to_string(),
+            source_revision_id: Some(citation.source_revision_id().to_string()),
+            line_start: Some(citation.line_start()),
+            line_end: Some(citation.line_end()),
+            source_text_path: source_text_path.map(str::to_string),
             locator: locator.clone(),
-            quote,
+            quote: Some(citation.evidence_span().to_string()),
         },
     }
 }
@@ -1000,10 +1239,17 @@ mod store_tests {
             confidence: Some(0.9),
             kind: Some("measurement".into()),
             evidence_class: "research".into(),
+            verification: None,
+            verification_reason: None,
+            ontology: Default::default(),
             provenance: ClaimProvenance {
                 document_id: "10.1000/xyz".into(),
                 document_url: "https://example.org/paper".into(),
                 source: "arxiv".into(),
+                source_revision_id: None,
+                line_start: None,
+                line_end: None,
+                source_text_path: None,
                 locator: prism_retrieval::Locator {
                     kind: prism_retrieval::fulltext::BlockKind::Body,
                     section_path: vec!["Results".into()],
@@ -1016,7 +1262,10 @@ mod store_tests {
     }
 
     #[test]
-    fn claim_endpoints_mirror_legacy_write_labels_without_inventing_types() {
+    fn claim_endpoints_stay_generic_without_an_ontology_class_iri() {
+        // CONTRACT CHANGE (agentic paper reading): a closed `kind`-to-class
+        // table no longer pretends to classify endpoints. Until an ontology
+        // IRI is proposed, semantic validation sees a generic entity.
         let facts = vec![
             prism_provenance::LocalFact {
                 subject: "Ti-6Al-4V".into(),
@@ -1043,24 +1292,24 @@ mod store_tests {
             .iter()
             .find(|entity| entity.name == "Ti-6Al-4V")
             .expect("subject proposal");
-        assert_eq!(subject.entity_type, "Matter");
-        assert_eq!(subject.storage_label, "Matter");
+        assert_eq!(subject.entity_type, "Entity");
+        assert_eq!(subject.storage_label, "Entity");
         assert_eq!(subject.class_iri, None);
 
         let object = entities
             .iter()
             .find(|entity| entity.name == "UTS")
             .expect("object proposal");
-        assert_eq!(object.entity_type, "Property");
-        assert_eq!(object.storage_label, "Property");
+        assert_eq!(object.entity_type, "Entity");
+        assert_eq!(object.storage_label, "Entity");
         assert_eq!(object.class_iri, None);
 
         let legacy = entities
             .iter()
             .find(|entity| entity.name == "turbine blade")
             .expect("legacy object proposal");
-        assert_eq!(legacy.entity_type, "Application");
-        assert_eq!(legacy.storage_label, "Application");
+        assert_eq!(legacy.entity_type, "Entity");
+        assert_eq!(legacy.storage_label, "Entity");
         assert_eq!(
             legacy.class_iri, None,
             "the active EMMO subset declares no Application IRI"
@@ -1073,18 +1322,28 @@ mod store_tests {
     async fn a_valid_claim_is_written_and_readable_back() {
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
+        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let mut cited = claim("UTS", Some("QUDT:MegaPA"), None);
+        cited.provenance.source_revision_id = Some("a".repeat(64));
+        cited.provenance.line_start = Some(7);
+        cited.provenance.line_end = Some(8);
+        cited.provenance.quote = Some("UTS was 1140 MPa".into());
 
         let out = store_claims(
-            &[claim("UTS", Some("QUDT:MegaPA"), Some("QUDT:K"))],
+            &[cited],
             "https://example.org/paper",
             "test-model",
             &db,
+            ontology.as_ref(),
+            &[],
+            &[],
         )
         .await
         .expect("store");
 
         assert_eq!(out["written"], 1, "claim was not written: {out}");
         assert_eq!(out["rejected"], 0);
+        assert_eq!(out["citation_warnings"], json!([]), "{out}");
         for check in ["near_duplicates", "typing", "triple_plausibility"] {
             assert_eq!(
                 out["semantic_validation"][check]["status"], "unavailable",
@@ -1099,7 +1358,12 @@ mod store_tests {
 
         let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
         let facts = store
-            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .recall_with_context_filtered(
+                "Ti-6Al-4V",
+                &["local"],
+                10,
+                prism_provenance::VerificationFilter::Any,
+            )
             .await
             .unwrap();
         assert_eq!(facts.len(), 1, "fact not readable back");
@@ -1110,82 +1374,257 @@ mod store_tests {
             "literature must stay ORANGE/research",
         );
         assert_eq!(facts[0].source, "https://example.org/paper");
+        // CONTRACT CHANGE (agentic paper reading): provenance now retains
+        // the exact revision and line witness rather than stopping at a
+        // prose URL on the aggregate assertion.
+        let assertion_id = prism_provenance::conditioned_assertion_id(
+            "local",
+            "Ti-6Al-4V",
+            "has_measurement",
+            "UTS",
+            Some(1140.0),
+            Some("QUDT:MegaPA"),
+            &[],
+        )
+        .unwrap();
+        let evidence = store.assertion_evidence_by_id(&assertion_id).await.unwrap();
+        assert_eq!(evidence.len(), 1);
+        let expected_revision = "a".repeat(64);
+        assert_eq!(
+            evidence[0].source_revision_id.as_deref(),
+            Some(expected_revision.as_str())
+        );
+        assert_eq!(evidence[0].line_start, Some(7));
+        assert_eq!(evidence[0].line_end, Some(8));
+        assert_eq!(
+            evidence[0].evidence_span.as_deref(),
+            Some("UTS was 1140 MPa")
+        );
         cleanup(&db);
     }
 
-    /// A measurement that loses its unit is a wrong number, not a slightly
-    /// poorer one. An invalid QUDT unit must reject the claim, not write it
-    /// unitless.
+    /// CONTRACT CHANGE (annotate-not-refuse): missing legacy citation data is
+    /// a visible note, not a reason to discard an otherwise storable fact.
     #[tokio::test]
-    async fn a_claim_with_an_invalid_unit_is_rejected_not_silently_unitless() {
+    async fn an_uncited_legacy_claim_is_stored_with_a_citation_warning() {
+        // CONTRACT CHANGE: citation metadata added by agentic population is
+        // nullable for old rows; absence is reported without restoring the
+        // former claim drop.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
+        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
 
         let out = store_claims(
-            &[claim("UTS", Some("megapascals"), None)],
+            &[claim("UTS", Some("QUDT:MegaPA"), None)],
+            "https://example.org/legacy-paper",
+            "test-model",
+            &db,
+            ontology.as_ref(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("legacy fact remains storable");
+
+        assert_eq!(out["written"], 1, "{out}");
+        assert_eq!(out["rejected"], 0, "{out}");
+        assert_eq!(out["citation_warnings"].as_array().unwrap().len(), 1);
+        assert!(
+            out["citation_warnings"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no exact source revision")),
+            "{out}"
+        );
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn customer_unit_terms_are_preserved_exactly() {
+        // CONTRACT CHANGE (vocabulary-neutral units): this formerly treated
+        // every non-QUDT spelling as invalid. Storage now preserves the exact
+        // non-empty terms selected from a customer's active ontology; Rust
+        // neither translates nor rejects them.
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let selected_unit = "customer:U-42";
+        let selected_condition_unit = "https://customer.example/ontology/unit/C-7";
+
+        let out = store_claims(
+            &[claim(
+                "reported property",
+                Some(selected_unit),
+                Some(selected_condition_unit),
+            )],
             "https://example.org/paper",
             "test-model",
             &db,
+            ontology.as_ref(),
+            &[],
+            &[],
         )
         .await
         .expect("store");
 
-        assert_eq!(out["written"], 0, "an unvalidated unit was written: {out}");
-        assert_eq!(out["rejected"], 1);
-        assert!(
-            out["rejections"][0]["reason"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("QUDT"),
-            "rejection does not say why: {out}"
-        );
+        assert_eq!(out["written"], 1, "claim was not written: {out}");
+        assert_eq!(out["rejected"], 0, "{out}");
 
         let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
         let facts = store
-            .recall_with_context("Ti-6Al-4V", "local", 10)
+            .recall_with_context_filtered(
+                "Ti-6Al-4V",
+                &["local"],
+                10,
+                prism_provenance::VerificationFilter::Any,
+            )
             .await
             .unwrap();
-        assert!(facts.is_empty(), "rejected claim reached the store anyway");
+        assert_eq!(facts.len(), 1, "claim disappeared: {facts:?}");
+        assert_eq!(facts[0].unit.as_deref(), Some(selected_unit));
+        assert_eq!(facts[0].conditions.len(), 1);
+        assert_eq!(
+            facts[0].conditions[0]
+                .unit
+                .as_ref()
+                .map(|unit| unit.as_str()),
+            Some(selected_condition_unit)
+        );
+        assert_eq!(facts[0].verification_status, None);
         cleanup(&db);
     }
 
-    /// A `measurement` with no value is dropped by the store while returning
-    /// Ok(()), so counting it as written reports a fact that is not in the
-    /// graph. `validate_and_stamp` does not catch this — it rejects a value
-    /// with no unit, not a measurement with no value.
     #[tokio::test]
-    async fn a_valueless_measurement_is_rejected_not_counted_as_written() {
+    async fn absent_unit_terms_are_semantic_and_blank_terms_are_annotated() {
+        // CONTRACT CHANGE (vocabulary-neutral units): Rust cannot declare an
+        // absent term wrong because the active ontology may define the value
+        // as dimensionless. Only an explicitly blank term is a structural
+        // defect; every fact still remains stored.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
+        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+
+        let mut missing_condition = claim("missing condition unit", Some("customer:U-42"), None);
+        missing_condition.conditions.push(MeasurementCondition {
+            name: "customer:condition".into(),
+            value: ConditionValue::Number(7.4),
+            unit: None,
+        });
+
+        let out = store_claims(
+            &[
+                claim("missing unit", None, None),
+                claim("blank unit", Some("   "), None),
+                missing_condition,
+            ],
+            "https://example.org/paper",
+            "test-model",
+            &db,
+            ontology.as_ref(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("store");
+
+        assert_eq!(out["written"], 3, "facts were not written: {out}");
+        assert_eq!(out["rejected"], 0, "{out}");
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+        let facts = store
+            .recall_with_context_filtered(
+                "Ti-6Al-4V",
+                &["local"],
+                10,
+                prism_provenance::VerificationFilter::Any,
+            )
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 3, "claims disappeared: {facts:?}");
+        let missing = facts
+            .iter()
+            .find(|fact| fact.object == "missing unit")
+            .expect("missing-unit fact");
+        assert_eq!(missing.unit, None);
+        assert_eq!(missing.verification_status, None);
+        assert_eq!(missing.verification_reason, None);
+        let missing_condition = facts
+            .iter()
+            .find(|fact| fact.object == "missing condition unit")
+            .expect("missing-condition-unit fact");
+        assert_eq!(missing_condition.verification_status, None);
+        assert_eq!(missing_condition.conditions[0].unit, None);
+        let blank = facts
+            .iter()
+            .find(|fact| fact.object == "blank unit")
+            .expect("blank-unit fact");
+        assert_eq!(blank.unit, None);
+        assert_eq!(
+            blank.verification_status,
+            Some(prism_provenance::VerificationStatus::UnitUnresolved)
+        );
+        assert!(
+            blank
+                .verification_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("is empty")),
+            "blank unit annotation: {facts:?}"
+        );
+        cleanup(&db);
+    }
+
+    #[tokio::test]
+    async fn a_valueless_legacy_kind_hint_is_stored_as_a_generic_edge() {
+        // CONTRACT CHANGE (agentic paper reading): `kind` is no longer a
+        // closed dispatch instruction. A value-less relation is therefore a
+        // normal cited edge, not a silently dropped malformed measurement.
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
 
         let mut c = claim("UTS", Some("QUDT:MegaPA"), None);
         c.value = None; // kind stays "measurement"
 
-        let out = store_claims(&[c], "https://example.org/paper", "m", &db)
-            .await
-            .expect("store");
+        let out = store_claims(
+            &[c],
+            "https://example.org/paper",
+            "m",
+            &db,
+            ontology.as_ref(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("store");
 
-        assert_eq!(
-            out["written"], 0,
-            "counted a fact the store discards: {out}"
-        );
-        assert_eq!(out["rejected"], 1);
+        assert_eq!(out["written"], 1, "generic edge was not written: {out}");
+        assert_eq!(out["rejected"], 0, "{out}");
 
         let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
         let facts = store
             .recall_with_context("Ti-6Al-4V", "local", 10)
             .await
             .unwrap();
-        assert!(facts.is_empty(), "the dropped fact appears in the store");
+        assert_eq!(facts.len(), 1, "generic edge disappeared: {facts:?}");
+        assert_eq!(facts[0].object, "UTS");
+        assert_eq!(facts[0].value, None);
         cleanup(&db);
     }
 
     #[tokio::test]
     async fn no_claims_means_no_store_file_and_no_error() {
         let db = scratch_db();
-        let out = store_claims(&[], "https://example.org/paper", "m", &db)
-            .await
-            .expect("store");
+        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let out = store_claims(
+            &[],
+            "https://example.org/paper",
+            "m",
+            &db,
+            ontology.as_ref(),
+            &[],
+            &[],
+        )
+        .await
+        .expect("store");
         assert_eq!(out["written"], 0);
         assert_eq!(out["semantic_validation"], serde_json::Value::Null);
         assert!(!db.exists(), "an empty claim set created a database anyway");

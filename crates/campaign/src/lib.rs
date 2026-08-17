@@ -27,6 +27,7 @@
 //!     description: "Refractory high-entropy alloy for turbine blades at 1200°C".into(),
 //!     elements: vec!["W".into(), "Mo".into(), "Ta".into(), "Nb".into(), "Cr".into(), "V".into()],
 //!     objective: "maximize creep resistance".into(),
+//!     target_property: Some("Tm_estimate_K".into()),
 //!     constraints: vec!["density < 12 g/cm³".into(), "melting_point > 2000K".into()],
 //!     seeds: vec![],
 //! };
@@ -67,13 +68,20 @@ pub use domain::alloy::{
 };
 pub use domain::polymer::RDKIT_INSTALL_HINT;
 pub use domain::{
-    ConstraintOperator, Domain, DomainKind, EvaluatorTier, ParsedCandidate, PropertyConstraint,
-    builtin_domain,
+    ALLOY_DOMAIN_ID, ConstraintOperator, Domain, DomainRegistry, EvaluatorTier, POLYMER_DOMAIN_ID,
+    ParsedCandidate, PropertyConstraint, register_domain, replace_domain, resolve_domain,
 };
 
 #[cfg(test)]
 use domain::alloy::{EVALUATION_TOOL, parse_and_expand_composition, validate_composition};
-use domain::builtin_domain as domain_for;
+
+/// Resolve the campaign's domain plugin. The id was validated when the
+/// campaign was constructed (or its checkpoint loaded), so this infallible
+/// view is backed by that earlier loud check.
+fn domain_for(id: &str) -> &'static dyn Domain {
+    resolve_domain(id)
+        .unwrap_or_else(|error| panic!("campaign domain '{id}' does not resolve: {error:#}"))
+}
 
 /// Durable schedules and watchers — what wakes a paused or crashed goal back
 /// up without a human. See [`schedule`] for the design rationale.
@@ -155,6 +163,16 @@ pub struct CampaignGoal {
     /// What to optimize (e.g. "maximize creep resistance", "minimize density").
     #[serde(default)]
     pub objective: String,
+    /// The DECLARED property the reward ranks on, keyed exactly as the
+    /// active evaluator reports it. This — not English substring matching
+    /// over `objective` — is how reward-property selection works: a German
+    /// or legal objective reads the same as an English one, and an unknown
+    /// spelling fails honestly instead of silently falling to a default.
+    /// `None` means the goal does not pin one; the domain plugin then applies
+    /// its documented default policy or refuses (see each domain's
+    /// `compute_reward`).
+    #[serde(default)]
+    pub target_property: Option<String>,
     /// Hard constraints (e.g. "density < 12 g/cm³").
     #[serde(default)]
     pub constraints: Vec<String>,
@@ -198,9 +216,16 @@ pub struct CampaignConfig {
     /// Negative = minimize, positive = maximize.
     #[serde(default)]
     pub reward_weights: BTreeMap<String, f64>,
-    /// Scientific domain plugin. Omitted legacy checkpoints default to alloy.
-    #[serde(default, skip_serializing_if = "DomainKind::is_alloy")]
-    pub domain: DomainKind,
+    /// Scientific domain plugin id, resolved through the process-wide domain
+    /// registry (`prism_campaign::domain::resolve_domain`). Omitted legacy
+    /// checkpoints default to the alloy domain; the wire form is unchanged
+    /// (the old closed enum serialised as the same "alloy"/"polymer"
+    /// strings).
+    #[serde(
+        default = "domain::default_domain_id",
+        skip_serializing_if = "domain::is_default_domain_id"
+    )]
+    pub domain: String,
     /// Evaluator tier selected from the active domain's declared tiers.
     /// None selects that domain's cheapest applicable tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,7 +287,7 @@ impl Default for CampaignConfig {
             llm_model: String::new(),
             llm_temperature: 0.7,
             reward_weights: BTreeMap::new(),
-            domain: DomainKind::Alloy,
+            domain: ALLOY_DOMAIN_ID.to_string(),
             evaluation_tier: None,
             property_constraints: Vec::new(),
             min_configurational_entropy_j_per_mol_k: None,
@@ -277,16 +302,16 @@ impl Default for CampaignConfig {
 
 impl CampaignConfig {
     fn apply_goal_implied_constraints(&mut self, goal: &CampaignGoal) {
-        domain_for(self.domain).apply_goal_implied_constraints(self, goal);
+        domain_for(&self.domain).apply_goal_implied_constraints(self, goal);
     }
 
     fn active_domain_definition(&self) -> Option<serde_json::Value> {
-        domain_for(self.domain).definition(self)
+        domain_for(&self.domain).definition(self)
     }
 }
 
 fn configured_domain_constraints(config: &CampaignConfig) -> Vec<String> {
-    domain_for(config.domain).configured_constraints(config)
+    domain_for(&config.domain).configured_constraints(config)
 }
 
 // ── Campaign State ──────────────────────────────────────────────────
@@ -634,6 +659,7 @@ impl CampaignState {
             description: research_goal.objective.clone(),
             elements: Vec::new(),
             objective: String::new(),
+            target_property: None,
             constraints: Vec::new(),
             seeds: Vec::new(),
         };
@@ -813,10 +839,10 @@ impl CampaignState {
             self.avg_reward(),
             evidence_token(campaign_evidence)
         ));
-        let domain = domain_for(self.config.domain);
+        let domain = domain_for(&self.config.domain);
         let hard_constraints = configured_domain_constraints(&self.config);
         if !hard_constraints.is_empty() {
-            let heading = if self.config.domain == DomainKind::Alloy {
+            let heading = if self.config.domain == ALLOY_DOMAIN_ID {
                 "Hard compositional constraints:\n"
             } else {
                 "Hard domain constraints:\n"
@@ -826,7 +852,7 @@ impl CampaignState {
                 s.push_str(&format!("  - {constraint}\n"));
             }
         }
-        if (!hard_constraints.is_empty() || self.config.domain != DomainKind::Alloy)
+        if (!hard_constraints.is_empty() || self.config.domain != ALLOY_DOMAIN_ID)
             && let Some(definition) = self.config.active_domain_definition()
         {
             let name = definition["name"].as_str().unwrap_or("unknown");
@@ -839,7 +865,11 @@ impl CampaignState {
         if let Some(best) = self.best() {
             s.push_str(&format!(
                 "Best: {} (reward={:.4} {})\n",
-                display_recorded_candidate(self.config.domain, &best.composition, &best.properties),
+                display_recorded_candidate(
+                    &self.config.domain,
+                    &best.composition,
+                    &best.properties
+                ),
                 best.reward,
                 evidence_token(best.evidence_class)
             ));
@@ -851,7 +881,7 @@ impl CampaignState {
                 s.push_str(&format!(
                     "  {}. {} — reward={:.4} {} (iter {}, {}){}\n",
                     i + 1,
-                    display_recorded_candidate(self.config.domain, &c.composition, &c.properties),
+                    display_recorded_candidate(&self.config.domain, &c.composition, &c.properties),
                     c.reward,
                     evidence_token(c.evidence_class),
                     c.iteration,
@@ -861,7 +891,7 @@ impl CampaignState {
             }
         }
         if !self.rejected_candidates.is_empty() {
-            if self.config.domain == DomainKind::Alloy {
+            if self.config.domain == ALLOY_DOMAIN_ID {
                 s.push_str("\nREJECTED by hard compositional constraints:\n");
             } else {
                 s.push_str("\nREJECTED by hard domain constraints:\n");
@@ -869,7 +899,7 @@ impl CampaignState {
             for rejection in &self.rejected_candidates {
                 let candidate = if rejection.evaluated {
                     display_recorded_candidate(
-                        self.config.domain,
+                        &self.config.domain,
                         &rejection.composition,
                         &rejection.properties,
                     )
@@ -890,11 +920,11 @@ impl CampaignState {
 }
 
 fn display_recorded_candidate(
-    kind: DomainKind,
+    kind: &str,
     candidate: &str,
     properties: &serde_json::Value,
 ) -> String {
-    let original_key = if kind == DomainKind::Alloy {
+    let original_key = if kind == ALLOY_DOMAIN_ID {
         "original_composition"
     } else {
         "original_candidate"
@@ -913,9 +943,9 @@ fn display_recorded_candidate(
 /// boundary; this prevents a future constructor or a legacy/corrupt checkpoint
 /// from publishing an invalid candidate as resumable campaign state.
 fn validate_checkpoint_compositions(state: &CampaignState) -> Result<()> {
-    let domain = domain_for(state.config.domain);
+    let domain = domain_for(&state.config.domain);
     domain.validate_goal(&state.goal).map_err(|reason| {
-        if state.config.domain == DomainKind::Alloy {
+        if state.config.domain == ALLOY_DOMAIN_ID {
             anyhow::anyhow!("invalid campaign allowed-element set: {reason}")
         } else {
             anyhow::anyhow!("invalid campaign domain search space: {reason}")
@@ -1435,7 +1465,7 @@ impl Campaign {
     async fn finish(&mut self, reason: &str) -> Result<()> {
         if self.state.candidates.is_empty() {
             if let Some(last) = self.state.rejected_candidates.last() {
-                let constraint_scope = if self.state.config.domain == DomainKind::Alloy {
+                let constraint_scope = if self.state.config.domain == ALLOY_DOMAIN_ID {
                     "hard compositional constraints"
                 } else {
                     "hard domain constraints"
@@ -1780,7 +1810,7 @@ impl Campaign {
                 self.record_event(
                     "campaign.reject",
                     invalid_proposal_event_data(
-                        self.state.config.domain,
+                        &self.state.config.domain,
                         iter,
                         &proposal.original,
                         reason,
@@ -2004,7 +2034,7 @@ impl Campaign {
         };
         let client = prism_llm::LlmClient::new(config);
 
-        let domain = domain_for(self.state.config.domain);
+        let domain = domain_for(&self.state.config.domain);
         let system = domain.proposal_system_prompt();
 
         // Counted BEFORE the await: a call that errors mid-flight may still
@@ -2046,7 +2076,7 @@ impl Campaign {
                 raw = %response,
                 "LLM returned no parseable {candidate_plural}; halting proposal step"
             );
-            if self.state.config.domain == DomainKind::Alloy {
+            if self.state.config.domain == ALLOY_DOMAIN_ID {
                 anyhow::bail!(
                     "proposal step failed: LLM returned no parseable compositions                  (campaign halted rather than proposing synthetic candidates)"
                 );
@@ -2066,7 +2096,7 @@ impl Campaign {
             self.state.goal.description, self.state.goal.objective
         );
 
-        let domain = domain_for(self.state.config.domain);
+        let domain = domain_for(&self.state.config.domain);
         prompt.push_str(&domain.search_space_prompt(&self.state.goal));
 
         if !self.state.goal.constraints.is_empty() {
@@ -2078,7 +2108,7 @@ impl Campaign {
 
         let hard_constraints = configured_domain_constraints(&self.state.config);
         if !hard_constraints.is_empty() {
-            let heading = if self.state.config.domain == DomainKind::Alloy {
+            let heading = if self.state.config.domain == ALLOY_DOMAIN_ID {
                 "Hard compositional constraints (mandatory):\n"
             } else {
                 "Hard domain constraints (mandatory, named and cited):\n"
@@ -2087,7 +2117,7 @@ impl Campaign {
             for constraint in &hard_constraints {
                 prompt.push_str(&format!("  - {constraint}\n"));
             }
-            if self.state.config.domain == DomainKind::Alloy {
+            if self.state.config.domain == ALLOY_DOMAIN_ID {
                 prompt.push_str(
                     "A proposal that violates either hard constraint will be visibly REJECTED and excluded from ranking.\n",
                 );
@@ -2110,7 +2140,7 @@ impl Campaign {
 
         if self.state.current_iteration > 0 && !self.state.candidates.is_empty() {
             // Show the LLM the top performers so it can narrow the search.
-            if self.state.config.domain == DomainKind::Alloy {
+            if self.state.config.domain == ALLOY_DOMAIN_ID {
                 prompt.push_str("\nBest candidates so far (composition → reward):\n");
             } else {
                 prompt.push_str(&format!(
@@ -2146,7 +2176,7 @@ impl Campaign {
         {
             arr
         } else {
-            let domain = domain_for(self.state.config.domain);
+            let domain = domain_for(&self.state.config.domain);
             text.lines()
                 .filter_map(|line| {
                     let line = line.trim().trim_start_matches(|c: char| {
@@ -2156,7 +2186,7 @@ impl Campaign {
                         return None;
                     }
                     let domain_valid = domain.parse_candidate(line, &self.state.goal).is_ok();
-                    let looks_like_candidate = if self.state.config.domain == DomainKind::Alloy {
+                    let looks_like_candidate = if self.state.config.domain == ALLOY_DOMAIN_ID {
                         line.chars().any(|c| c.is_ascii_uppercase())
                             && (line.chars().any(|c| c.is_ascii_digit() || c == '.')
                                 || domain_valid)
@@ -2178,7 +2208,7 @@ impl Campaign {
     }
 
     fn validate_proposal(&self, original: String) -> CandidateProposal {
-        match domain_for(self.state.config.domain).parse_candidate(&original, &self.state.goal) {
+        match domain_for(&self.state.config.domain).parse_candidate(&original, &self.state.goal) {
             Ok(parsed) => CandidateProposal {
                 original: parsed.original,
                 canonical: Some(parsed.canonical),
@@ -2200,7 +2230,7 @@ impl Campaign {
         original_candidate: &str,
         iteration: usize,
     ) -> Result<CandidateEvaluation> {
-        let domain = domain_for(self.state.config.domain);
+        let domain = domain_for(&self.state.config.domain);
         domain.validate_tier(&self.state.config)?;
 
         // Defensive evaluator boundary: internal callers cannot bypass the
@@ -2240,7 +2270,7 @@ impl Campaign {
         let violations = domain.constraint_violations(&parsed, &resp_body, &self.state.config);
         if !violations.is_empty() {
             let evidence = candidate_event_data(
-                self.state.config.domain,
+                &self.state.config.domain,
                 iteration,
                 &parsed,
                 &resp_body,
@@ -2262,7 +2292,7 @@ impl Campaign {
         // and enter the ranking.
         let reward = domain.compute_reward(&self.state.goal, &self.state.config, &resp_body)?;
         let evidence = candidate_event_data(
-            self.state.config.domain,
+            &self.state.config.domain,
             iteration,
             &parsed,
             &resp_body,
@@ -2292,7 +2322,7 @@ impl Campaign {
         original_composition: &str,
         expanded_composition: &str,
     ) -> Result<()> {
-        domain_for(DomainKind::Alloy).decorate_properties(
+        domain_for(ALLOY_DOMAIN_ID).decorate_properties(
             properties,
             &ParsedCandidate {
                 original: original_composition.to_string(),
@@ -2304,7 +2334,7 @@ impl Campaign {
 
     #[cfg(test)]
     fn constraint_violations(&self, properties: &serde_json::Value) -> Vec<String> {
-        domain_for(self.state.config.domain).constraint_violations(
+        domain_for(&self.state.config.domain).constraint_violations(
             &ParsedCandidate {
                 original: String::new(),
                 canonical: String::new(),
@@ -2316,7 +2346,7 @@ impl Campaign {
 
     #[cfg(test)]
     fn compute_reward(&self, properties: &serde_json::Value) -> Result<f64> {
-        domain_for(self.state.config.domain).compute_reward(
+        domain_for(&self.state.config.domain).compute_reward(
             &self.state.goal,
             &self.state.config,
             properties,
@@ -2393,12 +2423,12 @@ impl Campaign {
 }
 
 fn invalid_proposal_event_data(
-    kind: DomainKind,
+    kind: &str,
     iteration: usize,
     original: &str,
     reason: &str,
 ) -> serde_json::Value {
-    if kind == DomainKind::Alloy {
+    if kind == ALLOY_DOMAIN_ID {
         serde_json::json!({
             "iteration": iteration,
             "original_composition": original,
@@ -2418,7 +2448,7 @@ fn invalid_proposal_event_data(
 }
 
 fn candidate_event_data(
-    kind: DomainKind,
+    kind: &str,
     iteration: usize,
     parsed: &ParsedCandidate,
     properties: &serde_json::Value,
@@ -2433,7 +2463,7 @@ fn candidate_event_data(
     let object = event
         .as_object_mut()
         .expect("candidate event is constructed as an object");
-    if kind == DomainKind::Alloy {
+    if kind == ALLOY_DOMAIN_ID {
         object.insert(
             "original_composition".into(),
             serde_json::Value::String(parsed.original.clone()),
@@ -2812,6 +2842,7 @@ mod tests {
                 "Mo".into(),
             ],
             objective: "maximize strength-to-weight ratio".into(),
+            target_property: None,
             constraints: vec!["density < 5 g/cm³".into()],
             seeds: vec!["Ti0.9 Al0.06 V0.04".into()],
         }
@@ -2903,6 +2934,7 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
             objective: "maximize strength".into(),
+            target_property: None,
             constraints: vec![],
             seeds: vec![],
         };
@@ -2969,6 +3001,7 @@ mod tests {
                     .map(str::to_string)
                     .collect(),
                 objective: "maximize melting point".into(),
+                target_property: None,
                 constraints: vec![],
                 seeds: vec![],
             },
@@ -3405,8 +3438,15 @@ mod tests {
 
     #[test]
     fn melting_point_objective_uses_evaluated_descriptor() {
+        // CONTRACT CHANGE: reward-property selection reads the goal's DECLARED
+        // target_property, not English substring matching over the
+        // objective. A melting-point goal now pins the evaluator's own
+        // descriptor key; a goal that declares nothing keeps the entropy/
+        // density default policy (and `objective.contains("melting point")`
+        // no longer silently selects a different reward).
         let mut goal = test_goal();
         goal.objective = "maximize melting point".into();
+        goal.target_property = Some("Tm_estimate_K".into());
         let campaign = Campaign::new(goal, CampaignConfig::default(), "c1".into());
 
         let reward = campaign
@@ -3414,6 +3454,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(reward, 3123.4);
+    }
+
+    /// CONTRACT CHANGE: the same words WITHOUT the declared target property
+    /// no longer select a melting-point reward — English matching is gone,
+    /// so an undeclared goal falls to the documented default policy and a
+    /// missing descriptor still halts evaluation honestly.
+    #[test]
+    fn an_undeclared_melting_point_objective_no_longer_selects_it_by_english() {
+        let mut goal = test_goal();
+        goal.objective = "maximize melting point".into();
+        goal.target_property = None;
+        let campaign = Campaign::new(goal, CampaignConfig::default(), "c1".into());
+
+        let error = campaign
+            .compute_reward(&json!({"Tm_estimate_K": 3123.4}))
+            .expect_err("substring matching must not select the reward property");
+        assert!(
+            error.to_string().contains("no numeric descriptors"),
+            "{error}"
+        );
     }
 
     #[test]

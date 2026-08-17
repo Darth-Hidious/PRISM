@@ -556,24 +556,30 @@ impl Domain for AlloyDomain {
         props: &serde_json::Value,
     ) -> Result<f64> {
         if config.reward_weights.is_empty() {
-            let objective = goal.objective.to_ascii_lowercase();
-            if objective.contains("melting point") {
-                let melting_point = props
-                    .get("Tm_estimate_K")
-                    .or_else(|| props.get("melting_point_k"))
-                    .or_else(|| props.get("melting_point"))
+            // CONTRACT CHANGE: reward-property selection reads the goal's
+            // DECLARED `target_property` — never English substring matching
+            // over the objective text ("maximize melting point" used to be
+            // parsed by `objective.contains("melting point")`, which a
+            // German or differently-worded objective never matched). The
+            // direction word ("minimize") is the objective field's
+            // documented wire format, not domain vocabulary.
+            if let Some(property) = &goal.target_property {
+                let value = props
+                    .get(property)
                     .and_then(serde_json::Value::as_f64)
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "{EVALUATION_TOOL} returned no numeric melting-point descriptor for objective '{}'",
-                            goal.objective
+                            "{EVALUATION_TOOL} returned no numeric '{property}' declared as the goal's target_property"
                         )
                     })?;
-                return Ok(if objective.contains("minimize") {
-                    -melting_point
-                } else {
-                    melting_point
-                });
+                let objective = goal.objective.to_ascii_lowercase();
+                return Ok(
+                    if objective.contains("minimize") || objective.contains("minimise") {
+                        -value
+                    } else {
+                        value
+                    },
+                );
             }
 
             // Existing alloy policy: high entropy and, when available, lower
