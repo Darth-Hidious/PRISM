@@ -1,5 +1,7 @@
 """Integration tests for Phase E-2 data sources."""
 import sys
+import tempfile
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -64,9 +66,20 @@ class TestOMAT24Integration:
 
 
 class TestPatentIntegration:
-    @patch("app.tools.data_collectors.patent_collector.requests")
-    @patch.dict("os.environ", {"LENS_API_TOKEN": "test-token"})
-    def test_parsed_results(self, mock_requests):
+    # Patent search is a swappable backend now, so the Lens path has to be
+    # selected explicitly and `requests` is imported inside it (a site without
+    # Lens should not pay an import for a backend it never uses). Isolate the
+    # cache too: a warm hit from another test would skip the call this asserts.
+    @patch("requests.post")
+    @patch.dict(
+        "os.environ",
+        {
+            "LENS_API_TOKEN": "test-token",
+            "PRISM_PATENT_BACKEND": "lens",
+            "PRISM_PATENT_CACHE": tempfile.mkdtemp(),
+        },
+    )
+    def test_parsed_results(self, mock_post):
         resp = MagicMock()
         resp.json.return_value = {
             "data": [
@@ -82,7 +95,7 @@ class TestPatentIntegration:
             ]
         }
         resp.raise_for_status = MagicMock()
-        mock_requests.post.return_value = resp
+        mock_post.return_value = resp
 
         from app.tools.data_collectors.patent_collector import PatentCollector
         c = PatentCollector()
