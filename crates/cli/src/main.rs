@@ -13090,14 +13090,24 @@ async fn local_ontology_lookup(
     text: &str,
     limit: usize,
     verification: prism_provenance::VerificationFilter,
-) -> Option<LocalOntologyResults> {
-    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::debug!("local ontology store open failed: {e:#}");
-            return None;
-        }
-    };
+) -> Result<Option<LocalOntologyResults>> {
+    // A store we COULD NOT READ is not a store with nothing in it. This
+    // returned `Option` and logged the open failure at `debug!`, so a locked
+    // or missing database printed "No direct matches" — the caller, and the
+    // agent shelling out to it, then reported that the corpus does not contain
+    // what it was asked about. Measured: with the TUI holding the file, a
+    // search that finds 9 entities on a free store answered "no matches" and
+    // exit 0.
+    let store = prism_provenance::ProvenanceStore::open(db_path)
+        .await
+        .with_context(|| {
+            format!(
+                "could not open the local knowledge graph at {}. Another PRISM \
+                 process (the TUI, an ingest) may be holding it — close it and \
+                 retry, or point PRISM_PROVENANCE_DB at a different store",
+                db_path.display()
+            )
+        })?;
     let limit = limit.max(1) as i64;
     let scope = read_scope(&store).await;
     let tenants: Vec<&str> = scope.iter().map(String::as_str).collect();
@@ -13109,9 +13119,15 @@ async fn local_ontology_lookup(
         .await
     {
         Ok(traversal) => (traversal.nodes, traversal.edges),
+        // Degrading to "no neighbours" here is the same lie one level down: a
+        // failed read is not an absent relationship.
         Err(e) => {
-            tracing::debug!("local ontology neighbor read failed: {e:#}");
-            (Vec::new(), Vec::new())
+            return Err(e).with_context(|| {
+                format!(
+                    "could not read the local knowledge graph at {}",
+                    db_path.display()
+                )
+            });
         }
     };
 
@@ -13136,20 +13152,24 @@ async fn local_ontology_lookup(
         .await
     {
         Ok(facts) => facts,
+        // Same rule as the neighbour read: a failed recall is not an absence
+        // of facts, and must not be reported as one.
         Err(e) => {
-            tracing::debug!("local ontology recall failed: {e:#}");
-            Vec::new()
+            return Err(e).with_context(|| {
+                format!("could not read stored facts from {}", db_path.display())
+            });
         }
     };
 
     if nodes.is_empty() && edges.is_empty() && facts.is_empty() {
-        return None;
+        // A genuine miss: the store was read, and it holds nothing matching.
+        return Ok(None);
     }
-    Some(LocalOntologyResults {
+    Ok(Some(LocalOntologyResults {
         nodes,
         edges,
         facts,
-    })
+    }))
 }
 
 /// Semantic entity search over the bundled Turso store, ranked by Turso's
@@ -13382,7 +13402,7 @@ async fn handle_query(
         } else {
             prism_provenance::VerificationFilter::Trusted
         };
-        if let Some(local) = local_ontology_lookup(&turso_db, text, limit, filter).await {
+        if let Some(local) = local_ontology_lookup(&turso_db, text, limit, filter).await? {
             print!("{}", format_local_ontology(&local));
         } else if include_unverified {
             println!("  No direct matches. Try --semantic for vector search.");
@@ -18405,6 +18425,7 @@ data:\n\
                 prism_provenance::VerificationFilter::Trusted
             )
             .await
+            .expect("the store is readable")
             .is_none(),
             "empty store must be a clean miss"
         );
@@ -18461,6 +18482,7 @@ data:\n\
             prism_provenance::VerificationFilter::Trusted,
         )
         .await
+        .expect("the store is readable")
         .expect("ingested entity must be queryable");
         assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
         assert!(
@@ -18477,6 +18499,7 @@ data:\n\
             prism_provenance::VerificationFilter::Trusted,
         )
         .await
+        .expect("the store is readable")
         .expect("substring match must be queryable");
         assert!(hit.nodes.iter().any(|n| n.name == "Ti-6Al-4V"));
 
@@ -18489,20 +18512,36 @@ data:\n\
                 prism_provenance::VerificationFilter::Trusted
             )
             .await
+            .expect("the store is readable")
             .is_none()
         );
 
-        // Unopenable path (directory) → clean miss, never an error.
+        // CONTRACT CHANGE: an unreadable store is an ERROR, not a miss.
+        //
+        // This previously asserted the opposite — "store open failure must
+        // degrade to a miss" — which is the defect written down as a
+        // requirement. A store PRISM cannot open is not a store with nothing
+        // in it, and reporting one as the other is how a locked database
+        // became "No direct matches" and, through the agent that shells out to
+        // this command, "the corpus does not contain that".
+        let unreadable = local_ontology_lookup(
+            &std::env::temp_dir(),
+            "titanium",
+            10,
+            prism_provenance::VerificationFilter::Trusted,
+        )
+        .await;
+        let error = match unreadable {
+            Ok(_) => panic!("an unopenable store must not read as empty"),
+            Err(error) => format!("{error:#}"),
+        };
         assert!(
-            local_ontology_lookup(
-                &std::env::temp_dir(),
-                "titanium",
-                10,
-                prism_provenance::VerificationFilter::Trusted
-            )
-            .await
-            .is_none(),
-            "store open failure must degrade to a miss"
+            error.contains("could not open the local knowledge graph"),
+            "name what failed: {error}"
+        );
+        assert!(
+            error.contains("holding it") || error.contains("PRISM_PROVENANCE_DB"),
+            "an error must say how to get out of it: {error}"
         );
     }
 
@@ -18555,6 +18594,7 @@ data:\n\
             prism_provenance::VerificationFilter::Trusted,
         )
         .await
+        .expect("the store is readable")
         .expect("both tenants' knowledge must be readable");
 
         // The same-named entity appears once PER TENANT — the shadowing
