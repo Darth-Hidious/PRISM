@@ -881,7 +881,10 @@ fn tool_references_human_skill(
 ) -> bool {
     let mut referenced_paths = Vec::new();
     match tool_name {
-        "read_file" => {
+        // `file` action='read' is the successor to `read_file`. write and edit
+        // stay outside the gate exactly as `write_file` / `edit_file` were:
+        // editing a SKILL.md is not invoking the skill.
+        "file" if args.get("action").and_then(serde_json::Value::as_str) == Some("read") => {
             if let Some(path) = args.get("path").and_then(serde_json::Value::as_str) {
                 referenced_paths.extend(canonical_tool_path(workdir, path));
             }
@@ -924,7 +927,7 @@ pub fn gate_implicit_human_skill_invocation(
     workdir: &Path,
     policy: &SkillSurfacePolicy,
 ) -> Result<()> {
-    if !matches!(tool_name, "read_file" | "execute_bash") {
+    if !matches!(tool_name, "file" | "execute_bash") {
         return Ok(());
     }
     let context = current_turn_skill_context();
@@ -1420,8 +1423,8 @@ mod tests {
         assert!(error.to_string().contains("forbids implicit invocation"));
 
         let read_error = gate_implicit_human_skill_invocation(
-            "read_file",
-            &serde_json::json!({ "path": skill_path }),
+            "file",
+            &serde_json::json!({ "action": "read", "path": skill_path }),
             &root,
             &surface,
         )
@@ -1520,15 +1523,15 @@ mod tests {
 
         with_turn_skill_context(context, async {
             gate_implicit_human_skill_invocation(
-                "read_file",
-                &serde_json::json!({ "path": selected_path }),
+                "file",
+                &serde_json::json!({ "action": "read", "path": selected_path }),
                 &root,
                 &SkillSurfacePolicy::default(),
             )
             .expect("the exact selected path is authorized for this turn");
             gate_implicit_human_skill_invocation(
-                "read_file",
-                &serde_json::json!({ "path": other_path }),
+                "file",
+                &serde_json::json!({ "action": "read", "path": other_path }),
                 &root,
                 &SkillSurfacePolicy::default(),
             )

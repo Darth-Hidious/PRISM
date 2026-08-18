@@ -1177,18 +1177,20 @@ fn interactive_policy_role() -> String {
 
 fn manual_tool_preview(tool_name: &str, args: &Value) -> Option<String> {
     match tool_name {
-        "read_file" => args
+        // "<action> <path>", the shape `humanize_tool_verb` and the card
+        // formatters below already parse. Deliberately identical to
+        // `agent_loop::tool_preview`'s `file` arm — the two previewers are
+        // still separate copies (W13 merges the dispatchers), so a divergence
+        // here would show the same call two different ways in one transcript.
+        "file" => args
             .get("path")
             .and_then(|value| value.as_str())
-            .map(|path| format!("read {}", path)),
-        "edit_file" => args
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(|path| format!("edit {}", path)),
-        "write_file" => args
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(|path| format!("write {}", path)),
+            .map(
+                |path| match args.get("action").and_then(|value| value.as_str()) {
+                    Some(action) if !action.is_empty() => format!("{action} {path}"),
+                    _ => path.to_string(),
+                },
+            ),
         "execute_bash" => args
             .get("command")
             .and_then(|value| value.as_str())
@@ -1208,11 +1210,14 @@ fn manual_tool_preview(tool_name: &str, args: &Value) -> Option<String> {
                     .filter(|value| !value.is_empty())
                     .map(|code| format!("python: {}", code.lines().next().unwrap_or(code)))
             }),
-        "list_bash_tasks" => Some("list bash tasks".to_string()),
-        "read_bash_task" => args
-            .get("task_id")
-            .and_then(|value| value.as_str())
-            .map(|task_id| format!("read bash task {task_id}")),
+        "bash_task" => match args.get("action").and_then(|value| value.as_str()) {
+            Some("list") => Some("list bash tasks".to_string()),
+            Some("read") => args
+                .get("task_id")
+                .and_then(|value| value.as_str())
+                .map(|task_id| format!("read bash task {task_id}")),
+            _ => None,
+        },
         "stop_bash_task" => args
             .get("task_id")
             .and_then(|value| value.as_str())
@@ -2637,9 +2642,13 @@ fn format_files_report(transcript: &TranscriptStore, scratchpad: &Scratchpad) ->
         .iter()
         .rev()
         .filter(|entry| {
+            // The scratchpad is rebuilt empty on resume (see
+            // `restore_history_and_transcript_from_messages`), so a name here
+            // can only come from a tool THIS process called — and the tool
+            // server stopped serving the split file tools.
             matches!(
                 entry.tool_name.as_deref(),
-                Some("read_file" | "write_file" | "execute_bash" | "execute_python")
+                Some("file" | "execute_bash" | "execute_python")
             )
         })
         .take(8)
@@ -2921,14 +2930,7 @@ fn emit_files_screen(transcript: &TranscriptStore, scratchpad: &Scratchpad) {
         .filter(|entry| {
             matches!(
                 entry.tool_name.as_deref(),
-                Some(
-                    "apply_patch"
-                        | "read_file"
-                        | "write_file"
-                        | "edit_file"
-                        | "execute_bash"
-                        | "execute_python"
-                )
+                Some("apply_patch" | "file" | "execute_bash" | "execute_python")
             )
         })
         .take(8)
@@ -5541,6 +5543,28 @@ const CARD_EXCERPT_CHARS: usize = 4_000;
 /// says plainly when there were more than this.
 const CARD_ENTRY_LIMIT: usize = 20;
 
+/// Which action the unified `file` tool ran, read back off its ANSWER.
+///
+/// The tool takes the action as an argument, but the card formatter is handed
+/// only the name and the result — and the three answers are distinguishable:
+/// edit reports `replacements`, read carries the file `content`, write reports
+/// neither (`app/tools/system.py`). Anything else (an `error` payload) is left
+/// to the generic formatter rather than guessed at.
+fn file_result_action(parsed: Option<&Value>) -> &'static str {
+    let Some(object) = parsed.and_then(|value| value.as_object()) else {
+        return "";
+    };
+    if object.contains_key("replacements") {
+        "edit"
+    } else if object.contains_key("content") {
+        "read"
+    } else if object.contains_key("success") {
+        "write"
+    } else {
+        ""
+    }
+}
+
 fn build_tool_card_content(
     tool_name: &str,
     content: &str,
@@ -5549,7 +5573,7 @@ fn build_tool_card_content(
 ) -> (String, Value) {
     let parsed = serde_json::from_str::<Value>(content).ok();
     match tool_name {
-        "read_file" => {
+        "file" if file_result_action(parsed.as_ref()) == "read" => {
             if let Some(object) = parsed.as_ref().and_then(|value| value.as_object()) {
                 let path = object
                     .get("path")
@@ -5592,7 +5616,7 @@ fn build_tool_card_content(
                 );
             }
         }
-        "edit_file" => {
+        "file" if file_result_action(parsed.as_ref()) == "edit" => {
             if let Some(object) = parsed.as_ref().and_then(|value| value.as_object()) {
                 let path = object
                     .get("path")
@@ -5639,7 +5663,7 @@ fn build_tool_card_content(
                 );
             }
         }
-        "write_file" => {
+        "file" if file_result_action(parsed.as_ref()) == "write" => {
             if let Some(object) = parsed.as_ref().and_then(|value| value.as_object()) {
                 let path = object
                     .get("path")
@@ -5923,7 +5947,7 @@ fn build_tool_card_content(
                 );
             }
         }
-        "read_bash_task" | "stop_bash_task" => {
+        "bash_task" | "stop_bash_task" => {
             if let Some(task) = parsed
                 .as_ref()
                 .and_then(|value| value.get("task"))
@@ -5975,8 +5999,8 @@ fn build_tool_card_content(
                     }),
                 );
             }
-        }
-        "list_bash_tasks" => {
+            // action='read' (and `stop_bash_task`) answer with one `task`;
+            // action='list' answers with `tasks`. One tool, two shapes.
             if let Some(tasks) = parsed
                 .as_ref()
                 .and_then(|value| value.get("tasks"))
@@ -6709,12 +6733,21 @@ async fn handle_command(
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)
         }
+        // The tool server registers ONE `file` tool with a read|write|edit
+        // action (app/tools/system.py) and ONE read-only `bash_task` tool with
+        // a list|read action (app/tools/bash.py). The split `read_file` /
+        // `write_file` / `edit_file` / `list_bash_tasks` / `read_bash_task`
+        // names these slash commands used to send were deleted with the
+        // dispatchers that replaced them, so all five commands reached an
+        // unregistered tool and came back as an error the user could not act
+        // on. Same class as PR #91 (`search_materials` → `materials_search`);
+        // the names now live in `tool_catalog::RENAMED_AWAY`.
         _ if trimmed.starts_with("/read") => {
             let path = parse_read_slash_path(trimmed)?;
             execute_manual_tool_call(
                 &format!("/read {path}"),
-                "read_file",
-                serde_json::json!({ "path": path }),
+                "file",
+                serde_json::json!({ "action": "read", "path": path }),
                 tool_server,
                 session_store,
                 transcript,
@@ -6734,8 +6767,9 @@ async fn handle_command(
                 } => {
                     execute_manual_tool_call(
                         &format!("/edit {path}"),
-                        "edit_file",
+                        "file",
                         serde_json::json!({
+                            "action": "edit",
                             "path": path,
                             "old_text": old_text,
                             "new_text": new_text,
@@ -6780,8 +6814,8 @@ async fn handle_command(
                 WriteSlashAction::Write { path, content } => {
                     execute_manual_tool_call(
                         &format!("/write {path}"),
-                        "write_file",
-                        serde_json::json!({ "path": path, "content": content }),
+                        "file",
+                        serde_json::json!({ "action": "write", "path": path, "content": content }),
                         tool_server,
                         session_store,
                         transcript,
@@ -6836,8 +6870,8 @@ async fn handle_command(
                 BashSlashAction::Tasks => {
                     execute_manual_tool_call(
                         "/bash tasks",
-                        "list_bash_tasks",
-                        serde_json::json!({}),
+                        "bash_task",
+                        serde_json::json!({ "action": "list" }),
                         tool_server,
                         session_store,
                         transcript,
@@ -6849,8 +6883,8 @@ async fn handle_command(
                 BashSlashAction::Read { task_id } => {
                     execute_manual_tool_call(
                         &format!("/bash read {task_id}"),
-                        "read_bash_task",
-                        serde_json::json!({ "task_id": task_id }),
+                        "bash_task",
+                        serde_json::json!({ "action": "read", "task_id": task_id }),
                         tool_server,
                         session_store,
                         transcript,
@@ -8754,14 +8788,15 @@ mod tests {
         build_effective_permission_context, build_permission_context, build_tool_card_payload,
         build_ui_card_payload, format_skill_create, format_skill_run, format_skills_list,
         handle_notebook_slash_command, handle_skills_slash_command, humanize_tool_verb,
-        inline_list, load_plan_snapshot, notification_value, parse_artifact_fetch_response,
-        parse_artifact_list_response, parse_bash_slash_action, parse_command_tail,
-        parse_diff_slash_action, parse_edit_slash_action, parse_notebook_run_args,
-        parse_python_slash_action, parse_read_slash_path, parse_skill_create_args,
-        parse_slash_command, parse_title_json, parse_write_slash_action, persist_plan_snapshot,
-        pick_organization, pick_project, plan_snapshot_path, platform_llm_connected,
-        project_api_history, session_sync_response_error, shell_command_join, summarize_api_view,
-        system_prompt_for_mode, tool_surface_downgrade_note, truncate_for_ui,
+        inline_list, load_plan_snapshot, manual_tool_preview, notification_value,
+        parse_artifact_fetch_response, parse_artifact_list_response, parse_bash_slash_action,
+        parse_command_tail, parse_diff_slash_action, parse_edit_slash_action,
+        parse_notebook_run_args, parse_python_slash_action, parse_read_slash_path,
+        parse_skill_create_args, parse_slash_command, parse_title_json, parse_write_slash_action,
+        persist_plan_snapshot, pick_organization, pick_project, plan_snapshot_path,
+        platform_llm_connected, project_api_history, session_sync_response_error,
+        shell_command_join, summarize_api_view, system_prompt_for_mode,
+        tool_surface_downgrade_note, truncate_for_ui,
     };
     use prism_ingest::LlmConfig;
     use prism_runtime::auth;
@@ -9736,12 +9771,12 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_card_payload_formats_read_file_results() {
+    fn build_tool_card_payload_formats_file_read_results() {
         let (content, data) = build_tool_card_payload(
-            "read_file",
+            "file",
             r#"{"path":"/tmp/demo/src/main.rs","content":"fn main() {}\n","size_bytes":12}"#,
             Some("read src/main.rs"),
-            Some("read_file: /tmp/demo/src/main.rs (12 bytes)"),
+            Some("file: /tmp/demo/src/main.rs (12 bytes)"),
         );
 
         assert!(content.contains("path: /tmp/demo/src/main.rs"));
@@ -9752,12 +9787,12 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_card_payload_formats_write_file_results() {
+    fn build_tool_card_payload_formats_file_write_results() {
         let (content, data) = build_tool_card_payload(
-            "write_file",
+            "file",
             r#"{"success":true,"path":"/tmp/demo/src/main.rs","size_bytes":17}"#,
             Some("write src/main.rs"),
-            Some("write_file: /tmp/demo/src/main.rs (17 bytes)"),
+            Some("file: /tmp/demo/src/main.rs (17 bytes)"),
         );
 
         assert!(content.contains("path: /tmp/demo/src/main.rs"));
@@ -9769,12 +9804,12 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_card_payload_formats_edit_file_results() {
+    fn build_tool_card_payload_formats_file_edit_results() {
         let (content, data) = build_tool_card_payload(
-            "edit_file",
+            "file",
             r#"{"success":true,"path":"/tmp/demo/src/main.rs","size_bytes":19,"replacements":1}"#,
             Some("edit src/main.rs"),
-            Some("edit_file: /tmp/demo/src/main.rs (1 replacements, 19 bytes)"),
+            Some("file: /tmp/demo/src/main.rs (1 replacements, 19 bytes)"),
         );
 
         assert!(content.contains("path: /tmp/demo/src/main.rs"));
@@ -9784,6 +9819,85 @@ mod tests {
         assert_eq!(data["path"], "/tmp/demo/src/main.rs");
         assert_eq!(data["replacements"], 1);
         assert_eq!(data["success"], true);
+    }
+
+    /// Slash commands must name tools the tool server actually registers.
+    ///
+    /// Measured before this test existed: `app/tools/system.py` registers one
+    /// `file` tool and `app/tools/bash.py` one `bash_task` tool, while this
+    /// file still asked for `read_file`, `write_file`, `edit_file`,
+    /// `list_bash_tasks` and `read_bash_task` — so `/read`, `/write`, `/edit`,
+    /// `/bash tasks` and `/bash read`, five of the TUI's shipped commands,
+    /// every one of them reached an unregistered tool.
+    ///
+    /// No type can catch that: the tool name is a plain `&str` argument to
+    /// `execute_manual_tool_call`. So this reads the source and fails on any
+    /// name from `RENAMED_AWAY` sitting where that argument sits — a string
+    /// literal alone on its line. Names used inline elsewhere (the display
+    /// helpers still translate the old names for tools an MCP server may
+    /// happen to call `read_file`) are deliberately not matched.
+    #[test]
+    fn slash_commands_never_dispatch_a_renamed_away_tool() {
+        const SOURCE: &str = include_str!("protocol.rs");
+
+        for stale in crate::tool_catalog::RENAMED_AWAY {
+            let as_argument = format!("\"{stale}\",");
+            for (offset, line) in SOURCE.lines().enumerate() {
+                assert_ne!(
+                    line.trim(),
+                    as_argument,
+                    "protocol.rs:{} passes the removed tool `{stale}` as a tool name",
+                    offset + 1
+                );
+            }
+        }
+
+        for live in ["file", "bash_task"] {
+            let as_argument = format!("\"{live}\",");
+            assert!(
+                SOURCE.lines().any(|line| line.trim() == as_argument),
+                "the slash commands must still dispatch `{live}` — a rename that \
+                 deleted the call instead of repointing it would pass the check above"
+            );
+        }
+    }
+
+    /// The previews the cards and `humanize_tool_verb` parse are built from
+    /// the unified tools' `action` argument, not from the tool name.
+    #[test]
+    fn manual_tool_preview_covers_the_unified_tools() {
+        assert_eq!(
+            manual_tool_preview(
+                "file",
+                &serde_json::json!({"action": "read", "path": "a.txt"})
+            ),
+            Some("read a.txt".to_string())
+        );
+        assert_eq!(
+            manual_tool_preview(
+                "file",
+                &serde_json::json!({"action": "edit", "path": "a.txt"})
+            ),
+            Some("edit a.txt".to_string())
+        );
+        assert_eq!(
+            manual_tool_preview(
+                "file",
+                &serde_json::json!({"action": "write", "path": "a.txt", "content": "x"})
+            ),
+            Some("write a.txt".to_string())
+        );
+        assert_eq!(
+            manual_tool_preview("bash_task", &serde_json::json!({"action": "list"})),
+            Some("list bash tasks".to_string())
+        );
+        assert_eq!(
+            manual_tool_preview(
+                "bash_task",
+                &serde_json::json!({"action": "read", "task_id": "t-1"})
+            ),
+            Some("read bash task t-1".to_string())
+        );
     }
 
     #[test]

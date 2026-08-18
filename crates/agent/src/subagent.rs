@@ -21,8 +21,10 @@
 //! - **Token budget** ([`DEFAULT_SUBAGENT_BUDGET_TOKENS`], overridable via the
 //!   `max_tokens` argument): the nested turn gets its own `TranscriptStore`
 //!   whose cumulative input-token budget stops a runaway subagent. The
-//!   subagent's reported spend is ALSO recorded against the parent's budget
-//!   at the dispatch site, so delegation is never a budget escape hatch.
+//!   subagent's MEASURED spend is ALSO recorded against the parent's budget
+//!   at the dispatch site — unconditionally, from the accumulator the nested
+//!   turn fills as it runs, so an errored turn's real tokens are charged too
+//!   and delegation is never a budget escape hatch.
 //! - **Inherited gating — no privilege escalation**: the nested turn runs
 //!   under the parent's `ToolPermissionContext`, live permission overrides,
 //!   OPA policy engine, and approval channel. Approval requests raised inside
@@ -56,7 +58,7 @@ use crate::scratchpad::Scratchpad;
 use crate::task::ArtifactHandle;
 use crate::tool_catalog::{LoadedTool, ToolCatalog};
 use crate::transcript::{TranscriptStore, TurnBudget};
-use crate::types::{AgentConfig, AgentEvent, UsageInfo};
+use crate::types::{AgentConfig, AgentEvent};
 
 /// The meta-tool name (the [`crate::meta_tools::MetaTool::SpawnSubagent`]
 /// variant of the closed meta-tool registry).
@@ -176,20 +178,6 @@ fn depth_cap_error(config: &AgentConfig) -> Option<Value> {
     })
 }
 
-/// `(input_tokens, output_tokens)` reported in a spawn_subagent result — used
-/// by the dispatch site to charge the subagent's spend to the PARENT budget.
-#[must_use]
-pub fn usage_from_result(value: &Value) -> (u64, u64) {
-    let usage = value.get("usage");
-    let read = |key: &str| {
-        usage
-            .and_then(|u| u.get(key))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
-    (read("input_tokens"), read("output_tokens"))
-}
-
 // ── Execution ─────────────────────────────────────────────────────────
 
 /// Run one nested agent turn for a delegated task. Called from the agent
@@ -199,8 +187,14 @@ pub fn usage_from_result(value: &Value) -> (u64, u64) {
 /// Returns a boxed `dyn Future` (not an `async fn`): `run_turn` awaits this
 /// and this awaits `run_turn`, so the erased, explicitly-`Send` type is what
 /// breaks the recursive future-size/auto-trait cycle.
+///
+/// `run_metrics` is the caller's accumulator for the nested turn's spend. It
+/// is an OUT-PARAMETER, not a return value, because the caller must be able
+/// to charge what the subagent burned even when this future resolves to
+/// `Err` — the spend is real either way. See the dispatch site in
+/// `agent_loop`.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_spawn_subagent<'a>(
+pub(crate) fn execute_spawn_subagent<'a>(
     llm: &'a LlmClient,
     tool_server: &'a mut ToolServerHandle,
     command_tool_runtime: &'a CommandToolRuntime,
@@ -216,6 +210,7 @@ pub fn execute_spawn_subagent<'a>(
     approval_rx: Option<SharedApprovalReceiver>,
     policy: Option<&'a mut prism_policy::PolicyEngine>,
     subagent_lanes: Option<&'a ToolServerPool>,
+    run_metrics: &'a mut crate::agent_loop::AgentRunMetrics,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         execute_spawn_subagent_inner(
@@ -234,6 +229,7 @@ pub fn execute_spawn_subagent<'a>(
             approval_rx,
             policy,
             subagent_lanes,
+            run_metrics,
         )
         .await
     })
@@ -256,6 +252,7 @@ async fn execute_spawn_subagent_inner(
     approval_rx: Option<SharedApprovalReceiver>,
     policy: Option<&mut prism_policy::PolicyEngine>,
     subagent_lanes: Option<&ToolServerPool>,
+    run_metrics: &mut crate::agent_loop::AgentRunMetrics,
 ) -> Result<Value> {
     // SAFETY: access gate FIRST. spawn_subagent is effect-classified
     // ExecutesCode (it drives a nested turn over the same code-running tool
@@ -402,12 +399,19 @@ async fn execute_spawn_subagent_inner(
     let before_ids = session_record_ids(parent_session_id).await;
 
     // Harvest state filled by the nested emit callback.
+    //
+    // Spend is deliberately NOT harvested here. `run_metrics` (the caller's
+    // accumulator, threaded into the nested turn below) accrues per LLM call
+    // as the turn runs, so it is right whether the turn finishes or dies. The
+    // deleted alternative read `TurnComplete { total_usage, estimated_cost }`
+    // out of this callback — an event that never fires when a turn errors,
+    // and that carries `estimated_cost: None` on the budget-exhausted arm
+    // (`agent_loop.rs`, "Budget exhausted."). Both the reported figure and
+    // the parent's charge now come from the one accumulator the child's own
+    // ledger row is closed with, so they cannot drift apart again.
     let mut streamed_text = String::new();
     let mut final_text: Option<String> = None;
     let mut steps: Vec<String> = Vec::new();
-    let mut usage: Option<UsageInfo> = None;
-    let mut estimated_cost: Option<f64> = None;
-    let mut run_metrics = crate::agent_loop::AgentRunMetrics::default();
     let nested_result;
 
     {
@@ -423,15 +427,8 @@ async fn execute_spawn_subagent_inner(
                     return;
                 }
                 AgentEvent::ThinkingDelta { .. } | AgentEvent::TextFlush => return,
-                AgentEvent::TurnComplete {
-                    text,
-                    total_usage,
-                    estimated_cost: cost,
-                    ..
-                } => {
+                AgentEvent::TurnComplete { text, .. } => {
                     final_text = text.clone();
-                    usage = total_usage.clone();
-                    estimated_cost = *cost;
                     return;
                 }
                 AgentEvent::ToolCallResult { summary, .. } => {
@@ -488,7 +485,7 @@ async fn execute_spawn_subagent_inner(
                 subagent_lanes,
                 &child_run.id,
                 &child_run.session_id,
-                &mut run_metrics,
+                &mut *run_metrics,
             ));
         // `_chain_guard` restores the parent's chain on drop (Ok/Err/unwind).
         nested_result = nested.await;
@@ -543,11 +540,11 @@ async fn execute_spawn_subagent_inner(
         "summary": clip(summary_src.trim(), SUMMARY_CHARS),
         "steps": &steps[start..],
         "artifacts": artifacts,
-        "usage": usage.map(|u| json!({
-            "input_tokens": u.input_tokens,
-            "output_tokens": u.output_tokens,
-        })),
-        "estimated_cost": estimated_cost,
+        "usage": {
+            "input_tokens": run_metrics.tokens_in,
+            "output_tokens": run_metrics.tokens_out,
+        },
+        "estimated_cost": run_metrics.cost_usd,
         "hint": "artifacts are provenance references — expand one with recall(id=…); \
                  recall(query=…) finds anything not listed",
     }))
@@ -676,14 +673,5 @@ mod tests {
             err["error"].as_str().unwrap().contains("recursion cap"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn usage_from_result_reads_reported_spend() {
-        let value = json!({
-            "usage": { "input_tokens": 1200, "output_tokens": 340 },
-        });
-        assert_eq!(usage_from_result(&value), (1200, 340));
-        assert_eq!(usage_from_result(&json!({ "error": "x" })), (0, 0));
     }
 }

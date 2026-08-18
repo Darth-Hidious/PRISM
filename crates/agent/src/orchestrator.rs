@@ -91,7 +91,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -1025,8 +1025,11 @@ struct OrchestrationContext {
     /// `spawn_subagent`.
     parent_has_approval_channel: bool,
     events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
-    usage_in: AtomicU64,
-    usage_out: AtomicU64,
+    /// Fan-out total, rolled up from each item's own `AgentRunMetrics` — the
+    /// same accumulator `spawn_subagent` hands back, so both delegation paths
+    /// charge the parent from one type. Shared by reference across the item
+    /// tasks; the critical section is a few adds and never awaits.
+    usage: std::sync::Mutex<crate::agent_loop::AgentRunMetrics>,
 }
 
 /// Live state of one orchestrated agent, created on its first attempt and
@@ -1272,10 +1275,10 @@ impl ItemAgent for OrchestratedAgent {
             // the per-item ledger row already reports accurately), so it holds
             // the real spend whether the turn finished or died. Tokens spent
             // are spent; the outcome does not refund them.
-            ctx.usage_in
-                .fetch_add(live.metrics.tokens_in, Ordering::Relaxed);
-            ctx.usage_out
-                .fetch_add(live.metrics.tokens_out, Ordering::Relaxed);
+            ctx.usage
+                .lock()
+                .expect("orchestration usage roll-up is never held across a panic")
+                .absorb(&live.metrics);
 
             nested_result?;
 
@@ -1351,8 +1354,12 @@ impl ItemAgent for OrchestratedAgent {
 /// Run one orchestrated fan-out. Called from the agent loop's dispatch (NOT
 /// from `execute_meta_tool` — this needs the live turn machinery), exactly
 /// like `spawn_subagent`. Boxed for the same recursion-breaking reason.
+///
+/// `run_metrics` is the caller's accumulator for the fan-out's total spend —
+/// an OUT-PARAMETER for the same reason `spawn_subagent` takes one: the
+/// caller charges what was burned regardless of how this resolves.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_orchestrate_agents<'a>(
+pub(crate) fn execute_orchestrate_agents<'a>(
     llm: &'a LlmClient,
     command_tool_runtime: &'a CommandToolRuntime,
     tool_catalog: &'a ToolCatalog,
@@ -1366,6 +1373,7 @@ pub fn execute_orchestrate_agents<'a>(
     parent_has_approval_channel: bool,
     policy: Option<&'a prism_policy::PolicyEngine>,
     subagent_lanes: Option<&'a ToolServerPool>,
+    run_metrics: &'a mut crate::agent_loop::AgentRunMetrics,
 ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
     Box::pin(async move {
         // SAFETY: access gate FIRST — orchestration drives nested turns over
@@ -1464,8 +1472,7 @@ pub fn execute_orchestrate_agents<'a>(
             access: crate::command_tools::current_platform_access(),
             parent_has_approval_channel,
             events: events_tx,
-            usage_in: AtomicU64::new(0),
-            usage_out: AtomicU64::new(0),
+            usage: std::sync::Mutex::new(crate::agent_loop::AgentRunMetrics::default()),
         });
 
         // G2: one guard for the whole fan-out — the PARENT's repair-chain
@@ -1509,8 +1516,18 @@ pub fn execute_orchestrate_agents<'a>(
             emit(event);
         }
 
-        let usage_in = ctx.usage_in.load(Ordering::Relaxed);
-        let usage_out = ctx.usage_out.load(Ordering::Relaxed);
+        // Hand the roll-up back through the out-parameter, not through the
+        // result JSON. The dispatch site used to re-read this very object with
+        // `subagent::usage_from_result`, which made the parent's charge depend
+        // on the fan-out returning `Ok` — the same coupling that let the
+        // spawn_subagent path charge nothing for a turn that errored after
+        // billed calls. What the model is TOLD and what the parent is CHARGED
+        // now come from one value.
+        run_metrics.absorb(
+            &ctx.usage
+                .lock()
+                .expect("orchestration usage roll-up is never held across a panic"),
+        );
         Ok(json!({
             "items": run.items,
             "succeeded": run.succeeded(),
@@ -1527,12 +1544,11 @@ pub fn execute_orchestrate_agents<'a>(
                 "lane_bound": run.lane_bound,
                 "effective": run.effective_concurrency,
             },
-            // Read by the dispatch site (subagent::usage_from_result) to
-            // charge the whole fan-out's spend to the PARENT budget —
-            // orchestration is not a budget escape hatch.
+            // Reported to the model so it can see what the batch cost. The
+            // PARENT's charge comes from `run_metrics` above, not from here.
             "usage": {
-                "input_tokens": usage_in,
-                "output_tokens": usage_out,
+                "input_tokens": run_metrics.tokens_in,
+                "output_tokens": run_metrics.tokens_out,
             },
             "hint": "per-item details are durable: each item's run_id is in the agent-run \
                      ledger (with the spawn edge to this run), and recall(query=…) finds \

@@ -76,7 +76,7 @@ PLANS: dict[str, Plan] = {
     "check_lab_subscriptions":      Plan({},                                  True),
     "list_models":                  Plan({},                                  True),
     "list_predictable_properties":  Plan({"dataset_name": "demo"},            True,  "may 404 — that's a finding"),
-    "list_bash_tasks":              Plan({},                                  True),
+    "bash_task":                    Plan({"action": "list"},                  True),
 
     # Read-only Python tools with required args.
     # Arg names below are the ACTUAL ones the Pydantic schema expects (verified
@@ -143,7 +143,6 @@ PLANS: dict[str, Plan] = {
     "analyze_phases":       Plan(None, False, "writes results + needs db file"),
     "export_results_csv":   Plan(None, False, "writes file"),
     "generate_report":      Plan(None, False, "writes report"),
-    "read_bash_task":       Plan(None, False, "needs task_id"),
     "stop_bash_task":       Plan(None, False, "destructive"),
 }
 

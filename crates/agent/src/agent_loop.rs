@@ -275,6 +275,15 @@ impl AgentRunMetrics {
         self.tokens_out = self.tokens_out.saturating_add(usage.output_tokens);
         self.cost_usd += estimate_cost(usage, &get_model_config(model));
     }
+
+    /// Roll a finished nested run's spend into this one. Cost is carried too:
+    /// it is already priced against the model that actually ran, which a
+    /// token-only roll-up would silently re-price against the parent's.
+    pub(crate) fn absorb(&mut self, other: &Self) {
+        self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+        self.cost_usd += other.cost_usd;
+    }
 }
 
 pub(crate) fn agent_run_label(value: &str) -> String {
@@ -2600,6 +2609,26 @@ pub(crate) async fn run_turn_inner(
                         // nested run_turn under the parent's permission/approval
                         // gating, inheriting (never widening) the caller's
                         // platform access.
+                        //
+                        // The subagent's spend counts against the PARENT's cumulative
+                        // budget too — delegation must not be a budget escape hatch.
+                        // Charge from the INCREMENTAL metrics, unconditionally.
+                        //
+                        // The identical defect was found and fixed in the
+                        // orchestrator copy (see "Two bugs in one line" in
+                        // orchestrator.rs) and left live here. This site used to
+                        // gate the charge on `if let Ok(value)` and read the spend
+                        // back out of the RESULT JSON, which the subagent only
+                        // populated from `TurnComplete` — an event that never fires
+                        // when a turn errors. A delegated turn that made four billed
+                        // calls and died on the fifth therefore contributed ZERO to
+                        // the parent's budget: the escape hatch this very comment
+                        // promised did not exist. `AgentRunMetrics` accrues per LLM
+                        // call, so it holds the real spend whether the nested turn
+                        // finished or died — and it is the same accumulator the
+                        // child's own ledger row is closed with, so the report and
+                        // the charge cannot drift apart.
+                        let mut sub_metrics = AgentRunMetrics::default();
                         let sub_result = crate::subagent::execute_spawn_subagent(
                             llm,
                             tool_server,
@@ -2616,14 +2645,14 @@ pub(crate) async fn run_turn_inner(
                             approval_rx.clone(),
                             policy.as_deref_mut(),
                             subagent_lanes,
+                            &mut sub_metrics,
                         )
                         .await;
-                        // The subagent's spend counts against the PARENT's cumulative
-                        // budget too — delegation must not be a budget escape hatch.
-                        if let Ok(value) = &sub_result {
-                            let (sub_in, sub_out) = crate::subagent::usage_from_result(value);
-                            transcript.record_cost("subagent", sub_in, sub_out);
-                        }
+                        transcript.record_cost(
+                            "subagent",
+                            sub_metrics.tokens_in,
+                            sub_metrics.tokens_out,
+                        );
                         sub_result.map(|value| serde_json::json!({ "result": value }))
                     } else if meta_tool == crate::meta_tools::MetaTool::OrchestrateAgents {
                         // orchestrate_agents is spawn_subagent's fan-out sibling:
@@ -2633,6 +2662,14 @@ pub(crate) async fn run_turn_inner(
                         // approval CHANNEL exists — not the channel itself —
                         // because concurrent items cannot share one uncorrelated
                         // Allow/Deny stream; see orchestrator.rs "Approval shape".
+                        //
+                        // The whole fan-out's spend counts against the PARENT's
+                        // budget — orchestration must not be a budget escape hatch
+                        // either. Same accumulator, same unconditional charge as the
+                        // spawn_subagent arm above: one idiom, so a future reader
+                        // cannot fix one delegation path and miss the other (which
+                        // is exactly how the subagent hole survived).
+                        let mut orch_metrics = AgentRunMetrics::default();
                         let orch_result = crate::orchestrator::execute_orchestrate_agents(
                             llm,
                             command_tool_runtime,
@@ -2647,15 +2684,14 @@ pub(crate) async fn run_turn_inner(
                             approval_rx.is_some(),
                             policy.as_deref(),
                             subagent_lanes,
+                            &mut orch_metrics,
                         )
                         .await;
-                        // The whole fan-out's spend counts against the PARENT's
-                        // budget — orchestration must not be a budget escape
-                        // hatch either.
-                        if let Ok(value) = &orch_result {
-                            let (orch_in, orch_out) = crate::subagent::usage_from_result(value);
-                            transcript.record_cost("orchestrate_agents", orch_in, orch_out);
-                        }
+                        transcript.record_cost(
+                            "orchestrate_agents",
+                            orch_metrics.tokens_in,
+                            orch_metrics.tokens_out,
+                        );
                         orch_result.map(|value| serde_json::json!({ "result": value }))
                     } else {
                         // Open the same Turso store the provenance hook writes to.
@@ -4460,7 +4496,7 @@ mod tests {
     fn tier_to_core_keeps_core_meta_and_pinned_only() {
         let json = serde_json::json!({
             "tools": [
-                { "name": "read_file", "description": "d", "input_schema": {"type":"object"} },
+                { "name": "file", "description": "d", "input_schema": {"type":"object"} },
                 { "name": "deploy_create", "description": "d", "input_schema": {"type":"object"} },
                 { "name": "find_tools", "description": "d", "input_schema": {"type":"object"} },
                 { "name": "mesh_publish", "description": "d", "input_schema": {"type":"object"} }
@@ -4473,7 +4509,7 @@ mod tests {
             .iter()
             .map(|d| d.function.name.clone())
             .collect();
-        assert!(names.iter().any(|n| n == "read_file"), "core tool kept");
+        assert!(names.iter().any(|n| n == "file"), "core tool kept");
         assert!(names.iter().any(|n| n == "find_tools"), "meta tool kept");
         assert!(
             names.iter().any(|n| n == "mesh_publish"),

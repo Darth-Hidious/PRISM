@@ -88,10 +88,11 @@ pub struct PromptProfile {
 /// tuned later. Names that aren't in a session's live catalog are simply
 /// ignored by the tiering filter, so listing an absent tool is harmless.
 pub const CORE_TOOL_SET: &[&str] = &[
-    // file work
-    "read_file",
-    "edit_file",
-    "write_file",
+    // file work — ONE `file` tool (action=read|write|edit). The three split
+    // names this list used to carry left a weak model with no file tool at
+    // all: they are filtered out as absent from the catalog, and `file`, the
+    // tool that IS registered, was never named.
+    "file",
     "execute_bash",
     "execute_python",
     // knowledge / retrieval
@@ -411,7 +412,7 @@ mod tests {
     #[test]
     fn core_tool_set_includes_find_tools() {
         assert!(CORE_TOOL_SET.contains(&"find_tools"));
-        assert!(CORE_TOOL_SET.contains(&"read_file"));
+        assert!(CORE_TOOL_SET.contains(&"file"));
     }
 
     /// A weak/local model must be able to COMPUTE a material property, not

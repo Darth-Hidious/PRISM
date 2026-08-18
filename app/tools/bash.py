@@ -851,9 +851,10 @@ def create_bash_tools(registry: ToolRegistry) -> None:
             "build/test commands, and other local CLI workflows. "
             "Set run_in_background=true for long-running commands that should keep "
             "running after this tool returns. When a background launch succeeds, "
-            "PRISM returns a task_id. Use list_bash_tasks if you need to "
-            "rediscover task IDs, read_bash_task to inspect progress and tail "
-            "stdout/stderr, and stop_bash_task to cancel a running task. "
+            "PRISM returns a task_id. Use bash_task(action='list') if you need "
+            "to rediscover task IDs, bash_task(action='read') to inspect "
+            "progress and tail stdout/stderr, and stop_bash_task to cancel a "
+            "running task. "
             "Commands that require privilege escalation, networking, shell "
             "nesting, or paths outside the project are blocked."
         ),
@@ -888,8 +889,9 @@ def create_bash_tools(registry: ToolRegistry) -> None:
                         "Run the command as a session-local background task. "
                         "When true, PRISM returns a task_id and the command keeps "
                         "running until completion or stop_bash_task. After launch, "
-                        "use read_bash_task to tail logs or list_bash_tasks if you "
-                        "need to recover the task_id later."
+                        "use bash_task(action='read') to tail logs, or "
+                        "bash_task(action='list') if you need to recover the "
+                        "task_id later."
                     ),
                 },
             },
@@ -949,7 +951,7 @@ def create_bash_tools(registry: ToolRegistry) -> None:
             "respond. Use when the user says 'cancel that task', "
             "'kill the build', 'stop monitoring', or when the "
             "agent's plan has changed and an in-flight task is no "
-            "longer wanted. After this returns, `read_bash_task` "
+            "longer wanted. After this returns, `bash_task(action='read')` "
             "still works to get the final stdout / stderr / "
             "exit_code if the agent needs to inspect what the task "
             "produced before death. NOT for platform broker jobs "
@@ -966,7 +968,7 @@ def create_bash_tools(registry: ToolRegistry) -> None:
                     "description": (
                         "Background bash task ID — returned by "
                         "`execute_bash` or rediscovered via "
-                        "`list_bash_tasks`."
+                        "`bash_task(action='list')`."
                     ),
                 },
             },

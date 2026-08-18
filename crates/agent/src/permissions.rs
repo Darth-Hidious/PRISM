@@ -76,7 +76,6 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("patent_search", ReadOnly);
         m.insert("web_search", ReadOnly);
         m.insert("web_read", ReadOnly);
-        m.insert("read_file", ReadOnly);
         m.insert("show_scratchpad", ReadOnly);
         m.insert("list_models", ReadOnly);
         m.insert("list_predictable_properties", ReadOnly);
@@ -93,8 +92,7 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("compute_gpus", ReadOnly);
         m.insert("compute_providers", ReadOnly);
         m.insert("compute_status", ReadOnly);
-        m.insert("list_bash_tasks", ReadOnly);
-        m.insert("read_bash_task", ReadOnly);
+        m.insert("bash_task", ReadOnly);
         m.insert("status", ReadOnly);
         m.insert("tools", ReadOnly);
         m.insert("provision", WorkspaceWrite);
@@ -127,8 +125,13 @@ fn tool_permissions() -> &'static HashMap<&'static str, PermissionMode> {
         m.insert("discourse_turns", ReadOnly);
 
         // Workspace-write tools (create/modify files, run code)
-        m.insert("write_file", WorkspaceWrite);
-        m.insert("edit_file", WorkspaceWrite);
+        // `file` covers read|write|edit in one tool, so it takes the STRICTEST
+        // of the three names it replaced: a tool that can overwrite a file
+        // cannot be classified by its cheapest action. The cost is stated
+        // rather than hidden — a plain read through `file` now needs
+        // workspace-write and is denied in plan mode, and closing that needs
+        // per-action permissions, which this map cannot express.
+        m.insert("file", WorkspaceWrite);
         m.insert("export_results_csv", WorkspaceWrite);
         m.insert("import_dataset", WorkspaceWrite);
         m.insert("execute_python", WorkspaceWrite);
@@ -372,7 +375,6 @@ impl Default for ToolPermissionContext {
                 "list_predictable_properties".to_string(),
                 "discover_capabilities".to_string(),
                 "show_scratchpad".to_string(),
-                "read_file".to_string(),
                 "list_lab_services".to_string(),
                 "get_lab_service_info".to_string(),
                 "check_lab_subscriptions".to_string(),
@@ -400,10 +402,7 @@ mod tests {
             get_tool_permission("materials_search"),
             PermissionMode::ReadOnly
         );
-        assert_eq!(
-            get_tool_permission("write_file"),
-            PermissionMode::WorkspaceWrite
-        );
+        assert_eq!(get_tool_permission("file"), PermissionMode::WorkspaceWrite);
         assert_eq!(
             get_tool_permission("compute_submit"),
             PermissionMode::FullAccess
@@ -417,9 +416,9 @@ mod tests {
 
     #[test]
     fn all_known_tools_mapped() {
-        // 54 read-only + 23 workspace-write + 18 full-access = 95
+        // 52 read-only + 22 workspace-write + 18 full-access = 92
         let perms = tool_permissions();
-        assert_eq!(perms.len(), 95);
+        assert_eq!(perms.len(), 92);
     }
 
     #[test]
@@ -459,7 +458,7 @@ mod tests {
         let ctx = ToolPermissionContext::default().with_deny(&["execute_python".to_string()], &[]);
         assert!(ctx.blocks("execute_python"));
         assert!(ctx.blocks("Execute_Python")); // case-insensitive
-        assert!(!ctx.blocks("read_file"));
+        assert!(!ctx.blocks("file"));
     }
 
     #[test]
@@ -474,8 +473,11 @@ mod tests {
     fn context_auto_approve_default() {
         let ctx = ToolPermissionContext::default();
         assert!(ctx.auto_approves("materials_search"));
-        assert!(ctx.auto_approves("read_file"));
         assert!(!ctx.auto_approves("execute_python"));
+        // `read_file` used to sit in this list and was dropped, not renamed:
+        // the tool that replaced it also WRITES and EDITS, so auto-approving
+        // it by that name would have handed the model silent overwrite.
+        assert!(!ctx.auto_approves("file"));
     }
 
     #[test]
@@ -524,9 +526,9 @@ mod tests {
     fn live_deny_override_blocks_tool_even_if_auto_approved() {
         let ctx = ToolPermissionContext::default();
         let mut overrides = PermissionOverrides::default();
-        overrides.deny("read_file");
+        overrides.deny("materials_search");
 
-        let decision = ctx.decision_for("read_file", Some(&overrides));
+        let decision = ctx.decision_for("materials_search", Some(&overrides));
         assert!(decision.blocked);
     }
 }

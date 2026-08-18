@@ -191,7 +191,11 @@ async fn run_parent_turn(
     subagent_depth: usize,
     access: CommandToolPlatformAccess,
     use_lanes: bool,
-) -> (String, Vec<AgentEvent>) {
+) -> (
+    String,
+    Vec<AgentEvent>,
+    prism_agent::transcript::CostTracker,
+) {
     let seed = build_agent_seed(
         &tool_server_config(project, python),
         &llm_config(base_url.clone()),
@@ -249,7 +253,9 @@ async fn run_parent_turn(
     )
     .await
     .expect("parent turn");
-    (answer, events)
+    // The parent's cost log is returned too: it is where a delegated turn's
+    // spend is charged, and the only place a missing charge is observable.
+    (answer, events, transcript.cost)
 }
 
 fn tool_result_content<'a>(events: &'a [AgentEvent], tool: &str) -> Option<&'a str> {
@@ -274,7 +280,7 @@ async fn spawn_subagent_runs_a_nested_turn_that_calls_tools() {
     let session_id = "subagent-run-parent-edge";
     prism_agent::hooks::set_provenance_ctx(session_id, "stub-model");
 
-    let (answer, events) = run_parent_turn(
+    let (answer, events, _cost) = run_parent_turn(
         project.path(),
         &python,
         base_url,
@@ -356,7 +362,7 @@ async fn spawn_subagent_refuses_beyond_max_depth() {
 
     // Pretend this agent is ALREADY a depth-2 subagent: its spawn attempt
     // must be refused before any nested LLM call or tool execution.
-    let (answer, events) = run_parent_turn(
+    let (answer, events, _cost) = run_parent_turn(
         project.path(),
         &python,
         base_url,
@@ -398,7 +404,7 @@ async fn local_only_caller_cannot_spawn_a_subagent() {
     let base_url = start_stub_llm().await;
     let calls_log = project.path().join("calls.log");
 
-    let (answer, events) = run_parent_turn(
+    let (answer, events, _cost) = run_parent_turn(
         project.path(),
         &python,
         base_url,
@@ -499,7 +505,7 @@ async fn subagent_tools_run_on_their_own_lane() {
     let base_url = start_lane_stub_llm().await;
     let calls_log = project.path().join("calls.log");
 
-    let (answer, events) = run_parent_turn(
+    let (answer, events, _cost) = run_parent_turn(
         project.path(),
         &python,
         base_url,
@@ -538,7 +544,7 @@ async fn without_a_pool_the_subagent_borrows_the_parents_handle() {
     let base_url = start_lane_stub_llm().await;
     let calls_log = project.path().join("calls.log");
 
-    let (answer, _events) = run_parent_turn(
+    let (answer, _events, _cost) = run_parent_turn(
         project.path(),
         &python,
         base_url,
@@ -657,7 +663,7 @@ async fn spawn_subagent_preserves_parent_repair_chain() {
     // Clean the process-global chain so we assert only on THIS turn's records.
     prism_agent::hooks::reset_code_run_chain();
 
-    let (answer, events) = run_parent_turn(
+    let (answer, events, _cost) = run_parent_turn(
         project.path(),
         &python,
         base_url,
@@ -693,4 +699,115 @@ async fn spawn_subagent_preserves_parent_repair_chain() {
     );
 
     prism_agent::hooks::reset_code_run_chain();
+}
+
+// ── W2: the parent is charged for a subagent that DIED mid-turn ──────
+
+/// - `stub-model` (parent): spawn_subagent -> PARENT_DONE.
+/// - `claude-fable-5` (subagent): one billed `stub_echo` call, then the
+///   provider hard-fails the second call with HTTP 402.
+///
+/// 402 is terminal on the billable retry policy (`status_is_retryable_when_
+/// billable` = 429|503 only) and carries no tool-schema signal, so the nested
+/// turn dies on exactly the second call — no retry, no fallback.
+async fn start_dying_subagent_stub_llm() -> String {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(
+            |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                let model = body["model"].as_str().unwrap_or_default().to_string();
+                let tool_msgs = body["messages"]
+                    .as_array()
+                    .map(|msgs| msgs.iter().filter(|m| m["role"] == "tool").count())
+                    .unwrap_or(0);
+                match (model.as_str(), tool_msgs) {
+                    ("claude-fable-5", 0) => axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse_tool_call("stub_echo", "{}")))
+                        .expect("stub response"),
+                    ("claude-fable-5", _) => axum::response::Response::builder()
+                        .status(402)
+                        .body(axum::body::Body::from("out of credits mid-delegation"))
+                        .expect("stub response"),
+                    (_, 0) => axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse_tool_call(
+                            "spawn_subagent",
+                            "{\"task\": \"run the echo tool and report back\"}",
+                        )))
+                        .expect("stub response"),
+                    (_, _) => axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse_text("PARENT_DONE")))
+                        .expect("stub response"),
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub llm");
+    let addr = listener.local_addr().expect("stub llm addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Tokens spent are spent; a failed delegation does not refund them.
+///
+/// The pre-fix dispatch gated the charge on `if let Ok(value) = &sub_result`
+/// and then read the spend back out of the RESULT JSON, which the subagent
+/// only ever populated from `TurnComplete` — an event that never fires when a
+/// turn errors. A subagent that made billed calls and then died therefore
+/// contributed ZERO to the parent's budget: an unbounded escape hatch, since
+/// the parent could delegate again immediately with its budget untouched.
+///
+/// This fails if either half of that shape comes back — the `Ok` gate, or
+/// sourcing the charge from the tool result instead of the accumulator.
+#[tokio::test(flavor = "multi_thread")]
+async fn parent_is_charged_for_a_subagent_that_died_after_billed_calls() {
+    let _serial = SERIAL_TEST_LOCK.lock().await;
+    let Some(python) = find_python() else {
+        eprintln!("SKIP: python3 not on PATH");
+        return;
+    };
+    let project = tempfile::tempdir().expect("tempdir");
+    write_stub_project(project.path());
+    let base_url = start_dying_subagent_stub_llm().await;
+    prism_agent::hooks::set_provenance_ctx("subagent-charge-on-failure", "stub-model");
+
+    let (answer, events, cost) = run_parent_turn(
+        project.path(),
+        &python,
+        base_url,
+        0,
+        CommandToolPlatformAccess::VerifiedNodeOwner,
+        true,
+    )
+    .await;
+
+    // The delegation really failed — no result JSON to read a figure out of.
+    assert_eq!(answer, "PARENT_DONE");
+    let sub_result =
+        tool_result_content(&events, "spawn_subagent").expect("spawn_subagent result event");
+    assert!(
+        sub_result.starts_with("Tool error"),
+        "the subagent must have died on the provider error, so there is no result \
+         JSON to read a spend figure out of: {sub_result}"
+    );
+
+    // …and the parent was still charged the tokens the nested turn really
+    // burned before it died: one stub call at 100 in / 20 out.
+    let charged = cost
+        .events
+        .iter()
+        .find(|event| event.label == "subagent")
+        .expect("a failed delegation must still produce a parent charge event");
+    assert_eq!(
+        (charged.input_tokens, charged.output_tokens),
+        (100, 20),
+        "the parent must be charged the subagent's real pre-failure spend"
+    );
 }

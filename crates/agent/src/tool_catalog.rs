@@ -88,6 +88,17 @@ pub const RENAMED_AWAY: &[&str] = &[
     "knowledge_search",
     "predict_property",
     "semantic_search",
+    // Collapsed into the unified `file` tool (read|write|edit) and the
+    // read-only `bash_task` tool (list|read) when `app/tools/system.py` and
+    // `app/tools/bash.py` were rewritten. The registry stopped serving these
+    // five, but `/read`, `/write`, `/edit`, `/bash tasks` and `/bash read`
+    // kept sending them, so all five slash commands failed on an unregistered
+    // tool — the PR #91 failure again, five times over.
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_bash_tasks",
+    "read_bash_task",
 ];
 
 /// Full metadata for one loaded tool. Rust keeps this alongside the OpenAI
