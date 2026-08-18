@@ -368,6 +368,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         // operator's data moat, and this description ships in a public repo.
         // The model does not need the manifest to choose the tool — "search
         // what we already hold, before searching outside" is the whole rule.
+        //
         description: "Search the platform's OWN knowledge base — the operator's embedded corpora plus the knowledge graph. PREFER this before external literature searches (prior_art_search/web) — the platform often already holds the answer with provenance. Plain text runs a graph-entity search; `semantic=true` searches corpus chunks by meaning. Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
@@ -5448,7 +5449,28 @@ async fn execute_workflow_command(
 /// `query` is kept in this list for intent even though
 /// [`REDUNDANT_UMBRELLA_TOOLS`] already hides it in every state — it says what
 /// would happen if the umbrella were ever offered again.
-const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_local", "query_federated"];
+/// `query_local` IS NOT IN THIS LIST, and removing it is the point.
+///
+/// It reads the bundled Turso store straight off disk. The node is a separate
+/// daemon on 127.0.0.1:7327 and nothing in the local read path talks to it.
+/// Measured with the node down and no other process holding the store:
+/// `prism query "tunnel magnetoresistance"` returned 9 entities, and
+/// `--semantic` returned 10 scored matches. Both work; neither needs a node.
+///
+/// Gating it cost the user their own data. With the node offline — the
+/// ordinary state, which `doctor` itself lists as optional — the agent was
+/// offered `query_platform` and NOT `query_local`, so "search our ingested
+/// knowledge graph" went to the REMOTE store, found nothing, retried
+/// semantically, and died on HTTP 402 insufficient credits. The answer was in
+/// the local graph the whole time. Being absent from the catalog also made it
+/// unreachable by name: `ALWAYS_INCLUDE` and the system prompt can only
+/// promote a tool that is actually there, which is why fixing those two
+/// changed nothing.
+///
+/// `query_federated` stays: it spans mesh peers, which really is the node's
+/// job. `query` stays for intent, though [`REDUNDANT_UMBRELLA_TOOLS`] already
+/// hides it in every state.
+const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_federated"];
 
 /// Management-shell wrappers excluded from the offered agent surface while
 /// remaining executable for old transcripts and direct callers.
@@ -7210,14 +7232,23 @@ ValueError: boom\n";
     #[test]
     fn local_store_tools_hidden_when_node_offline() {
         let tools = command_tools_filtered(false);
-        // Only the local-node tools are gated offline; query_platform hits the
-        // remote API and stays offered (see offline_catalog_offers_platform_knowledge_path).
-        for name in ["query_local", "query_federated"] {
-            assert!(
-                tools.iter().all(|tool| tool.name != name),
-                "{name} must not be offered while the local node is offline"
-            );
-        }
+        // Only genuinely node-backed tools are gated offline; query_platform
+        // hits the remote API and stays offered (see
+        // offline_catalog_offers_platform_knowledge_path).
+        assert!(
+            tools.iter().all(|tool| tool.name != "query_federated"),
+            "query_federated spans mesh peers and must stay gated while the node is offline"
+        );
+        // THE USER'S OWN STORE IS NOT NODE-BACKED. `query_local` reads the
+        // Turso file directly — measured working with the node down, both
+        // plain (9 entities) and `--semantic` (10 scored matches). Gating it
+        // handed the agent a billed remote search and no local one, so
+        // "search our ingested knowledge graph" hit HTTP 402 while the answer
+        // sat on disk.
+        assert!(
+            tools.iter().any(|tool| tool.name == "query_local"),
+            "query_local must be offered with the node OFFLINE — it does not use the node"
+        );
         // Capability is gated, not deleted: every hidden tool still resolves
         // and executes if called by name (older transcripts, aliases).
         for name in ["query", "query_local", "query_federated"] {
@@ -7417,8 +7448,15 @@ ValueError: boom\n";
 
         // The platform search path is offered even with the local node down.
         assert!(names.contains(&"query_platform"));
-        // Node-gated local query tools are hidden offline.
-        assert!(!names.contains(&"query_local"));
+        // ...AND SO IS THE LOCAL ONE. Offering the billed remote search while
+        // hiding the free local search is what sent "search our ingested
+        // knowledge graph" to the platform and into an HTTP 402. `query_local`
+        // reads the Turso file directly and needs no node.
+        assert!(
+            names.contains(&"query_local"),
+            "the user's own store must be searchable with the node offline"
+        );
+        // Genuinely node-backed: federation spans mesh peers.
         assert!(!names.contains(&"query_federated"));
         // The typed knowledge command-tools are always offered (remote API).
         for name in [

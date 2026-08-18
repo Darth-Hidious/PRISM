@@ -96,6 +96,9 @@ pub const CORE_TOOL_SET: &[&str] = &[
     "execute_python",
     // knowledge / retrieval
     "query",
+    // The user's OWN ingested graph. Listing `query_platform` without it
+    // left a weak model with a billed remote search and no local one.
+    "query_local",
     "query_platform",
     "knowledge_entity",
     "research_query",

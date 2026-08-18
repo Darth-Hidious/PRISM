@@ -59,7 +59,21 @@ pub fn definition_tokens(def: &ToolDefinition) -> usize {
 /// which meant the federated OPTIMADE search reached the model only when the
 /// user's phrasing happened to keyword-match it — on a materials platform, the
 /// one tool that must always be on the table.
-pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search", "query_platform"];
+///
+/// `query_local` earns its place the hard way. Measured: asked to "search our
+/// ingested knowledge graph for tunnel magnetoresistance", the agent called
+/// `query_platform` — the REMOTE store — got no matches, retried with
+/// `semantic=true`, and died on HTTP 402 insufficient credits, while the answer
+/// sat in the local graph. Told explicitly "use the query_local tool (not
+/// query_platform)", it did the same thing again: a model cannot call a tool it
+/// was never offered. `query_platform` was on this list and `query_local` was
+/// not, so on any keyword miss the ONLY tool that reads this machine's graph
+/// disappeared from the session while its billed remote sibling stayed.
+///
+/// The umbrella `query` does not cover the gap. Its description ("run `prism
+/// query ...`") says nothing about which store it reads, so it loses to a
+/// sibling that describes itself confidently.
+pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search", "query_local", "query_platform"];
 
 /// Tool names this codebase has renamed away from.
 ///
@@ -456,6 +470,44 @@ mod tests {
                 "CORE_TOOL_SET still names the removed tool `{stale}`"
             );
         }
+    }
+
+    /// THE USER'S OWN GRAPH MUST ALWAYS BE ON THE TABLE.
+    ///
+    /// Regression for a measured failure: `query_platform` was always
+    /// included and `query_local` was not, so on any keyword miss the only
+    /// tool that reads THIS machine's graph vanished while its billed remote
+    /// sibling stayed. Asked to "search our ingested knowledge graph for
+    /// tunnel magnetoresistance", the agent queried the remote store, found
+    /// nothing, retried semantically and hit HTTP 402 insufficient credits —
+    /// with the answer in the local graph the whole time. Naming the tool
+    /// explicitly in the prompt did not help, because a model cannot call a
+    /// tool it was never offered.
+    ///
+    /// Asymmetry is the specific defect: whichever way the pair is filtered,
+    /// they go together, or the model is handed the paid option and denied
+    /// the free one.
+    #[test]
+    fn the_local_graph_is_always_offered_alongside_the_platform() {
+        assert!(
+            ALWAYS_INCLUDE.contains(&"query_local"),
+            "the user's own ingested graph must survive keyword filtering"
+        );
+        assert_eq!(
+            ALWAYS_INCLUDE.contains(&"query_local"),
+            ALWAYS_INCLUDE.contains(&"query_platform"),
+            "local and platform search must be offered together — offering only \
+             the billed remote one is how the agent skipped the user's own data"
+        );
+        assert!(
+            crate::prompt_profile::CORE_TOOL_SET.contains(&"query_local"),
+            "a weak model must be able to read the local graph without credits"
+        );
+        assert_eq!(
+            get_tool_permission("query_local"),
+            PermissionMode::ReadOnly,
+            "reading the user's own local graph must not require approval"
+        );
     }
 
     /// The federated materials search must be reachable and read-only.

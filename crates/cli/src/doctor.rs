@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use prism_core::chat_config;
 use prism_runtime::{PlatformEndpoints, PrismPaths};
 
 use crate::boot::{self, BootCheck, print_check_lines};
@@ -59,6 +60,21 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
             delay_ms: 0,
         });
     }
+
+    // 1c. WHICH MODEL ANSWERS, and whether it bills.
+    //
+    // Neither `doctor` nor `status` reported this, and the default target is
+    // the PAID platform (`ChatTarget::default()` is `Marc27`). So a
+    // `config.toml` that is missing, empty, or unparseable silently moves
+    // chat off the local server the user set up and onto billed hosting,
+    // with every other check still reading green. Measured on a live
+    // machine: the file was truncated to zero bytes, `llama-server running`
+    // said OK beside it, and nothing anywhere said the next question would
+    // be billed.
+    //
+    // A local server that is configured but DOWN is the same class of
+    // problem from the other end, so the row reports reachability too.
+    checks.push(chat_route_check(&prism_dir));
 
     // 2. Embedding model. This used to look for
     //    `models/embeddinggemma-300m.gguf` and claim it "auto-downloads on
@@ -402,6 +418,107 @@ fn manual_only(creds_present: bool, platform: &[BootCheck]) -> Vec<BootCheck> {
         });
     }
     rows
+}
+
+/// Which model answers a chat turn, and whether that costs money.
+///
+/// The distinction this row exists to draw is CHOSE-the-platform versus
+/// FELL-BACK-to-it. [`chat_config::ChatTarget::default()`] is `Marc27`, the
+/// billed platform, so a config that is missing, empty, or unparseable reads
+/// identically to one that names it — and the user who set up a local server
+/// gets billed with no signal. Only the second case is a problem, so only the
+/// second case is reported as one.
+fn chat_route_check(prism_dir: &Path) -> BootCheck {
+    let path = prism_dir.join("config.toml");
+    // Did the FILE actually name a target? `load()` cannot answer this: it
+    // returns the default for "absent", "empty" and "unparseable" alike,
+    // which is exactly how the fallback stays invisible.
+    let declared = std::fs::read_to_string(&path).is_ok_and(|raw| {
+        toml::from_str::<toml::Value>(&raw)
+            .ok()
+            .is_some_and(|value| value.get("chat").is_some())
+    });
+
+    let (result, ok) = match chat_config::load().unwrap_or_default().chat {
+        chat_config::ChatTarget::Local { url, model, .. } => {
+            let reachable = tcp_reachable(&url);
+            (
+                format!(
+                    "local — {model} at {url}{}",
+                    if reachable {
+                        ""
+                    } else {
+                        " — NOT REACHABLE; start the server or `prism use marc27`"
+                    }
+                ),
+                reachable,
+            )
+        }
+        chat_config::ChatTarget::Provider {
+            provider, model, ..
+        } => (
+            format!("direct provider — {provider}, {model} (billed by {provider})"),
+            true,
+        ),
+        chat_config::ChatTarget::Marc27 { model } => {
+            let named = model.unwrap_or_else(|| "platform default".to_string());
+            if declared {
+                (format!("{} — {named} (BILLED)", brand_name()), true)
+            } else {
+                (
+                    format!(
+                        "no [chat] target in {} — defaulting to {} ({named}), which is BILLED. \
+                         `prism use local --url <url> --model <name>` to route to your own server",
+                        path.display(),
+                        brand_name(),
+                    ),
+                    false,
+                )
+            }
+        }
+    };
+    BootCheck {
+        name: "Chat route".to_string(),
+        result,
+        ok,
+        dots: 0,
+        delay_ms: 0,
+    }
+}
+
+/// Platform name for user-facing text, from `brand.toml` rather than a
+/// hardcoded "MARC27" — the same rule the rest of the CLI follows.
+fn brand_name() -> String {
+    prism_core::brand::brand().platform_name.clone()
+}
+
+/// Whether an OpenAI-compatible base URL answers a TCP connect.
+///
+/// Deliberately a connect and not a request: this runs on every `doctor`,
+/// a model server can take seconds to answer `/v1/models` while loading
+/// weights, and "the port is open" is the fact the row needs.
+fn tcp_reachable(url: &str) -> bool {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let default_port = if url.starts_with("https://") { 443 } else { 80 };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().unwrap_or(default_port)),
+        None => (authority, default_port),
+    };
+    std::net::TcpStream::connect_timeout(
+        &match format!("{host}:{port}").parse() {
+            Ok(addr) => addr,
+            // A hostname needs resolving; fall back to the resolving connect.
+            Err(_) => {
+                return std::net::TcpStream::connect((host, port)).is_ok();
+            }
+        },
+        std::time::Duration::from_millis(800),
+    )
+    .is_ok()
 }
 
 fn check_binary(name: &str, candidates: &[&str]) -> BootCheck {
