@@ -437,6 +437,20 @@ const AGREEMENT_STOPWORDS: &[&str] = &[
     "being", "into", "onto", "than", "then", "such", "which", "these", "those",
 ];
 
+/// Words that REVERSE a claim. A fact and its negation are not the same fact,
+/// and no amount of shared wording makes them one.
+///
+/// Measured false merge before this existed: `Ti-6Al-4V "is soluble in"
+/// hydrogen` and `Ti-6Al-4V "is not soluble in" hydrogen` reduced to
+/// predicate word sets {soluble} and {not, soluble} — jaccard 0.5, exactly the
+/// threshold — so two contradictory claims fused into ONE fact stamped
+/// "corroborated by 2 of 2". Fabricated agreement on a contradiction is the
+/// worst output this comparison can produce.
+const NEGATIONS: &[&str] = &[
+    "not", "non", "no", "never", "without", "cannot", "neither", "nor", "un", "absent", "lacks",
+    "lacking", "free",
+];
+
 /// Shortest predicate word that can name a relation. Applies to PREDICATES
 /// ONLY: "is obtained as" and "isObtainedBy" agree once the two-letter
 /// scaffolding is gone, while subjects and objects keep their short tokens
@@ -521,6 +535,36 @@ fn content_words(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether a word set asserts a negation.
+fn negated(words: &BTreeSet<String>) -> bool {
+    words.iter().any(|w| NEGATIONS.contains(&w.as_str()))
+}
+
+/// Whether a token is the KIND of word that distinguishes two otherwise
+/// identical phrases, and so must never be outvoted by shared boilerplate.
+///
+/// Jaccard weighs every word equally, which is wrong for this domain: in
+/// `Ti-6Al-4V specimen 1 built via laser powder bed fusion` versus the same
+/// with `specimen 2`, nine of eleven words match and the ONE word carrying the
+/// identity is outvoted (0.82, well over the floor). Measured the same way:
+/// `alpha-Ti-6Al-4V` and `beta-Ti-6Al-4V` microstructure merged at 0.75, which
+/// fuses two different phases of the same alloy — a distinction the whole
+/// field rests on.
+///
+/// So identifiers are treated as identity, not as evidence: anything carrying
+/// a digit, and anything one or two characters long (element symbols, phase
+/// prefixes, variant labels), must be present on BOTH sides or the two
+/// phrases are about different things.
+fn discriminative(word: &str) -> bool {
+    word.chars().any(|c| c.is_numeric()) || word.chars().count() <= 2
+}
+
+/// Whether the tokens that DIFFER between two phrases are all incidental.
+fn identifiers_agree(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
+    left.symmetric_difference(right)
+        .all(|word| !discriminative(word))
+}
+
 /// Overlap of two word sets, 1.0 when both are empty — two facts that both
 /// omit a field agree about it rather than differing.
 fn jaccard(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64 {
@@ -556,7 +600,10 @@ impl PredicateIdentity {
         }
         let words: BTreeSet<String> = content_words(predicate)
             .into_iter()
-            .filter(|w| w.len() >= MIN_PREDICATE_WORD)
+            // A negation is never scaffolding, however short it is: dropping
+            // "no" here would make "has solubility" and "has no solubility"
+            // the same relation.
+            .filter(|w| w.len() >= MIN_PREDICATE_WORD || NEGATIONS.contains(&w.as_str()))
             .filter(|w| !AGREEMENT_COPULAS.contains(&w.as_str()))
             .collect();
         if words.is_empty() {
@@ -627,11 +674,39 @@ impl FactIdentity {
     }
 
     fn same_fact(&self, other: &Self) -> bool {
+        // A claim with NO SUBJECT is an extraction failure, not a shared
+        // claim. `jaccard` treats two empty sets as agreement — right for a
+        // unit, which is legitimately absent, and wrong here: it would hand
+        // two blank-subject failures a "corroborated" stamp for failing the
+        // same way.
+        if self.subject.is_empty() || other.subject.is_empty() {
+            return false;
+        }
+        // Negation parity, across predicate AND object, because either can
+        // carry it ("is not soluble" / "shows no solubility").
+        if self.negates() != other.negates() {
+            return false;
+        }
         self.value == other.value
             && self.unit == other.unit
             && self.predicate.agrees_with(&other.predicate)
             && jaccard(&self.subject, &other.subject) >= SUBJECT_AGREEMENT
             && jaccard(&self.object, &other.object) >= OBJECT_AGREEMENT
+            // Identity beats similarity: `specimen 1` is not `specimen 2` no
+            // matter how much surrounding wording they share.
+            && identifiers_agree(&self.subject, &other.subject)
+            && identifiers_agree(&self.object, &other.object)
+    }
+
+    /// Whether this claim is a denial, wherever the denial was written.
+    fn negates(&self) -> bool {
+        let predicate_negated = match &self.predicate {
+            PredicateIdentity::Words(words) => negated(words),
+            // A bare copula carries no negation, and an IRI's polarity is the
+            // ontology's business, not a word match's.
+            PredicateIdentity::Copula | PredicateIdentity::Iri(_) => false,
+        };
+        predicate_negated || negated(&self.object)
     }
 }
 
@@ -3556,6 +3631,134 @@ mod tests {
             .report(),
             None
         );
+    }
+
+    /// A CLAIM AND ITS DENIAL ARE NOT THE SAME CLAIM.
+    ///
+    /// Found by adversarial review, with this exact input. The predicate words
+    /// reduced to {soluble} and {not, soluble} — jaccard 0.5, landing exactly
+    /// ON the threshold — so two contradictory statements merged into one fact
+    /// stamped "corroborated by 2 of 2". Inventing agreement between a claim
+    /// and its negation is the worst result this comparison can produce: it
+    /// does not merely lose a fact, it manufactures confidence in a
+    /// contradiction.
+    #[test]
+    fn a_claim_and_its_negation_never_corroborate_each_other() {
+        let sampling =
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap();
+        for (affirm, deny) in [
+            ("is soluble in", "is not soluble in"),
+            ("has solubility in", "has no solubility in"),
+            ("dissolves in", "never dissolves in"),
+        ] {
+            let kept = kept_facts(
+                vec![
+                    vec![worded("Ti-6Al-4V", affirm, "hydrogen", None)],
+                    vec![worded("Ti-6Al-4V", deny, "hydrogen", None)],
+                ],
+                sampling,
+                2,
+            );
+            assert_eq!(
+                kept.len(),
+                2,
+                "{affirm:?} and {deny:?} are opposite claims, not one corroborated claim"
+            );
+            for cited in &kept {
+                assert!(
+                    cited
+                        .fact
+                        .verification_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("1 of 2")),
+                    "neither may be reported as corroborated: {cited:?}"
+                );
+            }
+        }
+    }
+
+    /// AN IDENTIFIER IS IDENTITY, NOT ONE VOTE AMONG MANY.
+    ///
+    /// Also from adversarial review. Jaccard weighs every word equally, so a
+    /// long shared phrase drowns the one word that carries the identity:
+    /// `specimen 1` and `specimen 2` shared 9 of 11 words (0.82) and merged,
+    /// as did `alpha-` and `beta-Ti-6Al-4V microstructure` (0.75) — fusing two
+    /// phases of one alloy, a distinction this whole field rests on.
+    #[test]
+    fn a_differing_identifier_blocks_a_merge_however_much_else_matches() {
+        let sampling =
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap();
+        for (left, right) in [
+            (
+                "Ti-6Al-4V specimen 1 built via laser powder bed fusion",
+                "Ti-6Al-4V specimen 2 built via laser powder bed fusion",
+            ),
+            ("α-Ti-6Al-4V microstructure", "β-Ti-6Al-4V microstructure"),
+            (
+                "sample A of the printed bracket",
+                "sample B of the printed bracket",
+            ),
+        ] {
+            let kept = kept_facts(
+                vec![
+                    vec![worded(
+                        left,
+                        "has hardness",
+                        "measured hardness",
+                        Some(400.0),
+                    )],
+                    vec![worded(
+                        right,
+                        "has hardness",
+                        "measured hardness",
+                        Some(400.0),
+                    )],
+                ],
+                sampling,
+                2,
+            );
+            assert_eq!(
+                kept.len(),
+                2,
+                "{left:?} and {right:?} name different things and must not merge"
+            );
+        }
+    }
+
+    /// A BLANK SUBJECT IS A FAILURE, NOT A SHARED CLAIM.
+    ///
+    /// `jaccard` treats two empty sets as agreement — correct for a unit,
+    /// which is legitimately absent, and wrong for a subject. Adversarial
+    /// review showed two samples that both extracted nothing being handed a
+    /// "corroborated by 2 of 2" stamp for failing in the same way.
+    #[test]
+    fn two_blank_subjects_do_not_corroborate_one_another() {
+        let kept = kept_facts(
+            vec![
+                vec![worded(
+                    "   ",
+                    "has hardness",
+                    "measured hardness",
+                    Some(400.0),
+                )],
+                vec![worded("", "has hardness", "measured hardness", Some(400.0))],
+            ],
+            SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
+                .unwrap(),
+            2,
+        );
+        for cited in &kept {
+            assert!(
+                cited
+                    .fact
+                    .verification_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("1 of 2")),
+                "a subjectless extraction must never be reported as corroborated: {cited:?}"
+            );
+        }
     }
 
     /// THE NUMBER IS STILL COMPARED EXACTLY.

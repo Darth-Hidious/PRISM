@@ -146,25 +146,28 @@ class TestBackendsAreSwappable:
             PatentCollector().collect("alloy")
         assert client.query.called
 
-    def test_an_operator_can_bring_their_own_backend(self, cache_dir, monkeypatch):
-        from app.tools.data_collectors import patent_collector as mod
+    def test_an_operator_replaces_the_whole_collector_to_bring_their_own(self, cache_dir):
+        """The extension path is the EXISTING one: the collector registry is
+        keyed by name, so a site's own "patents" collector replaces this one.
+        No second plugin system for one source."""
+        from app.tools.data_collectors.base_collector import (
+            CollectorRegistry,
+            DataCollector,
+        )
 
-        calls = []
+        class InHousePatents(DataCollector):
+            name = "patents"
 
-        def internal_system(query, max_results):
-            calls.append(query)
-            return [mod._shape(
-                number="INT-1", title="internal", abstract="", published="",
-                inventors=[], applicants=[], jurisdiction="XX", source="in_house",
-            )]
+            def collect(self, query="", max_results=20, **kwargs):
+                return [{"source": "in_house", "source_id": "patent:INT-1"}]
 
-        mod.register_backend("in_house", internal_system)
-        monkeypatch.setenv("PRISM_PATENT_BACKEND", "in_house")
-        results = PatentCollector().collect("alloy")
-        assert calls == ["alloy"]
-        assert results[0]["source"] == "in_house"
-        # Same shape as every other backend — that is what makes it swappable.
-        assert results[0]["evidence_kind"] == "claim"
+            def supported_params(self):
+                return ["query", "max_results"]
+
+        reg = CollectorRegistry()
+        reg.register(PatentCollector())
+        reg.register(InHousePatents())
+        assert reg.get("patents").collect(query="alloy")[0]["source"] == "in_house"
 
     def test_lens_backend_demands_its_token_rather_than_returning_empty(
         self, cache_dir, monkeypatch
@@ -192,17 +195,90 @@ class TestBackendsAreSwappable:
     def test_backends_do_not_share_a_cache_entry(self, cache_dir, monkeypatch):
         """Two services disagree; serving one's answer for the other would
         misreport prior art."""
-        from app.tools.data_collectors import patent_collector as mod
+        monkeypatch.setenv("LENS_API_TOKEN", "t")
+        lens_rows = {"data": [{"lens_id": "L-1", "title": "lens hit"}]}
+        resp = MagicMock()
+        resp.json.return_value = lens_rows
+        resp.raise_for_status = MagicMock()
 
-        mod.register_backend("bk_a", lambda q, n: [mod._shape(
-            number="A-1", title="a", abstract="", published="", inventors=[],
-            applicants=[], jurisdiction="", source="a")])
-        mod.register_backend("bk_b", lambda q, n: [mod._shape(
-            number="B-1", title="b", abstract="", published="", inventors=[],
-            applicants=[], jurisdiction="", source="b")])
-        monkeypatch.setenv("PRISM_PATENT_BACKEND", "bk_a")
-        first = PatentCollector().collect("same query")
-        monkeypatch.setenv("PRISM_PATENT_BACKEND", "bk_b")
-        second = PatentCollector().collect("same query")
-        assert first[0]["source_id"] == "patent:A-1"
-        assert second[0]["source_id"] == "patent:B-1"
+        monkeypatch.setenv("PRISM_PATENT_BACKEND", "bigquery")
+        with patch("google.cloud.bigquery.Client", return_value=_client_returning([ROW])):
+            first = PatentCollector().collect("same query")
+
+        monkeypatch.setenv("PRISM_PATENT_BACKEND", "lens")
+        with patch("requests.post", return_value=resp):
+            second = PatentCollector().collect("same query")
+
+        assert first[0]["source_id"] == "patent:US-2024300018-A1"
+        assert second[0]["source_id"] == "patent:L-1"
+
+
+class TestAMalformedResponseIsNotAClearField:
+    """Found by adversarial review: a 200 whose body lacks the results key
+    returned [] AND cached it for 30 days — the exact "nobody has patented
+    this" lie the module's docstring warns against."""
+
+    def test_lens_missing_data_key_raises(self, cache_dir, monkeypatch):
+        monkeypatch.setenv("PRISM_PATENT_BACKEND", "lens")
+        monkeypatch.setenv("LENS_API_TOKEN", "t")
+        resp = MagicMock()
+        resp.json.return_value = {"status": "throttled", "message": "slow down"}
+        resp.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=resp):
+            with pytest.raises(CollectorConfigError, match="no `data` array"):
+                PatentCollector().collect("alloy")
+
+    def test_platform_missing_results_key_raises(self, cache_dir, monkeypatch):
+        monkeypatch.setenv("PRISM_PATENT_BACKEND", "platform")
+        monkeypatch.setenv("PRISM_PLATFORM_URL", "https://example.invalid")
+        monkeypatch.setenv("PRISM_PLATFORM_TOKEN", "t")
+        resp = MagicMock()
+        resp.json.return_value = {"detail": "degraded"}
+        resp.raise_for_status = MagicMock()
+        with patch("requests.get", return_value=resp):
+            with pytest.raises(CollectorConfigError, match="no `results` array"):
+                PatentCollector().collect("alloy")
+
+    def test_a_genuinely_empty_field_is_still_allowed(self, cache_dir, monkeypatch):
+        """Zero hits is a real answer; only a MISSING key is a failure."""
+        monkeypatch.setenv("PRISM_PATENT_BACKEND", "lens")
+        monkeypatch.setenv("LENS_API_TOKEN", "t")
+        resp = MagicMock()
+        resp.json.return_value = {"data": []}
+        resp.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=resp):
+            assert PatentCollector().collect("nothing matches this") == []
+
+    def test_a_broken_response_is_never_cached(self, cache_dir, monkeypatch):
+        monkeypatch.setenv("PRISM_PATENT_BACKEND", "lens")
+        monkeypatch.setenv("LENS_API_TOKEN", "t")
+        bad = MagicMock()
+        bad.json.return_value = {"status": "throttled"}
+        bad.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=bad):
+            with pytest.raises(CollectorConfigError):
+                PatentCollector().collect("alloy")
+        good = MagicMock()
+        good.json.return_value = {"data": [{"lens_id": "L-9", "title": "real hit"}]}
+        good.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=good):
+            assert len(PatentCollector().collect("alloy")) == 1
+
+    def test_a_different_account_does_not_read_another_tenants_cache(
+        self, cache_dir, monkeypatch
+    ):
+        """The docstring recommends SHARED cache storage, so the key must carry
+        whose view of the corpus produced it — a private CPC extract must not
+        answer a deployment that never had access to it."""
+        monkeypatch.setenv("PRISM_PATENT_TABLE", "tenant-a.private.extract")
+        with patch("google.cloud.bigquery.Client", return_value=_client_returning([ROW])):
+            first = PatentCollector().collect("shared term")
+        assert len(first) == 1
+
+        monkeypatch.setenv("PRISM_PATENT_TABLE", "tenant-b.other.extract")
+        other = MagicMock()
+        other.query.return_value.result.return_value = iter([])
+        with patch("google.cloud.bigquery.Client", return_value=other) as client:
+            second = PatentCollector().collect("shared term")
+        assert client.called, "tenant B must not be served tenant A's cached rows"
+        assert second == []

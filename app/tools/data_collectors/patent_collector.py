@@ -17,8 +17,12 @@ same result shape. Selected with `PRISM_PATENT_BACKEND`:
                default because it is the one that works with no purchase.
     platform   PRISM's hosted patent service. Billed per search.
     lens       Lens.org, with the operator's `LENS_API_TOKEN`.
-    <custom>   Any entry registered through `register_backend`, so a site can
-               bring an internal system without editing this file.
+
+A site whose patent source is none of these does not need a hook here: the
+collector registry is keyed by name, so registering a `DataCollector` called
+"patents" replaces this one wholesale. That is the same extension path every
+other source uses, and one plane is worth more than a bespoke plugin system
+per collector.
 
 CACHE IN FRONT OF ALL OF THEM. Prior-art search recurs across turns, agents
 and sessions within one investigation, and every backend charges for a repeat
@@ -32,12 +36,13 @@ An empty result is NEVER invented. Every backend raises on failure, because
 conclusion nothing may guess at.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from app.tools.data_collectors.base_collector import CollectorConfigError, DataCollector
 
@@ -48,13 +53,18 @@ PUBLIC_TABLE = "patents-public-data.patents.publications"
 #: theatre.
 DEFAULT_TTL_SECONDS = 30 * 24 * 3600
 
-#: backend name -> callable(query, max_results) -> list of result dicts.
-_BACKENDS: Dict[str, Callable[[str, int], List[Dict]]] = {}
+def _scope_fingerprint() -> str:
+    """Short, non-reversible tag for WHOSE view of the corpus this is.
 
-
-def register_backend(name: str, fn: Callable[[str, int], List[Dict]]) -> None:
-    """Register a patent backend so a site can bring its own without a fork."""
-    _BACKENDS[name] = fn
+    Hashed rather than stored: the inputs include credentials, and a cache
+    index is not a place to keep them. Only a change of account or table needs
+    to be detectable, and a digest does that.
+    """
+    material = "|".join(
+        os.getenv(name, "")
+        for name in ("PRISM_PATENT_TABLE", "LENS_API_TOKEN", "PRISM_PLATFORM_URL")
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
 
 
 def _cache_path() -> Path:
@@ -180,6 +190,15 @@ def _lens_backend(query: str, max_results: int) -> List[Dict]:
         # 429 or a schema change all read as "no patents exist".
         raise CollectorConfigError(f"Lens.org patent search failed ({error})") from error
 
+    # A 200 whose body has no `data` key is a BROKEN response, not a clear
+    # field. Throttle notices and schema changes arrive shaped like this, and
+    # returning [] would cache "nobody has patented this" for the full TTL.
+    if not isinstance(data.get("data"), list):
+        raise CollectorConfigError(
+            f"Lens.org returned no `data` array (keys: {sorted(data)[:6]}); "
+            "treating this as a failed search, not an empty result"
+        )
+
     return [
         _shape(
             number=hit.get("lens_id", ""),
@@ -219,6 +238,13 @@ def _platform_backend(query: str, max_results: int) -> List[Dict]:
     except Exception as error:
         raise CollectorConfigError(f"platform patent search failed ({error})") from error
 
+    # As above: absent key != zero results.
+    if not isinstance(data.get("results"), list):
+        raise CollectorConfigError(
+            f"platform returned no `results` array (keys: {sorted(data)[:6]}); "
+            "treating this as a failed search, not an empty result"
+        )
+
     return [
         _shape(
             number=hit.get("publication_number", ""),
@@ -253,9 +279,13 @@ def _shape(*, number, title, abstract, published, inventors, applicants, jurisdi
     }
 
 
-register_backend("bigquery", _bigquery_backend)
-register_backend("lens", _lens_backend)
-register_backend("platform", _platform_backend)
+#: The built-in services. Replacing the whole collector is the supported way
+#: to add one, so this stays a plain lookup rather than a mutable registry.
+_BACKENDS = {
+    "bigquery": _bigquery_backend,
+    "lens": _lens_backend,
+    "platform": _platform_backend,
+}
 
 
 class PatentCollector(DataCollector):
@@ -270,9 +300,12 @@ class PatentCollector(DataCollector):
                 f"unknown patent backend {backend!r}; available: "
                 f"{', '.join(sorted(_BACKENDS))}"
             )
-        # Keyed by backend too: two services do not agree on results, and
-        # serving one's answer for the other would misreport prior art.
-        key = f"{backend}|{query.strip().lower()}|{max_results}"
+        # Keyed by backend AND by which account/table answered. Two services
+        # do not agree, and neither do two tenants: the docstring recommends
+        # pointing the cache at shared storage, so without this a deployment
+        # reading a private CPC extract would serve those results to a
+        # deployment that never had access to it.
+        key = f"{backend}|{_scope_fingerprint()}|{query.strip().lower()}|{max_results}"
 
         cached = self._cache_get(key)
         if cached is not None:

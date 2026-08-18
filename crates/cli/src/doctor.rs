@@ -74,7 +74,7 @@ pub async fn run(project_root: &Path, python_bin: &Path, fix: bool) -> Result<()
     //
     // A local server that is configured but DOWN is the same class of
     // problem from the other end, so the row reports reachability too.
-    checks.push(chat_route_check(&prism_dir));
+    checks.push(chat_route_check());
 
     // 2. Embedding model. This used to look for
     //    `models/embeddinggemma-300m.gguf` and claim it "auto-downloads on
@@ -428,18 +428,43 @@ fn manual_only(creds_present: bool, platform: &[BootCheck]) -> Vec<BootCheck> {
 /// identically to one that names it — and the user who set up a local server
 /// gets billed with no signal. Only the second case is a problem, so only the
 /// second case is reported as one.
-fn chat_route_check(prism_dir: &Path) -> BootCheck {
-    let path = prism_dir.join("config.toml");
+fn chat_route_check() -> BootCheck {
+    // BOTH halves must read the SAME file. An earlier version took the prism
+    // directory as an argument and inspected `<that>/config.toml` while
+    // `load()` resolved its own path — so the row could report on one file and
+    // route by another, which is precisely the class of failure it exists to
+    // catch.
+    let path = chat_config::config_path().unwrap_or_else(|_| PathBuf::from("config.toml"));
     // Did the FILE actually name a target? `load()` cannot answer this: it
     // returns the default for "absent", "empty" and "unparseable" alike,
     // which is exactly how the fallback stays invisible.
+    // DECLARED means "this file names a target `load()` could actually use",
+    // not merely "a [chat] table exists". Adversarial review found the weaker
+    // check reporting the same silent fallback this row exists to catch: a
+    // `[chat]` block missing a required field is valid TOML, so the key is
+    // present, but the structured parse fails and `load()` returns the billed
+    // default — and the row called that a deliberate choice.
     let declared = std::fs::read_to_string(&path).is_ok_and(|raw| {
         toml::from_str::<toml::Value>(&raw)
             .ok()
-            .is_some_and(|value| value.get("chat").is_some())
+            .and_then(|value| value.get("chat").cloned())
+            .is_some_and(|chat| chat.try_into::<chat_config::ChatTarget>().is_ok())
     });
 
-    let (result, ok) = match chat_config::load().unwrap_or_default().chat {
+    chat_route_row(
+        declared,
+        chat_config::load().unwrap_or_default().chat,
+        &path,
+    )
+}
+
+/// The row itself, as a pure decision over what was found.
+///
+/// Split out so the verdict can be tested without standing up a HOME: all the
+/// behaviour worth guarding is the mapping from (was a target declared?, which
+/// target) to a verdict.
+fn chat_route_row(declared: bool, target: chat_config::ChatTarget, path: &Path) -> BootCheck {
+    let (result, ok) = match target {
         chat_config::ChatTarget::Local { url, model, .. } => {
             let reachable = tcp_reachable(&url);
             (
@@ -875,5 +900,114 @@ mod tests {
             manual_only(true, &platform).is_empty(),
             "opt-in and downstream rows must not appear under Repairs",
         );
+    }
+
+    /// THE ROW THAT SAYS WHETHER THE NEXT QUESTION IS BILLED.
+    ///
+    /// [`chat_config::ChatTarget::default`] is the paid platform, so a
+    /// `config.toml` that is missing, empty or unparseable silently moves chat
+    /// off a local server onto billed hosting. Measured on a live machine: the
+    /// file was truncated to zero bytes, every other doctor row still read
+    /// green, `llama-server running [OK]` sat directly above it, and nothing
+    /// said the next question would cost money. The distinction the row exists
+    /// to draw is CHOSE-the-platform versus FELL-BACK-to-it, so both
+    /// directions are pinned.
+    #[test]
+    fn chat_route_separates_a_chosen_platform_from_a_silent_fallback() {
+        let path = Path::new("/nonexistent/config.toml");
+
+        // Undeclared: absent, empty and unparseable all arrive here, because
+        // `load()` returns the same default for every one of them.
+        let fell_back = chat_route_row(false, chat_config::ChatTarget::default(), path);
+        assert!(!fell_back.ok, "a silent fallback must not read as healthy");
+        assert!(fell_back.result.contains("BILLED"), "{}", fell_back.result);
+        assert!(
+            fell_back.result.contains("no [chat] target"),
+            "name the cause: {}",
+            fell_back.result
+        );
+        assert!(
+            fell_back.result.contains("prism use local"),
+            "an actionable way out belongs in the row: {}",
+            fell_back.result
+        );
+
+        // The SAME target, deliberately chosen, is not a fault. The row states
+        // the cost without crying wolf, or operators learn to ignore it.
+        let chosen = chat_route_row(true, chat_config::ChatTarget::default(), path);
+        assert!(chosen.ok, "an explicit choice is not a misconfiguration");
+        assert!(chosen.result.contains("BILLED"), "{}", chosen.result);
+    }
+
+    /// A [chat] TABLE THAT DOES NOT PARSE IS NOT A CHOICE.
+    ///
+    /// Adversarial review found this row reporting the very fallback it exists
+    /// to catch: `[chat] mode="local" url="..."` with no `model` is valid TOML,
+    /// so a bare key-presence check called it declared, while `load()` failed
+    /// the structured parse and returned the BILLED default. Green row, silent
+    /// billing — the original bug, one layer down.
+    #[test]
+    fn a_chat_table_that_fails_to_parse_is_not_a_deliberate_choice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        // Valid TOML, invalid ChatTarget: `local` requires a model.
+        std::fs::write(&path, "[chat]\nmode = \"local\"\nurl = \"http://x/v1\"\n").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let declared = toml::from_str::<toml::Value>(&raw)
+            .ok()
+            .and_then(|value| value.get("chat").cloned())
+            .is_some_and(|chat| chat.try_into::<chat_config::ChatTarget>().is_ok());
+        assert!(
+            !declared,
+            "a [chat] table that cannot become a ChatTarget must not count as declared"
+        );
+        let row = chat_route_row(declared, chat_config::ChatTarget::default(), &path);
+        assert!(!row.ok, "the row must flag it, not bless it");
+        assert!(row.result.contains("BILLED"), "{}", row.result);
+    }
+
+    /// A configured-but-down local server is the same problem from the other
+    /// end, and was equally invisible before this row existed.
+    #[test]
+    fn chat_route_reports_a_configured_but_unreachable_local_server() {
+        // Port 9 is discard; nothing listens on a normal host.
+        let down = chat_route_row(
+            true,
+            chat_config::ChatTarget::Local {
+                url: "http://127.0.0.1:9/v1".to_string(),
+                model: "some-model".to_string(),
+                api_key: None,
+            },
+            Path::new("/nonexistent/config.toml"),
+        );
+        assert!(
+            !down.ok,
+            "an unreachable local server must not read as healthy"
+        );
+        assert!(
+            down.result.contains("NOT REACHABLE"),
+            "say so plainly: {}",
+            down.result
+        );
+        assert!(
+            down.result.contains("some-model"),
+            "name the model it would have used: {}",
+            down.result
+        );
+    }
+
+    /// Malformed URLs must return a verdict, never panic the whole diagnostic.
+    #[test]
+    fn reachability_never_panics_on_a_malformed_url() {
+        for url in [
+            "http://127.0.0.1:8081/v1",
+            "http://127.0.0.1/v1",
+            "https://example.invalid/v1",
+            "http://[::1]:8081/v1",
+            "not-a-url",
+            "",
+        ] {
+            let _ = tcp_reachable(url);
+        }
     }
 }
