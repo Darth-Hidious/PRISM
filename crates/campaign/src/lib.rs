@@ -1121,6 +1121,9 @@ pub struct Campaign {
 struct LocalNodeIdentity {
     user_id: String,
     display_name: Option<String>,
+    /// The PLATFORM token, carried because minting a node session without it
+    /// produces an anonymous-local caller — see `call_evaluation_tool`.
+    access_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2532,6 +2535,7 @@ fn load_local_node_identity(paths: &prism_runtime::PrismPaths) -> Result<LocalNo
     Ok(LocalNodeIdentity {
         user_id,
         display_name: credentials.display_name,
+        access_token: credentials.access_token,
     })
 }
 
@@ -2563,10 +2567,27 @@ async fn call_evaluation_tool(
             "campaign evaluation has no PRISM identity; authenticate with `prism login --no-browser` (or `prism login --token <PAT>` for non-interactive authentication) and retry"
         )
     })?;
-    let node_token = prism_client::node_session::mint_local_session(
+    // WITH the platform token, or the node refuses every evaluation.
+    //
+    // `mint_local_session` is documented to stay anonymous-local: "the node
+    // deliberately ignores `user_id` unless this token verifies against the
+    // linked platform ... a bare `mint_local_session` remains anonymous-local
+    // for legacy local callers." The evaluator requires a verified node-owner
+    // session, so a campaign minting the bare session could never score a
+    // single candidate — measured: every proposal evaluated to HTTP 422
+    // "Platform access denied: this request requires a verified node-owner
+    // session", so the loop died on iteration 1 having produced candidates it
+    // could not rank.
+    //
+    // Two callers already did this correctly (`workflows.rs`,
+    // `command_tools::mint_agent_node_token`); this one and `main.rs:12963`
+    // took the legacy door. A `_with_x` twin where one variant silently
+    // downgrades the caller is the shape that keeps producing this.
+    let node_token = prism_client::node_session::mint_local_session_with_platform_token(
         base,
         &identity.user_id,
         identity.display_name.as_deref(),
+        Some(identity.access_token.as_str()),
     )
     .await
     .with_context(|| {
@@ -2770,6 +2791,7 @@ mod tests {
         let identity = LocalNodeIdentity {
             user_id: "campaign-user".into(),
             display_name: Some("Campaign User".into()),
+            access_token: "test-platform-token".to_string(),
         };
 
         let properties = call_evaluate_material(&base, "W0.5 Mo0.5", Some(&identity))
@@ -2802,6 +2824,7 @@ mod tests {
         let identity = LocalNodeIdentity {
             user_id: "campaign-user".into(),
             display_name: None,
+            access_token: "test-platform-token".to_string(),
         };
 
         let error = call_evaluate_material(&base, "W0.5 Mo0.5", Some(&identity))
@@ -2842,6 +2865,7 @@ mod tests {
         let identity = LocalNodeIdentity {
             user_id: "campaign-user".into(),
             display_name: None,
+            access_token: "test-platform-token".to_string(),
         };
 
         let error = call_evaluate_material(&base, "W0.5 Mo0.5", Some(&identity))
