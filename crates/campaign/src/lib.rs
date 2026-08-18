@@ -2029,6 +2029,26 @@ impl Campaign {
             base_url,
             api_key,
             model: model.clone(),
+            // TWO DISAGREEING DEADLINES, AND THE SHORTER ONE WINS SILENTLY.
+            //
+            // `..Default::default()` took `LlmConfig`'s 300s read deadline,
+            // while the configured default is 0 — no deadline — precisely
+            // because a long generation must not be cut mid-flight. The core
+            // config records this exact bug being fixed once already on the
+            // ingest path; the campaign kept it.
+            //
+            // Measured: a proposal call to a local 12B reasoner ran 8,813
+            // decoded tokens at ~29 tok/s — about five minutes — and died on
+            // the 300s deadline with the connection dropped. Not one iteration
+            // completed, and the loop cannot start without its first proposal.
+            // A campaign is long-running batch work bounded by `--budget` and
+            // `--max-iterations`; a read deadline is the wrong instrument, and
+            // cutting a generation costs the whole iteration.
+            timeout_secs: 0,
+            // Carried through rather than dropped: these are what bound
+            // generation and size the elision budget.
+            context_window: resolved.as_ref().and_then(|llm| llm.context_window),
+            max_output_tokens: resolved.as_ref().and_then(|llm| llm.max_output_tokens),
             embedding_model: resolved.and_then(|llm| llm.embedding_model),
             ..Default::default()
         };

@@ -688,3 +688,68 @@ pub(crate) fn weighted_reward(
     }
     Ok(reward)
 }
+
+#[cfg(test)]
+mod reward_specification {
+    use super::*;
+
+    /// A WEIGHTED REWARD MUST PREFER AN ACTUAL HIGH-ENTROPY ALLOY.
+    ///
+    /// Measured on a real 25-iteration run optimising `Tm_estimate_K` alone:
+    /// the loop climbed monotonically 3366.5 -> 3693.8 and converged on
+    /// `W0.995 Re0.005` — 100.0% of pure tungsten's melting point, with mixing
+    /// entropy down from 11.36 to 0.26 J/mol.K. A rule-of-mixtures average is
+    /// maximised by 100% of the highest-melting element, so "maximise Tm" has a
+    /// degenerate optimum that is not an alloy at all; the 0.5% Re was there
+    /// only to satisfy the two-element rule.
+    ///
+    /// The loop was working. The objective was wrong. This pins the fix:
+    /// with entropy weighted in, a real HEA must outrank near-pure tungsten.
+    #[test]
+    fn entropy_weighting_beats_the_degenerate_pure_element_optimum() {
+        let mut config = CampaignConfig::default();
+        config.reward_weights.insert("Tm_estimate_K".into(), 1.0);
+        config
+            .reward_weights
+            .insert("delta_S_mix_J_per_molK".into(), 100.0);
+
+        // The degenerate winner the Tm-only campaign actually converged on.
+        let near_pure_w = serde_json::json!({
+            "Tm_estimate_K": 3693.8, "delta_S_mix_J_per_molK": 0.26
+        });
+        // An equimolar four-element refractory HEA.
+        let real_hea = serde_json::json!({
+            "Tm_estimate_K": 3157.8, "delta_S_mix_J_per_molK": 11.53
+        });
+
+        let degenerate = weighted_reward(&config, &near_pure_w, "hea_descriptors").unwrap();
+        let alloy = weighted_reward(&config, &real_hea, "hea_descriptors").unwrap();
+        assert!(
+            alloy > degenerate,
+            "an actual HEA must outrank near-pure tungsten: {alloy} vs {degenerate}"
+        );
+
+        // And the single-property reward must still prefer the degenerate one —
+        // proving the difference is the OBJECTIVE, not the machinery.
+        let tm_only = CampaignConfig::default();
+        assert!(tm_only.reward_weights.is_empty());
+        assert!(
+            near_pure_w["Tm_estimate_K"].as_f64() > real_hea["Tm_estimate_K"].as_f64(),
+            "Tm alone genuinely favours the pure element; that was never a bug in the loop"
+        );
+    }
+
+    /// A weight naming a property the evaluator does not report must fail
+    /// loudly, not score zero and rank on the rest.
+    #[test]
+    fn a_missing_weighted_property_is_an_error() {
+        let mut config = CampaignConfig::default();
+        config
+            .reward_weights
+            .insert("not_a_real_property".into(), 1.0);
+        let props = serde_json::json!({"Tm_estimate_K": 3157.8});
+        let error = weighted_reward(&config, &props, "hea_descriptors")
+            .expect_err("a property the evaluator never returned must not score 0");
+        assert!(format!("{error}").contains("not_a_real_property"));
+    }
+}

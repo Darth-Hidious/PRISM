@@ -938,6 +938,23 @@ enum CampaignCommands {
         /// English words.
         #[arg(long)]
         target_property: Option<String>,
+        /// Weighted reward over SEVERAL declared properties, repeatable:
+        /// `--reward-weight Tm_estimate_K=1 --reward-weight delta_S_mix_J_per_molK=100`.
+        ///
+        /// A single `--target-property` optimises one number, and a
+        /// single-number objective can have a degenerate optimum. Measured: a
+        /// 25-iteration run maximising `Tm_estimate_K` — a rule-of-mixtures
+        /// average, so maximised by 100% of the highest-melting element —
+        /// climbed monotonically to `W0.995 Re0.005`, reaching 100.0% of pure
+        /// tungsten's melting point while its mixing entropy fell from 11.36
+        /// to 0.26 J/mol·K. It optimised away from "high-entropy alloy" for
+        /// 25 straight iterations, keeping 0.5% Re only to satisfy the
+        /// two-element rule. The loop was right; the objective was not.
+        ///
+        /// Weights are applied to the evaluator's own keys, so a trade-off is
+        /// STATED rather than left to a constraint to police.
+        #[arg(long = "reward-weight", value_name = "PROPERTY=WEIGHT")]
+        reward_weight: Vec<String>,
         /// Maximum number of discovery iterations.
         #[arg(long, default_value_t = 50)]
         max_iterations: usize,
@@ -2247,6 +2264,7 @@ async fn main() -> Result<()> {
                     elements,
                     objective,
                     target_property,
+                    reward_weight,
                     max_iterations,
                     batch_size,
                     budget,
@@ -2282,6 +2300,30 @@ async fn main() -> Result<()> {
                         seeds: Vec::new(),
                     };
 
+                    // Parsed here rather than deeper: a malformed weight is a
+                    // typo in the command, and the operator should hear about
+                    // it before a campaign starts spending, not on iteration 1.
+                    let mut reward_weights = std::collections::BTreeMap::new();
+                    for pair in &reward_weight {
+                        let (property, weight) = pair.split_once('=').ok_or_else(|| {
+                            anyhow!(
+                                "invalid --reward-weight {pair:?}. Expected PROPERTY=WEIGHT, \
+                                 e.g. --reward-weight Tm_estimate_K=1"
+                            )
+                        })?;
+                        let parsed: f64 = weight.trim().parse().with_context(|| {
+                            format!("--reward-weight {pair:?}: {weight:?} is not a number")
+                        })?;
+                        reward_weights.insert(property.trim().to_string(), parsed);
+                    }
+                    if !reward_weights.is_empty() && target_property.is_some() {
+                        // Both would silently pick one path; say which wins.
+                        println!(
+                            "  note: --reward-weight is set, so the weighted reward is used \
+                             and --target-property is ignored"
+                        );
+                    }
+
                     let config = CampaignConfig {
                         max_iterations,
                         batch_size,
@@ -2289,6 +2331,7 @@ async fn main() -> Result<()> {
                         checkpoint_every,
                         approval_gate_at: gates_vec,
                         project_root: Some(project_root.clone()),
+                        reward_weights,
                         ..Default::default()
                     };
 
@@ -6384,6 +6427,8 @@ pub(crate) fn build_llm_config(
         }
     };
 
+    // Read before the move into the struct below.
+    let model_for_limits = model.clone();
     Ok(prism_ingest::LlmConfig {
         base_url,
         model,
@@ -6394,6 +6439,30 @@ pub(crate) fn build_llm_config(
         // diagnostic tells users to raise. It existed in the message but not
         // in the config until 2026-08-10.
         max_output_tokens: llm.max_output_tokens,
+        // THE MODEL'S REAL CONTEXT WINDOW, resolved from the registry that
+        // already knows it rather than left `None`.
+        //
+        // PRISM deliberately does not cap output on the operator's behalf
+        // (see `LlmClient::effective_max_tokens`): a fixed ceiling silently
+        // breaks any model that reasons before it answers, which it did once
+        // already. The bound that justifies that policy is the CONTEXT
+        // WINDOW — and on this path there wasn't one, so nothing bounded
+        // generation at all.
+        //
+        // Measured: a campaign proposal call against a local 12B reasoner ran
+        // to 8,813 decoded tokens, roughly five minutes, and died on the
+        // 300-second HTTP timeout with the connection dropped mid-message.
+        // Not one iteration completed. The same `None` also left every HTTP
+        // model on the ingest path sharing one hardcoded elision budget.
+        //
+        // `get_model_config` is the registry the agent loop already uses —
+        // fuzzy id match, sanity clamps, user models ahead of the catalog
+        // cache ahead of the static seed. Reused here rather than reimplemented,
+        // because a second answer to "how big is this model's window" is how
+        // the first one drifted.
+        context_window: Some(
+            prism_agent::models::get_model_config(&model_for_limits).context_window as u64,
+        ),
         ..Default::default()
     })
 }
@@ -15531,6 +15600,40 @@ mod tests {
             None
         );
         assert_eq!(dropped_relationships_report(&serde_json::json!({})), None);
+    }
+
+    /// EVERY MODEL GETS ITS REAL WINDOW, not `None`.
+    ///
+    /// `build_llm_config` left `context_window` unset, and that single `None`
+    /// removed the only bound on generation. PRISM does not cap output on the
+    /// operator's behalf by design — a fixed ceiling once made a reasoning
+    /// model spend its whole budget thinking and return no JSON — so the
+    /// context window IS the bound. Without it a campaign proposal call ran to
+    /// 8,813 decoded tokens and died on the HTTP timeout, and every HTTP model
+    /// on the ingest path shared one hardcoded elision budget.
+    #[test]
+    fn build_llm_config_resolves_a_real_context_window() {
+        let root = tempfile::tempdir().expect("temp project root");
+        let config = build_llm_config(
+            root.path(),
+            Some("http://127.0.0.1:8081/v1"),
+            Some("gpt-5.5"),
+            None,
+        )
+        .expect("config builds");
+        let window = config
+            .context_window
+            .expect("a model without a context window has nothing bounding its output");
+        assert!(
+            window >= 8_192,
+            "a real window, not a placeholder: got {window}"
+        );
+        // And it must agree with the registry the agent loop uses — a second
+        // answer to this question is how the first one drifted.
+        assert_eq!(
+            window,
+            prism_agent::models::get_model_config("gpt-5.5").context_window as u64
+        );
     }
 
     /// Row coverage must reach the user's summary: processed of total, the
