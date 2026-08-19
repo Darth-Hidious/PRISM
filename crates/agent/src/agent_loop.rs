@@ -390,6 +390,326 @@ fn process_large_result(content: &str) -> String {
     )
 }
 
+// ── Saturation signal ─────────────────────────────────────────────
+//
+// The owner's requirement, verbatim: "the model should have some understanding
+// ... is this enough or do I need to research more? and this can only be
+// provided by the harness because we are not going to store all the papers in
+// the context itself."
+//
+// Measured 2026-08-19: a literature-review turn on glm-5.2 called `papers` 14
+// times, `prior_art_search` twice and `papers_ingest` ZERO times, re-finding an
+// increasingly overlapping corpus, and died at round 4 on the token budget with
+// no report and no artifact. Nothing told it the well was running dry, and
+// nothing told it that everything it had found was about to evaporate.
+//
+// This counts IDENTITY, never content: a set of dedup keys and a few integers.
+// The papers themselves stay out of context, which is the whole point.
+
+/// Tools whose results are a literature search.
+const SEARCH_TOOLS: &[&str] = &["papers", "papers_search", "prior_art_search"];
+/// How many recent searches the new-yield ratio is computed over.
+const SATURATION_WINDOW: usize = 3;
+/// New-unique share below which searching is mostly re-buying what you have.
+/// From Guest, Namey & Chen (2020) — a <=5% new-information rate over a short
+/// run is their validated thematic-saturation criterion. Not tuned here.
+const SATURATION_NEW_RATIO: f64 = 0.05;
+/// Cap on the "already tried" list, so the block cannot grow without bound.
+const SATURATION_QUERY_LIST_MAX: usize = 8;
+
+#[derive(Debug, Clone)]
+struct SearchCall {
+    tool: String,
+    query: String,
+    returned: usize,
+    fresh: usize,
+    /// The result could not be read (truncated or unparseable), so its yield is
+    /// UNKNOWN. Counting it as zero-new is how a big successful search gets
+    /// mistaken for a dry well.
+    unreadable: bool,
+}
+
+#[derive(Debug, Default)]
+struct SaturationTracker {
+    seen: std::collections::HashSet<String>,
+    searches: Vec<SearchCall>,
+    ingested_ok: usize,
+    facts_written: usize,
+    /// Sources that reported a failure, so "half the providers are down" is
+    /// never silently rendered as "the literature is exhausted".
+    degraded_sources: std::collections::BTreeSet<String>,
+}
+
+/// Exact-identifier dedup key for one paper record.
+///
+/// Mirrors `prism_retrieval::Paper::dedup_key` — DOI beats arXiv beats PMC,
+/// else per-source. `prism-agent` does not depend on `prism-retrieval` (it
+/// would pull a whole HTTP stack in for twelve lines), so the precedence is
+/// re-stated here and pinned by test. There is deliberately NO url tier and no
+/// fuzzy title match: merging records on guessed identity manufactures wrong
+/// data, which is the same reason the original refuses to.
+fn paper_key(paper: &Value) -> Option<String> {
+    let text = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(doi) = text(paper.get("doi")) {
+        return Some(format!("doi:{doi}"));
+    }
+    let ids = paper.get("external_ids");
+    if let Some(arxiv) = text(ids.and_then(|i| i.get("arxiv"))) {
+        return Some(format!("arxiv:{arxiv}"));
+    }
+    if let Some(pmc) = text(ids.and_then(|i| i.get("pmc"))) {
+        return Some(format!("pmc:{pmc}"));
+    }
+    match (text(paper.get("source")), text(paper.get("source_id"))) {
+        (Some(source), Some(id)) => Some(format!("{source}:{id}")),
+        _ => None,
+    }
+}
+
+/// Unwrap a CLI tool result to the JSON its command actually printed.
+///
+/// Command tools return an ENVELOPE — `{root, invocation, success, stdout, …}`
+/// (`command_tools::structured_success`) — with the command's JSON carried as a
+/// STRING in `stdout`, truncated at 30k with an `[Output truncated]` marker. A
+/// walker that looks for `papers[]` at the top level finds nothing on every
+/// call, which reads as permanent saturation. Returns `None` when the payload
+/// was truncated or is not JSON, so the caller can record "unknown" instead of
+/// inventing a zero.
+fn cli_payload(result: &Value) -> Option<Value> {
+    if let Some(stdout) = result.get("stdout").and_then(Value::as_str) {
+        if stdout.contains("[Output truncated]") {
+            return None;
+        }
+        return serde_json::from_str(stdout.trim()).ok();
+    }
+    // A native (non-CLI) tool already returns structured JSON.
+    Some(result.clone())
+}
+
+/// Every paper record in a search payload, whichever shape it arrived in.
+fn paper_records(payload: &Value) -> Vec<&Value> {
+    // `papers search` -> {papers:[…]}; `papers sweep` -> {outcome:{papers:[…]}};
+    // `prior_art_search` -> {papers:[…], patents:[…]}. Sweep is the biggest
+    // producer, so missing its nesting would silently exclude the most
+    // productive tool from the count.
+    for path in [
+        &["papers"][..],
+        &["outcome", "papers"][..],
+        &["results"][..],
+    ] {
+        let mut node = payload;
+        let mut ok = true;
+        for key in path {
+            match node.get(*key) {
+                Some(next) => node = next,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && let Some(list) = node.as_array() {
+            return list.iter().collect();
+        }
+    }
+    Vec::new()
+}
+
+impl SaturationTracker {
+    /// Fold one finished tool call into the counts. Called with the SAME value
+    /// the provenance hook persists, so the block and the store can never
+    /// disagree about what happened.
+    fn observe(&mut self, tool: &str, args: &Value, result: &Value, is_error: bool) {
+        if is_error {
+            return;
+        }
+        if tool == "papers_ingest" {
+            self.ingested_ok += 1;
+            if let Some(payload) = cli_payload(result) {
+                // `written` sits under the command's own `stored` object, not
+                // at the envelope root.
+                let written = payload
+                    .pointer("/stored/written")
+                    .or_else(|| payload.get("written"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.facts_written += written as usize;
+            }
+            return;
+        }
+        if !SEARCH_TOOLS.contains(&tool) {
+            return;
+        }
+
+        let query = args
+            .get("query")
+            .or_else(|| args.get("prompt"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                // Command tools carry the query inside `args: ["--query", "…"]`.
+                let list = args.get("args")?.as_array()?;
+                let at = list
+                    .iter()
+                    .position(|a| a.as_str() == Some("--query") || a.as_str() == Some("--q"))?;
+                list.get(at + 1)?.as_str().map(str::to_string)
+            })
+            .unwrap_or_else(|| "(query not recorded)".to_string());
+
+        let Some(payload) = cli_payload(result) else {
+            self.searches.push(SearchCall {
+                tool: tool.to_string(),
+                query,
+                returned: 0,
+                fresh: 0,
+                unreadable: true,
+            });
+            return;
+        };
+
+        for status in payload
+            .get("source_status")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let failed = status.get("error").is_some_and(|e| !e.is_null())
+                || status.get("ok").and_then(Value::as_bool) == Some(false);
+            if failed && let Some(name) = status.get("source").and_then(Value::as_str) {
+                self.degraded_sources.insert(name.to_string());
+            }
+        }
+
+        let keys: Vec<String> = paper_records(&payload)
+            .into_iter()
+            .filter_map(paper_key)
+            .collect();
+        let returned = keys.len();
+        let fresh = keys.iter().filter(|k| !self.seen.contains(*k)).count();
+        self.seen.extend(keys);
+        self.searches.push(SearchCall {
+            tool: tool.to_string(),
+            query,
+            returned,
+            fresh,
+            unreadable: false,
+        });
+    }
+
+    /// Share of the recent window that was new. `None` when the window holds no
+    /// readable search — an unknown yield must not read as a dry well.
+    fn recent_new_ratio(&self) -> Option<f64> {
+        let window: Vec<&SearchCall> = self
+            .searches
+            .iter()
+            .rev()
+            .filter(|c| !c.unreadable)
+            .take(SATURATION_WINDOW)
+            .collect();
+        if window.len() < SATURATION_WINDOW {
+            return None;
+        }
+        let returned: usize = window.iter().map(|c| c.returned).sum();
+        if returned == 0 {
+            return None;
+        }
+        let fresh: usize = window.iter().map(|c| c.fresh).sum();
+        Some(fresh as f64 / returned as f64)
+    }
+
+    /// The block the model sees, or `None` when no search has run — a chat turn
+    /// stays byte-for-byte what it was.
+    fn block(&self) -> Option<String> {
+        if self.searches.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "RESEARCH COVERAGE — counted by the harness from what your tools returned, not from papers held in this conversation.\n",
+        );
+        out.push_str(&format!(
+            "Searches: {}   Unique papers seen: {}   Ingested: {} call(s), {} fact(s) written\n",
+            self.searches.len(),
+            self.seen.len(),
+            self.ingested_ok,
+            self.facts_written
+        ));
+        for (index, call) in self
+            .searches
+            .iter()
+            .enumerate()
+            .skip(self.searches.len().saturating_sub(SATURATION_WINDOW))
+        {
+            if call.unreadable {
+                out.push_str(&format!(
+                    "  #{} {} {:?} -> result too large to count (yield unknown)\n",
+                    index + 1,
+                    call.tool,
+                    call.query
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  #{} {} {:?} -> {} found, {} new\n",
+                    index + 1,
+                    call.tool,
+                    call.query,
+                    call.returned,
+                    call.fresh
+                ));
+            }
+        }
+
+        let tried: Vec<String> = self
+            .searches
+            .iter()
+            .rev()
+            .take(SATURATION_QUERY_LIST_MAX)
+            .map(|c| format!("{:?}", c.query))
+            .collect();
+        out.push_str(&format!(
+            "Already tried, do not re-run these or close variants: {}\n",
+            tried.join("; ")
+        ));
+
+        match self.recent_new_ratio() {
+            Some(ratio) if ratio <= SATURATION_NEW_RATIO => out.push_str(&format!(
+                "STATUS: SATURATED — the last {} searches were {:.0}% new. More searching will mostly re-find what you have. Searching further is allowed and will not be blocked; it is unlikely to pay.\n",
+                SATURATION_WINDOW,
+                ratio * 100.0
+            )),
+            Some(ratio) => out.push_str(&format!(
+                "STATUS: STILL FINDING — the last {} searches were {:.0}% new.\n",
+                SATURATION_WINDOW,
+                ratio * 100.0
+            )),
+            None => out.push_str(
+                "STATUS: too early to say whether coverage is saturating.\n"
+                    .trim_end_matches("\n"),
+            ),
+        }
+        if !self.degraded_sources.is_empty() {
+            out.push_str(&format!(
+                "CAUTION: {} reported errors this session, so low yield may mean a source is down rather than the literature being exhausted.\n",
+                self.degraded_sources
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if self.seen.len() > self.facts_written && self.ingested_ok == 0 {
+            out.push_str(
+                "NOTE: nothing found this session has been persisted. Papers seen but not ingested do not survive this conversation.\n",
+            );
+        }
+        Some(out)
+    }
+}
+
 // ── Trajectory injection ──────────────────────────────────────────
 //
 // Long research turns die when the model forgets (or ignores) what it
@@ -934,6 +1254,7 @@ fn iteration_messages(
     capability_menu: Option<&str>,
     discovery_prompt: Option<&str>,
     session_memory: Option<&str>,
+    saturation: Option<&str>,
     traj_steps: &[String],
     history: &[ChatMessage],
     selected_prompt: Option<&str>,
@@ -955,6 +1276,7 @@ fn iteration_messages(
         .chain(capability_menu.map(str::to_string))
         .chain(discovery_prompt.map(str::to_string))
         .chain(session_memory.map(str::to_string))
+        .chain(saturation.map(str::to_string))
         .chain(trajectory_block(traj_steps))
         .collect();
     let mut messages = vec![ChatMessage {
@@ -1861,6 +2183,7 @@ pub(crate) async fn run_turn_inner(
     // One line per executed tool step — feeds the deterministic TRAJECTORY
     // block injected into every iteration's context.
     let mut traj_steps: Vec<String> = Vec::new();
+    let mut saturation = SaturationTracker::default();
     // Trajectory v2: durable cross-turn pointers, loaded ONCE per turn (a
     // local Turso open — the same cost the provenance hook already pays per
     // tool call). Missing store/session degrades to no block, never an error.
@@ -1932,6 +2255,9 @@ pub(crate) async fn run_turn_inner(
         // capability-gap retry, so discovery makes tools actually callable and
         // the working set follows the task. Done before message assembly so the
         // L1 capability menu can reflect what's already callable.
+        // Recomputed each turn from the running counts, so the model watches its
+        // own yield fall instead of being told once and forgetting.
+        let saturation_block = saturation.block();
         let route = routing_query(user_message, history);
         let influence_requested = context_influence_enabled();
         // Influence scoring and successful generation deliberately omit the L1
@@ -1944,6 +2270,7 @@ pub(crate) async fn run_turn_inner(
             None,
             turn_skill_context.discovery_prompt.as_deref(),
             session_memory.as_deref(),
+            saturation_block.as_deref(),
             &traj_steps,
             history,
             turn_skill_context.selected_prompt.as_deref(),
@@ -2008,6 +2335,7 @@ pub(crate) async fn run_turn_inner(
                 capability_menu.as_deref(),
                 turn_skill_context.discovery_prompt.as_deref(),
                 session_memory.as_deref(),
+                saturation_block.as_deref(),
                 &traj_steps,
                 history,
                 turn_skill_context.selected_prompt.as_deref(),
@@ -2075,6 +2403,7 @@ pub(crate) async fn run_turn_inner(
                     capability_menu.as_deref(),
                     turn_skill_context.discovery_prompt.as_deref(),
                     session_memory.as_deref(),
+                    saturation_block.as_deref(),
                     &traj_steps,
                     history,
                     turn_skill_context.selected_prompt.as_deref(),
@@ -2869,6 +3198,9 @@ pub(crate) async fn run_turn_inner(
             // shared classifier records status:error. Model-facing raw_content
             // is unchanged (the provenance hook never mutates the value).
             let result_value: Value = hook_result_value(&raw_content, is_error);
+            // Counted from the same bytes h6 persists, so the rendered coverage
+            // and the durable record can never disagree about what happened.
+            saturation.observe(tool_name, &args, &result_value, is_error);
             let post_result = hooks.fire_after(tool_name, &args, &result_value, elapsed_ms as f64);
             let content_after_hooks = if post_result != result_value {
                 serde_json::to_string(&post_result).unwrap_or(raw_content.to_string())
@@ -4755,5 +5087,224 @@ mod tests {
                 "a retained tool result lost the assistant message that called it"
             );
         }
+    }
+    // ── Saturation signal ──────────────────────────────────────────
+
+    /// The exact envelope a command tool returns: JSON as a STRING in `stdout`.
+    fn cli_envelope(payload: serde_json::Value) -> Value {
+        serde_json::json!({
+            "root": "papers",
+            "invocation": "prism papers search",
+            "success": true,
+            "exit_code": 0,
+            "stdout": payload.to_string(),
+            "stderr": "",
+        })
+    }
+
+    fn paper(doi: Option<&str>, source: &str, id: &str) -> Value {
+        let mut p = serde_json::json!({"source": source, "source_id": id, "external_ids": {}});
+        if let Some(doi) = doi {
+            p["doi"] = serde_json::json!(doi);
+        }
+        p
+    }
+
+    fn search_args(query: &str) -> Value {
+        serde_json::json!({"args": ["search", "--query", query, "--limit", "20"]})
+    }
+
+    #[test]
+    fn a_search_is_counted_through_the_cli_envelope_not_past_it() {
+        // THE trap: command tools wrap output as a string in `stdout`. A walker
+        // looking for a top-level `papers[]` finds nothing on every call, which
+        // renders as permanent saturation from search #2 onwards.
+        let mut t = SaturationTracker::default();
+        let payload = serde_json::json!({"papers": [
+            paper(Some("10.1/a"), "arxiv", "1"),
+            paper(None, "pubmed", "2"),
+        ]});
+        t.observe("papers", &search_args("q1"), &cli_envelope(payload), false);
+
+        assert_eq!(
+            t.seen.len(),
+            2,
+            "both papers were counted through the envelope"
+        );
+        assert_eq!(t.searches[0].returned, 2);
+        assert_eq!(t.searches[0].fresh, 2);
+        assert_eq!(t.searches[0].query, "q1", "the query is read from CLI args");
+    }
+
+    #[test]
+    fn a_sweep_result_is_not_silently_excluded() {
+        // `sweep` nests under `outcome` and is the biggest producer. Missing the
+        // nesting would drop the most productive tool from the count entirely.
+        let mut t = SaturationTracker::default();
+        let payload = serde_json::json!({
+            "state_path": "/tmp/x.json",
+            "outcome": {"papers": [paper(Some("10.1/z"), "arxiv", "9")]},
+        });
+        t.observe(
+            "papers",
+            &search_args("sweep me"),
+            &cli_envelope(payload),
+            false,
+        );
+        assert_eq!(t.seen.len(), 1, "a sweep's papers count like any other");
+    }
+
+    #[test]
+    fn a_truncated_result_is_unknown_yield_not_zero_yield() {
+        // 30k truncation corrupts the JSON. Reading that as "0 new" turns a big
+        // SUCCESSFUL search into evidence the well is dry.
+        let mut t = SaturationTracker::default();
+        let mut env = cli_envelope(serde_json::json!({"papers": []}));
+        env["stdout"] = serde_json::json!("{\"papers\": [{\"doi\"\n\n[Output truncated]");
+        t.observe("papers", &search_args("huge"), &env, false);
+
+        assert!(t.searches[0].unreadable, "an uncountable result says so");
+        assert!(
+            t.block().unwrap().contains("yield unknown"),
+            "and says so to the model too"
+        );
+        assert_eq!(
+            t.recent_new_ratio(),
+            None,
+            "an unknown yield must never contribute to a saturation verdict"
+        );
+    }
+
+    #[test]
+    fn saturation_is_declared_only_when_searching_stops_paying() {
+        let mut t = SaturationTracker::default();
+        let twenty: Vec<Value> = (0..20)
+            .map(|i| paper(Some(&format!("10.1/{i}")), "arxiv", "x"))
+            .collect();
+        // FOUR searches over the same twenty papers. The window is the last
+        // three, so the productive opening search has to fall OUT of it before
+        // saturation can be declared — three searches total is not enough, which
+        // is the point: one good search followed by two repeats is not a dry well.
+        for query in ["a", "b", "c", "d"] {
+            t.observe(
+                "papers",
+                &search_args(query),
+                &cli_envelope(serde_json::json!({"papers": twenty})),
+                false,
+            );
+        }
+        let ratio = t.recent_new_ratio().expect("four readable searches");
+        assert!(
+            ratio <= SATURATION_NEW_RATIO,
+            "the last three searches returned 60 papers and 0 new: {ratio}"
+        );
+        let block = t.block().unwrap();
+        assert!(block.contains("SATURATED"), "{block}");
+        assert!(
+            block.contains("allowed and will not be blocked"),
+            "annotate, never refuse: {block}"
+        );
+    }
+
+    #[test]
+    fn fresh_findings_do_not_read_as_saturation() {
+        let mut t = SaturationTracker::default();
+        for round in 0..3 {
+            let papers: Vec<Value> = (0..10)
+                .map(|i| paper(Some(&format!("10.{round}/{i}")), "arxiv", "x"))
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        assert_eq!(t.seen.len(), 30);
+        let block = t.block().unwrap();
+        assert!(block.contains("STILL FINDING"), "{block}");
+    }
+
+    #[test]
+    fn a_source_outage_is_never_reported_as_an_exhausted_literature() {
+        let mut t = SaturationTracker::default();
+        let payload = serde_json::json!({
+            "papers": [],
+            "source_status": [{"source": "pubmed", "ok": false, "error": "429"}],
+        });
+        t.observe("papers", &search_args("q"), &cli_envelope(payload), false);
+        let block = t.block().unwrap();
+        assert!(
+            block.contains("pubmed"),
+            "the failing source is named: {block}"
+        );
+        assert!(
+            block.contains("rather than the literature being exhausted"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn the_dedup_key_matches_the_retrieval_crates_precedence() {
+        // Mirrors prism_retrieval::Paper::dedup_key. DOI > arxiv > pmc > source.
+        // NO url tier, and no fuzzy title match — guessed identity manufactures
+        // wrong data.
+        let mut both = paper(Some("10.1/a"), "arxiv", "1");
+        both["external_ids"] = serde_json::json!({"arxiv": "2401.1", "pmc": "PMC1"});
+        assert_eq!(paper_key(&both).as_deref(), Some("doi:10.1/a"));
+
+        let mut no_doi = paper(None, "arxiv", "1");
+        no_doi["external_ids"] = serde_json::json!({"arxiv": "2401.1", "pmc": "PMC1"});
+        assert_eq!(paper_key(&no_doi).as_deref(), Some("arxiv:2401.1"));
+
+        let mut pmc_only = paper(None, "pubmed", "1");
+        pmc_only["external_ids"] = serde_json::json!({"pmc": "PMC1"});
+        assert_eq!(paper_key(&pmc_only).as_deref(), Some("pmc:PMC1"));
+
+        assert_eq!(
+            paper_key(&paper(None, "doaj", "7")).as_deref(),
+            Some("doaj:7")
+        );
+        assert_eq!(
+            paper_key(&serde_json::json!({"url": "https://x"})),
+            None,
+            "a bare url is NOT an identity"
+        );
+    }
+
+    #[test]
+    fn ingesting_is_counted_from_where_the_command_actually_reports_it() {
+        let mut t = SaturationTracker::default();
+        // `written` sits under the command's own `stored` object.
+        t.observe(
+            "papers_ingest",
+            &serde_json::json!({}),
+            &cli_envelope(serde_json::json!({"stored": {"written": 23}})),
+            false,
+        );
+        assert_eq!(t.ingested_ok, 1);
+        assert_eq!(t.facts_written, 23);
+    }
+
+    #[test]
+    fn nothing_persisted_is_stated_plainly() {
+        let mut t = SaturationTracker::default();
+        t.observe(
+            "papers",
+            &search_args("q"),
+            &cli_envelope(serde_json::json!({"papers": [paper(Some("10.1/a"), "arxiv", "1")]})),
+            false,
+        );
+        let block = t.block().unwrap();
+        assert!(block.contains("has been persisted"), "{block}");
+    }
+
+    #[test]
+    fn a_turn_with_no_search_renders_nothing_at_all() {
+        let t = SaturationTracker::default();
+        assert!(
+            t.block().is_none(),
+            "a chat turn is byte-for-byte unchanged"
+        );
     }
 }
