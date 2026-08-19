@@ -2780,6 +2780,19 @@ async fn main() -> Result<()> {
             let (context_window, max_output_tokens) = model_limits(&catalog, &model);
             tracing::info!(?context_window, ?max_output_tokens, model = %model, "model limits");
 
+            // Same two properties the native frontend used to lose to
+            // `..Default::default()`: a local server's REAL context window
+            // (`model_limits` only knows the catalog, which does not know an
+            // unregistered local model) and whether the endpoint can stream at
+            // all. Both are endpoint facts, so both are resolved from the
+            // endpoint rather than defaulted.
+            let context_window = context_window.or_else(|| {
+                Some(prism_agent::models::resolve_context_window(&base_url, &model) as u64)
+            });
+            let streaming = prism_core::providers::streams_for_url(
+                &prism_core::providers::Registry::load(),
+                &base_url,
+            );
             let llm_config = LlmConfig {
                 base_url,
                 model,
@@ -2788,6 +2801,7 @@ async fn main() -> Result<()> {
                 embedding_model: cfg_llm.embedding_model.clone(),
                 context_window,
                 max_output_tokens,
+                streaming,
                 ..Default::default()
             };
 

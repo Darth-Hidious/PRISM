@@ -366,6 +366,8 @@ pub fn spawn_native_session_with(
             &paths,
         )?,
     };
+    let llm_base_url = inputs.llm.base_url.clone();
+    let llm_model = inputs.llm.model.clone();
     let llm_config = prism_llm::LlmConfig {
         base_url: inputs.llm.base_url,
         model: inputs.llm.model,
@@ -379,8 +381,15 @@ pub fn spawn_native_session_with(
             }
         }),
         embedding_model: inputs.llm.embedding_model,
-        context_window: inputs.llm.context_window,
+        // `..Default::default()` used to decide these two, which meant a local
+        // endpoint's real context window and its inability to stream never
+        // reached the TUI at all — the resolver had already worked them out and
+        // the struct literal threw them away.
+        context_window: inputs.llm.context_window.or_else(|| {
+            Some(prism_agent::models::resolve_context_window(&llm_base_url, &llm_model) as u64)
+        }),
         max_output_tokens: inputs.llm.max_output_tokens,
+        streaming: inputs.llm.streaming,
         ..Default::default()
     };
     let tool_server = prism_python_bridge::ToolServer {

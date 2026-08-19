@@ -40,6 +40,13 @@ pub struct ResolvedLlm {
     /// fall back to turn-count compaction, same as the offline CLI.
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
+    /// Whether the resolved endpoint serves SSE streaming, per the provider
+    /// registry. Resolved HERE because every frontend that built its own
+    /// `LlmConfig` with `..Default::default()` silently got `true`, and a
+    /// provider that answers `stream: true` with 200 and then sends nothing
+    /// (mlx-lm) hangs the caller forever. One answer, at the point the
+    /// endpoint is chosen.
+    pub streaming: bool,
 }
 
 impl std::fmt::Debug for ResolvedLlm {
@@ -52,6 +59,7 @@ impl std::fmt::Debug for ResolvedLlm {
             .field("embedding_model", &self.embedding_model)
             .field("context_window", &self.context_window)
             .field("max_output_tokens", &self.max_output_tokens)
+            .field("streaming", &self.streaming)
             .finish()
     }
 }
@@ -279,6 +287,7 @@ pub fn resolve_llm_with(
         }
     };
 
+    let base_url_for_capabilities = base_url.clone();
     Ok(ResolvedLlm {
         base_url,
         model,
@@ -287,6 +296,10 @@ pub fn resolve_llm_with(
         embedding_model: cfg_llm.embedding_model.clone(),
         context_window: None,
         max_output_tokens: None,
+        streaming: prism_core::providers::streams_for_url(
+            &prism_core::providers::Registry::load(),
+            &base_url_for_capabilities,
+        ),
     })
 }
 
@@ -484,6 +497,7 @@ mod tests {
             embedding_model: None,
             context_window: None,
             max_output_tokens: None,
+            streaming: true,
         };
 
         let debug = format!("{resolved:?}");
