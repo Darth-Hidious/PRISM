@@ -94,12 +94,68 @@ pub enum PapersCommands {
         #[arg(long)]
         store: bool,
     },
+    /// Retrieve a subject's literature and write every paper's full text
+    /// into a corpus directory — the input `prism ontology induce` reads.
+    /// Papers whose full text is not openly retrievable are reported, not
+    /// silently dropped.
+    Corpus {
+        /// The subject to research, e.g. "refractory high entropy alloy oxidation".
+        #[arg(long)]
+        query: String,
+        /// Corpus directory to write. Created if absent; existing `.txt`
+        /// files for the same papers are reused, so a re-run resumes.
+        #[arg(long)]
+        out: PathBuf,
+        /// Max results per source before dedup.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Stop after this many full texts land (0 = every paper retrieved).
+        #[arg(long, default_value_t = 0)]
+        max_docs: usize,
+        /// Shortest accepted full text, in characters. Below this a document
+        /// is a parse failure, not a paper.
+        #[arg(long, default_value_t = 3000)]
+        min_chars: usize,
+        #[arg(long)]
+        sources: Option<String>,
+        #[arg(long)]
+        mailto: Option<String>,
+        #[arg(long)]
+        no_cache: bool,
+    },
 }
 
 /// Parse `--sources` into REGISTRY id strings — what selection is typed by.
 /// The [`SourceId`] enum is used only as the CLI's name catalogue: the CLI
 /// can only select built-ins (it has no way to register a third-party
 /// adapter), so an unknown name is a typo and fails here with the list.
+/// Filesystem-safe stem for a source id. Ids carry `/` (arXiv `cond-mat/0512xxx`)
+/// and `:` (some OpenAlex ids), which would otherwise create directories or
+/// break on case-insensitive volumes.
+/// Whether a paper has SOME openly retrievable full text.
+///
+/// A PMC id counts: [`prism_retrieval::fulltext::fetch_fulltext`] resolves it
+/// to open-access JATS BEFORE it ever looks at `fulltext_url`. Testing the URL
+/// alone discarded every PubMed paper in the OA subset — on one live query
+/// that was the difference between 12 and 40 retrievable full texts out of the
+/// same 113 papers.
+fn has_open_fulltext(paper: &Paper) -> bool {
+    paper.fulltext_url.is_some() || paper.external_ids.contains_key("pmc")
+}
+
+fn corpus_slug(source_id: &str) -> String {
+    source_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn parse_sources(list: &Option<String>) -> Result<Vec<String>> {
     let Some(raw) = list else {
         return Ok(prism_retrieval::all_sources()
@@ -263,6 +319,89 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     })
                 ),
             }
+        }
+        PapersCommands::Corpus {
+            query,
+            out,
+            limit,
+            max_docs,
+            min_chars,
+            sources,
+            mailto,
+            no_cache,
+        } => {
+            let source_ids = parse_sources(&sources)?;
+            let engine = build_engine(source_ids, &mailto, no_cache)
+                .with_relevance_policy(RelevancePolicy::default());
+            let outcome = engine.search(&query, limit).await;
+            std::fs::create_dir_all(&out)
+                .with_context(|| format!("cannot create corpus directory {out:?}"))?;
+
+            let mut written = Vec::new();
+            let mut reused = Vec::new();
+            let mut unavailable = Vec::new();
+            for paper in &outcome.papers {
+                if max_docs > 0 && written.len() + reused.len() >= max_docs {
+                    break;
+                }
+                let path = out.join(format!(
+                    "{}-{}.txt",
+                    paper.source,
+                    corpus_slug(&paper.source_id)
+                ));
+                if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as usize >= min_chars {
+                    reused.push(path.display().to_string());
+                    continue;
+                }
+                if !has_open_fulltext(paper) {
+                    unavailable.push(
+                        json!({"document": paper.url, "reason": "no open full-text location"}),
+                    );
+                    continue;
+                }
+                let text = match engine.fetch_fulltext_for(paper).await {
+                    Ok(Some(full)) => full.plain_text,
+                    Ok(None) => {
+                        unavailable.push(
+                            json!({"document": paper.url, "reason": "no_fulltext_available"}),
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        unavailable.push(json!({"document": paper.url, "reason": err.to_string()}));
+                        continue;
+                    }
+                };
+                if text.chars().count() < min_chars {
+                    unavailable.push(json!({
+                        "document": paper.url,
+                        "reason": format!("parsed {} chars, below --min-chars {min_chars}", text.chars().count()),
+                    }));
+                    continue;
+                }
+                std::fs::write(&path, &text).with_context(|| format!("cannot write {path:?}"))?;
+                written.push(json!({
+                    "path": path.display().to_string(),
+                    "title": paper.title,
+                    "chars": text.chars().count(),
+                }));
+            }
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "corpus_dir": out.display().to_string(),
+                    "query": query,
+                    "papers_found": outcome.papers.len(),
+                    "written": written,
+                    "reused": reused,
+                    "unavailable": unavailable,
+                    "next": format!(
+                        "prism ontology induce {} --domain <domain>",
+                        out.display()
+                    ),
+                }))?
+            );
         }
         PapersCommands::Claims {
             pmc,
@@ -1205,6 +1344,56 @@ mod tests {
             !err.contains("offline mode"),
             "guard fired with offline unset: {err}"
         );
+    }
+    fn bare_paper() -> Paper {
+        Paper {
+            source: "pubmed".into(),
+            source_id: "12345".into(),
+            title: "T".into(),
+            authors: Vec::new(),
+            year: None,
+            published: None,
+            doi: None,
+            external_ids: std::collections::BTreeMap::new(),
+            abstract_text: None,
+            url: "https://example.org/12345".into(),
+            fulltext_url: None,
+            fulltext_format: None,
+            journal: None,
+        }
+    }
+
+    #[test]
+    fn a_pmc_id_is_a_full_text_location() {
+        // Nothing to fetch: neither a URL nor a PMC id.
+        assert!(!has_open_fulltext(&bare_paper()));
+
+        // PubMed advertises no fulltext_url at all, but a PMC id resolves to
+        // open-access JATS. Requiring the URL threw these away.
+        let mut pmc = bare_paper();
+        pmc.external_ids.insert("pmc".into(), "PMC7654321".into());
+        assert!(has_open_fulltext(&pmc), "a PMC id must count as full text");
+
+        // A DOI is NOT a full-text location.
+        let mut doi_only = bare_paper();
+        doi_only
+            .external_ids
+            .insert("doi".into(), "10.1000/x".into());
+        assert!(!has_open_fulltext(&doi_only));
+
+        // The advertised URL still counts on its own.
+        let mut url = bare_paper();
+        url.fulltext_url = Some("https://arxiv.org/pdf/2512.06308v2".into());
+        assert!(has_open_fulltext(&url));
+    }
+
+    #[test]
+    fn corpus_filenames_cannot_escape_the_corpus_directory() {
+        // arXiv ids carry '/' (cond-mat/0512345); some ids carry ':'.
+        assert_eq!(corpus_slug("cond-mat/0512345"), "cond-mat_0512345");
+        assert_eq!(corpus_slug("2512.06308v2"), "2512.06308v2");
+        assert_eq!(corpus_slug("../../etc/passwd"), ".._.._etc_passwd");
+        assert!(!corpus_slug("a/b:c").contains('/'));
     }
 }
 
