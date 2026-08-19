@@ -819,14 +819,21 @@ fn resolve_seed(
 
     let mut push = |ontology: std::sync::Arc<dyn prism_ingest::ontologies::Ontology>,
                     resolved: &mut Vec<_>,
-                    seen: &mut Vec<String>|
+                    seen: &mut Vec<String>,
+                    is_own_prior: bool|
      -> Result<()> {
         let id = ontology.id().to_string();
         // `InducedOntology.domain` becomes the registry id AND the artifact
         // filename, and registration refuses an id that is already taken. A run
         // that grew `emmo` into `--domain emmo` could never be promoted, so
         // refuse it here with the reason rather than at promote time.
-        if id == domain {
+        //
+        // `--continue` is the ONE case where the ids matching is the point:
+        // growing this domain's own promoted artifact into its next version
+        // replaces that artifact, which is exactly how an ontology compounds
+        // across corpora. Applying the guard there made `--continue`
+        // categorically impossible.
+        if id == domain && !is_own_prior {
             bail!(
                 "--domain {domain} collides with the base ontology {id}: the result could \
                  never be promoted, because that id is already registered. Give the grown \
@@ -842,7 +849,7 @@ fn resolve_seed(
 
     if bases.is_empty() {
         let active = prism_ingest::ontologies::active_for_project_config(project_root)?;
-        push(active, &mut resolved, &mut seen)?;
+        push(active, &mut resolved, &mut seen, false)?;
     } else {
         for base in bases {
             let ontology =
@@ -856,7 +863,7 @@ fn resolve_seed(
                         induction::register::load_induced_from_path(path)?
                     }
                 };
-            push(ontology, &mut resolved, &mut seen)?;
+            push(ontology, &mut resolved, &mut seen, false)?;
         }
     }
 
@@ -865,7 +872,7 @@ fn resolve_seed(
             prism_ingest::ontologies::project_ontology_artifact_path(project_root, domain)?;
         if previous.is_file() {
             let prior = induction::register::load_induced_from_path(&previous)?;
-            push(prior, &mut resolved, &mut seen)?;
+            push(prior, &mut resolved, &mut seen, true)?;
         } else {
             bail!(
                 "--continue found no promoted ontology for domain {domain} at {} — run \

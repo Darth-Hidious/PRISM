@@ -369,6 +369,74 @@ async fn finish_root_agent_run(
 // "durable memory" across sessions anyway; keeping it was a parallel
 // half-path that lied about being the mechanism.
 
+/// Replace a counted search result with a compact digest.
+///
+/// A literature search returns twenty-odd records with abstracts. Those stay in
+/// the conversation for the rest of the turn and are re-sent on every
+/// subsequent request, so the cost of round 1 is paid again in rounds 2..N.
+/// Measured 2026-08-19: a PFAS review spent 240,967 cumulative input tokens
+/// across 27 tool calls and died on its budget with no report — the second time
+/// the same question died that way.
+///
+/// The full payload is NOT lost: the provenance post-hook records every tool
+/// call's complete output BEFORE this runs, and `recall` serves it back by id
+/// or query. What the model keeps is what it needs to decide the next move —
+/// how many, how many new, and what they were called.
+///
+/// Returns `None` when this is not a countable search result, leaving the
+/// normal large-result path to handle it.
+fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
+    if !SEARCH_TOOLS.contains(&tool) {
+        return None;
+    }
+    let payload = cli_payload(result)?;
+    let records = paper_records(&payload);
+    if records.is_empty() {
+        return None;
+    }
+    let mut out = format!(
+        "{} result(s), {fresh} not seen before in this session.\n",
+        records.len()
+    );
+    for record in records.iter().take(SEARCH_DIGEST_TITLES) {
+        let title = record
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled)");
+        let year = record
+            .get("year")
+            .and_then(Value::as_u64)
+            .map(|y| format!(" ({y})"))
+            .unwrap_or_default();
+        let id = paper_key(record).unwrap_or_else(|| "unidentified".to_string());
+        out.push_str(&format!("  - {title}{year} [{id}]\n"));
+    }
+    if records.len() > SEARCH_DIGEST_TITLES {
+        out.push_str(&format!(
+            "  … and {} more\n",
+            records.len() - SEARCH_DIGEST_TITLES
+        ));
+    }
+    for status in payload
+        .get("source_status")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let failed = status.get("error").is_some_and(|e| !e.is_null())
+            || status.get("ok").and_then(Value::as_bool) == Some(false);
+        if failed && let Some(name) = status.get("source").and_then(Value::as_str) {
+            out.push_str(&format!("  [source {name} returned an error]\n"));
+        }
+    }
+    out.push_str(
+        "Abstracts and full records are in durable memory, not here: call \
+         recall(query=\"<keywords>\") to pull any of them back. To keep a paper's FACTS, \
+         ingest it — a search result does not survive this conversation.\n",
+    );
+    Some(out)
+}
+
 fn process_large_result(content: &str) -> String {
     if content.len() <= MAX_TOOL_RESULT_CHARS {
         return content.to_string();
@@ -416,6 +484,8 @@ const SATURATION_WINDOW: usize = 3;
 const SATURATION_NEW_RATIO: f64 = 0.05;
 /// Cap on the "already tried" list, so the block cannot grow without bound.
 const SATURATION_QUERY_LIST_MAX: usize = 8;
+/// Titles kept in a compacted search result.
+const SEARCH_DIGEST_TITLES: usize = 8;
 
 #[derive(Debug, Clone)]
 struct SearchCall {
@@ -3201,6 +3271,7 @@ pub(crate) async fn run_turn_inner(
             // Counted from the same bytes h6 persists, so the rendered coverage
             // and the durable record can never disagree about what happened.
             saturation.observe(tool_name, &args, &result_value, is_error);
+            let last_search_fresh = saturation.searches.last().map_or(0, |call| call.fresh);
             let post_result = hooks.fire_after(tool_name, &args, &result_value, elapsed_ms as f64);
             let content_after_hooks = if post_result != result_value {
                 serde_json::to_string(&post_result).unwrap_or(raw_content.to_string())
@@ -3347,7 +3418,14 @@ pub(crate) async fn run_turn_inner(
             }
 
             // ── h8. Large-result handling ─────────────────────────
-            let content = process_large_result(&content_after_hooks);
+            // A counted search collapses to its digest FIRST. h6 has already
+            // persisted the full payload, so nothing is lost — and the twenty
+            // abstracts stop being re-sent on every later request, which is what
+            // ended the last two runs of this exact question on their budget.
+            let content = match search_digest(tool_name, &result_value, last_search_fresh) {
+                Some(digest) => digest,
+                None => process_large_result(&content_after_hooks),
+            };
 
             // ── h9. Log to scratchpad ─────────────────────────────
             let summary = summarize_tool_result(tool_name, preview.as_deref(), &content, is_error);
@@ -5305,6 +5383,63 @@ mod tests {
         assert!(
             t.block().is_none(),
             "a chat turn is byte-for-byte unchanged"
+        );
+    }
+    #[test]
+    fn a_counted_search_collapses_to_a_digest_the_model_can_act_on() {
+        let payload = serde_json::json!({"papers": (0..12).map(|i| {
+            let mut p = paper(Some(&format!("10.1/{i}")), "arxiv", "x");
+            p["title"] = serde_json::json!(format!("Paper number {i}"));
+            p["abstract"] = serde_json::json!("word ".repeat(400));
+            p
+        }).collect::<Vec<_>>()});
+        let envelope = cli_envelope(payload);
+        let raw = serde_json::to_string(&envelope).unwrap();
+
+        let digest = search_digest("papers", &envelope, 5).expect("a search collapses");
+        assert!(
+            digest.len() < raw.len() / 4,
+            "the digest must be far smaller: {} vs {}",
+            digest.len(),
+            raw.len()
+        );
+        assert!(
+            digest.contains("12 result(s), 5 not seen before"),
+            "{digest}"
+        );
+        assert!(
+            digest.contains("Paper number 0"),
+            "titles survive: {digest}"
+        );
+        assert!(
+            digest.contains("and 4 more"),
+            "the tail is counted, not hidden: {digest}"
+        );
+        assert!(
+            digest.contains("recall("),
+            "and the full records are reachable: {digest}"
+        );
+        assert!(
+            !digest.contains("word word word"),
+            "abstracts do NOT survive: {digest}"
+        );
+    }
+
+    #[test]
+    fn a_non_search_result_is_left_to_the_normal_path() {
+        let envelope = cli_envelope(serde_json::json!({"workflows": [{"name": "x"}]}));
+        assert!(
+            search_digest("workflow", &envelope, 0).is_none(),
+            "only search results are digested"
+        );
+        assert!(
+            search_digest(
+                "papers",
+                &cli_envelope(serde_json::json!({"papers": []})),
+                0
+            )
+            .is_none(),
+            "an empty search has nothing to digest and keeps its own message"
         );
     }
 }
