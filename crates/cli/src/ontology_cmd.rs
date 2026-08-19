@@ -52,6 +52,19 @@ pub enum OntologyCommands {
         /// only its opening window.
         #[arg(long, default_value_t = 0)]
         max_windows: usize,
+        /// Ontology to GROW, by registry id (`emmo`, `matkg`, a promoted
+        /// project ontology) or by path to a TTL artifact. Repeatable, so one
+        /// run can span several domains. Defaults to the project's active
+        /// ontology; pass `--no-base` for a standalone run.
+        #[arg(long = "base")]
+        bases: Vec<String>,
+        /// Induce standalone, inheriting nothing. The pre-growth behaviour.
+        #[arg(long, conflicts_with = "bases")]
+        no_base: bool,
+        /// Also grow the ontology previously promoted for this `--domain`, so
+        /// a second corpus compounds onto the first instead of restarting.
+        #[arg(long = "continue")]
+        continue_domain: bool,
     },
     /// Parse and validate an ontology artifact; exits non-zero listing the
     /// specific violations if it fails.
@@ -144,6 +157,9 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
             api_key,
             max_doc_chars,
             max_windows,
+            bases,
+            no_base,
+            continue_domain,
         } => {
             induce(
                 &corpus,
@@ -156,6 +172,9 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
                 api_key.as_deref(),
                 max_doc_chars,
                 max_windows,
+                &bases,
+                no_base,
+                continue_domain,
             )
             .await
         }
@@ -775,6 +794,107 @@ pub(crate) fn install_promoted_artifact(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Resolve the ontologies this run grows.
+///
+/// Default is the project's ACTIVE ontology — growth is the normal case, not
+/// an opt-in, because an induction that ignores the ontology the project
+/// already governs itself with produces a tree nobody can use. `--no-base`
+/// asks for the standalone behaviour explicitly.
+///
+/// Bases resolve by registry id first (`emmo`, `matkg`, a promoted project
+/// ontology) and then as a path to a TTL artifact, so a customer can hand over
+/// a file without registering anything.
+fn resolve_seed(
+    project_root: &Path,
+    domain: &str,
+    bases: &[String],
+    no_base: bool,
+    continue_domain: bool,
+) -> Result<induction::seed::Seed> {
+    if no_base {
+        return Ok(induction::seed::Seed::default());
+    }
+    let mut resolved: Vec<std::sync::Arc<dyn prism_ingest::ontologies::Ontology>> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    let mut push = |ontology: std::sync::Arc<dyn prism_ingest::ontologies::Ontology>,
+                    resolved: &mut Vec<_>,
+                    seen: &mut Vec<String>|
+     -> Result<()> {
+        let id = ontology.id().to_string();
+        // `InducedOntology.domain` becomes the registry id AND the artifact
+        // filename, and registration refuses an id that is already taken. A run
+        // that grew `emmo` into `--domain emmo` could never be promoted, so
+        // refuse it here with the reason rather than at promote time.
+        if id == domain {
+            bail!(
+                "--domain {domain} collides with the base ontology {id}: the result could \
+                 never be promoted, because that id is already registered. Give the grown \
+                 ontology its own domain id."
+            );
+        }
+        if !seen.contains(&id) {
+            seen.push(id);
+            resolved.push(ontology);
+        }
+        Ok(())
+    };
+
+    if bases.is_empty() {
+        let active = prism_ingest::ontologies::active_for_project_config(project_root)?;
+        push(active, &mut resolved, &mut seen)?;
+    } else {
+        for base in bases {
+            let ontology =
+                match prism_ingest::ontologies::active_from_project(Some(base), project_root) {
+                    Ok(found) => found,
+                    Err(registry_error) => {
+                        let path = Path::new(base);
+                        if !path.is_file() {
+                            return Err(registry_error);
+                        }
+                        induction::register::load_induced_from_path(path)?
+                    }
+                };
+            push(ontology, &mut resolved, &mut seen)?;
+        }
+    }
+
+    if continue_domain {
+        let previous =
+            prism_ingest::ontologies::project_ontology_artifact_path(project_root, domain)?;
+        if previous.is_file() {
+            let prior = induction::register::load_induced_from_path(&previous)?;
+            push(prior, &mut resolved, &mut seen)?;
+        } else {
+            bail!(
+                "--continue found no promoted ontology for domain {domain} at {} — run \
+                 without --continue to start it, then `prism ontology promote`.",
+                previous.display()
+            );
+        }
+    }
+
+    let seed = induction::seed::seed_from(&resolved)?;
+    if !seed.is_empty() {
+        println!(
+            "Growing {} — {} class(es), {} relation(s) inherited",
+            seen.join(" + "),
+            seed.classes.len(),
+            seed.relations.len()
+        );
+        // Whatever could not be carried across is SAID, not dropped quietly.
+        // EMMO's object properties, for instance, declare no rdfs:domain or
+        // rdfs:range, so they cannot enter an artifact whose validator requires
+        // typed endpoints — and inventing endpoints would assert structure the
+        // base never claimed.
+        for note in &seed.notes {
+            println!("  note: {note}");
+        }
+    }
+    Ok(seed)
+}
+
 async fn induce(
     corpus_path: &Path,
     domain: &str,
@@ -786,8 +906,12 @@ async fn induce(
     api_key: Option<&str>,
     max_doc_chars: usize,
     max_windows: usize,
+    bases: &[String],
+    no_base: bool,
+    continue_domain: bool,
 ) -> Result<()> {
     let mut config = InductionConfig::new(domain)?;
+    config.seed = resolve_seed(project_root, domain, bases, no_base, continue_domain)?;
     if max_doc_chars > 0 {
         config.max_doc_chars = max_doc_chars;
     }

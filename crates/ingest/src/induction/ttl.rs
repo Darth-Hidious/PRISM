@@ -128,6 +128,17 @@ pub fn to_turtle(o: &InducedOntology) -> String {
         "    prism:documentsFailed {} ;\n",
         p.documents_failed
     ));
+    // One line per inherited base: what it was, which version, and its digest,
+    // so a grown artifact can never quietly claim its base's classes as its own.
+    for seed in &p.seeds {
+        out.push_str(&format!(
+            "    prism:seed \"{}\" ;\n",
+            escape_literal(&format!(
+                "{}|{}|{}|{}|{}",
+                seed.id, seed.version_iri, seed.artifact_sha256, seed.classes, seed.relations
+            ))
+        ));
+    }
     out.push_str(&format!("    prism:windowsRead {} ;\n", p.windows_read));
     out.push_str(&format!(
         "    prism:windowsAttempted {} ;\n",
@@ -350,6 +361,22 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
         provenance.documents_failed = get("documentsFailed")
             .and_then(|v| v.parse().ok())
             .unwrap_or_default();
+        provenance.seeds = literals_of(&graph, act, &prism.get_unchecked("seed"))
+            .into_iter()
+            .filter_map(|raw| {
+                let parts: Vec<&str> = raw.splitn(5, '|').collect();
+                if parts.len() != 5 {
+                    return None;
+                }
+                Some(crate::induction::seed::SeedRef {
+                    id: parts[0].to_string(),
+                    version_iri: parts[1].to_string(),
+                    artifact_sha256: parts[2].to_string(),
+                    classes: parts[3].parse().unwrap_or_default(),
+                    relations: parts[4].parse().unwrap_or_default(),
+                })
+            })
+            .collect();
         provenance.windows_read = get("windowsRead")
             .and_then(|v| v.parse().ok())
             .unwrap_or_default();
@@ -565,6 +592,13 @@ mod tests {
                 documents_failed: 1,
                 windows_read: 5,
                 windows_attempted: 7,
+                seeds: vec![crate::induction::seed::SeedRef {
+                    id: "emmo".into(),
+                    version_iri: "https://example.org/emmo/1.0.3".into(),
+                    artifact_sha256: "a".repeat(64),
+                    classes: 50,
+                    relations: 5,
+                }],
                 malformed_items: 2,
                 created_at: "2026-08-09T00:00:00Z".into(),
                 promoted_at: None,
@@ -637,11 +671,25 @@ mod tests {
             ttl.contains("<https://prism.marc27.com/ontology/alloys> a owl:Ontology"),
             "{ttl}"
         );
+        // The SEED is part of artifact identity: the same corpus grown onto a
+        // different base is a different ontology, and must not claim the same
+        // version IRI. `sample()` inherits from emmo, so the digest is present.
         assert!(
             ttl.contains(
+                "owl:versionIRI <https://prism.marc27.com/ontology/alloys/version/1.abcdef12+"
+            ),
+            "a seeded artifact carries its seed in the version IRI: {ttl}"
+        );
+
+        // Drop the seed and the plain (domain, prompt, corpus) identity returns,
+        // so an unseeded run is unaffected by any of this.
+        let mut standalone = sample();
+        standalone.provenance.seeds.clear();
+        assert!(
+            to_turtle(&standalone).contains(
                 "owl:versionIRI <https://prism.marc27.com/ontology/alloys/version/1.abcdef12>"
             ),
-            "{ttl}"
+            "an unseeded artifact keeps the original version IRI"
         );
     }
 

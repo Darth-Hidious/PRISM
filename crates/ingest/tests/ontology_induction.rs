@@ -350,8 +350,11 @@ async fn same_corpus_same_responses_same_artifact_modulo_timestamp() {
     // changed what a prompt CARRIES: a document longer than one window is
     // read as several parts, and the already-known labels restated to the
     // model are sampled across the whole tree instead of its alphabetical
-    // head. Artifacts induced after that bump stamp "3".
-    assert!(artifacts[0].contains("prism:promptVersion \"3\""));
+    // head. PROMPT_VERSION 4 adds the SEEDED block — the classes of the
+    // ontology being extended, stated separately from the run's own findings
+    // as vocabulary to bind to rather than restate. Artifacts induced after
+    // that bump stamp "4".
+    assert!(artifacts[0].contains("prism:promptVersion \"4\""));
     assert!(artifacts[0].contains(&format!("prism:corpusHash \"{}\"", corpus.hash)));
     assert!(
         artifacts[0].contains("prism:status \"draft\""),

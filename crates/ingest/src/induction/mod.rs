@@ -34,6 +34,7 @@
 pub mod align;
 pub mod corpus;
 pub mod register;
+pub mod seed;
 pub mod ttl;
 pub mod validate;
 
@@ -53,7 +54,7 @@ use corpus::Corpus;
 /// v2: the prompt's examples are domain-abstract placeholders instead of
 /// metallurgy vocabulary — induction is the only door to a non-materials
 /// ontology, and it must not lean on materials English.
-pub const PROMPT_VERSION: &str = "3";
+pub const PROMPT_VERSION: &str = "4";
 
 /// Namespace of the PRISM annotation vocabulary (status, provenance keys).
 pub const PRISM_META_NS: &str = "https://prism.marc27.com/ontology/meta#";
@@ -248,6 +249,10 @@ pub struct InductionProvenance {
     pub windows_attempted: usize,
     /// Classes/relations dropped for empty or unusable labels.
     pub malformed_items: usize,
+    /// The base ontologies this artifact GREW, one entry each. Empty means the
+    /// artifact stands alone. Without this a grown artifact silently takes
+    /// credit for every class it inherited.
+    pub seeds: Vec<seed::SeedRef>,
     /// RFC 3339 creation time.
     pub created_at: String,
     /// RFC 3339 promotion time, once accepted.
@@ -279,9 +284,13 @@ pub struct InducedOntology {
 }
 
 impl InducedOntology {
-    /// Version IRI: deterministic for a (domain, prompt, corpus) triple.
+    /// Version IRI: deterministic for a (domain, prompt, corpus, seed) tuple.
     /// The timestamp lives in provenance, not the version IRI, so a re-run
     /// over the same corpus with the same prompt claims the same version.
+    ///
+    /// The SEED is part of the identity: the same corpus grown onto EMMO and
+    /// onto a customer's own ontology are different artifacts, and without
+    /// this they would claim the same version IRI.
     #[must_use]
     pub fn version_iri(&self) -> String {
         let hash8: String = self
@@ -291,12 +300,27 @@ impl InducedOntology {
             .chars()
             .take(8)
             .collect();
-        format!(
+        let base = format!(
             "{}/version/{}.{}",
             ontology_iri(&self.domain),
             self.provenance.prompt_version,
             hash8
-        )
+        );
+        if self.provenance.seeds.is_empty() {
+            return base;
+        }
+        let mut seeds: Vec<String> = self
+            .provenance
+            .seeds
+            .iter()
+            .map(|s| format!("{}@{}", s.id, s.artifact_sha256))
+            .collect();
+        seeds.sort();
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            seeds.join("|").as_bytes(),
+        ));
+        let seed8: String = digest.chars().take(8).collect();
+        format!("{base}+{seed8}")
     }
 }
 
@@ -702,6 +726,13 @@ pub struct InductionConfig {
     /// triple checks are intentionally not applied to class-label batches;
     /// instance/assertion geometry is not a reliable ontology-label prior.
     pub semantic_validation: NearDuplicatePolicy,
+    /// The ontologies this run GROWS, copied in before the first document is
+    /// read. Empty means a standalone run — the old behaviour.
+    pub seed: seed::Seed,
+    /// Cap on SEEDED labels restated per prompt, budgeted separately from
+    /// [`Self::max_known_labels`]. A 50-class base against one shared cap of
+    /// 60 would crowd the run's own findings out of its own prompt.
+    pub max_seed_labels: usize,
 }
 
 impl InductionConfig {
@@ -713,6 +744,8 @@ impl InductionConfig {
             max_known_labels: 60,
             max_windows_per_doc: 0,
             semantic_validation: NearDuplicatePolicy::default(),
+            seed: seed::Seed::default(),
+            max_seed_labels: 80,
         })
     }
 }
@@ -722,6 +755,7 @@ impl InductionConfig {
 #[must_use]
 pub fn induction_prompt(
     domain: &str,
+    seed_labels: &[&str],
     known_labels: &[&str],
     doc_path: &str,
     doc_text: &str,
@@ -730,6 +764,19 @@ pub fn induction_prompt(
         "(none yet)".to_string()
     } else {
         known_labels.join(", ")
+    };
+    // The base ontology's own terms, kept in a SEPARATE line from the run's
+    // own findings: these are already agreed vocabulary the artifact must bind
+    // to, not candidates it is free to restate in its own words.
+    let seeded = if seed_labels.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "         - These classes ALREADY EXIST in the ontology being extended. Bind to \
+             them exactly where they fit; propose a new class only for something they do \
+             not already cover: {}\n",
+            seed_labels.join(", ")
+        )
     };
     format!(
         "You are an ontology engineer. From the document below, propose an ontology \
@@ -746,6 +793,7 @@ pub fn induction_prompt(
          \"classes\".\n\
          - Reuse these already-known class labels where they fit instead of inventing \
          synonyms: {known}\n\
+         {seeded}\
          - Keep every definition to one sentence.\n\
          \n\
          Return ONLY valid JSON with this structure:\n\
@@ -864,7 +912,8 @@ pub async fn induce(
             };
             let known =
                 representative_labels(builder.known_class_labels(), config.max_known_labels);
-            let prompt = induction_prompt(&config.domain, &known, &doc_label, text);
+            let seeded = representative_labels(config.seed.class_labels(), config.max_seed_labels);
+            let prompt = induction_prompt(&config.domain, &seeded, &known, &doc_label, text);
 
             let mut proposal = None;
             for attempt in 1..=2u8 {
@@ -930,10 +979,23 @@ pub async fn induce(
     }
 
     if failed == corpus.docs.len() {
+        // With a seed present the run still HOLDS an ontology — it just did
+        // not learn anything. Saying "produced nothing" would be a lie about
+        // the artifact, and saying nothing at all would hide a total failure.
+        if config.seed.is_empty() {
+            bail!(
+                "induction produced nothing: all {failed} document(s) failed (model {}) — \
+                 check the LLM endpoint and model, then re-run. Last error: {}",
+                client.config().model,
+                last_error.as_deref().unwrap_or("none recorded")
+            );
+        }
         bail!(
-            "induction produced nothing: all {failed} document(s) failed (model {}) — \
-             check the LLM endpoint and model, then re-run. Last error: {}",
+            "induction learned nothing: all {failed} document(s) failed (model {}), so the \
+             result would be the {} seeded class(es) unchanged. Nothing was written. \
+             Last error: {}",
             client.config().model,
+            config.seed.classes.len(),
             last_error.as_deref().unwrap_or("none recorded")
         );
     }
@@ -951,13 +1013,113 @@ pub async fn induce(
         promoted_at: None,
         dropped_parent_links: Vec::new(),
         merge_notes: Vec::new(),
+        seeds: config.seed.refs.clone(),
         semantic_validation: OntologySemanticValidationReport {
             policy: config.semantic_validation.clone(),
             proposals: semantic_labels,
             ..OntologySemanticValidationReport::default()
         },
     };
-    Ok(builder.finish(provenance))
+    let induced = builder.finish(provenance);
+    Ok(graft_onto_seed(induced, &config.seed))
+}
+
+/// Merge what the run induced onto the ontologies it grew.
+///
+/// The induced side is finished in ISOLATION and merged afterwards, rather
+/// than the builder being pre-seeded. Pre-seeding would route every reused
+/// concept through `OntologyBuilder::absorb`, whose occupied-entry arm
+/// discards the model's definition and parent with no note and no counter —
+/// invisible loss on exactly the classes a customer cares most about. This
+/// shape is the one `ontology_cmd::accept_proposals` already uses to grow an
+/// artifact safely.
+///
+/// The base is authoritative: its label, definition and `skos:exactMatch`
+/// identity stand. Where the model proposed the same concept and said
+/// something genuinely new about it, that lands as a SUBCLASS beneath the base
+/// class rather than overwriting it — so nothing curated is rewritten by a
+/// model, and nothing the model learned is thrown away.
+fn graft_onto_seed(mut induced: InducedOntology, seed: &seed::Seed) -> InducedOntology {
+    if seed.is_empty() {
+        return induced;
+    }
+    let mut classes = seed.classes.clone();
+    let mut by_label: std::collections::BTreeMap<String, usize> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (normalize_label(&c.label), i))
+        .collect();
+    let mut notes = seed.notes.clone();
+
+    for proposed in induced.classes.drain(..) {
+        let key = normalize_label(&proposed.label);
+        let Some(&index) = by_label.get(&key) else {
+            by_label.insert(key, classes.len());
+            classes.push(proposed);
+            continue;
+        };
+        let base = &mut classes[index];
+        // A class the run only referenced, never described, adds nothing.
+        if proposed.declared_by_reference || proposed.definition.trim().is_empty() {
+            continue;
+        }
+        if base.definition.trim().is_empty() {
+            // The base declared the term without defining it; the papers did.
+            // Filling a stated silence is not an override.
+            base.definition = proposed.definition;
+            notes.push(format!(
+                "class {:?}: definition taken from the corpus — the base declared the term \
+                 without defining it",
+                base.label
+            ));
+            continue;
+        }
+        if normalize_label(&base.definition) == normalize_label(&proposed.definition) {
+            continue;
+        }
+        // Genuinely new nuance about an existing concept: a subclass, never an
+        // overwrite.
+        let refined = format!("{} ({})", proposed.label, induced.domain);
+        let refined_key = normalize_label(&refined);
+        if by_label.contains_key(&refined_key) {
+            continue;
+        }
+        notes.push(format!(
+            "class {:?}: the base definition stands; the corpus reading was kept as the \
+             subclass {refined:?}",
+            base.label
+        ));
+        let parent = base.label.clone();
+        by_label.insert(refined_key, classes.len());
+        classes.push(InducedClass {
+            label: refined,
+            definition: proposed.definition,
+            parent: Some(parent),
+            aligned_iri: None,
+            declared_by_reference: false,
+            sign_domain: proposed.sign_domain,
+        });
+    }
+
+    let mut relations = seed.relations.clone();
+    let mut relation_labels: std::collections::BTreeSet<String> = relations
+        .iter()
+        .map(|r| normalize_label(&r.label))
+        .collect();
+    for proposed in induced.relations.drain(..) {
+        if relation_labels.insert(normalize_label(&proposed.label)) {
+            relations.push(proposed);
+        }
+    }
+
+    classes.sort_by_key(|c| class_slug(&c.label));
+    relations.sort_by_key(|r| relation_slug(&r.label));
+    induced.classes = classes;
+    induced.relations = relations;
+    induced.provenance.merge_notes.extend(notes);
+    induced.provenance.merge_notes.sort();
+    induced.provenance.merge_notes.dedup();
+    induced
 }
 
 /// Parse + structurally validate an artifact file — the ONE production gate every
@@ -1002,6 +1164,7 @@ mod tests {
     fn induction_prompt_is_domain_abstract() {
         let prompt = induction_prompt(
             "legal",
+            &[],
             &["Statute", "Obligation"],
             "corpus/doc.md",
             "Body text.",
@@ -1110,5 +1273,149 @@ mod tests {
             representative_labels(all.clone(), 4),
             representative_labels(all, 4)
         );
+    }
+    fn seeded(label: &str, definition: &str, iri: &str) -> InducedClass {
+        InducedClass {
+            label: label.into(),
+            definition: definition.into(),
+            parent: None,
+            aligned_iri: Some(iri.into()),
+            declared_by_reference: false,
+            sign_domain: None,
+        }
+    }
+
+    fn proposed(label: &str, definition: &str) -> InducedClass {
+        InducedClass {
+            label: label.into(),
+            definition: definition.into(),
+            parent: None,
+            aligned_iri: None,
+            declared_by_reference: false,
+            sign_domain: None,
+        }
+    }
+
+    fn grown(seed_classes: Vec<InducedClass>, induced: Vec<InducedClass>) -> InducedOntology {
+        let seed = seed::Seed {
+            classes: seed_classes,
+            ..seed::Seed::default()
+        };
+        let ontology = InducedOntology {
+            domain: "rhea".into(),
+            status: OntologyStatus::Draft,
+            classes: induced,
+            relations: Vec::new(),
+            provenance: InductionProvenance::default(),
+        };
+        graft_onto_seed(ontology, &seed)
+    }
+
+    #[test]
+    fn the_base_definition_is_never_overwritten_by_the_model() {
+        let out = grown(
+            vec![seeded(
+                "Material",
+                "A curated definition.",
+                "https://w3id.org/emmo#M",
+            )],
+            vec![proposed("material", "Something the papers said instead.")],
+        );
+        let base = out
+            .classes
+            .iter()
+            .find(|c| c.label == "Material")
+            .expect("the base class survives");
+        assert_eq!(
+            base.definition, "A curated definition.",
+            "a model must never rewrite a curated definition"
+        );
+        assert_eq!(
+            base.aligned_iri.as_deref(),
+            Some("https://w3id.org/emmo#M"),
+            "the base keeps its identity, so the artifact never claims sole authorship"
+        );
+
+        // The reading is kept, beneath the base class — not discarded.
+        let refined = out
+            .classes
+            .iter()
+            .find(|c| c.parent.as_deref() == Some("Material"))
+            .expect("the corpus reading survives as a subclass");
+        assert_eq!(refined.definition, "Something the papers said instead.");
+        assert!(
+            out.provenance
+                .merge_notes
+                .iter()
+                .any(|n| n.contains("subclass")),
+            "and the decision is recorded: {:?}",
+            out.provenance.merge_notes
+        );
+    }
+
+    #[test]
+    fn a_base_that_declared_a_term_without_defining_it_is_filled_not_forked() {
+        let out = grown(
+            vec![seeded("Property", "", "https://w3id.org/emmo#P")],
+            vec![proposed("Property", "A measurable attribute.")],
+        );
+        assert_eq!(
+            out.classes.len(),
+            1,
+            "filling a stated silence must not fork the class: {:?}",
+            out.classes.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        assert_eq!(out.classes[0].definition, "A measurable attribute.");
+        assert_eq!(
+            out.classes[0].aligned_iri.as_deref(),
+            Some("https://w3id.org/emmo#P")
+        );
+    }
+
+    #[test]
+    fn an_identical_restatement_changes_nothing() {
+        let out = grown(
+            vec![seeded(
+                "Alloy",
+                "A metallic mixture.",
+                "https://w3id.org/emmo#A",
+            )],
+            vec![proposed("alloy", "A metallic mixture.")],
+        );
+        assert_eq!(out.classes.len(), 1, "no fork for an agreeing restatement");
+        assert!(
+            out.provenance.merge_notes.is_empty(),
+            "and nothing to report: {:?}",
+            out.provenance.merge_notes
+        );
+    }
+
+    #[test]
+    fn genuinely_new_classes_are_added_untouched() {
+        let out = grown(
+            vec![seeded("Material", "Base.", "https://w3id.org/emmo#M")],
+            vec![proposed(
+                "High entropy alloy",
+                "Five or more principal elements.",
+            )],
+        );
+        assert_eq!(out.classes.len(), 2);
+        let new = out
+            .classes
+            .iter()
+            .find(|c| c.label == "High entropy alloy")
+            .expect("the induced class is kept");
+        assert!(
+            new.aligned_iri.is_none(),
+            "an induced class claims no base identity it does not have"
+        );
+    }
+
+    #[test]
+    fn an_unseeded_run_is_completely_unaffected() {
+        let before = vec![proposed("Alloy", "A metallic mixture.")];
+        let out = grown(Vec::new(), before.clone());
+        assert_eq!(out.classes, before, "no seed, no change");
+        assert!(out.provenance.merge_notes.is_empty());
     }
 }
