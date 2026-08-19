@@ -387,6 +387,20 @@ impl TranscriptStore {
             .exhausted(self.turn_count, self.cost.total_input)
     }
 
+    /// Whether history should be compacted right now, mid-turn.
+    ///
+    /// `should_compact` alone counts TURNS, which never fires inside a single
+    /// long turn that makes thirty tool calls — the exact shape of a research
+    /// run. Cumulative input is what actually kills that run, so pressure
+    /// against the token budget triggers compaction too.
+    #[must_use]
+    pub fn needs_compaction_under_pressure(&self) -> bool {
+        if self.budget.should_compact(self.turn_count) {
+            return true;
+        }
+        self.budget.should_warn(self.cost.total_input)
+    }
+
     /// Return a warning message if approaching budget limits.
     #[must_use]
     pub fn budget_warning(&self) -> Option<String> {
@@ -779,5 +793,32 @@ mod tests {
         let text = "See /Users/someone/project/main.rs for details.";
         let files = extract_key_files(text, 8);
         assert!(files.iter().any(|f| f.starts_with("~/")));
+    }
+    #[test]
+    fn a_long_tool_calling_turn_compacts_before_the_budget_kills_it() {
+        // The failure this closes: `should_compact` counts TURNS, so a single
+        // turn making thirty tool calls never compacted — it grew until the
+        // cumulative-input guard ended the run, then compacted on the way out.
+        let mut t = TranscriptStore::new(None);
+        assert!(
+            !t.needs_compaction_under_pressure(),
+            "a fresh turn has nothing to compact"
+        );
+
+        // One turn, no extra turns — only token spend rises.
+        let warn_at = (t.budget.max_input_tokens as f64 * t.budget.warn_at_token_pct) as u64;
+        t.cost.record("turn", warn_at - 1, 0);
+        assert!(
+            !t.needs_compaction_under_pressure(),
+            "below the threshold nothing changes"
+        );
+
+        t.cost.record("turn", 1, 0);
+        assert!(
+            t.needs_compaction_under_pressure(),
+            "at {warn_at} cumulative input tokens the turn must compact, \
+             even though turn_count is still {}",
+            t.turn_count
+        );
     }
 }

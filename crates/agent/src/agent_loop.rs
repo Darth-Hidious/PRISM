@@ -3468,6 +3468,27 @@ pub(crate) async fn run_turn_inner(
                 .append(TranscriptEntry::new("tool", &content).with_tool_name(tool_name.as_str()));
         }
 
+        // ── 2h. Compact BEFORE looping back ───────────────────────
+        //
+        // The other `should_compact` call lives in the "no tool calls -> turn
+        // complete" arm, so a long research turn never compacted at all: it
+        // grew until the cumulative-input budget killed it, then compacted on
+        // the way out, which helps nobody. Measured twice on the same PFAS
+        // question — 207,689 tokens over 4 rounds, then 240,967 over 27.
+        //
+        // Cumulative input is the guard that actually binds here, so compaction
+        // triggers on token pressure as well as turn count. The last six
+        // messages always survive, so the model keeps the thread it is
+        // currently pulling; everything older becomes a summary, and the full
+        // text of every tool call remains in the provenance store behind
+        // `recall`.
+        if transcript.needs_compaction_under_pressure()
+            && let Some(summary) = transcript.compact(6)
+        {
+            tracing::debug!("compacting mid-turn under token pressure");
+            compact_history(history, &summary, 6);
+        }
+
         // ── 2i. Loop back ─────────────────────────────────────────
     }
 
