@@ -791,6 +791,75 @@ pub fn get_model_config(model_id: &str) -> ModelConfig {
     UNKNOWN_MODEL_CONFIG
 }
 
+/// Ask a LOCAL OpenAI-compatible server how big its context actually is.
+///
+/// llama.cpp answers `GET {base}/props` with
+/// `default_generation_settings.n_ctx` — the window the server was STARTED
+/// with (`-c`), which is the only number that binds. When the model is not in
+/// the registry, [`get_model_config`] returns the UNKNOWN fallback and its
+/// 128k context; [`crate::tool_catalog::tool_token_budget`] then sized the
+/// tool block against a window that did not exist.
+///
+/// Measured 2026-08-19: `gemma-4-12B` served at `-c 16384` was budgeted as a
+/// 128k model, so 171 tool definitions (12,289 tokens) shipped into a 16,384
+/// window and the FIRST tool result overflowed it — HTTP 400,
+/// `request (19679 tokens) exceeds the available context size (16384)`.
+/// The server knew the real number the whole time.
+///
+/// Best-effort and quiet: any failure returns `None` and the caller falls back
+/// to the registry, so this can only ever replace a guess with a measurement.
+/// Only plain-HTTP endpoints are probed — a remote HTTPS vendor is in the
+/// registry properly and is not ours to interrogate.
+#[must_use]
+pub fn probe_local_context_window(base_url: &str) -> Option<usize> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let rest = base_url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
+        None => (rest, ""),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (authority, 80u16),
+    };
+
+    let timeout = Duration::from_secs(2);
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let request =
+        format!("GET {path}/props HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut raw = Vec::new();
+    stream.take(1 << 20).read_to_end(&mut raw).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b)?;
+    let parsed: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+
+    let n_ctx = parsed
+        .get("default_generation_settings")
+        .and_then(|g| g.get("n_ctx"))
+        .or_else(|| parsed.get("n_ctx"))
+        .and_then(serde_json::Value::as_u64)?;
+    usize::try_from(n_ctx).ok().filter(|window| *window > 0)
+}
+
+/// The context window to plan against: what the SERVER reports when it can be
+/// asked, else what the registry knows. One resolution path, so there is still
+/// only one answer to "how big is this model's window" — it is just no longer
+/// allowed to be invented when the endpoint could have been asked.
+#[must_use]
+pub fn resolve_context_window(base_url: &str, model: &str) -> usize {
+    if let Some(measured) = probe_local_context_window(base_url) {
+        return measured;
+    }
+    get_model_config(model).context_window
+}
+
 /// Context available to an actual request. A resolved client config wins over
 /// registry metadata because embedded GGUF construction replaces catalog
 /// guesses with the runtime context read from the model itself.

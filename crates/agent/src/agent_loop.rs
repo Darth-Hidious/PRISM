@@ -938,52 +938,31 @@ fn iteration_messages(
     history: &[ChatMessage],
     selected_prompt: Option<&str>,
 ) -> Vec<ChatMessage> {
+    // ONE leading system message, not six.
+    //
+    // These blocks were always contiguous and always ahead of `history`, so
+    // concatenating them is semantically identical — and prefix caching is
+    // unaffected, because providers cache on the token prefix and
+    // `system_prompt` still comes first inside the joined text.
+    //
+    // What forced it: mlx-lm's OpenAI-compatible server answers a second
+    // system-role message with `System message must be at the beginning.`
+    // (HTTP 404), so every agent turn against a local MLX model failed before
+    // it began. A single leading system message is what every provider
+    // accepts, so this is the portable shape rather than an MLX special case.
+    let preamble: Vec<String> = std::iter::once(system_prompt.to_string())
+        .chain(task_block.map(str::to_string))
+        .chain(capability_menu.map(str::to_string))
+        .chain(discovery_prompt.map(str::to_string))
+        .chain(session_memory.map(str::to_string))
+        .chain(trajectory_block(traj_steps))
+        .collect();
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
-        content: Some(system_prompt.to_string()),
+        content: Some(preamble.join("\n\n")),
         tool_calls: None,
         tool_call_id: None,
     }];
-    if let Some(block) = task_block {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(block.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-    if let Some(menu) = capability_menu {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(menu.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-    if let Some(skills_menu) = discovery_prompt {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(skills_menu.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-    if let Some(memory) = session_memory {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(memory.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-    if let Some(trajectory) = trajectory_block(traj_steps) {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(trajectory),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
     messages.extend(history.iter().cloned());
     if let Some(selection) = selected_prompt {
         messages.push(ChatMessage {
@@ -1055,6 +1034,13 @@ fn finalize_tools(
         }
         if pinned.contains(name) {
             continue; // already paid for; the pinned loop below adds it
+        }
+        // Ranked retrieval is only progressive disclosure if the ranking is
+        // TRUNCATED. Stop at the count cap even when the budget would afford
+        // more: the block is re-sent every request, so its cost is paid once
+        // per turn, not once per session.
+        if defs.len() >= crate::tool_catalog::MAX_REQUEST_TOOLS {
+            break;
         }
         if seen.insert(name.clone())
             && let Some(tool) = catalog.find(name)
@@ -2116,7 +2102,7 @@ pub(crate) async fn run_turn_inner(
         // Reasoning tokens (is_reasoning=true) are emitted as a separate
         // event so the TUI can render them dimmed/collapsed.
         let mut streamed_deltas: Vec<(String, bool)> = Vec::new();
-        let response = llm
+        let first_attempt = llm
             .chat_with_tools_streaming(
                 &messages,
                 &relevant_tools,
@@ -2126,16 +2112,66 @@ pub(crate) async fn run_turn_inner(
                     }
                 },
             )
-            .await
-            .map_err(|e| {
+            .await;
+
+        // OVERFLOW RECOVERY — the same contract `paper_agent` already honours,
+        // which this loop did not. No context-window TABLE can be right: a
+        // local server's `-c` is whatever it was started with, and a hosted
+        // model's window changes under us (GLM ships 1M). The provider's own
+        // "request (N tokens) exceeds the available context size (M)" is the
+        // ONE authoritative statement of the limit, and it arrives exactly
+        // when it matters — so treat it as an instruction to compact, not as
+        // a fatal error.
+        //
+        // Measured 2026-08-19: a research turn died here on HTTP 400
+        // (19,679 vs 16,384) after seventeen successful tool calls. Every one
+        // of those results was already in hand; the run was lost to a
+        // recoverable condition the harness knew how to answer.
+        let response = match first_attempt {
+            Ok(response) => response,
+            Err(error) if prism_llm::error_is_context_window_exceeded(&error) => {
+                // Exactly one recovery per turn — the retry below is inline,
+                // so a second overflow propagates instead of looping on a
+                // request compaction has already failed to shrink.
+                tracing::warn!(
+                    error = %error,
+                    "context window exceeded — compacting the transcript and retrying this turn"
+                );
+                emit(AgentEvent::TextDelta {
+                    text: "[context full — compacting and retrying]\n".to_string(),
+                });
+                if let Some(summary) = transcript.compact(6) {
+                    compact_history(&mut messages, &summary, 6);
+                }
+                streamed_deltas.clear();
+                llm.chat_with_tools_streaming(
+                    &messages,
+                    &relevant_tools,
+                    |delta: &str, is_reasoning: bool| {
+                        if !delta.is_empty() {
+                            streamed_deltas.push((delta.to_string(), is_reasoning));
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "LLM call failed after compaction: {e:#}");
+                    emit(AgentEvent::TextDelta {
+                        text: format!("Error: {e:#}\n"),
+                    });
+                    e
+                })
+                .context("LLM call failed")?
+            }
+            Err(e) => {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");
                 // Surface error details in the UI, not just "LLM call failed"
                 emit(AgentEvent::TextDelta {
                     text: format!("Error: {e:#}\n"),
                 });
-                e
-            })
-            .context("LLM call failed")?;
+                return Err(e.context("LLM call failed"));
+            }
+        };
 
         if let crate::influence::ContextPrimingStatus::Primed {
             exact_context_tokens,
@@ -3389,58 +3425,87 @@ mod tests {
         }))
     }
 
-    /// THE BUG, and the fix. Under the old fixed cap the model was offered 15
-    /// of 54 tools no matter how much room the context had — so 39 capabilities
-    /// it owned were simply invisible, and "call find_tools if you need
-    /// something else" is an instruction models reliably ignore. Under the token
-    /// budget for a real hosted model, all 54 arrive.
+    /// TWO measured failures, and the lever that answers both.
+    ///
+    /// A fixed cap of 15 of 54 tools made 39 capabilities INVISIBLE, and
+    /// "call find_tools if you need something else" is an instruction models
+    /// reliably ignore. Removing the cap fixed that — and created the opposite
+    /// failure: the tool block is re-sent on EVERY request, so on 2026-08-19 a
+    /// literature review on glm-5.2 spent its whole 200,000-token budget
+    /// re-sending 171 definitions (12,289 x 17 = 208,913 against 207,689
+    /// observed) and stopped at round 4 with nothing left to answer with.
+    ///
+    /// Both are real, so the fix separates what each one costs. DEFINITIONS —
+    /// full JSON schemas, the expensive part — are capped by count, because
+    /// their cost is paid once per turn. VISIBILITY is not capped: everything
+    /// withheld is listed in the L1 capability menu as name + one line and
+    /// pulled back by `find_tools`. Nothing becomes invisible; the schemas just
+    /// stop being re-sent 171 at a time.
     #[test]
-    fn all_54_tools_reach_the_model_where_the_old_cap_offered_15() {
+    fn schemas_are_capped_by_count_while_every_tool_stays_visible() {
         let catalog = catalog_of_54();
         let pinned = std::collections::HashSet::new();
         let route = "help me with something";
 
-        // BEFORE: `definitions_for_query(route, 15)` — a hard count cap.
-        let before: Vec<String> = catalog
-            .names_by_relevance(route)
-            .into_iter()
-            .take(15)
-            .collect();
-        assert_eq!(
-            before.len(),
-            15,
-            "the old cap offered exactly 15: {before:?}"
-        );
-        println!("old top-15: {before:?}");
-
-        // AFTER: the budget for ministral-3b's real 131,072-token window.
+        // A large-context model: the token budget alone would afford ALL 54,
+        // which is exactly why the count cap has to be the binding constraint.
         let budget = crate::tool_catalog::tool_token_budget(131_072);
         let defs = assemble_request_tools(&catalog, route, &pinned, budget);
         let names: std::collections::HashSet<&str> =
             defs.iter().map(|d| d.function.name.as_str()).collect();
+
+        let catalog_defs = defs
+            .iter()
+            .filter(|d| !crate::meta_tools::is_meta_tool(&d.function.name))
+            .count();
+        assert!(
+            catalog_defs <= crate::tool_catalog::MAX_REQUEST_TOOLS,
+            "{catalog_defs} catalog schemas shipped, cap is {}",
+            crate::tool_catalog::MAX_REQUEST_TOOLS
+        );
+        assert!(
+            catalog_defs < 54,
+            "the cap must actually bind on a 54-tool catalog"
+        );
+        assert!(names.contains("find_tools"), "escape hatch stays offered");
+
+        // VISIBILITY: every tool that did not get a schema is named in the menu.
+        let entries: Vec<(String, String)> = catalog
+            .iter()
+            .map(|t| (t.name.clone(), format!("{}: {}", t.name, t.description)))
+            .collect();
+        let included: std::collections::HashSet<String> =
+            names.iter().map(|n| (*n).to_string()).collect();
+        let menu = crate::capability::capability_menu(&entries, &included, 150, 80)
+            .expect("withheld tools must produce a menu");
         for i in 0..54 {
             let want = format!("tool_{i:02}");
             assert!(
-                names.contains(want.as_str()),
-                "{want} must reach the model under the token budget"
+                names.contains(want.as_str()) || menu.contains(&want),
+                "{want} is neither callable nor listed — that is the invisibility bug"
             );
         }
-        assert!(names.contains("find_tools"), "escape hatch stays offered");
 
-        // ...and the whole request still costs a sane fraction of the window.
+        // And the point of the whole exercise: the per-request cost collapses.
         let spent: usize = defs
             .iter()
             .map(crate::tool_catalog::definition_tokens)
             .sum();
+        let whole_catalog: usize = catalog
+            .iter()
+            .map(|t| crate::tool_catalog::definition_tokens(&t.to_definition()))
+            .sum();
+        assert!(
+            spent < whole_catalog,
+            "capped request ({spent}) must cost less than shipping everything ({whole_catalog})"
+        );
         assert!(
             spent <= budget,
-            "per-request tool cost {spent} must respect the budget {budget}"
+            "cost {spent} must respect the budget {budget}"
         );
-        assert!(
-            spent < 131_072 / 4,
-            "per-request tool cost {spent} must stay under a quarter of the context window"
+        println!(
+            "{catalog_defs} schemas + meta = {spent} tokens; whole catalog would be {whole_catalog}"
         );
-        println!("54 tools + meta cost {spent} charged tokens (budget {budget})");
     }
 
     /// The budget is a real bound, not decoration: a small-context model gets

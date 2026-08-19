@@ -23,6 +23,29 @@ pub const MAX_TOOL_TOKENS: usize = 32_768;
 /// guarded where the native definitions are declared).
 pub const MIN_TOOL_TOKENS: usize = 2_048;
 
+/// How many catalog tools one request may carry, on top of the always-included
+/// core, pinned tools, and the meta-tools.
+///
+/// The token budget alone never restrained anything. Retrieval ranks the WHOLE
+/// catalog and `finalize_tools` walked that ranking until the budget ran out —
+/// but the whole catalog costs ~12,289 tokens against a budget that clamps at
+/// 32,768, so the budget was never the binding constraint and every tool
+/// shipped on every request. Progressive disclosure existed and was inert.
+///
+/// Measured 2026-08-19: a PFAS literature review on glm-5.2 spent its ENTIRE
+/// 200,000-token budget on re-sending 171 definitions — 12,289 x 17 requests =
+/// 208,913, against 207,689 observed. It stopped at round 4 of a saturation
+/// task with zero tokens left for the answer. The tool block, not the research,
+/// consumed the run.
+///
+/// A COUNT cap is what the token cap could not be: the cost of a request grows
+/// with turns because the block is re-sent every time, so the ranking has to be
+/// truncated, not merely afforded. What does not fit is not hidden — it is
+/// listed in the L1 capability menu (`capability::capability_menu`) and
+/// retrievable by name through the `find_tools` meta-tool, which is how the
+/// model was always meant to discover capability.
+pub const MAX_REQUEST_TOOLS: usize = 24;
+
 /// Share of the model's context window spendable on tool definitions (1/N).
 /// At 1/4 the whole catalog reaches every 128k-or-larger model — including
 /// `ministral-3b` (131k) — while [`MAX_TOOL_TOKENS`] keeps a 262k model at
