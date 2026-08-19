@@ -87,7 +87,7 @@
 //!   cancellation because dropping the orchestrate future aborts the
 //!   `JoinSet`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -208,6 +208,15 @@ pub struct OrchestratorTaskSpec {
     /// Self-contained JSON Schema the item's final answer must satisfy.
     /// `None` = the answer is reported as-is, unvalidated.
     pub result_schema: Option<Value>,
+    /// Ids of tasks that must finish before this one starts, turning a flat
+    /// fan-out into a DAG.
+    ///
+    /// Research is not a bag of independent questions: "compare the candidates
+    /// found in A and B" cannot run until A and B have run, and forcing it into
+    /// one agent's sequential loop is how a run spends its whole budget
+    /// re-searching. Empty (the default) means the task is a root and runs in
+    /// the first wave, so every existing caller behaves exactly as before.
+    pub depends_on: Vec<String>,
 }
 
 // ── Per-item outcomes ─────────────────────────────────────────────────
@@ -840,6 +849,193 @@ where
     }
 }
 
+// ── Dependency-ordered fan-out (the research DAG) ────────────────────
+//
+// `fan_out` runs every task at once, which is right for independent work and
+// wrong for research. Research decomposes into sub-questions where some depend
+// on others — "compare what A and B found" cannot start until A and B are done.
+// Forcing that into ONE agent's sequential loop is what a measured PFAS review
+// did: 17 searches, nothing persisted, budget exhausted, no report.
+//
+// This is a scheduler ON TOP of `fan_out`, not a second executor: tasks are
+// grouped into waves by dependency depth, and each wave is handed to the
+// existing bounded, cancellable fan-out unchanged.
+
+impl OrchestratedRun {
+    /// Turn a rejected PLAN into a reported run. A cycle or an unknown
+    /// dependency id is an authoring mistake; running the schedulable subset
+    /// would answer a different question than the one asked, and the caller
+    /// would have no way to see that from the results.
+    fn with_plan_error(mut self, reason: &str) -> Self {
+        self.items = vec![ItemReport {
+            id: "plan".to_string(),
+            outcome: ItemOutcome::Skipped {
+                reason: format!("the task plan was rejected: {reason}"),
+            },
+            // Nothing ran, so nothing was written to the ledger.
+            ledger_recorded: false,
+        }];
+        self
+    }
+}
+
+/// Order tasks into dependency waves. Every task appears exactly once, and no
+/// task appears before something it depends on.
+///
+/// Fails on a cycle and on a dependency naming a task that does not exist —
+/// both are authoring mistakes, and running "most of" a malformed plan produces
+/// an answer whose gaps nobody can see.
+fn dependency_waves(specs: &[OrchestratorTaskSpec]) -> Result<Vec<Vec<usize>>> {
+    let mut index_of: HashMap<&str, usize> = HashMap::new();
+    for (index, spec) in specs.iter().enumerate() {
+        if index_of.insert(spec.id.as_str(), index).is_some() {
+            anyhow::bail!(
+                "duplicate task id {:?}: dependencies would be ambiguous",
+                spec.id
+            );
+        }
+    }
+    for spec in specs {
+        for dep in &spec.depends_on {
+            anyhow::ensure!(
+                index_of.contains_key(dep.as_str()),
+                "task {:?} depends on {dep:?}, which is not one of the tasks",
+                spec.id
+            );
+            anyhow::ensure!(dep != &spec.id, "task {:?} depends on itself", spec.id);
+        }
+    }
+
+    let mut remaining: Vec<usize> = (0..specs.len()).collect();
+    let mut done: HashSet<usize> = HashSet::new();
+    let mut waves: Vec<Vec<usize>> = Vec::new();
+    while !remaining.is_empty() {
+        let ready: Vec<usize> = remaining
+            .iter()
+            .copied()
+            .filter(|i| {
+                specs[*i]
+                    .depends_on
+                    .iter()
+                    .all(|dep| done.contains(&index_of[dep.as_str()]))
+            })
+            .collect();
+        if ready.is_empty() {
+            let stuck: Vec<&str> = remaining.iter().map(|i| specs[*i].id.as_str()).collect();
+            anyhow::bail!(
+                "dependency cycle among tasks: {}. A cycle cannot be scheduled, and \
+                 running the rest would answer a different question than the one planned.",
+                stuck.join(", ")
+            );
+        }
+        for index in &ready {
+            done.insert(*index);
+        }
+        remaining.retain(|i| !done.contains(i));
+        waves.push(ready);
+    }
+    Ok(waves)
+}
+
+/// What an upstream task contributes to the tasks that depend on it.
+fn upstream_briefing(id: &str, report: &ItemReport) -> String {
+    match &report.outcome {
+        ItemOutcome::Succeeded { result } => {
+            format!("### Findings from {id}\n{result}\n")
+        }
+        ItemOutcome::Failed { reason } => format!(
+            "### {id} FAILED\n{reason}\nTreat its part of the question as unanswered; do not \
+             assume a result.\n"
+        ),
+        ItemOutcome::Skipped { reason } => {
+            format!("### {id} was skipped\n{reason}\nIts part of the question is unanswered.\n")
+        }
+    }
+}
+
+/// Run tasks in dependency order, wave by wave.
+///
+/// Each task's brief is extended with what its upstream tasks actually found —
+/// including their failures, stated as failures. A downstream task that silently
+/// received nothing would confidently answer from an empty premise, which is the
+/// worst possible outcome and the hardest to spot in a report.
+pub async fn fan_out_dag<F>(
+    specs: Vec<OrchestratorTaskSpec>,
+    policy: &OrchestratorPolicy,
+    lane_bound: Option<NonZeroUsize>,
+    cancel: CancelSignal,
+    factory: F,
+) -> Result<OrchestratedRun>
+where
+    F: Fn(usize, &OrchestratorTaskSpec) -> Box<dyn ItemAgent> + Send + Sync + Clone + 'static,
+{
+    let waves = dependency_waves(&specs)?;
+    // No edges at all: this is a plain fan-out, so do exactly that. One wave
+    // also means the DAG path costs nothing when nobody uses it.
+    let mut reports: HashMap<String, ItemReport> = HashMap::new();
+    let mut ordered: Vec<ItemReport> = Vec::new();
+    let mut aggregate: Option<OrchestratedRun> = None;
+
+    for wave in waves {
+        let mut wave_specs: Vec<OrchestratorTaskSpec> = Vec::with_capacity(wave.len());
+        for index in &wave {
+            let mut spec = specs[*index].clone();
+            if !spec.depends_on.is_empty() {
+                let mut briefing = String::from(
+                    "\n\n## What earlier tasks in this plan established\n\
+                     These are results, not assumptions. Where one failed, its part of the \
+                     question is open — say so rather than filling the gap.\n\n",
+                );
+                for dep in &spec.depends_on {
+                    if let Some(report) = reports.get(dep) {
+                        briefing.push_str(&upstream_briefing(dep, report));
+                    }
+                }
+                spec.task.push_str(&briefing);
+            }
+            wave_specs.push(spec);
+        }
+
+        let run = fan_out(
+            wave_specs,
+            policy,
+            lane_bound,
+            cancel.clone(),
+            factory.clone(),
+        )
+        .await;
+        for report in &run.items {
+            reports.insert(report.id.clone(), report.clone());
+            ordered.push(report.clone());
+        }
+        // Budget and concurrency are properties of the whole run, so carry the
+        // LAST wave's view forward and mark exhaustion if any wave hit it — a
+        // run that ran out of calls in wave 1 did not stop being exhausted
+        // because wave 2 had nothing left to ask for.
+        aggregate = Some(match aggregate.take() {
+            None => run,
+            Some(previous) => OrchestratedRun {
+                items: Vec::new(),
+                budget_used: previous.budget_used.max(run.budget_used),
+                budget_exhausted: previous.budget_exhausted || run.budget_exhausted,
+                ..run
+            },
+        });
+    }
+
+    let mut out = aggregate.unwrap_or_else(|| OrchestratedRun {
+        items: Vec::new(),
+        requested_concurrency: policy.max_concurrent.get(),
+        lane_bound: lane_bound.map(NonZeroUsize::get),
+        effective_concurrency: effective_concurrency(policy, lane_bound).get(),
+        budget_max: policy.max_agent_calls.get(),
+        budget_used: 0,
+        budget_exhausted: false,
+    });
+    out.items = ordered;
+    Ok(out)
+}
+
 // ── Catalog definition ────────────────────────────────────────────────
 
 /// Catalog entry for `orchestrate_agents`, merged into the always-on
@@ -853,11 +1049,9 @@ pub fn definition() -> LoadedTool {
         // tool budget (`always_on_meta_tools_leave_room_in_the_minimum_tool_budget`).
         // Full semantics live in the module docs; the tool RESULT carries the
         // per-item detail the model actually acts on.
-        description: "Run several INDEPENDENT agent tasks concurrently (each a full \
-            nested turn like spawn_subagent, on its own lane). Reports one outcome \
-            per task (succeeded/failed/skipped + reason) in input order. An optional \
-            `result_schema` per task gets one repair on mismatch; `max_agent_calls` \
-            caps the whole run."
+        description: "Run agent tasks as a DAG, each a full nested turn. DECOMPOSE a \
+            hard question instead of searching sequentially: no `depends_on` runs \
+            concurrently, with it waits and receives their findings."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -878,7 +1072,12 @@ pub fn definition() -> LoadedTool {
                             "max_tokens": { "type": "integer" },
                             "result_schema": {
                                 "type": "object",
-                                "description": "Self-contained JSON Schema for the final answer; no external $ref."
+                                "description": "JSON Schema for the answer; no external $ref."
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Task ids that must finish first; their findings enter this brief."
                             }
                         },
                         "required": ["task"]
@@ -964,12 +1163,26 @@ fn parse_args(args: &Value) -> Result<(Vec<OrchestratorTaskSpec>, OrchestratorPo
                 "tasks[{index}].result_schema must be a JSON Schema object, got {other}"
             ),
         };
+        let depends_on = match entry.get("depends_on") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| match item.as_str() {
+                    Some(dep) if !dep.trim().is_empty() => Ok(dep.trim().to_string()),
+                    _ => anyhow::bail!("tasks[{index}].depends_on entries must be task ids"),
+                })
+                .collect::<Result<Vec<String>>>()?,
+            Some(other) => {
+                anyhow::bail!("tasks[{index}].depends_on must be an array of task ids, got {other}")
+            }
+        };
         specs.push(OrchestratorTaskSpec {
             id,
             task: task.to_string(),
             model,
             max_tokens,
             result_schema,
+            depends_on,
         });
     }
 
@@ -1486,18 +1699,40 @@ pub(crate) fn execute_orchestrate_agents<'a>(
         let (_cancel_handle, cancel_signal) = cancellation();
 
         let factory_ctx = Arc::clone(&ctx);
-        let fan = fan_out(
-            specs,
-            &policy_spec,
-            lane_bound,
-            cancel_signal,
-            move |_, spec| {
+        // Dependency-ordered when the plan declares edges, plain fan-out when it
+        // does not — one wave IS a fan-out, so the DAG path costs nothing for
+        // callers that never use it.
+        let has_edges = specs.iter().any(|spec| !spec.depends_on.is_empty());
+        let fan = async move {
+            let factory = move |_: usize, spec: &OrchestratorTaskSpec| {
                 Box::new(OrchestratedAgent::new(
                     Arc::clone(&factory_ctx),
                     spec.clone(),
                 )) as Box<dyn ItemAgent>
-            },
-        );
+            };
+            if has_edges {
+                match fan_out_dag(specs, &policy_spec, lane_bound, cancel_signal, factory).await {
+                    Ok(run) => run,
+                    // A malformed plan (cycle, unknown or duplicate id) is an
+                    // authoring error, not a partial result. Report every item
+                    // as skipped with the reason rather than silently running
+                    // whichever subset happened to be schedulable.
+                    Err(error) => OrchestratedRun {
+                        items: Vec::new(),
+                        requested_concurrency: policy_spec.max_concurrent.get(),
+                        lane_bound: lane_bound.map(NonZeroUsize::get),
+                        effective_concurrency: effective_concurrency(&policy_spec, lane_bound)
+                            .get(),
+                        budget_max: policy_spec.max_agent_calls.get(),
+                        budget_used: 0,
+                        budget_exhausted: false,
+                    }
+                    .with_plan_error(&error.to_string()),
+                }
+            } else {
+                fan_out(specs, &policy_spec, lane_bound, cancel_signal, factory).await
+            }
+        };
         let mut fan = std::pin::pin!(fan);
 
         // Pump item events to the parent's sink WHILE the fan-out runs, so
@@ -1581,6 +1816,7 @@ mod tests {
             model: DEFAULT_SUBAGENT_MODEL.to_string(),
             max_tokens: DEFAULT_SUBAGENT_BUDGET_TOKENS,
             result_schema: None,
+            depends_on: Vec::new(),
         }
     }
 
@@ -2281,5 +2517,114 @@ mod tests {
         third.commit();
         assert_eq!(budget.used(), 2);
         assert!(budget.exhausted(), "the refusal was recorded");
+    }
+    // ── Research DAG ───────────────────────────────────────────────
+
+    fn dag_spec(id: &str, deps: &[&str]) -> OrchestratorTaskSpec {
+        OrchestratorTaskSpec {
+            id: id.to_string(),
+            task: format!("investigate {id}"),
+            model: DEFAULT_SUBAGENT_MODEL.to_string(),
+            max_tokens: DEFAULT_SUBAGENT_BUDGET_TOKENS,
+            result_schema: None,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn independent_questions_all_run_in_the_first_wave() {
+        let specs = vec![dag_spec("a", &[]), dag_spec("b", &[]), dag_spec("c", &[])];
+        let waves = dependency_waves(&specs).expect("no edges is a valid plan");
+        assert_eq!(waves.len(), 1, "nothing depends on anything: one wave");
+        assert_eq!(waves[0].len(), 3);
+    }
+
+    #[test]
+    fn a_synthesis_task_waits_for_what_it_synthesises() {
+        // The shape research actually takes: investigate two angles in
+        // parallel, then compare them. The comparison cannot run first.
+        let specs = vec![
+            dag_spec("compare", &["coatings", "seals"]),
+            dag_spec("coatings", &[]),
+            dag_spec("seals", &[]),
+        ];
+        let waves = dependency_waves(&specs).expect("a valid plan");
+        assert_eq!(waves.len(), 2, "two waves: the pair, then the comparison");
+        assert_eq!(waves[0].len(), 2, "both investigations run together");
+        assert_eq!(waves[1], vec![0], "the comparison runs alone, afterwards");
+    }
+
+    #[test]
+    fn a_chain_runs_strictly_in_order() {
+        let specs = vec![
+            dag_spec("third", &["second"]),
+            dag_spec("second", &["first"]),
+            dag_spec("first", &[]),
+        ];
+        let waves = dependency_waves(&specs).expect("a valid plan");
+        assert_eq!(waves.len(), 3, "a chain cannot be parallelised: {waves:?}");
+    }
+
+    #[test]
+    fn a_cycle_is_refused_rather_than_partly_run() {
+        let specs = vec![dag_spec("a", &["b"]), dag_spec("b", &["a"])];
+        let error = dependency_waves(&specs).expect_err("a cycle cannot be scheduled");
+        let message = error.to_string();
+        assert!(message.contains("cycle"), "{message}");
+        assert!(
+            message.contains('a') && message.contains('b'),
+            "names the stuck tasks: {message}"
+        );
+    }
+
+    #[test]
+    fn a_dependency_on_a_task_that_does_not_exist_is_refused() {
+        let specs = vec![dag_spec("a", &["ghost"])];
+        let message = dependency_waves(&specs)
+            .expect_err("an unknown id is an authoring error")
+            .to_string();
+        assert!(
+            message.contains("ghost"),
+            "names the missing task: {message}"
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_refused_because_edges_would_be_ambiguous() {
+        let specs = vec![dag_spec("a", &[]), dag_spec("a", &[])];
+        let message = dependency_waves(&specs).expect_err("ambiguous").to_string();
+        assert!(message.contains("duplicate"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_upstream_is_reported_as_open_not_hidden() {
+        // The dangerous case: a downstream task that silently received nothing
+        // would answer confidently from an empty premise.
+        let failed = ItemReport {
+            id: "seals".to_string(),
+            outcome: ItemOutcome::Failed {
+                reason: "provider timeout".to_string(),
+            },
+            ledger_recorded: false,
+        };
+        let briefing = upstream_briefing("seals", &failed);
+        assert!(briefing.contains("FAILED"), "{briefing}");
+        assert!(
+            briefing.contains("provider timeout"),
+            "the real reason travels: {briefing}"
+        );
+        assert!(
+            briefing.contains("unanswered"),
+            "and the downstream task is told not to assume a result: {briefing}"
+        );
+
+        let ok = ItemReport {
+            id: "coatings".to_string(),
+            outcome: ItemOutcome::Succeeded {
+                result: serde_json::json!("PTFE alternatives: PEEK, PPS"),
+            },
+            ledger_recorded: true,
+        };
+        assert!(upstream_briefing("coatings", &ok).contains("PEEK"));
     }
 }

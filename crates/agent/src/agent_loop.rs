@@ -1290,8 +1290,19 @@ pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, kee
     }
     let recent = history.split_off(split_at);
     history.clear();
+    // NOT a system message. `iteration_messages` puts the whole preamble first
+    // and appends history after it, so a system role inserted here lands in the
+    // MIDDLE of the array — which providers reject outright: GLM answers
+    // `1214 messages 参数非法` and mlx-lm answers `System message must be at the
+    // beginning`. It never bit while compaction only ran after twenty turns;
+    // compacting mid-turn under token pressure fires it on every long research
+    // run, which is exactly when the failure is least recoverable.
+    //
+    // `user` is the role every provider accepts at any position. The marker
+    // keeps it unmistakably harness-generated rather than something the human
+    // said.
     history.push(ChatMessage {
-        role: "system".to_string(),
+        role: "user".to_string(),
         content: Some(format!("[Conversation context compacted]\n{summary}")),
         tool_calls: None,
         tool_call_id: None,
@@ -4947,7 +4958,17 @@ mod tests {
         // The property this test exists for — older messages collapse into a
         // summary at the head — is unchanged.
         assert_eq!(history.len(), 4);
-        assert_eq!(history[0].role, "system");
+        // CONTRACT CHANGE: the summary is a `user` message, not `system`.
+        // History is appended AFTER the preamble, so a system role here sits
+        // mid-array and providers refuse it outright — GLM with
+        // `1214 messages 参数非法`, mlx-lm with "System message must be at the
+        // beginning". Harmless while compaction only ran after twenty turns;
+        // fatal once it runs mid-turn under token pressure.
+        assert_eq!(history[0].role, "user");
+        assert_ne!(
+            history[0].role, "system",
+            "a compaction summary must never be a mid-array system message"
+        );
         assert_ne!(
             history[1].role, "tool",
             "compaction must not leave a tool result as the first message after \
