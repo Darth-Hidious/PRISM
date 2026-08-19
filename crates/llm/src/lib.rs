@@ -224,6 +224,13 @@ mod credential_debug_tests {
 fn default_max_sample_rows() -> usize {
     10
 }
+/// How long one HTTP request may send NOTHING before it is treated as dead.
+///
+/// Not a cap on how long a request may take: data resets it. It exists so a
+/// wedged socket cannot silently consume a run, which `timeout_secs = 0`
+/// (no total deadline, deliberately) otherwise allows forever.
+const READ_IDLE_TIMEOUT_SECS: u64 = 600;
+
 fn default_timeout_secs() -> u64 {
     // 0 = no read deadline. Research runs are long by nature; the operator may
     // impose a deadline, PRISM does not impose one on them.
@@ -577,8 +584,27 @@ impl LlmClient {
                 // that is working.
                 //
                 // `timeout_secs = 0` means "no deadline" and is the default.
-                let mut builder =
-                    reqwest::Client::builder().connect_timeout(Duration::from_secs(30));
+                let mut builder = reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(30))
+                    // A deadline on SILENCE, not on duration — which is the
+                    // distinction `timeout_secs` misses. "Research runs are
+                    // long" is a statement about RUNS; this knob bounds one
+                    // HTTP request, and a request that has sent nothing for ten
+                    // minutes is not slow, it is dead.
+                    //
+                    // Measured 2026-08-19, twice in one session: an ontology
+                    // induction sat on a single wedged connection to a HEALTHY
+                    // provider for 90 minutes (0.35 s of CPU across the whole
+                    // period, one ESTABLISHED socket, no error, no output) and
+                    // had to be killed; a local MLX server exhausted GPU memory,
+                    // raised internally, sent no response at all, and hung the
+                    // TUI the same way. Neither would ever have returned.
+                    //
+                    // Deliberately generous: a NON-streaming request sends
+                    // nothing until generation completes, so this must exceed
+                    // the slowest legitimate single generation. It bounds one
+                    // request, never the run — a long run is many requests.
+                    .read_timeout(Duration::from_secs(READ_IDLE_TIMEOUT_SECS));
                 if config.timeout_secs > 0 {
                     builder = builder.timeout(Duration::from_secs(config.timeout_secs));
                 }

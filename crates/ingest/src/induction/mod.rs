@@ -485,6 +485,12 @@ impl OntologyBuilder {
 
     /// Labels of every class absorbed so far, for prompt vocabulary reuse.
     #[must_use]
+    /// Relations in the draft. Paired with [`Self::known_class_labels`] so a
+    /// progress reporter can show the tree growing without reaching inside.
+    pub fn relation_count(&self) -> usize {
+        self.relations.len()
+    }
+
     pub fn known_class_labels(&self) -> Vec<&str> {
         self.classes.values().map(|c| c.label.as_str()).collect()
     }
@@ -800,10 +806,37 @@ fn doc_windows(text: &str, size: usize, max: usize) -> Vec<String> {
     out
 }
 
+/// Progress of one induction run, reported after every window so a long run is
+/// observable while it happens.
+///
+/// A 90-minute run that prints nothing cannot be distinguished from a hung one
+/// — measured 2026-08-19, when exactly that question could not be answered from
+/// the terminal and the run turned out to be wedged on a dead socket.
+#[derive(Debug, Clone, Copy)]
+pub struct InductionProgress<'a> {
+    /// Document currently being read.
+    pub document: &'a str,
+    /// 1-based index of this document in the corpus.
+    pub doc_index: usize,
+    /// Documents in the corpus.
+    pub doc_total: usize,
+    /// 1-based window within this document.
+    pub window: usize,
+    /// Windows this document is split into.
+    pub window_total: usize,
+    /// Whether this window produced a usable proposal.
+    pub absorbed: bool,
+    /// Classes in the draft ontology after this window.
+    pub classes: usize,
+    /// Relations in the draft ontology after this window.
+    pub relations: usize,
+}
+
 pub async fn induce(
     client: &prism_llm::LlmClient,
     corpus: &Corpus,
     config: &InductionConfig,
+    on_progress: &mut dyn FnMut(InductionProgress<'_>),
 ) -> Result<InducedOntology> {
     if corpus.docs.is_empty() {
         bail!("corpus at {} contains no documents", corpus.root.display());
@@ -815,12 +848,13 @@ pub async fn induce(
     let mut windows_read = 0usize;
     let mut windows_attempted = 0usize;
 
-    for doc in &corpus.docs {
+    for (doc_index, doc) in corpus.docs.iter().enumerate() {
         let windows = doc_windows(&doc.text, config.max_doc_chars, config.max_windows_per_doc);
         let window_count = windows.len();
         let mut doc_absorbed = 0usize;
 
         for (index, text) in windows.iter().enumerate() {
+            let mut absorbed_this_window = false;
             // One window keeps the prompt byte-identical to the pre-windowing
             // form, so PROMPT_VERSION still describes what that call sends.
             let doc_label = if window_count == 1 {
@@ -872,7 +906,19 @@ pub async fn induce(
                 );
                 builder.absorb(p);
                 doc_absorbed += 1;
+                absorbed_this_window = true;
             }
+
+            on_progress(InductionProgress {
+                document: &doc.rel_path,
+                doc_index: doc_index + 1,
+                doc_total: corpus.docs.len(),
+                window: index + 1,
+                window_total: window_count,
+                absorbed: absorbed_this_window,
+                classes: builder.known_class_labels().len(),
+                relations: builder.relation_count(),
+            });
         }
 
         // A document counts as failed only when NO window of it was read.

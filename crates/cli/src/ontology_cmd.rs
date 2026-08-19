@@ -820,7 +820,30 @@ async fn induce(
         client.config().model
     );
 
-    let mut ontology = induction::induce(&client, &corpus, &config).await?;
+    // Print every window as it lands. A run over a real corpus is hundreds of
+    // LLM calls and tens of minutes; without this the only two observable
+    // states are "still going" and "finished", which makes a wedged run
+    // indistinguishable from a working one until it is far too late.
+    let started = std::time::Instant::now();
+    let mut last_doc = 0usize;
+    let mut on_progress = |p: induction::InductionProgress<'_>| {
+        if p.doc_index != last_doc {
+            last_doc = p.doc_index;
+            println!("  [{}/{}] {}", p.doc_index, p.doc_total, p.document);
+        }
+        println!(
+            "      window {}/{} {} — {} class(es), {} relation(s), {:.0}s elapsed",
+            p.window,
+            p.window_total,
+            if p.absorbed { "ok" } else { "UNUSABLE" },
+            p.classes,
+            p.relations,
+            started.elapsed().as_secs_f64(),
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    };
+    let mut ontology = induction::induce(&client, &corpus, &config, &mut on_progress).await?;
 
     if let Some(index) = &alignment {
         let outcome = align::align(&mut ontology, index);

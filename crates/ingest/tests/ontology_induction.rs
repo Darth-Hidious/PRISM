@@ -98,6 +98,7 @@ async fn induction_survives_malformed_json_and_counts_the_failure() {
         &client_for(&server),
         &corpus,
         &InductionConfig::new("survival-test").unwrap(),
+        &mut |_| {},
     )
     .await
     .expect("two of three documents succeeded — the run must survive");
@@ -150,6 +151,7 @@ async fn duplicate_classes_merge_and_conflicts_are_recorded() {
         &client_for(&server),
         &corpus,
         &InductionConfig::new("merge-test").unwrap(),
+        &mut |_| {},
     )
     .await
     .unwrap();
@@ -208,6 +210,7 @@ async fn model_emitted_cycles_are_broken_and_recorded() {
         &client_for(&server),
         &corpus,
         &InductionConfig::new("cycle-test").unwrap(),
+        &mut |_| {},
     )
     .await
     .unwrap();
@@ -257,6 +260,7 @@ async fn all_documents_failing_fails_the_run() {
         &client_for(&server),
         &corpus,
         &InductionConfig::new("allfail-test").unwrap(),
+        &mut |_| {},
     )
     .await
     .expect_err("a run with zero usable documents must fail");
@@ -332,6 +336,7 @@ async fn same_corpus_same_responses_same_artifact_modulo_timestamp() {
             &client_for(&server),
             &corpus,
             &InductionConfig::new("determinism-test").unwrap(),
+            &mut |_| {},
         )
         .await
         .unwrap();
