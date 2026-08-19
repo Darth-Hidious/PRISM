@@ -135,7 +135,7 @@ const LOCAL_ONTOLOGY_TENANT: &str = "local";
 /// the agent loop and local ingest use (`~/.prism/provenance.db`).
 fn default_provenance_db_path() -> PathBuf {
     dirs::home_dir()
-        .map(|h| h.join(".prism/provenance.db"))
+        .map(|_| prism_provenance::store_path())
         .unwrap_or_else(|| PathBuf::from("provenance.db"))
 }
 

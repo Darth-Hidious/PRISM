@@ -4565,3 +4565,71 @@ mod tests {
         );
     }
 }
+
+/// The provenance store this process must open.
+///
+/// `$PRISM_PROVENANCE_DB` wins when set and non-empty; otherwise
+/// `$HOME/.prism/provenance.db`.
+///
+/// EVERY OPEN RESOLVES HERE. Six call sites built this path by hand and so
+/// silently ignored the override: `cli::ontology_cmd`, `ingest::pipeline`,
+/// `workflows`, and `server::handlers::query` twice. Only the agent's copy
+/// honoured it, which is how `prism query` came to read an empty default store
+/// while the corpus the operator had selected sat elsewhere — the agent then
+/// reported, truthfully and wrongly, that the corpus did not contain what it
+/// was asked about.
+///
+/// It is not a hypothetical: pointing the ontology tools at a corpus with
+/// `PRISM_PROVENANCE_DB` opened the DEFAULT store instead, collided with the
+/// running node's lock, and failed. A resolver that only some callers use is
+/// not a resolver.
+#[must_use]
+pub fn store_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("PRISM_PROVENANCE_DB")
+        && !path.is_empty()
+    {
+        return std::path::PathBuf::from(path);
+    }
+    default_store_path()
+}
+
+/// `$HOME/.prism/provenance.db`, or a relative fallback when HOME is unset.
+#[must_use]
+pub fn default_store_path() -> std::path::PathBuf {
+    std::env::var_os("HOME").map_or_else(
+        || std::path::PathBuf::from(".prism/provenance.db"),
+        |home| std::path::PathBuf::from(home).join(".prism/provenance.db"),
+    )
+}
+
+#[cfg(test)]
+mod store_path_tests {
+    /// The override exists so an operator can point PRISM at a chosen corpus.
+    /// A caller that builds the path by hand silently ignores it, and the
+    /// symptom is not an error — it is a confident answer about the wrong
+    /// database.
+    #[test]
+    fn the_override_wins_and_an_empty_value_does_not() {
+        // Serialised against other env-touching tests in this crate.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("PRISM_PROVENANCE_DB");
+
+        unsafe { std::env::set_var("PRISM_PROVENANCE_DB", "/tmp/chosen-corpus.db") };
+        assert_eq!(
+            super::store_path(),
+            std::path::PathBuf::from("/tmp/chosen-corpus.db")
+        );
+
+        // Empty must NOT shadow the default, or `VAR=` would break every open.
+        unsafe { std::env::set_var("PRISM_PROVENANCE_DB", "") };
+        assert_eq!(super::store_path(), super::default_store_path());
+
+        unsafe { std::env::remove_var("PRISM_PROVENANCE_DB") };
+        assert_eq!(super::store_path(), super::default_store_path());
+
+        if let Some(value) = previous {
+            unsafe { std::env::set_var("PRISM_PROVENANCE_DB", value) };
+        }
+    }
+}

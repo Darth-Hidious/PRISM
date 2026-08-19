@@ -1547,7 +1547,8 @@ fn truncate_for_error(text: &str) -> String {
 /// `~/.prism/provenance.db`.
 #[cfg(not(feature = "test-guard"))]
 fn home_fallback_store_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".prism/provenance.db"))
+    // One resolver, so a workflow reads the store the operator selected.
+    Some(prism_provenance::store_path())
 }
 
 // Same reasoning as `prism_agent::hooks`: `test-guard` is a public cargo

@@ -689,7 +689,7 @@ impl IngestPipeline {
         let db_path = match &self.config.provenance_db {
             Some(p) => p.clone(),
             None => dirs::home_dir()
-                .map(|h| h.join(".prism/provenance.db"))
+                .map(|_| prism_provenance::store_path())
                 .unwrap_or_else(|| PathBuf::from("provenance.db")),
         };
         let store = ProvenanceStore::open(&db_path).await?;

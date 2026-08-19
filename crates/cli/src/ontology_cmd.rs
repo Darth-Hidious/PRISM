@@ -44,6 +44,14 @@ pub enum OntologyCommands {
         /// API key for authenticated LLM providers. Also reads LLM_API_KEY.
         #[arg(long, env = "LLM_API_KEY")]
         api_key: Option<String>,
+        /// Characters of a document fed per prompt. A paper is read as
+        /// successive overlapping windows of this size.
+        #[arg(long, default_value_t = 4000)]
+        max_doc_chars: usize,
+        /// Cap on windows read per document. 0 reads the whole paper; 1 reads
+        /// only its opening window.
+        #[arg(long, default_value_t = 0)]
+        max_windows: usize,
     },
     /// Parse and validate an ontology artifact; exits non-zero listing the
     /// specific violations if it fails.
@@ -134,6 +142,8 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
             llm_url,
             model,
             api_key,
+            max_doc_chars,
+            max_windows,
         } => {
             induce(
                 &corpus,
@@ -144,6 +154,8 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
                 llm_url.as_deref(),
                 model.as_deref(),
                 api_key.as_deref(),
+                max_doc_chars,
+                max_windows,
             )
             .await
         }
@@ -208,7 +220,10 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
 /// writes (`~/.prism/provenance.db`).
 fn proposal_store_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Ok(PathBuf::from(home).join(".prism/provenance.db"))
+    let _ = home;
+    // Honours $PRISM_PROVENANCE_DB — pointing the ontology tools at a chosen
+    // corpus used to open the DEFAULT store and collide with the node's lock.
+    Ok(prism_provenance::store_path())
 }
 
 async fn proposals(command: ProposalCommands, project_root: &Path) -> Result<()> {
@@ -769,8 +784,14 @@ async fn induce(
     llm_url: Option<&str>,
     model: Option<&str>,
     api_key: Option<&str>,
+    max_doc_chars: usize,
+    max_windows: usize,
 ) -> Result<()> {
-    let config = InductionConfig::new(domain)?;
+    let mut config = InductionConfig::new(domain)?;
+    if max_doc_chars > 0 {
+        config.max_doc_chars = max_doc_chars;
+    }
+    config.max_windows_per_doc = max_windows;
 
     // Alignment sources load FIRST: a typo'd reference path must fail before
     // any model spend, not after.
@@ -857,6 +878,20 @@ async fn induce(
         p.documents_total,
         p.corpus_hash
     );
+    // How much of each paper actually reached the model. A corpus read only
+    // in part must never look like a corpus read whole.
+    if p.windows_attempted > 0 {
+        println!(
+            "  read: {}/{} window(s) of the corpus absorbed{}",
+            p.windows_read,
+            p.windows_attempted,
+            if p.windows_read < p.windows_attempted {
+                " — the rest overflowed the model's context or returned unusable JSON"
+            } else {
+                ""
+            }
+        );
+    }
     println!(
         "  semantic near-duplicate check: {} ({} raw labels, {} finding(s))",
         p.semantic_validation.near_duplicates.status.as_str(),
