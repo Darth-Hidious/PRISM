@@ -421,6 +421,7 @@ mod tests {
             api_key_env: None,
             docs: None,
             platform: false,
+            streaming: true,
         }
     }
 

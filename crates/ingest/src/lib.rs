@@ -229,6 +229,7 @@ mod tests {
             context_window: None,
             max_output_tokens: None,
             credential_kind: None,
+            streaming: true,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: LlmConfig = serde_json::from_str(&json).unwrap();

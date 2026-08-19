@@ -179,6 +179,22 @@ name = "llama.cpp server (local)"
 base_url = "http://localhost:8080/v1"
 docs = "https://github.com/ggml-org/llama.cpp"
 
+# MLX is the Apple-silicon runtime: safetensors on the GPU via Metal, not GGUF,
+# so it serves models llama.cpp cannot load. Port 8082 rather than mlx-lm's own
+# default of 8080, which collides with llama.cpp above; a loopback entry here is
+# all discovery needs, since `local_llm::sweep_targets` probes every loopback
+# provider in this registry.
+[[provider]]
+id = "mlx"
+name = "MLX (local, Apple silicon)"
+base_url = "http://localhost:8082/v1"
+docs = "https://github.com/ml-explore/mlx-lm"
+# Measured 2026-08-19: mlx-lm accepts `stream: true`, answers 200, and sends
+# ZERO chunks — 180 s produced nothing, while the same request without
+# streaming returns in seconds. A streaming-only caller hangs forever, so
+# declare the limitation instead of making every caller discover it by timeout.
+streaming = false
+
 [[provider]]
 id = "lmstudio"
 name = "LM Studio (local)"

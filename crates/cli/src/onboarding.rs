@@ -451,6 +451,7 @@ mod tests {
             api_key_env: api_key_env.map(str::to_string),
             docs: None,
             platform: false,
+            streaming: true,
         }
     }
 

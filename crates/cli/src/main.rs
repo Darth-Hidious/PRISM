@@ -6429,6 +6429,7 @@ pub(crate) fn build_llm_config(
 
     // Read before the move into the struct below.
     let model_for_limits = model.clone();
+    let endpoint_for_limits = base_url.clone();
     Ok(prism_ingest::LlmConfig {
         base_url,
         model,
@@ -6460,8 +6461,23 @@ pub(crate) fn build_llm_config(
         // cache ahead of the static seed. Reused here rather than reimplemented,
         // because a second answer to "how big is this model's window" is how
         // the first one drifted.
-        context_window: Some(
-            prism_agent::models::get_model_config(&model_for_limits).context_window as u64,
+        // ASK the endpoint before trusting the registry. `get_model_config`
+        // answers for a model it does not know with the UNKNOWN fallback's
+        // 128k, and `tool_catalog::tool_token_budget` then sizes the tool
+        // block against a window that does not exist — measured 2026-08-19:
+        // 171 definitions (12,289 tokens) shipped at a llama.cpp server
+        // started with `-c 16384`, and the first tool result overflowed it.
+        // A local server reports its real `n_ctx`; compaction cannot fix this
+        // one because the tool block is not part of the history it shrinks.
+        context_window: Some(prism_agent::models::resolve_context_window(
+            &endpoint_for_limits,
+            &model_for_limits,
+        ) as u64),
+        // Whether this endpoint can stream, per the provider registry. Unknown
+        // endpoints stream; only a declared `streaming = false` turns it off.
+        streaming: prism_core::providers::streams_for_url(
+            &prism_core::providers::Registry::load(),
+            &endpoint_for_limits,
         ),
         ..Default::default()
     })

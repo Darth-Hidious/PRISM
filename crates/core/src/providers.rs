@@ -37,6 +37,10 @@ const BUILTIN_PROVIDERS_TOML: &str = include_str!("../providers.toml");
 
 /// One provider entry. Every field except `id` is optional so a user
 /// override file can be as short as an id plus a base URL.
+const fn default_streaming() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provider {
     /// Slug passed to `prism use provider <id>`. Matched case-insensitively.
@@ -53,6 +57,13 @@ pub struct Provider {
     /// Where to get a key — surfaced when the key is missing.
     #[serde(default)]
     pub docs: Option<String>,
+    /// Whether this endpoint can serve SSE streaming. Defaults to `true`
+    /// because nearly every OpenAI-compatible server streams; declare
+    /// `streaming = false` for one that accepts `stream: true` and then
+    /// never sends a chunk, so callers fall back to a single request
+    /// instead of waiting forever.
+    #[serde(default = "default_streaming")]
+    pub streaming: bool,
     /// `true` ⇒ the endpoint comes from the signed-in session, not this
     /// file. Only MARC27 sets it; it is what keeps MARC27 describable in
     /// the same table as everyone else without pretending its URL is
@@ -212,6 +223,46 @@ impl Registry {
 }
 
 /// `~/.prism/providers.toml`. `None` when `$HOME` is unset.
+/// Authority (`host:port`) of a base URL, with loopback spellings unified so
+/// `http://localhost:8082/v1` and `http://127.0.0.1:8082/v1` are the same
+/// endpoint — which is how people actually type them.
+fn authority_of(base_url: &str) -> Option<String> {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?']).next()?.to_ascii_lowercase();
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    let host = match host {
+        "localhost" | "::1" => "127.0.0.1",
+        other => other,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+/// Whether the endpoint at `base_url` serves SSE streaming, per the registry.
+///
+/// Unknown endpoints stream: that is the overwhelming default, and guessing
+/// `false` would turn every unrecognised server's streaming off. Only an entry
+/// that DECLARES `streaming = false` disables it.
+#[must_use]
+pub fn streams_for_url(registry: &Registry, base_url: &str) -> bool {
+    let Some(want) = authority_of(base_url) else {
+        return true;
+    };
+    registry
+        .all()
+        .iter()
+        .find(|provider| {
+            provider
+                .base_url
+                .as_deref()
+                .and_then(authority_of)
+                .is_some_and(|have| have == want)
+        })
+        .is_none_or(|provider| provider.streaming)
+}
+
 pub fn user_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".prism").join("providers.toml"))
 }
@@ -473,6 +524,7 @@ mod tests {
             ),
             ("ollama", "http://localhost:11434/v1/chat/completions"),
             ("llamacpp", "http://localhost:8080/v1/chat/completions"),
+            ("mlx", "http://localhost:8082/v1/chat/completions"),
             ("lmstudio", "http://localhost:1234/v1/chat/completions"),
             ("vllm", "http://localhost:8000/v1/chat/completions"),
         ];
@@ -566,7 +618,7 @@ mod tests {
     #[test]
     fn local_providers_are_keyless() {
         let reg = Registry::builtin().unwrap();
-        for id in ["ollama", "llamacpp", "lmstudio", "vllm"] {
+        for id in ["ollama", "llamacpp", "mlx", "lmstudio", "vllm"] {
             let p = reg.get(id).unwrap_or_else(|| panic!("{id} missing"));
             assert!(
                 p.api_key_env.is_none(),
@@ -591,6 +643,7 @@ mod tests {
                 api_key_env: Some("CORP_KEY".into()),
                 docs: None,
                 platform: false,
+                streaming: true,
             },
             Provider {
                 id: "brand-new".into(),
@@ -599,6 +652,7 @@ mod tests {
                 api_key_env: None,
                 docs: None,
                 platform: false,
+                streaming: true,
             },
         ]);
 
@@ -626,6 +680,7 @@ mod tests {
             api_key_env: Some("PRISM_TEST_KEY_PRESENCE".into()),
             docs: None,
             platform: false,
+            streaming: true,
         };
         // SAFETY: a uniquely-named var no other test reads or writes.
         unsafe { std::env::remove_var("PRISM_TEST_KEY_PRESENCE") };
@@ -635,5 +690,25 @@ mod tests {
         unsafe { std::env::set_var("PRISM_TEST_KEY_PRESENCE", "sk-x") };
         assert!(p.key_present());
         unsafe { std::env::remove_var("PRISM_TEST_KEY_PRESENCE") };
+    }
+    #[test]
+    fn only_a_declared_non_streaming_endpoint_turns_streaming_off() {
+        let registry = Registry::builtin().expect("builtin registry parses");
+
+        // mlx-lm accepts `stream: true` and sends nothing; it is declared.
+        assert!(!streams_for_url(&registry, "http://localhost:8082/v1"));
+        // Same endpoint, the other loopback spelling people actually type.
+        assert!(!streams_for_url(&registry, "http://127.0.0.1:8082/v1"));
+
+        // Everything else streams, including endpoints we ship and ones we
+        // have never seen — guessing `false` would break every unknown server.
+        assert!(streams_for_url(&registry, "http://localhost:8080/v1"));
+        assert!(streams_for_url(&registry, "http://127.0.0.1:11434/v1"));
+        assert!(streams_for_url(&registry, "https://api.openai.com/v1"));
+        assert!(streams_for_url(
+            &registry,
+            "http://gpu-box.internal:9000/v1"
+        ));
+        assert!(streams_for_url(&registry, "not a url"));
     }
 }

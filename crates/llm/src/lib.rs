@@ -141,6 +141,10 @@ pub enum LlmCredentialKind {
 }
 
 /// Configuration for connecting to an LLM backend.
+const fn default_streaming() -> bool {
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     /// Base URL of the LLM API.
@@ -173,6 +177,13 @@ pub struct LlmConfig {
     /// reserve room for the response when budgeting input context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Whether this endpoint actually serves SSE streaming. `false` makes
+    /// [`LlmClient::chat_with_tools_streaming`] do ONE non-streaming request
+    /// and deliver the whole reply as a single delta, which is the difference
+    /// between a slow answer and no answer at all: mlx-lm accepts
+    /// `stream: true`, returns 200, and never sends a chunk.
+    #[serde(default = "default_streaming")]
+    pub streaming: bool,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -245,6 +256,7 @@ impl Default for LlmConfig {
             timeout_secs: 300,
             context_window: None,
             max_output_tokens: None,
+            streaming: true,
         }
     }
 }
@@ -1655,6 +1667,22 @@ impl LlmClient {
         tools: &[ToolDefinition],
         mut on_delta: impl FnMut(&str, bool),
     ) -> Result<ChatResponse> {
+        // An endpoint that cannot stream is served by ONE ordinary request,
+        // with the finished text handed to the caller as a single delta so the
+        // streaming contract still holds for the UI. Declared per provider
+        // (`providers.toml`, `streaming = false`) rather than discovered by
+        // timeout: mlx-lm accepts `stream: true`, answers 200 and sends
+        // nothing at all, so a streaming-only caller waits for a chunk that is
+        // never coming.
+        if !self.config.streaming {
+            let response = self.chat_with_tools(messages, tools).await?;
+            if let Some(text) = response.message.content.as_deref()
+                && !text.is_empty()
+            {
+                on_delta(text, false);
+            }
+            return Ok(response);
+        }
         if let Some(local) = self.local_backend() {
             let messages_estimate = Self::estimate_tokens(&serde_json::to_value(messages)?);
             let tools_estimate = Self::estimate_tokens(&serde_json::to_value(tools)?);
