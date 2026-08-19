@@ -128,6 +128,11 @@ pub fn to_turtle(o: &InducedOntology) -> String {
         "    prism:documentsFailed {} ;\n",
         p.documents_failed
     ));
+    out.push_str(&format!("    prism:windowsRead {} ;\n", p.windows_read));
+    out.push_str(&format!(
+        "    prism:windowsAttempted {} ;\n",
+        p.windows_attempted
+    ));
     out.push_str(&format!("    prism:malformedItems {} ", p.malformed_items));
     out.push_str(&format!(
         ";\n    prism:semanticValidation \"{}\" ",
@@ -345,6 +350,12 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
         provenance.documents_failed = get("documentsFailed")
             .and_then(|v| v.parse().ok())
             .unwrap_or_default();
+        provenance.windows_read = get("windowsRead")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default();
+        provenance.windows_attempted = get("windowsAttempted")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default();
         provenance.malformed_items = get("malformedItems")
             .and_then(|v| v.parse().ok())
             .unwrap_or_default();
@@ -552,6 +563,8 @@ mod tests {
                 corpus_hash: "sha256:abcdef1234567890".into(),
                 documents_total: 3,
                 documents_failed: 1,
+                windows_read: 5,
+                windows_attempted: 7,
                 malformed_items: 2,
                 created_at: "2026-08-09T00:00:00Z".into(),
                 promoted_at: None,

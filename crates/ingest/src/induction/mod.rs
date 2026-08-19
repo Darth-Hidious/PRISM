@@ -53,7 +53,7 @@ use corpus::Corpus;
 /// v2: the prompt's examples are domain-abstract placeholders instead of
 /// metallurgy vocabulary — induction is the only door to a non-materials
 /// ontology, and it must not lean on materials English.
-pub const PROMPT_VERSION: &str = "2";
+pub const PROMPT_VERSION: &str = "3";
 
 /// Namespace of the PRISM annotation vocabulary (status, provenance keys).
 pub const PRISM_META_NS: &str = "https://prism.marc27.com/ontology/meta#";
@@ -239,6 +239,13 @@ pub struct InductionProvenance {
     pub documents_total: usize,
     /// Documents whose model response stayed unusable after one retry.
     pub documents_failed: usize,
+    /// Windows the model actually read. A paper longer than one window is
+    /// read as several; this is how much of the corpus reached the model.
+    pub windows_read: usize,
+    /// Windows offered to the model. `windows_read` below this means part of
+    /// the corpus was never absorbed — usually a window that overflowed the
+    /// model's context.
+    pub windows_attempted: usize,
     /// Classes/relations dropped for empty or unusable labels.
     pub malformed_items: usize,
     /// RFC 3339 creation time.
@@ -680,6 +687,11 @@ pub struct InductionConfig {
     pub max_doc_chars: usize,
     /// Cap on already-known class labels restated per prompt.
     pub max_known_labels: usize,
+    /// Cap on windows read per document; 0 reads the whole document.
+    /// A paper is longer than any one prompt, so it is read as successive
+    /// overlapping windows and the tree grows across them — the earlier
+    /// behaviour (one window, rest of the paper discarded) is `1`.
+    pub max_windows_per_doc: usize,
     /// Advisory near-duplicate policy for raw ontology labels. Typing and
     /// triple checks are intentionally not applied to class-label batches;
     /// instance/assertion geometry is not a reliable ontology-label prior.
@@ -693,6 +705,7 @@ impl InductionConfig {
             domain: domain.to_string(),
             max_doc_chars: 4000,
             max_known_labels: 60,
+            max_windows_per_doc: 0,
             semantic_validation: NearDuplicatePolicy::default(),
         })
     }
@@ -746,6 +759,47 @@ pub fn induction_prompt(
 /// when EVERY document fails — per-document failures are counted into
 /// provenance and the run continues, because a small model failing on some
 /// documents is the normal case this pipeline exists to survive.
+/// Split a document into successive overlapping windows of `size` chars.
+/// The overlap keeps a class whose evidence straddles a boundary readable
+/// in at least one whole window. `max` bounds the count (0 = all).
+/// Pick which already-known class labels to restate in the next prompt.
+///
+/// The builder keys classes in a `BTreeMap`, so taking the first `cap` gave
+/// the model the alphabetical HEAD of its own tree and nothing else. Under
+/// windowed reading a corpus produces hundreds of classes across hundreds of
+/// prompts, so every class past the head became invisible and the model
+/// re-invented synonyms for it. Sampling evenly keeps the whole tree in view
+/// at a fixed prompt cost, and stays deterministic for a given tree.
+fn representative_labels(all: Vec<&str>, cap: usize) -> Vec<&str> {
+    if cap == 0 || all.len() <= cap {
+        return all;
+    }
+    (0..cap).map(|i| all[i * all.len() / cap]).collect()
+}
+
+fn doc_windows(text: &str, size: usize, max: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if size == 0 || chars.is_empty() {
+        return vec![String::new()];
+    }
+    if chars.len() <= size {
+        return vec![chars.into_iter().collect()];
+    }
+    let overlap = (size / 10).max(200).min(size / 2);
+    let stride = size - overlap;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let end = (start + size).min(chars.len());
+        out.push(chars[start..end].iter().collect::<String>());
+        if end == chars.len() || (max > 0 && out.len() >= max) {
+            break;
+        }
+        start += stride;
+    }
+    out
+}
+
 pub async fn induce(
     client: &prism_llm::LlmClient,
     corpus: &Corpus,
@@ -758,37 +812,46 @@ pub async fn induce(
     let mut failed = 0usize;
     let mut last_error: Option<String> = None;
     let mut semantic_labels = Vec::new();
+    let mut windows_read = 0usize;
+    let mut windows_attempted = 0usize;
 
     for doc in &corpus.docs {
-        let text: String = doc.text.chars().take(config.max_doc_chars).collect();
-        let known: Vec<&str> = builder
-            .known_class_labels()
-            .into_iter()
-            .take(config.max_known_labels)
-            .collect();
-        let prompt = induction_prompt(&config.domain, &known, &doc.rel_path, &text);
+        let windows = doc_windows(&doc.text, config.max_doc_chars, config.max_windows_per_doc);
+        let window_count = windows.len();
+        let mut doc_absorbed = 0usize;
 
-        let mut proposal = None;
-        for attempt in 1..=2u8 {
-            match client.generate_json(&prompt).await {
-                Ok(raw) => match parse_proposal(&raw) {
-                    Ok(p) => {
-                        proposal = Some(p);
-                        break;
-                    }
+        for (index, text) in windows.iter().enumerate() {
+            // One window keeps the prompt byte-identical to the pre-windowing
+            // form, so PROMPT_VERSION still describes what that call sends.
+            let doc_label = if window_count == 1 {
+                doc.rel_path.clone()
+            } else {
+                format!("{} [part {}/{}]", doc.rel_path, index + 1, window_count)
+            };
+            let known =
+                representative_labels(builder.known_class_labels(), config.max_known_labels);
+            let prompt = induction_prompt(&config.domain, &known, &doc_label, text);
+
+            let mut proposal = None;
+            for attempt in 1..=2u8 {
+                match client.generate_json(&prompt).await {
+                    Ok(raw) => match parse_proposal(&raw) {
+                        Ok(p) => {
+                            proposal = Some(p);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(doc = %doc_label, attempt, "unusable proposal: {e:#}");
+                            last_error = Some(format!("{e:#}"));
+                        }
+                    },
                     Err(e) => {
-                        tracing::warn!(doc = %doc.rel_path, attempt, "unusable proposal: {e:#}");
+                        tracing::warn!(doc = %doc_label, attempt, "LLM call failed: {e:#}");
                         last_error = Some(format!("{e:#}"));
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(doc = %doc.rel_path, attempt, "LLM call failed: {e:#}");
-                    last_error = Some(format!("{e:#}"));
                 }
             }
-        }
-        match proposal {
-            Some(p) => {
+            if let Some(p) = proposal {
                 semantic_labels.extend(
                     p.classes
                         .iter()
@@ -808,9 +871,16 @@ pub async fn induce(
                         }),
                 );
                 builder.absorb(p);
+                doc_absorbed += 1;
             }
-            None => failed += 1,
         }
+
+        // A document counts as failed only when NO window of it was read.
+        if doc_absorbed == 0 {
+            failed += 1;
+        }
+        windows_read += doc_absorbed;
+        windows_attempted += window_count;
     }
 
     if failed == corpus.docs.len() {
@@ -828,6 +898,8 @@ pub async fn induce(
         corpus_hash: corpus.hash.clone(),
         documents_total: corpus.docs.len(),
         documents_failed: failed,
+        windows_read,
+        windows_attempted,
         malformed_items: 0,
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         promoted_at: None,
@@ -906,5 +978,91 @@ mod tests {
         assert!(prompt.contains("<relation label>"));
         assert!(prompt.contains("domain 'legal'"));
         assert!(prompt.contains("Statute, Obligation"), "{prompt}");
+    }
+
+    #[test]
+    fn a_paper_is_read_whole_not_truncated_to_its_first_window() {
+        // The bug this guards: every document was cut to `max_doc_chars` and
+        // the rest of the paper was never seen by the model.
+        let paper: String = "x".repeat(70_000);
+        let windows = doc_windows(&paper, 4_000, 0);
+        assert!(
+            windows.len() > 15,
+            "70k chars became {} window(s)",
+            windows.len()
+        );
+        let covered: usize = windows.iter().map(|w| w.chars().count()).sum();
+        assert!(
+            covered >= paper.chars().count(),
+            "coverage {covered} < 70000"
+        );
+        // Windows overlap, so a class straddling a boundary lands whole in one.
+        assert!(
+            windows[0].chars().count() == 4_000 && windows.len() >= 2,
+            "expected fixed-size overlapping windows"
+        );
+
+        // A short document is still exactly one prompt.
+        assert_eq!(doc_windows("short paper", 4_000, 0).len(), 1);
+        // The old behaviour remains reachable, explicitly.
+        assert_eq!(doc_windows(&paper, 4_000, 1).len(), 1);
+        // And the cap is honoured.
+        assert_eq!(doc_windows(&paper, 4_000, 3).len(), 3);
+    }
+
+    #[test]
+    fn windows_advance_so_induction_terminates() {
+        let text: String = "y".repeat(10_000);
+        // A degenerate overlap that did not advance would loop forever; the
+        // stride must stay positive for every window size.
+        for size in [201usize, 400, 1_000, 4_000, 9_999] {
+            let w = doc_windows(&text, size, 0);
+            assert!(
+                !w.is_empty() && w.len() < 200,
+                "size {size} produced {} windows",
+                w.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_model_sees_its_whole_tree_not_the_alphabetical_head() {
+        let labels = [
+            "Alloy",
+            "Bcc",
+            "Carbide",
+            "Diffusion",
+            "Elongation",
+            "Fcc",
+            "Grain",
+            "Hardness",
+            "Ingot",
+            "Jog",
+        ];
+        let all: Vec<&str> = labels.to_vec();
+
+        // Under the cap nothing is dropped.
+        assert_eq!(representative_labels(all.clone(), 10), all);
+        assert_eq!(representative_labels(all.clone(), 99), all);
+
+        // Over the cap the sample spans the tree instead of stopping at "Carbide".
+        let picked = representative_labels(all.clone(), 3);
+        assert_eq!(picked.len(), 3);
+        assert_eq!(picked[0], "Alloy");
+        assert!(
+            picked.contains(&"Grain") || picked.contains(&"Hardness"),
+            "sample {picked:?} never reaches the tail of the tree"
+        );
+        assert_ne!(
+            picked,
+            vec!["Alloy", "Bcc", "Carbide"],
+            "still the head only"
+        );
+
+        // Deterministic for a given tree.
+        assert_eq!(
+            representative_labels(all.clone(), 4),
+            representative_labels(all, 4)
+        );
     }
 }

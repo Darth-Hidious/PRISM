@@ -340,10 +340,13 @@ async fn same_corpus_same_responses_same_artifact_modulo_timestamp() {
     }
     assert_eq!(artifacts[0], artifacts[1]);
     assert!(artifacts[0].contains("prism:model \"scripted-test-model\""));
-    // CONTRACT CHANGE: the induction prompt is domain-abstract since
-    // PROMPT_VERSION 2 (metallurgy examples replaced by placeholders), so
-    // every artifact induced after that bump stamps "2".
-    assert!(artifacts[0].contains("prism:promptVersion \"2\""));
+    // CONTRACT CHANGE: PROMPT_VERSION 2 made the prompt domain-abstract
+    // (metallurgy examples replaced by placeholders). PROMPT_VERSION 3
+    // changed what a prompt CARRIES: a document longer than one window is
+    // read as several parts, and the already-known labels restated to the
+    // model are sampled across the whole tree instead of its alphabetical
+    // head. Artifacts induced after that bump stamp "3".
+    assert!(artifacts[0].contains("prism:promptVersion \"3\""));
     assert!(artifacts[0].contains(&format!("prism:corpusHash \"{}\"", corpus.hash)));
     assert!(
         artifacts[0].contains("prism:status \"draft\""),
