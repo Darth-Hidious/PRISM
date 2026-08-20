@@ -422,14 +422,14 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
             .unwrap_or_default();
         let id = paper_key(record).unwrap_or_else(|| "unidentified".to_string());
         out.push_str(&format!("  - {title}{year} [{id}]\n"));
-        if let Some(url) = record
-            .get("fulltext_url")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-        {
-            ingestable += 1;
-            out.push_str(&format!("      papers_ingest url={url}\n"));
+        match ingest_handle(record) {
+            Some(handle) => {
+                ingestable += 1;
+                out.push_str(&format!("      papers_ingest {handle}\n"));
+            }
+            None => {
+                out.push_str("      (no fetchable full text — do not spend an ingest on this)\n")
+            }
         }
     }
     if records.len() > SEARCH_DIGEST_TITLES {
@@ -463,6 +463,63 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
          itself does not survive this conversation.\n",
     );
     Some(out)
+}
+
+/// Hosts whose full text an unattended fetcher can actually retrieve.
+///
+/// Measured 2026-08-20 against the live web, not assumed:
+///   arxiv.org                200, real PDF -> 86 assertions extracted
+///   www.mdpi.com             403, hard block
+///   iopscience.iop.org       302 -> validate.perfdrive.com (Radware bot manager)
+///   chemrxiv.org             403 behind Cloudflare
+///
+/// The allowlist is deliberately small and positive. A denylist would have to
+/// keep pace with every publisher's bot vendor; an allowlist fails safe, and
+/// the honest fallback ("no fetchable full text") costs the model nothing.
+const FETCHABLE_FULLTEXT_HOSTS: &[&str] = &[
+    "arxiv.org",
+    "europepmc.org",
+    "ncbi.nlm.nih.gov",
+    "biorxiv.org",
+    "medrxiv.org",
+    "openalex.org",
+];
+
+/// The best `papers_ingest` argument for this record, or `None` when nothing
+/// about it is retrievable.
+///
+/// Added because the digest previously emitted `url=<fulltext_url>` for ANY
+/// advertised location. Measured on a live run: all three ingest attempts went
+/// to publisher PDFs (MDPI ×2, IOPscience) and every one came back
+/// `no_fulltext_available`. The harness was confidently handing the model walls
+/// to walk into, and each attempt costs a tool call and an approval.
+///
+/// PMC ids are preferred over any URL because `papers_ingest` fetches the JATS
+/// open-access XML for them — structured text rather than a scraped PDF.
+fn ingest_handle(record: &Value) -> Option<String> {
+    if let Some(pmc) = record
+        .pointer("/external_ids/pmc")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(format!("pmc={pmc}"));
+    }
+    let url = record
+        .get("fulltext_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())?;
+    let host = url
+        .split("://")
+        .nth(1)?
+        .split('/')
+        .next()?
+        .trim_start_matches("www.");
+    FETCHABLE_FULLTEXT_HOSTS
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+        .then(|| format!("url={url}"))
 }
 
 // ── Retroactive tool-output pruning ───────────────────────────────
@@ -5567,8 +5624,12 @@ mod tests {
     fn the_digest_carries_what_ingestion_needs() {
         let mut with_text = paper(Some("10.1/a"), "openalex", "W1");
         with_text["title"] = serde_json::json!("A paper with full text");
-        with_text["fulltext_url"] = serde_json::json!("https://example.org/a.pdf");
-        let without = paper(Some("10.1/b"), "openalex", "W2");
+        with_text["fulltext_url"] = serde_json::json!("https://arxiv.org/pdf/1234.5678");
+        // A publisher PDF that is measurably bot-blocked (MDPI 403) must NOT be
+        // offered as a handle — every ingest spent on one is a wasted call.
+        let mut without = paper(Some("10.1/b"), "openalex", "W2");
+        without["title"] = serde_json::json!("A paywalled paper");
+        without["fulltext_url"] = serde_json::json!("https://www.mdpi.com/1/2/3/pdf");
 
         let digest = search_digest(
             "papers",
@@ -5578,8 +5639,12 @@ mod tests {
         .expect("a search with results must produce a digest");
 
         assert!(
-            digest.contains("papers_ingest url=https://example.org/a.pdf"),
-            "the ingestable paper must arrive with a callable handle: {digest}"
+            digest.contains("papers_ingest url=https://arxiv.org/pdf/1234.5678"),
+            "a fetchable paper must arrive with a callable handle: {digest}"
+        );
+        assert!(
+            digest.contains("no fetchable full text"),
+            "a blocked publisher URL must be named as unusable, not offered: {digest}"
         );
         assert!(
             digest.contains("1 of the above have full text"),
