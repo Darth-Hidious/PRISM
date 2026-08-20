@@ -4,7 +4,7 @@
 //! server used by `http_chat_parity.rs`.
 //!
 //! The stub LLM routes on the request's `model` field — the parent runs as
-//! `stub-model`; the nested turn runs as the subagent default
+//! `stub-model`; the nested turn is asked to run as
 //! `claude-fable-5` (same endpoint, model swapped by `spawn_subagent`). This
 //! proves, with no live LLM:
 //!
@@ -142,9 +142,17 @@ async fn start_stub_llm() -> String {
                 let sse = match (model.as_str(), last_is_tool) {
                     ("claude-fable-5", false) => sse_tool_call("stub_echo", "{}"),
                     ("claude-fable-5", true) => sse_text("SUBAGENT_DONE"),
+                    // The model is named EXPLICITLY. An unnamed model now
+                    // inherits the parent's route — a subagent must not silently
+                    // switch to a provider the parent's endpoint does not serve
+                    // — which would make the nested turn run as `stub-model`,
+                    // indistinguishable from the parent to a stub that routes on
+                    // the model field. Naming it keeps the two scripts separable
+                    // and pins that an explicit model still beats inheritance.
                     (_, false) => sse_tool_call(
                         "spawn_subagent",
-                        "{\"task\": \"run the echo tool and report back\"}",
+                        "{\"task\": \"run the echo tool and report back\", \
+                          \"model\": \"claude-fable-5\"}",
                     ),
                     (_, true) => sse_text("PARENT_DONE"),
                 };
@@ -456,7 +464,7 @@ async fn start_lane_stub_llm() -> String {
                     (_, 0) => sse_tool_call("stub_echo", "{}"),
                     (_, 1) => sse_tool_call(
                         "spawn_subagent",
-                        "{\"task\": \"run the echo tool and report back\"}",
+                        "{\"task\": \"run the echo tool and report back\", \"model\": \"claude-fable-5\"}",
                     ),
                     (_, _) => sse_text("PARENT_DONE"),
                 };
@@ -628,7 +636,8 @@ async fn start_h4_stub_llm() -> String {
                     (_, 0) => sse_tool_call("execute_python", "{}"),
                     (_, 1) => sse_tool_call(
                         "spawn_subagent",
-                        "{\"task\": \"run a code cell and report back\"}",
+                        "{\"task\": \"run a code cell and report back\", \
+                          \"model\": \"claude-fable-5\"}",
                     ),
                     (_, _) => sse_text("PARENT_DONE"),
                 };
@@ -734,7 +743,7 @@ async fn start_dying_subagent_stub_llm() -> String {
                         .header("content-type", "text/event-stream")
                         .body(axum::body::Body::from(sse_tool_call(
                             "spawn_subagent",
-                            "{\"task\": \"run the echo tool and report back\"}",
+                            "{\"task\": \"run the echo tool and report back\", \"model\": \"claude-fable-5\"}",
                         )))
                         .expect("stub response"),
                     (_, _) => axum::response::Response::builder()

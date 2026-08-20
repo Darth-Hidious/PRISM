@@ -1107,7 +1107,10 @@ pub fn definition() -> LoadedTool {
 
 // ── Argument parsing ──────────────────────────────────────────────────
 
-fn parse_args(args: &Value) -> Result<(Vec<OrchestratorTaskSpec>, OrchestratorPolicy)> {
+fn parse_args(
+    args: &Value,
+    parent_model: &str,
+) -> Result<(Vec<OrchestratorTaskSpec>, OrchestratorPolicy)> {
     let tasks = args
         .get("tasks")
         .and_then(Value::as_array)
@@ -1149,7 +1152,19 @@ fn parse_args(args: &Value) -> Result<(Vec<OrchestratorTaskSpec>, OrchestratorPo
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|model| !model.is_empty())
-            .unwrap_or(DEFAULT_SUBAGENT_MODEL)
+            // Inherit the parent's route by default. The constant asks whatever
+            // endpoint the parent uses for a model it may not serve — measured
+            // with the parent on glm-5.3, every orchestrated task died with
+            // `1214 modelCode：不存在`, which killed decomposition entirely on
+            // any non-Anthropic route.
+            .unwrap_or_else(|| {
+                let inherited = parent_model.trim();
+                if inherited.is_empty() {
+                    DEFAULT_SUBAGENT_MODEL
+                } else {
+                    inherited
+                }
+            })
             .to_string();
         let max_tokens = entry
             .get("max_tokens")
@@ -1640,7 +1655,7 @@ pub(crate) fn execute_orchestrate_agents<'a>(
             }));
         };
 
-        let (specs, policy_spec) = parse_args(args)?;
+        let (specs, policy_spec) = parse_args(args, &parent_config.model)?;
         let lane_bound = Some(pool.policy().max_lanes);
 
         let mut config_template = parent_config.clone();
@@ -2452,44 +2467,57 @@ mod tests {
     fn parse_args_applies_defaults_and_limits() {
         let (specs, policy) = parse_args(&json!({
             "tasks": [ { "task": "survey refractory HEAs" }, { "task": "survey Ni superalloys", "id": "ni" } ],
-        }))
+        }), "glm-5.3")
         .expect("valid args");
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].id, "task-0");
         assert_eq!(specs[1].id, "ni");
-        assert_eq!(specs[0].model, DEFAULT_SUBAGENT_MODEL);
+        // CONTRACT CHANGE: an unnamed model INHERITS the parent's route rather
+        // than defaulting to the constant. The constant asked whatever endpoint
+        // the parent was on for a model it might not serve — with the parent on
+        // glm-5.3 every task died with `1214 modelCode：不存在`.
+        assert_eq!(specs[0].model, "glm-5.3");
         assert_eq!(specs[0].max_tokens, DEFAULT_SUBAGENT_BUDGET_TOKENS);
         assert_eq!(policy.max_concurrent.get(), 4);
         assert_eq!(policy.max_agent_calls.get(), 16);
 
         // The model-controlled budget is clamped to the declared ceiling.
-        let (_, policy) = parse_args(&json!({
-            "tasks": [ { "task": "t" } ],
-            "max_agent_calls": 100_000,
-        }))
+        let (_, policy) = parse_args(
+            &json!({
+                "tasks": [ { "task": "t" } ],
+                "max_agent_calls": 100_000,
+            }),
+            "glm-5.3",
+        )
         .expect("valid args");
         assert_eq!(policy.max_agent_calls.get(), MAX_AGENT_CALLS_CEILING);
     }
 
     #[test]
     fn parse_args_rejects_defective_batches() {
-        assert!(parse_args(&json!({})).is_err(), "missing tasks");
-        assert!(parse_args(&json!({ "tasks": [] })).is_err(), "empty tasks");
+        assert!(parse_args(&json!({}), "glm-5.3").is_err(), "missing tasks");
         assert!(
-            parse_args(&json!({ "tasks": [ { "task": "  " } ] })).is_err(),
+            parse_args(&json!({ "tasks": [] }), "glm-5.3").is_err(),
+            "empty tasks"
+        );
+        assert!(
+            parse_args(&json!({ "tasks": [ { "task": "  " } ] }), "glm-5.3").is_err(),
             "blank task"
         );
         assert!(
-            parse_args(&json!({
-                "tasks": [ { "task": "a", "id": "x" }, { "task": "b", "id": "x" } ]
-            }))
+            parse_args(
+                &json!({
+                    "tasks": [ { "task": "a", "id": "x" }, { "task": "b", "id": "x" } ]
+                }),
+                "glm-5.3"
+            )
             .is_err(),
             "duplicate ids"
         );
         let too_many: Vec<Value> = (0..=MAX_TASKS_PER_CALL)
             .map(|i| json!({ "task": format!("t{i}") }))
             .collect();
-        let err = parse_args(&json!({ "tasks": too_many })).expect_err("over the cap");
+        let err = parse_args(&json!({ "tasks": too_many }), "glm-5.3").expect_err("over the cap");
         assert!(err.to_string().contains("at most"), "{err}");
     }
 

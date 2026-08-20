@@ -4,7 +4,7 @@
 //! server used by `subagent_nested_turn.rs`.
 //!
 //! The stub LLM routes on the request's `model` field — the parent runs as
-//! `stub-model`; every orchestrated item runs as the subagent default
+//! `stub-model`; every orchestrated item is asked to run as
 //! `claude-fable-5`. This proves, with no live LLM:
 //!
 //! 1. the loop intercepts `orchestrate_agents` and runs N nested turns whose
@@ -120,14 +120,23 @@ fn sse_tool_call(tool: &str, arguments: &str) -> String {
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
+/// The model each orchestrated item is asked to run as.
+const ITEM_MODEL: &str = "claude-fable-5";
+
 /// The three-task batch the parent model requests. Built with serde so the
 /// nested JSON survives the tool-argument string encoding.
 fn orchestrate_args() -> String {
+    // Each task names its model EXPLICITLY. An unnamed model now inherits the
+    // parent's route (a subagent must not silently switch to a provider the
+    // parent's endpoint does not serve), which would make every item run as
+    // `stub-model` — indistinguishable from the parent to a stub that routes on
+    // the model field. Naming it keeps parent and item scripts separable here,
+    // and pins that an explicit model still beats inheritance.
     serde_json::json!({
         "tasks": [
-            { "id": "one",   "task": "run the echo tool and report back" },
-            { "id": "two",   "task": "run the echo tool and report back" },
-            { "id": "three", "task": "run the echo tool and report back" },
+            { "id": "one",   "model": ITEM_MODEL, "task": "run the echo tool and report back" },
+            { "id": "two",   "model": ITEM_MODEL, "task": "run the echo tool and report back" },
+            { "id": "three", "model": ITEM_MODEL, "task": "run the echo tool and report back" },
         ],
     })
     .to_string()

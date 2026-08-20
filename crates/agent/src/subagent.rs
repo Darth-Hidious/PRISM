@@ -135,7 +135,7 @@ struct SubagentArgs {
     budget_tokens: u64,
 }
 
-fn parse_args(args: &Value) -> Result<SubagentArgs> {
+fn parse_args(args: &Value, parent_model: &str) -> Result<SubagentArgs> {
     let task = args
         .get("task")
         .and_then(Value::as_str)
@@ -144,13 +144,27 @@ fn parse_args(args: &Value) -> Result<SubagentArgs> {
     if task.is_empty() {
         anyhow::bail!("spawn_subagent requires a non-empty `task`");
     }
+    // INHERIT the parent's model unless the caller names one. The old default
+    // was the constant, which asks whatever endpoint the parent is routed to for
+    // a model it may not serve: measured 2026-08-20 with the parent on glm-5.3,
+    // every subagent died with `1214 modelCode：不存在` and the whole
+    // decomposition path was dead on any non-Anthropic route. A subagent is the
+    // same agent doing a smaller piece of the same job; it should not silently
+    // change providers.
     let model = args
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|m| !m.is_empty())
-        .unwrap_or(DEFAULT_SUBAGENT_MODEL)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let inherited = parent_model.trim();
+            if inherited.is_empty() {
+                DEFAULT_SUBAGENT_MODEL.to_string()
+            } else {
+                inherited.to_string()
+            }
+        });
     let budget_tokens = args
         .get("max_tokens")
         .and_then(Value::as_u64)
@@ -270,7 +284,7 @@ async fn execute_spawn_subagent_inner(
     if let Some(err) = depth_cap_error(parent_config) {
         return Ok(err);
     }
-    let sub = parse_args(args)?;
+    let sub = parse_args(args, &parent_config.model)?;
 
     // Own tool-server lane. With a pool, the subagent's Python tool calls run
     // on a child of its OWN instead of serializing behind (and mutably
@@ -633,28 +647,41 @@ mod tests {
 
     #[test]
     fn parse_args_applies_defaults() {
-        let sub = parse_args(&json!({ "task": "survey refractory HEAs" })).unwrap();
+        let sub = parse_args(&json!({ "task": "survey refractory HEAs" }), "glm-5.3").unwrap();
         assert_eq!(sub.task, "survey refractory HEAs");
-        assert_eq!(sub.model, DEFAULT_SUBAGENT_MODEL);
+        // CONTRACT CHANGE: inherits the parent's model. A subagent is the same
+        // agent doing a smaller piece of the same job; it must not silently
+        // switch providers to one the parent's endpoint does not serve.
+        assert_eq!(sub.model, "glm-5.3");
         assert_eq!(sub.budget_tokens, DEFAULT_SUBAGENT_BUDGET_TOKENS);
+
+        // Only when the parent has no model at all does the constant apply.
+        let orphan = parse_args(&json!({ "task": "x" }), "  ").unwrap();
+        assert_eq!(orphan.model, DEFAULT_SUBAGENT_MODEL);
     }
 
     #[test]
     fn parse_args_honors_overrides() {
-        let sub = parse_args(&json!({
-            "task": "t",
-            "model": "claude-sonnet-5",
-            "max_tokens": 42_000,
-        }))
+        let sub = parse_args(
+            &json!({
+                "task": "t",
+                "model": "claude-sonnet-5",
+                "max_tokens": 42_000,
+            }),
+            "glm-5.3",
+        )
         .unwrap();
-        assert_eq!(sub.model, "claude-sonnet-5");
+        assert_eq!(
+            sub.model, "claude-sonnet-5",
+            "an explicitly named model still wins over the parent's"
+        );
         assert_eq!(sub.budget_tokens, 42_000);
     }
 
     #[test]
     fn parse_args_rejects_empty_task() {
-        assert!(parse_args(&json!({})).is_err());
-        assert!(parse_args(&json!({ "task": "   " })).is_err());
+        assert!(parse_args(&json!({}), "glm-5.3").is_err());
+        assert!(parse_args(&json!({ "task": "   " }), "glm-5.3").is_err());
     }
 
     #[test]
