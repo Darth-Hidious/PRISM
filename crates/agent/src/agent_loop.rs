@@ -451,10 +451,16 @@ fn process_large_result(content: &str) -> String {
     let truncated = &content[..end];
     let total = content.len();
     format!(
-        "{truncated}\n\n[Showing first {end} of {total} chars — the FULL result is in \
-         durable memory; call recall(query=\"<keywords>\") to find its record, then \
-         recall(id=\"<id>\") to pull it back (up to 64k chars per fetch). \
-         Refine the query or lower max_results for a result that fits whole.]"
+        // Do NOT advertise a fixed fetch size here. This message used to promise
+        // "up to 64k chars per fetch", and a turn that took the offer nine times
+        // spent 86% of its window re-reading records it had already stored.
+        // recall now sizes itself against the budget left, so any number printed
+        // here would be a promise the tool cannot keep.
+        "{truncated}\n\n[Showing first {end} of {total} chars — the FULL result is already in \
+         durable memory and is NOT lost. Refining the query or lowering max_results is the \
+         cheap way to get a result that fits whole; recall(id=\"<id>\") pulls a record back but \
+         spends the turn's remaining budget to do it, so prefer ingesting a paper over \
+         re-reading it.]"
     )
 }
 
@@ -842,10 +848,45 @@ impl SaturationTracker {
                     .join(", ")
             ));
         }
-        if self.seen.len() > self.facts_written && self.ingested_ok == 0 {
-            out.push_str(
-                "NOTE: nothing found this session has been persisted. Papers seen but not ingested do not survive this conversation.\n",
-            );
+        // Seen but never ingested. Two different situations, and the old text
+        // was wrong about both.
+        //
+        // It said "nothing found this session has been persisted", which stopped
+        // being true when `persist_paper_identities` landed: identity IS written
+        // to the graph on every search. A block that overstates the loss is a
+        // block the model learns to discount, and this is the line its own skill
+        // file calls "the most important line in the block and the easiest to
+        // ignore".
+        //
+        // And it never escalated. Measured twice now — 2026-08-19 on glm-5.2 and
+        // 2026-08-20 on glm-5.3 — a research turn saturated, ingested nothing,
+        // and spent the rest of its budget on `recall`: 18 `papers`, 5
+        // `prior_art_search`, 9 `recall`, ZERO ingests, dead at 100% of a 200k
+        // window with 570 papers saved and not one fact extracted. Once
+        // searching is saturated, "more searching is unlikely to pay" is no
+        // longer the useful sentence; naming the one action that converts what
+        // you have into knowledge is.
+        if self.ingested_ok == 0 && !self.seen.is_empty() {
+            let saturated =
+                matches!(self.recent_new_ratio(), Some(ratio) if ratio <= SATURATION_NEW_RATIO);
+            if saturated {
+                out.push_str(&format!(
+                    "ACTION REQUIRED: {} papers seen, 0 ingested. Searching is saturated, so \
+                     further searches will not add knowledge — and `recall` does NOT persist \
+                     anything: it re-reads a stored record back into this conversation at the \
+                     cost of the budget you have left. `papers_ingest` is the only action that \
+                     turns these papers into durable, cited graph rows. Choose the ones whose \
+                     numbers or mechanisms your question actually turns on, and ingest them now.\n",
+                    self.seen.len()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "NOTE: {} papers seen, 0 ingested. Their IDENTITY is already saved to the \
+                     graph; their FACTS are not — only `papers_ingest` writes those, and a search \
+                     result itself does not survive this conversation.\n",
+                    self.seen.len()
+                ));
+            }
         }
         Some(out)
     }
@@ -3261,6 +3302,14 @@ pub(crate) async fn run_turn_inner(
                             &session_id,
                             tool_catalog,
                             Some(&command_tool_runtime.project_root),
+                            // The real turn budget. `recall` is the only
+                            // meta-tool that can pull an arbitrarily large
+                            // payload back into the conversation, so it sizes
+                            // itself against what the turn actually has left.
+                            Some(crate::meta_tools::TurnRemaining::new(
+                                transcript.cost.total_input,
+                                transcript.budget.max_input_tokens,
+                            )),
                         )
                         .await
                         .map(|value| serde_json::json!({ "result": value }))
@@ -3810,6 +3859,7 @@ mod tests {
                     "approval-denial-test",
                     &catalog,
                     Some(&runtime.project_root),
+                    None,
                 ),
             )
             .await
@@ -5439,6 +5489,72 @@ mod tests {
         );
     }
 
+    /// Saturated AND nothing ingested is the moment the run is about to be
+    /// wasted, and the block has to stop describing and start directing.
+    ///
+    /// Measured twice — glm-5.2 on 2026-08-19 and glm-5.3 on 2026-08-20 — a
+    /// research turn saturated, ingested nothing, and spent the rest of its
+    /// budget on `recall`: 18 `papers`, 5 `prior_art_search`, 9 `recall`, zero
+    /// ingests, dead at 100% of a 200k window with 570 papers saved and not one
+    /// fact extracted. "More searching is unlikely to pay" was true and useless;
+    /// the model needed to be told the one action that converts what it has.
+    #[test]
+    fn saturated_with_nothing_ingested_names_the_action() {
+        let mut t = SaturationTracker::default();
+        // FOUR rounds of the same twenty papers. The ratio is computed over the
+        // last three, so the first round has to be the one that supplies them —
+        // otherwise round 0's 20 new papers sit inside the window and the run
+        // reads as 33% new, not saturated.
+        for round in 0..4 {
+            let papers: Vec<Value> = (0..20)
+                .map(|i| paper(Some(&format!("10.1/{i}")), "arxiv", "x"))
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        let block = t.block().unwrap();
+
+        assert!(block.contains("ACTION REQUIRED"), "{block}");
+        assert!(block.contains("papers_ingest"), "{block}");
+        // recall is the trap it actually fell into, so the block must name it.
+        assert!(
+            block.contains("`recall` does NOT persist"),
+            "the block must say recall is not a substitute for ingesting: {block}"
+        );
+        // And it must NOT claim the papers were lost — identity IS persisted.
+        assert!(
+            !block.contains("nothing found this session has been persisted"),
+            "identity is saved on every search; overstating the loss teaches \
+             the model to discount this block: {block}"
+        );
+    }
+
+    /// Before saturation the same fact is a note, not a directive — there is
+    /// still a reason to keep searching.
+    #[test]
+    fn still_finding_with_nothing_ingested_is_only_a_note() {
+        let mut t = SaturationTracker::default();
+        for round in 0..3 {
+            let papers: Vec<Value> = (0..10)
+                .map(|i| paper(Some(&format!("10.{round}/{i}")), "arxiv", "x"))
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        let block = t.block().unwrap();
+        assert!(block.contains("NOTE:"), "{block}");
+        assert!(!block.contains("ACTION REQUIRED"), "{block}");
+        assert!(block.contains("IDENTITY is already saved"), "{block}");
+    }
+
     #[test]
     fn fresh_findings_do_not_read_as_saturation() {
         let mut t = SaturationTracker::default();
@@ -5529,7 +5645,13 @@ mod tests {
             false,
         );
         let block = t.block().unwrap();
-        assert!(block.contains("has been persisted"), "{block}");
+        // The claim this used to assert — "nothing found this session has been
+        // persisted" — stopped being true when `persist_paper_identities`
+        // landed: identity is written to the graph on every search. What is
+        // still missing is the FACTS, and that is what has to be said plainly.
+        assert!(block.contains("0 ingested"), "{block}");
+        assert!(block.contains("IDENTITY is already saved"), "{block}");
+        assert!(block.contains("FACTS are not"), "{block}");
     }
 
     #[test]

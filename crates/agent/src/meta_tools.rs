@@ -149,6 +149,81 @@ const DEFAULT_RECALL_LIMIT: usize = 5;
 /// multi-megabyte child output, and still names the remainder honestly
 /// when a record exceeds it.
 const RECALL_BY_ID_MAX_CHARS: usize = 64_000;
+/// Share of the turn's REMAINING input budget a single by-id recall may take.
+///
+/// The constant above is a sensible size for one fetch and blind to how many
+/// fetches a turn makes. Measured 2026-08-20 on a live research run: tool calls
+/// 27–35 were nine consecutive recalls, and the turn went from 87% to 100% of a
+/// 200k window across them. Nine fetches at 64k chars is ~144k tokens — 86% of
+/// everything left after the tool block. Mid-turn compaction fired and could
+/// not keep up, because each recall re-injects a full payload faster than
+/// compaction sheds one. The run died having saved 570 papers and extracted
+/// facts from none of them: the budget went on re-reading what was already
+/// durably stored.
+///
+/// A quarter of what remains lets several recalls through early, when there is
+/// room, and shrinks them as the turn fills — which is exactly when a large
+/// fetch is most likely to be the thing that kills the run.
+const RECALL_BUDGET_SHARE: f64 = 0.25;
+/// Below this share of the budget remaining, a by-id recall REFUSES.
+///
+/// At 90% used the right move is not a smaller fetch, it is to stop fetching:
+/// whatever the model is about to read, it will not have room to act on. The
+/// refusal says so and names the alternative, because a silent empty result
+/// would just be re-tried.
+const RECALL_BUDGET_FLOOR: f64 = 0.10;
+
+/// The by-id character cap for this call, given the turn's remaining input
+/// budget. `None` remaining (no budget context — a slash command, a test)
+/// keeps the flat ceiling, which is the pre-existing behaviour.
+///
+/// Returns `Err(reason)` when the turn is too far gone to spend on a recall.
+fn recall_cap_for_budget(remaining: Option<TurnRemaining>) -> Result<usize, String> {
+    let Some(rem) = remaining else {
+        return Ok(RECALL_BY_ID_MAX_CHARS);
+    };
+    if rem.share() < RECALL_BUDGET_FLOOR {
+        return Err(format!(
+            "refusing to recall: only {:.0}% of this turn's token budget is left \
+             ({} of {} tokens), and a full record would consume most of it. \
+             Everything recall returns is ALREADY stored durably — nothing is \
+             lost by not re-reading it. Write your answer from what you have, \
+             or ingest the paper so its facts become graph rows instead of \
+             conversation.",
+            rem.share() * 100.0,
+            rem.remaining,
+            rem.total,
+        ));
+    }
+    let allowed_tokens = (rem.remaining as f64 * RECALL_BUDGET_SHARE) as usize;
+    Ok(allowed_tokens
+        .saturating_mul(prism_llm::CHARS_PER_TOKEN)
+        .min(RECALL_BY_ID_MAX_CHARS))
+}
+
+/// What is left of the turn's input budget, for sizing a recall.
+#[derive(Clone, Copy, Debug)]
+pub struct TurnRemaining {
+    pub remaining: u64,
+    pub total: u64,
+}
+
+impl TurnRemaining {
+    #[must_use]
+    pub fn new(used: u64, total: u64) -> Self {
+        Self {
+            remaining: total.saturating_sub(used),
+            total,
+        }
+    }
+
+    fn share(&self) -> f64 {
+        if self.total == 0 {
+            return 1.0;
+        }
+        self.remaining as f64 / self.total as f64
+    }
+}
 /// Per-match preview length (chars) in a keyword search.
 const RECALL_PREVIEW_CHARS: usize = 240;
 /// Minimum cosine similarity for a semantic match. Measured on the native
@@ -428,13 +503,15 @@ pub async fn execute_meta_tool(
     session_id: &str,
     catalog: &ToolCatalog,
 ) -> Result<Value> {
-    execute_meta_tool_with_project_root(tool_name, args, store, session_id, catalog, None).await
+    execute_meta_tool_with_project_root(tool_name, args, store, session_id, catalog, None, None)
+        .await
 }
 
 /// Execute a meta-tool with the trusted project root supplied by the agent
 /// runtime. Callers that do not own a project context use [`execute_meta_tool`];
 /// `apply_patch` refuses in that context instead of deriving a root from CWD or
 /// accepting one from model-controlled arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_meta_tool_with_project_root(
     tool_name: &str,
     args: &Value,
@@ -442,6 +519,7 @@ pub async fn execute_meta_tool_with_project_root(
     session_id: &str,
     catalog: &ToolCatalog,
     project_root: Option<&std::path::Path>,
+    remaining: Option<TurnRemaining>,
 ) -> Result<Value> {
     let meta_tool = MetaTool::from_name(tool_name)
         .ok_or_else(|| anyhow::anyhow!("unknown meta-tool '{tool_name}'"))?;
@@ -459,7 +537,7 @@ pub async fn execute_meta_tool_with_project_root(
             })?;
             crate::apply_patch::execute(project_root, args)
         }
-        MetaTool::Recall => recall(args, store, session_id).await,
+        MetaTool::Recall => recall(args, store, session_id, remaining).await,
         MetaTool::FindTools => Ok(find_tools(args, catalog)),
         MetaTool::WriteSkill => write_skill(args).await,
         MetaTool::RunSkill => run_skill(args).await,
@@ -751,12 +829,17 @@ fn find_tools(args: &Value, catalog: &ToolCatalog) -> Value {
     })
 }
 
-async fn recall(args: &Value, store: Option<&ProvenanceStore>, session_id: &str) -> Result<Value> {
+async fn recall(
+    args: &Value,
+    store: Option<&ProvenanceStore>,
+    session_id: &str,
+    remaining: Option<TurnRemaining>,
+) -> Result<Value> {
     // Only an already-initialized backend: recall must never stall a turn on
     // model init. The background provenance tasks warm it up on first write,
     // so in practice it's ready long before the model asks to recall.
     let backend = crate::embeddings::backend_if_ready();
-    recall_with_backend(args, store, session_id, backend.as_deref()).await
+    recall_with_backend(args, store, session_id, backend.as_deref(), remaining).await
 }
 
 async fn recall_with_backend(
@@ -764,6 +847,7 @@ async fn recall_with_backend(
     store: Option<&ProvenanceStore>,
     session_id: &str,
     backend: Option<&dyn EmbedBackend>,
+    remaining: Option<TurnRemaining>,
 ) -> Result<Value> {
     let Some(store) = store else {
         return Ok(json!({ "error": "durable memory is unavailable in this session" }));
@@ -796,20 +880,43 @@ async fn recall_with_backend(
                 "error": "`all_sessions` is only valid with `query`; pass `session_id` to fetch an id from another session"
             }));
         }
+        // A full record is the single largest thing the model can pull into a
+        // turn, so what it may cost depends on what the turn has left.
+        let cap = match recall_cap_for_budget(remaining) {
+            Ok(cap) => cap,
+            Err(reason) => return Ok(json!({ "error": reason })),
+        };
         // `query_chain` starts at `id` and walks parents within the selected
         // session; the record itself is included, so find it in the chain.
         let chain = store
             .query_chain(id, requested_session_id.unwrap_or(session_id))
             .await?;
         return Ok(match chain.into_iter().find(|r| r.id == id) {
-            Some(rec) => json!({
-                "id": rec.id,
-                "tool_name": rec.tool_name,
-                "input": rec.input_json,
-                "output": clip_value(rec.output_json, RECALL_BY_ID_MAX_CHARS),
-                "status": rec.status,
-                "exit_code": rec.exit_code,
-            }),
+            Some(rec) => {
+                let mut out = json!({
+                    "id": rec.id,
+                    "tool_name": rec.tool_name,
+                    "input": rec.input_json,
+                    "output": clip_value(rec.output_json, cap),
+                    "status": rec.status,
+                    "exit_code": rec.exit_code,
+                });
+                // Say WHY it is short, or the model reads a budget trim as the
+                // record being small and stops looking for the rest.
+                if cap < RECALL_BY_ID_MAX_CHARS
+                    && let Some(rem) = remaining
+                {
+                    out["budget_note"] = json!(format!(
+                        "trimmed to {cap} chars: {:.0}% of this turn's token \
+                         budget remains. Recalls are the most expensive thing \
+                         you can do to a turn, and this record is still stored \
+                         in full — narrow the query, or ingest instead of \
+                         re-reading.",
+                        rem.share() * 100.0
+                    ));
+                }
+                out
+            }
             None => json!({ "error": format!("no record with id '{id}'") }),
         });
     }
@@ -1223,6 +1330,7 @@ mod tests {
                 "",
                 &catalog,
                 Some(root.path()),
+                None,
             ),
         )
         .await
@@ -1429,12 +1537,98 @@ mod tests {
         assert!(out["error"].as_str().unwrap().contains("query"));
     }
 
+    /// A recall's size must fall out of what the TURN has left, not a constant.
+    ///
+    /// The flat 64k ceiling is a reasonable size for one fetch and blind to how
+    /// many fetches a turn makes. Measured on a live run: nine consecutive
+    /// recalls took a 200k-token turn from 87% to 100%, because nine × 64k
+    /// chars is ~144k tokens — 86% of everything left after the tool block.
+    #[test]
+    fn a_recall_is_sized_by_what_the_turn_has_left() {
+        // No budget context (slash command, test): unchanged behaviour.
+        assert_eq!(recall_cap_for_budget(None), Ok(RECALL_BY_ID_MAX_CHARS));
+
+        // Fresh turn — plenty of room, so the flat ceiling still binds.
+        let fresh = TurnRemaining::new(0, 200_000);
+        assert_eq!(
+            recall_cap_for_budget(Some(fresh)),
+            Ok(RECALL_BY_ID_MAX_CHARS)
+        );
+
+        // Half spent: 100k left, a quarter of that is 25k tokens = 100k chars,
+        // still above the ceiling.
+        let half = TurnRemaining::new(100_000, 200_000);
+        assert_eq!(
+            recall_cap_for_budget(Some(half)),
+            Ok(RECALL_BY_ID_MAX_CHARS)
+        );
+
+        // Tight but usable: 30k left -> 7.5k tokens -> 30k chars, under the
+        // ceiling, so the budget is what binds.
+        let tight = TurnRemaining::new(170_000, 200_000);
+        let cap = recall_cap_for_budget(Some(tight)).expect("15% left is still spendable");
+        assert!(
+            cap < RECALL_BY_ID_MAX_CHARS && cap > 0,
+            "the budget must bind before the constant does: {cap}"
+        );
+
+        // The case that actually killed the run, simulated: nine recalls in a
+        // row on a 200k turn. Each one is sized against what is left AT THAT
+        // MOMENT, so the sequence decays instead of nine equal 64k bites.
+        let total = 200_000_u64;
+        let mut used = 60_000_u64; // tool block + the searches that came first
+        let mut refused_at = None;
+        for call in 1..=9 {
+            match recall_cap_for_budget(Some(TurnRemaining::new(used, total))) {
+                Ok(cap) => used += (cap / prism_llm::CHARS_PER_TOKEN) as u64,
+                Err(_) => {
+                    refused_at = Some(call);
+                    break;
+                }
+            }
+            assert!(
+                used < total,
+                "recall #{call} pushed the turn to {used}/{total} — the sequence \
+                 that died at 100% must not be reachable"
+            );
+        }
+        // With the flat ceiling every call took 64k chars (16k tokens) and the
+        // ninth landed past 200k. Now the turn either survives all nine or is
+        // told to stop before it can spend itself to death.
+        assert!(
+            used < total,
+            "nine budget-sized recalls must not exhaust the turn: {used}/{total}"
+        );
+        assert!(
+            refused_at.is_none() || refused_at.is_some_and(|c| c > 1),
+            "the floor must not fire on the first call of a turn with 70% left"
+        );
+    }
+
+    /// Past the floor the answer is not a smaller fetch, it is "stop fetching".
+    #[test]
+    fn a_nearly_spent_turn_refuses_to_recall_and_says_why() {
+        let spent = TurnRemaining::new(195_000, 200_000); // 2.5% left
+        let reason = recall_cap_for_budget(Some(spent))
+            .expect_err("at 2.5% left a full record would consume what is left");
+
+        // The refusal has to be actionable, or it is just a failure the model
+        // retries. Name the two facts it needs: nothing is lost, and what to do.
+        assert!(reason.contains("ALREADY stored"), "{reason}");
+        assert!(reason.contains("ingest"), "{reason}");
+    }
+
     #[tokio::test]
     async fn recall_by_id_returns_full_record() {
         let (store, id) = seeded_store().await;
-        let out = recall(&json!({ "id": id.clone() }), Some(&store), "sess-recall")
-            .await
-            .unwrap();
+        let out = recall(
+            &json!({ "id": id.clone() }),
+            Some(&store),
+            "sess-recall",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(out["id"], json!(id));
         assert_eq!(out["tool_name"], json!("file"));
         assert_eq!(out["output"], json!("titanium aluminide rows: 42"));
@@ -1463,9 +1657,14 @@ mod tests {
         rec.output_json = Some(json!(payload.clone()));
         store.record(&rec).await.unwrap();
 
-        let out = recall(&json!({ "id": rec.id.clone() }), Some(&store), "sess-big")
-            .await
-            .unwrap();
+        let out = recall(
+            &json!({ "id": rec.id.clone() }),
+            Some(&store),
+            "sess-big",
+            None,
+        )
+        .await
+        .unwrap();
         // 40k fits whole under the 64k by-id cap — "pull it back" is
         // literally true for this record.
         assert_eq!(out["output"], json!(payload));
@@ -1476,7 +1675,7 @@ mod tests {
         let payload2 = "y".repeat(100_000);
         huge.output_json = Some(json!(payload2));
         store.record(&huge).await.unwrap();
-        let out2 = recall(&json!({ "id": "rec-huge" }), Some(&store), "sess-big")
+        let out2 = recall(&json!({ "id": "rec-huge" }), Some(&store), "sess-big", None)
             .await
             .unwrap();
         let clipped = out2["output"].as_str().unwrap();
@@ -1489,9 +1688,14 @@ mod tests {
     #[tokio::test]
     async fn recall_by_query_finds_matches() {
         let (store, _) = seeded_store().await;
-        let out = recall(&json!({ "query": "titanium" }), Some(&store), "sess-recall")
-            .await
-            .unwrap();
+        let out = recall(
+            &json!({ "query": "titanium" }),
+            Some(&store),
+            "sess-recall",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(out["count"], json!(1));
         assert_eq!(out["matches"][0]["tool_name"], json!("file"));
     }
@@ -1616,6 +1820,7 @@ mod tests {
             &json!({ "id": failed.id.clone() }),
             Some(&store),
             "sess-fail",
+            None,
         )
         .await
         .unwrap();
@@ -1643,7 +1848,7 @@ mod tests {
         failed.exit_code = Some(1);
         store.record(&failed).await.unwrap();
 
-        let out = recall(&json!({ "query": "boom" }), Some(&store), "sess-fail")
+        let out = recall(&json!({ "query": "boom" }), Some(&store), "sess-fail", None)
             .await
             .unwrap();
         assert_eq!(out["count"], json!(1));
@@ -1654,7 +1859,7 @@ mod tests {
     #[tokio::test]
     async fn recall_requires_id_or_query() {
         let (store, _) = seeded_store().await;
-        let out = recall(&json!({}), Some(&store), "sess-recall")
+        let out = recall(&json!({}), Some(&store), "sess-recall", None)
             .await
             .unwrap();
         assert!(out["error"].as_str().unwrap().contains("either"));
@@ -1662,7 +1867,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_without_store_is_graceful() {
-        let out = recall(&json!({ "query": "x" }), None, "sess-recall")
+        let out = recall(&json!({ "query": "x" }), None, "sess-recall", None)
             .await
             .unwrap();
         assert!(out["error"].as_str().unwrap().contains("unavailable"));
@@ -1717,6 +1922,7 @@ mod tests {
             Some(&store),
             "sess-current",
             Some(&backend),
+            None,
         )
         .await
         .unwrap();
@@ -1727,6 +1933,7 @@ mod tests {
             Some(&store),
             "sess-current",
             Some(&backend),
+            None,
         )
         .await
         .unwrap();
@@ -1737,6 +1944,7 @@ mod tests {
             Some(&store),
             "sess-current",
             Some(&backend),
+            None,
         )
         .await
         .unwrap();
@@ -1780,6 +1988,7 @@ mod tests {
             Some(&store),
             "sess-recall",
             Some(&backend),
+            None,
         )
         .await
         .unwrap();
@@ -1801,6 +2010,7 @@ mod tests {
             &json!({ "query": "titanium" }),
             Some(&store),
             "sess-recall",
+            None,
             None,
         )
         .await

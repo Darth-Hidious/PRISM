@@ -14,6 +14,19 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
 
+/// Bytes of serialized text per prompt token, as a working estimate.
+///
+/// Public because three other places were converting between chars and tokens
+/// with their own copy of this number, and a retune landed in one of four. It
+/// is deliberately rough: every caller uses it for a SAFETY margin (an output
+/// clamp, a size cap), never to predict a bill, so a slight under-count is
+/// absorbed by the margin and the server-side clamp.
+///
+/// It is an estimate for JSON and English prose. Dense scientific PDF text
+/// tokenizes far worse — closer to one token per character — so a caller
+/// budgeting raw extracted paper text should not lean on this alone.
+pub const CHARS_PER_TOKEN: usize = 4;
+
 mod local;
 mod minja;
 mod model_artifact;
@@ -1231,12 +1244,11 @@ impl LlmClient {
         model_max.min(by_context).max(FLOOR)
     }
 
-    /// Rough prompt-token estimate for a serialized request value (~4 chars per
-    /// token). Only feeds the [`Self::effective_max_tokens`] safety clamp, so a
-    /// slight under-count is harmless — the margin and the server-side clamp
-    /// absorb the slack.
+    /// Rough prompt-token estimate for a serialized request value. Only feeds
+    /// the [`Self::effective_max_tokens`] safety clamp, so a slight under-count
+    /// is harmless — the margin and the server-side clamp absorb the slack.
     fn estimate_tokens(value: &serde_json::Value) -> u64 {
-        value.to_string().len() as u64 / 4
+        value.to_string().len() as u64 / CHARS_PER_TOKEN as u64
     }
 
     /// Extract strict JSON output from a chat-completions choice.
