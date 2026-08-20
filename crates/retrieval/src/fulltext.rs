@@ -268,9 +268,39 @@ pub fn sniff(body: &[u8]) -> FulltextFormat {
 
 /// Parse PDF bytes to flat text. One Body block; the locator carries no
 /// section path because PDF extraction cannot honestly recover one.
+/// Run a parser and turn a PANIC into an ordinary `Err`.
+///
+/// Extracted so the containment itself is testable: a fixture that merely makes
+/// `pdf_extract` return `Err` proves nothing about unwinding, and the first
+/// version of this test passed with the containment removed.
+fn contain_parser_panic<T>(f: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        anyhow::anyhow!("pdf parser panicked on this document: {detail}")
+    })
+}
+
 pub fn parse_pdf(body: &[u8]) -> Result<Fulltext> {
-    let text = pdf_extract::extract_text_from_mem(body)
-        .map_err(|e| anyhow::anyhow!("pdf text extraction failed: {e}"))?;
+    // `pdf_extract` PANICS on some real-world PDFs rather than returning Err —
+    // measured 2026-08-20: "missing unicode map and encoding" (pdf-extract
+    // 0.12.0) killed an entire `papers corpus` harvest after 32 documents had
+    // already landed. One malformed file from one publisher ended the run.
+    //
+    // A panic is neither "reported" nor "skipped", so it breaks this command's
+    // stated contract that papers whose full text is not retrievable are
+    // REPORTED, not silently dropped. Catching it turns a fatal third-party
+    // panic into an ordinary per-document error the caller already knows how to
+    // record and move past.
+    //
+    // The payload is a `&[u8]` and the closure borrows nothing else, so there is
+    // no broken invariant to observe afterwards: `AssertUnwindSafe` is honest
+    // here rather than a way to silence the compiler.
+    let extracted = contain_parser_panic(|| pdf_extract::extract_text_from_mem(body))?;
+    let text = extracted.map_err(|e| anyhow::anyhow!("pdf text extraction failed: {e}"))?;
     let text = text.trim().to_string();
     if text.is_empty() {
         anyhow::bail!("pdf contained no extractable text (scanned image?)");
@@ -568,6 +598,37 @@ fn take(text: &mut String) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A third-party parser panic must not end the run.
+    ///
+    /// Measured 2026-08-20: `pdf_extract` panicked with "missing unicode map and
+    /// encoding" on one publisher's PDF and killed a `papers corpus` harvest
+    /// that had already written 32 full texts. `parse_pdf` returns `Result`, so
+    /// every caller was ready to skip a bad document — but a panic unwinds past
+    /// all of them.
+    ///
+    /// This tests the CONTAINMENT, not the parser. An earlier version fed
+    /// garbage bytes to `parse_pdf` and passed even with the containment
+    /// removed, because those bytes made `pdf_extract` return `Err` rather than
+    /// panic — a test that proved the wrong thing.
+    #[test]
+    fn a_parser_panic_becomes_an_error_and_the_process_survives() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the test output readable
+        let outcome = super::contain_parser_panic(|| -> &str { panic!("missing unicode map") });
+        std::panic::set_hook(previous);
+
+        let error = outcome.expect_err("a panicking parser must yield an Err");
+        let message = format!("{error:#}");
+        assert!(message.contains("panicked on this document"), "{message}");
+        assert!(
+            message.contains("missing unicode map"),
+            "the real cause must survive into the error: {message}"
+        );
+
+        // Still running, which is the whole point.
+        assert!(super::contain_parser_panic(|| 7).is_ok());
+    }
+
     use super::*;
 
     const JATS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
