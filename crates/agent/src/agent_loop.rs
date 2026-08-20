@@ -760,6 +760,21 @@ const SATURATION_WINDOW: usize = 3;
 const SATURATION_NEW_RATIO: f64 = 0.05;
 /// Cap on the "already tried" list, so the block cannot grow without bound.
 const SATURATION_QUERY_LIST_MAX: usize = 8;
+/// Unique papers after which "0 ingested" becomes a directive, not a note —
+/// even when searching is still yielding new work.
+///
+/// Measured 2026-08-20 across two full runs that both ended with a large corpus
+/// and ZERO extracted facts, for opposite reasons:
+///   run 1: saturated at 264 papers, then spent the rest of the budget on recall
+///   run 2: 357 papers over 30 calls, NEVER saturated, budget exhausted searching
+///
+/// Run 2 is why saturation alone is not enough. On a broad question the
+/// literature keeps yielding genuinely new papers, so a saturation-only trigger
+/// never fires. Forty is well past the point where a question has the papers it
+/// needs — the skill file's own rule is "ingest the papers that carry the
+/// evidence, do not ingest a hundred because you found a hundred" — and it
+/// leaves budget to actually ingest them.
+const INGEST_NUDGE_PAPERS: usize = 40;
 /// Titles kept in a compacted search result.
 const SEARCH_DIGEST_TITLES: usize = 8;
 
@@ -1068,10 +1083,27 @@ impl SaturationTracker {
         if self.ingested_ok == 0 && !self.seen.is_empty() {
             let saturated =
                 matches!(self.recent_new_ratio(), Some(ratio) if ratio <= SATURATION_NEW_RATIO);
-            if saturated {
+            // Saturation is not the only reason to stop searching.
+            //
+            // Measured 2026-08-20, run 2: 26 tool calls, 357 unique papers, ZERO
+            // ingests, and never once saturated — on a broad question the
+            // literature keeps yielding genuinely new papers, so a
+            // saturation-only trigger never fires and the run ends with a large
+            // corpus and no knowledge. Run 1 failed the same way for the
+            // opposite reason (it saturated, then spent the budget on recall).
+            //
+            // Past this many distinct papers the marginal search is worth less
+            // than the first ingest: the question is no longer "is there more?"
+            // but "what do the ones I have actually say?".
+            let past_enough_papers = self.seen.len() >= INGEST_NUDGE_PAPERS;
+            if saturated || past_enough_papers {
+                let why = if saturated {
+                    "Searching is saturated, so further searches will not add knowledge"
+                } else {
+                    "You have found plenty; more searching is worth less now than the first ingest"
+                };
                 out.push_str(&format!(
-                    "ACTION REQUIRED: {} papers seen, 0 ingested. Searching is saturated, so \
-                     further searches will not add knowledge — and `recall` does NOT persist \
+                    "ACTION REQUIRED: {} papers seen, 0 ingested. {why} — and `recall` does NOT persist \
                      anything: it re-reads a stored record back into this conversation at the \
                      cost of the budget you have left. `papers_ingest` is the only action that \
                      turns these papers into durable, cited graph rows. Choose the ones whose \
@@ -5796,6 +5828,51 @@ mod tests {
             !block.contains("nothing found this session has been persisted"),
             "identity is saved on every search; overstating the loss teaches \
              the model to discount this block: {block}"
+        );
+    }
+
+    /// A run that never saturates must still be told to ingest.
+    ///
+    /// Measured 2026-08-20, run 2: 30 tool calls, 357 unique papers, ZERO
+    /// ingests, budget exhausted — and it never once saturated, because on a
+    /// broad question the literature keeps yielding genuinely new papers. A
+    /// saturation-only trigger cannot fire on exactly the runs that need it
+    /// most. Run 1 failed the same way for the opposite reason: it saturated,
+    /// then spent everything left on `recall`.
+    #[test]
+    fn plenty_of_papers_and_no_ingest_is_a_directive_even_while_still_finding() {
+        let mut t = SaturationTracker::default();
+        // Every round returns entirely new papers, so this NEVER saturates.
+        for round in 0..5 {
+            let papers: Vec<Value> = (0..12)
+                .map(|i| paper(Some(&format!("10.{round}/{i}")), "arxiv", "x"))
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        assert!(
+            t.seen.len() >= INGEST_NUDGE_PAPERS,
+            "fixture must pass the threshold"
+        );
+        assert!(
+            !matches!(t.recent_new_ratio(), Some(r) if r <= SATURATION_NEW_RATIO),
+            "this fixture must NOT be saturated — that is the whole point"
+        );
+
+        let block = t.block().unwrap();
+        assert!(block.contains("ACTION REQUIRED"), "{block}");
+        assert!(block.contains("papers_ingest"), "{block}");
+        assert!(
+            block.contains("worth less now than the first ingest"),
+            "the reason must be volume, not saturation: {block}"
+        );
+        assert!(
+            block.contains("STILL FINDING"),
+            "and it is still finding: {block}"
         );
     }
 
