@@ -163,9 +163,19 @@ pub fn safety_hook() -> Hook {
                             if lowered.contains(pattern) {
                                 return HookResult {
                                     abort: true,
+                                    // Name a recourse that EXISTS. The flag this
+                                    // cited (`--dangerously-accept-all`) appears
+                                    // nowhere in the codebase, so the only
+                                    // actionable line in the message was false.
+                                    // `/bash` and `/python` are the real
+                                    // override: they run the same policy,
+                                    // permission, skill and provenance gates but
+                                    // treat THIS scan as advisory, because a
+                                    // human typed the command.
                                     reason: format!(
                                         "Blocked: '{}' detected in {}.{}. \
-                                         Use --dangerously-accept-all to override.",
+                                         Run it yourself with /bash or /python if \
+                                         that is what you meant.",
                                         pattern, tool_name, key
                                     ),
                                     modified_inputs: None,

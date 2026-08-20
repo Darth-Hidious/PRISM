@@ -1303,6 +1303,7 @@ fn short_first_line(s: &str) -> String {
     format!("{clipped}…")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_manual_tool_call(
     command_label: &str,
     tool_name: &str,
@@ -1312,6 +1313,8 @@ async fn execute_manual_tool_call(
     transcript: &mut TranscriptStore,
     permissions: &ToolPermissionContext,
     policy_engine: &mut Option<prism_policy::PolicyEngine>,
+    hooks: &HookRegistry,
+    project_root: &std::path::Path,
 ) -> Result<()> {
     let call_id = next_manual_call_id();
     let preview = manual_tool_preview(tool_name, &args);
@@ -1332,6 +1335,71 @@ async fn execute_manual_tool_call(
         call_id: call_id.clone(),
         preview: preview.clone(),
     });
+
+    // A slash command is explicit user intent about WHICH tool runs. It is not
+    // a statement about WHAT the tool may do, so it goes through the same gates
+    // the model-driven path uses: the safety pre-hook (destructive-keyword
+    // abort), the human-skill implicit-invocation gate, and — after execution —
+    // the provenance post-hook that writes the durable record and the
+    // `code_exec` tag. Skipping them made `/bash rm -rf ...` the one code path
+    // in the system that ran unrecorded and unscanned.
+    let deny_manual = |message: String,
+                       summary: String,
+                       session_store: &mut SessionStore,
+                       transcript: &mut TranscriptStore,
+                       preview: Option<String>| {
+        emit_agent_event(AgentEvent::ToolCallResult {
+            call_id: call_id.clone(),
+            tool_name: tool_name.to_string(),
+            content: message.clone(),
+            summary: Some(summary),
+            preview,
+            elapsed_ms: 0,
+            is_error: true,
+        });
+        session_store.append_message("tool", &message, tool_name, &call_id, None);
+        transcript.append(TranscriptEntry::new("tool", &message).with_tool_name(tool_name));
+        emit_notification("ui.turn.complete", serde_json::json!({}));
+    };
+
+    // Pre-hooks fire, but an ABORT here WARNS instead of blocking — the one
+    // intentional difference from the model-driven path, and the same reasoning
+    // that already lets a slash command skip the approval prompt.
+    //
+    // `safety_hook` is a substring scan for delete/drop/remove/destroy/truncate/
+    // reset across every string argument. Its job is catching the MODEL reaching
+    // for something destructive the user never asked for. A human typing
+    // `/bash git reset --hard` HAS asked for it, and the scan cannot tell that
+    // from `ls ~/Dropbox` (matches "drop") or from a `--description` field that
+    // is never executed at all. Blocking those would make the deliberate,
+    // human-typed path the only muzzled one in the system.
+    //
+    // The reason is still surfaced, so a genuine warning is not swallowed.
+    let pre_result = hooks.fire_before(tool_name, &args);
+    if pre_result.abort {
+        let warning = format!("Proceeding despite hook warning: {}", pre_result.reason);
+        tracing::warn!(tool = tool_name, "{warning}");
+        emit_notification(
+            "ui.tool.warning",
+            serde_json::json!({ "tool": tool_name, "warning": warning }),
+        );
+    }
+
+    if let Err(error) = crate::skills::gate_implicit_human_skill_invocation(
+        tool_name,
+        &args,
+        project_root,
+        &crate::skills::SkillSurfacePolicy::default(),
+    ) {
+        deny_manual(
+            format!("Skill invocation blocked: {error}"),
+            format!("{tool_name}: blocked by skill policy"),
+            session_store,
+            transcript,
+            preview.clone(),
+        );
+        return Ok(());
+    }
 
     let permission_decision = permissions.decision_for(tool_name, None);
     if permission_decision.blocked {
@@ -1410,7 +1478,7 @@ async fn execute_manual_tool_call(
     }
 
     let started = Instant::now();
-    let result = tool_server.call_tool(tool_name, args).await;
+    let result = tool_server.call_tool(tool_name, args.clone()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let (raw_content, is_error) = match result {
         Ok(resp) => {
@@ -1427,6 +1495,16 @@ async fn execute_manual_tool_call(
             (raw_content, is_error)
         }
         Err(error) => (format!("Tool error: {error}"), true),
+    };
+
+    // Post-hooks from the SAME bytes the transcript shows, via the agent loop's
+    // own wrapper so a non-JSON failure is recorded status:error rather than ok.
+    let result_value = crate::agent_loop::hook_result_value(&raw_content, is_error);
+    let post_result = hooks.fire_after(tool_name, &args, &result_value, elapsed_ms as f64);
+    let raw_content = if post_result != result_value {
+        serde_json::to_string(&post_result).unwrap_or(raw_content)
+    } else {
+        raw_content
     };
 
     let summary =
@@ -6645,6 +6723,7 @@ async fn handle_command(
     session_mode: &mut SessionMode,
     plan_state: &mut PlanRuntimeState,
     policy_engine: &mut Option<prism_policy::PolicyEngine>,
+    hooks: &HookRegistry,
 ) -> Result<bool> {
     let trimmed = command.trim();
 
@@ -6791,6 +6870,8 @@ async fn handle_command(
                 transcript,
                 permissions,
                 policy_engine,
+                hooks,
+                &slash_ctx.project_root,
             )
             .await?;
             Ok(true)
@@ -6818,6 +6899,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -6843,6 +6926,8 @@ async fn handle_command(
                 transcript,
                 permissions,
                 policy_engine,
+                hooks,
+                &slash_ctx.project_root,
             )
             .await?;
             Ok(true)
@@ -6859,6 +6944,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -6897,6 +6984,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -6915,6 +7004,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -6928,6 +7019,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -6941,6 +7034,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -6970,6 +7065,8 @@ async fn handle_command(
                         transcript,
                         permissions,
                         policy_engine,
+                        hooks,
+                        &slash_ctx.project_root,
                     )
                     .await?;
                 }
@@ -8559,6 +8656,7 @@ async fn run_server_core(
                         &mut runtime_ref.session_mode,
                         &mut runtime_ref.plan_state,
                         &mut runtime_ref.policy_engine,
+                        hooks.as_ref(),
                     ),
                 )
                 .await;
@@ -9898,6 +9996,55 @@ mod tests {
                  deleted the call instead of repointing it would pass the check above"
             );
         }
+    }
+
+    /// A slash command must not be a way around the hook chain.
+    ///
+    /// Measured before this test existed: `/bash` and `/python` went straight
+    /// from the permission check to the executor. So the ONE path in the system
+    /// that runs arbitrary shell and Python on the user's machine was also the
+    /// only one that wrote no provenance record, carried no `code_exec` tag, and
+    /// never ran `safety_hook`'s destructive-keyword scan — while the
+    /// model-driven path, which cannot be typed by a human at all, ran all
+    /// three.
+    ///
+    /// Nothing in the type system can catch a missing call, so this reads the
+    /// source. It checks ORDER, not presence: a pre-hook that fires after the
+    /// executor has already run cannot abort anything, and a post-hook that
+    /// fires before it records the wrong bytes. An edit that keeps both calls
+    /// but moves them to the wrong side of the call still fails here.
+    #[test]
+    fn a_slash_command_cannot_skip_the_hook_chain() {
+        const SOURCE: &str = include_str!("protocol.rs");
+
+        let body = SOURCE
+            .split_once("async fn execute_manual_tool_call(")
+            .expect("execute_manual_tool_call must exist")
+            .1;
+        let body = body
+            .split_once("\nfn command_timeout_for_root")
+            .expect("the fn must end before command_timeout_for_root")
+            .0;
+
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("execute_manual_tool_call must call `{needle}`"))
+        };
+
+        let fire_before = at("hooks.fire_before(");
+        let skill_gate = at("gate_implicit_human_skill_invocation(");
+        let execute = at("tool_server.call_tool(");
+        let fire_after = at("hooks.fire_after(");
+
+        assert!(
+            fire_before < execute && skill_gate < execute,
+            "the pre-hook and the skill gate must run BEFORE the executor — \
+             after it they cannot abort anything"
+        );
+        assert!(
+            fire_after > execute,
+            "the post-hook must run AFTER the executor, on its real result"
+        );
     }
 
     /// The previews the cards and `humanize_tool_verb` parse are built from

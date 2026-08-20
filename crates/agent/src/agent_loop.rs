@@ -974,7 +974,7 @@ fn check_doom_loop(recent: &VecDeque<String>, sig: &str) -> bool {
 /// through unchanged; when it is a non-JSON error string we wrap it as
 /// `{success:false, error:...}` so the shared classifier records the failure.
 /// A non-JSON, non-error content stays a bare string (unchanged behaviour).
-fn hook_result_value(raw_content: &str, is_error: bool) -> Value {
+pub(crate) fn hook_result_value(raw_content: &str, is_error: bool) -> Value {
     serde_json::from_str(raw_content).unwrap_or_else(|_| {
         if is_error {
             serde_json::json!({ "success": false, "error": raw_content })
