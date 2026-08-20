@@ -985,6 +985,21 @@ impl SaturationTracker {
 
     /// The block the model sees, or `None` when no search has run — a chat turn
     /// stays byte-for-byte what it was.
+    /// Whether the harness should stop OFFERING search, because it has already
+    /// told this run to ingest and been ignored.
+    ///
+    /// Exactly the condition that renders `ACTION REQUIRED` in [`Self::block`],
+    /// so the prompt and the tool list can never disagree about what the run is
+    /// being asked to do.
+    fn should_withhold_search(&self) -> bool {
+        if self.ingested_ok > 0 || self.seen.is_empty() {
+            return false;
+        }
+        let saturated =
+            matches!(self.recent_new_ratio(), Some(ratio) if ratio <= SATURATION_NEW_RATIO);
+        saturated || self.seen.len() >= INGEST_NUDGE_PAPERS
+    }
+
     fn block(&self) -> Option<String> {
         if self.searches.is_empty() {
             return None;
@@ -1943,6 +1958,29 @@ fn capability_menu_for_request(
 }
 
 /// Keyword selection (fallback path): the catalog ranked by keyword match on
+/// Withhold the SEARCH tools once the harness has told the run to ingest.
+///
+/// Measured 2026-08-20, third full run: 495 unique papers, 12 `papers` calls,
+/// ZERO ingests — with the ACTION REQUIRED directive firing on every turn from
+/// paper 40 onward. The block was in the prompt and the model kept searching.
+///
+/// Google's ADK long-horizon harness reached the same conclusion the same way
+/// (arXiv 2608.17528 / their Pattern 4): "strip the tools off the request and
+/// let the model write a plain-text handoff. Leave the tools attached and it
+/// keeps calling them, trading a runaway loop for an error loop."
+///
+/// So this is not a stronger instruction — a directive the model can decline is
+/// not a control. It removes the AFFORDANCE. `papers_ingest`, `recall`, the
+/// graph tools and everything else stay; only the three literature-search tools
+/// go, leaving "ingest what you have" and "answer" as the reachable moves.
+/// Nothing is refused and nothing errors: the tool simply is not offered, which
+/// is the difference between annotating and muzzling.
+fn withhold_search_tools(defs: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    defs.into_iter()
+        .filter(|d| !SEARCH_TOOLS.contains(&d.function.name.as_str()))
+        .collect()
+}
+
 /// `route`, filled until `token_budget` is spent, then meta-tools + pinned.
 fn assemble_request_tools(
     catalog: &ToolCatalog,
@@ -2840,6 +2878,31 @@ pub(crate) async fn run_turn_inner(
             }
         }
 
+        // The directive becomes a control here, not a suggestion.
+        //
+        // Once the harness has told the run to ingest, the search tools stop
+        // being offered. Measured 2026-08-20: 495 unique papers, 12 `papers`
+        // calls, ZERO ingests, with ACTION REQUIRED in the prompt on every turn
+        // from paper 40 onward. The model simply kept searching. Per Google's
+        // ADK harness (arXiv 2608.17528): "Leave the tools attached and it keeps
+        // calling them."
+        //
+        // Only the three literature-search tools go. `papers_ingest`, `recall`,
+        // the graph tools and everything else remain, so the reachable moves
+        // become "ingest what you have" and "answer". Nothing is refused and
+        // nothing errors — the affordance is simply absent, which is the
+        // difference between this and muzzling.
+        if saturation.should_withhold_search() {
+            let before = relevant_tools.len();
+            relevant_tools = withhold_search_tools(relevant_tools);
+            if relevant_tools.len() != before {
+                tracing::debug!(
+                    "withheld {} search tool(s): {} papers seen, 0 ingested",
+                    before - relevant_tools.len(),
+                    saturation.seen.len()
+                );
+            }
+        }
         tracing::debug!(
             total_tools = tool_catalog.len(),
             selected_tools = relevant_tools.len(),
@@ -5828,6 +5891,135 @@ mod tests {
             !block.contains("nothing found this session has been persisted"),
             "identity is saved on every search; overstating the loss teaches \
              the model to discount this block: {block}"
+        );
+    }
+
+    /// The helper existing is not the same as the loop USING it.
+    ///
+    /// Caught while mutation-testing: disabling the call site left the unit test
+    /// green, because that test exercises the predicate and the filter, not the
+    /// wiring between them. No type connects the two — so this reads the source,
+    /// and checks ORDER: the withholding must happen BEFORE the request is sent,
+    /// or it withholds nothing.
+    #[test]
+    fn the_loop_actually_withholds_before_it_calls_the_model() {
+        const SOURCE: &str = include_str!("agent_loop.rs");
+        let body = SOURCE
+            .split_once("// ── 2h. Process each tool call")
+            .map_or(SOURCE, |(before, _)| before);
+
+        let guard = body
+            .find("saturation.should_withhold_search()")
+            .expect("the loop must consult the tracker");
+        let apply = body
+            .find("withhold_search_tools(relevant_tools)")
+            .expect("the loop must apply the filter to the request tools");
+        let send = body
+            .find("chat_with_tools_streaming")
+            .expect("the loop must send the request");
+
+        assert!(
+            guard < apply && apply < send,
+            "withholding must be decided and applied BEFORE the model is called: \
+             guard={guard} apply={apply} send={send}"
+        );
+    }
+
+    /// A directive the model can decline is not a control.
+    ///
+    /// Measured 2026-08-20, third full run: 495 unique papers, 12 `papers`
+    /// calls, ZERO ingests — with ACTION REQUIRED in the prompt on every turn
+    /// from paper 40 onward. The block fired; the model kept searching. Google's
+    /// ADK harness reached the same conclusion (arXiv 2608.17528): "Leave the
+    /// tools attached and it keeps calling them."
+    ///
+    /// So withholding must fire on EXACTLY the condition that renders the
+    /// directive — otherwise the prompt and the tool list disagree about what
+    /// the run is being asked to do, which is worse than either alone.
+    #[test]
+    fn search_is_withheld_on_exactly_the_condition_that_demands_ingestion() {
+        let mut t = SaturationTracker::default();
+        assert!(
+            !t.should_withhold_search(),
+            "a turn with no searches keeps its tools"
+        );
+
+        // Under the threshold, still finding: keep searching.
+        for round in 0..2 {
+            let papers: Vec<Value> = (0..10)
+                .map(|i| paper(Some(&format!("10.{round}/{i}")), "arxiv", "x"))
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        assert!(t.seen.len() < INGEST_NUDGE_PAPERS);
+        assert!(
+            !t.should_withhold_search(),
+            "20 papers is not yet enough to stop"
+        );
+        assert!(
+            t.block().unwrap().contains("NOTE:"),
+            "and it is only a note"
+        );
+
+        // Past the threshold with nothing ingested: stop offering search.
+        for round in 2..5 {
+            let papers: Vec<Value> = (0..10)
+                .map(|i| paper(Some(&format!("10.{round}/{i}")), "arxiv", "x"))
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        assert!(t.seen.len() >= INGEST_NUDGE_PAPERS);
+        assert!(t.should_withhold_search());
+        assert!(
+            t.block().unwrap().contains("ACTION REQUIRED"),
+            "the tool list and the prompt must agree"
+        );
+
+        // The withholding removes ONLY search. Everything else stays reachable.
+        let defs: Vec<prism_llm::ToolDefinition> = [
+            "papers",
+            "prior_art_search",
+            "papers_ingest",
+            "recall",
+            "query_local",
+        ]
+        .iter()
+        .map(|n| prism_llm::ToolDefinition {
+            tool_type: "function".to_string(),
+            function: prism_llm::FunctionDef {
+                name: (*n).to_string(),
+                description: "d".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect();
+        let kept: Vec<String> = withhold_search_tools(defs)
+            .into_iter()
+            .map(|d| d.function.name)
+            .collect();
+        assert!(!kept.contains(&"papers".to_string()));
+        assert!(!kept.contains(&"prior_art_search".to_string()));
+        assert!(
+            kept.contains(&"papers_ingest".to_string()),
+            "ingest must remain: {kept:?}"
+        );
+        assert!(
+            kept.contains(&"recall".to_string()),
+            "recall must remain: {kept:?}"
+        );
+        assert!(
+            kept.contains(&"query_local".to_string()),
+            "graph tools must remain: {kept:?}"
         );
     }
 
