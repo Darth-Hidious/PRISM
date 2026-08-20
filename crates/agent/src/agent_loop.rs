@@ -775,6 +775,12 @@ const SATURATION_QUERY_LIST_MAX: usize = 8;
 /// evidence, do not ingest a hundred because you found a hundred" — and it
 /// leaves budget to actually ingest them.
 const INGEST_NUDGE_PAPERS: usize = 40;
+/// Concrete ingest arguments carried in the coverage block.
+///
+/// Small on purpose: enough to act on, not a second copy of the corpus. The
+/// block is rebuilt every turn, so this is paid on every request.
+const INGEST_HANDLES_KEPT: usize = 6;
+
 /// Titles kept in a compacted search result.
 const SEARCH_DIGEST_TITLES: usize = 8;
 
@@ -799,6 +805,15 @@ struct SaturationTracker {
     /// Sources that reported a failure, so "half the providers are down" is
     /// never silently rendered as "the literature is exhausted".
     degraded_sources: std::collections::BTreeSet<String>,
+    /// Concrete, fetchable `papers_ingest` arguments seen this session.
+    ///
+    /// These live HERE, on the tracker, because the coverage block is rebuilt
+    /// from scratch every turn and can never be pruned — whereas the search
+    /// result that first carried a handle can be, and is. Measured 2026-08-20
+    /// run 5: told to ingest with the handles already pruned out of history,
+    /// the model invented `PMC0000000` and ingested nothing. A directive whose
+    /// arguments have been garbage-collected invites exactly that.
+    ingest_handles: Vec<String>,
 }
 
 /// Exact-identifier dedup key for one paper record.
@@ -946,6 +961,19 @@ impl SaturationTracker {
             }
         }
 
+        // Keep a bounded set of CONCRETE ingest arguments. The directive tells
+        // the model to ingest; these are what it ingests WITH, and they must
+        // outlive the search result that carried them (which the pruner zeroes).
+        for record in paper_records(&payload) {
+            if self.ingest_handles.len() >= INGEST_HANDLES_KEPT {
+                break;
+            }
+            if let Some(handle) = ingest_handle(record)
+                && !self.ingest_handles.contains(&handle)
+            {
+                self.ingest_handles.push(handle);
+            }
+        }
         let keys: Vec<String> = paper_records(&payload)
             .into_iter()
             .filter_map(paper_key)
@@ -1125,6 +1153,15 @@ impl SaturationTracker {
                      numbers or mechanisms your question actually turns on, and ingest them now.\n",
                     self.seen.len()
                 ));
+                // The arguments, not just the instruction. Invent nothing: these
+                // are handles this session actually saw, repeated every turn so
+                // they cannot be pruned out from under the directive.
+                if !self.ingest_handles.is_empty() {
+                    out.push_str("Ready to run, verbatim — do not invent an id or url:\n");
+                    for handle in &self.ingest_handles {
+                        out.push_str(&format!("  papers_ingest {handle}\n"));
+                    }
+                }
             } else {
                 out.push_str(&format!(
                     "NOTE: {} papers seen, 0 ingested. Their IDENTITY is already saved to the \
@@ -5935,6 +5972,47 @@ mod tests {
             guard < apply && apply < send,
             "withholding must be decided and applied BEFORE the model is called: \
              guard={guard} apply={apply} send={send}"
+        );
+    }
+
+    /// A directive whose arguments have been garbage-collected invites a
+    /// hallucination.
+    ///
+    /// Measured 2026-08-20 run 5: search and recall were withheld, the model
+    /// was told to ingest, and it ingested `PMC0000000` — an id it invented.
+    /// The real handles had been in a `papers` result that the pruner zeroed,
+    /// because `papers` is not on PRUNE_PROTECTED_TOOLS. So the handles now ride
+    /// in the coverage block, which is rebuilt every turn and can never be
+    /// pruned.
+    #[test]
+    fn the_directive_carries_the_handles_it_tells_the_model_to_use() {
+        let mut t = SaturationTracker::default();
+        for round in 0..5 {
+            let papers: Vec<Value> = (0..10)
+                .map(|i| {
+                    let mut p = paper(Some(&format!("10.{round}/{i}")), "arxiv", "x");
+                    p["fulltext_url"] =
+                        serde_json::json!(format!("https://arxiv.org/pdf/{round}{i}.00001"));
+                    p
+                })
+                .collect();
+            t.observe(
+                "papers",
+                &search_args(&format!("q{round}")),
+                &cli_envelope(serde_json::json!({"papers": papers})),
+                false,
+            );
+        }
+        let block = t.block().unwrap();
+        assert!(block.contains("ACTION REQUIRED"), "{block}");
+        assert!(
+            block.contains("papers_ingest url=https://arxiv.org/pdf/"),
+            "the block must carry runnable handles, not just an instruction: {block}"
+        );
+        assert!(block.contains("do not invent an id or url"), "{block}");
+        assert!(
+            t.ingest_handles.len() <= INGEST_HANDLES_KEPT,
+            "bounded: the block is paid on every request"
         );
     }
 
