@@ -77,10 +77,49 @@ impl TurnBudget {
             .map(|w| w.saturating_sub(self.reserved_output_tokens))
     }
 
-    /// Check if the budget is exhausted.
+    /// Optional cumulative-SPEND ceiling for one turn. `None` = no cap.
+    ///
+    /// Opt-in via `PRISM_MAX_TURN_TOKENS`, because the research loop is supposed
+    /// to read and store and read and store: that is inherently many calls, each
+    /// re-sending history, and a cumulative cap punishes exactly the behaviour
+    /// the loop exists to perform. The principled stop signal is saturation with
+    /// facts written, which the harness already computes — an accounting limit
+    /// must not pre-empt it.
+    #[must_use]
+    pub fn max_spend_tokens() -> Option<u64> {
+        std::env::var("PRISM_MAX_TURN_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    }
+
+    /// Whether the turn must stop.
+    ///
+    /// `input_tokens` is CUMULATIVE spend, and it no longer stops a turn by
+    /// itself. It used to be compared against `max_input_tokens` — a number
+    /// taken from the model's per-request context window — so a turn of many
+    /// modest calls died while every individual call sat at a few percent of
+    /// that window. All five research runs on 2026-08-20 ended this way.
+    ///
+    /// The turn COUNT remains the backstop against a genuine runaway, and a
+    /// spend ceiling applies only when the operator opts in.
     #[must_use]
     pub fn exhausted(&self, turns: usize, input_tokens: u64) -> bool {
-        turns >= self.max_turns || input_tokens >= self.max_input_tokens
+        if turns >= self.max_turns {
+            return true;
+        }
+        Self::max_spend_tokens().is_some_and(|cap| input_tokens >= cap)
+    }
+
+    /// Capacity pressure: is the NEXT request likely to crowd the window?
+    ///
+    /// Measures the most recent request against the usable window, which is
+    /// what compaction actually relieves. `None` window (local llama.cpp with
+    /// no `/props`) falls back to the turn counter.
+    #[must_use]
+    pub fn under_capacity_pressure(&self, last_input: u64) -> bool {
+        self.usable_context()
+            .is_some_and(|usable| last_input >= (usable as f64 * self.warn_at_token_pct) as u64)
     }
 
     /// Turn-count compaction check — the fallback when the model's
@@ -138,12 +177,23 @@ impl std::fmt::Display for CostEvent {
 pub struct CostTracker {
     pub total_input: u64,
     pub total_output: u64,
+    /// Input tokens on the MOST RECENT call — the capacity signal.
+    ///
+    /// `total_input` is a SPEND measure: it sums every call in the turn. It says
+    /// nothing about how full the context is, because each call re-sends a
+    /// history that compaction may just have shrunk. Comparing that sum to the
+    /// context window (which is a PER-REQUEST limit) killed five research runs
+    /// that were nowhere near overflowing: measured 2026-08-20, a turn died at
+    /// 212,326 cumulative across 30 calls — about 7k per call, 3.3% of the
+    /// window it was supposedly exceeding.
+    pub last_input: u64,
     pub events: Vec<CostEvent>,
 }
 
 impl CostTracker {
     /// Record a cost event.
     pub fn record(&mut self, label: impl Into<String>, input_tokens: u64, output_tokens: u64) {
+        self.last_input = input_tokens;
         self.total_input += input_tokens;
         self.total_output += output_tokens;
         self.events
@@ -398,18 +448,35 @@ impl TranscriptStore {
         if self.budget.should_compact(self.turn_count) {
             return true;
         }
-        self.budget.should_warn(self.cost.total_input)
+        // CAPACITY, not spend. This read `cost.total_input` — the cumulative sum
+        // across the turn — so it fired on turns whose history was small and
+        // never fired on the one oversized request that actually needed it.
+        // That is why compaction was observed "firing but not keeping up": it
+        // was responding to a number it could not affect.
+        self.budget.under_capacity_pressure(self.cost.last_input)
     }
 
     /// Return a warning message if approaching budget limits.
     #[must_use]
     pub fn budget_warning(&self) -> Option<String> {
-        if self.budget.should_warn(self.cost.total_input) {
-            let pct =
-                (self.cost.total_input as f64 / self.budget.max_input_tokens as f64 * 100.0) as u64;
+        // Report CONTEXT pressure, which is what compaction can relieve. The old
+        // line reported cumulative spend against the context window and read as
+        // "you are running out of room" when the room was 97% empty.
+        if let Some(usable) = self.budget.usable_context()
+            && self.budget.under_capacity_pressure(self.cost.last_input)
+        {
+            let pct = (self.cost.last_input as f64 / usable as f64 * 100.0) as u64;
             return Some(format!(
-                "Token budget: {}% used ({} / {})",
-                pct, self.cost.total_input, self.budget.max_input_tokens
+                "Context: {}% of the usable window on the last request ({} / {})",
+                pct, self.cost.last_input, usable
+            ));
+        }
+        if let Some(cap) = TurnBudget::max_spend_tokens()
+            && self.cost.total_input >= (cap as f64 * self.budget.warn_at_token_pct) as u64
+        {
+            return Some(format!(
+                "Turn spend: {} / {} tokens (PRISM_MAX_TURN_TOKENS)",
+                self.cost.total_input, cap
             ));
         }
         if self.turn_count >= self.budget.max_turns.saturating_sub(3) {
@@ -583,12 +650,88 @@ mod tests {
         assert!((b.warn_at_token_pct - 0.8).abs() < f64::EPSILON);
     }
 
+    /// The loop is supposed to read and store and read and store. That is
+    /// inherently many calls, each re-sending a history compaction keeps small.
+    ///
+    /// Measured 2026-08-20: five research runs, every one killed by "budget
+    /// exhausted", none anywhere near the context window. Run 2 died at 212,326
+    /// cumulative over 30 calls — about 7k per call, 3.3% of the 200k window it
+    /// was supposedly exceeding. The counter punished the exact behaviour the
+    /// harness exists to perform.
+    #[test]
+    fn a_long_read_and_store_turn_is_not_killed_by_its_own_call_count() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("PRISM_MAX_TURN_TOKENS");
+        unsafe { std::env::remove_var("PRISM_MAX_TURN_TOKENS") };
+
+        let budget = TurnBudget::for_model(Some(200_000), Some(8_000));
+        let mut t = TranscriptStore::new(Some(budget));
+
+        // Forty calls of ordinary size — 280k cumulative, far past the old
+        // ceiling, while no single request uses more than ~4% of the window.
+        for _ in 0..40 {
+            t.cost.record("read+store", 7_000, 500);
+        }
+        assert_eq!(t.cost.total_input, 280_000);
+        assert!(
+            !t.budget_exhausted(),
+            "a productive 40-call turn must not be stopped by cumulative spend"
+        );
+        assert!(
+            !t.needs_compaction_under_pressure(),
+            "and nothing needs compacting: the history is small"
+        );
+        assert!(t.budget_warning().is_none(), "no warning either");
+
+        // Capacity is still guarded: one oversized request does compact.
+        let usable = t.budget.usable_context().unwrap();
+        t.cost.record("huge", usable, 0);
+        assert!(
+            t.needs_compaction_under_pressure(),
+            "a request that crowds the window still triggers compaction"
+        );
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("PRISM_MAX_TURN_TOKENS", v) },
+            None => unsafe { std::env::remove_var("PRISM_MAX_TURN_TOKENS") },
+        }
+    }
+
     #[test]
     fn budget_exhausted() {
+        // Serialised: this test manipulates a process-wide env var.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("PRISM_MAX_TURN_TOKENS");
+        unsafe { std::env::remove_var("PRISM_MAX_TURN_TOKENS") };
+
         let b = TurnBudget::default();
         assert!(!b.exhausted(10, 100));
-        assert!(b.exhausted(30, 100));
-        assert!(b.exhausted(10, 200_000));
+        assert!(b.exhausted(30, 100), "the turn COUNT is still the backstop");
+
+        // Cumulative spend no longer ends a turn on its own. It used to be
+        // compared against the model's per-request context window, so a turn of
+        // many modest calls died while each call sat at a few percent of that
+        // window — the death of all five research runs on 2026-08-20.
+        assert!(
+            !b.exhausted(10, 200_000),
+            "spend alone must not end a turn: read-store-read-store IS many calls"
+        );
+        assert!(
+            !b.exhausted(10, 5_000_000),
+            "no cumulative figure ends a turn unless the operator asked for a cap"
+        );
+
+        // Opt in, and it binds.
+        unsafe { std::env::set_var("PRISM_MAX_TURN_TOKENS", "150000") };
+        assert!(b.exhausted(10, 150_000), "an explicit cap is honoured");
+        assert!(!b.exhausted(10, 149_999));
+
+        match previous {
+            Some(v) => unsafe { std::env::set_var("PRISM_MAX_TURN_TOKENS", v) },
+            None => unsafe { std::env::remove_var("PRISM_MAX_TURN_TOKENS") },
+        }
     }
 
     #[test]
@@ -729,11 +872,27 @@ mod tests {
 
     #[test]
     fn budget_warning_tokens() {
-        let mut store = TranscriptStore::new(None);
-        store.record_cost("big", 170_000, 0);
-        let warning = store.budget_warning();
-        assert!(warning.is_some());
-        assert!(warning.unwrap().contains("Token budget"));
+        // The warning must describe CONTEXT pressure, which compaction can
+        // relieve. It used to compare cumulative spend against the context
+        // window and read "you are running out of room" while the room was
+        // nearly empty.
+        let budget = TurnBudget::for_model(Some(200_000), Some(8_000));
+        let mut store = TranscriptStore::new(Some(budget));
+
+        // Thirty modest calls: a lot of SPEND, no capacity problem at all.
+        for _ in 0..30 {
+            store.record_cost("call", 7_000, 0);
+        }
+        assert!(
+            store.budget_warning().is_none(),
+            "210k cumulative across 30 small calls is not a context problem"
+        );
+
+        // One request that genuinely crowds the usable window.
+        let usable = store.budget.usable_context().unwrap();
+        store.record_cost("big", usable, 0);
+        let warning = store.budget_warning().expect("a full request must warn");
+        assert!(warning.contains("Context:"), "{warning}");
     }
 
     #[test]
@@ -805,15 +964,28 @@ mod tests {
             "a fresh turn has nothing to compact"
         );
 
-        // One turn, no extra turns — only token spend rises.
-        let warn_at = (t.budget.max_input_tokens as f64 * t.budget.warn_at_token_pct) as u64;
+        // Compaction answers CAPACITY, so the trigger is the size of the last
+        // request against the usable window — not the turn's cumulative spend,
+        // which compaction cannot reduce.
+        t.budget = TurnBudget::for_model(Some(200_000), Some(8_000));
+        let usable = t.budget.usable_context().unwrap();
+
+        for _ in 0..30 {
+            t.cost.record("call", 7_000, 0);
+        }
+        assert!(
+            !t.needs_compaction_under_pressure(),
+            "210k spent across 30 small calls needs no compaction: the history is small"
+        );
+
+        let warn_at = (usable as f64 * t.budget.warn_at_token_pct) as u64;
         t.cost.record("turn", warn_at - 1, 0);
         assert!(
             !t.needs_compaction_under_pressure(),
-            "below the threshold nothing changes"
+            "below the capacity threshold nothing changes"
         );
 
-        t.cost.record("turn", 1, 0);
+        t.cost.record("turn", warn_at, 0);
         assert!(
             t.needs_compaction_under_pressure(),
             "at {warn_at} cumulative input tokens the turn must compact, \
