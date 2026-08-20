@@ -770,11 +770,6 @@ impl ProvenanceStore {
             .await
             .context("failed to open Turso database")?;
         let conn = db.connect()?;
-        // Keep local provenance portable on Lustre/GPFS: WAL requires
-        // cross-client shared-memory coordination and creates -wal/-shm
-        // sidecars that are not reliable on parallel filesystems.
-        let mut journal_mode = conn.query("PRAGMA journal_mode=DELETE", ()).await?;
-        while journal_mode.next().await?.is_some() {}
 
         // Wait for a competing writer instead of failing the open.
         //
@@ -785,8 +780,29 @@ impl ProvenanceStore {
         // that error drop the record — one at `agent_loop.rs` with no log at
         // all. Five seconds is long enough to outlast any single write here
         // and short enough that a genuinely stuck lock still surfaces.
+        //
+        // THIS MUST BE THE FIRST STATEMENT ON THE CONNECTION. It used to run
+        // second, after the `journal_mode` pragma below — and changing the
+        // journal mode takes an exclusive lock, so the one statement most
+        // likely to collide was the one statement still running with a zero
+        // timeout. The protection was applied one statement too late to cover
+        // the case it was written for.
+        //
+        // Observed 2026-08-20: a second PRISM instance failed with "failed to
+        // open Turso database" against a store a 20-hour-old instance was
+        // using, while `prism provenance stats` opened the same file
+        // successfully moments later and a copy of it opened fine — an
+        // intermittent collision, not a corrupt database. The instance that
+        // lost degraded to "JSONL persistence remains active", i.e. it kept
+        // running with the knowledge graph silently disconnected.
         let mut busy = conn.query("PRAGMA busy_timeout=5000", ()).await?;
         while busy.next().await?.is_some() {}
+
+        // Keep local provenance portable on Lustre/GPFS: WAL requires
+        // cross-client shared-memory coordination and creates -wal/-shm
+        // sidecars that are not reliable on parallel filesystems.
+        let mut journal_mode = conn.query("PRAGMA journal_mode=DELETE", ()).await?;
+        while journal_mode.next().await?.is_some() {}
 
         // Enforce the store's declared foreign keys (provenance assertion
         // evidence and the rebuildable session search terms). Like SQLite,
@@ -4745,6 +4761,70 @@ mod store_path_tests {
         assert!(
             db.exists(),
             "the store file must exist after a successful open"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// `busy_timeout` must be the FIRST statement on a new connection.
+    ///
+    /// Changing the journal mode takes an exclusive lock. While that pragma
+    /// ran before the timeout was set, the one statement most likely to
+    /// collide was the one still running with a zero timeout — so the
+    /// protection missed exactly the case its own comment describes.
+    ///
+    /// Read from the source because ordering is the property under test and
+    /// no type expresses it. The concurrent open below exercises the
+    /// behaviour, but a race cannot be reproduced deterministically.
+    #[test]
+    fn busy_timeout_is_set_before_any_lock_taking_pragma() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let body = SOURCE
+            .split_once("pub async fn open(path: &Path) -> Result<Self> {")
+            .expect("open() must exist")
+            .1;
+
+        let busy = body
+            .find("PRAGMA busy_timeout")
+            .expect("open() must set a busy timeout");
+        let journal = body
+            .find("PRAGMA journal_mode")
+            .expect("open() must set the journal mode");
+
+        assert!(
+            busy < journal,
+            "busy_timeout must precede journal_mode: changing the journal mode \
+             takes an exclusive lock, and with a zero timeout a concurrent \
+             writer makes the whole open fail"
+        );
+    }
+
+    /// Two PRISM instances sharing one store is ordinary operation, not an
+    /// edge case — the agent loop opens per turn and hooks open per tool call
+    /// in spawned tasks. Every concurrent open must succeed.
+    #[tokio::test]
+    async fn concurrent_opens_all_succeed() {
+        let temp = std::env::temp_dir().join(format!("prism_conc_{}", uuid::Uuid::new_v4()));
+        let db = temp.join("provenance.db");
+
+        // First open serially so the schema exists, then race the rest.
+        let first = super::ProvenanceStore::open(&db).await.expect("first open");
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let path = db.clone();
+            set.spawn(async move { super::ProvenanceStore::open(&path).await.map(|_| ()) });
+        }
+        let mut failures = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            if let Err(e) = joined.expect("task must not panic") {
+                failures.push(format!("{e:#}"));
+            }
+        }
+        drop(first);
+
+        assert!(
+            failures.is_empty(),
+            "a concurrent open must wait for the lock, not fail: {failures:?}"
         );
         let _ = std::fs::remove_dir_all(&temp);
     }
