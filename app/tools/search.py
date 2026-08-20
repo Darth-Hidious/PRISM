@@ -227,9 +227,22 @@ def _prior_art_search(**kwargs) -> dict:
 
     Result shape stays uniform regardless of source:
       { "papers": [...], "patents": [...], "eastern": [...],
-        "counts": {"papers": N, "patents": M, "eastern": K} }
+        "counts": {"papers": N, "patents": M, "eastern": K},
+        "searched": ["papers"] }
     Empty arrays for unrequested sources so consumers don't have to
     null-check.
+
+    A count of `0` means SEARCHED AND FOUND NOTHING. A source that was not
+    consulted counts `null`, and `searched` lists the ones that were.
+
+    Measured 2026-08-20: called with `source="papers"`, this returned
+    `counts: {papers: 39, patents: 0, eastern: 0}`. Both zeros were for
+    backends that were never contacted, and nothing in the payload said so —
+    so the honest reading ("I did not look for patents") and the false one
+    ("there are no relevant patents") are the same bytes. The model had just
+    been told the patent backend was unconfigured, and a plain `0` invites it
+    to conclude the literature is settled. Absence of evidence must not be
+    encoded as evidence of absence.
     """
     query = kwargs.get("query", "")
     max_results = kwargs.get("max_results", 20)
@@ -239,11 +252,16 @@ def _prior_art_search(**kwargs) -> dict:
         "papers": [],
         "patents": [],
         "eastern": [],
-        "counts": {"papers": 0, "patents": 0, "eastern": 0},
+        # `None` until a backend actually answers; each branch below sets its
+        # own count, and any left `None` were not searched.
+        "counts": {"papers": None, "patents": None, "eastern": None},
+        "searched": [],
         "query": query,
     }
 
     if source in ("eastern", "both"):
+        out["searched"].append("eastern")
+        out["counts"]["eastern"] = 0
         try:
             east = _eastern_search_impl(
                 query=query,
@@ -259,6 +277,8 @@ def _prior_art_search(**kwargs) -> dict:
             out["eastern_error"] = str(exc)
 
     if source in ("papers", "both"):
+        out["searched"].append("papers")
+        out["counts"]["papers"] = 0
         try:
             lit = _literature_search_impl(
                 query=query,
@@ -280,6 +300,8 @@ def _prior_art_search(**kwargs) -> dict:
             out["papers_error"] = str(exc)
 
     if source in ("patents", "both"):
+        out["searched"].append("patents")
+        out["counts"]["patents"] = 0
         if not (query or "").strip():
             # The collector answers a blank query with [], which at this level
             # is a silent zero: measured once as counts.patents = 0 with no
