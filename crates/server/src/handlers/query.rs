@@ -181,53 +181,62 @@ fn provenance_db_path(state: &NodeState) -> PathBuf {
 /// each paired with the origin locator this node can honestly report for
 /// it (`None` when no stored assertion mentions the entity).
 ///
-/// Never errors: any failure (store unopenable, query error) degrades to
-/// `None`, which the handler renders as an empty result set. `None` is
-/// also returned when the store is fine but nothing matched (fresh
-/// install, unknown term).
+/// Distinguishes the three cases its semantic sibling already distinguishes,
+/// because a federated caller cannot tell them apart from the outside:
+///
+/// - **no store file** ⇒ `Ok(empty)`. Nothing was ever ingested. An empty
+///   index is not a broken one, and a fresh install must not raise an alarm.
+/// - **store unopenable, or the read fails** ⇒ `Err`. This node cannot answer.
+/// - **store fine, nothing matched** ⇒ `Ok(empty)`. A real miss.
+///
+/// It used to collapse all three into `None`, which the handler rendered as
+/// `200 {count: 0}` with an audit row marked `Success`. A peer whose store was
+/// locked or corrupt therefore reported "I know nothing about that" — and a
+/// federated answer silently dropped everything that peer held, with nothing
+/// anywhere saying so. `debug!` is not a disclosure: it is off by default.
 async fn local_graph_lookup(
     db_path: &Path,
     text: &str,
     limit: usize,
     scope: Option<&[String]>,
-) -> Option<Vec<(prism_provenance::GraphNode, Option<String>)>> {
-    let store = match prism_provenance::ProvenanceStore::open(db_path).await {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::debug!("local graph store open failed: {e:#}");
-            return None;
-        }
-    };
+) -> anyhow::Result<Vec<(prism_provenance::GraphNode, Option<String>)>> {
+    use anyhow::Context as _;
+
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = prism_provenance::ProvenanceStore::open(db_path)
+        .await
+        .with_context(|| {
+            format!(
+                "local graph store {} could not be opened",
+                db_path.display()
+            )
+        })?;
     let limit = limit.max(1) as i64;
     let scope = read_scope(&store, scope).await;
     let tenants: Vec<&str> = scope.iter().map(String::as_str).collect();
 
     // Exact/canonical entity name → 1-hop neighborhood (the Turso
     // counterpart of Neo4j `neighbors`).
-    let mut nodes = match store
+    // A read failure is NOT a miss. Swallowing it here is what let a broken
+    // store look like an empty one.
+    let mut nodes = store
         .get_neighbors_scoped(text, None, &tenants, limit)
         .await
-    {
-        Ok(traversal) => traversal.nodes,
-        Err(e) => {
-            tracing::debug!("local graph neighbor read failed: {e:#}");
-            Vec::new()
-        }
-    };
+        .context("local graph neighbor read failed")?
+        .nodes;
 
     // No exact center → substring search over entity names.
     if nodes.is_empty() {
-        nodes = match store.graph_search_scoped(text, &tenants, limit).await {
-            Ok(nodes) => nodes,
-            Err(e) => {
-                tracing::debug!("local graph search failed: {e:#}");
-                Vec::new()
-            }
-        };
+        nodes = store
+            .graph_search_scoped(text, &tenants, limit)
+            .await
+            .context("local graph search failed")?;
     }
 
     if nodes.is_empty() {
-        return None;
+        return Ok(Vec::new());
     }
 
     // Attach the origin each entity can honestly be attributed to, so a
@@ -247,7 +256,7 @@ async fn local_graph_lookup(
             });
         out.push((node, origin));
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Semantic entity search over the bundled Turso store, ranked by Turso's
@@ -425,26 +434,50 @@ async fn handle_graph_query(
     body: &QueryRequest,
     user_id: &str,
 ) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let nodes = local_graph_lookup(
+    let audit = |detail: String, outcome: prism_core::audit::AuditOutcome| {
+        state.audit_and_broadcast(&prism_core::audit::AuditEntry {
+            id: 0,
+            timestamp: chrono::Utc::now(),
+            user_id: user_id.to_string(),
+            action: prism_core::audit::AuditAction::DataQuery,
+            target: "graph".into(),
+            detail: Some(detail),
+            outcome,
+        });
+    };
+
+    // Same contract as `handle_semantic_query` 250 lines below: an unusable
+    // store is a 503 naming the problem and an audited FAILURE, never a silent
+    // `200 {count:0}` that a federated caller reads as "this peer knows
+    // nothing".
+    let nodes = match local_graph_lookup(
         &provenance_db_path(state),
         &body.query,
         body.limit,
         body.tenants.as_deref(),
     )
     .await
-    .unwrap_or_default();
+    {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            let error = format!("{e:#}");
+            audit(
+                format!("source=turso-local, error={error}"),
+                prism_core::audit::AuditOutcome::Failure,
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse { error }),
+            ));
+        }
+    };
     let results = graph_nodes_to_results(&nodes);
     let count = results.len() as u64;
 
-    state.audit_and_broadcast(&prism_core::audit::AuditEntry {
-        id: 0,
-        timestamp: chrono::Utc::now(),
-        user_id: user_id.to_string(),
-        action: prism_core::audit::AuditAction::DataQuery,
-        target: "graph".into(),
-        detail: Some(format!("results={count}, source=turso-local")),
-        outcome: prism_core::audit::AuditOutcome::Success,
-    });
+    audit(
+        format!("results={count}, source=turso-local"),
+        prism_core::audit::AuditOutcome::Success,
+    );
 
     Ok(Json(QueryResponse {
         results,
@@ -680,20 +713,44 @@ mod tests {
         assert!((score - f64::from(0.87_f32)).abs() < 1e-6, "got: {score}");
     }
 
+    /// An EMPTY graph and a BROKEN one must not look the same to a federated
+    /// caller — the same contract the semantic path already keeps.
+    ///
+    /// This test previously asserted the opposite ("open failure must degrade
+    /// to a miss"), which is the defect written down as a requirement: a peer
+    /// whose store was locked or corrupt answered `200 {count:0}` with an audit
+    /// row marked Success, so everything that peer knew silently vanished from
+    /// the federated answer and nothing anywhere said so.
     #[tokio::test]
-    async fn local_graph_lookup_misses_cleanly_on_empty_or_unopenable_store() {
+    async fn empty_graph_is_ok_but_unopenable_store_is_a_named_error() {
         let db = TempProvenanceDb::new();
         assert!(
             local_graph_lookup(&db.path, "titanium", 10, None)
                 .await
-                .is_none(),
+                .expect("an empty store is an empty graph, not a broken one")
+                .is_empty(),
             "empty store must be a clean graph miss"
         );
+
+        // A never-created store is "never ingested", not "broken".
+        let absent = std::env::temp_dir()
+            .join(format!("prism_absent_graph_{}", uuid::Uuid::new_v4()))
+            .join(".prism/provenance.db");
         assert!(
-            local_graph_lookup(&std::env::temp_dir(), "titanium", 10, None)
+            local_graph_lookup(&absent, "titanium", 10, None)
                 .await
-                .is_none(),
-            "graph store open failure must degrade to a miss"
+                .expect("a never-created store is an empty graph")
+                .is_empty()
+        );
+
+        // A path that exists but is not a database IS broken, and must say so.
+        let error = local_graph_lookup(&std::env::temp_dir(), "titanium", 10, None)
+            .await
+            .expect_err("an unopenable store must be an error, not an empty answer");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("could not be opened"),
+            "the error must name the problem: {message}"
         );
     }
 
@@ -884,7 +941,8 @@ mod tests {
         assert!(
             local_graph_lookup(&db.path, "no-such-entity-xyz", 10, None)
                 .await
-                .is_none()
+                .expect("a miss against a working store is not an error")
+                .is_empty()
         );
     }
 
