@@ -636,8 +636,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             // without ever knowing what was in it.
             let stored = if store {
                 Some({
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    let db_path = std::path::PathBuf::from(home).join(".prism/provenance.db");
+                    let db_path = prism_provenance::store_path();
                     store_claims(
                         &claims,
                         &fulltext.source_url,

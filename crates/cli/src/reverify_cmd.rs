@@ -76,8 +76,10 @@ pub enum ReverifyCommands {
 /// Where the reverify ledger and assertions live — the same store every
 /// ingest path writes (`~/.prism/provenance.db`).
 fn store_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Ok(PathBuf::from(home).join(".prism/provenance.db"))
+    // Honours $PRISM_PROVENANCE_DB. Hand-building the default meant `reverify`
+    // read the home store while the ingest that produced the ledger wrote the
+    // operator's chosen one — it reported an empty ledger, not an error.
+    Ok(prism_provenance::store_path())
 }
 
 /// Parse a `--status` argument or fail with the full valid list. Status

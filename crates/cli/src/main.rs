@@ -3855,11 +3855,8 @@ async fn main() -> Result<()> {
                             // store under the publisher's own tenant
                             // ("mesh:{node id}") — always available, no
                             // external graph service required.
-                            let sync_home =
-                                std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                             let sync_config = Some(prism_mesh::sync::SyncConfig {
-                                provenance_db: std::path::PathBuf::from(sync_home)
-                                    .join(".prism/provenance.db"),
+                                provenance_db: prism_provenance::store_path(),
                             });
 
                             // Spawn consumer loop
@@ -6207,9 +6204,8 @@ async fn handle_mesh_command(
             // Never carry a stored provider credential to it; remote peers
             // must be vouched for through authenticated platform discovery.
             let sessions = prism_mesh::peer_session::PeerSessions::new(None);
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             let sync_config = Some(prism_mesh::sync::SyncConfig {
-                provenance_db: std::path::PathBuf::from(home).join(".prism/provenance.db"),
+                provenance_db: prism_provenance::store_path(),
             });
 
             println!("Pulling dataset '{dataset_name}' from {peer} (node {publisher})...");
@@ -8392,8 +8388,7 @@ async fn run_local_repair_pass(
     };
     let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let db_path = PathBuf::from(home).join(".prism/provenance.db");
+    let db_path = prism_provenance::store_path();
     let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
 
     // Say "nothing to do" honestly instead of spending a model on an empty
@@ -13088,11 +13083,8 @@ async fn handle_matkg_load(
     limit: Option<usize>,
     json: bool,
 ) -> Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let db_path = PathBuf::from(home).join(".prism/provenance.db");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    // The directory is created by `ProvenanceStore::open` for every caller.
+    let db_path = prism_provenance::store_path();
     let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
     let report = prism_ingest::matkg::load(
         path,
@@ -15658,11 +15650,26 @@ mod tests {
             window >= 8_192,
             "a real window, not a placeholder: got {window}"
         );
-        // And it must agree with the registry the agent loop uses — a second
-        // answer to this question is how the first one drifted.
+        // And it must agree with the agent loop — a second answer to this
+        // question is how the first one drifted.
+        //
+        // Compare against `resolve_context_window`, the function production
+        // calls, NOT `get_model_config`. The two differ on purpose: the
+        // registry answers for the model NAME, while resolution asks the
+        // ENDPOINT first and only falls back to the registry. This assertion
+        // named the registry and passed for the wrong reason — the `/props`
+        // probe was building `{base}/v1/props`, 404ing, and falling back — so
+        // it agreed with the registry precisely while the probe was broken.
+        // Fixing the probe made it fail here against a developer machine with
+        // a llama-server on 8081: `n_ctx` 16384 measured, versus 1,050,000
+        // claimed by the catalog for hosted `gpt-5.5`, which is not what is
+        // listening on that port. The measured number is the correct one, and
+        // an assertion that only holds while a probe is broken is worse than
+        // no assertion.
         assert_eq!(
             window,
-            prism_agent::models::get_model_config("gpt-5.5").context_window as u64
+            prism_agent::models::resolve_context_window("http://127.0.0.1:8081/v1", "gpt-5.5")
+                as u64
         );
     }
 

@@ -313,11 +313,21 @@ pub fn provenance_db_path() -> std::path::PathBuf {
     default_store_path()
 }
 
+/// Delegates to the ONE default resolver, so this crate and `prism_provenance`
+/// can never name two different files.
+///
+/// They previously could: this copy read `dirs::home_dir()` (which falls back
+/// to getpwuid when HOME is unset) and, failing that, a bare relative
+/// `provenance.db`; `prism_provenance::default_store_path` reads `$HOME` and
+/// falls back to `.prism/provenance.db`. With HOME unset the agent wrote one
+/// file and every reader opened another — two live stores, no error, and the
+/// symptom is an empty answer rather than a failure.
+///
+/// The wrapper survives only to keep the `test-guard` arm below, which is why
+/// resolution still routes through this crate at all.
 #[cfg(not(feature = "test-guard"))]
 fn default_store_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".prism/provenance.db"))
-        .unwrap_or_else(|| std::path::PathBuf::from("provenance.db"))
+    prism_provenance::default_store_path()
 }
 
 // `test-guard` is an ordinary PUBLIC cargo feature, so nothing about the

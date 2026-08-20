@@ -238,8 +238,6 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
 /// Where the governance queue lives — the same store every ingest path
 /// writes (`~/.prism/provenance.db`).
 fn proposal_store_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let _ = home;
     // Honours $PRISM_PROVENANCE_DB — pointing the ontology tools at a chosen
     // corpus used to open the DEFAULT store and collide with the node's lock.
     Ok(prism_provenance::store_path())

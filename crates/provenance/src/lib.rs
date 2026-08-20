@@ -741,6 +741,29 @@ impl ProvenanceStore {
         let path_str = path.to_str().ok_or_else(|| {
             anyhow::anyhow!("provenance database path is not valid UTF-8: {path:?}")
         })?;
+        // The directory is this function's job, not the caller's.
+        //
+        // Three of fifteen call sites created it; the rest did not, so on a
+        // fresh install with no `~/.prism` those three worked and the others
+        // failed to open — and the agent's copies degrade that failure to a
+        // warn!, so the visible symptom is provenance quietly not being
+        // recorded. Every ingest test pre-creates the directory, which is
+        // exactly why the suite never showed it: the guarantee lived in test
+        // setup rather than in the code under test.
+        //
+        // `:memory:` has no parent to make, and a bare relative filename
+        // yields an empty parent — skip both rather than calling create_dir_all("").
+        if path_str != ":memory:"
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create the provenance store directory {}",
+                    parent.display()
+                )
+            })?;
+        }
         let _open_guard = STORE_OPEN_LOCK.lock().await;
         let db = turso::Builder::new_local(path_str)
             .build()
@@ -4631,5 +4654,98 @@ mod store_path_tests {
         if let Some(value) = previous {
             unsafe { std::env::set_var("PRISM_PROVENANCE_DB", value) };
         }
+    }
+
+    /// The override only works if EVERY writer honours it. Eight sites
+    /// hand-built `$HOME/.prism/provenance.db`, so with the override set,
+    /// ingest / papers / repair / matkg / mesh-pull wrote the home store while
+    /// `prism query` read the chosen one. Nothing errored — the operator got a
+    /// confident "0 results" about a database nothing had written to.
+    ///
+    /// No type can catch a path built by hand, so this greps the workspace.
+    /// Doc comments and tests may still name the default (they describe it);
+    /// what must not exist is a `.join(".prism/provenance.db")` outside the
+    /// resolver, which is a path being CONSTRUCTED.
+    #[test]
+    fn no_crate_hand_builds_the_default_store_path() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/ is the parent of this crate");
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![crates.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // This file IS the resolver; `tests/` legitimately builds
+                // scratch paths under a TempDir to prove isolation.
+                let display = path.display().to_string();
+                if display.ends_with("provenance/src/lib.rs") || display.contains("/tests/") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Only PRODUCTION code. An inline `#[cfg(test)]` module builds
+                // this path on purpose — under a `TempDir`, to prove isolation
+                // — and every such site in the workspace today does exactly
+                // that. Tests are laid out at the bottom of the file, so
+                // stopping at the first attribute is enough and keeps the lint
+                // a grep rather than a parser.
+                let production = text
+                    .split_once("\n#[cfg(test)]")
+                    .map_or(text.as_str(), |(before, _)| before);
+                for (offset, line) in production.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                        continue;
+                    }
+                    if line.contains(".join(\".prism/provenance.db\")") {
+                        offenders.push(format!("{display}:{}", offset + 1));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these sites build the default store path by hand and so ignore \
+             $PRISM_PROVENANCE_DB — call prism_provenance::store_path() instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// A9/A33 together: the override is honoured AND the directory it names
+    /// does not have to exist yet. A fresh install has no `~/.prism`, and
+    /// three of fifteen callers created the parent while the rest did not.
+    #[tokio::test]
+    async fn open_creates_a_missing_parent_directory() {
+        let temp = std::env::temp_dir().join(format!("prism_open_{}", uuid::Uuid::new_v4()));
+        let db = temp.join("nested/deeper/provenance.db");
+        assert!(!temp.exists(), "the fixture must start absent");
+
+        let store = super::ProvenanceStore::open(&db)
+            .await
+            .expect("open must create the directory it was given, not fail on it");
+        drop(store);
+
+        assert!(
+            db.exists(),
+            "the store file must exist after a successful open"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
