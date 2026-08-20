@@ -2818,11 +2818,9 @@ impl App {
         }
         let indices = self.model_filtered_indices();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !indices.is_empty() {
-                    self.model_picker.selected =
-                        (self.model_picker.selected + 1).min(indices.len() - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if !indices.is_empty() => {
+                self.model_picker.selected =
+                    (self.model_picker.selected + 1).min(indices.len() - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.model_picker.selected = self.model_picker.selected.saturating_sub(1);
@@ -2873,11 +2871,9 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.gpu_picker.gpus.is_empty() {
-                    self.gpu_picker.selected =
-                        (self.gpu_picker.selected + 1).min(self.gpu_picker.gpus.len() - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if !self.gpu_picker.gpus.is_empty() => {
+                self.gpu_picker.selected =
+                    (self.gpu_picker.selected + 1).min(self.gpu_picker.gpus.len() - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.gpu_picker.selected = self.gpu_picker.selected.saturating_sub(1);
@@ -2933,11 +2929,9 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.node_picker.nodes.is_empty() {
-                    self.node_picker.selected =
-                        (self.node_picker.selected + 1).min(self.node_picker.nodes.len() - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if !self.node_picker.nodes.is_empty() => {
+                self.node_picker.selected =
+                    (self.node_picker.selected + 1).min(self.node_picker.nodes.len() - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.node_picker.selected = self.node_picker.selected.saturating_sub(1);
@@ -3108,11 +3102,9 @@ impl App {
         }
         let indices = self.session_filtered_indices();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !indices.is_empty() {
-                    self.session_picker.selected =
-                        (self.session_picker.selected + 1).min(indices.len() - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if !indices.is_empty() => {
+                self.session_picker.selected =
+                    (self.session_picker.selected + 1).min(indices.len() - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.session_picker.selected = self.session_picker.selected.saturating_sub(1);
@@ -3256,10 +3248,8 @@ impl App {
         }
         let n = self.tools_window_filtered().len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if n > 0 {
-                    self.tools_window.selected = (self.tools_window.selected + 1).min(n - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.tools_window.selected = (self.tools_window.selected + 1).min(n - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.tools_window.selected = self.tools_window.selected.saturating_sub(1);
@@ -3622,18 +3612,14 @@ impl App {
         }
         let n = self.link_picker.urls.len();
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                if n > 0 {
-                    self.link_picker.selected = (self.link_picker.selected + 1).min(n - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.link_picker.selected = (self.link_picker.selected + 1).min(n - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.link_picker.selected = self.link_picker.selected.saturating_sub(1);
             }
-            KeyCode::Enter => {
-                if n > 0 {
-                    self.link_picker.confirm = true;
-                }
+            KeyCode::Enter if n > 0 => {
+                self.link_picker.confirm = true;
             }
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as usize) - ('1' as usize);
