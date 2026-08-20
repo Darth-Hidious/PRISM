@@ -398,6 +398,18 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
         "{} result(s), {fresh} not seen before in this session.\n",
         records.len()
     );
+    // Carry the handle INGESTION needs, not just the one citation needs.
+    //
+    // The digest used to emit title + dedup key and nothing else, while
+    // `papers_ingest` requires `url` or `pmc`. So the harness could tell the
+    // model to ingest and the model had no way to name a paper to ingest —
+    // its only route to a URL was `recall`, which is the budget sink this same
+    // change is trying to stop. A directive the model cannot follow is worse
+    // than no directive: it burns the turn proving it cannot comply.
+    //
+    // `fulltext_url` is on every record the engine returns and costs ~60-100
+    // chars here, against a ~30k recall to fetch the same string back.
+    let mut ingestable = 0usize;
     for record in records.iter().take(SEARCH_DIGEST_TITLES) {
         let title = record
             .get("title")
@@ -410,6 +422,15 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
             .unwrap_or_default();
         let id = paper_key(record).unwrap_or_else(|| "unidentified".to_string());
         out.push_str(&format!("  - {title}{year} [{id}]\n"));
+        if let Some(url) = record
+            .get("fulltext_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+        {
+            ingestable += 1;
+            out.push_str(&format!("      papers_ingest url={url}\n"));
+        }
     }
     if records.len() > SEARCH_DIGEST_TITLES {
         out.push_str(&format!(
@@ -429,10 +450,17 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
             out.push_str(&format!("  [source {name} returned an error]\n"));
         }
     }
+    if ingestable > 0 {
+        out.push_str(&format!(
+            "{ingestable} of the above have full text and can be ingested directly with the \
+             url shown — you do not need to recall anything to do it.\n"
+        ));
+    }
     out.push_str(
-        "Abstracts and full records are in durable memory, not here: call \
-         recall(query=\"<keywords>\") to pull any of them back. To keep a paper's FACTS, \
-         ingest it — a search result does not survive this conversation.\n",
+        "Abstracts and full records are in durable memory, not here: recall(query=\"<keywords>\") \
+         pulls one back, but it spends this turn's remaining budget and persists nothing. \
+         Ingesting is what turns a paper's FACTS into durable graph rows; a search result \
+         itself does not survive this conversation.\n",
     );
     Some(out)
 }
@@ -456,6 +484,7 @@ fn process_large_result(content: &str) -> String {
         // spent 86% of its window re-reading records it had already stored.
         // recall now sizes itself against the budget left, so any number printed
         // here would be a promise the tool cannot keep.
+        // (see search_digest for why the ingest handle travels with the digest)
         "{truncated}\n\n[Showing first {end} of {total} chars — the FULL result is already in \
          durable memory and is NOT lost. Refining the query or lowering max_results is the \
          cheap way to get a result that fits whole; recall(id=\"<id>\") pulls a record back but \
@@ -5395,6 +5424,50 @@ mod tests {
 
     fn search_args(query: &str) -> Value {
         serde_json::json!({"args": ["search", "--query", query, "--limit", "20"]})
+    }
+
+    /// The digest has to carry the handle INGESTION needs, not only the one
+    /// CITATION needs.
+    ///
+    /// It used to emit title + dedup key and stop, while `papers_ingest`
+    /// requires `url` or `pmc`. So the harness could tell a saturated run to
+    /// ingest, and the model had no way to name a paper to ingest — its only
+    /// route to a URL was `recall`, the budget sink that killed the run in the
+    /// first place. A directive the model cannot follow is worse than none: it
+    /// burns the turn proving it cannot comply.
+    #[test]
+    fn the_digest_carries_what_ingestion_needs() {
+        let mut with_text = paper(Some("10.1/a"), "openalex", "W1");
+        with_text["title"] = serde_json::json!("A paper with full text");
+        with_text["fulltext_url"] = serde_json::json!("https://example.org/a.pdf");
+        let without = paper(Some("10.1/b"), "openalex", "W2");
+
+        let digest = search_digest(
+            "papers",
+            &cli_envelope(serde_json::json!({"papers": [with_text, without]})),
+            2,
+        )
+        .expect("a search with results must produce a digest");
+
+        assert!(
+            digest.contains("papers_ingest url=https://example.org/a.pdf"),
+            "the ingestable paper must arrive with a callable handle: {digest}"
+        );
+        assert!(
+            digest.contains("1 of the above have full text"),
+            "say how many can be ingested without a recall: {digest}"
+        );
+        // The paper with no full text must NOT get a handle it cannot honour.
+        assert_eq!(
+            digest.matches("papers_ingest url=").count(),
+            1,
+            "only papers that actually have full text get a handle: {digest}"
+        );
+        // And recall must be described as costly, not as the obvious next step.
+        assert!(
+            digest.contains("spends this turn's remaining budget"),
+            "{digest}"
+        );
     }
 
     #[test]
