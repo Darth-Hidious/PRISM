@@ -725,24 +725,68 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
 fn semantic_entities_for_claim_facts(
     facts: &[prism_provenance::LocalFact],
 ) -> Vec<prism_ingest::semantic_validation::SemanticEntityProposal> {
+    semantic_entities_for_claims(facts.iter().map(|fact| {
+        (
+            fact.subject.as_str(),
+            fact.object.as_str(),
+            &EMPTY_ONTOLOGY_BINDING,
+        )
+    }))
+}
+
+/// Used when a caller genuinely has no ontology binding to offer.
+static EMPTY_ONTOLOGY_BINDING: prism_retrieval::claims::ClaimOntologyBinding =
+    prism_retrieval::claims::ClaimOntologyBinding {
+        subject_class_iri: None,
+        predicate_iri: None,
+        object_class_iri: None,
+    };
+
+/// Build typing proposals, carrying the class IRI the reading model selected
+/// from the ACTIVE ONTOLOGY.
+///
+/// `ExtractedClaim.ontology` has always had `subject_class_iri` and
+/// `object_class_iri`, and `LocalFact` — the storage-side type this used to
+/// take — has no field for either. So the binding was dropped at the
+/// conversion and every proposal went out with `class_iri: None`. The comment
+/// here even asserted the payload carried no class IRI, which was true of
+/// `LocalFact` and false of the claim it came from.
+///
+/// Measured 2026-08-20 on a real three-paper store: `emmo_entity.class_iri`
+/// populated for 10 of 149 rows, every proposal typed `Entity`, and the typing
+/// validator reporting "127 carried no declared class IRI" — 100% of them. The
+/// geometry check could not run at all, so nothing verified that an entity was
+/// filed under the right class.
+///
+/// Nothing is DERIVED here: a class IRI is used only when the model selected
+/// one against the active ontology. Inventing a class from a closed Rust
+/// `kind` list would put domain vocabulary in this CLI, which is exactly what
+/// the original comment was right to refuse.
+fn semantic_entities_for_claims<'a>(
+    claims: impl Iterator<
+        Item = (
+            &'a str,
+            &'a str,
+            &'a prism_retrieval::claims::ClaimOntologyBinding,
+        ),
+    >,
+) -> Vec<prism_ingest::semantic_validation::SemanticEntityProposal> {
     use prism_ingest::semantic_validation::SemanticEntityProposal;
 
-    // The claim payload carries no endpoint class IRI. Keep typing explicitly
-    // unavailable instead of deriving a domain class from a closed Rust
-    // `kind` list; the active ontology and the reading model, not this CLI,
-    // own that vocabulary.
-    let proposal = |name: &str| SemanticEntityProposal {
+    // An entity's type label still comes from the ontology binding or stays
+    // the neutral `Entity`; the IRI is what makes the class checkable.
+    let proposal = |name: &str, class_iri: Option<&String>| SemanticEntityProposal {
         name: name.to_string(),
         entity_type: "Entity".to_string(),
         storage_label: "Entity".to_string(),
-        class_iri: None,
+        class_iri: class_iri.cloned(),
     };
 
     let mut entities = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for fact in facts {
-        let subject = proposal(&fact.subject);
-        let object = proposal(&fact.object);
+    for (subject_name, object_name, binding) in claims {
+        let subject = proposal(subject_name, binding.subject_class_iri.as_ref());
+        let object = proposal(object_name, binding.object_class_iri.as_ref());
 
         for entity in [subject, object] {
             let identity = (
@@ -950,7 +994,16 @@ async fn store_claims(
         .iter()
         .map(|(_, fact, _, _)| fact.to_local_fact())
         .collect();
-    let semantic_entities = semantic_entities_for_claim_facts(&local_facts);
+    // From the CLAIMS, not the converted facts — the conversion has no field
+    // for a class IRI, so taking facts here silently untyped every entity.
+    let semantic_entities =
+        semantic_entities_for_claims(prepared.iter().map(|(claim, _, _, _)| {
+            (
+                claim.subject.as_str(),
+                claim.object.as_str(),
+                &claim.ontology,
+            )
+        }));
     let mut semantic_policy =
         prism_ingest::semantic_validation::SemanticValidationPolicy::default();
     // The numeric prior's eligible kinds come from the active ontology's
