@@ -18,7 +18,6 @@ use anyhow::Result;
 use prism_core::{chat_config, config as core_config, providers};
 
 use crate::auth::PlatformAuth;
-use crate::platform_env::PlatformVar;
 use crate::{PlatformEndpoints, PrismPaths};
 
 /// The built-in local default, refused for cloud targets when not
@@ -193,11 +192,19 @@ pub fn resolve_llm_with(
     // keys belong ONLY here — never on the marc27 arm (a project `.env`
     // ANTHROPIC_API_KEY would otherwise shadow the platform JWT and 401
     // every platform LLM call).
+    //
+    // The PLATFORM TOKEN IS DELIBERATELY ABSENT from this chain. It used to sit
+    // second, which meant a user logged into the platform who then pointed chat
+    // at a local server or a third-party vendor sent their platform BEARER to
+    // that endpoint: `Local` falls back with `local_key.or(api_key)` and
+    // `Provider` with `provider_key.or(api_key)`, so any target without its own
+    // key inherited it. A credential that authenticates to the platform must
+    // never travel to a host the user merely typed into `prism use local`.
+    //
+    // The marc27 arm is unaffected: it resolves its own credential from stored
+    // bearers and endpoint config (`resolved_platform_credential` below) and
+    // never reads this value.
     let api_key = std::env::var("LLM_API_KEY")
-        .or_else(|_| {
-            PlatformVar::get_preferred_then_alias(&[PlatformVar::TOKEN, PlatformVar::API_TOKEN])
-                .ok_or(std::env::VarError::NotPresent)
-        })
         .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .ok()
@@ -672,5 +679,52 @@ mod tests {
             env.get("MARC27_API_URL").map(String::as_str),
             Some("https://configured.example/api/v1")
         );
+    }
+    /// A platform credential must never travel to an endpoint the user merely
+    /// typed in.
+    ///
+    /// The chain used to be `LLM_API_KEY -> PRISM_TOKEN -> ANTHROPIC -> OPENAI`,
+    /// and both non-platform arms fall back to it (`local_key.or(api_key)`,
+    /// `provider_key.or(api_key)`). So a user logged into the platform who ran
+    /// `prism use local --url http://anything:8081/v1` sent their platform
+    /// BEARER to that host as an Authorization header. The existing suite could
+    /// not see it: `PlatformEnvironmentGuard::clear()` removes `PRISM_TOKEN`
+    /// before every test, so the leaking value was never present. This test
+    /// SETS it on purpose.
+    #[test]
+    fn a_platform_token_never_reaches_a_local_endpoint() {
+        let _guard = PlatformEnvironmentGuard::clear();
+        unsafe { std::env::set_var("PRISM_TOKEN", "platform-bearer-must-not-leak") };
+
+        let directory = tempfile::tempdir().expect("isolated runtime paths");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Local {
+                url: "http://127.0.0.1:8081/v1".into(),
+                model: "local-model".into(),
+                api_key: None,
+            }),
+        )
+        .expect("a local target resolves");
+
+        assert_eq!(
+            resolved.api_key, None,
+            "a local endpoint with no key of its own must get NO key — it must \
+             never inherit the platform bearer"
+        );
+        assert_ne!(
+            resolved.api_key.as_deref(),
+            Some("platform-bearer-must-not-leak"),
+            "the platform credential leaked to a user-supplied host"
+        );
+
+        unsafe { std::env::remove_var("PRISM_TOKEN") };
     }
 }

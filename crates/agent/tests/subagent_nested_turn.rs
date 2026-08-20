@@ -228,6 +228,7 @@ async fn run_parent_turn(
     let mut scratchpad = prism_agent::scratchpad::Scratchpad::new();
     let mut answer = String::new();
     let mut events: Vec<AgentEvent> = Vec::new();
+    let mut policy = prism_policy::PolicyEngine::with_discovery(None).ok();
     prism_agent::command_tools::with_platform_access(
         access,
         agent_loop::run_turn(
@@ -255,7 +256,10 @@ async fn run_parent_turn(
                 events.push(event);
             },
             None,
-            None,
+            // A REAL engine, as production passes. `None` now means "the policy
+            // engine failed to load" and denies every tool fail-closed, so a
+            // test passing None exercised a path production never takes.
+            policy.as_mut(),
             use_lanes.then_some(&subagent_lanes),
         ),
     )

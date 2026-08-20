@@ -3027,7 +3027,44 @@ pub(crate) async fn run_turn_inner(
             }
 
             // ── h4. OPA policy check ──────────────────────────────
-            if let Some(ref mut pe) = policy {
+            //
+            // A MISSING ENGINE DENIES. `policy` is `None` only when
+            // `PolicyEngine::with_discovery` returned `Err` — i.e. a `.rego`
+            // file failed to load (service.rs: "OPA policy engine failed to
+            // load — running without policies"). It is NOT the
+            // no-policies-configured case, which returns `Ok` with a count of
+            // zero.
+            //
+            // This used to be a bare `if let Some(..)`, so one malformed policy
+            // file silently disabled ALL tool policy enforcement in the agent
+            // loop while `mcp_server_native.rs` refused on the same condition.
+            // A policy layer that turns itself off when its rules will not
+            // parse is worse than none, because the operator believes it is on.
+            let Some(pe) = policy.as_mut() else {
+                let denied_msg = format!(
+                    "Tool '{tool_name}' refused: the OPA policy engine failed to \
+                     initialize and policy cannot be bypassed (fail-closed). \
+                     Check ~/.prism/policies and .prism/policies for invalid \
+                     .rego files."
+                );
+                emit(AgentEvent::ToolCallResult {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: denied_msg.clone(),
+                    summary: Some(format!("{tool_name}: policy engine unavailable")),
+                    preview: preview.clone(),
+                    elapsed_ms: 0,
+                    is_error: true,
+                });
+                history.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(denied_msg),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                });
+                continue;
+            };
+            {
                 let policy_input = prism_policy::PolicyInput {
                     action: "tool.call".to_string(),
                     principal: "agent".to_string(),

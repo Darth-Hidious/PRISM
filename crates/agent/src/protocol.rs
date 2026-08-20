@@ -1351,7 +1351,30 @@ async fn execute_manual_tool_call(
         return Ok(());
     }
 
-    if let Some(pe) = policy_engine.as_mut() {
+    // A MISSING ENGINE DENIES — same rule as the agent loop and
+    // `mcp_server_native`. `policy_engine` is `None` only when discovery
+    // returned `Err` (a `.rego` that would not load), never for the
+    // no-policies-configured case. Skipping the gate there means one malformed
+    // file silently disables enforcement while telling nobody.
+    let Some(pe) = policy_engine.as_mut() else {
+        let message = format!(
+            "Tool '{tool_name}' refused: the OPA policy engine failed to \
+             initialize and policy cannot be bypassed (fail-closed). Check \
+             ~/.prism/policies and .prism/policies for invalid .rego files."
+        );
+        emit_agent_event(AgentEvent::ToolCallResult {
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            content: message.clone(),
+            summary: Some(format!("{tool_name}: policy engine unavailable")),
+            preview: None,
+            elapsed_ms: 0,
+            is_error: true,
+        });
+        emit_notification("ui.turn.complete", serde_json::json!({}));
+        return Ok(());
+    };
+    {
         let principal = interactive_policy_principal();
         let role = interactive_policy_role();
         let policy_input = prism_policy::PolicyInput {
