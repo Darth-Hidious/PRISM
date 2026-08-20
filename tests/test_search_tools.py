@@ -175,8 +175,80 @@ class TestPatentSearchFunc:
         assert result["source"] == "patents"
 
     @patch("app.tools.data_collectors.patent_collector.PatentCollector.collect")
-    def test_no_token_empty(self, mock_collect):
+    def test_a_backend_that_genuinely_found_nothing_reports_zero(self, mock_collect):
+        """Zero hits from a backend that RAN is a real answer. A missing
+        credential is not — that raises, and is covered below."""
         mock_collect.return_value = []
         result = _patent_search(query="alloy")
         assert result["count"] == 0
         assert result["results"] == []
+
+
+class TestAPatentFailureIsNeverAnEmptyList:
+    """Measured: prior_art_search(source='patents') came back with
+    counts.patents = 0 and no patents_error at all. An unattributed zero is
+    indistinguishable from "nobody has patented this", which is a business
+    conclusion nothing may guess at.
+    """
+
+    @staticmethod
+    def _unconfigured(monkeypatch, tmp_path):
+        monkeypatch.setenv("PRISM_PATENT_CACHE", str(tmp_path))
+        for var in (
+            "PRISM_PATENT_BACKEND", "PRISM_PATENT_TABLE", "PRISM_PLATFORM_URL",
+            "PRISM_PLATFORM_TOKEN", "LENS_API_TOKEN",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_no_backend_configured_reports_the_routes(self, monkeypatch, tmp_path):
+        self._unconfigured(monkeypatch, tmp_path)
+        out = _prior_art_search(query="pfas free seals", source="patents")
+        assert out["patents"] == []
+        assert out["counts"]["patents"] == 0
+        assert out.get("patents_error"), "an unconfigured source reported a bare zero"
+        for credential in ("PRISM_PATENT_TABLE", "LENS_API_TOKEN", "PRISM_PLATFORM_URL"):
+            assert credential in out["patents_error"]
+
+    @patch("app.tools.data_collectors.patent_collector.PatentCollector.collect")
+    def test_a_build_or_ceiling_failure_surfaces(self, mock_collect):
+        """The byte ceiling makes an over-large job FAIL. That failure has to
+        reach the agent, not be flattened into an empty array."""
+        from app.tools.data_collectors.base_collector import CollectorConfigError
+
+        mock_collect.side_effect = CollectorConfigError(
+            "BigQuery patent search failed (Query exceeded limit for bytes billed)"
+        )
+        out = _prior_art_search(query="alloy", source="patents")
+        assert out["patents"] == []
+        assert "bytes billed" in out["patents_error"]
+
+    def test_a_blank_query_is_named_rather_than_answered_with_zero(self):
+        out = _prior_art_search(query="   ", source="patents")
+        assert out["counts"]["patents"] == 0
+        assert "non-empty query" in out["patents_error"]
+
+    def test_a_zero_is_attributed_to_the_backend_that_produced_it(
+        self, monkeypatch, tmp_path
+    ):
+        """Driven through the real collector — a mocked `collect` would not
+        exercise the selection this asserts."""
+        self._unconfigured(monkeypatch, tmp_path)
+        monkeypatch.setenv("LENS_API_TOKEN", "t")
+        resp = MagicMock()
+        resp.json.return_value = {"data": []}   # ran fine, found nothing
+        resp.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=resp):
+            out = _prior_art_search(query="alloy", source="patents")
+        assert out.get("patents_error") is None
+        assert out["counts"]["patents"] == 0
+        assert out["patents_backend"] == "lens"
+
+    def test_a_patent_failure_does_not_take_the_papers_branch_down(
+        self, monkeypatch, tmp_path
+    ):
+        self._unconfigured(monkeypatch, tmp_path)
+        with patch("app.tools.search._literature_search_impl") as lit:
+            lit.return_value = {"results": [{"title": "a paper"}], "count": 1}
+            out = _prior_art_search(query="alloy", source="both")
+        assert out["counts"]["papers"] == 1
+        assert out.get("patents_error")

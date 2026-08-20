@@ -194,7 +194,14 @@ def _eastern_search_impl(**kwargs) -> dict:
 
 def _patent_search_impl(**kwargs) -> dict:
     """Run the PatentCollector. Internal helper for both the unified tool
-    and the legacy `patent_search` alias."""
+    and the legacy `patent_search` alias.
+
+    Everything that can go wrong in the collector — no backend configured, an
+    extract that could not be built, a byte ceiling that refused the job —
+    raises `CollectorConfigError`. It is deliberately NOT caught here: the
+    caller turns it into `patents_error`, because an empty list would be read
+    as "nobody has patented this".
+    """
     from app.tools.data_collectors.patent_collector import PatentCollector
     collector = PatentCollector()
     results = collector.collect(**kwargs)
@@ -202,6 +209,9 @@ def _patent_search_impl(**kwargs) -> dict:
         "results": results,
         "count": len(results),
         "source": "patents",
+        # Which corpus produced this. A zero has to be attributable — an
+        # unattributed 0 is indistinguishable from a source that never ran.
+        "backend": getattr(collector, "last_backend", None),
     }
 
 
@@ -270,16 +280,27 @@ def _prior_art_search(**kwargs) -> dict:
             out["papers_error"] = str(exc)
 
     if source in ("patents", "both"):
-        try:
-            pat = _patent_search_impl(query=query, max_results=max_results)
-            out["patents"] = pat.get("results", [])
-            out["counts"]["patents"] = pat.get("count", 0)
-        except Exception as exc:
-            # Lens commonly fails for users without LENS_API_TOKEN —
-            # surface as a per-source error instead of failing the
-            # whole call. The agent can decide to retry with
-            # source="papers" if it cares.
-            out["patents_error"] = str(exc)
+        if not (query or "").strip():
+            # The collector answers a blank query with [], which at this level
+            # is a silent zero: measured once as counts.patents = 0 with no
+            # patents_error at all. Name it instead.
+            out["patents_error"] = (
+                "prior_art_search(source='patents') needs a non-empty query"
+            )
+        else:
+            try:
+                pat = _patent_search_impl(query=query, max_results=max_results)
+                out["patents"] = pat.get("results", [])
+                out["counts"]["patents"] = pat.get("count", 0)
+                # Say which corpus answered, so a zero is attributable rather
+                # than merely absent.
+                out["patents_backend"] = pat.get("backend")
+            except Exception as exc:
+                # No backend configured, an extract that could not be built, a
+                # byte ceiling that refused the job, an expired Lens token —
+                # every one of them is a FAILED search, never an empty one.
+                # Surfaced per-source so literature results still flow.
+                out["patents_error"] = str(exc)
 
     return out
 
@@ -304,7 +325,8 @@ def create_search_tools(registry: ToolRegistry) -> None:
         name="prior_art_search",
         description=(
             "Federated prior-art search across scientific literature "
-            "(arXiv, Semantic Scholar), patents (Lens.org), AND non-Western "
+            "(arXiv, Semantic Scholar), patents (whichever patent backend the "
+            "operator configured), AND non-Western "
             "sources (CyberLeninka's Russian aerospace-materials journals, "
             "NASA Technical Translations of Soviet work, J-STAGE Japanese "
             "metallurgy, scanned Soviet handbooks on Internet Archive). Use "
@@ -342,7 +364,12 @@ def create_search_tools(registry: ToolRegistry) -> None:
                     "default": "papers",
                     "description": (
                         "What to search. 'papers' = arXiv + Semantic Scholar; "
-                        "'patents' = Lens.org (needs LENS_API_TOKEN env); "
+                        "'patents' = the configured patent backend (a hosted "
+                        "service, the caller's own BigQuery project, or "
+                        "Lens.org — it is selected from whichever credentials "
+                        "are set, and says so in `patents_backend`; with none "
+                        "set it reports the routes in `patents_error` rather "
+                        "than returning an empty list); "
                         "'eastern' = Soviet/Russian, Japanese and scanned-"
                         "handbook sources (CyberLeninka OAI, NASA Technical "
                         "Translations, J-STAGE, Internet Archive) that the "

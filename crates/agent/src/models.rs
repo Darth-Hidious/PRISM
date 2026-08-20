@@ -816,9 +816,14 @@ pub fn probe_local_context_window(base_url: &str) -> Option<usize> {
     use std::net::{TcpStream, ToSocketAddrs};
 
     let rest = base_url.strip_prefix("http://")?;
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
-        None => (rest, ""),
+    // `/props` is served at the ROOT, not under the OpenAI-compatible prefix.
+    // A configured base of `http://host:8081/v1` therefore probes `/v1/props`,
+    // which 404s — and the 404 returns None, falls back to the registry, and
+    // reinstates exactly the invented 128k this function exists to replace.
+    // Silent, and it made the whole probe a no-op until an audit caught it.
+    let authority = match rest.find('/') {
+        Some(i) => &rest[..i],
+        None => rest,
     };
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h, p.parse().ok()?),
@@ -830,8 +835,7 @@ pub fn probe_local_context_window(base_url: &str) -> Option<usize> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
-    let request =
-        format!("GET {path}/props HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET /props HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
 
     let mut raw = Vec::new();
@@ -1796,5 +1800,18 @@ context_window = 0
         assert_eq!(get_default_model("google"), "gemini-2.5-pro");
         assert_eq!(get_default_model("vertexai"), "gemini-2.5-pro");
         assert_eq!(get_default_model("zhipu"), "glm-5");
+    }
+    #[test]
+    fn the_props_probe_reaches_a_real_local_server() {
+        // Regression: the probe built `{base}/props`, so a configured base of
+        // `http://host:8081/v1` asked for `/v1/props` — a 404 — and fell back
+        // to the registry's invented 128k, which is precisely what it exists to
+        // prevent. It was a no-op for months of configured deployments.
+        let Some(measured) = probe_local_context_window("http://127.0.0.1:8081/v1") else {
+            eprintln!("no local llama-server on 8081; skipping live probe");
+            return;
+        };
+        assert_eq!(measured, 16_384, "the probe must read the server's real -c");
+        assert_ne!(measured, 128_000, "and must never be the UNKNOWN fallback");
     }
 }
