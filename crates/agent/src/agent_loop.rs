@@ -465,6 +465,119 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
     Some(out)
 }
 
+// ── Retroactive tool-output pruning ───────────────────────────────
+//
+// Adapted from Google's ADK long-horizon harness
+// (`core/python/long-horizon-harness/horizon/context/tool_output_pruning.py`,
+// Apache-2.0, © 2026 Google LLC). Modified: PRISM walks `Vec<ChatMessage>`
+// rather than ADK events, resolves the tool name through `tool_call_id`, and
+// points the marker at `recall` because every result here is already durable.
+//
+// The reason this is a SEPARATE mechanism from the per-call cap, in their
+// words and confirmed here: "a cap bounds the worst single call; the pruner
+// reclaims a long tail of mid-sized results that were each individually fine.
+// Dropping either one leaves a real session unbounded." That is exactly the
+// failure measured on 2026-08-20 — nine `recall`s, none of them oversized, 87%
+// to 100% of a 200k window between them. Capping recall (which this session
+// also did) bounds one call; only pruning reclaims the accumulated tail.
+const PRUNE_MARKER: &str = "[output pruned to reclaim context — the FULL result is still in durable memory; \
+     recall(query=\"<keywords>\") finds it if you need it again]";
+/// Recent tool output kept untouched, so the model never loses the thread it
+/// is currently pulling.
+///
+/// ADK protects "the last N USER turns" and that rule does not transfer. Their
+/// long-horizon unit is a chat spanning days, so user turns are frequent. The
+/// PRISM failure this exists for is ONE user turn making forty-plus tool calls
+/// — `turns_seen` never passes 3, so a turn-keyed rule protects the entire
+/// history and the pruner never fires in exactly the case it was added for.
+/// Caught by the test below on the first run, which is why this is a token
+/// countdown instead.
+const PRUNE_PROTECT_TOKEN_BUDGET: usize = 40_000;
+/// Below this a result is not worth the churn of pruning.
+const PRUNE_MIN_PART_TOKENS: usize = 500;
+/// Anti-thrash floor: rewrite history only when the reclaim is material.
+const PRUNE_MIN_RECLAIM_TOKENS: usize = 20_000;
+/// Never pruned. A subagent or orchestrated report cost minutes and money to
+/// produce, and "recall it" is not the same bargain as for a search result.
+const PRUNE_PROTECTED_TOOLS: &[&str] = &["subagent", "orchestrate", "skill", "clarify"];
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PruneOutcome {
+    pub pruned: usize,
+    pub reclaimed_tokens: usize,
+}
+
+fn prune_is_protected_tool(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    PRUNE_PROTECTED_TOOLS
+        .iter()
+        .any(|needle| lowered.contains(needle))
+}
+
+/// Zero the bodies of old, large tool results in place.
+///
+/// Walks newest to oldest so "recent" is a simple countdown. Mutates only when
+/// the total reclaim clears [`PRUNE_MIN_RECLAIM_TOKENS`], so an ordinary short
+/// turn is never rewritten for a trivial gain.
+pub(crate) fn prune_stale_tool_results(history: &mut [ChatMessage]) -> PruneOutcome {
+    // A tool message carries only `tool_call_id`; the NAME lives on the
+    // assistant message that requested it, so protection needs this map.
+    let mut name_by_call_id: HashMap<&str, String> = HashMap::new();
+    for message in history.iter() {
+        for call in message.tool_calls.iter().flatten() {
+            name_by_call_id.insert(call.id.as_str(), call.function.name.clone());
+        }
+    }
+    let name_by_call_id: HashMap<String, String> = name_by_call_id
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // (index, tokens)
+    let mut protected_tokens = 0usize;
+
+    for (index, message) in history.iter().enumerate().rev() {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(content) = message.content.as_deref() else {
+            continue;
+        };
+        if content.starts_with(PRUNE_MARKER) {
+            continue;
+        }
+        let tokens = content.len() / prism_llm::CHARS_PER_TOKEN;
+        if protected_tokens < PRUNE_PROTECT_TOKEN_BUDGET {
+            protected_tokens += tokens;
+            continue;
+        }
+        if message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| name_by_call_id.get(id))
+            .is_some_and(|name| prune_is_protected_tool(name))
+        {
+            continue;
+        }
+        if tokens < PRUNE_MIN_PART_TOKENS {
+            continue;
+        }
+        candidates.push((index, tokens));
+    }
+
+    let reclaimable: usize = candidates.iter().map(|(_, tokens)| tokens).sum();
+    if reclaimable < PRUNE_MIN_RECLAIM_TOKENS {
+        return PruneOutcome::default();
+    }
+    for (index, _) in &candidates {
+        history[*index].content = Some(PRUNE_MARKER.to_string());
+    }
+    PruneOutcome {
+        pruned: candidates.len(),
+        reclaimed_tokens: reclaimable,
+    }
+}
+
 fn process_large_result(content: &str) -> String {
     if content.len() <= MAX_TOOL_RESULT_CHARS {
         return content.to_string();
@@ -3684,6 +3797,21 @@ pub(crate) async fn run_turn_inner(
         // currently pulling; everything older becomes a summary, and the full
         // text of every tool call remains in the provenance store behind
         // `recall`.
+        // Reclaim the free context FIRST. Compaction costs an LLM call and
+        // rewrites history; zeroing stale tool bodies costs nothing and often
+        // makes the call unnecessary. Pattern lifted from Google's ADK
+        // long-horizon harness (`horizon/context/tool_output_pruning.py`,
+        // Apache-2.0), adapted: PRISM stores every tool result durably, so a
+        // pruned body is genuinely recoverable via `recall` rather than only
+        // re-runnable.
+        let pruned = prune_stale_tool_results(history);
+        if pruned.pruned > 0 {
+            tracing::debug!(
+                "pruned {} stale tool result(s), ~{} tokens reclaimed",
+                pruned.pruned,
+                pruned.reclaimed_tokens
+            );
+        }
         if transcript.needs_compaction_under_pressure()
             && let Some(summary) = transcript.compact(6)
         {
@@ -5725,6 +5853,130 @@ mod tests {
         assert!(block.contains("0 ingested"), "{block}");
         assert!(block.contains("IDENTITY is already saved"), "{block}");
         assert!(block.contains("FACTS are not"), "{block}");
+    }
+
+    fn tool_msg(call_id: &str, chars: usize) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: Some("x".repeat(chars)),
+            tool_calls: None,
+            tool_call_id: Some(call_id.to_string()),
+        }
+    }
+
+    fn assistant_calling(call_id: &str, tool: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![prism_llm::ToolCallResponse {
+                id: call_id.to_string(),
+                call_type: "function".to_string(),
+                function: prism_llm::FunctionCall {
+                    name: tool.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+        }
+    }
+
+    fn user_msg() -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: Some("next".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// A long tail of individually-reasonable results is what actually kills a
+    /// research turn, and no per-call cap can see it.
+    ///
+    /// Measured 2026-08-20: nine `recall`s, none oversized, took a 200k window
+    /// from 87% to 100%. Capping one call bounds the worst call; only pruning
+    /// reclaims the accumulated tail. Pattern from Google's ADK long-horizon
+    /// harness, whose own note says dropping either mechanism "leaves a real
+    /// session unbounded".
+    #[test]
+    fn stale_bulk_is_reclaimed_but_recent_and_expensive_results_survive() {
+        let big = PRUNE_MIN_PART_TOKENS * prism_llm::CHARS_PER_TOKEN * 4; // ~2k tokens each
+        let mut history = Vec::new();
+
+        // Old, prunable bulk: 40 results, well past the recent window.
+        for i in 0..40 {
+            let id = format!("old-{i}");
+            history.push(assistant_calling(&id, "papers"));
+            history.push(tool_msg(&id, big));
+        }
+        // An expensive subagent report in the same stale region — never pruned.
+        history.push(assistant_calling("sub-1", "spawn_subagent"));
+        history.push(tool_msg("sub-1", big));
+        // Recent work — protected by the token countdown, which is what a
+        // single long research turn actually needs.
+        for i in 0..3 {
+            history.push(user_msg());
+            let id = format!("recent-{i}");
+            history.push(assistant_calling(&id, "papers"));
+            history.push(tool_msg(
+                &id,
+                PRUNE_PROTECT_TOKEN_BUDGET * prism_llm::CHARS_PER_TOKEN / 3,
+            ));
+        }
+
+        let before: Vec<Option<String>> = history.iter().map(|m| m.content.clone()).collect();
+        let outcome = prune_stale_tool_results(&mut history);
+
+        assert!(outcome.pruned > 0, "a long stale tail must be reclaimed");
+        assert!(outcome.reclaimed_tokens >= PRUNE_MIN_RECLAIM_TOKENS);
+
+        // The subagent report survives: "re-run it" is not a fair bargain.
+        let sub = history
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("sub-1"))
+            .expect("subagent result");
+        assert!(
+            !sub.content.as_deref().unwrap().starts_with(PRUNE_MARKER),
+            "an expensive subagent report must never be pruned"
+        );
+        // The recent turns survive, so the model keeps the thread it is pulling.
+        for i in 0..3 {
+            let id = format!("recent-{i}");
+            let recent = history
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id.as_str()))
+                .expect("recent result");
+            assert!(
+                !recent.content.as_deref().unwrap().starts_with(PRUNE_MARKER),
+                "recent result {id} must survive"
+            );
+        }
+        // And the marker points at recall, because the body really is durable.
+        let pruned_one = history
+            .iter()
+            .find(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(PRUNE_MARKER))
+            })
+            .expect("something was pruned");
+        assert!(pruned_one.content.as_deref().unwrap().contains("recall"));
+        assert_ne!(before.len(), 0);
+    }
+
+    /// Anti-thrash: a short turn is never rewritten for a trivial gain.
+    #[test]
+    fn a_small_history_is_left_completely_alone() {
+        let mut history = vec![
+            assistant_calling("a", "papers"),
+            tool_msg("a", 400),
+            user_msg(),
+        ];
+        let snapshot = history.clone();
+        let outcome = prune_stale_tool_results(&mut history);
+        assert_eq!(outcome, PruneOutcome::default());
+        for (before, after) in snapshot.iter().zip(history.iter()) {
+            assert_eq!(before.content, after.content, "nothing may be rewritten");
+        }
     }
 
     #[test]
