@@ -45,6 +45,20 @@ pub async fn fetch_page(
     Ok((page, next))
 }
 
+/// `https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5501191` -> `PMC5501191`.
+///
+/// Tolerates the bare form and a trailing slash, and leaves anything that does
+/// not contain a `PMC…` segment untouched rather than inventing one.
+fn normalize_pmcid(raw: &str) -> String {
+    raw.trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|seg| seg.starts_with("PMC"))
+        .unwrap_or(raw.trim())
+        .to_string()
+}
+
 /// Pure parser over the OpenAlex `/works` response. `available` is
 /// `meta.count`; `raw_count` is every work served, parsed or not.
 pub fn parse(body: &[u8]) -> Result<SourcePage> {
@@ -107,10 +121,49 @@ fn parse_work(work: &Value) -> Option<Paper> {
     // Best open-access location gives both a landing page and, when present,
     // a direct PDF.
     let oa = work.get("best_oa_location");
-    let fulltext_url = oa
+    // OpenAlex advertises an open-access location in three places and this read
+    // only one of them.
+    //
+    // Measured 2026-08-20 over a real run's 264 papers: 109 came back with NO
+    // full-text URL at all — the single largest reason PRISM could not extract
+    // facts, bigger than every publisher block combined. Many of those are open
+    // access; their PDF simply is not on `best_oa_location.pdf_url`. It sits in
+    // another `locations[]` entry (frequently the arXiv or PMC copy, which are
+    // the hosts that actually answer an unattended fetcher), or only
+    // `open_access.oa_url` is populated.
+    //
+    // Ordered by how likely the result is to be retrievable, not by how
+    // canonical OpenAlex considers it.
+    // (url, is_declared_pdf). The flag matters: `fetch_fulltext` TRUSTS a
+    // declared format over sniffing the bytes, and `open_access.oa_url` is
+    // frequently a landing page rather than a PDF. Declaring Pdf for one would
+    // send an HTML page into the PDF parser and fail for a reason no log
+    // explains. A `pdf_url` field is a publisher's own claim that it is a PDF;
+    // for anything else, leave the format unset and let `sniff()` read the
+    // bytes.
+    let fulltext: Option<(String, bool)> = oa
         .and_then(|l| l.get("pdf_url"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| (u.to_string(), true))
+        .or_else(|| {
+            work.get("locations")?
+                .as_array()?
+                .iter()
+                .filter_map(|loc| loc.get("pdf_url")?.as_str())
+                .find(|u| !u.trim().is_empty())
+                .map(|u| (u.to_string(), true))
+        })
+        .or_else(|| {
+            work.pointer("/open_access/oa_url")
+                .and_then(|v| v.as_str())
+                .filter(|u| !u.trim().is_empty())
+                .map(|u| (u.to_string(), false))
+        });
+    let fulltext_url = fulltext.as_ref().map(|(u, _)| u.clone());
+    let fulltext_format = fulltext
+        .as_ref()
+        .and_then(|(_, is_pdf)| is_pdf.then_some(FulltextFormat::Pdf));
     let landing = oa
         .and_then(|l| l.get("landing_page_url"))
         .and_then(|v| v.as_str())
@@ -132,7 +185,12 @@ fn parse_work(work: &Value) -> Option<Paper> {
         external_ids.insert("openalex".to_string(), openalex_id.clone());
     }
     if let Some(pmcid) = work.pointer("/ids/pmcid").and_then(|v| v.as_str()) {
-        external_ids.insert("pmc".to_string(), pmcid.to_string());
+        // OpenAlex returns this as a URL
+        // (`https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5501191`), not a bare
+        // id. Every consumer wants the id: `papers_ingest pmc=<id>` fetches the
+        // open-access JATS XML, and passing a URL there simply fails. Storing
+        // the URL made the identifier look present while being unusable.
+        external_ids.insert("pmc".to_string(), normalize_pmcid(pmcid));
     }
     if let Some(pmid) = work.pointer("/ids/pmid").and_then(|v| v.as_str()) {
         external_ids.insert("pmid".to_string(), pmid.to_string());
@@ -151,10 +209,96 @@ fn parse_work(work: &Value) -> Option<Paper> {
         external_ids,
         abstract_text: abstract_from_inverted_index(work),
         url,
-        fulltext_url: fulltext_url.clone(),
-        fulltext_format: fulltext_url.map(|_| FulltextFormat::Pdf),
+        fulltext_url,
+        fulltext_format,
         journal,
     })
+}
+
+#[cfg(test)]
+mod oa_location_tests {
+    use super::*;
+
+    fn work(json: serde_json::Value) -> Paper {
+        parse_work(&json).expect("fixture must parse")
+    }
+
+    fn base(extra: serde_json::Value) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "id": "https://openalex.org/W1",
+            "display_name": "A paper",
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        v
+    }
+
+    /// 109 of 264 papers in a real run arrived with NO full-text URL — the
+    /// single biggest reason PRISM could not extract facts, bigger than every
+    /// publisher block combined. Many are open access with the PDF somewhere
+    /// other than `best_oa_location.pdf_url`.
+    #[test]
+    fn an_oa_pdf_is_found_outside_best_oa_location() {
+        let p = work(base(serde_json::json!({
+            "best_oa_location": { "pdf_url": null },
+            "locations": [
+                { "pdf_url": null },
+                { "pdf_url": "https://arxiv.org/pdf/2509.05344v1" }
+            ]
+        })));
+        assert_eq!(
+            p.fulltext_url.as_deref(),
+            Some("https://arxiv.org/pdf/2509.05344v1"),
+            "a PDF in locations[] must not be discarded"
+        );
+        assert_eq!(p.fulltext_format, Some(FulltextFormat::Pdf));
+    }
+
+    /// `oa_url` is often a LANDING PAGE. Declaring it a PDF sends HTML into the
+    /// PDF parser, because `fetch_fulltext` trusts a declared format over
+    /// sniffing the bytes.
+    #[test]
+    fn an_oa_url_is_used_but_never_declared_a_pdf() {
+        let p = work(base(serde_json::json!({
+            "open_access": { "oa_url": "https://example.org/article/123" }
+        })));
+        assert_eq!(
+            p.fulltext_url.as_deref(),
+            Some("https://example.org/article/123")
+        );
+        assert_eq!(
+            p.fulltext_format, None,
+            "format must stay unset so the bytes decide"
+        );
+    }
+
+    /// OpenAlex returns pmcid as a URL. `papers_ingest pmc=<id>` needs the id;
+    /// storing the URL made the identifier look present while being unusable.
+    #[test]
+    fn a_pmc_id_is_stored_as_an_id_not_a_url() {
+        let p = work(base(serde_json::json!({
+            "ids": { "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5501191" }
+        })));
+        assert_eq!(
+            p.external_ids.get("pmc").map(String::as_str),
+            Some("PMC5501191")
+        );
+
+        assert_eq!(normalize_pmcid("PMC42"), "PMC42", "already-bare id is kept");
+        assert_eq!(
+            normalize_pmcid("https://example.org/nothing/here"),
+            "https://example.org/nothing/here",
+            "a value with no PMC segment is left alone, never invented"
+        );
+    }
+
+    #[test]
+    fn a_paper_with_no_open_access_anywhere_still_reports_none() {
+        let p = work(base(serde_json::json!({ "best_oa_location": null })));
+        assert_eq!(p.fulltext_url, None);
+        assert_eq!(p.fulltext_format, None);
+    }
 }
 
 /// OpenAlex serves abstracts as {word: [positions...]}. Reassemble in
