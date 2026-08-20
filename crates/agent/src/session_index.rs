@@ -175,20 +175,53 @@ fn run_worker(database_path: PathBuf, receiver: mpsc::Receiver<IndexCommand>) {
         }
     };
 
-    let store = match runtime.block_on(ProvenanceStore::open(&database_path)) {
-        Ok(store) => store,
-        Err(error) => {
-            warn!(
-                %error,
-                path = %database_path.display(),
-                "failed to open session metadata index; JSONL persistence remains active"
-            );
-            reject_commands(receiver, error.to_string());
-            return;
-        }
-    };
-
+    // Open PER COMMAND, never for the lifetime of the session.
+    //
+    // This worker held one handle open from start-up until exit, waiting on a
+    // channel for occasional metadata upserts. libsql keeps the store in WAL
+    // (the `journal_mode=DELETE` pragma in `ProvenanceStore::open` is a silent
+    // no-op — a store created by this binary reads back `journal_mode = wal`),
+    // and libsql's WAL does not support multi-process access. So that one idle
+    // handle made every PRISM subprocess fail to open the store at all:
+    //
+    //   Error: failed to open Turso database
+    //     Locking error: Failed locking file '…/pfas6.db-wal'.
+    //     File is locked by another process
+    //
+    // Measured 2026-08-20: that is what failed EVERY `papers_ingest` in run 6.
+    // The agent shells out to its own binary for CLI-backed tools, so a
+    // second process on the store is the normal execution path, not an edge
+    // case — and a low-frequency metadata writer was holding the lock the whole
+    // time.
+    //
+    // Cost: one open per command, on a path that fires on session
+    // create/rename/reconcile. Cheap against making ingestion possible at all.
+    // A failure to open is still reported per command and JSONL stays
+    // authoritative, so nothing silently drops.
     while let Ok(command) = receiver.recv() {
+        let store = match runtime.block_on(ProvenanceStore::open(&database_path)) {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(
+                    %error,
+                    path = %database_path.display(),
+                    "session metadata index unavailable for this command; JSONL remains authoritative"
+                );
+                match command {
+                    IndexCommand::Upsert(_) => {}
+                    IndexCommand::ReconciledAt { response, .. } => {
+                        let _ = response.send(Err(anyhow!("session index unavailable: {error}")));
+                    }
+                    IndexCommand::ReplaceSource { response, .. } => {
+                        let _ = response.send(Err(anyhow!("session index unavailable: {error}")));
+                    }
+                    IndexCommand::List { response, .. } => {
+                        let _ = response.send(Err(anyhow!("session index unavailable: {error}")));
+                    }
+                }
+                continue;
+            }
+        };
         match command {
             IndexCommand::Upsert(entry) => {
                 if let Err(error) = runtime.block_on(store.upsert_session_metadata(&entry)) {

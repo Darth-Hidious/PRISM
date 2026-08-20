@@ -801,8 +801,38 @@ impl ProvenanceStore {
         // Keep local provenance portable on Lustre/GPFS: WAL requires
         // cross-client shared-memory coordination and creates -wal/-shm
         // sidecars that are not reliable on parallel filesystems.
+        // Read the mode BACK. Setting it is not the same as it taking effect.
+        //
+        // This pragma was assumed to work for as long as it has existed. It does
+        // not: a store created by this binary reads back `journal_mode = wal`,
+        // and the comment above promises portability the code never delivered.
+        // The cost was invisible until it was fatal — libsql's WAL does not
+        // support multi-process access, and PRISM shells out to its own binary
+        // for CLI-backed tools, so every `papers_ingest` in run 6 (2026-08-20)
+        // died with "Failed locking file '…-wal'. File is locked by another
+        // process".
+        //
+        // Warn rather than fail: an existing WAL store still works for a single
+        // process, and refusing to open would strand anyone who already has one.
+        // But it must never again be believed silently.
         let mut journal_mode = conn.query("PRAGMA journal_mode=DELETE", ()).await?;
-        while journal_mode.next().await?.is_some() {}
+        let mut resulting_mode = String::new();
+        while let Some(row) = journal_mode.next().await? {
+            if let Ok(value) = row.get_value(0)
+                && let Some(text) = value.as_text()
+            {
+                resulting_mode = text.to_ascii_lowercase();
+            }
+        }
+        if !resulting_mode.is_empty() && resulting_mode != "delete" {
+            tracing::warn!(
+                mode = %resulting_mode,
+                path = %path.display(),
+                "journal_mode=DELETE did not take effect; the store is in '{resulting_mode}'. \
+                 libsql WAL does not support multi-process access, so a PRISM subprocess \
+                 (any CLI-backed tool) will fail to open this store while the parent holds it",
+            );
+        }
 
         // Enforce the store's declared foreign keys (provenance assertion
         // evidence and the rebuildable session search terms). Like SQLite,
