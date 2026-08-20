@@ -1007,15 +1007,25 @@ pub async fn validate_write_with_backend(
     if policy.near_duplicate.enabled
         && coverage.compatible_embeddings > policy.near_duplicate.maximum_neighbors_per_entity
     {
-        mark_unavailable(
+        mark_bounded_scan(
             &mut batch.report.near_duplicates,
             &format!(
-                "near-duplicate retrieval is bounded to {} neighbors across {} compatible entities; findings are valid but a clean result is not exhaustive",
+                "near-duplicate retrieval is bounded to {} neighbors across {} compatible entities; the duplicates reported here are real, but a CLEAN result would not prove absence",
                 policy.near_duplicate.maximum_neighbors_per_entity, coverage.compatible_embeddings
             ),
         );
     }
     batch
+}
+
+fn append_check_message<T>(check: &mut SemanticCheckReport<T>, message: &str) {
+    match &mut check.message {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(message);
+        }
+        None => check.message = Some(message.to_string()),
+    }
 }
 
 fn mark_unavailable<T>(check: &mut SemanticCheckReport<T>, message: &str) {
@@ -1024,13 +1034,68 @@ fn mark_unavailable<T>(check: &mut SemanticCheckReport<T>, message: &str) {
         check.passed = None;
     }
     if check.status == SemanticValidationStatus::Unavailable {
-        match &mut check.message {
-            Some(existing) => {
-                existing.push_str("; ");
-                existing.push_str(message);
-            }
-            None => check.message = Some(message.to_string()),
-        }
+        append_check_message(check, message);
+    }
+}
+
+/// The scan RAN over a populated graph but was bounded — distinct from having
+/// nothing to compare against, which stays [`mark_unavailable`].
+///
+/// A bound on the SEARCH cannot invalidate what the search FOUND:
+///
+///   findings present -> TRUE regardless of exhaustiveness. Four duplicates are
+///                       four duplicates whether or not a fifth exists. Keep the
+///                       verdict; record the caveat.
+///   no findings      -> depends entirely on having looked everywhere, so a
+///                       bounded clean scan genuinely cannot claim a pass.
+///
+/// This existed as a plain `mark_unavailable`, and its trigger —
+/// `compatible_embeddings > maximum_neighbors_per_entity` (8) — is true of any
+/// graph past its ninth entity. So in production near-duplicate detection could
+/// NEVER report a verdict, however many duplicates it found. Measured
+/// 2026-08-20: 78 candidates, 78 evaluated, 4 real findings, reported
+/// `unavailable` with `passed: null`. A check that cannot pass is not a check.
+fn mark_bounded_scan<T>(check: &mut SemanticCheckReport<T>, message: &str) {
+    if check.status == SemanticValidationStatus::Applied && !check.findings.is_empty() {
+        append_check_message(check, message);
+        return;
+    }
+    mark_unavailable(check, message);
+}
+
+/// A check that ran over SOME of its candidates.
+///
+/// Reporting `Unavailable` for a partial run — which every partial check used
+/// to do — throws away real evaluations and tells the operator that nothing was
+/// validated when nearly everything was. `check_typing` demanded
+/// `evaluated == candidates`, so one entity without a class IRI nullified the
+/// other seventy-seven.
+///
+/// Zero evaluations IS unavailable: there is nothing to report. Anything above
+/// zero is a real result over a stated denominator.
+fn partial_check<T>(
+    candidates: usize,
+    evaluated: usize,
+    findings: Vec<T>,
+    why: String,
+) -> SemanticCheckReport<T> {
+    if evaluated == 0 {
+        return unfinished_check(candidates, SemanticValidationStatus::Unavailable, why);
+    }
+    if evaluated == candidates {
+        return applied_check(candidates, evaluated, findings);
+    }
+    SemanticCheckReport {
+        status: SemanticValidationStatus::Applied,
+        candidates,
+        evaluated,
+        // A verdict over what was actually examined, with the denominator in
+        // the message so it is never read as a verdict over everything.
+        passed: Some(findings.is_empty()),
+        findings,
+        message: Some(format!(
+            "evaluated {evaluated} of {candidates} candidates — the verdict covers those {evaluated}, not the rest: {why}"
+        )),
     }
 }
 
@@ -1226,11 +1291,19 @@ async fn check_typing<'a>(
 
     let mut evaluated = 0;
     let mut findings = Vec::new();
+    // Count the skip reasons separately. The old message was a single "or"
+    // covering three different causes, so an operator could not tell whether
+    // extraction was failing to assign class IRIs or the graph simply did not
+    // have enough exemplars yet — the first is a bug, the second is cold start
+    // and fixes itself as papers land.
+    let (mut no_class_iri, mut no_probe, mut thin_regions) = (0usize, 0usize, 0usize);
     for (probe_id, entity) in candidates {
         let Some(class_iri) = entity.class_iri.as_deref() else {
+            no_class_iri += 1;
             continue;
         };
         let Some(regions) = by_probe.get(&probe_id) else {
+            no_probe += 1;
             continue;
         };
         let assigned = regions.iter().copied().find(|region| {
@@ -1244,6 +1317,7 @@ async fn check_typing<'a>(
             })
             .min_by(|a, b| a.mean_distance.total_cmp(&b.mean_distance));
         let Some((assigned, alternative)) = assigned.zip(alternative) else {
+            thin_regions += 1;
             continue;
         };
         evaluated += 1;
@@ -1273,21 +1347,23 @@ async fn check_typing<'a>(
     }
     findings.sort_by(|a, b| b.distance_advantage.total_cmp(&a.distance_advantage));
     findings.truncate(policy.maximum_findings);
-    if evaluated == entities.len() {
-        applied_check(evaluated, evaluated, findings)
-    } else {
-        SemanticCheckReport {
-            status: SemanticValidationStatus::Unavailable,
-            candidates: entities.len(),
-            evaluated,
-            passed: None,
-            findings,
-            message: Some(
-                "one or more proposed instances lacked a declared class IRI or sufficiently populated assigned and alternative class regions"
-                    .to_string(),
-            ),
-        }
+    let mut reasons = Vec::new();
+    if no_class_iri > 0 {
+        reasons.push(format!(
+            "{no_class_iri} carried no declared class IRI (an extraction gap — these were never typed)"
+        ));
     }
+    if no_probe > 0 {
+        reasons.push(format!("{no_probe} had no embedding vector to probe with"));
+    }
+    if thin_regions > 0 {
+        reasons.push(format!(
+            "{thin_regions} had no assigned AND alternative class region with at least {} exemplars \
+             (cold start — this resolves itself as more papers are ingested)",
+            policy.minimum_class_examples
+        ));
+    }
+    partial_check(entities.len(), evaluated, findings, reasons.join("; "))
 }
 
 async fn check_triples<'a>(
@@ -1877,6 +1953,72 @@ mod tests {
         assert!(report.near_duplicates.findings.iter().any(|finding| {
             finding.proposed_name == "Heat Treatment" && finding.colliding_name == "HeatTreatment"
         }));
+    }
+
+    /// A bound on the SEARCH must not invalidate what the search FOUND.
+    ///
+    /// The near-duplicate downgrade triggers whenever the graph holds more
+    /// compatible vectors than the per-entity neighbour bound (8) — true of any
+    /// graph past its ninth entity, so in production this check could never
+    /// report a verdict. Measured 2026-08-20 on a real two-paper store: 78
+    /// candidates, 78 evaluated, 4 genuine duplicate findings, reported
+    /// `unavailable` / `passed: null`. A check that cannot pass is not a check.
+    #[test]
+    fn a_bounded_scan_keeps_the_duplicates_it_actually_found() {
+        let mut found: SemanticCheckReport<String> =
+            applied_check(78, 78, vec!["Ti-6Al-4V ~ Ti6Al4V".to_string()]);
+        mark_bounded_scan(&mut found, "bounded to 8 neighbors");
+        assert_eq!(
+            found.status,
+            SemanticValidationStatus::Applied,
+            "four duplicates are four duplicates whether or not a fifth exists"
+        );
+        assert_eq!(found.passed, Some(false));
+        assert_eq!(found.findings.len(), 1);
+        assert!(
+            found.message.as_deref().unwrap().contains("bounded"),
+            "the caveat is still recorded: {found:?}"
+        );
+
+        // A CLEAN result is exactly the one that depends on exhaustiveness, so
+        // it still cannot claim a pass.
+        let mut clean: SemanticCheckReport<String> = applied_check(78, 78, Vec::new());
+        mark_bounded_scan(&mut clean, "bounded to 8 neighbors");
+        assert_eq!(clean.status, SemanticValidationStatus::Unavailable);
+        assert_eq!(clean.passed, None);
+    }
+
+    /// One un-evaluatable candidate must not nullify the rest.
+    ///
+    /// `check_typing` required `evaluated == candidates`, so a single entity
+    /// with no class IRI discarded the verdict on the other seventy-seven and
+    /// reported that nothing had been validated.
+    #[test]
+    fn a_partial_check_reports_a_verdict_over_what_it_examined() {
+        let partial: SemanticCheckReport<String> = partial_check(
+            78,
+            77,
+            Vec::new(),
+            "1 carried no declared class IRI".to_string(),
+        );
+        assert_eq!(partial.status, SemanticValidationStatus::Applied);
+        assert_eq!(partial.passed, Some(true));
+        assert_eq!(partial.evaluated, 77);
+        let message = partial.message.as_deref().unwrap();
+        assert!(
+            message.contains("77 of 78"),
+            "the denominator must travel with the verdict: {message}"
+        );
+        assert!(
+            message.contains("not the rest"),
+            "and it must not read as a verdict over everything: {message}"
+        );
+
+        // Zero evaluations really is unavailable — there is nothing to report.
+        let none: SemanticCheckReport<String> =
+            partial_check(78, 0, Vec::new(), "no vectors".to_string());
+        assert_eq!(none.status, SemanticValidationStatus::Unavailable);
+        assert_eq!(none.passed, None);
     }
 
     #[test]
