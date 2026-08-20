@@ -1263,10 +1263,10 @@ fn summarize_manual_tool_result(
                 return format!("{tool_name}: error — {}", short_first_line(err));
             }
         }
-        let short = if content.len() > 80 {
-            &content[..80]
+        let short = if content.chars().count() > 80 {
+            clip_chars(content, 80)
         } else {
-            content
+            content.to_string()
         };
         return format!("{tool_name}: error — {short}");
     }
@@ -1933,6 +1933,21 @@ fn loaded_tools_by_access(
 
 fn resolve_loaded_tool_name(tool_name: &str, tools: &ToolCatalog) -> Option<String> {
     tools.find(tool_name).map(|tool| tool.name.clone())
+}
+
+/// Truncate to at most `max` CHARACTERS, never bytes.
+///
+/// `&text[..n]` panics when byte `n` lands inside a multi-byte character, and
+/// tool output is full of them: an en dash in a paper title, an accent in an
+/// author name, any CJK glyph. Measured 2026-08-20 — a live research turn died
+/// at `protocol.rs` formatting a web-search snippet, taking the whole turn with
+/// it after 98% of the budget had already been spent. A display truncation must
+/// never be able to end a run.
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    text.chars().take(max).collect()
 }
 
 pub(crate) fn restore_history_and_transcript_from_messages(
@@ -6082,8 +6097,8 @@ fn build_tool_card_content(
                                 line.push_str(&format!("\n   {url}"));
                             }
                             if !snippet.is_empty() {
-                                let s = if snippet.len() > 120 {
-                                    format!("{}...", &snippet[..117])
+                                let s = if snippet.chars().count() > 120 {
+                                    format!("{}...", clip_chars(snippet, 117))
                                 } else {
                                     snippet.to_string()
                                 };
@@ -10316,6 +10331,30 @@ mod browse_slash_tests {
         assert!(
             body.contains("offline mode"),
             "the refusal must identify the offline policy: {body}"
+        );
+    }
+    #[test]
+    fn a_display_truncation_never_panics_on_real_world_text() {
+        // The measured crash: `&snippet[..117]` on a web-search snippet whose
+        // byte 117 fell inside a multi-byte character. It killed a research turn
+        // at 98% of its budget — after all the work, before any of the answer.
+        let em_dash = "PFAS restriction — ECHA is considering alternatives ".repeat(10);
+        let clipped = clip_chars(&em_dash, 117);
+        assert_eq!(clipped.chars().count(), 117);
+        assert!(em_dash.starts_with(&clipped));
+
+        // Every boundary in and around a multi-byte character.
+        let mixed = "aé漢🙂b";
+        for n in 0..=mixed.chars().count() + 3 {
+            let out = clip_chars(mixed, n);
+            assert!(mixed.starts_with(&out), "n={n} produced {out:?}");
+        }
+        assert_eq!(clip_chars(mixed, 2), "aé");
+        assert_eq!(clip_chars(mixed, 0), "");
+        assert_eq!(
+            clip_chars("short", 99),
+            "short",
+            "under the cap is returned whole"
         );
     }
 }
