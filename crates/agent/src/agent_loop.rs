@@ -1975,9 +1975,22 @@ fn capability_menu_for_request(
 /// go, leaving "ingest what you have" and "answer" as the reachable moves.
 /// Nothing is refused and nothing errors: the tool simply is not offered, which
 /// is the difference between annotating and muzzling.
+///
+/// `recall` goes with them, learned the hard way. Removing only search produced
+/// exactly the failure ADK warns about — "trading a runaway loop for an error
+/// loop": measured 2026-08-20 run 4, the model answered the withdrawal of search
+/// with SIX `recall` calls, three of them against hallucinated record ids that
+/// could only error. Recall is re-reading, which is the behaviour this state
+/// exists to stop, and it is not needed to ingest: the digest already carries
+/// `papers_ingest url=…` / `pmc=…` handles, and 20 fetchable ones were in front
+/// of it at the time. Narrow the affordances to converting and answering, or the
+/// model finds the next way to keep gathering.
 fn withhold_search_tools(defs: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
     defs.into_iter()
-        .filter(|d| !SEARCH_TOOLS.contains(&d.function.name.as_str()))
+        .filter(|d| {
+            let name = d.function.name.as_str();
+            !SEARCH_TOOLS.contains(&name) && name != "recall"
+        })
         .collect()
 }
 
@@ -6014,8 +6027,10 @@ mod tests {
             "ingest must remain: {kept:?}"
         );
         assert!(
-            kept.contains(&"recall".to_string()),
-            "recall must remain: {kept:?}"
+            !kept.contains(&"recall".to_string()),
+            "recall is re-reading — the behaviour this state exists to stop. Run 4 \
+             answered the loss of search with six recalls, three against \
+             hallucinated ids: {kept:?}"
         );
         assert!(
             kept.contains(&"query_local".to_string()),
