@@ -815,10 +815,10 @@ fn resolve_seed(
     let mut resolved: Vec<std::sync::Arc<dyn prism_ingest::ontologies::Ontology>> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
-    let mut push = |ontology: std::sync::Arc<dyn prism_ingest::ontologies::Ontology>,
-                    resolved: &mut Vec<_>,
-                    seen: &mut Vec<String>,
-                    is_own_prior: bool|
+    let push = |ontology: std::sync::Arc<dyn prism_ingest::ontologies::Ontology>,
+                resolved: &mut Vec<_>,
+                seen: &mut Vec<String>,
+                is_own_prior: bool|
      -> Result<()> {
         let id = ontology.id().to_string();
         // `InducedOntology.domain` becomes the registry id AND the artifact

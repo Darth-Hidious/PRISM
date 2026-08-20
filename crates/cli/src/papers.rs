@@ -740,26 +740,6 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
 /// Evidence class is re-capped through `evidence_for_result` on the way in.
 /// This store call is a separate entry point and does not depend on an
 /// upstream evidence-class promise.
-fn semantic_entities_for_claim_facts(
-    facts: &[prism_provenance::LocalFact],
-) -> Vec<prism_ingest::semantic_validation::SemanticEntityProposal> {
-    semantic_entities_for_claims(facts.iter().map(|fact| {
-        (
-            fact.subject.as_str(),
-            fact.object.as_str(),
-            &EMPTY_ONTOLOGY_BINDING,
-        )
-    }))
-}
-
-/// Used when a caller genuinely has no ontology binding to offer.
-static EMPTY_ONTOLOGY_BINDING: prism_retrieval::claims::ClaimOntologyBinding =
-    prism_retrieval::claims::ClaimOntologyBinding {
-        subject_class_iri: None,
-        predicate_iri: None,
-        object_class_iri: None,
-    };
-
 /// Build typing proposals, carrying the class IRI the reading model selected
 /// from the ACTIVE ONTOLOGY.
 ///
@@ -1532,7 +1512,7 @@ mod store_tests {
         // CONTRACT CHANGE (agentic paper reading): a closed `kind`-to-class
         // table no longer pretends to classify endpoints. Until an ontology
         // IRI is proposed, semantic validation sees a generic entity.
-        let facts = vec![
+        let facts = [
             prism_provenance::LocalFact {
                 subject: "Ti-6Al-4V".into(),
                 predicate: "has_measurement".into(),
@@ -1553,7 +1533,14 @@ mod store_tests {
             },
         ];
 
-        let entities = semantic_entities_for_claim_facts(&facts);
+        // Facts with no ontology binding: the proposals must stay untyped
+        // rather than inventing a class.
+        let empty = prism_retrieval::claims::ClaimOntologyBinding::default();
+        let entities = semantic_entities_for_claims(
+            facts
+                .iter()
+                .map(|f| (f.subject.as_str(), f.object.as_str(), &empty)),
+        );
         let subject = entities
             .iter()
             .find(|entity| entity.name == "Ti-6Al-4V")
