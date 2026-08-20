@@ -85,6 +85,17 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+# NO default table is named here. PRISM must not carry an operator's private
+# BigQuery resource in its source; the extract belongs in that operator's own
+# configuration (`PRISM_PATENT_TABLE`). The byte ceiling below is what makes an
+# unconfigured deployment safe, rather than a hardcoded pointer at someone's
+# project.
+
+# Most a single patent search may bill. Ten gigabytes is generous for the
+# extract and far below one full-table scan, so a query that has silently
+# escaped to the public table fails instead of costing money.
+MAX_PATENT_BYTES_BILLED = 10 * 1024**3
+
 # ── backends ─────────────────────────────────────────────────────────────
 
 
@@ -101,6 +112,12 @@ def _bigquery_backend(query: str, max_results: int) -> List[Dict]:
     # (B22F, B33Y, C22C, C21D, C22F, C23C, B23K) turns a 253GB scan into a
     # 2.5GB table of 2.76M publications, and a search from ~21GB into ~1.9GB.
     # The extract must project title/abstract flat, as below.
+    # An operator may point at their own pre-filtered extract to cut the scan.
+    # Measured 2026-08-20 from a billing alert: seventeen searches against the
+    # FULL public table billed 240.03 GB each — 4.1 TB, about EUR 24, from one
+    # afternoon of testing, with nothing in the loop noticing until the alert
+    # arrived. Filtering to the materials CPC classes (B22F, B33Y, C22C, C21D,
+    # C22F, C23C, B23K) turns a search into roughly 1.9 GB.
     table = os.getenv("PRISM_PATENT_TABLE")
     if table:
         sql = f"""
@@ -133,6 +150,13 @@ def _bigquery_backend(query: str, max_results: int) -> List[Dict]:
     # Parameterised: the term is model-authored text and must never be
     # concatenated into SQL.
     config = bigquery.QueryJobConfig(
+        # A HARD ceiling, not a hope. BigQuery bills by bytes SCANNED, so a
+        # query against the wrong table is billed in full whether or not anyone
+        # reads the answer, and nothing in the loop notices until a billing
+        # alert arrives days later. Over this limit the job FAILS and costs
+        # nothing, which is the only failure mode that cannot quietly spend
+        # money.
+        maximum_bytes_billed=MAX_PATENT_BYTES_BILLED,
         query_parameters=[
             bigquery.ScalarQueryParameter("needle", "STRING", f"%{query.strip().lower()}%"),
             bigquery.ScalarQueryParameter("limit", "INT64", max_results),

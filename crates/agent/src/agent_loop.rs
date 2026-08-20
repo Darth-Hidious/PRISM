@@ -458,6 +458,77 @@ fn process_large_result(content: &str) -> String {
     )
 }
 
+/// Persist the IDENTITY of every paper a search returned, into the knowledge
+/// graph, with no LLM call.
+///
+/// Measured 2026-08-20 on the live store: `provenance_records` held 9,213 rows
+/// while `emmo_entity`, `emmo_edge` and `prov_assertion` held ZERO. Every tool
+/// call's raw output was durable and recallable, and not one paper had ever
+/// become a node. The research was saved as a transcript and lost as knowledge.
+///
+/// `papers_ingest` is the expensive path — an LLM call per paper to extract
+/// typed, cited claims — and it is still the right way to get FACTS. This is
+/// the cheap half that was missing entirely: title, identity key and source, so
+/// a later turn (or a later session) can ask the graph what it has already seen
+/// instead of searching for it again.
+///
+/// Best-effort and quiet: a store that will not open must never fail a search
+/// the model already got its answer from.
+async fn persist_paper_identities(tool: &str, result: &Value) {
+    if !SEARCH_TOOLS.contains(&tool) {
+        return;
+    }
+    let Some(payload) = cli_payload(result) else {
+        return;
+    };
+    let records = paper_records(&payload);
+    if records.is_empty() {
+        return;
+    }
+    let db_path = crate::hooks::provenance_db_path();
+    let store = match prism_provenance::ProvenanceStore::open(&db_path).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::debug!("paper identities not persisted: {error:#}");
+            return;
+        }
+    };
+    let mut written = 0usize;
+    for record in records {
+        let Some(key) = paper_key(record) else {
+            continue;
+        };
+        let title = record
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("(untitled)");
+        let props = serde_json::json!({
+            "identity": key,
+            "title": title,
+            "doi": record.get("doi"),
+            "source": record.get("source"),
+            "year": record.get("year"),
+            "url": record.get("url"),
+            "fulltext_url": record.get("fulltext_url"),
+            "seen_via": tool,
+        })
+        .to_string();
+        if let Err(error) = store
+            .write_extracted_entity(&key, "Paper", Some(props), "local")
+            .await
+        {
+            tracing::debug!("paper {key} not persisted: {error:#}");
+            continue;
+        }
+        written += 1;
+    }
+    if written > 0 {
+        tracing::debug!("persisted {written} paper identities from {tool}");
+    }
+}
+
 // ── Saturation signal ─────────────────────────────────────────────
 //
 // The owner's requirement, verbatim: "the model should have some understanding
@@ -3282,6 +3353,11 @@ pub(crate) async fn run_turn_inner(
             // Counted from the same bytes h6 persists, so the rendered coverage
             // and the durable record can never disagree about what happened.
             saturation.observe(tool_name, &args, &result_value, is_error);
+            // Identity into the graph, from the same bytes, before the payload
+            // is compacted out of the conversation.
+            if !is_error {
+                persist_paper_identities(tool_name, &result_value).await;
+            }
             let last_search_fresh = saturation.searches.last().map_or(0, |call| call.fresh);
             let post_result = hooks.fire_after(tool_name, &args, &result_value, elapsed_ms as f64);
             let content_after_hooks = if post_result != result_value {
