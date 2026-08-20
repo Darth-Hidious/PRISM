@@ -496,9 +496,27 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 .blocks
                 .iter()
                 .filter(|block| {
+                    // Abstract included deliberately. It was excluded, and the
+                    // abstract is where a paper states its headline quantities
+                    // in their most self-contained form — the exact shape an
+                    // extractor wants. The materials-IE literature is largely
+                    // BUILT on abstracts (Dagdelen et al., Nat. Commun. 2024),
+                    // so dropping it discarded the highest-density section.
+                    //
+                    // Duplication with the body is not a cost here: all windows
+                    // of one document write under one provenance activity, so a
+                    // fact asserted twice counts once and simply gains a
+                    // corroboration.
+                    //
+                    // Title is NOT added: it already reaches the model as the
+                    // separate `title` argument to the extractor, and repeating
+                    // it inside the body text would only spend context.
                     matches!(
                         block.locator.kind,
-                        BlockKind::Body | BlockKind::Table | BlockKind::Caption
+                        BlockKind::Abstract
+                            | BlockKind::Body
+                            | BlockKind::Table
+                            | BlockKind::Caption
                     )
                 })
                 .take(if max_blocks == 0 {
