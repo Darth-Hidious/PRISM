@@ -113,6 +113,11 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
     // normalised label -> (base id, surface form), for collision detection and
     // for resolving a parent IRI back to the label its class was seeded under.
     let mut claimed: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // Relation labels are claimed SEPARATELY from class labels: a relation and
+    // a class may legitimately share a word (the verb "contains" and a class
+    // "Contains"), and colliding those namespaces would qualify one of them for
+    // no reason. Maps normalized label -> owning base id.
+    let mut claimed_relations: BTreeMap<String, String> = BTreeMap::new();
     let mut iri_to_label: BTreeMap<String, String> = BTreeMap::new();
 
     for base in bases {
@@ -193,6 +198,36 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
                 ));
                 continue;
             };
+            // Two bases slicing one corpus both name the verb "abrades". Classes
+            // already resolve this by qualifying the later claimant rather than
+            // asserting the two are the same concept; relations get the SAME
+            // rule, not a cleverer one. Without it a fold of eight shards died
+            // with 2259 duplicate_relation_label violations across 950 labels —
+            // invisible until relations stopped being silently dropped.
+            let key = normalize_label(&label);
+            let label = match claimed_relations.get(&key) {
+                // The same base repeating itself: nothing to disambiguate.
+                Some(owner) if owner == &base_id => continue,
+                Some(owner) => {
+                    let qualified = format!("{label} ({base_id})");
+                    let qualified_key = normalize_label(&qualified);
+                    if claimed_relations.contains_key(&qualified_key) {
+                        bail!(
+                            "base {base_id} declares relation {label:?}, which base {owner} \
+                             already claims, and the disambiguated form {qualified:?} is taken \
+                             too. Rename one, or seed these bases in separate runs."
+                        );
+                    }
+                    seed.notes.push(format!(
+                        "relation {qualified:?}: {label:?} was already claimed by base \
+                         {owner}, so this one is qualified — the two are NOT asserted to be \
+                         the same relation"
+                    ));
+                    qualified
+                }
+                None => label,
+            };
+            claimed_relations.insert(normalize_label(&label), base_id.clone());
             seed.relations.push(InducedRelation {
                 label,
                 definition: String::new(),

@@ -885,6 +885,43 @@ mod tests {
         assert!(msg.contains("teleportation"), "{msg}");
     }
 
+    /// Two bases slicing one corpus name the same verb. Classes already resolve
+    /// that by qualifying the later claimant; relations must do the same, or the
+    /// merged artifact is REJECTED before it is written. Folding eight real
+    /// shards died with 2259 `duplicate_relation_label` violations across 950
+    /// labels — a failure invisible until relations stopped being dropped.
+    #[test]
+    fn two_bases_naming_one_relation_keep_both_under_distinct_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seeds = Vec::new();
+        for domain in ["indtest-dupra", "indtest-duprb"] {
+            let o = ontology(domain);
+            let path = dir.path().join(format!("{domain}.ttl"));
+            write_artifact(&path, &o).unwrap();
+            seeds.push(load_induced_seed_from_path(&path).expect("a draft loads as a seed"));
+        }
+
+        let seed = super::super::seed::seed_from(&seeds).expect("seeding two bases succeeds");
+
+        assert_eq!(
+            seed.relations.len(),
+            2,
+            "both bases' relations must survive; notes: {:?}",
+            seed.notes
+        );
+        let labels: std::collections::BTreeSet<&str> =
+            seed.relations.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            2,
+            "a shared label must be qualified, not duplicated: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("indtest-duprb")),
+            "the later claimant carries its base id: {labels:?}"
+        );
+    }
+
     /// A relation must survive being used as an induction BASE.
     ///
     /// The artifact states `rdfs:domain`/`rdfs:range` for every relation, but
