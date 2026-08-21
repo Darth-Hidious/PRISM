@@ -343,8 +343,15 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
             })?,
             pref_label: Some(rel.label.clone()),
             parents: Vec::new(),
-            domains: Vec::new(),
-            ranges: Vec::new(),
+            // The artifact states `rdfs:domain`/`rdfs:range` for every relation
+            // and validation already guarantees each names a DECLARED class, so
+            // both mint the same IRI the class loop above minted. Leaving these
+            // empty silently discarded every relation when an artifact was used
+            // as an induction base: the seeder reads `domains.first()`, got
+            // `None`, and reported "not among the seeded classes" — which was
+            // never true. Folding eight shards lost 6168 of 6168 relations.
+            domains: vec![class_iri(&rel.domain)?],
+            ranges: vec![class_iri(&rel.range)?],
             extraction_labels: vec![token],
         });
     }
@@ -876,6 +883,44 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("factKind"), "{msg}");
         assert!(msg.contains("teleportation"), "{msg}");
+    }
+
+    /// A relation must survive being used as an induction BASE.
+    ///
+    /// The artifact states `rdfs:domain`/`rdfs:range` for every relation, but
+    /// the adapter built `RelationDecl` with both empty, so `seed_from` read
+    /// `domains.first()`, got `None`, dropped the relation, and reported it as
+    /// "not among the seeded classes" — which was never true. Folding eight real
+    /// shards lost 6168 of 6168 relations: everything that carries a fact.
+    ///
+    /// This drives the real adapter and the real seeder. A hand-built
+    /// `RelationDecl` would have passed with the bug present.
+    #[test]
+    fn a_relation_survives_being_used_as_an_induction_base() {
+        let o = ontology("indtest-baserelations");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.ttl");
+        write_artifact(&path, &o).unwrap();
+
+        let base = load_induced_seed_from_path(&path).expect("a draft loads as a seed");
+        let seed = super::super::seed::seed_from(&[base]).expect("seeding a base succeeds");
+
+        assert_eq!(
+            seed.relations.len(),
+            1,
+            "the base's relation must be seeded, not dropped; notes: {:?}",
+            seed.notes
+        );
+        assert_eq!(seed.relations[0].domain, "Polymer");
+        assert_eq!(seed.relations[0].range, "Glass Transition Temperature");
+        assert!(
+            !seed
+                .notes
+                .iter()
+                .any(|n| n.contains("not among the seeded classes")),
+            "a declared endpoint must never be reported unseeded: {:?}",
+            seed.notes
+        );
     }
 
     /// Sharded induction produces DRAFTS, and folding shards means handing
