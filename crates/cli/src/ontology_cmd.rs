@@ -858,7 +858,7 @@ fn resolve_seed(
                         if !path.is_file() {
                             return Err(registry_error);
                         }
-                        induction::register::load_induced_from_path(path)?
+                        induction::register::load_induced_seed_from_path(path)?
                     }
                 };
             push(ontology, &mut resolved, &mut seen, false)?;
@@ -869,7 +869,7 @@ fn resolve_seed(
         let previous =
             prism_ingest::ontologies::project_ontology_artifact_path(project_root, domain)?;
         if previous.is_file() {
-            let prior = induction::register::load_induced_from_path(&previous)?;
+            let prior = induction::register::load_induced_seed_from_path(&previous)?;
             push(prior, &mut resolved, &mut seen, true)?;
         } else {
             bail!(

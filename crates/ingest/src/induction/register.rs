@@ -474,6 +474,29 @@ pub fn load_induced_from_path(path: &std::path::Path) -> Result<Arc<dyn Ontology
     accepted_adapter_with_sha(&ontology, hex::encode(Sha256::digest(&bytes)))
 }
 
+/// Load one artifact as a SEED for further induction, which a DRAFT may be.
+///
+/// [`load_induced_from_path`] refuses a draft, and is right to: registering one
+/// would let an unreviewed proposal govern production writes. A seed is the
+/// opposite case. `--base` and `--continue` hand an artifact to the inducer as a
+/// starting point, and what comes out is itself another draft that still has to
+/// be reviewed and promoted deliberately — the gate is not bypassed, only moved
+/// to where the artifact actually reaches production.
+///
+/// Refusing drafts here made sharded induction unusable: folding N shards would
+/// have required promoting N unreviewed ontologies first, which is precisely
+/// what the draft gate exists to prevent.
+///
+/// Structural validation is unchanged — [`super::load_validated`] rejects a
+/// malformed artifact before this returns, so a seed is parsed and checked
+/// exactly as strictly as a promoted one. Only the ACCEPTED status is waived.
+pub fn load_induced_seed_from_path(path: &std::path::Path) -> Result<Arc<dyn Ontology>> {
+    let ontology = super::load_validated(path)?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("cannot re-read ontology artifact {}", path.display()))?;
+    adapter(&ontology, hex::encode(Sha256::digest(&bytes)))
+}
+
 /// Load an artifact file and register it — the production dispatch for
 /// "put this induced vocabulary on the extraction path". Parsing and
 /// validation run inside [`super::load_validated`]; the draft gate runs in
@@ -853,6 +876,39 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("factKind"), "{msg}");
         assert!(msg.contains("teleportation"), "{msg}");
+    }
+
+    /// Sharded induction produces DRAFTS, and folding shards means handing
+    /// them straight back as bases. Refusing a draft on the seed path made that
+    /// impossible: merging N shards would have required promoting N unreviewed
+    /// ontologies first, which is the exact thing the draft gate exists to
+    /// prevent. The gate is not weakened here, only placed where an artifact
+    /// actually reaches production — so the same draft must still be refused by
+    /// the loader that governs writes.
+    #[test]
+    fn a_draft_seeds_induction_but_still_cannot_govern_writes() {
+        let o = ontology("indtest-draftseed");
+        assert_eq!(
+            o.status,
+            OntologyStatus::Draft,
+            "this test is meaningless unless the helper yields a draft"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard.ttl");
+        write_artifact(&path, &o).unwrap();
+
+        // A draft is a legitimate SEED: `Arc<dyn Ontology>` is not Debug, so
+        // check the discriminant rather than unwrapping.
+        if load_induced_seed_from_path(&path).is_err() {
+            panic!("a draft shard must load as an induction seed, or shards cannot be folded");
+        }
+
+        // ...and is still refused where it would govern extraction.
+        let Err(err) = load_induced_from_path(&path) else {
+            panic!("a draft must never load on the path that governs production writes");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("DRAFT"), "{msg}");
     }
 
     /// The sign-domain channel the trait promises, proven end-to-end through
