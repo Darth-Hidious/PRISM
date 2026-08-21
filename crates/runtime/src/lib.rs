@@ -10,13 +10,16 @@
 //!
 //! The crate name `runtime` is historical. This crate owns configuration,
 //! paths, credential resolution, offline policy, and retry policy; it does not
-//! own an event loop, scheduler, process supervision, or task executor.
+//! own an event loop or task executor. The one supervisory surface it does own
+//! is [`seam`] — component activation with runtime-derived teardown — which
+//! supervises *components and their inverses*, not threads or processes.
 
 pub mod auth;
 pub mod llm_resolve;
 pub mod offline;
 pub mod platform_env;
 pub mod retry;
+pub mod seam;
 
 use std::env;
 use std::fs;

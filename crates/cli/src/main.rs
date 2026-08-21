@@ -7400,7 +7400,10 @@ fn semantic_entities_for_text_facts(
 }
 
 /// Make the vision document reader available for this process, if a model is
-/// configured at all.
+/// configured at all. Since the composability seam took over the PDF path
+/// (`ensure_vision_seam`), this direct registration is its FALLBACK: if the
+/// seam ever fails to initialise, the reader is still installed this way, so
+/// a seam bug can degrade supervision but never remove vision (audit F11).
 ///
 /// Registered ONCE, alongside the built-in text layer, so escalation has
 /// somewhere to go when a page comes back scanned or with a broken font
@@ -7467,9 +7470,90 @@ fn register_vision_reader(cfg: prism_ingest::LlmConfig) {
         Arc::new(prism_ingest::document::CommandRasteriser::poppler()),
         Arc::new(prism_ingest::llm::LlmClient::new(cfg)),
     ));
-    if let Err(error) = prism_ingest::document::register_understanding(reader) {
-        tracing::debug!(%error, "vision document reader was already registered");
+    // First registration in this process simply registers. In a REUSED
+    // process (watch mode, the TUI) the id is already taken — by run 1's
+    // `retire` tombstone — and a register-only call here left that
+    // tombstone standing: vision permanently off from run 2 onward,
+    // announced nowhere (round two's silent muzzle through a different
+    // door). Displace it deliberately.
+    if prism_ingest::document::register_understanding(reader.clone()).is_err()
+        && let Err(error) = prism_ingest::document::replace_understanding(reader)
+    {
+        // Both doors failed (the id vanished between the calls). This
+        // fallback exists to preserve vision, so its own failure must be
+        // loud, not a debug line.
+        eprintln!("Warning: could not install the vision document reader: {error:#}");
     }
+}
+
+/// Wiring of the composability seam: the vision endpoint becomes a
+/// supervised key, published ONCE for the whole ingest run — the caller owns
+/// the slot and every file of the run shares it. Nothing is probed, ever:
+/// no host is contacted and no credential leaves the machine until a page
+/// actually needs vision, and from then on the READER's own reads are the
+/// endpoint's health signal (`VisionSeam::observe`) — enough consecutive
+/// failures park the reader once for the rest of the corpus, and a parked
+/// endpoint earns real trial reads back on a bounded backoff
+/// (`VisionSeam::retry_endpoint_if_due`, consulted here, once per file).
+async fn ensure_vision_seam(
+    vision_seam: &mut Option<prism_ingest::document::VisionSeam>,
+    cfg: prism_ingest::LlmConfig,
+) {
+    if let Some(seam) = vision_seam {
+        seam.retry_endpoint_if_due().await;
+        return;
+    }
+    match prism_ingest::document::VisionSeam::start(cfg.clone()).await {
+        Ok(seam) => *vision_seam = Some(seam),
+        // Reachable when the reader component fails to activate — `settle`
+        // swallows activation errors into fiber status, and `start` checks
+        // the state actually reached (audit F11). The seam steps aside
+        // LOUDLY and the reader is registered directly, as it was before
+        // the seam existed: a seam bug may cost supervision, never vision.
+        Err(error) => {
+            eprintln!(
+                "Warning: the vision seam could not activate its reader ({error:#}); \
+                 the vision reader is registered directly instead"
+            );
+            register_vision_reader(cfg);
+        }
+    }
+}
+
+/// The `deferred` summary fragment for a PDF whose damaged pages need the
+/// vision endpoint — withdrawn, or live but failing on the wire — or `None`
+/// when nothing is deferred. The caller
+/// records it and PROCEEDS with extraction (audit F2) — deferral is
+/// bookkeeping about the blocked pages, never a reason to discard the sound
+/// ones. Factored out of `run_local_text_ingest_file` so the decision is
+/// testable without a probe, an endpoint, or an LLM.
+fn deferred_vision_pages(
+    vision_seam: Option<&prism_ingest::document::VisionSeam>,
+    outcome: &prism_ingest::document::ReadOutcome,
+) -> Option<serde_json::Value> {
+    let seam = vision_seam?;
+    let reason = prism_ingest::document::vision_deferral_reason(&seam.status(), outcome)?;
+    eprintln!("Deferred: {reason}");
+    let pages: Vec<u32> = outcome.unrecovered().map(|note| note.number).collect();
+    Some(serde_json::json!({
+        "waiting_on": prism_ingest::document::VISION_ENDPOINT_KEY.to_string(),
+        "reason": reason,
+        "pages": pages,
+    }))
+}
+
+/// One operator-facing line for an adapter that contributed nothing —
+/// worded by its typed `kind`, never by `Display` alone. A reader that RAN
+/// and failed must not be called "unavailable": that word claims it never
+/// ran, which is exactly the defect class `SkipNote`'s typed kind exists to
+/// prevent (observed verbatim before this helper: "document reader
+/// unavailable — vision: rendering page 1: pdftoppm failed").
+fn skip_note_line(note: &prism_ingest::document::SkipNote) -> String {
+    let what = match note.kind {
+        prism_ingest::document::SkipKind::Unavailable => "document reader unavailable",
+        prism_ingest::document::SkipKind::Failed(_) => "document reader failed",
+    };
+    format!("Note: {what} — {note}")
 }
 
 /// Read one document's text ON DEVICE — the SAME reader Phase 1 uses,
@@ -7498,7 +7582,7 @@ async fn read_document_text(path: &Path, runtime_url: &str) -> Result<(String, O
         // paper that silently never reached the extractor is exactly the kind
         // of hole this plane exists to stop being invisible.
         for skipped in &outcome.skipped {
-            eprintln!("Note: document reader unavailable — {skipped}");
+            eprintln!("{}", skip_note_line(skipped));
         }
         let unrecovered: Vec<String> = outcome
             .unrecovered()
@@ -7587,6 +7671,12 @@ async fn run_local_text_ingest_file(
     mapping_path: Option<&Path>,
     sampling: prism_ingest::text_extract::SamplingPolicy,
     vision: VisionModelChoice<'_>,
+    // The RUN-scoped seam slot, owned by the caller: one seam for a whole
+    // corpus, so a mid-corpus endpoint death parks the reader ONCE (running
+    // the tombstone inverse on the live component — audit F3) instead of
+    // each file rebuilding a runtime that forgot everything (the shape that
+    // made the tombstone test-only and paid a dead endpoint per file).
+    vision_seam: &mut Option<prism_ingest::document::VisionSeam>,
 ) -> Result<serde_json::Value> {
     let ontology_id = active_ontology_from_config(project_root)?;
     let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
@@ -7604,15 +7694,30 @@ async fn run_local_text_ingest_file(
     // must not start requiring a model just because escalation might want
     // one. With no model configured there is simply no vision reader, and
     // escalation reports that against any page it could not fix.
-    if let Ok(cfg) = build_vision_llm_config(
-        project_root,
-        llm_url,
-        model,
-        api_key,
-        vision.url,
-        vision.model,
-    ) {
-        register_vision_reader(cfg);
+    //
+    // Every configured vision endpoint — explicit (--vision-url /
+    // --vision-model, the LLM_VISION_* env) or inherited from the extraction
+    // model — goes through the composability seam on the default PDF path
+    // (audit F10). This is safe to run by default because nothing gates the
+    // reader up front: there is NO probe, no host is contacted until a page
+    // actually needs vision, and a park DEFERS the blocked pages while the
+    // rest of the document ingests (audit F2). What the seam adds over
+    // direct registration is teardown and memory: a mid-corpus endpoint
+    // death (measured by the reader's own reads) swaps in the tombstone
+    // once, the corpus stops paying that endpoint's timeout per file, and
+    // real trial reads on a bounded backoff win the endpoint back.
+    if ingest_format(path) == "pdf"
+        && let Ok(cfg) = build_vision_llm_config(
+            project_root,
+            llm_url,
+            model,
+            api_key,
+            vision.url,
+            vision.model,
+        )
+        && !cfg.base_url.trim().is_empty()
+    {
+        ensure_vision_seam(vision_seam, cfg).await;
     }
 
     // PDFs are read ON DEVICE through the document-understanding plane: no
@@ -7623,7 +7728,7 @@ async fn run_local_text_ingest_file(
     // `page_ranges` carries the document's structural units (byte ranges of
     // pages in `text`) into segmentation; empty means "no page structure
     // known" and segmentation falls back to blank-line paragraphs.
-    let (text, _page_ranges, warning) = if ingest_format(path) == "pdf" {
+    let (text, _page_ranges, warning, deferred) = if ingest_format(path) == "pdf" {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read PDF {}", path.display()))?;
         // Read through the document-understanding plane rather than calling
@@ -7643,7 +7748,7 @@ async fn run_local_text_ingest_file(
         // paper that silently never reached the extractor is exactly the kind
         // of hole this plane exists to stop being invisible.
         for skipped in &outcome.skipped {
-            eprintln!("Note: document reader unavailable — {skipped}");
+            eprintln!("{}", skip_note_line(skipped));
         }
         let unrecovered: Vec<String> = outcome
             .unrecovered()
@@ -7660,28 +7765,89 @@ async fn run_local_text_ingest_file(
         if let Some(warning) = &warning {
             eprintln!("Warning: {warning}");
         }
+
+        // Mid-corpus endpoint death (audit F3): the LIVE reader's own reads
+        // are the health signal — no probe exists to disagree with them.
+        // After enough consecutive ENDPOINT-side failures the key is
+        // withdrawn: the seam's inverse swaps in the tombstone and the REST
+        // of the corpus skips the dead host via readiness instead of
+        // re-paying its timeout per file; bounded trial reads later win it
+        // back. A single failure, any successful vision read, or any number
+        // of LOCAL failures (poppler dying on an encrypted file says
+        // nothing about the host) withdraws nothing.
+        if let Some(seam) = vision_seam.as_mut()
+            && let Some(reason) = seam.observe(&outcome).await
+        {
+            eprintln!("Note: vision reader parked — {reason}");
+        }
+
+        // The seam's consumer-side decision (audit F2): pages that needed
+        // vision while the endpoint key is withdrawn — or whose live read
+        // failed on the wire — are DEFERRED — recorded
+        // in the summary with the reason, readable by a re-run once the
+        // endpoint answers — and everything the text layer read soundly is
+        // extracted and stored NOW. The old code parked the whole document
+        // here (39 sound pages discarded over one micrograph) and the run
+        // still exited 0; a tool that silently ingests nothing and reports
+        // success is far worse than one that ingests degraded text.
+        let deferred = deferred_vision_pages(vision_seam.as_ref(), &outcome);
+
         let (text, ranges) = outcome.understanding.plain_text_with_page_ranges();
-        (text, ranges, warning)
+        (text, ranges, warning, deferred)
     } else {
         // Non-PDF text formats just read the file. Either way the runtime
         // sidecar is never contacted on the local path.
         let (text, _pages, warning) = extract_platform_ingest_text(path, runtime_url).await?;
-        (text, Vec::new(), warning)
+        (text, Vec::new(), warning, None)
     };
     let chars = text.chars().count();
     if text.trim().is_empty() {
-        bail!("No ingestable text found in {}", path.display());
+        match deferred {
+            // The fully-scanned PDF: no readable text NOW, but every page is
+            // deferred behind the vision endpoint — so this is a real
+            // summary (zero facts, the deferred pages machine-readable), not
+            // an error. Bailing here made the document that most needs
+            // vision the only one excluded from vision recovery: the bail
+            // aborted the whole batch (`handle_ingest` stops on a file
+            // error), the file's mtime was already recorded as seen, and the
+            // error string carried no retry marker — permanently lost, and
+            // invisible to the run-level deferral verdict (audit F9).
+            Some(deferred) => {
+                eprintln!(
+                    "Note: no ingestable text in {} yet — every readable page \
+                     is deferred behind the vision endpoint",
+                    path.display()
+                );
+                return Ok(serde_json::json!({
+                    "backend": "local_text",
+                    "path": path.display().to_string(),
+                    "format": ingest_format(path),
+                    "chars": 0,
+                    "warning": warning,
+                    "facts_written": 0,
+                    "deferred": deferred,
+                }));
+            }
+            // With nothing deferred there is nothing a re-run could recover:
+            // the document itself has no ingestable text, and that is still
+            // an honest per-file error.
+            None => bail!("No ingestable text found in {}", path.display()),
+        }
     }
 
     if schema_only {
-        return Ok(serde_json::json!({
+        let mut summary = serde_json::json!({
             "backend": "local_text",
             "path": path.display().to_string(),
             "format": ingest_format(path),
             "schema_only": true,
             "chars": chars,
             "warning": warning,
-        }));
+        });
+        if let Some(deferred) = deferred {
+            summary["deferred"] = deferred;
+        }
+        return Ok(summary);
     }
 
     let llm_cfg = build_llm_config(project_root, llm_url, model, api_key)?;
@@ -8228,7 +8394,7 @@ async fn run_local_text_ingest_file(
         eprintln!("  WARNING: {}", verdict.detail);
     }
 
-    Ok(serde_json::json!({
+    let mut summary = serde_json::json!({
         "backend": "local_text",
         "path": path.display().to_string(),
         "format": ingest_format(path),
@@ -8338,7 +8504,14 @@ async fn run_local_text_ingest_file(
         // `unavailable` or `failed` has `passed: null`; an unchecked write
         // can therefore never pose as validated in machine-readable output.
         "semantic_validation": semantic_validation,
-    }))
+    });
+    // Pages waiting on the vision endpoint (audit F2): everything above was
+    // extracted from what COULD be read; this names what could not, and
+    // why, so a re-run can finish the job.
+    if let Some(deferred) = deferred {
+        summary["deferred"] = deferred;
+    }
+    Ok(summary)
 }
 
 /// Drain a legacy document repair queue one item at a time.
@@ -8598,6 +8771,19 @@ fn print_ingest_summary(summary: &serde_json::Value) {
     let path = value_string(summary, &["path"]).unwrap_or("?");
 
     println!("Ingesting: {path}");
+
+    // Pages deferred behind the vision endpoint (audit F2): named
+    // FIRST, then the normal extraction report follows — the sound pages
+    // WERE ingested and their counts must print. The old code parked the
+    // whole document and returned here, which hid a stored-nothing run
+    // behind a calm sentence.
+    if let Some(deferred) = summary.get("deferred") {
+        let reason = deferred
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("waiting for a withdrawn provider");
+        println!("  Deferred: {reason}");
+    }
 
     match backend {
         "local_tabular" => {
@@ -9127,6 +9313,67 @@ fn ingest_summary_errors(summary: &serde_json::Value) -> usize {
         .unwrap_or(0)
 }
 
+/// How many documents in this run carry pages deferred behind the vision
+/// endpoint. Surfaced as a visible count and used by watch mode to know
+/// which files to re-ingest when the endpoint returns (audit F8/F9).
+fn ingest_summary_deferrals(summaries: &[serde_json::Value]) -> usize {
+    summaries
+        .iter()
+        .filter(|summary| summary.get("deferred").is_some())
+        .count()
+}
+
+/// The starved fraction of a run's PDF corpus at which deferral stops being
+/// a "partial" outcome and becomes the run's verdict. Inclusive: half the
+/// corpus starving IS the vision outage costing the run its PDFs. Below it,
+/// the deferral stays a visible count and exit 0 — making a genuinely
+/// partial deferral an error would re-muzzle the run over pages it never
+/// needed; above it, "399 of 400 starved plus one junk fact" must not read
+/// as success (the round-three gate demanded ALL PDFs starved, so exactly
+/// that run exited 0).
+const STARVED_RUN_ERROR_PERCENT: usize = 50;
+
+/// Audit F9: the run-level exit verdict for deferrals. The error-worthy
+/// unit is a PDF-backed DOCUMENT that deferred pages and stored zero facts
+/// (a "starved" document); the run fails when at least
+/// [`STARVED_RUN_ERROR_PERCENT`] of its PDF documents starved. Counting
+/// documents at that granularity (never a whole-run fact sum) keeps a
+/// `.csv` in the directory from vouching for 399 empty PDFs, and keeps one
+/// junk fact from vouching for the whole run — a deferred document that
+/// stored facts is a live document, and never counts as starved. Starved is
+/// counted over PDF-backed summaries ONLY, so a non-PDF that one day
+/// carries `deferred` cannot push the count past the denominator and
+/// silently disable the gate.
+fn deferred_and_nothing_stored(summaries: &[serde_json::Value]) -> Option<String> {
+    let is_pdf = |summary: &&serde_json::Value| {
+        summary.get("format").and_then(|f| f.as_str()) == Some("pdf")
+    };
+    let pdf_documents = summaries.iter().filter(is_pdf).count();
+    let starved = summaries
+        .iter()
+        .filter(is_pdf)
+        .filter(|summary| {
+            summary.get("deferred").is_some()
+                && summary.get("facts_written").and_then(|v| v.as_u64()) == Some(0)
+        })
+        .count();
+    (pdf_documents > 0 && starved * 100 >= pdf_documents * STARVED_RUN_ERROR_PERCENT).then(|| {
+        format!(
+            "{starved} of {pdf_documents} PDF document(s) have \
+             {DEFERRED_NOTHING_STORED_MARKER} and stored nothing — re-run \
+             once the endpoint answers (see the Deferred lines above)"
+        )
+    })
+}
+
+/// The stable phrase inside [`deferred_and_nothing_stored`]'s message, so
+/// watch mode can recognise that error and keep the file eligible for the
+/// endpoint-recovery retry (audit F8) — a fully-deferred file must not lose
+/// its retry exactly because it also stored nothing (audit F9). Deliberately
+/// does NOT say "withdrawn": the below-breaker window defers pages behind an
+/// endpoint that is still live, and this message must stay true there.
+const DEFERRED_NOTHING_STORED_MARKER: &str = "pages deferred behind the vision endpoint";
+
 async fn fetch_ingest_status(corpus: Option<&str>) -> Result<serde_json::Value> {
     let (api_base, auth) = resolve_agent_auth()?;
     let client = reqwest::Client::builder()
@@ -9444,6 +9691,38 @@ async fn handle_ingest_status(corpus: Option<&str>, json_output: bool) -> Result
     Ok(())
 }
 
+/// What one `handle_ingest` run did, beyond its exit status. Watch mode
+/// reads `deferred_documents` to know the file must be re-ingested once the
+/// vision endpoint answers (audit F8).
+#[derive(Debug)]
+struct IngestRunReport {
+    deferred_documents: usize,
+}
+
+/// The `--json` payload for one ingest run. A single file keeps its summary
+/// as the whole payload (the shape scripts already parse); several files
+/// ride under `documents`. Either way `deferred_documents` is a TOP-LEVEL
+/// field: the run-level deferral count used to print in the human branch
+/// alone, so an agent or script keying off `--json` could not see the
+/// run-level verdict at all.
+fn ingest_json_payload(
+    summaries: Vec<serde_json::Value>,
+    deferred_documents: usize,
+) -> serde_json::Value {
+    let mut payload = if summaries.len() == 1 {
+        summaries.into_iter().next().unwrap_or_default()
+    } else {
+        serde_json::json!({ "documents": summaries })
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "deferred_documents".to_string(),
+            serde_json::json!(deferred_documents),
+        );
+    }
+    payload
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_ingest(
     path: &Path,
@@ -9458,7 +9737,7 @@ async fn handle_ingest(
     mapping_path: Option<&Path>,
     sampling: prism_ingest::text_extract::SamplingPolicy,
     vision: VisionModelChoice<'_>,
-) -> Result<()> {
+) -> Result<IngestRunReport> {
     let ingest_targets = collect_ingest_paths(path)?;
     if ingest_targets.is_empty() {
         bail!("No ingestable files found under {}", path.display());
@@ -9513,7 +9792,16 @@ async fn handle_ingest(
         TextLocality::Cloud
     };
 
+    // The vision seam lives for the WHOLE run (audit F3): one runtime, one
+    // reader activation, one tombstone inverse — so a mid-corpus endpoint
+    // death parks the reader once for every remaining file, instead of each
+    // file rebuilding a runtime that forgot the last file's discovery.
+    let mut vision_seam: Option<prism_ingest::document::VisionSeam> = None;
+
     let mut summaries = Vec::new();
+    // Held, not `?`'d: a per-file error must still reach the seam
+    // retirement below before it leaves this function.
+    let mut run_error: Option<anyhow::Error> = None;
     for target in ingest_targets {
         let summary = match ingest_backend(&target) {
             Some(IngestBackend::LocalTabular) => {
@@ -9526,7 +9814,7 @@ async fn handle_ingest(
                     schema_only,
                     mapping_path,
                 )
-                .await?
+                .await
             }
             Some(IngestBackend::PlatformText) if text_locality.is_local() => {
                 run_local_text_ingest_file(
@@ -9540,8 +9828,9 @@ async fn handle_ingest(
                     mapping_path,
                     sampling,
                     vision,
+                    &mut vision_seam,
                 )
-                .await?
+                .await
             }
             Some(IngestBackend::PlatformText) => {
                 run_platform_ingest_file(
@@ -9552,25 +9841,47 @@ async fn handle_ingest(
                     schema_only,
                     mapping_path,
                 )
-                .await?
+                .await
             }
-            None => bail!(
+            None => Err(anyhow::anyhow!(
                 "Unsupported ingest format for {}. Supported: {}",
                 target.display(),
                 supported_ingest_formats()
-            ),
+            )),
         };
-        summaries.push(summary);
+        match summary {
+            Ok(summary) => summaries.push(summary),
+            Err(error) => {
+                run_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    // Retire the run's component NOW, explicitly: `Runtime` has no `Drop`
+    // by design, so dropping the slot with the fiber Active would leave the
+    // tombstone inverse unrun and a stale reader registered process-wide
+    // (watch mode, the TUI, a test binary) — in a module whose thesis is
+    // that teardown must not be forgotten by hand.
+    if let Some(seam) = vision_seam.take() {
+        seam.retire().await;
+    }
+    if let Some(error) = run_error {
+        return Err(error);
     }
 
     let total_step_errors: usize = summaries.iter().map(ingest_summary_errors).sum();
+    let deferred_documents = ingest_summary_deferrals(&summaries);
+    let deferred_nothing_stored = if schema_only {
+        // Schema-only stores nothing BY DESIGN; a deferral there proves
+        // nothing about the endpoint costing the run its facts.
+        None
+    } else {
+        deferred_and_nothing_stored(&summaries)
+    };
 
     if json_output {
-        let payload = if summaries.len() == 1 {
-            summaries.into_iter().next().unwrap_or_default()
-        } else {
-            serde_json::Value::Array(summaries)
-        };
+        let payload = ingest_json_payload(summaries, deferred_documents);
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         for (index, summary) in summaries.iter().enumerate() {
@@ -9578,6 +9889,15 @@ async fn handle_ingest(
                 println!();
             }
             print_ingest_summary(summary);
+        }
+        // A visible run-level count (audit F9): a partial deferral is NOT an
+        // error — the sound pages' facts are stored — but it must never be
+        // invisible either.
+        if deferred_documents > 0 {
+            println!(
+                "\n{deferred_documents} document(s) have pages deferred behind the \
+                 vision endpoint; re-run them once it answers"
+            );
         }
     }
 
@@ -9587,8 +9907,85 @@ async fn handle_ingest(
     if total_step_errors > 0 {
         bail!("{total_step_errors} ingest step(s) failed — see errors above/in JSON");
     }
+    // Audit F9: a fully-deferred run that stored NOTHING exits non-zero —
+    // the parked summaries carry no `errors`, so without this the
+    // exit-0-having-stored-nothing came straight back.
+    if let Some(message) = deferred_nothing_stored {
+        bail!("{message}");
+    }
 
-    Ok(())
+    Ok(IngestRunReport { deferred_documents })
+}
+
+/// Watch-mode pacing for endpoint-recovery retries (audit F8). A retry is a
+/// REAL re-ingest — same auth, same timeouts, same retry policy as any read;
+/// there is no probe to consult, because a check cheaper than the reader was
+/// wrong about it twice — so it is paced like real work: first chance after
+/// a minute, doubling to a fifteen-minute ceiling while the endpoint stays
+/// dead, reset by any recovery. Quick enough to catch an endpoint that
+/// blipped; bounded enough that a dead weekend costs dozens of single-file
+/// trials, not thousands.
+const WATCH_RETRY_MIN_DELAY: Duration = Duration::from_secs(60);
+const WATCH_RETRY_MAX_DELAY: Duration = Duration::from_secs(900);
+
+fn watch_retry_backoff(previous: Duration) -> Duration {
+    (previous * 2).min(WATCH_RETRY_MAX_DELAY)
+}
+
+/// One watched file's ingest, with the deferred-set bookkeeping every call
+/// site needs identically: a run that deferred documents — or error-exited
+/// with the fully-deferred marker (audit F9), which must keep its retry
+/// eligibility exactly like a partial deferral (audit F8) — stays in the
+/// set; a clean run leaves it. Returns `true` when the file fully ingested
+/// with nothing deferred.
+#[allow(clippy::too_many_arguments)]
+async fn watch_ingest_once(
+    path: &Path,
+    deferred: &mut std::collections::HashSet<PathBuf>,
+    project_root: &Path,
+    model: Option<&str>,
+    llm_url: Option<&str>,
+    api_key: Option<&str>,
+    schema_only: bool,
+    runtime_url: &str,
+    corpus: Option<&str>,
+    json_output: bool,
+    mapping: Option<&Path>,
+    sampling: prism_ingest::text_extract::SamplingPolicy,
+    vision: VisionModelChoice<'_>,
+) -> bool {
+    match handle_ingest(
+        path,
+        project_root,
+        model,
+        llm_url,
+        api_key,
+        schema_only,
+        runtime_url,
+        corpus,
+        json_output,
+        mapping,
+        sampling,
+        vision,
+    )
+    .await
+    {
+        Ok(report) if report.deferred_documents > 0 => {
+            deferred.insert(path.to_path_buf());
+            false
+        }
+        Ok(_) => {
+            deferred.remove(path);
+            true
+        }
+        Err(error) => {
+            if format!("{error:#}").contains(DEFERRED_NOTHING_STORED_MARKER) {
+                deferred.insert(path.to_path_buf());
+            }
+            eprintln!("  Error: {error}");
+            false
+        }
+    }
 }
 
 /// Watch a directory for new/modified ingestable files and ingest them.
@@ -9607,7 +10004,7 @@ async fn handle_ingest_watch(
     sampling: prism_ingest::text_extract::SamplingPolicy,
     vision: VisionModelChoice<'_>,
 ) -> Result<()> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, SystemTime};
 
     if !dir.is_dir() {
@@ -9621,6 +10018,12 @@ async fn handle_ingest_watch(
 
     // Track file modification times to detect changes
     let mut seen: HashMap<PathBuf, SystemTime> = HashMap::new();
+    // Files whose last ingest deferred pages behind the vision
+    // endpoint (audit F8). Their mtimes are in `seen` like everyone else's —
+    // this set is the promise "It will ingest fully once the endpoint is
+    // back" actually being kept: each poll tick, if anything is deferred and
+    // the endpoint answers a bounded probe, the deferred files re-ingest.
+    let mut deferred: HashSet<PathBuf> = HashSet::new();
 
     // Initial scan — ingest all existing files
     for entry in std::fs::read_dir(dir)? {
@@ -9634,8 +10037,9 @@ async fn handle_ingest_watch(
         {
             seen.insert(path.clone(), modified);
         }
-        match handle_ingest(
+        watch_ingest_once(
             &path,
+            &mut deferred,
             project_root,
             model,
             llm_url,
@@ -9648,17 +10052,75 @@ async fn handle_ingest_watch(
             sampling,
             vision,
         )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => eprintln!("  Error: {e}"),
-        }
+        .await;
     }
 
     // Poll loop — check for new/modified files every 5 seconds
     let poll_interval = Duration::from_secs(5);
+    let mut retry_delay = WATCH_RETRY_MIN_DELAY;
+    let mut next_retry = std::time::Instant::now() + retry_delay;
     loop {
         tokio::time::sleep(poll_interval).await;
+
+        // Audit F8: deferred files re-ingest once the endpoint recovers,
+        // discovered by REAL reads on a bounded backoff. ONE trial file
+        // pays for the discovery; only its recovery opens the gate for the
+        // rest — so a dead endpoint costs one file's re-ingest per backoff
+        // step, never the whole set per tick.
+        if !deferred.is_empty()
+            && std::time::Instant::now() >= next_retry
+            && let Some(trial) = deferred.iter().next().cloned()
+        {
+            deferred.remove(&trial);
+            println!(
+                "Retrying deferred file {} (the vision endpoint may be back)",
+                trial.display()
+            );
+            let recovered = watch_ingest_once(
+                &trial,
+                &mut deferred,
+                project_root,
+                model,
+                llm_url,
+                api_key,
+                schema_only,
+                runtime_url,
+                corpus,
+                json_output,
+                mapping,
+                sampling,
+                vision,
+            )
+            .await;
+            if recovered {
+                retry_delay = WATCH_RETRY_MIN_DELAY;
+                for path in deferred.drain().collect::<Vec<_>>() {
+                    println!(
+                        "Vision endpoint is answering again — re-ingesting {}",
+                        path.display()
+                    );
+                    watch_ingest_once(
+                        &path,
+                        &mut deferred,
+                        project_root,
+                        model,
+                        llm_url,
+                        api_key,
+                        schema_only,
+                        runtime_url,
+                        corpus,
+                        json_output,
+                        mapping,
+                        sampling,
+                        vision,
+                    )
+                    .await;
+                }
+            } else {
+                retry_delay = watch_retry_backoff(retry_delay);
+            }
+            next_retry = std::time::Instant::now() + retry_delay;
+        }
 
         let entries: Vec<_> = match std::fs::read_dir(dir) {
             Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
@@ -9686,8 +10148,9 @@ async fn handle_ingest_watch(
 
             if is_new {
                 seen.insert(path.clone(), modified);
-                match handle_ingest(
+                watch_ingest_once(
                     &path,
+                    &mut deferred,
                     project_root,
                     model,
                     llm_url,
@@ -9700,11 +10163,7 @@ async fn handle_ingest_watch(
                     sampling,
                     vision,
                 )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) => eprintln!("  Error: {e}"),
-                }
+                .await;
             }
         }
     }
@@ -15531,6 +15990,420 @@ fn resolve_unauth_llm_url(fallback_url: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// One home for every CLI test that touches the process-wide
+    /// document-understanding registry (the vision seam installs and parks
+    /// its reader there). `cargo test` runs this binary's tests on
+    /// concurrent threads, and per-test locks serialise nothing. Other
+    /// crates' test binaries are separate processes with their own registry
+    /// — the ingest crate's `GLOBAL_REGISTRY_TEST_LOCK` covers those and
+    /// could not race this binary anyway. Async-aware because guards are
+    /// deliberately held across `.await`s.
+    static VISION_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Removes the "vision" adapter a seam test installed, so parallel
+    /// tests that expect "vision" absent are not poisoned.
+    struct DeregisterVision;
+    impl Drop for DeregisterVision {
+        fn drop(&mut self) {
+            let _ = prism_ingest::document::deregister_understanding("vision");
+        }
+    }
+
+    /// A loopback port that was bound and then released: nothing answers
+    /// there, and nothing in these tests should ever contact it.
+    fn unanswered_llm_config() -> prism_ingest::LlmConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        prism_ingest::LlmConfig {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "stub-vlm".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The production deferral branch (`deferred_vision_pages`, the same
+    /// function `run_local_text_ingest_file` records into its summary): a
+    /// damaged PDF whose vision endpoint key is withdrawn DEFERS the blocked
+    /// pages — a fragment naming the key, the reason and the page numbers —
+    /// while a document with no seam running gets no fragment at all. It is
+    /// a fragment, not a summary (audit F2): the caller attaches it and
+    /// proceeds with extraction; deferral must never displace the stored
+    /// facts. No endpoint is ever contacted.
+    #[tokio::test]
+    async fn a_damaged_pdf_defers_its_pages_when_the_vision_endpoint_is_withdrawn() {
+        use prism_ingest::document::{
+            Damage, Modality, PageNote, PageText, ReadOutcome, Understanding, VisionSeam,
+        };
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
+
+        let outcome = ReadOutcome {
+            understanding: Understanding {
+                adapter_id: "text-layer".into(),
+                modality: Modality::TextLayer,
+                pages: vec![PageText {
+                    number: 2,
+                    text: String::new(),
+                }],
+            },
+            notes: vec![PageNote {
+                number: 2,
+                damage: Damage::new("empty", "no text recovered"),
+                recovered_by: None,
+            }],
+            skipped: Vec::new(),
+        };
+
+        // A run's seam after its breaker tripped: started, then withdrawn
+        // with the reader's own last error — the exact state
+        // `VisionSeam::observe` leaves behind after consecutive failures.
+        let mut seam = VisionSeam::start(unanswered_llm_config())
+            .await
+            .expect("the seam starts");
+        seam.withdraw("the vision reader failed 3 consecutive read(s); last: connection refused")
+            .await;
+
+        let deferred = deferred_vision_pages(Some(&seam), &outcome)
+            .expect("a damaged document with the key withdrawn must defer its pages");
+        assert_eq!(deferred["waiting_on"], "llm.vision.endpoint");
+        assert_eq!(
+            deferred["pages"],
+            serde_json::json!([2]),
+            "the deferred pages are machine-readable for the re-run",
+        );
+        let reason = deferred["reason"]
+            .as_str()
+            .expect("the deferral reason is a sentence");
+        assert!(reason.contains("connection refused"), "{reason}");
+        assert!(
+            reason.contains("p2"),
+            "the deferred page is named: {reason}"
+        );
+        assert!(
+            reason.contains("ingested now"),
+            "the reason must promise the rest of the document is stored, \
+             not discarded (audit F2): {reason}",
+        );
+
+        // No seam (no vision configured): today's behaviour — proceed,
+        // degraded but reported upstream, with nothing to defer against.
+        assert!(
+            deferred_vision_pages(None, &outcome).is_none(),
+            "without a seam the document must proceed exactly as before",
+        );
+    }
+
+    /// The run-level seam init (audit F11): one call initialises the slot,
+    /// activates the reader component, and installs the vision adapter in
+    /// the process-wide registry — no probe, no network. In a module whose
+    /// premise is that silent degradation is the enemy, an init that
+    /// silently produced a fiberless runtime (no park, no reader, flat text
+    /// forever) was the worst exit; this pins the wiring that makes it
+    /// impossible.
+    #[tokio::test]
+    async fn ensure_vision_seam_activates_the_reader_for_the_run() {
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
+        let cfg = unanswered_llm_config();
+
+        let mut slot: Option<prism_ingest::document::VisionSeam> = None;
+        ensure_vision_seam(&mut slot, cfg.clone()).await;
+
+        let seam = slot.as_ref().expect("the run slot must be initialised");
+        let status = seam.status();
+        assert_eq!(status.len(), 1, "one supervised component");
+        assert_eq!(
+            status[0].state,
+            prism_runtime::seam::FiberState::Active,
+            "the reader component must be ACTIVE for the whole run, so a \
+             mid-corpus withdrawal actually runs its tombstone inverse \
+             (audit F3): {:?}",
+            status[0],
+        );
+        assert!(
+            prism_ingest::document::registry().get("vision").is_some(),
+            "activation must install the vision adapter",
+        );
+
+        // Second call in the same run: the slot is reused, not rebuilt.
+        ensure_vision_seam(&mut slot, cfg).await;
+        assert_eq!(
+            slot.as_ref().map(|seam| seam.status().len()),
+            Some(1),
+            "a later file must reuse the run's seam, never stack a second one",
+        );
+    }
+
+    /// Round four's R2: in a reused process (watch mode, the TUI), run 1's
+    /// `retire` leaves the tombstone under the id "vision" — so run 2's
+    /// direct-registration fallback finds the id taken. A register-only
+    /// fallback swallowed that at `tracing::debug!` and the tombstone stood:
+    /// vision permanently off from run 2 onward, announced nowhere. The
+    /// fallback must DISPLACE whatever holds the id.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn register_vision_reader_displaces_a_previous_runs_tombstone() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
+        // A fake renderer on PATH so the LIVE reader reports Ready
+        // deterministically — the assertion below distinguishes live from
+        // tombstone by readiness, which must not depend on the host having
+        // poppler.
+        let fake_bin = tempfile::tempdir().expect("fake bin dir");
+        let fake = fake_bin.path().join("pdftoppm");
+        std::fs::write(&fake, "#!/bin/sh\nexit 7\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _path = PathGuard::prepend(fake_bin.path());
+
+        // Run 1 ends: retire installs the tombstone.
+        let seam = prism_ingest::document::VisionSeam::start(unanswered_llm_config())
+            .await
+            .expect("the seam starts");
+        seam.retire().await;
+        assert!(
+            !prism_ingest::document::registry()
+                .get("vision")
+                .expect("the tombstone stands after retirement")
+                .readiness()
+                .is_ready(),
+            "precondition: run 1 left the tombstone",
+        );
+
+        // Run 2's fallback must install a LIVE reader over it.
+        register_vision_reader(unanswered_llm_config());
+        assert!(
+            prism_ingest::document::registry()
+                .get("vision")
+                .expect("a reader is installed")
+                .readiness()
+                .is_ready(),
+            "the fallback must displace run 1's tombstone with a live reader \
+             — a register-only fallback leaves vision permanently off",
+        );
+    }
+
+    /// Round four's R7: the operator-facing skip line is worded by the
+    /// note's typed `kind`. An adapter that RAN and failed was available —
+    /// calling it "unavailable" is the exact defect the typed kind exists
+    /// to prevent.
+    #[test]
+    fn a_failed_reader_is_not_reported_as_unavailable() {
+        use prism_ingest::document::{FailureOrigin, SkipKind, SkipNote};
+
+        let failed = SkipNote {
+            adapter_id: "vision".into(),
+            reason: "rendering page 1: pdftoppm failed".into(),
+            kind: SkipKind::Failed(FailureOrigin::Local),
+        };
+        let line = skip_note_line(&failed);
+        assert!(line.contains("document reader failed"), "{line}");
+        assert!(
+            !line.contains("unavailable"),
+            "an adapter that ran must not be called unavailable: {line}",
+        );
+        assert!(
+            line.contains("vision: rendering page 1: pdftoppm failed"),
+            "the id and the adapter's own reason survive: {line}",
+        );
+
+        let unavailable = SkipNote {
+            adapter_id: "vision".into(),
+            reason: "'pdftoppm' is not on PATH".into(),
+            kind: SkipKind::Unavailable,
+        };
+        let line = skip_note_line(&unavailable);
+        assert!(line.contains("document reader unavailable"), "{line}");
+        assert!(!line.contains("failed —"), "{line}");
+    }
+
+    /// Audit F9 + round four's R3, the exit verdict at DOCUMENT
+    /// granularity: the run fails when at least
+    /// [`STARVED_RUN_ERROR_PERCENT`] of its PDF-backed documents deferred
+    /// pages and stored zero facts. The round-three gate demanded ALL PDFs
+    /// starved, so "399 of 400 starved plus one junk fact" exited 0. A
+    /// `.csv` in the directory must not vouch for the PDFs, one junk fact
+    /// must not vouch for the run, a deferred document that stored its
+    /// sound pages' facts is never starved, and a genuinely partial
+    /// deferral (below the threshold) stays exit 0 with a visible count.
+    #[test]
+    fn a_starved_run_is_an_error_and_a_genuinely_partial_one_is_not() {
+        let deferred_empty = serde_json::json!({
+            "backend": "local_text",
+            "format": "pdf",
+            "facts_written": 0,
+            "deferred": {"waiting_on": "llm.vision.endpoint", "reason": "r", "pages": [2]},
+        });
+        let deferred_stored = serde_json::json!({
+            "backend": "local_text",
+            "format": "pdf",
+            "facts_written": 4,
+            "deferred": {"waiting_on": "llm.vision.endpoint", "reason": "r", "pages": [7]},
+        });
+        let clean_pdf = serde_json::json!({
+            "backend": "local_text",
+            "format": "pdf",
+            "facts_written": 0,
+        });
+        let csv = serde_json::json!({"backend": "local_tabular", "format": "csv"});
+        // A non-PDF that one day carries `deferred` — the gate must count
+        // starvation over PDFs only, or this pushes `starved` past the
+        // denominator and disarms it.
+        let deferred_txt = serde_json::json!({
+            "backend": "local_text",
+            "format": "txt",
+            "facts_written": 0,
+            "deferred": {"waiting_on": "llm.vision.endpoint", "reason": "r", "pages": [1]},
+        });
+
+        // Every PDF starved: the muzzle chain's end state, and it must be
+        // loud, with exact counts.
+        let batch = vec![deferred_empty.clone(), deferred_empty.clone()];
+        assert_eq!(ingest_summary_deferrals(&batch), 2);
+        let message = deferred_and_nothing_stored(&batch)
+            .expect("a run whose every PDF starved must exit non-zero");
+        assert!(message.contains("stored nothing"), "{message}");
+        assert!(message.contains("2 of 2"), "exact counts: {message}");
+        assert!(
+            message.contains(DEFERRED_NOTHING_STORED_MARKER),
+            "watch mode recognises the error by this marker: {message}",
+        );
+
+        // Round four's R3: 399 of 400 starved is not "partial" in any
+        // ordinary sense. The round-three `==` gate exited 0 here.
+        let mut nearly_all = vec![deferred_stored.clone()];
+        nearly_all.resize(400, deferred_empty.clone());
+        let message = deferred_and_nothing_stored(&nearly_all)
+            .expect("399 of 400 starved PDFs must exit non-zero");
+        assert!(message.contains("399 of 400"), "exact counts: {message}");
+
+        // A tabular file beside the starved PDF must NOT vouch for it —
+        // round two's gate compared deferrals against ALL summaries and
+        // exited 0 here.
+        assert!(
+            deferred_and_nothing_stored(&[deferred_empty.clone(), csv.clone()]).is_some(),
+            "a csv in the directory must not make a starved PDF run green",
+        );
+
+        // At the (inclusive) threshold: half the corpus starved IS the
+        // outage costing the run its PDFs, even when the other half's
+        // deferred document stored facts.
+        assert!(
+            deferred_and_nothing_stored(&[deferred_empty.clone(), deferred_stored.clone()])
+                .is_some(),
+            "half the PDF corpus starving is the run's verdict, not a footnote",
+        );
+
+        // Below the threshold the deferral stays a visible count, exit 0:
+        // a deferred document that stored facts is alive (never starved),
+        // and an undeferred PDF's zero facts are its own honest outcome.
+        assert!(
+            deferred_and_nothing_stored(&[
+                deferred_empty.clone(),
+                deferred_stored,
+                clean_pdf.clone()
+            ])
+            .is_none(),
+            "one starved PDF in three is a visible count, never an error",
+        );
+        assert!(
+            deferred_and_nothing_stored(&[
+                deferred_empty.clone(),
+                clean_pdf.clone(),
+                clean_pdf.clone()
+            ])
+            .is_none()
+        );
+
+        // The starved count is filtered to PDF-backed summaries: a deferred
+        // non-PDF neither trips the gate on its own…
+        assert!(
+            deferred_and_nothing_stored(&[
+                deferred_txt.clone(),
+                clean_pdf.clone(),
+                clean_pdf.clone()
+            ])
+            .is_none(),
+            "a deferred non-PDF must not count as a starved PDF",
+        );
+        // …nor disarms it when a PDF genuinely starved.
+        assert!(
+            deferred_and_nothing_stored(&[deferred_txt, deferred_empty]).is_some(),
+            "a deferred non-PDF must not push starved past the denominator \
+             and silently disable the gate",
+        );
+
+        // No PDFs at all: this gate has no opinion.
+        assert!(deferred_and_nothing_stored(&[csv]).is_none());
+        assert!(deferred_and_nothing_stored(&[clean_pdf]).is_none());
+    }
+
+    /// Round four's R3: the run-level deferral count must be visible to
+    /// `--json` consumers, not only in the human branch — as a TOP-LEVEL
+    /// `deferred_documents` field on both payload shapes.
+    #[test]
+    fn the_json_payload_carries_the_run_level_deferral_count() {
+        let summary = serde_json::json!({
+            "backend": "local_text",
+            "format": "pdf",
+            "facts_written": 3,
+        });
+
+        let single = ingest_json_payload(vec![summary.clone()], 1);
+        assert_eq!(
+            single["deferred_documents"], 1,
+            "a single-file payload carries the run-level count: {single}",
+        );
+        assert_eq!(
+            single["backend"], "local_text",
+            "the single summary is still the payload itself: {single}",
+        );
+
+        let multi = ingest_json_payload(vec![summary.clone(), summary], 2);
+        assert_eq!(
+            multi["deferred_documents"], 2,
+            "a multi-file payload carries the run-level count: {multi}",
+        );
+        assert_eq!(
+            multi["documents"]
+                .as_array()
+                .expect("summaries ride under `documents`")
+                .len(),
+            2,
+        );
+    }
+
+    /// Audit F8: watch-mode recovery retries are REAL re-ingests, so they
+    /// are paced — doubling from a minute to a capped ceiling while the
+    /// endpoint stays dead — never fired free by a probe that could be
+    /// wrong about the reader.
+    #[test]
+    fn the_watch_retry_schedule_doubles_and_caps() {
+        assert_eq!(
+            watch_retry_backoff(WATCH_RETRY_MIN_DELAY),
+            WATCH_RETRY_MIN_DELAY * 2,
+        );
+        let mut delay = WATCH_RETRY_MIN_DELAY;
+        for _ in 0..16 {
+            delay = watch_retry_backoff(delay);
+        }
+        assert_eq!(
+            delay, WATCH_RETRY_MAX_DELAY,
+            "the schedule must cap, not grow unboundedly",
+        );
+        assert_eq!(
+            watch_retry_backoff(WATCH_RETRY_MAX_DELAY),
+            WATCH_RETRY_MAX_DELAY
+        );
+    }
+
     /// The credential must never leave the machine for a host the caller
     /// merely named. `--dashboard-url` is a free string on `mesh publish` and
     /// `query --federated`, and the agent tool schemas expose it to the model,
@@ -19071,6 +19944,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("a project-installed non-default ontology must reach text ingest");
@@ -19133,6 +20007,14 @@ data:\n\
     /// yet" refusal branch makes this die on `skipped`.
     #[tokio::test]
     async fn local_text_ingest_parses_a_pdf_on_device() {
+        // This drives PRODUCTION dispatch, which starts a real `VisionSeam`
+        // and registers a live "vision" reader in the process-wide registry
+        // — proven with `--nocapture`. Unlocked and uncleaned, that live
+        // reader can flip the tombstone assertion in
+        // `handle_ingest_fails_loudly_when_every_pdf_starves_behind_vision`
+        // running on a parallel thread.
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
         let dir = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
         let root = dir.path();
         let pdf = root.join("paper.pdf");
@@ -19149,6 +20031,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("a parseable PDF must ingest locally");
@@ -19166,6 +20049,10 @@ data:\n\
     /// skip, not a silent empty success, and not a crash of the whole run.
     #[tokio::test]
     async fn local_text_ingest_reports_an_unparseable_pdf_honestly() {
+        // Same registry hygiene as `local_text_ingest_parses_a_pdf_on_device`:
+        // production dispatch touches the process-wide vision registry.
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
         let dir = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
         let root = dir.path();
         let pdf = root.join("broken.pdf");
@@ -19182,6 +20069,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect_err("a malformed PDF must be an error, not a silent skip");
@@ -19323,6 +20211,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("a document with one bad fact must still ingest the good ones");
@@ -19457,6 +20346,372 @@ data:\n\
         );
     }
 
+    /// Audit F2, end to end through PRODUCTION dispatch
+    /// (`run_local_text_ingest_file` against a mocked extraction LLM): a PDF
+    /// with a damaged page, ingested while the vision endpoint key is
+    /// withdrawn, still EXTRACTS AND STORES — and its summary carries the
+    /// `deferred` record naming the blocked pages. The old code returned a
+    /// parked summary before extraction, discarding every sound page of a
+    /// 40-page paper over one micrograph, and the run exited 0 having
+    /// stored nothing.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_deferred_pdf_still_extracts_and_stores_its_readable_text() {
+        use prism_ingest::document::VisionSeam;
+
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
+
+        let mut server = mockito::Server::new_async().await;
+        let extraction = r#"{"facts":[
+            {"subject":"alloy","predicate":"has_measurement","object":"note","value":3.0,"unit":"customer:U-1","conditions":[],"confidence":0.9,"kind":"measurement","evidence_class":"research"}
+        ]}"#;
+        let _mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            // Cites line 3: pdf-extract renders this fixture with two
+            // leading blank lines, and a citation quoting an empty line is
+            // dropped as malformed.
+            .with_body_from_request(agentic_extraction_responder_citing(extraction, 3))
+            .create_async()
+            .await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+
+        let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = project.path();
+        let pdf = root.join("micrograph-paper.pdf");
+        // Sparse on purpose: under the 120-char floor, so the page is
+        // damaged and — with no vision reader active — stays unrecovered.
+        std::fs::write(&pdf, minimal_pdf("Figure 3: cross-section micrograph")).unwrap();
+
+        // The run-scoped seam after its breaker tripped: started, then
+        // withdrawn with the reader's own last error — the tombstone stands
+        // in the registry (restored by the guard above); no network.
+        let mut seam = VisionSeam::start(unanswered_llm_config())
+            .await
+            .expect("the seam starts");
+        seam.withdraw("the vision reader failed 3 consecutive read(s); last: connection refused")
+            .await;
+        let mut vision_seam = Some(seam);
+
+        let summary = run_local_text_ingest_file(
+            &pdf,
+            root,
+            Some("test-extractor"),
+            Some(&server.url()),
+            None,
+            "http://192.0.2.1:1",
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+            &mut vision_seam,
+        )
+        .await
+        .expect("a deferred document must still ingest its readable text");
+
+        // The muzzle check: extraction RAN and stored. A parked-and-empty
+        // summary here is the corpus-killer coming back.
+        assert!(
+            summary["facts_written"].as_u64().is_some_and(|n| n > 0),
+            "the readable text must be extracted and stored despite the \
+             deferral (audit F2): {summary}",
+        );
+        // And the deferral is recorded, machine-readably, for the re-run.
+        let deferred = summary
+            .get("deferred")
+            .expect("the blocked pages must be recorded on the summary");
+        assert_eq!(deferred["waiting_on"], "llm.vision.endpoint");
+        assert_eq!(deferred["pages"], serde_json::json!([1]));
+        assert!(
+            deferred["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("connection refused")),
+            "{deferred}",
+        );
+    }
+
+    /// A PATH override that puts a directory FIRST, so a fake renderer
+    /// shadows any real one. Restored on drop; callers hold
+    /// `boot_checks::ENV_LOCK` for the duration.
+    struct PathGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+    impl PathGuard {
+        fn prepend(dir: &Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            let mut paths: Vec<std::path::PathBuf> = vec![dir.to_path_buf()];
+            if let Some(previous) = &previous {
+                paths.extend(std::env::split_paths(previous));
+            }
+            let joined = std::env::join_paths(paths).expect("PATH joins");
+            unsafe { std::env::set_var("PATH", joined) };
+            Self { previous }
+        }
+    }
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// A fake `pdftoppm` on PATH that "renders" every page by emitting a
+    /// small REAL PNG — so the vision reader's rasterise and crop steps
+    /// succeed and the only thing left to fail is the endpoint call itself.
+    /// Callers hold `boot_checks::ENV_LOCK` for the PATH override.
+    fn fake_renderer_emitting_a_real_png() -> (tempfile::TempDir, PathGuard) {
+        use base64::Engine as _;
+        // A 64×48 flat-grey RGB PNG, 121 bytes.
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(concat!(
+                "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAwCAIAAAAuKetIAAAAQElEQVR42u3PMQ0AAAwDoPpXVlm1",
+                "sHcJOCB9LgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICVwP3MCGlAxJ6DgAAAABJ",
+                "RU5ErkJggg==",
+            ))
+            .expect("embedded PNG decodes");
+        let fake_bin = tempfile::tempdir().expect("fake bin dir");
+        std::fs::write(fake_bin.path().join("page.png"), png).unwrap();
+        let fake = fake_bin.path().join("pdftoppm");
+        std::fs::write(&fake, "#!/bin/sh\ncat \"$(dirname \"$0\")/page.png\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = PathGuard::prepend(fake_bin.path());
+        (fake_bin, path)
+    }
+
+    /// An LLM endpoint that ANSWERS and fails every call — HTTP 400, as a
+    /// text-only model handed a PNG answers. Failing on the wire is what
+    /// makes the failure REMOTE (round four's R1): a fake renderer that
+    /// merely exits non-zero is a LOCAL failure now, and local failures
+    /// defer nothing and trip no breaker.
+    async fn endpoint_refusing_every_read() -> mockito::ServerGuard {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_body("no vision-capable model is loaded")
+            .create_async()
+            .await;
+        server
+    }
+
+    /// Audits F9, B2 and B6 through `handle_ingest` ITSELF — the function
+    /// the watch loop calls, which previously had zero test callers (a
+    /// verifier replaced the exit gate's call site with a no-op and the
+    /// whole suite stayed green). A corpus whose only PDF is fully scanned,
+    /// read while the live vision reader's ENDPOINT call fails (the render
+    /// itself succeeds — a local render failure is not a deferral, R1),
+    /// must:
+    /// 1. NOT abort or discard the file (B2): it yields a summary with zero
+    ///    facts and machine-readable deferred pages;
+    /// 2. exit non-zero carrying the deferral marker (F9), because every
+    ///    PDF-backed document starved;
+    /// 3. retire its seam on the way out (B6): the registry holds the
+    ///    tombstone, never a stale live reader;
+    /// and the watch loop's bookkeeping, driven by that same real error,
+    /// must keep the file retry-eligible (F8).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn handle_ingest_fails_loudly_when_every_pdf_starves_behind_vision() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
+
+        let (_fake_bin, _path) = fake_renderer_emitting_a_real_png();
+        let server = endpoint_refusing_every_read().await;
+
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+        let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = project.path();
+        let pdf = root.join("scanned.pdf");
+        // No readable text at all: the whole document depends on vision.
+        std::fs::write(&pdf, minimal_pdf(" ")).unwrap();
+
+        // The vision reader inherits this endpoint; extraction never runs
+        // (no text survives to extract), so the 400s are all it answers.
+        let llm_url = server.url();
+        let err = handle_ingest(
+            &pdf,
+            root,
+            Some("test-extractor"),
+            Some(&llm_url),
+            None,
+            false,
+            "http://192.0.2.1:1",
+            None,
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await
+        .expect_err("a run whose every PDF starved behind vision must exit non-zero");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(DEFERRED_NOTHING_STORED_MARKER),
+            "watch mode keys its retry off this marker: {message}",
+        );
+        assert!(message.contains("stored nothing"), "{message}");
+
+        // B6: the run retired its component on the way out — the registry
+        // holds the tombstone with the run-ended reason, never a stale live
+        // reader for the next surface in this process to trust.
+        match prism_ingest::document::registry()
+            .get("vision")
+            .expect("the tombstone stands after the run")
+            .readiness()
+        {
+            prism_ingest::document::Readiness::Unavailable(reason) => {
+                assert!(reason.contains("run ended"), "{reason}");
+            }
+            prism_ingest::document::Readiness::Ready => panic!(
+                "handle_ingest must retire the seam: a stale live reader \
+                 survived the run"
+            ),
+        }
+
+        // F8: the watch loop's bookkeeping, driven by the SAME real error —
+        // the fully-starved file keeps its retry eligibility.
+        let mut deferred = std::collections::HashSet::new();
+        let fully_ingested = watch_ingest_once(
+            &pdf,
+            &mut deferred,
+            root,
+            Some("test-extractor"),
+            Some(&llm_url),
+            None,
+            false,
+            "http://192.0.2.1:1",
+            None,
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await;
+        assert!(!fully_ingested);
+        assert!(
+            deferred.contains(&pdf),
+            "a fully-starved file must keep its retry eligibility",
+        );
+    }
+
+    /// Round four's R5, restoring coverage round three deleted with
+    /// `deferred_watch_files_retry_only_when_the_endpoint_answers`: the
+    /// watch loop's retry set is driven by `watch_ingest_once`'s Ok arms,
+    /// and a verifier deleted BOTH `deferred.insert(...)` and
+    /// `deferred.remove(path)` from them with the suite staying green — a
+    /// cleanly-ingested file could sit in the retry set forever, and a
+    /// deferred one could silently lose its retry. Schema-only keeps the
+    /// starved-run error gate out of the way, so the deferral arrives as
+    /// `Ok(report.deferred_documents > 0)` — the exact arm the Err-path
+    /// test above cannot reach.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn deferred_watch_files_leave_the_retry_set_only_when_clean() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _registry = VISION_REGISTRY_TEST_LOCK.lock().await;
+        let _cleanup = DeregisterVision;
+
+        let (_fake_bin, _path) = fake_renderer_emitting_a_real_png();
+        let server = endpoint_refusing_every_read().await;
+        let llm_url = server.url();
+
+        let project = project_with_ontology_config("[ontology]\nid = \"emmo\"\n");
+        let root = project.path();
+        let scanned = root.join("scanned.pdf");
+        std::fs::write(&scanned, minimal_pdf(" ")).unwrap();
+        let sound = root.join("sound.pdf");
+        // Comfortably above the sparse floor, so no page escalates and no
+        // vision read happens: a clean ingest.
+        std::fs::write(
+            &sound,
+            minimal_pdf(
+                "A genuine paragraph of body text about nickel superalloy \
+                 disks, powder metallurgy processing, and thermal cracking \
+                 behaviour in alloys with high refractory content such as \
+                 molybdenum, niobium and tungsten.",
+            ),
+        )
+        .unwrap();
+
+        let mut deferred = std::collections::HashSet::new();
+
+        // A deferral through the REAL run report: the file must ENTER the
+        // retry set and the run must not report full ingestion.
+        let fully_ingested = watch_ingest_once(
+            &scanned,
+            &mut deferred,
+            root,
+            Some("test-extractor"),
+            Some(&llm_url),
+            None,
+            true, // schema-only: no store, no extraction model
+            "http://192.0.2.1:1",
+            None,
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await;
+        assert!(!fully_ingested, "a deferred run is not a full ingest");
+        assert!(
+            deferred.contains(&scanned),
+            "a file whose run deferred documents must enter the retry set",
+        );
+
+        // A clean ingest must LEAVE the set — pre-seeded, then re-ingested
+        // cleanly. Without the `deferred.remove`, this file retries forever
+        // with nothing going red.
+        deferred.insert(sound.clone());
+        let fully_ingested = watch_ingest_once(
+            &sound,
+            &mut deferred,
+            root,
+            Some("test-extractor"),
+            Some(&llm_url),
+            None,
+            true,
+            "http://192.0.2.1:1",
+            None,
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await;
+        assert!(fully_ingested, "a clean run reports full ingestion");
+        assert!(
+            !deferred.contains(&sound),
+            "a cleanly-ingested file must leave the retry set",
+        );
+        // The genuinely deferred file keeps its eligibility — another
+        // file's success must not drain it.
+        assert!(deferred.contains(&scanned));
+    }
+
     /// THE FULL LOOP through production dispatch: Phase 1 enqueues a
     /// CONTRACT CHANGE: a value-less legacy `measurement` hint is no longer
     /// a population refusal. The generic relation stores immediately, so a
@@ -19510,6 +20765,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("the representable relation ingests");
@@ -19623,6 +20879,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("a representable value-less relation must ingest cleanly");
@@ -19756,6 +21013,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("the alias-bearing document must ingest");
@@ -19842,6 +21100,17 @@ data:\n\
     fn agentic_extraction_responder(
         facts_json: &str,
     ) -> impl Fn(&mockito::Request) -> Vec<u8> + Send + Sync + 'static {
+        agentic_extraction_responder_citing(facts_json, 1)
+    }
+
+    /// [`agentic_extraction_responder`] with the cited line as a parameter,
+    /// for fixtures whose evidence does not sit on line 1 — a PDF's
+    /// extracted text starts wherever `pdf-extract` puts it, and a citation
+    /// quoting an empty line is (correctly) dropped as malformed.
+    fn agentic_extraction_responder_citing(
+        facts_json: &str,
+        cited_line: u32,
+    ) -> impl Fn(&mockito::Request) -> Vec<u8> + Send + Sync + 'static {
         let envelope: serde_json::Value = serde_json::from_str(facts_json).expect("facts fixture");
         let facts = envelope["facts"]
             .as_array()
@@ -19854,7 +21123,7 @@ data:\n\
                 "type": "function",
                 "function": {
                     "name": "read_paper",
-                    "arguments": serde_json::json!({"from_line": 1, "to_line": 1}).to_string(),
+                    "arguments": serde_json::json!({"from_line": cited_line, "to_line": cited_line}).to_string(),
                 }
             }]}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
@@ -19870,8 +21139,8 @@ data:\n\
                     "name": "propose_fact",
                     "arguments": serde_json::json!({
                         "fact": fact,
-                        "from_line": 1,
-                        "to_line": 1,
+                        "from_line": cited_line,
+                        "to_line": cited_line,
                     }).to_string(),
                 }
             }));
@@ -19997,6 +21266,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("the promoted ontology's text fact must ingest");
@@ -20188,6 +21458,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("an extension-proposing reader must ingest");
@@ -20448,6 +21719,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("a multi-window document must ingest");
@@ -20624,6 +21896,7 @@ data:\n\
             None,
             prism_ingest::text_extract::SamplingPolicy::default(),
             VisionModelChoice::default(),
+            &mut None,
         )
         .await
         .expect("a failed loop is a reported result, not a crash");

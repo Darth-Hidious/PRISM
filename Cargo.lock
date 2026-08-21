@@ -5301,6 +5301,7 @@ dependencies = [
  "prism-ontology",
  "prism-provenance",
  "prism-retrieval",
+ "prism-runtime",
  "reqwest",
  "serde",
  "serde_json",
@@ -5529,9 +5530,11 @@ name = "prism-runtime"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "backon",
  "chrono",
  "directories",
+ "futures",
  "prism-core",
  "reqwest",
  "serde",

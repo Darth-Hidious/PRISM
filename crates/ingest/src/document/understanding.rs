@@ -349,6 +349,33 @@ impl UnderstandingRegistry {
         self.by_id.get(id).map(|&idx| self.adapters[idx].clone())
     }
 
+    /// Remove the adapter registered under `id`, returning it. The id must be
+    /// taken — a typo must not report success while the adapter it meant to
+    /// remove keeps answering. Escalation order of the remaining adapters is
+    /// preserved.
+    ///
+    /// This is the plane's removal inverse: now that an adapter can be
+    /// installed by a supervised component (see
+    /// [`super::vision_seam::VisionReaderComponent`]), installation has to be
+    /// undoable without leaving a stand-in behind — a registry that can only
+    /// ever grow cannot be recovered exactly.
+    pub fn deregister(&mut self, id: &str) -> Result<Arc<dyn DocumentUnderstanding>> {
+        let Some(&idx) = self.by_id.get(id) else {
+            bail!("no document-understanding adapter '{id}' registered to deregister");
+        };
+        let adapter = self.adapters.remove(idx);
+        self.decls.remove(idx);
+        // Removal shifts every later adapter down one slot; rebuild the index
+        // rather than patching it, so it cannot drift from the vectors.
+        self.by_id = self
+            .decls
+            .iter()
+            .enumerate()
+            .map(|(i, decl)| (decl.id, i))
+            .collect();
+        Ok(adapter)
+    }
+
     /// Every adapter claiming `media_type`, in registration (escalation)
     /// order. Availability is NOT filtered here — the caller reports which
     /// adapters it skipped and why, so an unavailable vision adapter produces
@@ -415,6 +442,20 @@ pub fn replace_understanding(
         "document-understanding adapter replaced in the process-wide registry"
     );
     Ok(displaced)
+}
+
+/// Remove an adapter from the process-wide registry — the inverse of
+/// [`register_understanding`]. Returns the removed adapter.
+pub fn deregister_understanding(id: &str) -> Result<Arc<dyn DocumentUnderstanding>> {
+    let removed = REGISTRY
+        .write()
+        .expect("document-understanding registry lock poisoned")
+        .deregister(id)?;
+    tracing::info!(
+        id,
+        "document-understanding adapter removed from the process-wide registry"
+    );
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -535,6 +576,41 @@ mod tests {
         );
         assert_eq!(reg.candidates("tiff").len(), 1, "new claim is live");
         assert_eq!(reg.all().len(), 1, "replaced in place, not appended");
+    }
+
+    /// Deregistration is exact: the named adapter goes, everything else keeps
+    /// its escalation order, and an absent id is refused rather than
+    /// reporting a removal that never happened.
+    #[test]
+    fn deregister_removes_exactly_the_named_adapter() {
+        let mut reg = UnderstandingRegistry::builtin();
+        reg.register(fake("zzz-vision", &["pdf"])).unwrap();
+        reg.register(fake("zzz-third", &["pdf"])).unwrap();
+
+        let removed = reg
+            .deregister("zzz-vision")
+            .expect("a registered id must be removable");
+        assert_eq!(removed.id(), "zzz-vision");
+
+        let ids: Vec<&str> = reg.candidates("pdf").iter().map(|a| a.id()).collect();
+        assert_eq!(
+            ids,
+            ["text-layer", "zzz-third"],
+            "the survivors keep their escalation order",
+        );
+        // The index survived the shift: the shifted adapter is still
+        // reachable by id, and the removed one is gone.
+        assert_eq!(
+            reg.get("zzz-third").expect("still registered").id(),
+            "zzz-third"
+        );
+        assert!(reg.get("zzz-vision").is_none());
+
+        let err = match reg.deregister("zzz-vision") {
+            Err(e) => e,
+            Ok(_) => panic!("an absent id must be refused"),
+        };
+        assert!(format!("{err:#}").contains("no document-understanding"));
     }
 
     #[test]

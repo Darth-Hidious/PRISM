@@ -9,6 +9,12 @@ authors.workspace = true
 [dependencies]
 url.workspace = true
 anyhow.workspace = true
+# The `seam` Component trait must be object-safe AND async (activation talks
+# to the network); async fn in traits alone cannot be boxed as `dyn`.
+async-trait.workspace = true
+# `FutureExt::catch_unwind`: one panicking seam inverse must not abandon the
+# inverses below it on the stack (audit F5).
+futures.workspace = true
 # Bounded exponential backoff with jitter, so no crate has to hand-roll (and
 # get wrong) its own retry loop.
 backon.workspace = true

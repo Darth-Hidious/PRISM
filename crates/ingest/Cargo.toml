@@ -28,6 +28,9 @@ polars = { workspace = true }
 pdf-extract = { workspace = true }
 image = { workspace = true }
 prism-llm = { path = "../llm" }
+# The composability seam: the vision reader is installed/parked through a
+# supervised component instead of an unconditional registration.
+prism-runtime = { path = "../runtime" }
 prism-embed = { path = "../embed" }
 prism-ontology = { path = "../ontology" }
 prism-provenance = { path = "../provenance" }

@@ -25,6 +25,7 @@ mod rasterise;
 mod text_layer;
 mod understanding;
 mod vision;
+mod vision_seam;
 
 pub use quality::{
     BUILTIN_SIGNALS, Damage, DamagePolicy, DamageSignal, is_degenerate, text_layer_damage,
@@ -34,11 +35,17 @@ pub use rasterise::CommandRasteriser;
 pub use text_layer::TextLayerUnderstanding;
 pub use understanding::{
     DocumentUnderstanding, Modality, PageText, Policy, Readiness, SourceDocument, Understanding,
-    UnderstandingRegistry, register_understanding, registry, replace_understanding,
+    UnderstandingRegistry, deregister_understanding, register_understanding, registry,
+    replace_understanding,
 };
 pub use vision::{PageRasteriser, VisionUnderstanding};
+pub use vision_seam::{
+    VISION_ENDPOINT_KEY, VISION_READER_COMPONENT, VisionEndpoint, VisionReaderComponent,
+    VisionSeam, vision_deferral_reason,
+};
 
 use anyhow::{Result, bail};
+use std::fmt;
 
 /// What a read produced, and everything that happened on the way — including
 /// what did NOT happen. A page recovered by vision, a page left damaged
@@ -51,10 +58,80 @@ pub struct ReadOutcome {
     /// Per-page notes, in page order. Empty when every page read cleanly on
     /// the first adapter.
     pub notes: Vec<PageNote>,
-    /// Adapters that could have helped but could not run, with the reason
-    /// each gave. Surfaced to the user verbatim: "vision is unavailable
-    /// because X" is actionable, a silently missing capability is not.
-    pub skipped: Vec<String>,
+    /// Adapters that contributed nothing, with the reason each gave.
+    /// Surfaced to the user verbatim: "vision is unavailable because X" is
+    /// actionable, a silently missing capability is not.
+    pub skipped: Vec<SkipNote>,
+}
+
+/// Why one adapter contributed nothing to a read.
+///
+/// Typed, not a formatted string: [`vision_seam`] trips its breaker off
+/// these notes, and a decision that greps a sentence assembled in this
+/// module would be one rewording away from never firing again — proven: a
+/// verifier changed the sentence's format and every test stayed green. The
+/// fields are the contract; [`fmt::Display`] is only presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipNote {
+    /// The adapter that contributed nothing, by its registry id.
+    pub adapter_id: String,
+    /// The reason it gave (a readiness sentence, or the read error).
+    pub reason: String,
+    /// Whether the adapter never ran, or ran and failed.
+    pub kind: SkipKind,
+}
+
+/// How an adapter came to be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipKind {
+    /// Readiness said no — the adapter never ran, so this says nothing
+    /// about whether its backend is alive.
+    Unavailable,
+    /// The adapter RAN and its read failed, on the recorded side of the
+    /// wire. Only `Failed(FailureOrigin::Remote)` is evidence about the
+    /// backend itself.
+    Failed(FailureOrigin),
+}
+
+/// Which side of the wire a failed read died on.
+///
+/// The breaker in [`vision_seam`] withdraws the endpoint key off `Failed`
+/// notes, and before this distinction existed it counted every failure as
+/// the endpoint's: three encrypted PDFs in a row exiting poppler non-zero
+/// read exactly like three dead-host timeouts, and parked a perfectly
+/// healthy endpoint for the rest of the corpus. A local failure is a fact
+/// about THIS file or THIS machine, never about the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureOrigin {
+    /// The failure happened before anything left the machine — rendering,
+    /// cropping, configuration. Says nothing about the endpoint, so it may
+    /// never count against it.
+    Local,
+    /// The endpoint call itself failed: refused, timed out, or answered
+    /// non-2xx. The only origin the breaker may count.
+    Remote,
+}
+
+/// Context an adapter attaches around its ENDPOINT call — and nowhere else —
+/// so [`escalate`](read) can put a failed read on the correct side of the
+/// wire. A skip note is stamped [`FailureOrigin::Remote`] only when the
+/// error chain carries this type; a failure without it stays
+/// [`FailureOrigin::Local`] and can never trip the endpoint breaker.
+/// Displays as the message it wraps, so marking a call adds no noise to the
+/// operator-facing error chain.
+#[derive(Debug)]
+pub struct EndpointCall(pub String);
+
+impl fmt::Display for EndpointCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for SkipNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.adapter_id, self.reason)
+    }
 }
 
 /// What happened to one page.
@@ -161,7 +238,11 @@ async fn escalate(
             break;
         }
         if let Readiness::Unavailable(reason) = adapter.readiness() {
-            skipped.push(format!("{}: {reason}", adapter.id()));
+            skipped.push(SkipNote {
+                adapter_id: adapter.id().to_string(),
+                reason,
+                kind: SkipKind::Unavailable,
+            });
             continue;
         }
 
@@ -182,7 +263,20 @@ async fn escalate(
                 if first {
                     return Err(error);
                 }
-                skipped.push(format!("{}: {error:#}", adapter.id()));
+                // Which side of the wire died: an adapter marks its endpoint
+                // call with [`EndpointCall`]; an unmarked failure (rendering,
+                // cropping, configuration) is local and must never read as
+                // evidence about the endpoint.
+                let origin = if error.downcast_ref::<EndpointCall>().is_some() {
+                    FailureOrigin::Remote
+                } else {
+                    FailureOrigin::Local
+                };
+                skipped.push(SkipNote {
+                    adapter_id: adapter.id().to_string(),
+                    reason: format!("{error:#}"),
+                    kind: SkipKind::Failed(origin),
+                });
                 continue;
             }
         };
@@ -588,17 +682,136 @@ mod tests {
         let (outcome, _) = read_with(vec![text, vision], Policy::default()).await;
 
         assert_eq!(outcome.skipped.len(), 1);
-        assert!(
-            outcome.skipped[0].contains("vision"),
-            "{:?}",
-            outcome.skipped
+        assert_eq!(outcome.skipped[0].adapter_id, "vision");
+        assert_eq!(
+            outcome.skipped[0].kind,
+            SkipKind::Unavailable,
+            "an adapter that never ran must not read as a failed read",
         );
         assert!(
-            outcome.skipped[0].contains("no rasteriser installed"),
+            outcome.skipped[0]
+                .reason
+                .contains("no rasteriser installed"),
             "the reason must survive to the user: {:?}",
             outcome.skipped,
         );
+        assert!(
+            outcome.skipped[0]
+                .to_string()
+                .contains("vision: no rasteriser installed"),
+            "the rendered note keeps the id and the reason",
+        );
         assert_eq!(outcome.unrecovered().count(), 1);
+    }
+
+    /// An adapter that RUNS and fails produces a [`SkipKind::Failed`] note
+    /// carrying its id, its error, and WHICH SIDE OF THE WIRE died —
+    /// through the REAL `escalate`, not a hand-written literal. This note
+    /// is what [`super::VisionSeam::observe`] counts toward withdrawing the
+    /// endpoint key, so its shape here IS the cross-module contract: an
+    /// error carrying [`EndpointCall`] is `Remote`; an unmarked one
+    /// (a crashed renderer, an undecodable render, a config bail) is
+    /// `Local` and may never read as evidence about the endpoint. Change
+    /// what escalation records and this test — not a distant corpus run —
+    /// goes red.
+    #[tokio::test]
+    async fn a_failing_adapter_produces_a_failed_skip_note() {
+        /// Fails before anything could leave the machine.
+        struct FailingLocally;
+        #[async_trait::async_trait]
+        impl DocumentUnderstanding for FailingLocally {
+            fn id(&self) -> &'static str {
+                "vision"
+            }
+            fn media_types(&self) -> &'static [&'static str] {
+                &["pdf"]
+            }
+            fn modality(&self) -> Modality {
+                Modality::Vision
+            }
+            fn readiness(&self) -> Readiness {
+                Readiness::Ready
+            }
+            async fn understand(&self, _doc: &SourceDocument<'_>) -> Result<Understanding> {
+                bail!("rendering page 1: the renderer crashed")
+            }
+        }
+
+        /// Fails inside its marked endpoint call — the vision reader's
+        /// `describe_image` path.
+        struct FailingRemotely;
+        #[async_trait::async_trait]
+        impl DocumentUnderstanding for FailingRemotely {
+            fn id(&self) -> &'static str {
+                "remote-ocr"
+            }
+            fn media_types(&self) -> &'static [&'static str] {
+                &["pdf"]
+            }
+            fn modality(&self) -> Modality {
+                Modality::Vision
+            }
+            fn readiness(&self) -> Readiness {
+                Readiness::Ready
+            }
+            async fn understand(&self, _doc: &SourceDocument<'_>) -> Result<Understanding> {
+                use anyhow::Context as _;
+                Err(anyhow::anyhow!("connection refused"))
+                    .context(EndpointCall("reading page 1 tile r0c0".into()))
+            }
+        }
+
+        let text = scripted(
+            "text-layer",
+            Modality::TextLayer,
+            true,
+            vec![(1, String::new())],
+        );
+        let mut reg = UnderstandingRegistry::new();
+        reg.register(text as Arc<dyn DocumentUnderstanding>)
+            .expect("text layer registers");
+        reg.register(Arc::new(FailingLocally))
+            .expect("locally failing adapter registers");
+        reg.register(Arc::new(FailingRemotely))
+            .expect("remotely failing adapter registers");
+        let doc = SourceDocument::whole(b"%PDF-1.7", "pdf", "t.pdf");
+        let outcome = escalate(&doc, &reg.candidates("pdf"), &DamagePolicy::default())
+            .await
+            .expect("a later adapter failing is not fatal");
+
+        assert_eq!(outcome.skipped.len(), 2, "{:?}", outcome.skipped);
+        let local = &outcome.skipped[0];
+        assert_eq!(local.adapter_id, "vision");
+        assert_eq!(
+            local.kind,
+            SkipKind::Failed(FailureOrigin::Local),
+            "an unmarked failure never left the machine and must not be \
+             typed as evidence about the endpoint",
+        );
+        assert!(
+            local.reason.contains("the renderer crashed"),
+            "the adapter's own error survives verbatim: {local:?}",
+        );
+        let remote = &outcome.skipped[1];
+        assert_eq!(remote.adapter_id, "remote-ocr");
+        assert_eq!(
+            remote.kind,
+            SkipKind::Failed(FailureOrigin::Remote),
+            "a failure carrying EndpointCall died on the wire and is the \
+             only kind the breaker may count",
+        );
+        assert!(
+            remote
+                .reason
+                .contains("reading page 1 tile r0c0: connection refused"),
+            "the marking context displays as the message it wraps — no \
+             noise added to the chain: {remote:?}",
+        );
+        assert_eq!(
+            outcome.unrecovered().count(),
+            1,
+            "the page the failed adapters were meant to rescue stays reported",
+        );
     }
 
     /// A clean document costs exactly one adapter run — escalation is not a

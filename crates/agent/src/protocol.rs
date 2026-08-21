@@ -3762,10 +3762,22 @@ fn emit_publish_view(title: &str, value: &Value) {
     );
 }
 
-fn emit_ingest_view(title: &str, value: &Value) {
-    let items = value_array(value, &[])
+/// The per-document entries an ingest view lists.
+///
+/// A multi-file run reports `{"documents": [...], "deferred_documents": N}`,
+/// because a run-level verdict cannot ride on a bare array and a sidecar would
+/// reintroduce the invisibility that field exists to fix. `value_array` tries
+/// `as_array()` first, so a single-file payload and the older bare-array shape
+/// both still resolve. Named rather than inlined so the container key is pinned
+/// by a test: with it missing, a directory ingest silently renders as one item.
+fn ingest_view_items(value: &Value) -> Vec<Value> {
+    value_array(value, &["documents"])
         .cloned()
-        .unwrap_or_else(|| vec![value.clone()]);
+        .unwrap_or_else(|| vec![value.clone()])
+}
+
+fn emit_ingest_view(title: &str, value: &Value) {
+    let items = ingest_view_items(value);
     let summary = if let Some(graph) = value.get("graph") {
         let nodes = graph
             .get("nodes")
@@ -10525,6 +10537,44 @@ mod browse_slash_tests {
             clip_chars("short", 99),
             "short",
             "under the cap is returned whole"
+        );
+    }
+
+    /// A multi-file `prism ingest --json` payload is an object carrying the
+    /// run-level `deferred_documents` verdict alongside the per-file entries.
+    /// The shipped `/ingest <dir>` view renders one line per document, so if the
+    /// container key is ever dropped the whole run collapses to a single "?" row
+    /// with the raw blob beside it — degraded silently, with every suite green.
+    #[test]
+    fn a_multi_file_ingest_payload_lists_every_document() {
+        let payload = serde_json::json!({
+            "documents": [
+                {"path": "a.pdf", "backend": "platform_text", "chunk_count": 3, "chars": 900},
+                {"path": "b.pdf", "backend": "platform_text", "chunk_count": 5, "chars": 1200},
+            ],
+            "deferred_documents": 1
+        });
+        let items = ingest_view_items(&payload);
+        assert_eq!(
+            items.len(),
+            2,
+            "a directory ingest must list each document, not the envelope"
+        );
+        assert_eq!(items[0].get("path").and_then(|v| v.as_str()), Some("a.pdf"));
+
+        // The single-file object and the older bare array must keep working:
+        // `value_array` tries `as_array()` before consulting the container key.
+        let single = serde_json::json!({"path": "solo.pdf", "backend": "platform_text"});
+        assert_eq!(
+            ingest_view_items(&single).len(),
+            1,
+            "a single-file payload is one item"
+        );
+        let legacy = serde_json::json!([{"path": "a.pdf"}, {"path": "b.pdf"}]);
+        assert_eq!(
+            ingest_view_items(&legacy).len(),
+            2,
+            "a bare array still resolves"
         );
     }
 }

@@ -32,8 +32,8 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use super::{
-    DamagePolicy, DocumentUnderstanding, Modality, PageText, Readiness, SourceDocument,
-    Understanding, is_degenerate,
+    DamagePolicy, DocumentUnderstanding, EndpointCall, Modality, PageText, Readiness,
+    SourceDocument, Understanding, is_degenerate,
 };
 
 /// How a page becomes an image.
@@ -126,11 +126,18 @@ impl VisionUnderstanding {
             for col in 0..cols {
                 let tile = crop_tile(&png, col, row, cols, rows, TILE_OVERLAP)
                     .with_context(|| format!("cropping page {page} tile r{row}c{col}"))?;
+                // The typed [`EndpointCall`] context — around the model call
+                // ALONE — is what puts this failure on the REMOTE side of
+                // the skip note. Render and crop failures above carry plain
+                // string contexts and stay local: poppler crashing on an
+                // encrypted PDF must never read as the endpoint dying.
                 let text = self
                     .llm
                     .describe_image(TRANSCRIBE_PROMPT, &tile, TILE_TOKEN_BOUND)
                     .await
-                    .with_context(|| format!("reading page {page} tile r{row}c{col}"))?;
+                    .with_context(|| {
+                        EndpointCall(format!("reading page {page} tile r{row}c{col}"))
+                    })?;
                 if is_degenerate(&text, &self.damage) {
                     // Reported, not silently dropped: a page that came back
                     // short because a model looped is a different fact from a
