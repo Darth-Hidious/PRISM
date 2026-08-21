@@ -94,10 +94,11 @@ pub fn definition() -> LoadedTool {
     LoadedTool {
         name: SPAWN_SUBAGENT_TOOL.to_string(),
         description: "Delegate a SELF-CONTAINED task to a nested subagent turn \
-            (a full agent loop with the same tools; default model claude-fable-5). \
-            The subagent cannot ask questions — include all context in `task`. \
-            Returns a short summary plus provenance references (expand with \
-            recall(id=…)). For several independent tasks use orchestrate_agents."
+            (same tools). It cannot ask questions — put all context in `task`. \
+            Returns `status` (completed|incomplete), a summary and provenance \
+            refs; `incomplete` means it stopped without a final answer, so do \
+            not report that work as done. For several independent tasks use \
+            orchestrate_agents."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -544,14 +545,43 @@ async fn execute_spawn_subagent_inner(
     // missed — recall(query=…) covers anything not listed).
     let artifacts = harvest_artifacts(parent_session_id, before_ids.as_ref()).await;
 
+    // A child that finished and a child that stopped mid-sentence must not look
+    // the same to the parent.
+    //
+    // `final_text` is the child's answer. When it is absent this falls back to
+    // `streamed_text` — everything the child said WHILE WORKING — and hands it
+    // over as "summary". Google's ADK harness measured exactly this failure
+    // (arXiv 2608.17528, Pattern 4): "A child that timed out, hit its step
+    // limit, paused for approval, or completed normally all returned the exact
+    // same structure... Partial commentary reads exactly like a finished
+    // report." Their root agent reported "all 20 tests passing" from a delegate
+    // that had timed out and written nothing.
+    //
+    // Their fix, adopted here: name the terminal state AND say it in the
+    // summary. "A status field protects the calling code but not the model,
+    // which reads the summary, not the field beside it." Codex's multi-agent
+    // protocol draws the same line, typing every message NEW_TASK | MESSAGE |
+    // FINAL_ANSWER so a parent branches on a kind rather than on prose.
+    let completed = final_text.as_deref().is_some_and(|t| !t.trim().is_empty());
     let summary_src = final_text
         .filter(|t| !t.trim().is_empty())
         .unwrap_or(streamed_text);
+    let summary = clip(summary_src.trim(), SUMMARY_CHARS);
+    let summary = if completed {
+        summary
+    } else {
+        format!(
+            "INCOMPLETE: the subagent stopped without producing a final answer. \
+             What follows is its working commentary, NOT a finished result — do \
+             not report this work as done.\n\n{summary}"
+        )
+    };
     let start = steps.len().saturating_sub(STEPS_SHOWN);
 
     Ok(json!({
         "model": sub.model,
-        "summary": clip(summary_src.trim(), SUMMARY_CHARS),
+        "status": if completed { "completed" } else { "incomplete" },
+        "summary": summary,
         "steps": &steps[start..],
         "artifacts": artifacts,
         "usage": {
@@ -635,6 +665,31 @@ fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A child that stopped mid-sentence must not read like one that finished.
+    ///
+    /// Google's ADK harness measured this (arXiv 2608.17528, Pattern 4): a
+    /// delegate that timed out returned the same shape as one that completed —
+    /// "every line the child had said while working, joined together" — and the
+    /// root agent reported "all 20 tests passing" from a run that wrote nothing.
+    /// PRISM had the same shape: `final_text ... .unwrap_or(streamed_text)`.
+    ///
+    /// The status field alone is not the fix. ADK: "A status field protects the
+    /// calling code but not the model, which reads the summary, not the field
+    /// beside it." So the SUMMARY has to say it too.
+    #[test]
+    fn an_unfinished_subagent_says_so_in_the_summary_not_only_in_a_field() {
+        let def = super::definition();
+        assert!(
+            def.description.contains("completed|incomplete"),
+            "the parent must be told the field exists: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("do not report that work as done"),
+            "and what it means: {}",
+            def.description
+        );
+    }
 
     #[test]
     fn definition_is_conservative() {
