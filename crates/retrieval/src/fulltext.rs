@@ -324,6 +324,24 @@ pub fn parse_pdf(body: &[u8]) -> Result<Fulltext> {
 
 /// Parse JATS XML into located blocks. Sections nest; tables and figure
 /// wraps are captured with their labels and captions.
+///
+/// Wraps are captured from THREE zones, not just `<body>`: measured on a
+/// real PMC document (PMC13302085, MDPI *Materials*), every `<table-wrap>`
+/// and every `<fig>` lived in `<floats-group>` (after `</back>`) or in
+/// `<back>/<app-group>/<app>` — the body held only `<xref>` pointers to
+/// them. A body-only parser silently dropped ALL five tables and ALL eight
+/// figure captions of that paper. `<ref-list>` stays excluded: bibliography
+/// text is not document content.
+///
+/// Table structure is preserved into the text, because the text is the only
+/// thing the reader and the citation spans ever see:
+/// - each row is one line (both JATS table models),
+/// - cells within a row are separated by `|`, and an EMPTY cell keeps its
+///   `|` so later cells stay under their own column headers,
+/// - the wrap's label is visible: a captioned wrap renders as
+///   `"Table 1. <caption>"`, an uncaptioned one carries a `"Table 1"` line
+///   above its rows. Invisible labels made every table unfindable by name —
+///   searching "Table 3" hit prose mentions only, never the table itself.
 pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
     let mut reader = quick_xml::Reader::from_reader(body);
     reader.config_mut().trim_text(true);
@@ -336,9 +354,19 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
     let mut section_stack: Vec<(usize, String)> = Vec::new();
     let mut depth_front: i32 = 0;
     let mut depth_body: i32 = 0;
+    // <floats-group> and <app> hold the tables and figures many publishers
+    // (MDPI among them) keep OUT of <body>.
+    let mut depth_floats: i32 = 0;
+    let mut depth_app: i32 = 0;
     let mut depth_sec: usize = 0;
     // The most recent <sec> is waiting for its <title>.
     let mut awaiting_sec_title = false;
+    // Inside <object-id>: publisher-internal identifiers
+    // ("materials-19-02487-t0A1_Table A1"), not document text.
+    let mut in_object_id = false;
+    // The current wrap's caption block was emitted (and carries the label
+    // heading), so the wrap-close block must not repeat the label.
+    let mut caption_emitted = false;
 
     #[derive(Clone, Copy, PartialEq)]
     enum Sink {
@@ -377,6 +405,9 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                 match e.local_name().as_ref() {
                     b"front" => depth_front += 1,
                     b"body" => depth_body += 1,
+                    b"floats-group" => depth_floats += 1,
+                    b"app" => depth_app += 1,
+                    b"object-id" => in_object_id = true,
                     b"sec" if depth_body > 0 => {
                         depth_sec += 1;
                         awaiting_sec_title = true;
@@ -393,17 +424,25 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         sink = Some(Sink::SecTitle);
                         text.clear();
                     }
-                    b"table-wrap" if depth_body > 0 && sink.is_none() => {
+                    b"table-wrap"
+                        if (depth_body > 0 || depth_floats > 0 || depth_app > 0)
+                            && sink.is_none() =>
+                    {
                         sink = Some(Sink::Wrap);
                         wrap_element = Some("table-wrap");
                         text.clear();
                         current_label = None;
+                        caption_emitted = false;
                     }
-                    b"fig" if depth_body > 0 && sink.is_none() => {
+                    b"fig"
+                        if (depth_body > 0 || depth_floats > 0 || depth_app > 0)
+                            && sink.is_none() =>
+                    {
                         sink = Some(Sink::Wrap);
                         wrap_element = Some("fig");
                         text.clear();
                         current_label = None;
+                        caption_emitted = false;
                     }
                     b"label" if sink == Some(Sink::Wrap) && current_label.is_none() => {
                         // Sentinel: the next text chunk is this wrap's label.
@@ -425,7 +464,23 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         // both, so <row> is a row boundary exactly like <tr>.
                         text.push('\n');
                     }
-                    b"p" if depth_body > 0 && sink.is_none() => {
+                    b"td" | b"th" | b"entry" if sink == Some(Sink::Wrap) => {
+                        // Preserve CELL structure: cells joined with bare
+                        // spaces destroyed column identity — "Inconel 718
+                        // 1375" cannot be split back into alloy and value,
+                        // and a multi-word cell swallows its neighbours.
+                        // ~85% of reported compositions/properties live in
+                        // tables (DiSCoMaT, ACL 2023); the delimiter is what
+                        // lets a reader bind a value to its column header.
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push_str(" |");
+                        }
+                    }
+                    b"p" if (depth_body > 0 || depth_app > 0) && sink.is_none() => {
+                        // <app> paragraphs are document content (appendix
+                        // derivations, symbol definitions); <notes> and
+                        // <ref-list> paragraphs stay excluded because neither
+                        // zone opens a capture depth.
                         sink = Some(Sink::Paragraph);
                         text.clear();
                     }
@@ -453,11 +508,28 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
             // event: it must not open a sink or a depth, or the parser
             // wedges on it and silently drops the rest of the document
             // (e.g. a bare <table-wrap/>).
-            Event::Empty(_) => None,
+            //
+            // One exception acts without opening anything: a self-closing
+            // cell (<td/>) is an EMPTY CELL, not nothing. It must keep its
+            // delimiter or every later cell in the row shifts left one
+            // column and binds to the wrong header.
+            Event::Empty(e) => {
+                if sink == Some(Sink::Wrap)
+                    && matches!(e.local_name().as_ref(), b"td" | b"th" | b"entry")
+                    && !text.is_empty()
+                    && !text.ends_with('\n')
+                {
+                    text.push_str(" |");
+                }
+                None
+            }
             Event::End(e) => {
                 match e.local_name().as_ref() {
                     b"front" => depth_front -= 1,
                     b"body" => depth_body -= 1,
+                    b"floats-group" => depth_floats -= 1,
+                    b"app" => depth_app -= 1,
+                    b"object-id" => in_object_id = false,
                     b"sec" if depth_body >= 0 => {
                         // Close every section entry opened at this depth (there is
                         // at most one per depth).
@@ -494,12 +566,24 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                     b"caption" if sink == Some(Sink::Caption) => {
                         let caption = take(&mut text);
                         if !caption.is_empty() {
+                            // The label joins the visible text: "Table 1.
+                            // Measured conductivity…" is how the document
+                            // itself names the table, and it is the string a
+                            // reader searches for. A label held only in the
+                            // locator made every table unfindable by name.
+                            let caption = match current_label.as_deref() {
+                                Some(label) => {
+                                    format!("{}. {caption}", label.trim_end_matches('.'))
+                                }
+                                None => caption,
+                            };
                             blocks.push((
                                 BlockKind::Caption,
                                 section_path(&section_stack),
                                 current_label.clone(),
                                 caption,
                             ));
+                            caption_emitted = true;
                         }
                         sink = Some(Sink::Wrap);
                     }
@@ -514,7 +598,18 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                     {
                         let content = take(&mut text);
                         let is_fig = wrap_element == Some("fig");
-                        if !content.is_empty() || current_label.is_some() {
+                        // When no caption carried the label into the text,
+                        // the wrap's own block does: a "Table 1" line above
+                        // the rows is what makes the table findable at the
+                        // table, not only in prose mentions of it.
+                        let content = match current_label.as_deref() {
+                            Some(label) if !caption_emitted && !content.is_empty() => {
+                                format!("{label}\n{content}")
+                            }
+                            Some(label) if !caption_emitted => label.to_string(),
+                            _ => content,
+                        };
+                        if !content.is_empty() {
                             blocks.push((
                                 if is_fig {
                                     BlockKind::Caption
@@ -529,6 +624,7 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         sink = None;
                         wrap_element = None;
                         current_label = None;
+                        caption_emitted = false;
                     }
                     _ => {}
                 }
@@ -539,6 +635,13 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
         };
         if let Some(chunk) = chunk
             && let Some(kind) = sink
+            // <object-id> text is a publisher-internal identifier
+            // ("materials-19-02487-t0A1_Table A1"), not document text. For a
+            // CAPTIONED wrap the caption arm's text.clear() happens to wipe
+            // it; for an uncaptioned wrap nothing does, and the junk would
+            // lead the table's evidence text. Excluded at the source so
+            // neither shape depends on that accident.
+            && !in_object_id
         {
             let trimmed = chunk.trim().to_string();
             if trimmed.is_empty() {
@@ -547,7 +650,14 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                 text.pop();
                 current_label = Some(trimmed);
             } else {
-                if !text.is_empty() && !text.ends_with(' ') && !text.ends_with('[') {
+                // No joiner space at a row start: a '\n' already separates,
+                // and the space it used to add put every table row behind a
+                // leading blank (" 200 | 800").
+                if !text.is_empty()
+                    && !text.ends_with(' ')
+                    && !text.ends_with('[')
+                    && !text.ends_with('\n')
+                {
                     text.push(' ');
                 }
                 text.push_str(&trimmed);
@@ -705,7 +815,10 @@ mod tests {
             .find(|b| b.locator.kind == BlockKind::Caption)
             .unwrap();
         assert_eq!(caption.locator.label.as_deref(), Some("Table 1"));
-        assert_eq!(caption.text, "Measured conductivity at 300 K.");
+        // The label is IN the visible text — "Table 1. …" is the string a
+        // reader searches for; a locator-only label left the table
+        // unfindable by name.
+        assert_eq!(caption.text, "Table 1. Measured conductivity at 300 K.");
 
         // Offsets point into plain_text faithfully.
         for block in &ft.blocks {
@@ -801,12 +914,165 @@ mod tests {
         assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
         let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
         // Exact row structure: three separate rows, so the two alloys'
-        // numbers (950 / 1375) never share one. This equality is the
-        // assertion; a weaker `.any()` after it could never fail first.
+        // numbers (950 / 1375) never share one — and cells keep their
+        // boundaries, so "Inconel 718 | 1375" splits back into alloy and
+        // value instead of fusing into an unparseable "Inconel 718 1375".
+        // This equality is the assertion; a weaker `.any()` after it could
+        // never fail first.
         assert_eq!(
             rows,
-            vec!["Alloy UTS (MPa)", "Ti-6Al-4V 950", "Inconel 718 1375"]
+            vec!["Alloy | UTS (MPa)", "Ti-6Al-4V | 950", "Inconel 718 | 1375"]
         );
+    }
+
+    /// A self-closing `<td/>` is an EMPTY CELL, not nothing: it must keep
+    /// its `|` or every later cell in the row shifts left one column and
+    /// binds to the wrong header. Under the old space-join the porosity
+    /// column below would silently vanish and 950 would read as porosity.
+    #[test]
+    fn empty_cells_hold_their_column_position() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Empty cell probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <table-wrap>
+        <label>Table 1</label>
+        <table>
+          <tr><th>Alloy</th><th>Porosity (%)</th><th>UTS (MPa)</th></tr>
+          <tr><td>Ti-6Al-4V</td><td/><td>950</td></tr>
+        </table>
+      </table-wrap>
+    </sec>
+  </body>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let table = ft
+            .blocks
+            .iter()
+            .find(|b| b.locator.kind == BlockKind::Table)
+            .unwrap();
+        let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "Table 1",
+                "Alloy | Porosity (%) | UTS (MPa)",
+                "Ti-6Al-4V | | 950"
+            ]
+        );
+    }
+
+    /// Measured on PMC13302085 (MDPI *Materials*): EVERY `<table-wrap>` and
+    /// EVERY `<fig>` lived in `<floats-group>` or `<back>/<app-group>`, not
+    /// in `<body>` — a body-only parser dropped all of them silently. Wraps
+    /// from both zones must reach the block stream; `<ref-list>` text must
+    /// not.
+    #[test]
+    fn floats_group_and_appendix_wraps_are_captured() {
+        let body = r#"<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front>
+    <article-meta>
+      <title-group><article-title>Floats probe</article-title></title-group>
+      <abstract><p>Abstract text.</p></abstract>
+    </article-meta>
+  </front>
+  <body>
+    <sec>
+      <title>1. Section</title>
+      <p>Process parameters are listed in Table 1.</p>
+    </sec>
+  </body>
+  <back>
+    <app-group>
+      <app>
+        <title>Appendix A</title>
+        <p>HD denotes hatch distance.</p>
+        <table-wrap>
+          <object-id pub-id-type="pii">materials-00-00000-t0A1_Table A1</object-id>
+          <label>Table A1</label>
+          <table>
+            <tr><th>Ref</th><th>Power (W)</th></tr>
+            <tr><td>Smith 2020</td><td>400</td></tr>
+          </table>
+        </table-wrap>
+      </app>
+    </app-group>
+    <ref-list><ref><mixed-citation>Old citation text.</mixed-citation></ref></ref-list>
+  </back>
+  <floats-group>
+    <table-wrap>
+      <label>Table 1</label>
+      <caption><p>Process parameters.</p></caption>
+      <table>
+        <tr><th>Power (W)</th><th>Speed (mm/s)</th></tr>
+        <tr><td>200</td><td>800</td></tr>
+      </table>
+    </table-wrap>
+    <fig>
+      <label>Figure 1</label>
+      <caption><p>Melt pool geometry.</p></caption>
+      <graphic xlink:href="fig1.jpg"/>
+    </fig>
+  </floats-group>
+</article>"#;
+        let ft = parse_jats(body.as_bytes()).unwrap();
+        let table_1 = ft
+            .blocks
+            .iter()
+            .find(|b| {
+                b.locator.kind == BlockKind::Table && b.locator.label.as_deref() == Some("Table 1")
+            })
+            .expect("the floats-group table must reach the block stream");
+        assert_eq!(
+            table_1.text.lines().collect::<Vec<_>>(),
+            vec!["Power (W) | Speed (mm/s)", "200 | 800"]
+        );
+        assert!(
+            ft.plain_text.contains("Table 1. Process parameters."),
+            "the floats-group table's caption must carry its label: {}",
+            ft.plain_text
+        );
+        assert!(
+            ft.plain_text.contains("Figure 1. Melt pool geometry."),
+            "the floats-group figure caption must reach the text: {}",
+            ft.plain_text
+        );
+
+        let table_a1 = ft
+            .blocks
+            .iter()
+            .find(|b| {
+                b.locator.kind == BlockKind::Table && b.locator.label.as_deref() == Some("Table A1")
+            })
+            .expect("the appendix table must reach the block stream");
+        // Uncaptioned on purpose: this is the shape where <object-id> junk
+        // would lead the evidence text (a caption's text.clear() is what
+        // wipes it for captioned wraps), and where the label must ride the
+        // table block itself.
+        assert_eq!(
+            table_a1.text.lines().collect::<Vec<_>>(),
+            vec!["Table A1", "Ref | Power (W)", "Smith 2020 | 400"]
+        );
+        assert!(
+            !table_a1.text.contains("materials-00-00000"),
+            "object-id junk must not enter the evidence text: {}",
+            table_a1.text
+        );
+        assert!(
+            ft.plain_text.contains("HD denotes hatch distance."),
+            "appendix prose must reach the text: {}",
+            ft.plain_text
+        );
+        // Bibliography text is still not document content.
+        assert!(!ft.plain_text.contains("Old citation text"));
     }
 
     /// H6: the text of a <xref ref-type="bibr"> is a citation marker by
@@ -886,8 +1152,14 @@ mod tests {
         assert_eq!(table.locator.label.as_deref(), Some("Table 1"));
         let rows: Vec<&str> = table.text.lines().map(str::trim).collect();
         // Exact row structure: two separate rows, so the two alloys'
-        // numbers (950 / 1375) never share one.
-        assert_eq!(rows, vec!["Ti-6Al-4V 950", "Inconel 718 1375"]);
+        // numbers (950 / 1375) never share one. The wrap has a label but no
+        // caption, so the label rides the table block itself as its first
+        // line — otherwise "Table 1" would exist only in the locator and the
+        // table would be unfindable by name.
+        assert_eq!(
+            rows,
+            vec!["Table 1", "Ti-6Al-4V | 950", "Inconel 718 | 1375"]
+        );
     }
 
     #[test]

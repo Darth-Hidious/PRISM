@@ -4891,6 +4891,52 @@ fn structured_success(root: &str, invocation: &str, stdout: String, extra: Value
     Value::Object(object)
 }
 
+/// Wrap a finished workflow run, deriving `success`/`exit_code` from the
+/// workflow's OWN step statuses instead of stamping success over them.
+///
+/// `execute_workflow_with_policy_and_options` deliberately returns `Ok` for
+/// runs whose ordered step results carry status `"failed"` or `"partial"` —
+/// per its own contract, so callers receive the outcome "without the run
+/// becoming either a silent success or a whole-run error". Routing every `Ok`
+/// through `structured_success` (hardcoded `success: true, exit_code: 0`)
+/// re-created exactly that silent success at this boundary: the is_error gate
+/// read `success`, provenance recorded "ok", saturation counted a good call,
+/// and a run whose every step failed passed `has_evidence`. Derive the flag
+/// from the statuses the workflow itself reported.
+fn workflow_result_value(
+    invocation: &str,
+    spec: &WorkflowSpec,
+    result: &WorkflowRunResult,
+) -> Value {
+    let not_clean: Vec<String> = result
+        .steps
+        .iter()
+        .filter(|step| matches!(step.status.as_str(), "failed" | "partial"))
+        .map(|step| format!("{} ({})", step.id, step.status))
+        .collect();
+    let mut value = structured_success(
+        "workflow",
+        invocation,
+        render_workflow_result(spec, result),
+        json!({
+            "workflow": result.workflow,
+            "mode": result.mode,
+            "steps": result.steps,
+            "context": result.context,
+        }),
+    );
+    if !not_clean.is_empty() {
+        value["success"] = json!(false);
+        value["exit_code"] = json!(1);
+        value["stderr"] = json!(format!(
+            "workflow '{}' did not complete cleanly; step(s) not completed: {}",
+            result.workflow,
+            not_clean.join(", ")
+        ));
+    }
+    value
+}
+
 fn structured_failure(root: &str, invocation: &str, error: &anyhow::Error) -> Value {
     json!({
         "root": root,
@@ -5407,17 +5453,7 @@ async fn execute_workflow_command(
                 )
                 .await
                 {
-                    Ok(result) => structured_success(
-                        "workflow",
-                        invocation,
-                        render_workflow_result(spec, &result),
-                        json!({
-                            "workflow": result.workflow,
-                            "mode": result.mode,
-                            "steps": result.steps,
-                            "context": result.context,
-                        }),
-                    ),
+                    Ok(result) => workflow_result_value(invocation, spec, &result),
                     Err(error) => structured_failure("workflow", invocation, &error),
                 },
                 None => structured_failure(
@@ -5582,6 +5618,14 @@ pub fn is_command_tool(tool_name: &str) -> bool {
 /// is hidden from the offered catalog (hidden ≠ unexecutable).
 pub fn command_tool_requires_approval(tool_name: &str) -> Option<bool> {
     spec_by_name(tool_name).map(|spec| spec.requires_approval)
+}
+
+/// The declared permission mode of a command tool (`None` if no such command
+/// tool; aliases and roots resolve like every other spec lookup). Lets the
+/// safety pre-hook key on the capability the spec table already declares
+/// instead of guessing from words in tool arguments.
+pub(crate) fn command_tool_permission_mode(tool_name: &str) -> Option<PermissionMode> {
+    spec_by_name(tool_name).map(|spec| spec.permission_mode)
 }
 
 pub fn command_tool_preview(tool_name: &str, args: &Value) -> Option<String> {
@@ -6022,6 +6066,92 @@ mod tests {
         }
     }
     use super::*;
+
+    // ── M2: workflow tool results must carry the workflow's OWN outcome ──
+
+    fn m2_spec() -> WorkflowSpec {
+        WorkflowSpec {
+            name: "wf".into(),
+            description: "test workflow".into(),
+            command_name: "wf".into(),
+            source_path: "memory".into(),
+            default_mode: "execute".into(),
+            arguments: Vec::new(),
+            steps: Vec::new(),
+            raw: Value::Null,
+        }
+    }
+
+    fn m2_step(id: &str, status: &str) -> prism_workflows::WorkflowStepResult {
+        prism_workflows::WorkflowStepResult {
+            id: id.into(),
+            action: "tool".into(),
+            status: status.into(),
+            summary: format!("{id}: {status}"),
+            data: Value::Null,
+        }
+    }
+
+    fn m2_run(steps: Vec<prism_workflows::WorkflowStepResult>) -> WorkflowRunResult {
+        WorkflowRunResult {
+            workflow: "wf".into(),
+            mode: "execute".into(),
+            context: BTreeMap::new(),
+            steps,
+        }
+    }
+
+    #[test]
+    fn m2_failed_workflow_run_is_not_success() {
+        let run = m2_run(vec![m2_step("a", "completed"), m2_step("b", "failed")]);
+        let value = workflow_result_value("workflow run wf", &m2_spec(), &run);
+        assert_eq!(value["success"], json!(false), "failed run stamped success");
+        assert_ne!(value["exit_code"], json!(0));
+        assert!(
+            crate::tool_result::tool_result_is_error(&value),
+            "the is_error gate must see the failure"
+        );
+        let stderr = value["stderr"].as_str().unwrap();
+        assert!(
+            stderr.contains("b (failed)"),
+            "stderr must name the step: {stderr}"
+        );
+    }
+
+    #[test]
+    fn m2_partial_workflow_run_is_not_success() {
+        let run = m2_run(vec![m2_step("fan_out", "partial")]);
+        let value = workflow_result_value("workflow run wf", &m2_spec(), &run);
+        assert_eq!(
+            value["success"],
+            json!(false),
+            "partial run stamped success"
+        );
+        assert_ne!(value["exit_code"], json!(0));
+        assert!(crate::tool_result::tool_result_is_error(&value));
+        assert!(
+            value["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("fan_out (partial)")
+        );
+    }
+
+    #[test]
+    fn m2_clean_workflow_run_is_success() {
+        // "planned" (dry-run) and "skipped" are clean outcomes, not failures.
+        let run = m2_run(vec![
+            m2_step("a", "completed"),
+            m2_step("b", "planned"),
+            m2_step("c", "skipped"),
+        ]);
+        let value = workflow_result_value("workflow run wf", &m2_spec(), &run);
+        assert_eq!(value["success"], json!(true));
+        assert_eq!(value["exit_code"], json!(0));
+        assert!(!crate::tool_result::tool_result_is_error(&value));
+        // The structured payload still carries the ordered step results.
+        assert_eq!(value["steps"].as_array().unwrap().len(), 3);
+    }
 
     #[tokio::test]
     async fn anonymous_chat_workflow_run_is_refused_at_execution_boundary() {

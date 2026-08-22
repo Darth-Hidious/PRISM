@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — the research loop reaches the graph
+
+- **PRISM called PRISM and deadlocked on its own database.** A live autonomous
+  run found 113 papers, chose the eight with fetchable full text, and began
+  ingesting. 113 entities landed; every extraction died on
+  `Locking error: Failed locking file '.prism/provenance.db-wal'`. The agent held
+  an `Arc<ProvenanceStore>` for the whole turn while shelling out to
+  `prism papers claims --store`, and libsql's local backend takes an EXCLUSIVE
+  lock on the WAL file — unlike stock SQLite, which permits multi-process WAL.
+
+  The run ledger now holds a `PathBuf` and opens per write. Three holders were
+  fixed, not one: `run_turn`, `subagent.rs`, and `orchestrator.rs` — so every
+  subagent and every fan-out lane would have died the same way on first ingest.
+  `open` retries that one lock error under a 5s bound, the file-lock analogue of
+  the `busy_timeout` it already sets. Both tests spawn REAL child processes,
+  because a mock passes while the loop stays broken.
+
+- **Extraction produced narration instead of facts.** 688 assertions with
+  subjects like `"the model"` and `"Figure 6"` and predicates like `stands for`
+  and `shows`. Three constraints stacked: the reader received ONE ontology from a
+  registry holding many (`all()` had no ontology-side caller); the vocabulary was
+  reachable only one class at a time through a tool; and the prompt said
+  *"Spend them on proposing, not on looking"* while a proposal had to cite a
+  range read in an EARLIER turn. Narration was the only affordable output,
+  because narration needs no vocabulary.
+
+  The reader now sees every loaded ontology — install polymer, add alloy, both
+  govern; sell pharma, pharma governs, with no code edit. The vocabulary is
+  deliberately NOT placed in the prompt: a controlled ablation
+  (arXiv:2605.29168) measured in-context ontology cutting extracted triples 41%
+  and qualifiers 81% versus open extraction plus post-hoc correction, which
+  reached the same 98% conformance with 1.7x the recall. A test asserts no class
+  labels reach the prompt.
+
+  **Measured, same model and topic, before and after: assertions carrying a
+  numeric value rose from 32% to 59%.** Real values now land — `IN718 bare plate
+  — laser absorptivity → 0.51`, `NIST AMB2025-06 — volumetric energy density →
+  72.9 J/mm3`.
+
+### Fixed — sharded ontology induction
+
+- **A draft could not seed induction, which made sharding unusable.** `--base`
+  loaded through the path that refuses DRAFT artifacts, so folding N shards
+  required promoting N unreviewed ontologies first — precisely what the draft
+  gate exists to prevent. Seeding now waives the ACCEPTED status and nothing
+  else; structural validation is unchanged, and what comes out of a fold is
+  itself a draft.
+
+- **Every relation was silently discarded at the fold — 6,168 of 6,168.** The
+  artifact states `rdfs:domain` and `rdfs:range` for each relation and validation
+  already guarantees both name a declared class, but `adapter()` built every
+  `RelationDecl` with empty vectors. The seeder then blamed the data:
+  *"its domain or range is not among the seeded classes"* — which was never true.
+  This is why exactly five EMMO relations went missing from all eight shards
+  identically, `hasProperty` and `isPartOf` among them.
+
+- **Colliding relation labels rejected the merged artifact** — 2,259 violations
+  across 950 labels, because two shards of one corpus both name the verb
+  "abrades". Relations now get the same qualification classes already had.
+
+- **Classes declaring the same canonical `skos:exactMatch` are one class.** The
+  fold discarded the EMMO IRI its own shards declared, leaving eight parallel
+  taxonomies with no shared root.
+
+  Result: eight shards fold into a validated artifact of **6,893 classes and
+  6,170 relations**, every relation carrying both endpoints.
+
+### Added — a composability seam
+
+- `crates/runtime/src/seam.rs`. Fifty hand-written `impl Drop` guards in this
+  tree are each one inverse written longhand, and `python-bridge/src/pool.rs`
+  solves teardown ordering by relying on struct field declaration order. The
+  seam makes that one mechanism: an effect registers its undo where it acts, a
+  missing dependency parks instead of erroring, and a provider withdraws only
+  after its dependents have deactivated. There is no teardown to write.
+
+  Its first consumer is the vision reader. `VisionUnderstanding::readiness()`
+  only ever checked the rasteriser, so a dead `LLM_VISION_URL` reported Ready as
+  long as poppler was installed and the CLI stored the flat text anyway. Three
+  consecutive REMOTE read failures now withdraw the key; recovery is a real read
+  on a bounded backoff, so there is no second auth rule and no synthetic probe
+  that can be wrong about a healthy endpoint. `SkipNote` carries
+  `Failed(Local|Remote)`, so a crashed renderer can never be counted against an
+  endpoint.
+
+
 ### Fixed — tool transport
 
 - **A timed-out tool call could hand its late response to the NEXT caller.**

@@ -46,7 +46,20 @@ allow if {
 
 # Research ingestion — owner decision 2026-07-07 ("should be allowed"): the
 # research agent may ingest into the knowledge graph without admin approval.
-# Scoped to knowledge_ingest only; every other destructive tool stays gated.
+# The exemption covers the whole research-ingestion FAMILY — the tools whose
+# only write is adding knowledge to the graph. Scoping it to the single name
+# "knowledge_ingest" while `ingest`/`ingest_file`/`ingest_watch` (same intent,
+# and `ingest_file` is advertised in the agent's core tool set) stayed denied
+# made those tools permanently unreachable: the agent loop hardcodes
+# role="agent", so the deny below always fired. Genuinely destructive tools
+# (delete/restart/deploy/compute-spend) stay gated.
+research_ingest_tools := {
+    "knowledge_ingest",
+    "ingest",
+    "ingest_file",
+    "ingest_watch",
+}
+
 allow if {
     input.role in {"agent", "operator"}
     input.action == "tool.call"
@@ -54,7 +67,7 @@ allow if {
 }
 
 research_ingest_exempt if {
-    input.resource == "knowledge_ingest"
+    input.resource in research_ingest_tools
     input.role in {"agent", "operator"}
     # An ingest call is a write by nature; a delete-mode call is NOT research
     # ingestion and stays admin-gated.
@@ -160,7 +173,9 @@ destructive_tools := {
     "deploy",
     "deploy_create",
     "deploy_stop",
-    # Ingest-class writes — siblings of knowledge_ingest.
+    # Ingest-class writes — siblings of knowledge_ingest. Classified
+    # destructive so delete-mode calls stay admin-gated, but plain research
+    # ingestion is exempted for agent/operator via research_ingest_tools above.
     "ingest",
     "ingest_file",
     "ingest_watch",

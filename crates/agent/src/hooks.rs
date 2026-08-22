@@ -145,8 +145,48 @@ impl HookRegistry {
 
 // ── Built-in hooks ──────────────────────────────────────────────────
 
-/// Pre-hook on ALL tools. Scans arg values for destructive keywords.
-/// If found, aborts with a reason string.
+/// Resolve whether a tool can WRITE, from what the harness already declares
+/// about it — never from the words in its arguments.
+///
+/// Resolution order mirrors how the catalog itself is assembled:
+/// 1. Command-tool specs (`COMMAND_TOOLS`) declare a `permission_mode` per
+///    tool (aliases included).
+/// 2. Native meta-tools carry an exhaustive effect classification
+///    ([`crate::meta_tools::MetaTool::effect`]).
+/// 3. Python/platform tools fall through to the global permission map, where
+///    an UNKNOWN tool defaults to `WorkspaceWrite` — so an unregistered tool
+///    is treated as write-capable (the scan stays fail-closed for tools the
+///    harness knows nothing about).
+fn tool_is_write_capable(tool_name: &str) -> bool {
+    use crate::permissions::PermissionMode;
+    if let Some(mode) = crate::command_tools::command_tool_permission_mode(tool_name) {
+        return mode != PermissionMode::ReadOnly;
+    }
+    if let Some(meta) = crate::meta_tools::MetaTool::from_name(tool_name) {
+        return meta.effect() != crate::meta_tools::MetaToolEffect::ReadOnly;
+    }
+    crate::permissions::get_tool_permission(tool_name) != PermissionMode::ReadOnly
+}
+
+/// Pre-hook on ALL tools: a destructive-keyword tripwire for WRITE-CAPABLE
+/// tools only.
+///
+/// The gate keys on the tool's registered write capability — a fact the
+/// harness already knows — never on English words in a read-only tool's
+/// arguments. A search string is data: "droplet spreading in LPBF" and
+/// "hydrogen removal from Ti melts" are this product's own domain language,
+/// and the previous unanchored `contains` scan over EVERY tool's string
+/// arguments aborted exactly those searches ("drop" in "droplet", "remove"
+/// in "removal") ahead of every real gate in the system.
+///
+/// For write-capable tools the keywords match as WHOLE WORDS (alphanumeric/
+/// underscore token boundaries). Honest scope: this catches the model
+/// spelling out an explicit destructive verb ("DROP TABLE", "git reset
+/// --hard", "delete the store") to a tool that can write. It cannot catch
+/// destructive intent phrased without these words, hidden inside code, or
+/// fused into an identifier ("drop_table") — it is a tripwire, not a
+/// security boundary. The real gates (permission map, OPA policy, approval)
+/// still run after it.
 pub fn safety_hook() -> Hook {
     let destructive: HashSet<&str> = ["delete", "drop", "remove", "destroy", "truncate", "reset"]
         .into_iter()
@@ -155,32 +195,41 @@ pub fn safety_hook() -> Hook {
     Hook {
         name: "safety_guard".into(),
         before: Some(Box::new(move |tool_name, inputs| {
+            // Read-only tools take queries, not commands. Their arguments
+            // are never scanned.
+            if !tool_is_write_capable(tool_name) {
+                return HookResult::default();
+            }
             if let Value::Object(map) = inputs {
                 for (key, val) in map {
                     if let Value::String(s) = val {
                         let lowered = s.to_lowercase();
-                        for &pattern in &destructive {
-                            if lowered.contains(pattern) {
-                                return HookResult {
-                                    abort: true,
-                                    // Name a recourse that EXISTS. The flag this
-                                    // cited (`--dangerously-accept-all`) appears
-                                    // nowhere in the codebase, so the only
-                                    // actionable line in the message was false.
-                                    // `/bash` and `/python` are the real
-                                    // override: they run the same policy,
-                                    // permission, skill and provenance gates but
-                                    // treat THIS scan as advisory, because a
-                                    // human typed the command.
-                                    reason: format!(
-                                        "Blocked: '{}' detected in {}.{}. \
-                                         Run it yourself with /bash or /python if \
-                                         that is what you meant.",
-                                        pattern, tool_name, key
-                                    ),
-                                    modified_inputs: None,
-                                };
-                            }
+                        if let Some(word) = lowered
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .find(|token| destructive.contains(token))
+                        {
+                            // The caller receiving this abort is the MODEL,
+                            // which cannot invoke slash commands — so the
+                            // recourse it is given is one it can actually
+                            // take: ask the human. A human-typed /bash or
+                            // /python runs the same policy, permission,
+                            // skill and provenance gates but treats THIS
+                            // scan as advisory, because a human asked.
+                            return HookResult {
+                                abort: true,
+                                reason: format!(
+                                    "Blocked: the word '{}' appears in {}.{} \
+                                     and '{}' can write. If the user asked \
+                                     for exactly this, ask them to run it \
+                                     themselves with /bash or /python (the \
+                                     human-typed path treats this check as \
+                                     advisory). Otherwise rephrase without \
+                                     the destructive wording or use a \
+                                     read-only tool.",
+                                    word, tool_name, key, tool_name
+                                ),
+                                modified_inputs: None,
+                            };
                         }
                     }
                 }
@@ -752,6 +801,100 @@ mod tests {
         let inputs = json!({"query": "SELECT * FROM users"});
         let result = registry.fire_before("sql_exec", &inputs);
         assert!(!result.abort);
+    }
+
+    // ── M1: the gate keys on write capability, never on words in a
+    // read-only tool's query ─────────────────────────────────────────
+
+    #[test]
+    fn m1_read_only_search_accepts_domain_language() {
+        // `papers` is declared ReadOnly in COMMAND_TOOLS. Melt-pool
+        // literature is made of the word "droplet"; these queries previously
+        // aborted on the unanchored substrings "drop"/"remove".
+        let registry = build_default_hooks();
+        for query in [
+            "droplet spreading in LPBF",
+            "hydrogen removal from Ti melts",
+            "support removal after additive manufacturing",
+            "drop tower microgravity solidification",
+        ] {
+            let result = registry.fire_before("papers", &json!({ "query": query }));
+            assert!(
+                !result.abort,
+                "read-only search must accept {query:?}: {}",
+                result.reason
+            );
+        }
+    }
+
+    #[test]
+    fn m1_read_only_tool_is_never_scanned_even_for_exact_words() {
+        // Stronger than anchoring: even an EXACT destructive word in a
+        // read-only tool's argument passes, because a query is data, not a
+        // command. Covers all three capability-resolution branches:
+        // command-tool spec (`papers`), meta-tool effect (`recall`), and the
+        // global permission map (`materials_search`).
+        let registry = build_default_hooks();
+        for tool in ["papers", "recall", "materials_search"] {
+            let result = registry.fire_before(tool, &json!({ "query": "how to delete and reset" }));
+            assert!(
+                !result.abort,
+                "read-only tool '{tool}' must never be scanned: {}",
+                result.reason
+            );
+        }
+    }
+
+    #[test]
+    fn m1_write_capable_tool_is_still_gated() {
+        // `execute_bash` is FullAccess; `knowledge_ingest` is WorkspaceWrite.
+        // A whole destructive word in their arguments still aborts.
+        let registry = build_default_hooks();
+        let bash = registry.fire_before("execute_bash", &json!({ "command": "git reset --hard" }));
+        assert!(bash.abort, "write-capable tool must stay gated");
+        assert!(bash.reason.contains("reset"));
+        let ingest = registry.fire_before(
+            "knowledge_ingest",
+            &json!({ "content": "DROP TABLE users" }),
+        );
+        assert!(ingest.abort, "workspace-write tool must stay gated");
+    }
+
+    #[test]
+    fn m1_write_capable_gate_matches_whole_words_not_substrings() {
+        // "Dropbox" contains "drop" and "droplet_data" contains "drop";
+        // neither is the word. This goes RED if the scan reverts to
+        // `contains`.
+        let registry = build_default_hooks();
+        for command in ["ls ~/Dropbox", "cat droplet_data.csv", "echo removalists"] {
+            let result = registry.fire_before("execute_bash", &json!({ "command": command }));
+            assert!(
+                !result.abort,
+                "substring must not trip the whole-word gate for {command:?}: {}",
+                result.reason
+            );
+        }
+    }
+
+    #[test]
+    fn m1_abort_reason_names_recourse_the_model_can_take() {
+        // The abort is delivered to the MODEL, which cannot invoke slash
+        // commands. The recourse must be one the caller can act on: asking
+        // the human — not "run it yourself".
+        let registry = build_default_hooks();
+        let result =
+            registry.fire_before("execute_bash", &json!({ "command": "rm -rf x; drop it" }));
+        assert!(result.abort);
+        assert!(
+            result.reason.contains("ask them to run it"),
+            "reason must direct the model to ask the human: {}",
+            result.reason
+        );
+        assert!(
+            !result.reason.contains("Run it yourself"),
+            "reason must not tell the model to invoke human-only slash commands: {}",
+            result.reason
+        );
     }
 
     #[test]

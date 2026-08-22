@@ -494,52 +494,8 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             // source block. Blocks retain their locator and line range for
             // human navigation, but search_paper/read_paper address the same
             // complete text throughout the loop.
-            use prism_retrieval::fulltext::BlockKind;
-            let selected_blocks = fulltext
-                .blocks
-                .iter()
-                .filter(|block| {
-                    // Abstract included deliberately. It was excluded, and the
-                    // abstract is where a paper states its headline quantities
-                    // in their most self-contained form — the exact shape an
-                    // extractor wants. The materials-IE literature is largely
-                    // BUILT on abstracts (Dagdelen et al., Nat. Commun. 2024),
-                    // so dropping it discarded the highest-density section.
-                    //
-                    // Duplication with the body is not a cost here: all windows
-                    // of one document write under one provenance activity, so a
-                    // fact asserted twice counts once and simply gains a
-                    // corroboration.
-                    //
-                    // Title is NOT added: it already reaches the model as the
-                    // separate `title` argument to the extractor, and repeating
-                    // it inside the body text would only spend context.
-                    matches!(
-                        block.locator.kind,
-                        BlockKind::Abstract
-                            | BlockKind::Body
-                            | BlockKind::Table
-                            | BlockKind::Caption
-                    )
-                })
-                .take(if max_blocks == 0 {
-                    usize::MAX
-                } else {
-                    max_blocks
-                })
-                .collect::<Vec<_>>();
-            let blocks_extracted = selected_blocks.len();
-            let mut paper_text = String::new();
-            let mut located_lines = Vec::with_capacity(selected_blocks.len());
-            for block in &selected_blocks {
-                if !paper_text.is_empty() {
-                    paper_text.push('\n');
-                }
-                let line_start = paper_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
-                paper_text.push_str(&block.text);
-                let line_end = line_start + block.text.lines().count().max(1) - 1;
-                located_lines.push((line_start, line_end, &block.locator));
-            }
+            let (paper_text, located_lines) = assemble_paper_workspace(&fulltext, max_blocks);
+            let blocks_extracted = located_lines.len();
 
             let mut extraction_failures: Vec<serde_json::Value> = Vec::new();
             let mut agent_traces: Vec<prism_ingest::paper_agent::PaperAgentTrace> = Vec::new();
@@ -629,7 +585,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                                     && citation.line_start() as usize <= *end
                             })
                             .map(|(_, _, locator)| *locator)
-                            .or_else(|| selected_blocks.first().map(|block| &block.locator))
+                            .or_else(|| located_lines.first().map(|(_, _, locator)| *locator))
                             .expect("a non-empty paper workspace has a source locator");
                         // CONTRACT CHANGE (annotate-not-refuse): propose_fact
                         // selected and bounds-checked these exact lines. Do not
@@ -1230,6 +1186,62 @@ fn probe_endpoint(base_url: &str) -> Result<(), String> {
         .map_err(|e| format!("LLM endpoint {addr} unreachable: {e}."))
 }
 
+/// The reader's workspace, assembled from a parsed full text.
+///
+/// Selected blocks are joined into ONE newline-separated text — the only
+/// surface `search_paper`/`read_paper` serve and the only coordinate system
+/// citations use. Each selected block's one-based line range in that text is
+/// returned beside its locator, so a fact citing table lines is stamped with
+/// the table's locator (kind, label, section path) in its provenance —
+/// table values cite their table exactly the way prose values cite their
+/// section.
+///
+/// Abstract included deliberately. It was excluded, and the abstract is
+/// where a paper states its headline quantities in their most
+/// self-contained form — the exact shape an extractor wants. The
+/// materials-IE literature is largely BUILT on abstracts (Dagdelen et al.,
+/// Nat. Commun. 2024), so dropping it discarded the highest-density section.
+///
+/// Duplication with the body is not a cost here: all windows of one document
+/// write under one provenance activity, so a fact asserted twice counts once
+/// and simply gains a corroboration.
+///
+/// Title is NOT added: it already reaches the model as the separate `title`
+/// argument to the extractor, and repeating it inside the body text would
+/// only spend context.
+fn assemble_paper_workspace(
+    fulltext: &prism_retrieval::Fulltext,
+    max_blocks: usize,
+) -> (String, Vec<(usize, usize, &prism_retrieval::Locator)>) {
+    use prism_retrieval::BlockKind;
+    let selected_blocks = fulltext
+        .blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.locator.kind,
+                BlockKind::Abstract | BlockKind::Body | BlockKind::Table | BlockKind::Caption
+            )
+        })
+        .take(if max_blocks == 0 {
+            usize::MAX
+        } else {
+            max_blocks
+        });
+    let mut paper_text = String::new();
+    let mut located_lines = Vec::new();
+    for block in selected_blocks {
+        if !paper_text.is_empty() {
+            paper_text.push('\n');
+        }
+        let line_start = paper_text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        paper_text.push_str(&block.text);
+        let line_end = line_start + block.text.lines().count().max(1) - 1;
+        located_lines.push((line_start, line_end, &block.locator));
+    }
+    (paper_text, located_lines)
+}
+
 /// Convert one extracted `MaterialFact` into a provenance-carrying claim,
 /// retaining the exact source revision, line range, and span the paper agent
 /// read before it proposed the fact. Literature evidence keeps its research
@@ -1299,6 +1311,56 @@ fn claim_from_fact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A REAL published JATS document (PMC13302085, MDPI *Materials*, CC BY
+    /// 4.0 — the license statement travels inside the file). Every one of
+    /// its five tables lives in `<floats-group>`/`<app-group>`, the shape
+    /// that used to reach the reader with NO tables at all.
+    const REAL_JATS: &str = include_str!("../../retrieval/tests/fixtures/PMC13302085.nxml");
+
+    /// End to end from real JATS to the reader's workspace: the exact text
+    /// `search_paper`/`read_paper` serve must contain the table BY NAME and
+    /// its rows WITH cell boundaries, and the row's line must map to a
+    /// Table locator carrying the label — that locator is what
+    /// `claim_from_fact` stamps into a claim's provenance, so a value from
+    /// a table cites its table the way prose values cite their section.
+    #[test]
+    fn workspace_serves_tables_by_name_and_maps_their_lines_to_table_locators() {
+        let fulltext = prism_retrieval::fulltext::parse_jats(REAL_JATS.as_bytes()).unwrap();
+        let (paper_text, located_lines) = assemble_paper_workspace(&fulltext, 0);
+
+        // The heading a reader searches for ("Table A1") is in the text the
+        // tools serve, with the caption that carries the table's meaning.
+        assert!(
+            paper_text
+                .contains("Table A1. Literature Data Used for LOF Process-Window Validation."),
+            "the table heading never reached the reader's workspace"
+        );
+        // Figure captions from <floats-group> reach the reader too.
+        assert!(
+            paper_text.contains("Figure 1. Illustration of the melt pool geometry"),
+            "the figure caption never reached the reader's workspace"
+        );
+
+        // A data row arrives with its cell boundaries, transcribed from the
+        // XML source by hand (not from parser output).
+        let row = "1 | 99.9 | No LOF | Malý et al., 2022 [[53] ] | 400 | 500 | 60 | 30";
+        let row_line = paper_text
+            .lines()
+            .position(|line| line == row)
+            .map(|index| index + 1)
+            .expect("the delimited data row must be in the workspace text");
+
+        // The line a citation of that row would carry maps to the table's
+        // locator: kind Table, label "Table A1".
+        let locator = located_lines
+            .iter()
+            .find(|(start, end, _)| row_line >= *start && row_line <= *end)
+            .map(|(_, _, locator)| *locator)
+            .expect("the row's line must fall inside a located block");
+        assert_eq!(locator.kind, prism_retrieval::BlockKind::Table);
+        assert_eq!(locator.label.as_deref(), Some("Table A1"));
+    }
 
     /// The CRATE's lock, not a private one.
     ///

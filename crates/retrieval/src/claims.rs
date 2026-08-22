@@ -3652,7 +3652,7 @@ mod tests {
                 &GuardPolicy::SILENT
             )
             .as_deref(),
-            Some("Ti-6Al-4V 950")
+            Some("Ti-6Al-4V | 950")
         );
         // The caption digit reports support in the body block under a
         // silent ontology — recorded, not judged here.
@@ -3740,7 +3740,7 @@ mod tests {
                 &GuardPolicy::SILENT
             )
             .as_deref(),
-            Some("Ti-6Al-4V 950")
+            Some("Ti-6Al-4V | 950")
         );
         assert_eq!(
             supporting_quote(
@@ -3751,7 +3751,7 @@ mod tests {
                 &GuardPolicy::SILENT
             )
             .as_deref(),
-            Some("Inconel 718 1375")
+            Some("Inconel 718 | 1375")
         );
     }
 

@@ -455,9 +455,10 @@ mod tests {
 
     #[test]
     fn agent_still_denied_other_destructive_tools() {
-        // The knowledge_ingest exemption must not leak to its siblings.
+        // The research-ingestion exemption must not leak beyond its family:
+        // spend, deployment, and deletion stay admin-gated.
         let mut engine = PolicyEngine::new().unwrap();
-        for tool in ["ingest_file", "compute_submit", "deploy", "data_delete"] {
+        for tool in ["compute_submit", "deploy", "data_delete", "node_restart"] {
             let input = PolicyInput {
                 action: "tool.call".into(),
                 principal: "agent".into(),
@@ -523,9 +524,12 @@ mod tests {
 
     #[test]
     fn newly_classified_destructive_tools_gated() {
-        // Defect 4: compute-submit / deploy / ingest classes must be denied to
-        // the agent (non-admin) and permitted to admin — proving they are now
-        // classified destructive rather than blanket-blocked.
+        // Defect 4: compute-submit / deploy classes must be denied to the
+        // agent (non-admin) and permitted to admin — proving they are now
+        // classified destructive rather than blanket-blocked. The ingest
+        // family is destructive-classified too but carries the research-
+        // ingestion exemption; it is covered by
+        // `research_ingest_family_reachable_to_agent` below.
         let newly_destructive = [
             "compute_submit",
             "compute_cancel",
@@ -533,9 +537,6 @@ mod tests {
             "deploy",
             "deploy_create",
             "deploy_stop",
-            "ingest",
-            "ingest_file",
-            "ingest_watch",
         ];
         for tool in newly_destructive {
             let mut engine = PolicyEngine::new().unwrap();
@@ -565,6 +566,60 @@ mod tests {
                 decision.allowed,
                 "{tool} must be allowed to admin: {:?}",
                 decision
+            );
+        }
+    }
+
+    #[test]
+    fn research_ingest_family_reachable_to_agent() {
+        // M3: the recorded owner decision ("research ingestion should be
+        // allowed") covers the whole family, not just the one name
+        // "knowledge_ingest". `ingest_file` is advertised in the agent's core
+        // tool set and the agent loop hardcodes role="agent" — so a deny here
+        // means the tool is advertised but can never execute.
+        for tool in ["knowledge_ingest", "ingest", "ingest_file", "ingest_watch"] {
+            let mut engine = PolicyEngine::new().unwrap();
+            for context in [serde_json::json!({}), serde_json::json!({"mode": "write"})] {
+                let input = PolicyInput {
+                    action: "tool.call".into(),
+                    principal: "agent".into(),
+                    role: "agent".into(),
+                    resource: tool.into(),
+                    context,
+                };
+                let decision = engine.evaluate(&input).unwrap();
+                assert!(
+                    decision.allowed,
+                    "{tool} must be reachable to the agent: {decision:?}"
+                );
+            }
+
+            // A delete-mode call is NOT research ingestion: still admin-gated.
+            let delete = PolicyInput {
+                action: "tool.call".into(),
+                principal: "agent".into(),
+                role: "agent".into(),
+                resource: tool.into(),
+                context: serde_json::json!({"mode": "delete"}),
+            };
+            let decision = engine.evaluate(&delete).unwrap();
+            assert!(
+                !decision.allowed,
+                "{tool} in delete mode must stay admin-gated: {decision:?}"
+            );
+
+            // Admin keeps full access, delete mode included.
+            let admin = PolicyInput {
+                action: "tool.call".into(),
+                principal: "root".into(),
+                role: "admin".into(),
+                resource: tool.into(),
+                context: serde_json::json!({"mode": "delete"}),
+            };
+            let decision = engine.evaluate(&admin).unwrap();
+            assert!(
+                decision.allowed,
+                "{tool} must stay open to admin: {decision:?}"
             );
         }
     }

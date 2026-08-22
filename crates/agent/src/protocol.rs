@@ -1366,13 +1366,13 @@ async fn execute_manual_tool_call(
     // intentional difference from the model-driven path, and the same reasoning
     // that already lets a slash command skip the approval prompt.
     //
-    // `safety_hook` is a substring scan for delete/drop/remove/destroy/truncate/
-    // reset across every string argument. Its job is catching the MODEL reaching
+    // `safety_hook` is a whole-word destructive-keyword tripwire that applies
+    // only to WRITE-CAPABLE tools (a read-only tool's query is data and is
+    // never scanned — see hooks.rs). Its job is catching the MODEL reaching
     // for something destructive the user never asked for. A human typing
-    // `/bash git reset --hard` HAS asked for it, and the scan cannot tell that
-    // from `ls ~/Dropbox` (matches "drop") or from a `--description` field that
-    // is never executed at all. Blocking those would make the deliberate,
-    // human-typed path the only muzzled one in the system.
+    // `/bash git reset --hard` HAS asked for it, so on this human-typed path
+    // the tripwire stays advisory: blocking here would muzzle the one caller
+    // whose intent is certain.
     //
     // The reason is still surfaced, so a genuine warning is not swallowed.
     let pre_result = hooks.fire_before(tool_name, &args);

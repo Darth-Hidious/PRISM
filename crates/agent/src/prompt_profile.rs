@@ -348,6 +348,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn core_tool_set_is_reachable_under_default_policy() {
+        // M3: every tool advertised to a weak/core-set model must actually be
+        // callable under the default OPA policy with the role the agent loop
+        // hardcodes ("agent"). Advertising a tool the policy always denies
+        // teaches the model that the capability is broken — `ingest_file` was
+        // exactly that: in CORE_TOOL_SET, in rego's destructive_tools, and
+        // outside the research-ingestion exemption, so it could never execute.
+        for tool in CORE_TOOL_SET {
+            let mut engine = prism_policy::PolicyEngine::new().expect("default policy loads");
+            let input = prism_policy::PolicyInput {
+                action: "tool.call".to_string(),
+                principal: "agent".to_string(),
+                role: "agent".to_string(),
+                resource: (*tool).to_string(),
+                context: serde_json::json!({}),
+            };
+            let decision = engine.evaluate(&input).expect("evaluation succeeds");
+            assert!(
+                decision.allowed,
+                "core tool '{tool}' is advertised to every core-set model but \
+                 denied by the default policy: {}",
+                decision.reason
+            );
+        }
+    }
+
+    #[test]
     fn claude_gets_xml_full_and_native_thinking() {
         let p = profile_for_model("claude-opus-4-6");
         assert_eq!(p.structure_style, StructureStyle::XmlTags);

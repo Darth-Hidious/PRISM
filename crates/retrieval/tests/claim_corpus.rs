@@ -571,6 +571,19 @@ fn corpus() -> Vec<CorpusCase> {
             Expect::MustStamp,
             "both JATS table models emit newline rows: a genuine row stamps",
         ),
+        case(
+            "Table 1. Ultimate tensile strength.\n\
+             Alloy | UTS (MPa)\n\
+             Ti-6Al-4V | 950\n\
+             Inconel 718 | 1375",
+            "Ti-6Al-4V",
+            "UTS",
+            950.0,
+            Expect::MustStamp,
+            "the JATS sink now delimits cells with '|'; a delimited row must \
+             stamp exactly like a space-joined one — the delimiter is a clean \
+             token boundary, not part of any name or number",
+        ),
         // ---------------- MUST_STAMP: H2 spaced controls -------------
         case(
             "In Fig. 3, 5 ev was measured for the Ti-6Al-4V band gap.",
