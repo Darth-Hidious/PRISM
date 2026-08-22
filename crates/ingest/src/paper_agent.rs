@@ -55,15 +55,22 @@ pub fn turn_budget_for(line_count: usize) -> usize {
     (MIN_TURN_BUDGET + line_count / LINES_PER_TURN).min(MAX_TURN_BUDGET)
 }
 
-// Bounds the KNOWLEDGE PATH — how much of a paper one call may read. Cost is
-// never a sufficient reason to cap this. It was 200 while the reference agent
-// scoring 0.80 on LitXBench reads 2000 lines per call; benchmark papers run to
-// 465 lines, so a whole paper cost that agent ONE call and cost this one three,
-// each a turn, while the prompt discouraged spending turns looking.
-const MAX_READ_LINES: usize = 2000;
-const MAX_SEARCH_RESULTS: usize = 100;
-const MAX_ONTOLOGY_RESULTS: usize = 50;
-const MAX_ONTOLOGY_NEIGHBORS: usize = 100;
+// `read_paper` has NO ceiling. It returns exactly the range asked for, however
+// large. A cap here bounds the knowledge path — reading the paper — where cost
+// is never a sufficient justification, and any number chosen is arbitrary: 200
+// was, 2000 would be too. A document is as long as it is.
+//
+// What remains capped is a CITATION span, which is a different job: a citation
+// names the lines that support one fact, so a 5000-line "citation" is not
+// evidence, it is the whole paper. That bound is about meaning, not cost.
+const MAX_CITATION_LINES: usize = 2000;
+// Re-reading the ontology is named explicitly as never-bounded. `bounded_values`
+// truncates with NO paging parameter, so a truncation here is unrecoverable —
+// the model is told `truncated: true` and given no way to get the rest. These
+// are set past any real ontology's fan-out rather than to a round number.
+const MAX_SEARCH_RESULTS: usize = usize::MAX;
+const MAX_ONTOLOGY_RESULTS: usize = usize::MAX;
+const MAX_ONTOLOGY_NEIGHBORS: usize = usize::MAX;
 const MAX_QUERY_CHARS: usize = 256;
 const MAX_TITLE_CHARS: usize = 512;
 
@@ -1632,9 +1639,7 @@ impl<'a> PaperWorkspace<'a> {
                 self.lines.len()
             ));
         }
-        let to_line = requested_to_line
-            .min(self.lines.len())
-            .min(from_line.saturating_add(MAX_READ_LINES - 1));
+        let to_line = requested_to_line.min(self.lines.len());
         let lines = (from_line..=to_line)
             .map(|line| json!({"line": line, "text": self.lines[line - 1]}))
             .collect::<Vec<_>>();
@@ -1656,9 +1661,9 @@ impl<'a> PaperWorkspace<'a> {
                 self.lines.len()
             ));
         }
-        if to_line - from_line + 1 > MAX_READ_LINES {
+        if to_line - from_line + 1 > MAX_CITATION_LINES {
             return Err(format!(
-                "citation spans more than the {MAX_READ_LINES}-line limit; cite a narrower range"
+                "citation spans more than the {MAX_CITATION_LINES}-line limit; cite a narrower range"
             ));
         }
         Ok(PaperCitation {
@@ -2921,13 +2926,18 @@ mod tests {
     }
 
     #[test]
-    fn ontology_navigation_bounds_large_descendant_sets() {
-        // CONTRACT CHANGE: the removed prompt-embedded registry cap is now
-        // an on-demand tool-result cap, so a large promoted ontology enters
-        // context only where the reader requests it.
+    fn ontology_navigation_returns_a_large_descendant_set_whole() {
+        // CONTRACT CHANGE: this test used to build MAX_ONTOLOGY_NEIGHBORS + 7
+        // descendants and assert the result was TRUNCATED — it pinned the cap
+        // as correct. Re-reading the ontology is knowledge-path work, and
+        // `bounded_values` truncates with no paging parameter, so a truncation
+        // was unrecoverable: the model was told `truncated: true` and given no
+        // way to ask for the rest. The cap is gone; a class's descendants now
+        // arrive whole however many there are.
         let mut ontology = GermanOntology::new();
         let root = Iri::new("https://beispiel.invalid/klasse/Stoff".to_string()).unwrap();
-        for index in 0..MAX_ONTOLOGY_NEIGHBORS + 7 {
+        const WIDE: usize = 3_000;
+        for index in 0..WIDE {
             ontology.classes.push(ClassDecl {
                 iri: Iri::new(format!(
                     "https://beispiel.invalid/klasse/Unterklasse{index}"
@@ -2944,15 +2954,20 @@ mod tests {
         let read = workspace.read_ontology(&json!({"iri": root.as_str()}));
         assert!(read.ok);
         let read = read.result.unwrap();
+        let served = read["descendants"].as_array().unwrap().len();
+        let total = read["descendants_total"].as_u64().unwrap() as usize;
         assert_eq!(
-            read["descendants"].as_array().unwrap().len(),
-            MAX_ONTOLOGY_NEIGHBORS
+            served, total,
+            "every descendant must be served, not a capped prefix"
+        );
+        assert!(
+            served >= WIDE,
+            "expected at least {WIDE} descendants, got {served}"
         );
         assert_eq!(
-            read["descendants_total"],
-            serde_json::Value::from(MAX_ONTOLOGY_NEIGHBORS + 8)
+            read["descendants_truncated"], false,
+            "re-reading the ontology must never be truncated: there is no way to page past it"
         );
-        assert_eq!(read["descendants_truncated"], true);
     }
 
     #[test]
