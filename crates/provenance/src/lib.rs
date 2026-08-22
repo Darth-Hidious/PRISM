@@ -705,6 +705,27 @@ async fn finish_session_index_txn(
 /// ordinary reads and writes remain concurrent after `open` returns.
 static STORE_OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// How long [`ProvenanceStore::open`] waits out a SIBLING PROCESS holding the
+/// store's file lock before giving up. Sized to match `busy_timeout=5000`
+/// below: long enough to outlast any single writer (the longest known holder,
+/// `papers claims --store`, keeps the store for one fact-persistence pass),
+/// short enough that a wedged process still surfaces as an error.
+const OPEN_LOCK_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll cadence inside [`OPEN_LOCK_RETRY_WINDOW`]. The OS file lock has no
+/// wait-with-timeout API through turso, so this is a poll, not a queue.
+const OPEN_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Whether an open failure is a cross-process file-lock collision — the only
+/// error class worth retrying. Matched on the error text because turso
+/// surfaces it as an opaque boxed error ("Locking error: Failed locking file
+/// '….db-wal'. File is locked by another process"); a false positive costs at
+/// most one retry window before the SAME error is returned unchanged.
+fn error_is_file_lock_collision(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().to_ascii_lowercase().contains("lock"))
+}
+
 pub struct ProvenanceStore {
     conn: turso::Connection,
     /// Serializes EVERY write issued through this one handle — the raw
@@ -764,6 +785,46 @@ impl ProvenanceStore {
                 )
             })?;
         }
+
+        // Cross-PROCESS lock collisions get a bounded wait, the same courtesy
+        // `busy_timeout` below extends to competing statements. libsql/turso
+        // keeps this store in WAL (the journal_mode pragma below is a
+        // measured no-op) and its WAL takes an exclusive OS file lock on the
+        // `-wal` sidecar for the LIFETIME of the open handle — so while any
+        // sibling process holds the store, this open fails outright at
+        // `build()` with "Failed locking file '….db-wal'", a stage
+        // `busy_timeout` cannot reach.
+        //
+        // Since 2026-08-21 no PRISM process holds the store across a child
+        // (the agent's run ledger opens per write — see
+        // agent/src/agent_loop.rs::RunLedger), so a collision here means a
+        // sibling is mid-write for milliseconds (a provenance hook record, a
+        // heartbeat) or seconds (`papers claims --store` persisting a
+        // paper's facts). Waiting briefly wins both races; failing instantly
+        // lost real work — a child that had already paid a full LLM
+        // extraction died on a millisecond overlap and every fact was
+        // discarded. A store held beyond the window still surfaces the
+        // original error, so a genuinely wedged holder is reported, just 5
+        // seconds later.
+        let deadline = std::time::Instant::now() + OPEN_LOCK_RETRY_WINDOW;
+        loop {
+            match Self::open_attempt(path_str).await {
+                Ok(store) => return Ok(store),
+                Err(error)
+                    if error_is_file_lock_collision(&error)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // The sleep deliberately happens OUTSIDE open_attempt's
+                    // STORE_OPEN_LOCK guard so in-process opens of other
+                    // paths are not serialized behind this wait.
+                    tokio::time::sleep(OPEN_LOCK_RETRY_INTERVAL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn open_attempt(path_str: &str) -> Result<Self> {
         let _open_guard = STORE_OPEN_LOCK.lock().await;
         let db = turso::Builder::new_local(path_str)
             .build()
@@ -827,7 +888,7 @@ impl ProvenanceStore {
         if !resulting_mode.is_empty() && resulting_mode != "delete" {
             tracing::warn!(
                 mode = %resulting_mode,
-                path = %path.display(),
+                path = %path_str,
                 "journal_mode=DELETE did not take effect; the store is in '{resulting_mode}'. \
                  libsql WAL does not support multi-process access, so a PRISM subprocess \
                  (any CLI-backed tool) will fail to open this store while the parent holds it",
@@ -4793,6 +4854,26 @@ mod store_path_tests {
             "the store file must exist after a successful open"
         );
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// The open-retry must fire on the cross-process lock error and on
+    /// nothing else. The error text is turso's, verbatim from the measured
+    /// failure ("every papers_ingest child died on the parent's held
+    /// handle") — if turso rewords it, this classifier goes quietly inert
+    /// and children start dying on millisecond collisions again, so the
+    /// wording is pinned here.
+    #[test]
+    fn open_retry_classifier_matches_the_lock_error_and_not_others() {
+        let lock = anyhow::anyhow!(
+            "Locking error: Failed locking file '/x/provenance.db-wal'. \
+             File is locked by another process"
+        )
+        .context("failed to open Turso database");
+        assert!(super::error_is_file_lock_collision(&lock));
+
+        let unrelated =
+            anyhow::anyhow!("no such table: emmo_edge").context("failed to open Turso database");
+        assert!(!super::error_is_file_lock_collision(&unrelated));
     }
 
     /// `busy_timeout` must be the FIRST statement on a new connection.

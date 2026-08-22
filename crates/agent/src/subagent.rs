@@ -352,32 +352,13 @@ async fn execute_spawn_subagent_inner(
         &crate::agent_loop::agent_run_label(&sub.task),
         Some(parent_run_id),
     );
-    let db_path = crate::hooks::provenance_db_path();
-    let run_store = match prism_provenance::ProvenanceStore::open(&db_path).await {
-        Ok(store) => match store.start_agent_run(&child_run).await {
-            Ok(()) => Some(std::sync::Arc::new(store)),
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %child_run.id,
-                    parent_run_id,
-                    error = %error,
-                    "subagent-run ledger start failed; continuing spawn"
-                );
-                None
-            }
-        },
-        Err(error) => {
-            tracing::warn!(
-                run_id = %child_run.id,
-                parent_run_id,
-                error = %error,
-                "subagent-run ledger open failed; continuing spawn"
-            );
-            None
-        }
-    };
+    // Per-write ledger, never a held store handle: this state lives across
+    // every tool call of the nested turn, and a held handle blocks any PRISM
+    // subprocess the subagent spawns from opening the store. See
+    // `agent_loop::RunLedger`.
+    let run_ledger = crate::agent_loop::RunLedger::start(&child_run, "subagent-run").await;
     let run_heartbeat =
-        crate::agent_loop::AgentRunHeartbeat::start(run_store.clone(), child_run.id.clone());
+        crate::agent_loop::AgentRunHeartbeat::start(run_ledger.clone(), child_run.id.clone());
 
     // Real budget/context accounting for the subagent model (WU1: the default
     // fable model is registered, so this is never the $0 UNKNOWN fallback).
@@ -519,24 +500,10 @@ async fn execute_spawn_subagent_inner(
             Some(format!("{error:#}")),
         ),
     };
-    if let Some(store) = run_store.as_deref()
-        && let Err(error) = store
-            .finish_agent_run(
-                &child_run.id,
-                status,
-                run_metrics.tokens_in,
-                run_metrics.tokens_out,
-                run_metrics.cost_usd,
-                last_error.as_deref(),
-            )
-            .await
-    {
-        tracing::warn!(
-            run_id = %child_run.id,
-            parent_run_id,
-            error = %error,
-            "subagent-run ledger finish failed; preserving nested result"
-        );
+    if let Some(ledger) = run_ledger.as_ref() {
+        ledger
+            .finish(&child_run.id, status, run_metrics, last_error.as_deref())
+            .await;
     }
     nested_result?;
 

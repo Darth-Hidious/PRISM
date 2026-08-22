@@ -168,6 +168,140 @@ impl Default for AgentRunHeartbeatPolicy {
     }
 }
 
+/// Per-write handle to the durable agent-run ledger.
+///
+/// Holds ONLY the store path. Every write opens the provenance store, writes,
+/// and drops the handle before returning — the run ledger never holds the
+/// store across tool execution.
+///
+/// This is the same seam as `session_index.rs::run_worker`, for the same
+/// measured reason: libsql/turso keeps the store in WAL, its WAL takes an
+/// exclusive OS file lock for the lifetime of an open handle, and the agent
+/// shells out to its own binary for CLI-backed tools. A run-long
+/// `Arc<ProvenanceStore>` (plus the heartbeat task's clone of it) therefore
+/// made EVERY `papers_ingest` child fail to open the store:
+///
+///   Error: failed to open Turso database
+///     Locking error: Failed locking file '…/provenance.db-wal'.
+///     File is locked by another process
+///
+/// Measured 2026-08-21 on a live run: 113 entities landed (written by
+/// transient in-process opens), zero facts, zero edges, zero assertions —
+/// every extraction's store write was the child that died on the parent's
+/// held handle. PRISM called PRISM and deadlocked on its own database.
+///
+/// Cost: one open per ledger write (start / 30s heartbeat / finish), the
+/// price every other provenance writer in this crate already pays per
+/// record. Each write commits before the handle drops, so releasing loses
+/// nothing.
+#[derive(Clone)]
+pub(crate) struct RunLedger {
+    db_path: std::path::PathBuf,
+    /// Which loop owns the run ("agent-run", "subagent-run",
+    /// "orchestrated-run") — keeps the warn logs grep-able per caller.
+    kind: &'static str,
+}
+
+impl RunLedger {
+    /// Open the store, write the start row for `run`, release the handle.
+    ///
+    /// `None` when the open or the write fails — heartbeat and finish are
+    /// then skipped for this run, exactly as when the old held handle failed
+    /// to open. The turn itself continues either way.
+    pub(crate) async fn start(
+        run: &prism_provenance::AgentRun,
+        kind: &'static str,
+    ) -> Option<Self> {
+        let db_path = crate::hooks::provenance_db_path();
+        match prism_provenance::ProvenanceStore::open(&db_path).await {
+            Ok(store) => match store.start_agent_run(run).await {
+                Ok(()) => Some(Self { db_path, kind }),
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = %run.id,
+                        parent_run_id = run.parent_run_id.as_deref(),
+                        error = %error,
+                        "{kind} ledger start failed; continuing without a ledger row"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    parent_run_id = run.parent_run_id.as_deref(),
+                    error = %error,
+                    "{kind} ledger open failed; continuing without a ledger row"
+                );
+                None
+            }
+        }
+    }
+
+    /// Refresh the run row's liveness timestamp. Best-effort: a failure is
+    /// logged and the run continues — while a `papers claims --store` child
+    /// briefly holds the store file, a tick landing in that window loses.
+    async fn heartbeat(&self, run_id: &str) {
+        match prism_provenance::ProvenanceStore::open(&self.db_path).await {
+            Ok(store) => {
+                if let Err(error) = store.heartbeat_agent_run(run_id).await {
+                    tracing::warn!(
+                        run_id,
+                        error = %error,
+                        "{} ledger heartbeat failed; continuing turn", self.kind
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id,
+                    error = %error,
+                    "{} ledger heartbeat open failed; continuing turn", self.kind
+                );
+            }
+        }
+    }
+
+    /// Close the run row with its outcome and spend. Best-effort: the turn's
+    /// result is already decided, so a failure is logged, never propagated.
+    pub(crate) async fn finish(
+        &self,
+        run_id: &str,
+        status: prism_provenance::AgentRunStatus,
+        metrics: &AgentRunMetrics,
+        last_error: Option<&str>,
+    ) {
+        let store = match prism_provenance::ProvenanceStore::open(&self.db_path).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    run_id,
+                    error = %error,
+                    "{} ledger finish open failed; preserving the turn result", self.kind
+                );
+                return;
+            }
+        };
+        if let Err(error) = store
+            .finish_agent_run(
+                run_id,
+                status,
+                metrics.tokens_in,
+                metrics.tokens_out,
+                metrics.cost_usd,
+                last_error,
+            )
+            .await
+        {
+            tracing::warn!(
+                run_id,
+                error = %error,
+                "{} ledger finish failed; preserving the turn result", self.kind
+            );
+        }
+    }
+}
+
 /// Scoped heartbeat task for one persisted run.
 pub(crate) struct AgentRunHeartbeat {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -175,19 +309,16 @@ pub(crate) struct AgentRunHeartbeat {
 }
 
 impl AgentRunHeartbeat {
-    pub(crate) fn start(
-        store: Option<Arc<prism_provenance::ProvenanceStore>>,
-        run_id: String,
-    ) -> Self {
-        Self::start_with_policy(store, run_id, AgentRunHeartbeatPolicy::default())
+    pub(crate) fn start(ledger: Option<RunLedger>, run_id: String) -> Self {
+        Self::start_with_policy(ledger, run_id, AgentRunHeartbeatPolicy::default())
     }
 
     fn start_with_policy(
-        store: Option<Arc<prism_provenance::ProvenanceStore>>,
+        ledger: Option<RunLedger>,
         run_id: String,
         policy: AgentRunHeartbeatPolicy,
     ) -> Self {
-        let Some(store) = store else {
+        let Some(ledger) = ledger else {
             return Self {
                 stop_tx: None,
                 task: None,
@@ -215,13 +346,10 @@ impl AgentRunHeartbeat {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     _ = ticker.tick() => {
-                        if let Err(error) = store.heartbeat_agent_run(&run_id).await {
-                            tracing::warn!(
-                                run_id,
-                                error = %error,
-                                "agent-run ledger heartbeat failed; continuing turn"
-                            );
-                        }
+                        // Per-tick open, per-tick release — see [`RunLedger`]:
+                        // a handle parked here between ticks blocked every
+                        // PRISM subprocess from opening the store at all.
+                        ledger.heartbeat(&run_id).await;
                     }
                 }
             }
@@ -295,40 +423,13 @@ pub(crate) fn agent_run_label(value: &str) -> String {
     }
 }
 
-async fn start_root_agent_run(
-    run: &prism_provenance::AgentRun,
-) -> Option<Arc<prism_provenance::ProvenanceStore>> {
-    let db_path = crate::hooks::provenance_db_path();
-    match prism_provenance::ProvenanceStore::open(&db_path).await {
-        Ok(store) => match store.start_agent_run(run).await {
-            Ok(()) => Some(Arc::new(store)),
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %run.id,
-                    error = %error,
-                    "agent-run ledger start failed; continuing turn"
-                );
-                None
-            }
-        },
-        Err(error) => {
-            tracing::warn!(
-                run_id = %run.id,
-                error = %error,
-                "agent-run ledger open failed; continuing turn"
-            );
-            None
-        }
-    }
-}
-
 async fn finish_root_agent_run(
-    store: Option<&prism_provenance::ProvenanceStore>,
+    ledger: Option<&RunLedger>,
     run_id: &str,
     result: &Result<()>,
     metrics: &AgentRunMetrics,
 ) {
-    let Some(store) = store else {
+    let Some(ledger) = ledger else {
         return;
     };
     let (status, last_error) = match result {
@@ -338,23 +439,9 @@ async fn finish_root_agent_run(
             Some(format!("{error:#}")),
         ),
     };
-    if let Err(error) = store
-        .finish_agent_run(
-            run_id,
-            status,
-            metrics.tokens_in,
-            metrics.tokens_out,
-            metrics.cost_usd,
-            last_error.as_deref(),
-        )
-        .await
-    {
-        tracing::warn!(
-            run_id,
-            error = %error,
-            "agent-run ledger finish failed; preserving turn result"
-        );
-    }
+    ledger
+        .finish(run_id, status, metrics, last_error.as_deref())
+        .await;
 }
 
 // ── Large-result handling ─────────────────────────────────
@@ -2473,8 +2560,13 @@ pub async fn run_turn(
         prism_provenance::new_agent_run(&session_id, "agent", &agent_run_label(user_message), None);
     // Generate the id independently of persistence. A child can still retain
     // the intended topology if this best-effort parent write is unavailable.
-    let run_store = start_root_agent_run(&run).await;
-    let run_heartbeat = AgentRunHeartbeat::start(run_store.clone(), run.id.clone());
+    //
+    // A path-holding ledger, NOT a store handle: anything held open here is
+    // held across every tool call of the turn, and a held handle blocks every
+    // PRISM subprocess (`papers claims --store`, …) from opening the store at
+    // all. See [`RunLedger`].
+    let run_ledger = RunLedger::start(&run, "agent-run").await;
+    let run_heartbeat = AgentRunHeartbeat::start(run_ledger.clone(), run.id.clone());
     let mut run_metrics = AgentRunMetrics::default();
     let surface_policy = crate::skills::SkillSurfacePolicy::default();
     let turn_skill_context = crate::skills::prepare_turn_skill_context(
@@ -2545,7 +2637,7 @@ pub async fn run_turn(
         }
     };
     run_heartbeat.stop().await;
-    finish_root_agent_run(run_store.as_deref(), &run.id, &result, &run_metrics).await;
+    finish_root_agent_run(run_ledger.as_ref(), &run.id, &result, &run_metrics).await;
     result
 }
 
@@ -4059,20 +4151,29 @@ mod tests {
 
     #[tokio::test]
     async fn active_run_heartbeat_refreshes_until_stopped() {
-        let store = Arc::new(
-            prism_provenance::ProvenanceStore::open(std::path::Path::new(":memory:"))
-                .await
-                .unwrap(),
-        );
+        // A FILE-backed store, not ":memory:": the heartbeat now opens the
+        // store per tick and releases it between ticks (see RunLedger), and
+        // an in-memory database would be a fresh empty store on every open.
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("heartbeat.db");
         let run = prism_provenance::new_agent_run(
             "heartbeat-session",
             "agent",
             "waiting on a provider",
             None,
         );
-        store.start_agent_run(&run).await.unwrap();
+        {
+            let store = prism_provenance::ProvenanceStore::open(&db_path)
+                .await
+                .unwrap();
+            store.start_agent_run(&run).await.unwrap();
+        }
+        let ledger = RunLedger {
+            db_path: db_path.clone(),
+            kind: "agent-run",
+        };
         let heartbeat = AgentRunHeartbeat::start_with_policy(
-            Some(store.clone()),
+            Some(ledger),
             run.id.clone(),
             AgentRunHeartbeatPolicy {
                 interval: Duration::from_millis(5),
@@ -4081,6 +4182,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
         heartbeat.stop().await;
+        let store = prism_provenance::ProvenanceStore::open(&db_path)
+            .await
+            .unwrap();
         let rows = store
             .list_agent_runs(&prism_provenance::AgentRunFilter {
                 session_id: Some(run.session_id.clone()),

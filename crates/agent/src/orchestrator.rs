@@ -1271,7 +1271,10 @@ struct LiveItemState {
     scratchpad: Scratchpad,
     config: AgentConfig,
     run: prism_provenance::AgentRun,
-    run_store: Option<Arc<prism_provenance::ProvenanceStore>>,
+    /// Per-write ledger, never a held store handle — this state lives for the
+    /// whole fan-out item, and a handle held here blocks any PRISM subprocess
+    /// the item spawns from opening the store. See `agent_loop::RunLedger`.
+    run_ledger: Option<crate::agent_loop::RunLedger>,
     heartbeat: Option<crate::agent_loop::AgentRunHeartbeat>,
     metrics: crate::agent_loop::AgentRunMetrics,
     policy: Option<prism_policy::PolicyEngine>,
@@ -1323,32 +1326,9 @@ impl OrchestratedAgent {
             &crate::agent_loop::agent_run_label(&spec.task),
             Some(&ctx.parent_run_id),
         );
-        let db_path = crate::hooks::provenance_db_path();
-        let run_store = match prism_provenance::ProvenanceStore::open(&db_path).await {
-            Ok(store) => match store.start_agent_run(&run).await {
-                Ok(()) => Some(Arc::new(store)),
-                Err(error) => {
-                    tracing::warn!(
-                        run_id = %run.id,
-                        parent_run_id = %ctx.parent_run_id,
-                        error = %error,
-                        "orchestrated-run ledger start failed; continuing spawn"
-                    );
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %run.id,
-                    parent_run_id = %ctx.parent_run_id,
-                    error = %error,
-                    "orchestrated-run ledger open failed; continuing spawn"
-                );
-                None
-            }
-        };
+        let run_ledger = crate::agent_loop::RunLedger::start(&run, "orchestrated-run").await;
         let heartbeat =
-            crate::agent_loop::AgentRunHeartbeat::start(run_store.clone(), run.id.clone());
+            crate::agent_loop::AgentRunHeartbeat::start(run_ledger.clone(), run.id.clone());
 
         let model_cfg = get_model_config(&spec.model);
         let mut llm_config = ctx.llm_config.clone();
@@ -1373,7 +1353,7 @@ impl OrchestratedAgent {
             scratchpad: Scratchpad::new(),
             config,
             run,
-            run_store,
+            run_ledger,
             heartbeat: Some(heartbeat),
             metrics: crate::agent_loop::AgentRunMetrics::default(),
             policy: ctx.policy_template.clone(),
@@ -1385,11 +1365,11 @@ impl OrchestratedAgent {
 impl ItemAgent for OrchestratedAgent {
     fn ledger_recorded(&self) -> bool {
         // `live` is None only when the item never spawned; such an item has
-        // nothing to record. Once it spawned, an absent store means the
+        // nothing to record. Once it spawned, an absent ledger means the
         // ledger write failed.
         self.live
             .as_ref()
-            .is_none_or(|live| live.run_store.is_some())
+            .is_none_or(|live| live.run_ledger.is_some())
     }
 
     fn attempt(&mut self, repair: Option<String>) -> BoxFut<'_, Result<AttemptReport>> {
@@ -1553,23 +1533,10 @@ impl ItemAgent for OrchestratedAgent {
                     Some(reason.clone()),
                 ),
             };
-            if let Some(store) = live.run_store.as_deref()
-                && let Err(error) = store
-                    .finish_agent_run(
-                        &live.run.id,
-                        status,
-                        live.metrics.tokens_in,
-                        live.metrics.tokens_out,
-                        live.metrics.cost_usd,
-                        last_error.as_deref(),
-                    )
-                    .await
-            {
-                tracing::warn!(
-                    run_id = %live.run.id,
-                    error = %error,
-                    "orchestrated-run ledger finish failed; outcome already decided"
-                );
+            if let Some(ledger) = live.run_ledger.as_ref() {
+                ledger
+                    .finish(&live.run.id, status, &live.metrics, last_error.as_deref())
+                    .await;
             }
             // Dropping the live state returns (or discards) the lane.
             self.live = None;
