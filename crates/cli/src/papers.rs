@@ -307,7 +307,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
         }
         PapersCommands::FullText { pmc, url, format } => {
             let paper = paper_for_fulltext(&pmc, &url, &format)?;
-            let engine = build_engine(vec![SourceId::Arxiv.as_str().to_string()], &None, false);
+            // Every source, not just arXiv. `parse_sources(&None)` already means
+            // "all adapters"; hardcoding arXiv here meant SEARCH could reach every
+            // source while EXTRACTION could fetch from exactly one — and a paper on
+            // any other host was reported `no_fulltext_available`, which is a lie:
+            // the paper has full text, this engine had no adapter wired for it.
+            let engine = build_engine(parse_sources(&None)?, &None, false);
             match engine.fetch_fulltext_for(&paper).await? {
                 Some(fulltext) => println!("{}", serde_json::to_string_pretty(&fulltext)?),
                 None => println!(
@@ -414,7 +419,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             store,
         } => {
             let paper = paper_for_fulltext(&pmc, &url, &format)?;
-            let engine = build_engine(vec![SourceId::Arxiv.as_str().to_string()], &None, false);
+            // Every source, not just arXiv. `parse_sources(&None)` already means
+            // "all adapters"; hardcoding arXiv here meant SEARCH could reach every
+            // source while EXTRACTION could fetch from exactly one — and a paper on
+            // any other host was reported `no_fulltext_available`, which is a lie:
+            // the paper has full text, this engine had no adapter wired for it.
+            let engine = build_engine(parse_sources(&None)?, &None, false);
             let Some(fulltext) = engine.fetch_fulltext_for(&paper).await? else {
                 println!(
                     "{}",

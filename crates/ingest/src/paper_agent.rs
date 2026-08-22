@@ -55,7 +55,12 @@ pub fn turn_budget_for(line_count: usize) -> usize {
     (MIN_TURN_BUDGET + line_count / LINES_PER_TURN).min(MAX_TURN_BUDGET)
 }
 
-const MAX_READ_LINES: usize = 200;
+// Bounds the KNOWLEDGE PATH — how much of a paper one call may read. Cost is
+// never a sufficient reason to cap this. It was 200 while the reference agent
+// scoring 0.80 on LitXBench reads 2000 lines per call; benchmark papers run to
+// 465 lines, so a whole paper cost that agent ONE call and cost this one three,
+// each a turn, while the prompt discouraged spending turns looking.
+const MAX_READ_LINES: usize = 2000;
 const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_ONTOLOGY_RESULTS: usize = 50;
 const MAX_ONTOLOGY_NEIGHBORS: usize = 100;
@@ -1014,7 +1019,14 @@ const MAX_TOOL_RESULT_CHARS: usize = 24_000;
 /// promising the newest result would "survive" was simply false. Whatever the
 /// budget arithmetic says, the transcript keeps room for the last thing the
 /// model asked to see.
-const MIN_ELISION_CHARS: usize = MAX_READ_LINES * 120;
+// DELIBERATELY DECOUPLED from `MAX_READ_LINES`. These were `MAX_READ_LINES *
+// 120`, and raising the read cap to 2000 lines made the floor 240k characters —
+// larger than a 32k or 100k window holds. The floor would then exceed the
+// transcript it bounds, and the halved retry budget could never drop below it,
+// disabling overflow recovery entirely. The cap governs how much may be read at
+// once; the floor guarantees a read is not blanked the instant it arrives.
+// Different jobs, different numbers.
+const MIN_ELISION_CHARS: usize = 24_000;
 
 /// Placeholder left where an old tool result used to be.
 const ELIDED: &str = "{\"elided\":\"older tool output; re-read if still needed\"}";
