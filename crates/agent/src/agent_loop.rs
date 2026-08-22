@@ -4091,9 +4091,12 @@ pub(crate) async fn run_turn_inner(
         // currently pulling; everything older becomes a summary, and the full
         // text of every tool call remains in the provenance store behind
         // `recall`.
-        // Reclaim the free context FIRST. Compaction costs an LLM call and
-        // rewrites history; zeroing stale tool bodies costs nothing and often
-        // makes the call unnecessary. Pattern lifted from Google's ADK
+        // Reclaim the free context FIRST. Compaction rewrites history and
+        // discards the original wording; zeroing stale tool bodies costs
+        // nothing and often makes it unnecessary. (Compaction is regex string
+        // assembly, not an LLM call — `transcript.rs` `extract_pending_work` /
+        // `extract_key_files`. An earlier comment here said otherwise and the
+        // claim was repeated in a commit message.) Pattern lifted from Google's ADK
         // long-horizon harness (`horizon/context/tool_output_pruning.py`,
         // Apache-2.0), adapted: PRISM stores every tool result durably, so a
         // pruned body is genuinely recoverable via `recall` rather than only
