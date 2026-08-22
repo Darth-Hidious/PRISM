@@ -274,6 +274,16 @@ pub struct ClaimOntologyBinding {
     pub predicate_iri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_class_iri: Option<String>,
+    /// Id of the loaded ontology that declared each bound IRI. Several
+    /// ontologies may be loaded at once (they are additive), so a claim
+    /// records which one supplied each term; absent on rows written before
+    /// the union existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_ontology_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate_ontology_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_ontology_id: Option<String>,
 }
 
 /// Errors a claim can carry instead of being silently accepted.

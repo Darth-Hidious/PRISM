@@ -465,7 +465,10 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
 
             let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
             let ontology_id = crate::active_ontology_from_config(project_root)?;
-            let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
+            // The UNION of loaded ontologies, active one first: the reader
+            // consults every loaded vocabulary, and a term from any of them
+            // binds.
+            let ontologies = prism_ingest::ontologies::loaded(Some(&ontology_id))?;
             let title = paper.title.clone();
             let document_id = paper
                 .doi
@@ -555,9 +558,9 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             let mut dropped_facts: Vec<serde_json::Value> = Vec::new();
             if !paper_text.trim().is_empty() {
                 let extraction =
-                    prism_ingest::text_extract::extract_facts_from_text_with_ontology_and_policy(
+                    prism_ingest::text_extract::extract_facts_from_text_with_ontologies_and_policy(
                         &llm,
-                        ontology.as_ref(),
+                        &ontologies,
                         &title,
                         &paper_text,
                         prism_ingest::text_extract::GroundingPolicy::default(),
@@ -660,7 +663,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         &fulltext.source_url,
                         &extractor_model,
                         &db_path,
-                        ontology.as_ref(),
+                        &ontologies,
                         &proposed_classes,
                         &proposed_relations,
                     )
@@ -806,7 +809,7 @@ async fn store_claims(
     document_url: &str,
     model: &str,
     db_path: &std::path::Path,
-    ontology: &dyn prism_ingest::ontologies::Ontology,
+    ontologies: &prism_ingest::ontologies::OntologySet,
     proposed_classes: &[prism_ingest::paper_agent::OntologyClassProposal],
     proposed_relations: &[prism_ingest::paper_agent::OntologyRelationProposal],
 ) -> Result<serde_json::Value> {
@@ -814,6 +817,12 @@ async fn store_claims(
         EvidenceSource, FactPayload as _, LocalProvenance, MaterialFact, MeasurementCondition,
         ProvenanceStore, UnitTerm, evidence_for_result,
     };
+
+    // The PRIMARY (active) ontology owns the storage tenant, the run-level
+    // classification stamp, and the typed fact shapes. Class-IRI bindings
+    // resolve against the whole loaded set below — a term supplied by a
+    // second loaded ontology types its node, and the binding says which.
+    let ontology = ontologies.primary();
 
     if claims.is_empty() && proposed_classes.is_empty() && proposed_relations.is_empty() {
         return Ok(json!({
@@ -1029,14 +1038,14 @@ async fn store_claims(
                     .ontology
                     .subject_class_iri
                     .as_deref()
-                    .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology, iri))
+                    .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontologies, iri))
                     .transpose()
                     .map_err(anyhow::Error::msg)?;
                 let object = claim
                     .ontology
                     .object_class_iri
                     .as_deref()
-                    .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology, iri))
+                    .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontologies, iri))
                     .transpose()
                     .map_err(anyhow::Error::msg)?;
                 let nodes = prism_provenance::OntologyBoundFactNodes {
@@ -1269,6 +1278,9 @@ fn claim_from_fact(
             subject_class_iri: ontology_binding.subject_class_iri,
             predicate_iri: ontology_binding.predicate_iri,
             object_class_iri: ontology_binding.object_class_iri,
+            subject_ontology_id: ontology_binding.subject_ontology_id,
+            predicate_ontology_id: ontology_binding.predicate_ontology_id,
+            object_ontology_id: ontology_binding.object_ontology_id,
         },
         provenance: prism_retrieval::claims::ClaimProvenance {
             document_id: document_id.to_string(),
@@ -1575,7 +1587,7 @@ mod store_tests {
     async fn a_valid_claim_is_written_and_readable_back() {
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
-        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
         let mut cited = claim("UTS", Some("QUDT:MegaPA"), None);
         cited.provenance.source_revision_id = Some("a".repeat(64));
         cited.provenance.line_start = Some(7);
@@ -1587,7 +1599,7 @@ mod store_tests {
             "https://example.org/paper",
             "test-model",
             &db,
-            ontology.as_ref(),
+            &ontologies,
             &[],
             &[],
         )
@@ -1665,14 +1677,14 @@ mod store_tests {
         // former claim drop.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
-        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
 
         let out = store_claims(
             &[claim("UTS", Some("QUDT:MegaPA"), None)],
             "https://example.org/legacy-paper",
             "test-model",
             &db,
-            ontology.as_ref(),
+            &ontologies,
             &[],
             &[],
         )
@@ -1699,7 +1711,7 @@ mod store_tests {
         // neither translates nor rejects them.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
-        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
         let selected_unit = "customer:U-42";
         let selected_condition_unit = "https://customer.example/ontology/unit/C-7";
 
@@ -1712,7 +1724,7 @@ mod store_tests {
             "https://example.org/paper",
             "test-model",
             &db,
-            ontology.as_ref(),
+            &ontologies,
             &[],
             &[],
         )
@@ -1754,7 +1766,7 @@ mod store_tests {
         // defect; every fact still remains stored.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
-        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
 
         let mut missing_condition = claim("missing condition unit", Some("customer:U-42"), None);
         missing_condition.conditions.push(MeasurementCondition {
@@ -1772,7 +1784,7 @@ mod store_tests {
             "https://example.org/paper",
             "test-model",
             &db,
-            ontology.as_ref(),
+            &ontologies,
             &[],
             &[],
         )
@@ -1832,7 +1844,7 @@ mod store_tests {
         // normal cited edge, not a silently dropped malformed measurement.
         unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
         let db = scratch_db();
-        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
 
         let mut c = claim("UTS", Some("QUDT:MegaPA"), None);
         c.value = None; // kind stays "measurement"
@@ -1842,7 +1854,7 @@ mod store_tests {
             "https://example.org/paper",
             "m",
             &db,
-            ontology.as_ref(),
+            &ontologies,
             &[],
             &[],
         )
@@ -1866,13 +1878,13 @@ mod store_tests {
     #[tokio::test]
     async fn no_claims_means_no_store_file_and_no_error() {
         let db = scratch_db();
-        let ontology = prism_ingest::ontologies::active(None).expect("default ontology");
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
         let out = store_claims(
             &[],
             "https://example.org/paper",
             "m",
             &db,
-            ontology.as_ref(),
+            &ontologies,
             &[],
             &[],
         )

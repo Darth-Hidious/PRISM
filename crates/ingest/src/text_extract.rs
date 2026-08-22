@@ -29,7 +29,7 @@ use prism_provenance::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ontologies::Ontology;
+use crate::ontologies::{Ontology, OntologySet};
 use crate::paper_agent::{
     FactOntologyBinding, OntologyClassProposal, OntologyRelationProposal, PaperAgentPolicy,
     PaperAgentStopReason, PaperAgentTrace, PaperFactProposal, run_paper_agent_sample,
@@ -386,20 +386,21 @@ pub async fn extract_facts_from_text(
     title: &str,
     text: &str,
 ) -> Result<TextExtraction> {
-    let ontology = crate::ontologies::active(None)?;
-    extract_facts_from_text_with_ontology(llm, ontology.as_ref(), title, text).await
+    let ontologies = crate::ontologies::loaded(None)?;
+    extract_facts_from_text_with_ontologies(llm, &ontologies, title, text).await
 }
 
-/// Extract a whole paper against the caller-selected active ontology.
-pub async fn extract_facts_from_text_with_ontology(
+/// Extract a whole paper against the caller-selected loaded-ontology set
+/// (the run's active ontology first — see [`crate::ontologies::loaded`]).
+pub async fn extract_facts_from_text_with_ontologies(
     llm: &LlmClient,
-    ontology: &dyn Ontology,
+    ontologies: &OntologySet,
     title: &str,
     text: &str,
 ) -> Result<TextExtraction> {
-    extract_facts_from_text_with_ontology_and_policy(
+    extract_facts_from_text_with_ontologies_and_policy(
         llm,
-        ontology,
+        ontologies,
         title,
         text,
         GroundingPolicy::default(),
@@ -718,10 +719,10 @@ pub async fn extract_facts_from_text_with_policy(
     text: &str,
     policy: GroundingPolicy,
 ) -> Result<TextExtraction> {
-    let ontology = crate::ontologies::active(None)?;
-    extract_facts_from_text_with_ontology_and_policy(
+    let ontologies = crate::ontologies::loaded(None)?;
+    extract_facts_from_text_with_ontologies_and_policy(
         llm,
-        ontology.as_ref(),
+        &ontologies,
         title,
         text,
         policy,
@@ -730,10 +731,11 @@ pub async fn extract_facts_from_text_with_policy(
     .await
 }
 
-/// Whole-paper extraction with both ontology and annotation policy explicit.
-pub async fn extract_facts_from_text_with_ontology_and_policy(
+/// Whole-paper extraction with both the loaded-ontology set and the
+/// annotation policy explicit.
+pub async fn extract_facts_from_text_with_ontologies_and_policy(
     llm: &LlmClient,
-    ontology: &dyn Ontology,
+    ontologies: &OntologySet,
     title: &str,
     text: &str,
     policy: GroundingPolicy,
@@ -742,7 +744,7 @@ pub async fn extract_facts_from_text_with_ontology_and_policy(
     let ctx = DocumentContext {
         document: text,
         chunk_start_byte: 0,
-        ontology,
+        ontologies,
     };
     extract_facts_from_chunk(llm, title, text, ctx, policy, reading).await
 }
@@ -757,8 +759,9 @@ pub struct DocumentContext<'a> {
     pub document: &'a str,
     /// Byte offset where `chunk` begins in [`Self::document`].
     pub chunk_start_byte: usize,
-    /// The registry-selected ontology served by the navigation tools.
-    pub ontology: &'a dyn Ontology,
+    /// The loaded ontologies served by the navigation tools — the union,
+    /// with the run's active ontology first.
+    pub ontologies: &'a OntologySet,
 }
 
 /// Compatibility entry point for callers that previously scheduled prompt
@@ -839,7 +842,7 @@ pub async fn extract_facts_from_chunk_sampled(
     for pass in 0..sampling.samples.get() {
         let output = run_paper_agent_sample(
             llm,
-            ctx.ontology,
+            ctx.ontologies,
             title,
             ctx.document,
             pass + 1,
@@ -2402,9 +2405,8 @@ mod tests {
                 "object": "outcome B"
             }),
             ontology: FactOntologyBinding {
-                subject_class_iri: None,
                 predicate_iri: Some(predicate_iri.to_string()),
-                object_class_iri: None,
+                ..Default::default()
             },
             citation: crate::paper_agent::PaperCitation {
                 source_revision_id: revision.clone(),
@@ -3148,6 +3150,9 @@ mod tests {
         let sampling =
             SamplingPolicy::new(NonZeroUsize::new(3).unwrap(), NonZeroUsize::new(2).unwrap())
                 .expect("2 of 3 is a valid policy");
+        let ontologies = crate::ontologies::OntologySet::single(std::sync::Arc::new(
+            crate::ontologies::EmmoOntology,
+        ));
         let extraction = extract_facts_from_chunk_sampled(
             &client_for(&server),
             "Study",
@@ -3155,7 +3160,7 @@ mod tests {
             DocumentContext {
                 document: source,
                 chunk_start_byte: 0,
-                ontology: &crate::ontologies::EmmoOntology,
+                ontologies: &ontologies,
             },
             GroundingPolicy::default(),
             sampling,
@@ -4518,6 +4523,9 @@ mod tests {
         let sampling =
             SamplingPolicy::new(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap())
                 .expect("2 of 2 is a valid policy");
+        let ontologies = crate::ontologies::OntologySet::single(std::sync::Arc::new(
+            crate::ontologies::EmmoOntology,
+        ));
         let extraction = extract_facts_from_chunk_sampled(
             &client_for(&server),
             "Study",
@@ -4525,7 +4533,7 @@ mod tests {
             DocumentContext {
                 document: &source,
                 chunk_start_byte: 0,
-                ontology: &crate::ontologies::EmmoOntology,
+                ontologies: &ontologies,
             },
             GroundingPolicy::default(),
             sampling,

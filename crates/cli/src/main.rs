@@ -7680,6 +7680,11 @@ async fn run_local_text_ingest_file(
 ) -> Result<serde_json::Value> {
     let ontology_id = active_ontology_from_config(project_root)?;
     let ontology = prism_ingest::ontologies::active(Some(&ontology_id))?;
+    // The UNION of loaded ontologies (active first) — what the paper reader
+    // navigates and what class-IRI bindings resolve against. The `ontology`
+    // handle above stays the PRIMARY: tenant, classification stamp, and
+    // typed fact shapes remain the active ontology's.
+    let ontology_set = prism_ingest::ontologies::loaded(Some(&ontology_id))?;
 
     if mapping_path.is_some() {
         eprintln!(
@@ -8003,7 +8008,7 @@ async fn run_local_text_ingest_file(
             prism_ingest::text_extract::DocumentContext {
                 document: &text,
                 chunk_start_byte: *start,
-                ontology: ontology.as_ref(),
+                ontologies: &ontology_set,
             },
             prism_ingest::text_extract::GroundingPolicy::default(),
             sampling,
@@ -8195,13 +8200,13 @@ async fn run_local_text_ingest_file(
             let subject = binding
                 .subject_class_iri
                 .as_deref()
-                .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology.as_ref(), iri))
+                .map(|iri| prism_ingest::paper_agent::resolve_class_binding(&ontology_set, iri))
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
             let object = binding
                 .object_class_iri
                 .as_deref()
-                .map(|iri| prism_ingest::paper_agent::resolve_class_binding(ontology.as_ref(), iri))
+                .map(|iri| prism_ingest::paper_agent::resolve_class_binding(&ontology_set, iri))
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
             let nodes = prism_provenance::OntologyBoundFactNodes {

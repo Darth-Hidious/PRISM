@@ -51,6 +51,11 @@ struct InducedVocabulary {
     /// prefLabel and the extraction label — so [`Ontology::quantity_sign_domain`]
     /// answers whichever identity the fact carried.
     class_iri_by_name: HashMap<String, String>,
+    /// Canonical external identity (`skos:exactMatch`) by minted class IRI,
+    /// straight from the artifact's `aligned_iri`. Served through
+    /// [`Ontology::class_exact_match`] so the artifact's identity statement
+    /// crosses the adapter boundary instead of dying in the TTL.
+    exact_matches: HashMap<String, Iri>,
     /// Extraction tokens of the relations the artifact typed, grouped by the
     /// store's typed fact shape. Empty for a kind the ontology never
     /// declared — those relations stay generic edges, which is honest.
@@ -121,6 +126,16 @@ impl Ontology for InducedVocabulary {
             }
         }
         false
+    }
+
+    /// The artifact's own `skos:exactMatch` for one of its classes — the
+    /// statement a shard makes that its `:Property` IS EMMO's
+    /// `EMMO_b7bcff25…`. Without this override the statement was written
+    /// into every artifact and readable by nothing, so folding shards
+    /// qualified parallel copies of classes the shards themselves declared
+    /// identical.
+    fn class_exact_match(&self, class: &Iri) -> Option<Iri> {
+        self.exact_matches.get(class.as_str()).cloned()
     }
 
     /// Serves the artifact's `prism:factKind` declarations. WHICH relation
@@ -271,6 +286,7 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
     let mut parents: HashMap<String, Vec<String>> = HashMap::new();
     let mut sign_domains: HashMap<String, QuantitySignDomain> = HashMap::new();
     let mut class_iri_by_name: HashMap<String, String> = HashMap::new();
+    let mut exact_matches: HashMap<String, Iri> = HashMap::new();
     for class in &ontology.classes {
         let iri = class_iri(&class.label)?;
         let mut parent_iris = Vec::new();
@@ -298,6 +314,18 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
         }
         if let Some(domain) = class.sign_domain {
             sign_domains.insert(iri.as_str().to_string(), domain);
+        }
+        // The artifact's `skos:exactMatch` — its statement of which canonical
+        // concept this class IS. `ClassDecl` cannot carry it, so it is served
+        // through `class_exact_match` instead of being dropped here.
+        if let Some(aligned) = &class.aligned_iri {
+            let aligned = Iri::new(aligned.clone()).map_err(|e| {
+                anyhow::anyhow!(
+                    "class {:?} carries an invalid skos:exactMatch IRI {aligned:?}: {e}",
+                    class.label
+                )
+            })?;
+            exact_matches.insert(iri.as_str().to_string(), aligned);
         }
         classes.push(ClassDecl {
             iri,
@@ -395,6 +423,7 @@ fn adapter(ontology: &InducedOntology, artifact_sha256: String) -> Result<Arc<dy
         parents,
         sign_domains,
         class_iri_by_name,
+        exact_matches,
         fact_kind_relations: by_fact_kind,
         fact_kind_ranges,
         quantitative_labels,
@@ -957,6 +986,164 @@ mod tests {
                 .any(|n| n.contains("not among the seeded classes")),
             "a declared endpoint must never be reported unseeded: {:?}",
             seed.notes
+        );
+    }
+
+    /// Two shards that COPIED the same base class fold into ONE class.
+    ///
+    /// Each shard artifact states the class's canonical identity as
+    /// `skos:exactMatch`, but `ClassDecl` has no field for it, so the
+    /// statement died at the adapter and the seeder qualified what the
+    /// shards declared identical. Measured on the real eight-shard fold:
+    /// 3738 of 6893 classes were qualification duplicates, and the merged
+    /// hierarchy had eight parallel `Property` roots.
+    ///
+    /// This drives the real adapter and the real seeder — two artifacts on
+    /// disk, loaded through `load_induced_seed_from_path`. A hand-built
+    /// `ClassDecl` cannot fail here, because `ClassDecl` cannot carry the
+    /// statement whose loss is the bug.
+    #[test]
+    fn shards_aligned_to_one_canonical_iri_fold_into_one_class() {
+        const EMMO_MATERIAL: &str = "https://w3id.org/emmo#EMMO_material_test";
+        const EMMO_PROPERTY: &str = "https://w3id.org/emmo#EMMO_property_test";
+
+        let shard = |domain: &str, unique_class: &str, rel_label: &str| InducedOntology {
+            domain: domain.into(),
+            status: OntologyStatus::Draft,
+            classes: vec![
+                InducedClass {
+                    label: "Material".into(),
+                    definition: "Physical substance.".into(),
+                    parent: None,
+                    aligned_iri: Some(EMMO_MATERIAL.into()),
+                    declared_by_reference: false,
+                    sign_domain: None,
+                },
+                InducedClass {
+                    label: "Property".into(),
+                    definition: "An attribute of a material.".into(),
+                    parent: Some("Material".into()),
+                    aligned_iri: Some(EMMO_PROPERTY.into()),
+                    declared_by_reference: false,
+                    sign_domain: None,
+                },
+                InducedClass {
+                    label: unique_class.into(),
+                    definition: String::new(),
+                    parent: Some("Property".into()),
+                    aligned_iri: None,
+                    declared_by_reference: false,
+                    sign_domain: None,
+                },
+            ],
+            relations: vec![InducedRelation {
+                label: rel_label.into(),
+                definition: String::new(),
+                domain: "Material".into(),
+                range: "Property".into(),
+                aligned_iri: None,
+                fact_kind: None,
+            }],
+            provenance: InductionProvenance {
+                corpus_hash: "sha256:deadbeef00".into(),
+                prompt_version: "1".into(),
+                ..Default::default()
+            },
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut seeds = Vec::new();
+        for (domain, unique_class, rel_label) in [
+            ("indtest-foldsh1", "Density", "has property"),
+            ("indtest-foldsh2", "Viscosity", "exhibits"),
+        ] {
+            let path = dir.path().join(format!("{domain}.ttl"));
+            write_artifact(&path, &shard(domain, unique_class, rel_label)).unwrap();
+            seeds.push(load_induced_seed_from_path(&path).expect("a draft loads as a seed"));
+        }
+
+        // The channel itself: the adapter serves the artifact's exactMatch
+        // for an aligned class, and silence for an unaligned one.
+        let class_iri = |seed: &Arc<dyn Ontology>, label: &str| {
+            seed.classes()
+                .iter()
+                .find(|c| c.pref_label.as_deref() == Some(label))
+                .expect("declared class present")
+                .iri
+                .clone()
+        };
+        assert_eq!(
+            seeds[0]
+                .class_exact_match(&class_iri(&seeds[0], "Property"))
+                .as_ref()
+                .map(Iri::as_str),
+            Some(EMMO_PROPERTY),
+            "the adapter must serve the artifact's skos:exactMatch"
+        );
+        assert_eq!(
+            seeds[0].class_exact_match(&class_iri(&seeds[0], "Density")),
+            None,
+            "an unaligned class has no canonical identity — silence, not a guess"
+        );
+
+        let seed = super::super::seed::seed_from(&seeds).expect("folding two shards succeeds");
+
+        // One Material, one Property — the shards said so — plus each
+        // shard's own contribution. No qualified parallel copies.
+        let mut labels: Vec<&str> = seed.classes.iter().map(|c| c.label.as_str()).collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            ["Density", "Material", "Property", "Viscosity"],
+            "classes sharing a canonical IRI must merge, not qualify; notes: {:?}",
+            seed.notes
+        );
+
+        // The surviving class carries the CANONICAL identity, not the
+        // shard-local IRI that made the fold's exactMatch self-referential.
+        let property = seed.classes.iter().find(|c| c.label == "Property").unwrap();
+        assert_eq!(
+            property.aligned_iri.as_deref(),
+            Some(EMMO_PROPERTY),
+            "the fold's exactMatch must keep pointing at the standard vocabulary"
+        );
+        // THE hazard: both shards' relations must still find their endpoints
+        // through the merged class's local IRIs, or the fix reintroduces the
+        // dropped-relations bug.
+        assert_eq!(
+            seed.relations.len(),
+            2,
+            "both shards' relations must survive the merge; notes: {:?}",
+            seed.notes
+        );
+        for rel in &seed.relations {
+            assert_eq!(rel.domain, "Material", "relation {:?}", rel.label);
+            assert_eq!(rel.range, "Property", "relation {:?}", rel.label);
+        }
+        assert!(
+            !seed
+                .notes
+                .iter()
+                .any(|n| n.contains("not among the seeded classes")),
+            "no endpoint of a merged class may be reported unseeded: {:?}",
+            seed.notes
+        );
+
+        assert_eq!(
+            property.parent.as_deref(),
+            Some("Material"),
+            "a merged class's parent must still resolve"
+        );
+        // The merged-away shard's OWN class hangs from the surviving one.
+        let viscosity = seed
+            .classes
+            .iter()
+            .find(|c| c.label == "Viscosity")
+            .unwrap();
+        assert_eq!(
+            viscosity.parent.as_deref(),
+            Some("Property"),
+            "the second shard's parent link must land on the surviving class"
         );
     }
 

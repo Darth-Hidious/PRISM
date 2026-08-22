@@ -223,6 +223,22 @@ pub trait Ontology: Send + Sync {
         BTreeMap::new()
     }
 
+    /// The canonical identity `class` is declared EQUAL to in an external
+    /// standard vocabulary (`skos:exactMatch`), when this ontology's artifact
+    /// states one. `None` — the default, and the only honest answer for an
+    /// ontology that carries no alignment — means the class's own IRI is its
+    /// only known identity.
+    ///
+    /// This is how an induced artifact's statement "my `:Property` IS EMMO's
+    /// `EMMO_b7bcff25…`" crosses the adapter boundary. [`ClassDecl`] has no
+    /// field for it, so before this method the statement was written into
+    /// every shard artifact and readable by nothing: folding eight shards
+    /// qualified eight copies of a class the shards themselves declared to be
+    /// one concept. The seeder consults this as the class identity key.
+    fn class_exact_match(&self, _class: &Iri) -> Option<Iri> {
+        None
+    }
+
     /// Resolve an exact extraction label to its canonical class declaration.
     fn class_for_label(&self, label: &str) -> Option<&ClassDecl> {
         self.classes().iter().find(|decl| {
@@ -1275,6 +1291,136 @@ pub fn active_from_project(id: Option<&str>, project_root: &Path) -> Result<Arc<
     Ok(ontology)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// The loaded set — what extraction reads
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The ontologies LOADED for one extraction run: the run's ACTIVE ontology
+/// first, then every other registered ontology in registration order.
+///
+/// This is the additive plugin contract made concrete. Installing a second
+/// ontology ADDS its vocabulary on top of the ones already in use: the
+/// reader consults the union, a term from any loaded ontology binds, and
+/// nothing is replaced or merged into one artifact. Every lookup answers
+/// WITH the ontology that declared the term, so provenance can always name
+/// a bound term's source. Lookup order is set order (primary first), which
+/// makes a label or prefix collision deterministic: the earliest loaded
+/// declaration wins.
+#[derive(Clone)]
+pub struct OntologySet {
+    ontologies: Vec<Arc<dyn Ontology>>,
+}
+
+impl OntologySet {
+    /// A set holding exactly one loaded ontology.
+    pub fn single(ontology: Arc<dyn Ontology>) -> Self {
+        Self {
+            ontologies: vec![ontology],
+        }
+    }
+
+    /// Build a set from the primary ontology plus the other loaded ones. An
+    /// empty set and a duplicate id are both refused loudly: with one id
+    /// resolving to two adapters, "which ontology supplied this term" would
+    /// have no answer.
+    pub fn new(ontologies: Vec<Arc<dyn Ontology>>) -> Result<Self> {
+        if ontologies.is_empty() {
+            bail!("an extraction run needs at least one loaded ontology");
+        }
+        let mut seen = HashSet::new();
+        for ontology in &ontologies {
+            if !seen.insert(ontology.id()) {
+                bail!(
+                    "ontology id '{}' appears twice in one loaded set",
+                    ontology.id()
+                );
+            }
+        }
+        Ok(Self { ontologies })
+    }
+
+    /// The run's ACTIVE ontology — the one that owns the storage tenant and
+    /// the run-level classification stamp. Always the set's first entry.
+    pub fn primary(&self) -> &dyn Ontology {
+        self.ontologies[0].as_ref()
+    }
+
+    /// Every loaded ontology, primary first.
+    pub fn all(&self) -> &[Arc<dyn Ontology>] {
+        &self.ontologies
+    }
+
+    /// The loaded ontology that declares `iri` as a navigable class, primary
+    /// first, with the declaration it serves.
+    pub fn declaring_class(&self, iri: &Iri) -> Option<(&dyn Ontology, &ClassDecl)> {
+        self.ontologies
+            .iter()
+            .find_map(|ontology| ontology.class(iri).map(|decl| (ontology.as_ref(), decl)))
+    }
+
+    /// The loaded ontology that declares `iri` as a navigable object
+    /// property, primary first, with the declaration it serves.
+    pub fn declaring_property(&self, iri: &Iri) -> Option<(&dyn Ontology, &RelationDecl)> {
+        self.ontologies
+            .iter()
+            .find_map(|ontology| ontology.property(iri).map(|decl| (ontology.as_ref(), decl)))
+    }
+
+    /// Resolve an exact extraction label across the union, primary first.
+    ///
+    /// This pair is the GROUNDING seam: extracted terms are resolved against
+    /// the union of loaded vocabularies after extraction — the vocabulary is
+    /// deliberately NOT dumped into the extraction prompt (measured:
+    /// hundred-label prompts collapse extraction accuracy; see
+    /// LongICLBench). A post-extraction grounding pass binds each extracted
+    /// term through these lookups, and the declaring ontology comes back
+    /// with the declaration so the binding can name its source.
+    pub fn class_for_label(&self, label: &str) -> Option<(&dyn Ontology, &ClassDecl)> {
+        self.ontologies.iter().find_map(|ontology| {
+            ontology
+                .class_for_label(label)
+                .map(|decl| (ontology.as_ref(), decl))
+        })
+    }
+
+    /// Same contract as [`OntologySet::class_for_label`], for object
+    /// properties.
+    pub fn relation_for_label(&self, label: &str) -> Option<(&dyn Ontology, &RelationDecl)> {
+        self.ontologies.iter().find_map(|ontology| {
+            ontology
+                .relation_for_label(label)
+                .map(|decl| (ontology.as_ref(), decl))
+        })
+    }
+}
+
+/// Resolve the UNION of loaded ontologies for one extraction run: the active
+/// id (same contract and same loud failure as [`active`]) first, then every
+/// other registered ontology in registration order.
+///
+/// [`active`] answers "which ontology governs storage"; this answers "which
+/// vocabularies may bind during extraction" — and per the pluggability
+/// contract that is the union of what is loaded, never one ontology picked
+/// out of it. The measured cost of picking one: a live LPBF run whose reader
+/// was handed a single ontology wrote 688 assertions of document narration
+/// and zero measured quantities.
+pub fn loaded(active_id: Option<&str>) -> Result<OntologySet> {
+    let primary = active(active_id)?;
+    let primary_id = primary.id();
+    let mut ontologies = vec![primary];
+    {
+        // `ids()` is the registry's own pre-captured bookkeeping — no adapter
+        // code runs under the process-wide read lock.
+        let registry = registry();
+        for (id, ontology) in registry.ids().iter().zip(registry.all()) {
+            if *id != primary_id {
+                ontologies.push(ontology.clone());
+            }
+        }
+    }
+    OntologySet::new(ontologies)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1418,6 +1564,29 @@ mod tests {
                 "a silent ontology must stay silent for {identity:?}"
             );
         }
+    }
+
+    /// The union accessor: the ACTIVE ontology first, every other
+    /// registered ontology after it — [`OntologyRegistry::all`]'s first
+    /// ontology-side caller. If `loaded` ever collapses to the active
+    /// ontology alone, the second assertion here goes red before any
+    /// extraction path does.
+    #[test]
+    fn loaded_returns_the_active_ontology_first_and_the_rest_after() {
+        let set = loaded(None).expect("built-ins load");
+        assert_eq!(set.primary().id(), DEFAULT_ONTOLOGY_ID);
+        let ids: Vec<_> = set.all().iter().map(|ontology| ontology.id()).collect();
+        assert!(ids.contains(&MATKG_ONTOLOGY_ID), "{ids:?}");
+
+        let set = loaded(Some(MATKG_ONTOLOGY_ID)).expect("matkg is registered");
+        assert_eq!(set.primary().id(), MATKG_ONTOLOGY_ID);
+        let ids: Vec<_> = set.all().iter().map(|ontology| ontology.id()).collect();
+        assert!(ids.contains(&DEFAULT_ONTOLOGY_ID), "{ids:?}");
+        assert_eq!(
+            ids.iter().filter(|id| **id == MATKG_ONTOLOGY_ID).count(),
+            1,
+            "the primary must not be listed twice: {ids:?}"
+        );
     }
 
     /// The loud half of the two-call contract: `register` refuses a taken

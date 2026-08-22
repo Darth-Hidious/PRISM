@@ -108,6 +108,16 @@ fn display_name(pref_label: Option<&str>, extraction_labels: &[String], iri: &st
 /// forbid the main use case, while merging the two would silently claim that
 /// EMMO's `Chemical` and MatKG's `Chemical` are the same concept. Keeping both
 /// under distinguishable names asserts neither.
+///
+/// When two bases declare the same CANONICAL identity, they are MERGED — the
+/// second occurrence maps onto the first's seeded class. This asserts nothing
+/// new: qualification exists because the seeder refuses to claim two
+/// same-named classes are the same concept, but a shared `skos:exactMatch`
+/// (served through [`Ontology::class_exact_match`]) is the bases themselves
+/// stating that identity, and qualifying it would discard a stated fact.
+/// Measured before this rule existed: folding eight shards of one corpus
+/// produced eight parallel taxonomies — 3738 of 6893 classes were
+/// qualification duplicates whose shards all pointed at the same EMMO IRI.
 pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
     let mut seed = Seed::default();
     // normalised label -> (base id, surface form), for collision detection and
@@ -119,6 +129,10 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
     // no reason. Maps normalized label -> owning base id.
     let mut claimed_relations: BTreeMap<String, String> = BTreeMap::new();
     let mut iri_to_label: BTreeMap<String, String> = BTreeMap::new();
+    // Canonical identity -> the label it was seeded under. A class's identity
+    // is the external IRI its base declares it equal to (`skos:exactMatch`),
+    // or its own IRI when the base states no alignment.
+    let mut identity_to_label: BTreeMap<String, String> = BTreeMap::new();
 
     for base in bases {
         let base_id = base.id().to_string();
@@ -128,6 +142,21 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
         for decl in base.ontology_classes() {
             let iri = decl.iri.as_str().to_string();
             let label = display_name(decl.pref_label.as_deref(), &decl.extraction_labels, &iri);
+            let identity = base
+                .class_exact_match(&decl.iri)
+                .map(|aligned| aligned.as_str().to_string())
+                .unwrap_or_else(|| iri.clone());
+            if let Some(existing) = identity_to_label.get(&identity) {
+                // Two bases whose classes share one canonical identity have
+                // already stated that these are the same class — merging
+                // asserts nothing new, it stops discarding what the bases
+                // said. Qualification stays for the case it was built for:
+                // same word, no stated identity. The local IRI still resolves
+                // to the surviving label, so this base's relations and parent
+                // links keep their endpoints instead of being dropped.
+                iri_to_label.insert(iri, existing.clone());
+                continue;
+            }
             let key = normalize_label(&label);
             if key.is_empty() {
                 seed.notes.push(format!(
@@ -158,14 +187,19 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
                 None => (label, key),
             };
             claimed.insert(key, (base_id.clone(), label.clone()));
-            iri_to_label.insert(iri.clone(), label.clone());
+            iri_to_label.insert(iri, label.clone());
+            identity_to_label.insert(identity.clone(), label.clone());
             seed.classes.push(InducedClass {
                 label,
                 definition: String::new(),
                 // Resolved in a second pass: a parent IRI may name a class this
                 // loop has not reached yet.
                 parent: None,
-                aligned_iri: Some(iri),
+                // The CANONICAL identity, not the base-local IRI: the fold's
+                // own `skos:exactMatch` must keep pointing at the standard
+                // vocabulary the base pointed at, or the identity is lost
+                // again at the next fold.
+                aligned_iri: Some(identity),
                 declared_by_reference: false,
                 sign_domain: None,
             });
@@ -281,15 +315,37 @@ fn resolve_parents(
             let mut chosen = resolved.into_iter();
             let first = chosen.next();
             let extra: Vec<String> = chosen.chain(unresolved).collect();
-            parents.insert(decl.iri.as_str().to_string(), (first, extra));
+            // Keyed by the same canonical identity the class was seeded
+            // under, so a class merged from several bases still finds its
+            // parents. The first declaration's parent stands; a later merged
+            // declaration that disagrees is said, not silently dropped.
+            let identity = base
+                .class_exact_match(&decl.iri)
+                .map(|aligned| aligned.as_str().to_string())
+                .unwrap_or_else(|| decl.iri.as_str().to_string());
+            match parents.get(&identity) {
+                Some((existing, _)) if *existing != first => {
+                    if let Some(later) = first {
+                        seed.notes.push(format!(
+                            "class {identity}: a merged declaration from base {} states \
+                             parent {later:?} — the first declaration's parent stands",
+                            base.id()
+                        ));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    parents.insert(identity, (first, extra));
+                }
+            }
         }
     }
 
     for class in &mut seed.classes {
-        let Some(iri) = class.aligned_iri.as_deref() else {
+        let Some(identity) = class.aligned_iri.as_deref() else {
             continue;
         };
-        let Some((first, extra)) = parents.get(iri) else {
+        let Some((first, extra)) = parents.get(identity) else {
             continue;
         };
         class.parent = first.clone();
