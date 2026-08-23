@@ -265,8 +265,30 @@ fn map_local_facts(
                 )
             } else if contains.contains(rel.rel_type.as_str()) {
                 (Some("contains"), rel.weight, None, None, None)
+            } else if let Some(v) = rel.value.filter(|v| v.is_finite())
+                && rel.unit.as_deref().is_some_and(|u| !u.trim().is_empty())
+            {
+                // GROUNDING: a claim carrying BOTH a finite number and a unit is a
+                // measurement, whatever the model called the relation.
+                //
+                // The chain above binds only when the predicate string is itself a
+                // declared relation token. Extraction emits the PROPERTY NAME there
+                // — "crack-growth resistance", "laser absorptivity" — so nothing
+                // matched, and the branch below recorded the number as dropped:
+                // measured live, 881 of 1047 edges carried free-text predicates
+                // across 697 distinct relation types, and their values were lost.
+                //
+                // The predicate names the property; the RELATION is "has
+                // measurement". Binding on the value+unit shape rather than on the
+                // spelling is what the ontology can actually decide, and it infers
+                // nothing about meaning: the predicate is preserved verbatim as the
+                // property, and unit interpretation stays with `numeric_unit_term`.
+                let (unit, verification, reason) =
+                    numeric_unit_term(rel.unit.as_deref(), &rel.from, &rel.to, &rel.rel_type, v);
+                (Some("measurement"), Some(v), unit, verification, reason)
             } else {
-                // Generic edge under its own predicate. A numeric claim on the
+                // Generic edge under its own predicate. A claim with no unit has
+                // nowhere typed to go unless THIS relation
                 // edge or its target has nowhere typed to go unless THIS relation
                 // is declared as measurement-carrying. Report every such loss,
                 // whether the ontology declares zero measurement relations or a
