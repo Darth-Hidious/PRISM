@@ -2288,9 +2288,14 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
     }
     lines.extend([
         Line::raw(""),
-        // NOTEBOOKS — live entirely outside the agent world today (honest).
+        // NOTEBOOKS. This used to read "not wired in-app yet — will be
+        // agent-watched + editable", which had stopped being true: the pane
+        // exists (`crate::notebook`), the kernel runs in the backend, and
+        // the agent shares it through `notebook_exec`. A dashboard that
+        // denies a working feature is worse than one that omits it — nobody
+        // types `/notebook open` for something the app says is unbuilt.
         section("NOTEBOOKS"),
-        muted("not wired in-app yet — will be agent-watched + editable".to_string()),
+        muted("/notebook open — Python cells; agent shares kernel".to_string()),
         Line::raw(""),
         // SYSTEMS — live App state only.
         section("SYSTEMS"),

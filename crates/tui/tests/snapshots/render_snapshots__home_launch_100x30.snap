@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 107
 expression: rendered
 ---
  ‹ back  New session    0 tools    Ctrl-P · ?                      │ Workspace
@@ -12,7 +13,7 @@ expression: rendered
 │     loading tool catalog…                                      │ │
 │                                                                │ │
 │  NOTEBOOKS                                                     │ │
-│     not wired in-app yet — will be agent-watched + editable    │ │
+│     /notebook open — Python cells; agent shares kernel         │ │
 │                                                                │ │
 │  SYSTEMS                                                       │ │
 │   ● model  —   s status                                        │ │
