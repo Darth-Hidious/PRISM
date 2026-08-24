@@ -582,7 +582,17 @@ impl ChatService {
         } else {
             crate::command_tools::with_platform_access(
                 platform_access,
-                self.chat_inner(request, user_id, platform_access, &events),
+                // BOXED, and it has to stay boxed. `chat_inner` is a whole
+                // agent turn — session resolution, the tool loop, transcript
+                // and scratchpad state — so its generated state machine is
+                // megabytes wide. Composed inline, that entire object lives
+                // on the caller's stack, and the caller here is an HTTP
+                // handler on a tokio worker with a 2 MiB stack
+                // (`crates/server/src/handlers/chat.rs`). It overflowed and
+                // aborted the process with SIGABRT, which the parity test
+                // reproduced. Boxing puts the state machine on the heap; only
+                // the frames actually executing use stack.
+                Box::pin(self.chat_inner(request, user_id, platform_access, &events)),
             )
             .await
         };
