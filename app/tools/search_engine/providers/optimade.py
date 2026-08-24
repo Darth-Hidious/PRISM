@@ -24,6 +24,10 @@ from app.tools.search_engine.translator import (
 logger = logging.getLogger(__name__)
 
 
+class NonOptimadeResponse(RuntimeError):
+    """A 2xx whose body is not OPTIMADE JSON — a moved or retired endpoint."""
+
+
 class OptimadeProvider(Provider):
     """Single OPTIMADE endpoint provider."""
 
@@ -109,6 +113,26 @@ class OptimadeProvider(Provider):
                 ) as client:
                     resp = await client.get(page_url, params=page_params)
                     resp.raise_for_status()
+                    # A 200 is not proof this is still an OPTIMADE endpoint.
+                    # A retired one commonly redirects to its project
+                    # homepage and answers 200 with HTML — nomad-lab.eu did
+                    # exactly that on 2026-08-24. `resp.json()` does refuse
+                    # that, so nothing bad is stored, but it refuses with
+                    # "Expecting value: line 1 column 1", which names the
+                    # symptom and hides the cause. Say what actually
+                    # happened, so a moved endpoint reads as a moved
+                    # endpoint and not as a mystery.
+                    # Only a content-type that is PRESENT and says something
+                    # other than JSON is evidence of a moved endpoint. An
+                    # absent header is a different, rarer thing and must not
+                    # be conflated with it.
+                    content_type = getattr(resp, "headers", {}).get("content-type", "")
+                    if content_type and "json" not in content_type.lower():
+                        raise NonOptimadeResponse(
+                            f"{self.id}: endpoint answered HTTP {resp.status_code} with "
+                            f"content-type {content_type!r}, not JSON — it has most likely "
+                            f"moved or been retired (URL: {page_url})"
+                        )
                     return resp.json(), resp.status_code
 
             try:
