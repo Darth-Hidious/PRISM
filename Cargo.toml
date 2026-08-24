@@ -37,6 +37,13 @@ strip = false
 # ─────────────────────────────────────────────────────────────────────
 [workspace.dependencies]
 
+# Mesh transport. Dials a peer by its Ed25519 public key rather than an IP,
+# which is what `PeerIdentity.node_pubkey_hex` already is — so peers keep the
+# identity they have and only the carrier underneath changes. Hole-punches,
+# falls back to relays, and `iroh-relay` is self-hostable, so replacing the
+# retired MARC27 hub does not mean operating a new one.
+iroh = "1.0.3"
+
 # Core async / runtime
 anyhow = "1.0.102"
 async-recursion = "1.1.1"
