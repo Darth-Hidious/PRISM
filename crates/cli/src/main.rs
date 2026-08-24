@@ -7660,6 +7660,20 @@ pub(crate) fn persist_source_text_snapshot(
 /// ontology and write the resulting facts (with one PROV-O activity) into
 /// the bundled Turso provenance store. Nothing leaves the machine.
 #[allow(clippy::too_many_arguments)]
+/// The provenance store this process must open.
+///
+/// ONE rule, shared with the workflows plane (`crates/workflows`):
+/// `$PRISM_PROVENANCE_DB` first, then `~/.prism/provenance.db`. The CLI
+/// used to hardcode the home path, so the env var was honoured on one
+/// plane and silently ignored on the other — which is how a benchmark run
+/// writes its facts into the operator's LIVE graph while appearing to be
+/// isolated.
+fn provenance_db_path(prism_home: &Path) -> PathBuf {
+    std::env::var_os("PRISM_PROVENANCE_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| prism_home.join("provenance.db"))
+}
+
 async fn run_local_text_ingest_file(
     path: &Path,
     project_root: &Path,
@@ -7891,7 +7905,7 @@ async fn run_local_text_ingest_file(
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let prism_home = PathBuf::from(home).join(".prism");
-    let db_path = prism_home.join("provenance.db");
+    let db_path = provenance_db_path(&prism_home);
     let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -7943,6 +7957,10 @@ async fn run_local_text_ingest_file(
     // failure lands on the errors spine (non-zero exit), and an interrupted
     // run keeps the chunks it finished.
     let mut written_facts: Vec<prism_provenance::MaterialFact> = Vec::new();
+    // Property names contributed by facts that were actually STORED,
+    // accumulated across chunks so the resolution ladder below runs once per
+    // document rather than once per window.
+    let mut property_terms: Vec<prism_ingest::property_resolution::PropertyTerm> = Vec::new();
     let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped_facts: Vec<String> = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
@@ -8244,6 +8262,25 @@ async fn run_local_text_ingest_file(
                         }
                         _ => stored_trusted += 1,
                     }
+                    prism_ingest::property_resolution::property_terms_for_fact(
+                        &ontology_set,
+                        &fact,
+                        binding.predicate_iri.as_deref(),
+                        binding.object_class_iri.as_deref(),
+                        usize::try_from(citation.line_start())
+                            .ok()
+                            .zip(usize::try_from(citation.line_end()).ok())
+                            .filter(|(from_line, to_line)| *from_line >= 1 && to_line >= from_line)
+                            .map(
+                                |(from_line, to_line)| prism_ingest::paper_agent::PaperCitation {
+                                    source_revision_id: citation.source_revision_id().to_string(),
+                                    from_line,
+                                    to_line,
+                                    quoted_text: citation.evidence_span().to_string(),
+                                },
+                            ),
+                        &mut property_terms,
+                    );
                     written_facts.push(fact);
                     chunk_written += 1;
                 }
@@ -8399,6 +8436,41 @@ async fn run_local_text_ingest_file(
         eprintln!("  WARNING: {}", verdict.detail);
     }
 
+    // The ontology resolution ladder, AFTER every write: bind each stored
+    // measurement's free-text property name against the UNION of loaded
+    // ontologies (exact → normalised → semantic → proposal). Facts are
+    // already in the store, so no rung can discard one; a resolution
+    // failure is reported in the summary and never fails the ingest that
+    // produced it. Terms that bind to nothing become citation-carrying
+    // proposals and stay on `unbound_term_bindings` for re-resolution — no
+    // paper is re-read when a richer ontology later arrives.
+    let property_resolution = if property_terms.is_empty() {
+        None
+    } else {
+        let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+            .await
+            .ok()
+            .flatten();
+        match prism_ingest::property_resolution::resolve_property_terms(
+            &store,
+            &ontology_set,
+            backend.as_deref(),
+            &prov.tenant,
+            &document_id,
+            &property_terms,
+            prism_ingest::property_resolution::DEFAULT_SEMANTIC_BIND_THRESHOLD,
+        )
+        .await
+        {
+            Ok(bindings) => Some(prism_ingest::property_resolution::binding_report(&bindings)),
+            Err(error) => Some(serde_json::json!({
+                "error": format!(
+                    "property resolution failed after the writes (facts are unaffected): {error:#}"
+                ),
+            })),
+        }
+    };
+
     let mut summary = serde_json::json!({
         "backend": "local_text",
         "path": path.display().to_string(),
@@ -8406,6 +8478,7 @@ async fn run_local_text_ingest_file(
         "schema_only": false,
         "chars": chars,
         "facts_written": written_facts.len(),
+        "property_resolution": property_resolution,
         "model": agent_id,
         "store": db_path.display().to_string(),
         "source_text_snapshot": source_text_snapshot.display().to_string(),
@@ -12937,7 +13010,7 @@ async fn create_dashboard_session_for_user_with_platform_token(
 /// store must not brick a discovery run.
 async fn open_campaign_provenance() -> Option<prism_provenance::ProvenanceStore> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let db_path = PathBuf::from(home).join(".prism").join("provenance.db");
+    let db_path = provenance_db_path(&PathBuf::from(home).join(".prism"));
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

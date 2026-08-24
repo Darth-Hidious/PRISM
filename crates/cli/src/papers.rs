@@ -1083,6 +1083,39 @@ async fn store_claims(
         tracing::warn!(%error, "papers claim embeddings were not stored");
     }
 
+    // The ontology resolution ladder, AFTER the writes: bind each measured
+    // claim's free-text property name against the union of loaded
+    // ontologies (exact → normalised → semantic → proposal). Facts are
+    // already stored, so no rung can discard one; a resolution failure is
+    // reported in the result, never allowed to fail the ingest it follows.
+    let property_terms = property_terms_for_claims(ontologies, &prepared);
+    let property_resolution = if property_terms.is_empty() {
+        None
+    } else {
+        let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+            .await
+            .ok()
+            .flatten();
+        match prism_ingest::property_resolution::resolve_property_terms(
+            &store,
+            ontologies,
+            backend.as_deref(),
+            &base_prov.tenant,
+            document_url,
+            &property_terms,
+            prism_ingest::property_resolution::DEFAULT_SEMANTIC_BIND_THRESHOLD,
+        )
+        .await
+        {
+            Ok(bindings) => Some(prism_ingest::property_resolution::binding_report(&bindings)),
+            Err(error) => Some(json!({
+                "error": format!(
+                    "property resolution failed after the writes (facts are unaffected): {error:#}"
+                ),
+            })),
+        }
+    };
+
     // Persist the ontology-extension proposals with their citations — the
     // same governance queue the text-ingest path writes. Until now this
     // command PRINTED them into its JSON blob and nothing else: a proposal
@@ -1142,10 +1175,71 @@ async fn store_claims(
             "enqueued": proposals_enqueued,
             "suppressed": proposals_suppressed,
         },
+        "property_resolution": property_resolution,
         "store": db_path.display().to_string(),
         "tenant": base_prov.tenant,
         "semantic_validation": semantic.report,
     }))
+}
+
+/// The free-text property names the resolution ladder should bind for one
+/// batch of prepared claims, each with the citation of the fact that
+/// carried it.
+///
+/// Selection is SHAPE, never vocabulary: a claim whose fact carries a finite
+/// value AND a unit term states a measurement (the same grounding rule the
+/// tabular mapper binds `kind` on), and its property is named by
+/// - the PREDICATE, when the model did not bind it to an ontology property
+///   and no loaded ontology declares it as a relation label ("crack-growth
+///   resistance" — the live free-text shape), and
+/// - the OBJECT, when the model did not classify it ("has_measurement" →
+///   "yield strength" — the property rides the object of a relation-shaped
+///   predicate).
+///
+/// Both candidates pass through [`is_property_name_shaped`], which drops
+/// strings that merely restate the value ("950 MPa").
+fn property_terms_for_claims(
+    ontologies: &prism_ingest::ontologies::OntologySet,
+    prepared: &[(
+        &prism_retrieval::claims::ExtractedClaim,
+        prism_provenance::MaterialFact,
+        Option<prism_provenance::SourceCitation>,
+        prism_provenance::LocalProvenance,
+    )],
+) -> Vec<prism_ingest::property_resolution::PropertyTerm> {
+    use prism_ingest::paper_agent::PaperCitation;
+
+    let mut terms = Vec::new();
+    for (claim, fact, _, _) in prepared {
+        let citation = match (
+            claim.provenance.source_revision_id.as_deref(),
+            claim.provenance.line_start,
+            claim.provenance.line_end,
+            claim.provenance.quote.as_deref(),
+        ) {
+            (Some(revision), Some(start), Some(end), Some(quote)) if start >= 1 && end >= start => {
+                usize::try_from(start)
+                    .ok()
+                    .zip(usize::try_from(end).ok())
+                    .map(|(from_line, to_line)| PaperCitation {
+                        source_revision_id: revision.to_string(),
+                        from_line,
+                        to_line,
+                        quoted_text: quote.to_string(),
+                    })
+            }
+            _ => None,
+        };
+        prism_ingest::property_resolution::property_terms_for_fact(
+            ontologies,
+            fact,
+            claim.ontology.predicate_iri.as_deref(),
+            claim.ontology.object_class_iri.as_deref(),
+            citation,
+            &mut terms,
+        );
+    }
+    terms
 }
 
 /// TCP-probe an LLM base URL with a hard 3-second budget.
@@ -1737,6 +1831,147 @@ mod store_tests {
             evidence[0].evidence_span.as_deref(),
             Some("UTS was 1140 MPa")
         );
+        cleanup(&db);
+    }
+
+    /// The resolution ladder runs AFTER the writes, over the union of
+    /// loaded ontologies, for each measured claim's free-text property
+    /// names: here the object "metallic material" binds (rung 2) to the
+    /// bundled EMMO class and stamps the property node the write minted,
+    /// while the free-text predicate "has_measurement" stays free text —
+    /// recorded unbound AND queued as a cited class proposal — and the fact
+    /// itself is untouched by both outcomes.
+    #[tokio::test]
+    async fn the_resolution_ladder_binds_measured_property_terms_after_the_writes() {
+        unsafe { std::env::set_var("PRISM_EMBED_BACKEND", "off") };
+        let db = scratch_db();
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
+        let mut cited = claim("metallic material", Some("QUDT:MegaPA"), None);
+        cited.provenance.source_revision_id = Some("b".repeat(64));
+        cited.provenance.line_start = Some(3);
+        cited.provenance.line_end = Some(4);
+        cited.provenance.quote = Some("the metallic material reached 1140 MPa".into());
+
+        // A claim with NO measured value: not measurement-shaped, so neither
+        // its predicate nor its object may become a property term.
+        let mut unmeasured = claim("turbine blades", None, None);
+        unmeasured.predicate = "used_in".into();
+        unmeasured.value = None;
+        unmeasured.kind = None;
+
+        // The live free-text shape: the PREDICATE names the property and the
+        // object merely restates the value — the value-string must not
+        // become a class proposal.
+        let mut free_text = claim("950 MPa", Some("QUDT:MegaPA"), None);
+        free_text.predicate = "crack-growth resistance".into();
+        free_text.value = Some(950.0);
+        free_text.provenance.source_revision_id = Some("c".repeat(64));
+        free_text.provenance.line_start = Some(9);
+        free_text.provenance.line_end = Some(9);
+        free_text.provenance.quote = Some("crack-growth resistance of 950 MPa".into());
+
+        let out = store_claims(
+            &[cited, unmeasured, free_text],
+            "https://example.org/paper",
+            "test-model",
+            &db,
+            &ontologies,
+            &[],
+            &[],
+        )
+        .await
+        .expect("store");
+        assert_eq!(out["written"], 3, "{out}");
+
+        let resolution = &out["property_resolution"];
+        assert_eq!(resolution["terms"], 3, "{out}");
+        assert_eq!(resolution["normalized"], 1, "{out}");
+        assert_eq!(resolution["proposed"], 2, "{out}");
+        assert_eq!(resolution["proposals_enqueued"], 2, "{out}");
+        assert_eq!(
+            resolution["entities_stamped"], 1,
+            "the object node the write minted was stamped: {out}"
+        );
+
+        let store = prism_provenance::ProvenanceStore::open(&db).await.unwrap();
+
+        // The bound term's durable record: rung 2, EMMO class, no score.
+        let bound = store
+            .term_binding("local", "metallic material")
+            .await
+            .unwrap()
+            .expect("binding row for the object term");
+        assert_eq!(bound.rung, prism_provenance::TERM_BINDING_RUNG_NORMALIZED);
+        assert_eq!(bound.ontology_id.as_deref(), Some("emmo"));
+        assert!(
+            bound
+                .class_iri
+                .as_deref()
+                .is_some_and(|iri| iri.starts_with("https://w3id.org/emmo#")),
+            "{bound:?}"
+        );
+        assert_eq!(bound.score, None);
+
+        // The free-text predicate's record: unbound, pending proposal id.
+        let unbound = store
+            .term_binding("local", "has_measurement")
+            .await
+            .unwrap()
+            .expect("binding row for the free-text predicate");
+        assert_eq!(unbound.rung, prism_provenance::TERM_BINDING_RUNG_PROPOSED);
+        assert_eq!(unbound.class_iri, None);
+        let item_id = unbound
+            .proposal_item_id
+            .as_deref()
+            .expect("cited rung-4 term queued a proposal");
+
+        // The proposal sits in the human governance queue with the claim's
+        // own citation attached as its sighting.
+        let pending = store.pending_ontology_proposals(10).await.unwrap();
+        let (item, _) = pending
+            .iter()
+            .find(|(item, _)| item.item_id == item_id)
+            .expect("the ladder's proposal is pending");
+        assert_eq!(item.kind, "class");
+        assert_eq!(item.label, "has_measurement");
+
+        // The free-text predicate of the third claim is a term too, and its
+        // proposal is queued; the value-string object is NOT a term.
+        assert!(
+            store
+                .term_binding("local", "crack-growth resistance")
+                .await
+                .unwrap()
+                .is_some_and(|row| row.proposal_item_id.is_some()),
+        );
+        for never_a_term in ["used_in", "turbine blades", "950 mpa"] {
+            assert!(
+                store
+                    .term_binding("local", never_a_term)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{never_a_term:?} must not enter the ladder"
+            );
+        }
+
+        // And no rung discarded a fact — all three claims are in the graph.
+        let facts = store
+            .recall_with_context_filtered(
+                "Ti-6Al-4V",
+                &["local"],
+                10,
+                prism_provenance::VerificationFilter::Any,
+            )
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 3, "every fact survived resolution: {facts:?}");
+        for object in ["metallic material", "turbine blades", "950 MPa"] {
+            assert!(
+                facts.iter().any(|fact| fact.object == object),
+                "fact with object {object:?} survived: {facts:?}"
+            );
+        }
         cleanup(&db);
     }
 

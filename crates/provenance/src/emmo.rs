@@ -2510,6 +2510,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     )
     .await?;
 
+    // The resolution ladder's durable surfaces: per-term binding records
+    // (rung + score) and per-ontology class-label vectors.
+    crate::term_binding::init_schema(conn).await?;
+
     run_key_migrations(conn).await?;
 
     Ok(())

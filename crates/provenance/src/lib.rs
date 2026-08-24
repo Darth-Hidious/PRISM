@@ -35,6 +35,7 @@ use turso::Value;
 use uuid::Uuid;
 
 pub mod emmo;
+pub mod term_binding;
 pub mod units;
 pub use emmo::{
     ActivityDecoding, AssertionClassification, ClassRegionDistance, ClassifiedFactNodes,
@@ -46,6 +47,10 @@ pub use emmo::{
     RecalledMaterialFact, SemanticEntityHit, SourceCitation, StoreBusy, StoredAssertion,
     TraversalResult, TripleGeometryNeighbor, TripleGeometryProbe, UnitTerm, VerificationFilter,
     VerificationStatus, assertion_id, canonical_key, conditioned_assertion_id, evidence_for_result,
+};
+pub use term_binding::{
+    ClassLabelEmbedding, ClassLabelNeighbor, TERM_BINDING_RUNG_EXACT, TERM_BINDING_RUNG_NORMALIZED,
+    TERM_BINDING_RUNG_PROPOSED, TERM_BINDING_RUNG_SEMANTIC, TermBinding,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

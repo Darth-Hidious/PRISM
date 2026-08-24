@@ -47,6 +47,7 @@ pub mod ontologies;
 pub mod ontology;
 pub mod paper_agent;
 pub mod pipeline;
+pub mod property_resolution;
 pub mod repair;
 /// Phase 2: the model tier that drains the repair queue one item at a
 /// time, after the code tiers ([`repair`]) have decided everything code

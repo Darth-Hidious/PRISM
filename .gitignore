@@ -173,3 +173,4 @@ data/training/
 # (a `cargo test` in the shared target arms prism-agent/test-guard, which
 # then aborts the real backend). Build artefacts, never committed.
 target-*/
+.dual-graph/
