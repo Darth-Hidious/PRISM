@@ -3,7 +3,7 @@ source: crates/tui/tests/render_snapshots.rs
 assertion_line: 107
 expression: rendered
 ---
- ‹ back  New session    0 tools    Ctrl-P · ?                      │ Workspace
+ ‹ back  New session    Ctrl-P · ?                                 │ Workspace
 ┌ PRISM · materials research workspace ──────────────────────────┐ │ [Act] Too Fil Obj Str Art
 │                                                                │ │
 │  WORKFLOWS                                                     │ │  (no activity yet)

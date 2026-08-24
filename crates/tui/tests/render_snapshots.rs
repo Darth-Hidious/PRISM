@@ -141,9 +141,22 @@ fn first_screen_has_no_debug_text_stale_state_or_panel_overlap() {
         "debug output leaked into rendered lines:\n{rendered}"
     );
     assert!(!rendered.contains("loading tool catalog…"), "{rendered}");
+    // The catalog HAS loaded (above), and the home view says so without
+    // reciting the inventory.
+    assert!(rendered.contains("tools ready"), "{rendered}");
+    // Regression guard for a deliberate product decision: the tool COUNT is
+    // not advertised on any ambient surface. A headline "164 tools" invites
+    // being asked about all 164, and the number is implementation detail
+    // rather than a capability anyone can act on. It stays one keypress away
+    // in the tools pane (`t`) and in the usage stats — surfaces reached by
+    // asking. Nothing is hidden; it is simply not shouted.
     assert!(
-        rendered.contains("164 tools · 55 need approval · 109 auto"),
-        "{rendered}"
+        !rendered.contains("164 tools"),
+        "the tool count must not appear on the first screen:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("need approval"),
+        "the approval split must not appear on the first screen:\n{rendered}"
     );
     assert!(!rendered.contains("model: —"), "{rendered}");
     assert_eq!(

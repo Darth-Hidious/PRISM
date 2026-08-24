@@ -301,7 +301,15 @@ fn welcome_sets_version_and_tool_count() {
     assert_eq!(app.tool_count, 99);
     // Should push a system message
     assert!(!app.messages.is_empty());
-    assert!(app.messages.last().unwrap().text.contains("99 tools"));
+    // The welcome carries the count into STATE (asserted above), but does not
+    // recite it at the user: the tool inventory is implementation detail, and
+    // a greeting that opens with "99 tools" invites being asked about all 99.
+    // It stays reachable through the tools pane and the usage stats.
+    assert!(app.messages.last().unwrap().text.contains("PRISM ready"));
+    assert!(
+        !app.messages.last().unwrap().text.contains("99 tools"),
+        "the greeting must not advertise the tool count"
+    );
 }
 
 #[test]

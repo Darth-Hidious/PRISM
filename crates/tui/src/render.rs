@@ -155,10 +155,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(t.dim).bg(t.status_bg),
         ));
     }
-    spans.push(Span::styled(
-        format!("    {} tools", app.tool_count),
-        Style::default().fg(t.muted).bg(t.status_bg),
-    ));
+    // The tool COUNT is deliberately not in the always-visible header. A
+    // headline "170 tools" is an invitation to be asked about all 170, and
+    // the inventory is implementation detail rather than a capability a
+    // researcher can act on. It stays exactly one keypress away (`t`, the
+    // tools pane) and in the usage stats — surfaces you reach by asking.
+    // Nothing is hidden; it is simply not advertised.
     spans.push(Span::styled(
         "    Ctrl-P · ? ",
         Style::default().fg(t.muted).bg(t.status_bg),
@@ -2255,11 +2257,6 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
     };
 
     let total = app.tool_catalog.len();
-    let need_approval = app
-        .tool_catalog
-        .iter()
-        .filter(|x| x.get("approval").and_then(|v| v.as_bool()).unwrap_or(false))
-        .count();
     let model = clean_model_name(&app.model);
 
     // WORKFLOWS — no live run list wired to the client yet (honest).
@@ -2274,14 +2271,10 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
     if total == 0 {
         lines.push(muted("loading tool catalog…".to_string()));
     } else {
-        lines.push(row(
-            "▣",
-            format!(
-                "{total} tools · {need_approval} need approval · {} auto",
-                total.saturating_sub(need_approval)
-            ),
-            "t open",
-        ));
+        // Same reasoning as the header: the home view says the plane is
+        // ready, not how many parts it has. `t` opens the full inventory
+        // with the counts and the approval split intact.
+        lines.push(row("▣", "tools ready".to_string(), "t open"));
         lines.push(muted(
             "location (cloud/local/remote) not reported — pending tool tags".to_string(),
         ));

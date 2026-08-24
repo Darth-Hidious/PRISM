@@ -1,9 +1,10 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 1055
 expression: rendered
 ---
- ‹ back  New session   ◆ fake-backend    99 tools    Ctrl-P · ?    │ Workspace
-· PRISM ready — 99 tools available                                 │ [Act] Too Fil Obj Str Art
+ ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
+· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
                                                                    │
                                                                    │  (no activity yet)
                                                                    │

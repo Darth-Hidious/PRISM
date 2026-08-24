@@ -3968,10 +3968,7 @@ impl App {
                 if let Some(session_id) = session_id {
                     self.set_session_scope(&session_id);
                 }
-                self.push_system(&format!(
-                    "PRISM ready — {} tools available",
-                    self.tool_count
-                ));
+                self.push_system("PRISM ready");
             }
             AgentMsg::Permissions {
                 mode,
