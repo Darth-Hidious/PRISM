@@ -3722,3 +3722,19 @@ fn structures_tab_cycles_between_objects_and_artifacts() {
     app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
     assert_eq!(app.workspace_tab, WorkspaceTab::Objects);
 }
+
+/// Adding a provider must produce an entry PRISM's registry actually loads,
+/// and must never write the key into the shared providers file.
+///
+/// The bar the owner set is: palette → paste URL → paste key → done. Before
+/// this, the only way to add a provider PRISM did not ship was editing
+/// `~/.prism/providers.toml` by hand.
+#[test]
+fn a_display_name_slugs_into_a_registry_id() {
+    use prism_tui::app::App;
+    assert_eq!(App::provider_slug("Alibaba DashScope"), "alibaba-dashscope");
+    assert_eq!(App::provider_slug("z.ai  GLM (coding)"), "z-ai-glm-coding");
+    assert_eq!(App::provider_slug("  Moonshot  "), "moonshot");
+    // Nothing usable in it -> refused upstream rather than minting an empty id.
+    assert_eq!(App::provider_slug("!!!"), "");
+}

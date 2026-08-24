@@ -1995,6 +1995,11 @@ fn draw_apikey_window(f: &mut Frame, app: &App) {
     let area = centered_rect(64, 62, f.area());
     f.render_widget(Clear, area);
 
+    if app.apikey_window.adding {
+        draw_add_provider_form(f, app, area);
+        return;
+    }
+
     let providers = crate::app::API_PROVIDERS;
     let idx = app.apikey_window.provider_idx.min(providers.len() - 1);
     let (provider_name, env_var) = providers[idx];
@@ -2062,7 +2067,7 @@ fn draw_apikey_window(f: &mut Frame, app: &App) {
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  ←/→ provider · type key · ↵ save · Esc close",
+        "  ←/→ provider · type key · ↵ save · ^N add a provider · Esc close",
         Style::default().fg(t.muted),
     )));
 
@@ -2075,6 +2080,76 @@ fn draw_apikey_window(f: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(t.accent))
                 .title(Span::styled(
                     title,
+                    Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                )),
+        );
+    f.render_widget(para, area);
+}
+
+/// Add a provider PRISM does not ship: a name, an OpenAI-compatible base
+/// URL, and a key. Three fields, one screen.
+///
+/// The registry always supported this — `Provider` is data and the user file
+/// merges over the built-ins — but writing an entry meant opening
+/// `~/.prism/providers.toml` in an editor. A mechanism nobody can reach from
+/// the product is not a feature.
+fn draw_add_provider_form(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let t = app.theme();
+    let w = &app.apikey_window;
+
+    // The key is masked; name and URL are not — they are not secrets, and
+    // hiding a URL only makes a typo impossible to spot.
+    let masked: String = "•".repeat(w.key_input.len());
+    let fields: [(&str, &str, &str); 3] = [
+        ("Name", w.new_name.as_str(), "Alibaba DashScope"),
+        (
+            "Base URL",
+            w.new_url.as_str(),
+            "https://…/compatible-mode/v1",
+        ),
+        ("API key", masked.as_str(), "paste it here"),
+    ];
+
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+    for (i, (label, value, placeholder)) in fields.iter().enumerate() {
+        let focused = i == w.field_idx;
+        let (shown, colour) = if value.is_empty() {
+            (*placeholder, t.muted)
+        } else {
+            (*value, t.text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if focused { "> " } else { "  " },
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{label:<9} "),
+                Style::default().fg(if focused { t.accent } else { t.muted }),
+            ),
+            Span::styled(shown.to_string(), Style::default().fg(colour)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  The key is stored for you; the URL is written to ~/.prism/providers.toml.",
+        Style::default().fg(t.muted),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  Tab field · ↵ save · Esc back",
+        Style::default().fg(t.muted),
+    )));
+
+    let para = Paragraph::new(lines)
+        .style(Style::default().bg(t.overlay_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.accent))
+                .title(Span::styled(
+                    " Add a provider ",
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )),
         );

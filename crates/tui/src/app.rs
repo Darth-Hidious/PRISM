@@ -390,6 +390,17 @@ pub struct ApiKeyWindow {
     pub provider_idx: usize,
     pub key_input: String,
     pub status: Vec<(String, bool)>, // (env_var, has_key)
+    /// Adding a provider PRISM does not ship. Until this existed the only
+    /// way was hand-editing `~/.prism/providers.toml`, which is not a
+    /// feature — it is a workaround the user has to be told about.
+    pub adding: bool,
+    /// Display name, e.g. "Alibaba DashScope". The registry id is slugged
+    /// from it so the user never types two names for one thing.
+    pub new_name: String,
+    /// OpenAI-compatible base URL.
+    pub new_url: String,
+    /// Which of (name, url, key) has focus while `adding`.
+    pub field_idx: usize,
 }
 
 /// One row of the Workspace *Activity* tab, tied back to the transcript
@@ -3465,6 +3476,10 @@ impl App {
             .collect();
         self.apikey_window.key_input.clear();
         self.apikey_window.provider_idx = 0;
+        self.apikey_window.adding = false;
+        self.apikey_window.new_name.clear();
+        self.apikey_window.new_url.clear();
+        self.apikey_window.field_idx = 0;
         self.apikey_window.open = true;
     }
 
@@ -3498,14 +3513,153 @@ impl App {
         Ok(())
     }
 
+    /// Slug a display name into a registry id: "Alibaba DashScope Intl" ->
+    /// "alibaba-dashscope-intl". The user names the thing once.
+    pub fn provider_slug(name: &str) -> String {
+        let mut out = String::with_capacity(name.len());
+        let mut prev_dash = true; // no leading dash
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.extend(ch.to_lowercase());
+                prev_dash = false;
+            } else if !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        }
+        while out.ends_with('-') {
+            out.pop();
+        }
+        out
+    }
+
+    /// Append a provider to `~/.prism/providers.toml` and store its key.
+    ///
+    /// The registry has always supported this — `Provider` is data, and the
+    /// user file merges over the built-ins by id. What was missing was any
+    /// way to write the entry without opening a text editor, which is the
+    /// difference between a mechanism and a feature.
+    fn save_new_provider(name: &str, url: &str, key: &str) -> Result<String, String> {
+        let id = Self::provider_slug(name);
+        if id.is_empty() {
+            return Err("name must contain a letter or digit".into());
+        }
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err("base URL must start with http:// or https://".into());
+        }
+        let env_var = format!("PRISM_{}_API_KEY", id.replace('-', "_").to_uppercase());
+        let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+        let path = format!("{home}/.prism/providers.toml");
+
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.contains(&format!("id = \"{id}\"")) {
+            return Err(format!(
+                "provider {id:?} already exists — pick another name"
+            ));
+        }
+        // The KEY never lands here: this file records only which env var to
+        // read at request time, matching how the built-in registry works.
+        let entry = format!(
+            "\n[[provider]]\nid = \"{id}\"\nname = \"{name}\"\nbase_url = \"{url}\"\napi_key_env = \"{env_var}\"\n"
+        );
+        let mut merged = existing;
+        if !merged.is_empty() && !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        merged.push_str(&entry);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, merged).map_err(|e| e.to_string())?;
+        Self::save_api_key(&env_var, key)?;
+        Ok(id)
+    }
+
     fn handle_apikey_key(&mut self, key: KeyEvent) {
         let cancel = (key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c'))
             || key.code == KeyCode::Esc;
         if cancel {
+            if self.apikey_window.adding {
+                // Esc backs out of the form, not the whole window.
+                self.apikey_window.adding = false;
+                self.apikey_window.field_idx = 0;
+                return;
+            }
             self.close_apikey_window();
             return;
         }
+
+        if self.apikey_window.adding {
+            match key.code {
+                KeyCode::Tab | KeyCode::Down => {
+                    self.apikey_window.field_idx = (self.apikey_window.field_idx + 1) % 3;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.apikey_window.field_idx =
+                        self.apikey_window.field_idx.checked_sub(1).unwrap_or(2);
+                }
+                KeyCode::Backspace => {
+                    match self.apikey_window.field_idx {
+                        0 => self.apikey_window.new_name.pop(),
+                        1 => self.apikey_window.new_url.pop(),
+                        _ => self.apikey_window.key_input.pop(),
+                    };
+                }
+                KeyCode::Char(c) => match self.apikey_window.field_idx {
+                    0 => self.apikey_window.new_name.push(c),
+                    1 => self.apikey_window.new_url.push(c),
+                    _ => self.apikey_window.key_input.push(c),
+                },
+                KeyCode::Enter => {
+                    let name = self.apikey_window.new_name.trim().to_string();
+                    let url = self.apikey_window.new_url.trim().to_string();
+                    let key_val = self.apikey_window.key_input.trim().to_string();
+                    // Say which field is missing rather than "invalid input".
+                    let missing = if name.is_empty() {
+                        Some("name")
+                    } else if url.is_empty() {
+                        Some("base URL")
+                    } else if key_val.is_empty() {
+                        Some("API key")
+                    } else {
+                        None
+                    };
+                    if let Some(field) = missing {
+                        self.toast(format!("{field} is required"), ToastKind::Warn);
+                        return;
+                    }
+                    match Self::save_new_provider(&name, &url, &key_val) {
+                        Ok(id) => {
+                            self.toast(format!("added {id} — /use provider {id}"), ToastKind::Ok);
+                            self.apikey_window.adding = false;
+                            self.apikey_window.new_name.clear();
+                            self.apikey_window.new_url.clear();
+                            self.apikey_window.key_input.clear();
+                            self.apikey_window.field_idx = 0;
+                        }
+                        Err(e) => self.toast(e, ToastKind::Err),
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Ctrl-N opens the add-a-provider form. NOT a bare letter: in this
+        // mode `Char(c)` appends to the key being typed, so any plain-letter
+        // binding silently eats that character out of the user's API key.
+        // (The pre-existing `h`/`l` navigation bindings below have exactly
+        // that problem — a key containing an h or an l cannot be typed here.
+        // Left untouched as a separate defect rather than changed under an
+        // unrelated feature.)
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            self.apikey_window.adding = true;
+            self.apikey_window.field_idx = 0;
+            self.apikey_window.key_input.clear();
+            return;
+        }
+
         match key.code {
             KeyCode::Left | KeyCode::Char('h') => {
                 let n = API_PROVIDERS.len();
