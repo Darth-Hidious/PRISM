@@ -544,6 +544,55 @@ mod tests {
         );
     }
 
+    /// The +1 relevance floor is NOT a guarantee, and pretending otherwise is
+    /// what let this fail in the wild.
+    ///
+    /// A keyword hit in a tool NAME scores +5; the always-include floor is +1.
+    /// So a query containing "query" ranks `query_materials_project` ABOVE
+    /// `query_local`, and the token-budget truncation downstream then drops
+    /// the loser. Measured live 2026-08-24: five consecutive wrong calls, and
+    /// the model reporting "every attempt to emit query_local collapses into
+    /// that wrong call".
+    ///
+    /// The existing tests all asserted `ALWAYS_INCLUDE.contains(...)` — that
+    /// the NAME is in the list — which stayed true the entire time the
+    /// behaviour was broken. This one asserts the ranking, which is what
+    /// actually decides whether the model can see the tool.
+    #[test]
+    fn the_always_include_floor_does_not_survive_a_name_keyword_match() {
+        let catalog = ToolCatalog::from_tool_server_json(&serde_json::json!({
+            "tools": [
+                {
+                    "name": "query_materials_project",
+                    "description": "Query the Materials Project database.",
+                    "input_schema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "query_local",
+                    "description": "Search this machine's own knowledge graph.",
+                    "input_schema": {"type": "object", "properties": {}}
+                }
+            ]
+        }));
+
+        let ranked = catalog.names_by_relevance("query the fatigue threshold");
+        let mp = ranked.iter().position(|n| n == "query_materials_project");
+        let local = ranked.iter().position(|n| n == "query_local");
+
+        // This is the defect, asserted rather than described: relevance alone
+        // puts the wrong tool first even though the other is "always
+        // included". Ranking cannot be the guarantee — pinning is, and
+        // `agent_loop` seeds the pin set from ALWAYS_INCLUDE for exactly this
+        // reason. If a future change makes ranking sufficient, this test
+        // fails and the pin seeding can be revisited deliberately.
+        assert!(
+            mp < local,
+            "expected the keyword match to outrank the always-include floor \
+             (mp={mp:?}, local={local:?}); if it no longer does, the pin \
+             seeding in agent_loop may be reconsidered"
+        );
+    }
+
     /// The federated materials search must be reachable and read-only.
     ///
     /// Two separate ways it was not: absent from the core set, so weak models

@@ -2814,6 +2814,30 @@ pub(crate) async fn run_turn_inner(
     // find_tools returned names the model could never actually call.
     let mut pinned_tools: std::collections::HashSet<String> =
         turn_skill_context.pinned_tools().cloned().collect();
+    // ALWAYS_INCLUDE must actually always include.
+    //
+    // It did not. The only thing it did was add +1 to a relevance score in
+    // `names_by_relevance`, while a keyword hit in a tool's NAME is worth +5
+    // — so a query containing "query" ranked `query_materials_project` above
+    // the local-graph tool that `ALWAYS_INCLUDE` exists to protect, and the
+    // token-budget truncation in `finalize_tools` then cut the loser.
+    //
+    // Observed live 2026-08-24 on a question whose answer was in the local
+    // graph: the model called `query_materials_project` FIVE times, said
+    // "every attempt to emit query_local collapses into that wrong call",
+    // and only escaped via the doom-loop guard. That is the exact failure
+    // `ALWAYS_INCLUDE`'s own doc comment describes as the reason it exists —
+    // "a model cannot call a tool it was never offered" — recurring because
+    // the constant was advisory rather than binding.
+    //
+    // Pinning is the mechanism that already means "paid for first": pinned
+    // tools are charged ahead of the ranked list in `finalize_tools`. Seeding
+    // the pin set here makes the name true. A tool that is genuinely absent
+    // from the catalog is skipped by `pin_within_budget`, so this cannot
+    // offer something that does not exist.
+    for name in crate::tool_catalog::ALWAYS_INCLUDE {
+        pinned_tools.insert((*name).to_string());
+    }
     // Execution-contract gate state: names of tools that ACTUALLY EXECUTED
     // this turn (recorded at h5, after the permission / policy / approval
     // gates — a blocked call produced no evidence and must not count), and how
