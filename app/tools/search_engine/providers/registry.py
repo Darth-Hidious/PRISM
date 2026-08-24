@@ -469,6 +469,7 @@ def build_registry(
     from pathlib import Path
     from app.tools.search_engine.providers.discovery import (
         load_cache, save_cache, is_cache_fresh, discover_providers,
+        CACHE_MAX_AGE_DAYS,
         load_overrides, apply_overrides, load_platform_providers,
         DEFAULT_CACHE_PATH,
     )
@@ -479,11 +480,43 @@ def build_registry(
     cache = load_cache(c_path)
 
     if cache and cache.get("endpoints"):
-        # Always prefer cache if it has data — re-discover in background later
         endpoints = cache["endpoints"]
         if not is_cache_fresh(cache) and not skip_network:
-            # Stale cache: schedule background refresh, don't block startup
-            logger.debug("Cache stale, using existing %d providers", len(endpoints))
+            # A stale cache USED to be kept forever: this branch computed
+            # `is_cache_fresh`, wrote one `logger.debug` that nothing reads,
+            # and scheduled the refresh its own comment promised in no way at
+            # all. So the endpoint list froze at first run while the OPTIMADE
+            # federation kept moving — measured 2026-08-24 at 33 days old
+            # against a 7-day window, with 4 of 5 spot-checked endpoints dead.
+            # Re-discover for real. Discovery failing is not fatal: the stale
+            # list is still better than none, but saying so is not optional.
+            logger.info(
+                "OPTIMADE registry cache is stale (%d providers, older than %g days) — "
+                "rediscovering",
+                len(endpoints),
+                CACHE_MAX_AGE_DAYS,
+            )
+            try:
+                overrides_data = load_overrides(overrides_path)
+                fallbacks = overrides_data.get("fallback_index_urls", {})
+                fresh = asyncio.run(discover_providers(fallback_index_urls=fallbacks))
+                if fresh:
+                    save_cache(fresh, c_path)
+                    endpoints = fresh
+                    logger.info("OPTIMADE registry refreshed: %d providers", len(fresh))
+                else:
+                    logger.warning(
+                        "OPTIMADE rediscovery returned nothing — continuing on the "
+                        "STALE cache of %d providers; results may be from dead endpoints",
+                        len(endpoints),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "OPTIMADE rediscovery failed (%s) — continuing on the STALE cache "
+                    "of %d providers; results may be from dead endpoints",
+                    exc,
+                    len(endpoints),
+                )
     elif not skip_network:
         try:
             overrides_data = load_overrides(overrides_path)
