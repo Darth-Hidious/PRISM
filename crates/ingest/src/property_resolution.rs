@@ -149,16 +149,18 @@ pub fn property_terms_for_fact(
         });
     }
     // The object slot of a measured fact holds EITHER the quantity's name
-    // ("yield strength") or a restatement of the measurement itself ("485
-    // HV30 (highest among the alloys studied)"). The second is a value, not
-    // a property name, and turning it into a class proposal puts work on a
-    // human reviewer that can never be accepted. Told apart structurally by
-    // the fact's OWN number — no vocabulary, no length limit, nothing that
-    // could reject a real name like "0.2% proof stress" (whose leading
-    // number is not the measured value).
-    let object_restates_the_value = fact.value.is_some_and(|value| {
-        leading_number(&fact.object).is_some_and(|lead| same_number(lead, value))
-    });
+    // ("yield strength") or a restatement of the measurement itself
+    // ("density of 4.51 g/cm3, the lowest of the series"). The second is a
+    // value, not a property name, and turning it into a class proposal puts
+    // work on a human reviewer that can never accept it. Told apart
+    // structurally, by whether the fact's OWN number appears anywhere in the
+    // string — no vocabulary, no length limit. A real name like "0.2% proof
+    // stress" survives because 0.2 is not the measured value (the stress
+    // is). Measured live: this shape was 7 of 12 unbindable terms from one
+    // paper, and a leading-number-only test caught none of them.
+    let object_restates_the_value = fact
+        .value
+        .is_some_and(|value| numbers_in(&fact.object).any(|found| same_number(found, value)));
     if object_class_iri.is_none()
         && !object_restates_the_value
         && is_property_name_shaped(&fact.object)
@@ -170,32 +172,51 @@ pub fn property_terms_for_fact(
     }
 }
 
-/// The numeric literal a string OPENS with, if any (`"485 HV30 (…)"` → 485,
-/// `"0.2% proof stress"` → 0.2, `"yield strength"` → None).
-fn leading_number(text: &str) -> Option<f64> {
-    let trimmed = text.trim_start();
-    let mut end = 0usize;
-    let mut seen_digit = false;
-    for (index, ch) in trimmed.char_indices() {
-        let keep = match ch {
-            '0'..='9' => {
-                seen_digit = true;
-                true
+/// Every finite numeric literal in a string, in order (`"density of 4.51
+/// g/cm3"` → 4.51, 3; `"Ti 0.17, Zr 0.13"` → 0.17, 0.13; `"yield strength"`
+/// → nothing). A literal is a maximal run of digits with at most one
+/// interior decimal point, plus a sign written directly against it.
+fn numbers_in(text: &str) -> impl Iterator<Item = f64> + '_ {
+    let bytes = text.as_bytes();
+    let mut cursor = 0usize;
+    std::iter::from_fn(move || {
+        while cursor < bytes.len() {
+            if !bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+                continue;
             }
-            '+' | '-' => index == 0,
-            '.' => seen_digit,
-            'e' | 'E' => false,
-            _ => false,
-        };
-        if !keep {
-            break;
+            // Extend left over an attached sign, then right over the digits
+            // and at most one interior point, so "-3.5" and "0.52" read
+            // whole rather than as fragments.
+            let mut start = cursor;
+            if start > 0 && (bytes[start - 1] == b'-' || bytes[start - 1] == b'+') {
+                start -= 1;
+            }
+            let mut end = cursor;
+            let mut seen_point = false;
+            while end < bytes.len() {
+                if bytes[end].is_ascii_digit() {
+                    end += 1;
+                } else if bytes[end] == b'.'
+                    && !seen_point
+                    && end + 1 < bytes.len()
+                    && bytes[end + 1].is_ascii_digit()
+                {
+                    seen_point = true;
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            cursor = end;
+            if let Ok(parsed) = text[start..end].parse::<f64>()
+                && parsed.is_finite()
+            {
+                return Some(parsed);
+            }
         }
-        end = index + ch.len_utf8();
-    }
-    if !seen_digit {
-        return None;
-    }
-    trimmed[..end].parse::<f64>().ok().filter(|n| n.is_finite())
+        None
+    })
 }
 
 /// Equal as measurements: relative for large magnitudes, absolute near zero.
@@ -785,14 +806,43 @@ mod tests {
     }
 
     #[test]
-    fn leading_number_reads_only_an_opening_literal() {
-        assert_eq!(leading_number("485 HV30 (highest)"), Some(485.0));
-        assert_eq!(leading_number("0.2% proof stress"), Some(0.2));
-        assert_eq!(leading_number("-3.5 mm shrinkage"), Some(-3.5));
-        assert_eq!(leading_number("yield strength"), None);
-        assert_eq!(leading_number(""), None);
-        // A bare unit prefix is not a number.
-        assert_eq!(leading_number("HV30 hardness"), None);
+    fn numbers_in_reads_every_literal_wherever_it_sits() {
+        let all = |t: &str| numbers_in(t).collect::<Vec<_>>();
+        assert_eq!(all("485 HV30 (highest)"), vec![485.0, 30.0]);
+        assert_eq!(all("density of 4.51 g/cm3, the lowest"), vec![4.51, 3.0]);
+        assert_eq!(all("0.2% proof stress"), vec![0.2]);
+        assert_eq!(all("-3.5 mm shrinkage"), vec![-3.5]);
+        assert_eq!(all("Ti 0.17, Zr 0.13"), vec![0.17, 0.13]);
+        assert_eq!(all("yield strength"), Vec::<f64>::new());
+        assert_eq!(all(""), Vec::<f64>::new());
+    }
+
+    /// The measured number embedded MID-STRING is the common shape: 7 of 12
+    /// unbindable terms in one live run looked like this, and a
+    /// leading-number-only test caught none of them.
+    #[test]
+    fn object_embedding_the_measured_value_is_not_a_term() {
+        let set = loaded_set();
+        for (object, value) in [
+            ("density of 4.51 g/cm3, the lowest of the series", 4.51),
+            ("melting point of 1668 C, the lowest among them", 1668.0),
+            ("VEC of 4.329", 4.329),
+            ("Ta atomic fraction of 0.52 +/- 0.02", 0.52),
+        ] {
+            let mut terms = Vec::new();
+            property_terms_for_fact(
+                &set,
+                &measured("has some property", object, value),
+                None,
+                None,
+                None,
+                &mut terms,
+            );
+            assert!(
+                terms.iter().all(|t| t.term != object),
+                "{object:?} restates the measured value {value} and must not be proposed"
+            );
+        }
     }
 
     struct TempDb {
