@@ -7660,20 +7660,6 @@ pub(crate) fn persist_source_text_snapshot(
 /// ontology and write the resulting facts (with one PROV-O activity) into
 /// the bundled Turso provenance store. Nothing leaves the machine.
 #[allow(clippy::too_many_arguments)]
-/// The provenance store this process must open.
-///
-/// ONE rule, shared with the workflows plane (`crates/workflows`):
-/// `$PRISM_PROVENANCE_DB` first, then `~/.prism/provenance.db`. The CLI
-/// used to hardcode the home path, so the env var was honoured on one
-/// plane and silently ignored on the other — which is how a benchmark run
-/// writes its facts into the operator's LIVE graph while appearing to be
-/// isolated.
-fn provenance_db_path(prism_home: &Path) -> PathBuf {
-    std::env::var_os("PRISM_PROVENANCE_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| prism_home.join("provenance.db"))
-}
-
 async fn run_local_text_ingest_file(
     path: &Path,
     project_root: &Path,
@@ -7905,7 +7891,11 @@ async fn run_local_text_ingest_file(
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let prism_home = PathBuf::from(home).join(".prism");
-    let db_path = provenance_db_path(&prism_home);
+    // ONE store-selection rule, shared with every other plane:
+    // `$PRISM_PROVENANCE_DB` then `~/.prism/provenance.db`. Hardcoding the
+    // home path here made the override work on some commands and silently
+    // not others — which is how a benchmark writes into the LIVE graph.
+    let db_path = prism_provenance::store_path();
     let store = prism_provenance::ProvenanceStore::open(&db_path).await?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -13009,8 +12999,7 @@ async fn create_dashboard_session_for_user_with_platform_token(
 /// checkpoint-only persistence with a loud warning — a locked or corrupt
 /// store must not brick a discovery run.
 async fn open_campaign_provenance() -> Option<prism_provenance::ProvenanceStore> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let db_path = provenance_db_path(&PathBuf::from(home).join(".prism"));
+    let db_path = prism_provenance::store_path();
     if let Some(parent) = db_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

@@ -148,12 +148,60 @@ pub fn property_terms_for_fact(
             citation: citation.clone(),
         });
     }
-    if object_class_iri.is_none() && is_property_name_shaped(&fact.object) {
+    // The object slot of a measured fact holds EITHER the quantity's name
+    // ("yield strength") or a restatement of the measurement itself ("485
+    // HV30 (highest among the alloys studied)"). The second is a value, not
+    // a property name, and turning it into a class proposal puts work on a
+    // human reviewer that can never be accepted. Told apart structurally by
+    // the fact's OWN number — no vocabulary, no length limit, nothing that
+    // could reject a real name like "0.2% proof stress" (whose leading
+    // number is not the measured value).
+    let object_restates_the_value = fact.value.is_some_and(|value| {
+        leading_number(&fact.object).is_some_and(|lead| same_number(lead, value))
+    });
+    if object_class_iri.is_none()
+        && !object_restates_the_value
+        && is_property_name_shaped(&fact.object)
+    {
         out.push(PropertyTerm {
             term: fact.object.clone(),
             citation,
         });
     }
+}
+
+/// The numeric literal a string OPENS with, if any (`"485 HV30 (…)"` → 485,
+/// `"0.2% proof stress"` → 0.2, `"yield strength"` → None).
+fn leading_number(text: &str) -> Option<f64> {
+    let trimmed = text.trim_start();
+    let mut end = 0usize;
+    let mut seen_digit = false;
+    for (index, ch) in trimmed.char_indices() {
+        let keep = match ch {
+            '0'..='9' => {
+                seen_digit = true;
+                true
+            }
+            '+' | '-' => index == 0,
+            '.' => seen_digit,
+            'e' | 'E' => false,
+            _ => false,
+        };
+        if !keep {
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+    if !seen_digit {
+        return None;
+    }
+    trimmed[..end].parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// Equal as measurements: relative for large magnitudes, absolute near zero.
+fn same_number(left: f64, right: f64) -> bool {
+    let difference = (left - right).abs();
+    difference <= f64::EPSILON.max(1e-9 * left.abs().max(right.abs()))
 }
 
 /// Roll one resolution run up for a command's JSON result: counts per rung
@@ -665,6 +713,86 @@ mod tests {
             Arc::new(MatKgOntology) as Arc<dyn Ontology>,
         ])
         .expect("built-in ontologies form a valid set")
+    }
+
+    /// A measured fact whose object is whatever the model wrote there.
+    fn measured(predicate: &str, object: &str, value: f64) -> prism_provenance::MaterialFact {
+        prism_provenance::MaterialFact {
+            subject: "HfNbTaTiZr".into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            value: Some(value),
+            unit: Some(
+                prism_provenance::UnitTerm::new("HV30").expect("HV30 is a usable unit spelling"),
+            ),
+            conditions: Vec::new(),
+            confidence: None,
+            kind: Some("measurement".into()),
+            evidence_class: prism_provenance::EvidenceClass::Research,
+            verification: None,
+            verification_reason: None,
+        }
+    }
+
+    /// The object of a measured fact that OPENS with the fact's own number
+    /// restates the measurement — it is a value, not a property name, and
+    /// must never reach the governance queue as a class proposal. Measured
+    /// live: 8 of 21 terms from one paper were strings of this shape.
+    #[test]
+    fn object_restating_the_measured_value_is_not_a_term() {
+        let set = loaded_set();
+        let mut terms = Vec::new();
+        property_terms_for_fact(
+            &set,
+            &measured(
+                "Vickers hardness",
+                "485 HV30 (highest among the alloys studied)",
+                485.0,
+            ),
+            None,
+            None,
+            None,
+            &mut terms,
+        );
+        let collected: Vec<&str> = terms.iter().map(|t| t.term.as_str()).collect();
+        assert_eq!(
+            collected,
+            vec!["Vickers hardness"],
+            "the predicate names the property; the object restates the value"
+        );
+    }
+
+    /// The guard keys on the fact's OWN number, so a genuine property name
+    /// that merely BEGINS with a different number still passes. Without
+    /// this, "0.2% proof stress" would be silently discarded.
+    #[test]
+    fn number_led_property_name_is_still_a_term() {
+        let set = loaded_set();
+        let mut terms = Vec::new();
+        property_terms_for_fact(
+            &set,
+            &measured("exhibits", "0.2% proof stress", 1100.0),
+            None,
+            None,
+            None,
+            &mut terms,
+        );
+        assert!(
+            terms.iter().any(|t| t.term == "0.2% proof stress"),
+            "0.2 is not the measured value 1100, so this is a property name: {:?}",
+            terms.iter().map(|t| &t.term).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn leading_number_reads_only_an_opening_literal() {
+        assert_eq!(leading_number("485 HV30 (highest)"), Some(485.0));
+        assert_eq!(leading_number("0.2% proof stress"), Some(0.2));
+        assert_eq!(leading_number("-3.5 mm shrinkage"), Some(-3.5));
+        assert_eq!(leading_number("yield strength"), None);
+        assert_eq!(leading_number(""), None);
+        // A bare unit prefix is not a number.
+        assert_eq!(leading_number("HV30 hardness"), None);
     }
 
     struct TempDb {

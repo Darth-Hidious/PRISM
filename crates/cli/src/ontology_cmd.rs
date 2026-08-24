@@ -84,6 +84,27 @@ pub enum OntologyCommands {
     /// standard plugin contract for the ontology plane (same inventory as
     /// `prism plugins list`, ontology section, and the TUI/agent routes).
     List,
+    /// Re-run the property resolution ladder over every term that is still
+    /// unbound, against the ontologies loaded NOW.
+    ///
+    /// This is what makes a better ontology pay off retroactively: promote a
+    /// proposal, or load a richer vocabulary, and the terms that had nothing
+    /// to bind to bind now — WITHOUT re-reading a single paper. Bindings only
+    /// ever strengthen (a lower rung never replaces a higher one), and facts
+    /// are never touched: they keep their free-text spelling and gain
+    /// identity through the term.
+    Rebind {
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the semantic bind threshold for this run. Every score is
+        /// recorded either way, so this can be tuned from measured data.
+        #[arg(long)]
+        threshold: Option<f64>,
+        /// Machine-readable result.
+        #[arg(long)]
+        json: bool,
+    },
     /// Review the ontology-extension proposals the paper reader queued:
     /// list them with their citations, accept them into a DRAFT artifact
     /// (which then goes through the normal `promote` gate), or reject them
@@ -230,7 +251,195 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
         }
         OntologyCommands::List => list(project_root),
         OntologyCommands::Proposals { command } => proposals(command, project_root).await,
+        OntologyCommands::Rebind {
+            dry_run,
+            threshold,
+            json,
+        } => rebind(project_root, dry_run, threshold, json).await,
     }
+}
+
+// ── Re-resolution ──────────────────────────────────────────────────────
+
+/// Re-run the ladder over the unbound backlog against the ontologies loaded
+/// now.
+///
+/// The ladder records EVERY term it sees, bound or not, with the score and
+/// threshold in force at the time. That backlog is the work list here: a
+/// term that found nothing when the only vocabulary was a 50-class EMMO
+/// binds the moment a quantity-bearing ontology is promoted. Nothing is
+/// re-extracted and no document is re-read — the join is the term itself.
+async fn rebind(
+    project_root: &Path,
+    dry_run: bool,
+    threshold: Option<f64>,
+    json: bool,
+) -> Result<()> {
+    let threshold =
+        threshold.unwrap_or(prism_ingest::property_resolution::DEFAULT_SEMANTIC_BIND_THRESHOLD);
+    if !(threshold.is_finite() && (0.0..=1.0).contains(&threshold)) {
+        bail!("--threshold must be a similarity from 0 to 1, got {threshold}");
+    }
+
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    // Register the project's catalog artifact BEFORE asking for the loaded
+    // set: `loaded` reads the process-wide registry, which knows nothing of
+    // `.prism/ontologies/` until this runs. Without it the command fails on
+    // exactly the ontology it exists to apply.
+    prism_ingest::ontologies::active_from_project(Some(&config.ontology.id), project_root)?;
+    let ontologies = prism_ingest::ontologies::loaded(Some(&config.ontology.id))?;
+    let tenant = prism_ingest::ontologies::storage_tenant(
+        prism_provenance::LOCAL_TENANT,
+        ontologies.primary().id(),
+    );
+
+    let store = prism_provenance::ProvenanceStore::open(&proposal_store_path()?).await?;
+    let unbound = store.unbound_term_bindings(&tenant).await?;
+    if unbound.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "tenant": tenant,
+                    "unbound_before": 0,
+                    "bound_now": 0,
+                    "still_unbound": 0,
+                })
+            );
+        } else {
+            println!(
+                "no unbound terms for tenant {tenant:?} — nothing to re-resolve (ingest a \
+                 paper, or the backlog is already fully bound)"
+            );
+        }
+        return Ok(());
+    }
+
+    // A dry run must not write, and the ladder writes — so it is answered by
+    // reporting the backlog rather than by running a ladder whose effects are
+    // then discarded. Saying "N terms would be re-tried against M classes" is
+    // honest; simulating a bind and throwing it away would not be.
+    if dry_run {
+        let classes = ontologies
+            .all()
+            .iter()
+            .map(|o| o.classes().len())
+            .sum::<usize>();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dry_run": true,
+                    "tenant": tenant,
+                    "unbound_before": unbound.len(),
+                    "ontologies": ontologies.all().iter().map(|o| o.id()).collect::<Vec<_>>(),
+                    "classes_available": classes,
+                })
+            );
+        } else {
+            println!(
+                "{} unbound term(s) for tenant {tenant:?} would be re-tried against {} class(es) \
+                 from {} loaded ontolog(ies) at threshold {threshold}",
+                unbound.len(),
+                classes,
+                ontologies.all().len(),
+            );
+            for binding in unbound.iter().take(20) {
+                println!(
+                    "  {:?} (best score so far: {})",
+                    binding.verbatim,
+                    binding
+                        .score
+                        .map_or_else(|| "none".to_string(), |s| format!("{s:.3}"))
+                );
+            }
+            if unbound.len() > 20 {
+                println!("  … and {} more", unbound.len() - 20);
+            }
+        }
+        return Ok(());
+    }
+
+    let terms: Vec<prism_ingest::property_resolution::PropertyTerm> = unbound
+        .iter()
+        .map(|binding| prism_ingest::property_resolution::PropertyTerm {
+            term: binding.verbatim.clone(),
+            // The original citation already backs the queued proposal; a
+            // re-resolution adds no new sighting of its own.
+            citation: None,
+        })
+        .collect();
+
+    let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+        .await
+        .ok()
+        .flatten();
+    if backend.is_none() {
+        eprintln!(
+            "  WARNING: no embedding backend configured — rungs 1 and 2 still apply, but the \
+             semantic rung cannot run and terms needing it stay unbound"
+        );
+    }
+
+    let bindings = prism_ingest::property_resolution::resolve_property_terms(
+        &store,
+        &ontologies,
+        backend.as_deref(),
+        &tenant,
+        // Re-resolution is not a document reading; it is named as itself so
+        // provenance never claims a paper was consulted when none was.
+        "prism://rebind",
+        &terms,
+        threshold,
+    )
+    .await?;
+
+    let bound_now = bindings.iter().filter(|b| b.class_iri.is_some()).count();
+    let stamped: u64 = bindings.iter().map(|b| b.entities_stamped).sum();
+    if json {
+        let mut report = prism_ingest::property_resolution::binding_report(&bindings);
+        if let Some(object) = report.as_object_mut() {
+            object.insert("tenant".into(), serde_json::json!(tenant));
+            object.insert("unbound_before".into(), serde_json::json!(unbound.len()));
+            object.insert("bound_now".into(), serde_json::json!(bound_now));
+            object.insert(
+                "still_unbound".into(),
+                serde_json::json!(bindings.len().saturating_sub(bound_now)),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "re-resolved {} unbound term(s) for tenant {tenant:?} against {} loaded ontolog(ies) \
+             at threshold {threshold}:",
+            unbound.len(),
+            ontologies.all().len(),
+        );
+        println!(
+            "  BOUND NOW: {bound_now}   still unbound: {}   entities stamped: {stamped}",
+            bindings.len().saturating_sub(bound_now),
+        );
+        for binding in &bindings {
+            let Some(iri) = binding.class_iri.as_deref() else {
+                continue;
+            };
+            println!(
+                "  {:?} → {iri} (rung {}{})",
+                binding.term,
+                binding.rung.as_str(),
+                binding
+                    .score
+                    .map_or_else(String::new, |s| format!(", score {s:.3}")),
+            );
+        }
+        if bound_now == 0 {
+            println!(
+                "  nothing bound — the loaded ontologies declare no class these terms match. \
+                 Promote a richer ontology and run this again; no paper is re-read."
+            );
+        }
+    }
+    Ok(())
 }
 
 // ── Ontology extension proposal governance ─────────────────────────────
