@@ -283,10 +283,10 @@ async fn invalid_artifact_is_rejected_through_the_production_file_gate() {
         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
         @prefix owl: <http://www.w3.org/2002/07/owl#> .
         @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
-        @prefix prism: <https://prism.marc27.com/ontology/meta#> .
-        @prefix : <https://prism.marc27.com/ontology/badmodel#> .
+        @prefix prism: <https://prism.mirdyne.com/ontology/meta#> .
+        @prefix : <https://prism.mirdyne.com/ontology/badmodel#> .
 
-        <https://prism.marc27.com/ontology/badmodel> a owl:Ontology ;
+        <https://prism.mirdyne.com/ontology/badmodel> a owl:Ontology ;
             prism:domain "badmodel" ;
             prism:status "draft" .
 

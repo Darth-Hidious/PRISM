@@ -1792,7 +1792,7 @@ mod tests {
 
         // Enqueue exactly what an ingest would: the production queue-item
         // builders with a real citation.
-        let parent_iri = "https://prism.marc27.com/ontology/gov-active#NeutralEntity".to_string();
+        let parent_iri = "https://prism.mirdyne.com/ontology/gov-active#NeutralEntity".to_string();
         let class_proposal = prism_ingest::paper_agent::OntologyClassProposal {
             label: "Feedstock Powder".to_string(),
             proposed_iri: None,

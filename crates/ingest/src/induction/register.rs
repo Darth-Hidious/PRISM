@@ -658,7 +658,7 @@ mod tests {
             .clone();
         assert_eq!(
             polymer.iri.as_str(),
-            "https://prism.marc27.com/ontology/indtest-promoted#Polymer",
+            "https://prism.mirdyne.com/ontology/indtest-promoted#Polymer",
             "classes carry real PRISM-namespace IRIs"
         );
         assert_eq!(polymer.pref_label.as_deref(), Some("Polymer"));
@@ -678,7 +678,7 @@ mod tests {
         // file bytes that were registered.
         assert_eq!(
             registered.version_iri().as_str(),
-            "https://prism.marc27.com/ontology/indtest-promoted/version/1.deadbeef",
+            "https://prism.mirdyne.com/ontology/indtest-promoted/version/1.deadbeef",
         );
         let sha = registered.artifact_sha256();
         assert_eq!(sha.len(), 64, "{sha}");
@@ -1203,7 +1203,7 @@ mod tests {
 
         // Direct declaration, answered by every identity a reader may bind.
         let gtt_iri =
-            "https://prism.marc27.com/ontology/indtest-signdomain#GlassTransitionTemperature";
+            "https://prism.mirdyne.com/ontology/indtest-signdomain#GlassTransitionTemperature";
         for identity in [
             "Glass Transition Temperature",
             "GlassTransitionTemperature",

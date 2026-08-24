@@ -21498,7 +21498,7 @@ data:\n\
         let text = "Feedstock powders were sieved before use.";
         let document = root.join("proposal-source.md");
         std::fs::write(&document, text).unwrap();
-        let parent_iri = format!("https://prism.marc27.com/ontology/{ontology_id}#NeutralEntity");
+        let parent_iri = format!("https://prism.mirdyne.com/ontology/{ontology_id}#NeutralEntity");
         let mut server = mockito::Server::new_async().await;
         let extraction = server
             .mock("POST", "/chat/completions")

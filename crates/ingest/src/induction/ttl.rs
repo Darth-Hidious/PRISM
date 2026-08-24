@@ -668,7 +668,7 @@ mod tests {
         assert!(ttl.contains(":Alloy a owl:Class"), "{ttl}");
         assert!(ttl.contains(":hasProperty a owl:ObjectProperty"), "{ttl}");
         assert!(
-            ttl.contains("<https://prism.marc27.com/ontology/alloys> a owl:Ontology"),
+            ttl.contains("<https://prism.mirdyne.com/ontology/alloys> a owl:Ontology"),
             "{ttl}"
         );
         // The SEED is part of artifact identity: the same corpus grown onto a
@@ -676,7 +676,7 @@ mod tests {
         // version IRI. `sample()` inherits from emmo, so the digest is present.
         assert!(
             ttl.contains(
-                "owl:versionIRI <https://prism.marc27.com/ontology/alloys/version/1.abcdef12+"
+                "owl:versionIRI <https://prism.mirdyne.com/ontology/alloys/version/1.abcdef12+"
             ),
             "a seeded artifact carries its seed in the version IRI: {ttl}"
         );
@@ -687,7 +687,7 @@ mod tests {
         standalone.provenance.seeds.clear();
         assert!(
             to_turtle(&standalone).contains(
-                "owl:versionIRI <https://prism.marc27.com/ontology/alloys/version/1.abcdef12>"
+                "owl:versionIRI <https://prism.mirdyne.com/ontology/alloys/version/1.abcdef12>"
             ),
             "an unseeded artifact keeps the original version IRI"
         );
@@ -703,8 +703,8 @@ mod tests {
     fn parse_refuses_missing_status() {
         let ttl = r#"
             @prefix owl: <http://www.w3.org/2002/07/owl#> .
-            @prefix prism: <https://prism.marc27.com/ontology/meta#> .
-            <https://prism.marc27.com/ontology/x> a owl:Ontology ;
+            @prefix prism: <https://prism.mirdyne.com/ontology/meta#> .
+            <https://prism.mirdyne.com/ontology/x> a owl:Ontology ;
                 prism:domain "x" .
         "#;
         let err = parse_turtle(ttl).unwrap_err();
@@ -715,8 +715,8 @@ mod tests {
     fn parse_refuses_unknown_status() {
         let ttl = r#"
             @prefix owl: <http://www.w3.org/2002/07/owl#> .
-            @prefix prism: <https://prism.marc27.com/ontology/meta#> .
-            <https://prism.marc27.com/ontology/x> a owl:Ontology ;
+            @prefix prism: <https://prism.mirdyne.com/ontology/meta#> .
+            <https://prism.mirdyne.com/ontology/x> a owl:Ontology ;
                 prism:domain "x" ;
                 prism:status "probably-fine" .
         "#;
@@ -728,8 +728,8 @@ mod tests {
     fn legacy_artifact_without_semantic_report_is_explicitly_unavailable() {
         let ttl = r#"
             @prefix owl: <http://www.w3.org/2002/07/owl#> .
-            @prefix prism: <https://prism.marc27.com/ontology/meta#> .
-            <https://prism.marc27.com/ontology/x> a owl:Ontology ;
+            @prefix prism: <https://prism.mirdyne.com/ontology/meta#> .
+            <https://prism.mirdyne.com/ontology/x> a owl:Ontology ;
                 prism:domain "x" ;
                 prism:status "draft" .
         "#;
