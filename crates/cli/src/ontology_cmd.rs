@@ -84,6 +84,59 @@ pub enum OntologyCommands {
     /// standard plugin contract for the ontology plane (same inventory as
     /// `prism plugins list`, ontology section, and the TUI/agent routes).
     List,
+    /// Bind free-text names onto the loaded ontologies and print the result.
+    ///
+    /// The projection surface: give it the names a source actually used and
+    /// it answers with the class each one binds to, by which rung and at
+    /// what score. Exactly the ladder the ingest path runs, exposed so a
+    /// consumer can ask for the mapping instead of reimplementing one.
+    /// Names that bind to nothing come back unbound — never guessed.
+    Bind {
+        /// File with one name per line. `-` reads standard input.
+        names: PathBuf,
+        /// Restrict the target to ONE loaded ontology, by registry id.
+        ///
+        /// Without this, names bind against the whole loaded union, which is
+        /// what ingest wants — the best class from anything available. When
+        /// the question is "project these onto THIS schema", the target has
+        /// to be nameable, and this names it.
+        #[arg(long = "onto")]
+        onto: Option<String>,
+        /// Override the semantic bind threshold.
+        #[arg(long)]
+        threshold: Option<f64>,
+        /// Machine-readable result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a plain list of terms as an ontology a customer can bind
+    /// against — one term per line, from anywhere.
+    ///
+    /// A target schema is USUALLY just a list of names: an enum, a column
+    /// header row, a data dictionary, a controlled vocabulary. This turns
+    /// any such list into a DRAFT artifact that goes through the ordinary
+    /// promote gate. Nothing about any particular schema is known to PRISM;
+    /// the list is the whole input, which is what makes bringing your own
+    /// schema a file rather than a code change.
+    ///
+    /// Importing a vocabulary is OPTIONAL. Extraction never requires one:
+    /// terms are read in the source's own words and bound afterwards, so
+    /// with no vocabulary loaded everything is simply recorded unbound.
+    Import {
+        /// File with one term per line. `-` reads standard input. Blank
+        /// lines and `#` comments are skipped.
+        terms: PathBuf,
+        /// Domain id for the imported vocabulary (its registry id).
+        #[arg(long)]
+        domain: String,
+        /// Output artifact path. Default: ./ontology-<domain>.ttl
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Optional label for a single parent class every term is filed
+        /// under, so the import is one taxonomy rather than N loose roots.
+        #[arg(long)]
+        parent: Option<String>,
+    },
     /// Re-run the property resolution ladder over every term that is still
     /// unbound, against the ontologies loaded NOW.
     ///
@@ -251,12 +304,248 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
         }
         OntologyCommands::List => list(project_root),
         OntologyCommands::Proposals { command } => proposals(command, project_root).await,
+        OntologyCommands::Bind {
+            names,
+            onto,
+            threshold,
+            json,
+        } => bind_names(project_root, &names, onto.as_deref(), threshold, json).await,
+        OntologyCommands::Import {
+            terms,
+            domain,
+            output,
+            parent,
+        } => import_vocabulary(&terms, &domain, output.as_deref(), parent.as_deref()),
         OntologyCommands::Rebind {
             dry_run,
             threshold,
             json,
         } => rebind(project_root, dry_run, threshold, json).await,
     }
+}
+
+// ── Projection ─────────────────────────────────────────────────────────
+
+/// Bind a list of free-text names onto the loaded ontologies.
+async fn bind_names(
+    project_root: &Path,
+    names_path: &Path,
+    onto: Option<&str>,
+    threshold: Option<f64>,
+    json: bool,
+) -> Result<()> {
+    let threshold =
+        threshold.unwrap_or(prism_ingest::property_resolution::DEFAULT_SEMANTIC_BIND_THRESHOLD);
+    if !(threshold.is_finite() && (0.0..=1.0).contains(&threshold)) {
+        bail!("--threshold must be a similarity from 0 to 1, got {threshold}");
+    }
+    let raw = if names_path == Path::new("-") {
+        use std::io::Read;
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        buffer
+    } else {
+        std::fs::read_to_string(names_path)
+            .with_context(|| format!("reading names from {}", names_path.display()))?
+    };
+    let terms: Vec<prism_ingest::property_resolution::PropertyTerm> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| prism_ingest::property_resolution::PropertyTerm {
+            term: line.to_string(),
+            // A projection request is not a sighting in a document, so it
+            // queues no proposal and cites nothing.
+            citation: None,
+        })
+        .collect();
+    if terms.is_empty() {
+        bail!("no names to bind in {}", names_path.display());
+    }
+
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    prism_ingest::ontologies::active_from_project(Some(&config.ontology.id), project_root)?;
+    let ontologies = match onto {
+        Some(id) => {
+            // Register it from the project catalog first: a target schema is
+            // usually a promoted project artifact, not a builtin.
+            let target = prism_ingest::ontologies::active_from_project(Some(id), project_root)?;
+            prism_ingest::ontologies::OntologySet::single(target)
+        }
+        None => prism_ingest::ontologies::loaded(Some(&config.ontology.id))?,
+    };
+    let tenant = prism_ingest::ontologies::storage_tenant(
+        prism_provenance::LOCAL_TENANT,
+        ontologies.primary().id(),
+    );
+    let store = prism_provenance::ProvenanceStore::open(&proposal_store_path()?).await?;
+    let backend = tokio::task::spawn_blocking(prism_embed::from_config)
+        .await
+        .ok()
+        .flatten();
+    if backend.is_none() {
+        eprintln!(
+            "  WARNING: no embedding backend — rungs 1 and 2 apply, the semantic rung cannot run"
+        );
+    }
+    let bindings = prism_ingest::property_resolution::resolve_property_terms(
+        &store,
+        &ontologies,
+        backend.as_deref(),
+        &tenant,
+        "prism://bind",
+        &terms,
+        threshold,
+    )
+    .await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&prism_ingest::property_resolution::binding_report(
+                &bindings
+            ))?
+        );
+    } else {
+        for binding in &bindings {
+            match binding.class_iri.as_deref() {
+                Some(iri) => println!(
+                    "  {:?} -> {iri}  (rung {}{})",
+                    binding.term,
+                    binding.rung.as_str(),
+                    binding
+                        .score
+                        .map_or_else(String::new, |s| format!(", score {s:.3}")),
+                ),
+                None => println!("  {:?} -> UNBOUND", binding.term),
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Vocabulary import ──────────────────────────────────────────────────
+
+/// Turn a plain list of terms into a DRAFT ontology artifact.
+///
+/// This is the "bring your own schema" seam. A target vocabulary — someone
+/// else's enum, a data dictionary, a column header row — is a list of names,
+/// and a list of names is an ontology with one class per name. Writing it as
+/// a normal artifact means every existing mechanism applies unchanged: the
+/// promote gate, the loaded union, and the resolution ladder that binds
+/// free-text property names onto whatever is loaded. No schema is known to
+/// PRISM and none is compiled in.
+fn import_vocabulary(
+    terms_path: &Path,
+    domain: &str,
+    output: Option<&Path>,
+    parent: Option<&str>,
+) -> Result<()> {
+    let raw = if terms_path == Path::new("-") {
+        use std::io::Read;
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("reading terms from standard input")?;
+        buffer
+    } else {
+        std::fs::read_to_string(terms_path)
+            .with_context(|| format!("reading terms from {}", terms_path.display()))?
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut terms: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let term = line.trim();
+        if term.is_empty() || term.starts_with('#') {
+            continue;
+        }
+        if seen.insert(term.to_lowercase()) {
+            terms.push(term.to_string());
+        }
+    }
+    if terms.is_empty() {
+        bail!(
+            "no terms found in {} — a vocabulary import needs at least one \
+             non-empty, non-comment line",
+            terms_path.display()
+        );
+    }
+
+    let mut classes: Vec<induction::InducedClass> = Vec::new();
+    if let Some(parent_label) = parent {
+        classes.push(induction::InducedClass {
+            label: parent_label.to_string(),
+            definition: String::new(),
+            parent: None,
+            aligned_iri: None,
+            declared_by_reference: true,
+            sign_domain: None,
+        });
+    }
+    for term in &terms {
+        classes.push(induction::InducedClass {
+            label: term.clone(),
+            definition: String::new(),
+            parent: parent.map(str::to_string),
+            aligned_iri: None,
+            declared_by_reference: false,
+            sign_domain: None,
+        });
+    }
+
+    // The corpus hash is over the TERMS as imported: re-importing the same
+    // list claims the same version, and a changed list does not.
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for term in &terms {
+            hasher.update(term.as_bytes());
+            hasher.update(b"\n");
+        }
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        format!("sha256:{hex}")
+    };
+
+    let ontology = induction::InducedOntology {
+        domain: domain.to_string(),
+        status: induction::OntologyStatus::Draft,
+        classes,
+        relations: Vec::new(),
+        provenance: induction::InductionProvenance {
+            // No model read anything: this vocabulary was DECLARED, not
+            // induced, and the artifact must not imply otherwise.
+            model: "none (declared vocabulary import)".to_string(),
+            prompt_version: "0".to_string(),
+            corpus_hash: digest,
+            documents_total: 0,
+            documents_failed: 0,
+            windows_read: 0,
+            windows_attempted: 0,
+            malformed_items: 0,
+            ..Default::default()
+        },
+    };
+
+    let path = output.map_or_else(
+        || PathBuf::from(format!("./ontology-{domain}.ttl")),
+        Path::to_path_buf,
+    );
+    ttl::write_artifact(&path, &ontology)?;
+    println!(
+        "IMPORTED: {} — {} term(s) as DRAFT ontology '{}'. Promote it with \
+         `prism ontology promote {}`.",
+        path.display(),
+        terms.len(),
+        domain,
+        path.display(),
+    );
+    Ok(())
 }
 
 // ── Re-resolution ──────────────────────────────────────────────────────
