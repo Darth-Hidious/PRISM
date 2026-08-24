@@ -1146,6 +1146,22 @@ enum NotebookCommands {
         /// PID, port number, or "all".
         target: String,
     },
+    /// Render a running notebook IN THIS TERMINAL.
+    ///
+    /// PRISM starts Jupyter but had nowhere to show it without leaving for
+    /// a browser, which is the same complaint as exiting to the CLI. This
+    /// drives a headless browser and brings the page back here.
+    View {
+        /// Port of the notebook to view. Defaults to the only running one.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Capture a PNG instead of text. iTerm2 and kitty draw it inline.
+        #[arg(long)]
+        image: bool,
+        /// Where to write the PNG (implies --image).
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2562,6 +2578,55 @@ async fn main() -> Result<()> {
                     println!("Stopped {count} notebook(s).");
                 } else {
                     println!("No matching notebooks found.");
+                }
+            }
+            NotebookCommands::View { port, image, out } => {
+                let sessions = notebook::list()?;
+                // Naming the alternatives beats "not found": the usual cause
+                // is a second notebook running, not a missing one.
+                let session = match (port, sessions.len()) {
+                    (Some(p), _) => sessions.iter().find(|s| s.port == p).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no notebook on port {p}. Running: {}",
+                            if sessions.is_empty() {
+                                "none — start one with `prism notebook start`".to_string()
+                            } else {
+                                sessions
+                                    .iter()
+                                    .map(|s| s.port.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        )
+                    })?,
+                    (None, 1) => &sessions[0],
+                    (None, 0) => anyhow::bail!(
+                        "no notebook is running — start one with `prism notebook start`"
+                    ),
+                    (None, _) => anyhow::bail!(
+                        "{} notebooks are running; choose one with --port {}",
+                        sessions.len(),
+                        sessions
+                            .iter()
+                            .map(|s| s.port.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" | --port ")
+                    ),
+                };
+                let mode = if image || out.is_some() {
+                    notebook::ViewMode::Image
+                } else {
+                    notebook::ViewMode::Text
+                };
+                let rendered = notebook::view(session, mode, out.as_deref())?;
+                match mode {
+                    notebook::ViewMode::Text => println!("{rendered}"),
+                    notebook::ViewMode::Image => {
+                        println!("Captured notebook on port {}: {rendered}", session.port);
+                        println!(
+                            "  iTerm2: imgcat {rendered}    kitty: kitty +kitten icat {rendered}"
+                        );
+                    }
                 }
             }
         },
