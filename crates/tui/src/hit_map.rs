@@ -24,6 +24,8 @@ pub enum HitTarget {
     WorkspaceRow { tab: WorkspaceTab, index: usize },
     /// A message in the transcript, by its index in `App::messages`.
     TranscriptMessage { index: usize },
+    /// The close control on the reference panel.
+    RefPanelClose,
     /// A marked reference inside rendered text — the thing hovering resolves.
     /// Holds only the reference, never the payload: what it points at is
     /// fetched when the pointer arrives, not when the text was written.

@@ -2697,3 +2697,212 @@ fn prose_with_no_registered_object_has_no_reference_regions() {
         }
     }
 }
+
+/// B5: pointing at a reference opens a panel, and nothing is fetched before
+/// the pointer arrives.
+///
+/// The laziness is the point. Most marks are never hovered, so resolving them
+/// as the text is written would be work thrown away and would slow the writing
+/// down. This asserts the order: registered and marked, but no request; then a
+/// pointer lands and the panel opens saying it is fetching.
+#[test]
+fn a_reference_resolves_only_when_the_pointer_lands_on_it() {
+    use prism_tui::app::RefPanelState;
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://e129a2e9d3".into(),
+        kind: "structure".into(),
+        label: "MoNbTaW".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta("The MoNbTaW cell relaxed.\n".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 120, 30);
+
+    assert!(
+        app.ref_panel.is_none(),
+        "nothing may be resolved before the pointer arrives"
+    );
+
+    // Find the marked word and put the pointer on it.
+    let cell = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some(HitTarget::Reference { .. }) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("the marked word must claim cells")
+    };
+    app.pointer_moved(cell.0, cell.1);
+
+    let panel = app.ref_panel.as_ref().expect("hovering opens the panel");
+    assert_eq!(panel.id, "cache://e129a2e9d3");
+    assert_eq!(panel.label, "MoNbTaW");
+    // The fake backend answers or refuses; either is a real state, and neither
+    // is a blank box standing in for an answer.
+    assert!(
+        matches!(
+            panel.state,
+            RefPanelState::Fetching | RefPanelState::Ready(_) | RefPanelState::Failed(_)
+        ),
+        "the panel must say what is happening; got {:?}",
+        panel.state
+    );
+
+    // The panel is on screen and names the thing.
+    let rendered = render_app_to_string(&app, 120, 30);
+    assert!(
+        rendered.contains("MoNbTaW"),
+        "the panel must name the reference; got:\n{rendered}"
+    );
+
+    // Moving off the word closes it — the panel answers "what is this word"
+    // and has no business outliving the pointer being on that word.
+    app.pointer_moved(0, 29);
+    assert!(
+        app.ref_panel.is_none(),
+        "moving off the reference must close the panel"
+    );
+}
+
+/// Esc closes the panel, and the close control claims cells so it can be
+/// clicked. A panel with no way out is a trap.
+#[test]
+fn the_reference_panel_can_be_dismissed() {
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://abc".into(),
+        kind: "structure".into(),
+        label: "Al4".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta("The Al4 cell.\n".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 120, 30);
+
+    let cell = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some(HitTarget::Reference { .. }) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("marked word")
+    };
+
+    // Esc.
+    app.pointer_moved(cell.0, cell.1);
+    assert!(app.ref_panel.is_some());
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.ref_panel.is_none(), "Esc must close the panel");
+
+    // The close control exists on screen and dismisses when clicked.
+    app.pointer_moved(cell.0, cell.1);
+    let _ = render_app_to_string(&app, 120, 30);
+    let close = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some(HitTarget::RefPanelClose) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("the panel must offer a close control")
+    };
+    app.pointer_pressed(close.0, close.1);
+    assert!(app.ref_panel.is_none(), "clicking × must close the panel");
+}
+
+/// A CIF meant for the detail view must not land in the hover panel, and vice
+/// versa.
+///
+/// The two fetches share one backend method and one response message. If the
+/// hover lane accepted any `StructureFetched` it saw, then pressing Enter on a
+/// structure while a panel happened to be open would fill that panel with the
+/// wrong body — and, worse, swallow the response so the detail view never got
+/// it. Nothing else in the suite covers this: removing the key check leaves
+/// every other test green.
+#[test]
+fn a_hover_fetch_and_the_detail_view_do_not_take_each_others_answers() {
+    use prism_tui::app::RefPanelState;
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://wanted".into(),
+        kind: "structure".into(),
+        label: "MoNbTaW".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta("The MoNbTaW cell.\n".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 120, 30);
+
+    let cell = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some(HitTarget::Reference { .. }) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("marked word")
+    };
+    app.pointer_moved(cell.0, cell.1);
+    let before = app.ref_panel.as_ref().expect("panel is open").state.clone();
+
+    // A response for a DIFFERENT structure — the detail view's, not ours.
+    app.apply_agent_msg(AgentMsg::StructureFetched {
+        session_id: String::new(),
+        cache_key: "someone-elses-key".into(),
+        cif: "data_wrong\n_chemical_formula_structural Xx".into(),
+        truncated: false,
+    });
+    let after = app
+        .ref_panel
+        .as_ref()
+        .expect("panel still open")
+        .state
+        .clone();
+    assert_eq!(
+        before, after,
+        "a CIF for another key must not fill this panel"
+    );
+    if let RefPanelState::Ready(body) = &after {
+        assert!(
+            !body.contains("data_wrong"),
+            "the panel took another lane's answer: {body}"
+        );
+    }
+}

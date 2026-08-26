@@ -728,6 +728,22 @@ pub struct App {
     /// words that stand for them, never payloads: what a reference points at
     /// is fetched when the pointer lands on it.
     pub references: crate::refs::ReferenceRegistry,
+    /// The panel shown for the reference under the pointer, or `None`.
+    ///
+    /// Opened by `pointer_moved`, never by the renderer — resolution is a
+    /// side effect and the renderer only gets `&App`.
+    pub ref_panel: Option<RefPanel>,
+    /// Resolved reference bodies, by id. A second hover is instant; the first
+    /// is what pays. Nothing is fetched until a pointer actually lands.
+    ref_cache: std::collections::HashMap<String, RefPanelState>,
+    /// The reference id whose fetch is in flight, and its JSON-RPC id.
+    ///
+    /// SEPARATE from `structure_fetch_key` / `structure_view_key` on purpose:
+    /// those belong to the Enter-key detail view, and a hover that reused them
+    /// would silently redirect an open detail pane to whatever the pointer
+    /// brushed past.
+    ref_fetch: Option<(String, String)>,
+    ref_fetch_rpc_id: Option<u64>,
     /// Put the newest user turn at the TOP of the viewport instead of pinning
     /// to the last line.
     ///
@@ -871,6 +887,10 @@ impl App {
             view_scroll: std::cell::Cell::new(0),
             sidebar_visible: std::cell::Cell::new(true),
             references: crate::refs::ReferenceRegistry::default(),
+            ref_panel: None,
+            ref_cache: std::collections::HashMap::new(),
+            ref_fetch: None,
+            ref_fetch_rpc_id: None,
             anchor_user_turn: std::cell::Cell::new(false),
             hit_map: std::cell::RefCell::new(crate::hit_map::HitMap::default()),
             hovered: None,
@@ -1116,6 +1136,13 @@ impl App {
             return;
         }
 
+        // Esc closes the reference panel first: it is the newest thing on
+        // screen, so it is what "go back" means while it is up.
+        if key.code == KeyCode::Esc && self.ref_panel.is_some() {
+            self.ref_panel = None;
+            return;
+        }
+
         // Below the sidebar's width threshold the Workspace pane is not drawn
         // at all. Focus does not follow it, so a reader who was in the sidebar
         // and then narrowed the terminal kept a focus on something invisible:
@@ -1165,7 +1192,101 @@ impl App {
     /// passes over it.
     pub fn pointer_moved(&mut self, column: u16, row: u16) {
         let target = self.hit_map.borrow().at(column, row).cloned();
+        match &target {
+            Some(crate::hit_map::HitTarget::Reference { id }) => {
+                let id = id.clone();
+                self.open_reference_panel(&id, column, row);
+            }
+            // Moving onto anything else closes the panel. The panel exists to
+            // answer "what is this word", so it has no business outliving the
+            // pointer being on that word.
+            _ => self.ref_panel = None,
+        }
         self.hovered = target;
+    }
+
+    /// Show the panel for `id`, resolving it if this is the first time.
+    ///
+    /// Re-hovering the same reference is a no-op beyond moving the anchor, so
+    /// drifting a pixel inside a word does not re-request anything.
+    fn open_reference_panel(&mut self, id: &str, column: u16, row: u16) {
+        if let Some(open) = &mut self.ref_panel
+            && open.id == id
+        {
+            open.anchor = (column, row);
+            return;
+        }
+        let entry = self.references.get(id);
+        let label = entry
+            .and_then(|e| e.tokens.first().cloned())
+            .unwrap_or_else(|| id.to_string());
+        let kind = entry.map(|e| e.kind);
+        let state = match self.ref_cache.get(id) {
+            Some(cached) => cached.clone(),
+            None => self.begin_reference_fetch(id, kind),
+        };
+        self.ref_panel = Some(RefPanel {
+            id: id.to_string(),
+            label,
+            kind,
+            state,
+            anchor: (column, row),
+        });
+    }
+
+    /// Start resolving a reference, returning the state to show meanwhile.
+    ///
+    /// A kind PRISM cannot fetch yet says so by name rather than showing an
+    /// empty box — an empty panel and an unfetchable one look identical to a
+    /// reader, and only one of them is worth reporting.
+    fn begin_reference_fetch(
+        &mut self,
+        id: &str,
+        kind: Option<crate::refs::RefKind>,
+    ) -> RefPanelState {
+        match kind {
+            Some(crate::refs::RefKind::Structure) => {
+                let Some(key) = id.strip_prefix("cache://") else {
+                    return RefPanelState::Failed(format!(
+                        "structure reference is not a cache ref: {id}"
+                    ));
+                };
+                let key = key.split('/').next().unwrap_or(key).to_string();
+                match self.backend.fetch_structure(&key) {
+                    Ok(rpc) => {
+                        self.ref_fetch = Some((id.to_string(), key));
+                        self.ref_fetch_rpc_id = Some(rpc);
+                        RefPanelState::Fetching
+                    }
+                    Err(error) => RefPanelState::Failed(format!("{error}")),
+                }
+            }
+            Some(other) => RefPanelState::NotResolvable(format!(
+                "{other:?} references are recorded but cannot be opened yet"
+            )),
+            None => {
+                RefPanelState::NotResolvable("this reference is no longer registered".to_string())
+            }
+        }
+    }
+
+    /// Record a resolved reference body and show it if its panel is still up.
+    fn resolve_reference(&mut self, cache_key: &str, state: RefPanelState) -> bool {
+        let Some((id, key)) = self.ref_fetch.clone() else {
+            return false;
+        };
+        if key != cache_key {
+            return false;
+        }
+        self.ref_fetch = None;
+        self.ref_fetch_rpc_id = None;
+        self.ref_cache.insert(id.clone(), state.clone());
+        if let Some(panel) = &mut self.ref_panel
+            && panel.id == id
+        {
+            panel.state = state;
+        }
+        true
     }
 
     /// Act on a click.
@@ -1182,6 +1303,13 @@ impl App {
                 self.workspace_selected = 0;
                 self.workspace_expanded = false;
                 self.focus = Focus::Workspace;
+            }
+            Some(crate::hit_map::HitTarget::RefPanelClose) => {
+                self.ref_panel = None;
+                // Return without touching `hovered`: the close was the whole
+                // intent, and re-recording the panel's own cell as hovered
+                // would reopen it on the next move.
+                return;
             }
             Some(crate::hit_map::HitTarget::WorkspaceRow { tab, index }) => {
                 self.workspace_tab = tab;
@@ -4485,6 +4613,20 @@ impl App {
                 cif,
                 truncated,
             } => {
+                // A hover fetch and the Enter-key detail view are separate
+                // lanes. Try the hover lane FIRST: if this response answers a
+                // pointer, it is not the detail view's and must not fall
+                // through to the guard below, which would drop it.
+                if self.resolve_reference(
+                    &cache_key,
+                    RefPanelState::Ready(if truncated {
+                        format!("{cif}\n\n[truncated]")
+                    } else {
+                        cif.clone()
+                    }),
+                ) {
+                    return;
+                }
                 if self.structure_fetch_key.as_deref() != Some(cache_key.as_str()) {
                     return;
                 }
@@ -4517,6 +4659,14 @@ impl App {
                 }
             }
             AgentMsg::StructureFetchError { cache_key, message } => {
+                // Hover lane first, same reason as the success path: a refusal
+                // aimed at a pointer must reach the panel that asked, and must
+                // not be mistaken for the detail view's.
+                if let Some(key) = cache_key.as_deref()
+                    && self.resolve_reference(key, RefPanelState::Failed(message.clone()))
+                {
+                    return;
+                }
                 let applies = cache_key
                     .as_deref()
                     .is_none_or(|key| self.structure_fetch_key.as_deref() == Some(key));
@@ -6886,4 +7036,35 @@ mod tests {
             "unenforced sources must be labeled advisory: {prompt}"
         );
     }
+}
+
+/// The panel shown for the reference under the pointer.
+///
+/// Holds only what is needed to draw: the identity, the words that stood for
+/// it, and whatever resolution has produced so far. Never a handle to a
+/// fetch — the fetch is owned by `App`, so a closed panel cannot leave one
+/// running against a dead target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefPanel {
+    pub id: String,
+    pub label: String,
+    pub kind: Option<crate::refs::RefKind>,
+    pub state: RefPanelState,
+    /// Screen cell the pointer was on, so the panel can open beside the word
+    /// rather than over it.
+    pub anchor: (u16, u16),
+}
+
+/// How far resolution has got. Every variant says something true; none of
+/// them is an empty box standing in for an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefPanelState {
+    /// Asked, waiting. The reader sees that something is happening.
+    Fetching,
+    /// Resolved. The body as it will be shown.
+    Ready(String),
+    /// Asked and refused, with the reason as given.
+    Failed(String),
+    /// A kind PRISM records but cannot open yet, named rather than blank.
+    NotResolvable(String),
 }

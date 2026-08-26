@@ -204,6 +204,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_modal(f, modal, app);
     }
 
+    // The reference panel sits above the transcript but below toasts: it
+    // answers "what is this word", and a toast is a more urgent thing to read.
+    draw_ref_panel(f, app, area);
+
     // Toasts float over everything, last and non-blocking.
     draw_toasts(f, app);
 }
@@ -4714,6 +4718,91 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Draw the panel for the reference under the pointer.
+///
+/// Opens BESIDE the word, never over it: a panel covering the thing you are
+/// pointing at makes you move the pointer to read it, which closes it. Clamped
+/// into the frame so a reference near the right edge still shows its body.
+fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
+    let Some(panel) = &app.ref_panel else {
+        return;
+    };
+    let t = app.theme();
+    let width = 56u16.min(area.width.saturating_sub(2)).max(12);
+    let body: Vec<String> = match &panel.state {
+        crate::app::RefPanelState::Fetching => {
+            vec!["fetching…".to_string()]
+        }
+        crate::app::RefPanelState::Ready(text) => text
+            .lines()
+            .take(12)
+            .map(|l| clip(l, width.saturating_sub(2) as usize))
+            .collect(),
+        crate::app::RefPanelState::Failed(why) => {
+            vec![clip(why, width.saturating_sub(2) as usize)]
+        }
+        crate::app::RefPanelState::NotResolvable(why) => {
+            vec![clip(why, width.saturating_sub(2) as usize)]
+        }
+    };
+    // Header + id + body + borders.
+    let height = (body.len() as u16 + 4)
+        .min(area.height.saturating_sub(1))
+        .max(4);
+
+    // Prefer below-right of the pointer; flip when that would fall off.
+    let (px, py) = panel.anchor;
+    let x = if px + width < area.x + area.width {
+        px
+    } else {
+        (area.x + area.width).saturating_sub(width)
+    };
+    let y = if py + 1 + height < area.y + area.height {
+        py + 1
+    } else {
+        py.saturating_sub(height)
+    };
+    let rect = Rect::new(x, y.max(area.y), width, height);
+
+    f.render_widget(Clear, rect);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            panel.label.clone(),
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            match panel.kind {
+                Some(crate::refs::RefKind::Structure) => "  structure",
+                Some(crate::refs::RefKind::Doi) => "  paper",
+                Some(crate::refs::RefKind::FileLine) => "  source",
+                None => "  unregistered",
+            },
+            Style::default().fg(t.muted),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        clip(&panel.id, width.saturating_sub(2) as usize),
+        Style::default().fg(t.dim),
+    )));
+    for b in body {
+        lines.push(Line::from(Span::styled(b, Style::default().fg(t.text))));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.warn))
+        .title(" × esc ")
+        .style(Style::default().bg(t.panel));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+
+    // The close control is the title cell run, so clicking it dismisses.
+    let mut map = app.hit_map.borrow_mut();
+    map.push(
+        Rect::new(rect.x + 1, rect.y, 7.min(rect.width.saturating_sub(1)), 1),
+        HitTarget::RefPanelClose,
+    );
 }
 
 #[cfg(test)]
