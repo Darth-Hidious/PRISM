@@ -43,6 +43,14 @@ pub struct Theme {
     pub err: Color,
     /// Warnings / tool activity / focus (was `Yellow`).
     pub warn: Color,
+    /// Words backed by something you can open.
+    ///
+    /// A DEDICATED colour, not a reuse of `warn`. The convention the reader is
+    /// asked to learn is "orange means I can open this", and `warn` already
+    /// paints loading messages, approval prompts and tagged markers — so
+    /// sharing it taught the convention and then broke it seventeen times on
+    /// the same screen. One meaning, one colour.
+    pub reference: Color,
     /// Approval accent (was `Magenta`).
     pub approval: Color,
     /// Popup background fill (was `Black`).
@@ -75,10 +83,11 @@ pub static THEMES: &[Theme] = &[
         system: Color::Rgb(128, 128, 128), // textMuted
         ok: Color::Rgb(127, 216, 143),     // success #7fd88f
         err: Color::Rgb(224, 108, 117),    // error #e06c75
-        warn: Color::Rgb(245, 167, 66),    // warning #f5a742
+        warn: Color::Rgb(245, 167, 66),
+        reference: Color::Rgb(255, 138, 0),  // warning #f5a742
         approval: Color::Rgb(157, 124, 216), // accent #9d7cd8 — purple
-        overlay_bg: Color::Rgb(10, 10, 10), // background #0a0a0a
-        panel: Color::Rgb(20, 20, 20),     // backgroundPanel #141414
+        overlay_bg: Color::Rgb(10, 10, 10),  // background #0a0a0a
+        panel: Color::Rgb(20, 20, 20),       // backgroundPanel #141414
     },
     Theme {
         name: "my eyes hurt",
@@ -94,6 +103,7 @@ pub static THEMES: &[Theme] = &[
         ok: Color::Green,
         err: Color::Red,
         warn: Color::Yellow,
+        reference: Color::Rgb(255, 138, 0),
         approval: Color::Magenta,
         overlay_bg: Color::Black,
         panel: Color::Rgb(26, 38, 58),
@@ -112,6 +122,7 @@ pub static THEMES: &[Theme] = &[
         ok: Color::Rgb(120, 220, 168),
         err: Color::Rgb(244, 116, 140),
         warn: Color::Rgb(244, 204, 96),
+        reference: Color::Rgb(255, 150, 40),
         approval: Color::Rgb(206, 124, 226),
         overlay_bg: Color::Rgb(12, 12, 28),
         panel: Color::Rgb(18, 18, 44),
@@ -130,6 +141,7 @@ pub static THEMES: &[Theme] = &[
         ok: Color::Rgb(152, 224, 152),
         err: Color::Rgb(224, 120, 110),
         warn: Color::Rgb(222, 192, 92),
+        reference: Color::Rgb(233, 143, 44),
         approval: Color::Rgb(184, 204, 122),
         overlay_bg: Color::Rgb(10, 20, 12),
         panel: Color::Rgb(16, 32, 20),
@@ -148,6 +160,7 @@ pub static THEMES: &[Theme] = &[
         ok: Color::Rgb(184, 187, 38),
         err: Color::Rgb(251, 73, 52),
         warn: Color::Rgb(250, 189, 47),
+        reference: Color::Rgb(254, 128, 25),
         approval: Color::Rgb(214, 93, 14),
         overlay_bg: Color::Rgb(20, 18, 16),
         panel: Color::Rgb(28, 24, 20),
@@ -166,6 +179,7 @@ pub static THEMES: &[Theme] = &[
         ok: Color::Rgb(176, 216, 176),
         err: Color::Rgb(220, 176, 176),
         warn: Color::Rgb(212, 212, 162),
+        reference: Color::Rgb(224, 138, 60),
         approval: Color::Rgb(202, 182, 202),
         overlay_bg: Color::Rgb(12, 12, 12),
         panel: Color::Rgb(24, 24, 24),
@@ -246,5 +260,42 @@ mod tests {
         assert_eq!(find("my eyes hurt"), Some(1));
         assert_eq!(find("mono"), Some(THEMES.len() - 1));
         assert_eq!(find("nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod reference_colour_tests {
+    use super::THEMES;
+
+    /// The reference colour must not be any other colour in its theme.
+    ///
+    /// The convention the reader is asked to learn is "this colour means I can
+    /// open it". Sharing the colour with `warn` — which paints loading
+    /// messages, approval prompts and tagged rows — taught that rule and then
+    /// broke it seventeen times on the same screen. One meaning, one colour.
+    #[test]
+    fn reference_has_a_colour_of_its_own_in_every_theme() {
+        for t in THEMES {
+            let others = [
+                ("warn", t.warn),
+                ("accent", t.accent),
+                ("text", t.text),
+                ("ok", t.ok),
+                ("err", t.err),
+                ("approval", t.approval),
+                ("user", t.user),
+                ("system", t.system),
+                ("dim", t.dim),
+                ("muted", t.muted),
+            ];
+            for (name, colour) in others {
+                assert_ne!(
+                    t.reference, colour,
+                    "theme {:?}: reference shares its colour with {name}, so \
+                     an openable word is indistinguishable from one that is not",
+                    t.name
+                );
+            }
+        }
     }
 }

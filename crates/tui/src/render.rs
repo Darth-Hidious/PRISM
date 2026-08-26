@@ -4781,7 +4781,9 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled(
             panel.label.clone(),
-            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(t.reference)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             match panel.kind {
@@ -4829,7 +4831,7 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     )));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(t.warn))
+        .border_style(Style::default().fg(t.reference))
         .title(" × esc ")
         .style(Style::default().bg(t.panel));
     f.render_widget(Paragraph::new(lines).block(block), rect);

@@ -127,8 +127,12 @@ pub fn annotate_references(
     if reg.is_empty() {
         return (lines, Vec::new());
     }
+    // A dedicated colour, not `warn`. The convention the reader learns is
+    // "this colour means I can open it"; `warn` also paints loading messages,
+    // approval prompts and tagged rows, so sharing it taught the rule and then
+    // broke it on the same screen.
     let style = Style::default()
-        .fg(t.warn)
+        .fg(t.reference)
         .add_modifier(Modifier::UNDERLINED);
     let mut regions = Vec::new();
     let mut out = Vec::with_capacity(lines.len());
