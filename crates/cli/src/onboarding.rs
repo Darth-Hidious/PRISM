@@ -36,30 +36,6 @@ struct CuratedModel {
 /// deliberately tiny because a first-run user does not want 550 rows.)
 const CURATED_MODELS: &[CuratedModel] = &[
     CuratedModel {
-        id: "anthropic/claude-sonnet-5",
-        name: "Claude Sonnet 5",
-        blurb: "Recommended — balanced depth & speed",
-        price: "$2 / $10 per M",
-    },
-    CuratedModel {
-        id: "anthropic/claude-haiku-4.5",
-        name: "Claude Haiku 4.5",
-        blurb: "Fastest, cheapest Claude",
-        price: "$1 / $5",
-    },
-    CuratedModel {
-        id: "anthropic/claude-opus-4.7",
-        name: "Claude Opus 4.7",
-        blurb: "Deepest reasoning",
-        price: "$5 / $25",
-    },
-    CuratedModel {
-        id: "anthropic/claude-fable-5",
-        name: "Claude Fable 5",
-        blurb: "Frontier tier",
-        price: "$10 / $50",
-    },
-    CuratedModel {
         id: "gpt-5.5",
         name: "GPT-5.5",
         blurb: "OpenAI",
@@ -218,7 +194,7 @@ fn choose_route(local_servers: &[LocalServer]) -> Result<Route> {
     options.push(RouteChoice {
         route: Route::OwnProvider,
         label: "Own key".to_string(),
-        blurb: "OpenAI, Anthropic, Groq, Ollama, … — your key, your bill".to_string(),
+        blurb: "OpenAI, Google, Groq, Ollama, … — your key, your bill".to_string(),
     });
 
     let chosen = prompt_select("Route", &options, |o| {
@@ -406,7 +382,7 @@ fn api_keys_note() {
     );
     println!("  To use your \x1b[1mown\x1b[0m provider key instead (billed to you directly):\n");
     println!(
-        "    \x1b[2mexport OPENAI_API_KEY=…\x1b[0m   \x1b[2m# or ANTHROPIC_API_KEY, etc.\x1b[0m"
+        "    \x1b[2mexport OPENAI_API_KEY=…\x1b[0m   \x1b[2m# or GEMINI_API_KEY, GROQ_API_KEY, etc.\x1b[0m"
     );
     println!(
         "    \x1b[2mthen \x1b[0m\x1b[1m/use list\x1b[0m\x1b[2m inside PRISM to see every provider and switch\x1b[0m\n"

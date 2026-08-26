@@ -380,9 +380,18 @@ mod tests {
             .filter(|p| !p.platform)
             .map(|p| p.id.as_str())
             .collect();
-        for expected in ["openai", "anthropic", "openrouter", "groq", "ollama"] {
+        for expected in ["openai", "openrouter", "groq", "ollama"] {
             assert!(peers.contains(&expected), "{expected} must be offered too");
         }
+        // Anthropic is NOT bundled — a deliberate product decision, documented
+        // in the policy block in `providers.toml`. A user who wants it adds it
+        // to `~/.prism/providers.toml` like any other unshipped vendor, which
+        // `an_override_replaces_a_builtin_and_new_ids_append` already covers.
+        assert!(
+            !peers.contains(&"anthropic"),
+            "PRISM must not ship an Anthropic provider; it is added by the user \
+             or not at all"
+        );
         assert!(
             peers.len() >= 12,
             "the platform must be one of many, got {} peers",
@@ -441,10 +450,9 @@ mod tests {
     fn lookup_is_case_insensitive() {
         let reg = Registry::builtin().unwrap();
         assert_eq!(reg.get("OpenAI").map(|p| p.id.as_str()), Some("openai"));
-        assert_eq!(
-            reg.get("ANTHROPIC").map(|p| p.id.as_str()),
-            Some("anthropic")
-        );
+        assert_eq!(reg.get("MISTRAL").map(|p| p.id.as_str()), Some("mistral"));
+        // A name PRISM does not ship resolves to nothing, whatever the casing.
+        assert!(reg.get("Anthropic").is_none());
     }
 
     #[test]
@@ -494,7 +502,6 @@ mod tests {
 
         const EXPECTED: &[(&str, &str)] = &[
             ("openai", "https://api.openai.com/v1/chat/completions"),
-            ("anthropic", "https://api.anthropic.com/v1/chat/completions"),
             (
                 "google",
                 "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
@@ -586,7 +593,6 @@ mod tests {
     #[test]
     fn key_env_comes_from_the_registry() {
         let reg = Registry::builtin().unwrap();
-        assert_eq!(default_api_key_env(&reg, "anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(default_api_key_env(&reg, "openai"), "OPENAI_API_KEY");
         assert_eq!(default_api_key_env(&reg, "OpenAI"), "OPENAI_API_KEY");
         assert_eq!(default_api_key_env(&reg, "mistral"), "MISTRAL_API_KEY");

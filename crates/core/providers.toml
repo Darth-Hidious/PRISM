@@ -14,6 +14,39 @@
 # env-var convention to fall back on, so storing it is the point — but it is
 # stored, and saying otherwise here would be a lie in shipped text.
 #
+# ── Policy: Anthropic is not a bundled provider ───────────────────────
+#
+# PRISM does not ship an Anthropic entry and makes no call to the Anthropic
+# API. This is a deliberate product decision by the owner of this project,
+# not an oversight and not a technical limitation.
+#
+# It is NOT a block. Anthropic's OpenAI-compatible endpoint works fine with
+# this client, and anyone who wants it can have it in about thirty seconds
+# by adding it to `~/.prism/providers.toml` like any other vendor PRISM has
+# not shipped:
+#
+#   [[provider]]
+#   id = "anthropic"
+#   name = "Anthropic"
+#   base_url = "https://api.anthropic.com/v1"
+#   api_key_env = "ANTHROPIC_API_KEY"
+#   docs = "https://console.anthropic.com/settings/keys"
+#
+# That is the whole difference: their key, their account, their choice —
+# rather than PRISM putting it in front of every user by default. The same
+# route serves a private gateway or a corporate proxy, so nothing here is
+# special-cased against one vendor; the vendor is simply not preinstalled.
+#
+# Nothing in PRISM reaches for `ANTHROPIC_API_KEY` on its own any more
+# either. The key-resolution chain in `crates/runtime/src/llm_resolve.rs`
+# used to fall back to it, which meant an unrelated key sitting in a shell
+# environment could silently take over — and shadow the platform session
+# token, producing a 401 nobody could explain. A provider a user adds
+# themselves names its own env var, and only that.
+#
+# For the record, and with the irony fully intended: this policy text was
+# written by Claude, an Anthropic model, at the owner's instruction.
+#
 # ── Overriding / extending ────────────────────────────────────────────
 # Drop a file with this same schema at `~/.prism/providers.toml`. Entries
 # whose `id` matches a built-in REPLACE it; new ids are appended. That is
@@ -64,13 +97,6 @@ name = "OpenAI"
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 docs = "https://platform.openai.com/api-keys"
-
-[[provider]]
-id = "anthropic"
-name = "Anthropic"
-base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
-docs = "https://console.anthropic.com/settings/keys"
 
 [[provider]]
 id = "google"

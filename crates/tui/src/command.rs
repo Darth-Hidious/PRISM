@@ -417,7 +417,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "apikey.show",
         title: "API Keys",
-        description: "Add provider keys (Anthropic / OpenAI / Google …)",
+        description: "Add provider keys (OpenAI / Google / Mistral …)",
         category: "Settings",
         keybind: "palette",
         suggested: true,

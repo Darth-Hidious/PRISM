@@ -204,8 +204,15 @@ pub fn resolve_llm_with(
     // The marc27 arm is unaffected: it resolves its own credential from stored
     // bearers and endpoint config (`resolved_platform_credential` below) and
     // never reads this value.
+    //
+    // `ANTHROPIC_API_KEY` used to sit second in this chain. It is gone: PRISM
+    // does not ship an Anthropic provider (see the policy block in
+    // `crates/core/providers.toml`), so reaching for that key on its own let an
+    // unrelated key in a shell environment silently take over the route — the
+    // shadowing this comment already warned about, one line up. A provider a
+    // user adds themselves declares its own `api_key_env`, and only that is
+    // read for it.
     let api_key = std::env::var("LLM_API_KEY")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .ok()
         .or_else(|| cfg_llm.resolve_api_key());
@@ -337,7 +344,6 @@ pub fn tool_server_env_with_endpoints(
         "MP_API_KEY",
         "LENS_API_TOKEN",
         "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
         "FIRECRAWL_API_KEY",
     ] {
         if let Ok(val) = std::env::var(key) {
