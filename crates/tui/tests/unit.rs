@@ -424,22 +424,55 @@ fn tool_card_success_pushes_result_with_text_evidence_token() {
     assert!(last.text.contains("[YELLOW screening]"), "{}", last.text);
 }
 
+/// Saying nothing and saying something unreadable are different, and only one
+/// of them is the tool's fault.
+///
+/// Both stay visibly not-verified — an unmarked result reads as a verified one
+/// — but RED is reserved for a claim, so that it still means something when it
+/// appears. Nearly every tool in the tree declares no class at all; painting
+/// all of them RED is what hid the results that genuinely are ungrounded.
 #[test]
-fn tool_card_missing_or_unknown_evidence_is_indeterminate() {
-    for data in [None, Some(json!({"evidence_class": "unrecognized"}))] {
-        let mut app = test_app();
-        app.apply_agent_msg(AgentMsg::ToolCard {
-            tool_name: "evaluate_material".into(),
-            content: "reward=0.75".into(),
-            card_type: "results".into(),
-            elapsed_ms: Some(10),
-            call_id: None,
-            provenance_id: None,
-            data,
-        });
-        let last = app.messages.last().unwrap();
-        assert!(last.text.contains("[RED indeterminate]"), "{}", last.text);
-    }
+fn a_tool_that_declared_nothing_is_unclassified_not_ungrounded() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "evaluate_material".into(),
+        content: "reward=0.75".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(10),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let last = app.messages.last().unwrap();
+    assert!(last.text.contains("[unclassified]"), "{}", last.text);
+    assert!(
+        !last.text.contains("[GREEN"),
+        "an unclassified result must never read as verified: {}",
+        last.text
+    );
+}
+
+/// A class PRISM cannot read is a claim it cannot check, so it stays RED. The
+/// tool asserted a grounding; we simply do not know which — that is a worse
+/// position than silence, not a better one.
+#[test]
+fn an_unreadable_evidence_class_stays_indeterminate() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "evaluate_material".into(),
+        content: "reward=0.75".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(10),
+        call_id: None,
+        provenance_id: None,
+        data: Some(json!({"evidence_class": "unrecognized"})),
+    });
+    let last = app.messages.last().unwrap();
+    assert!(
+        last.text.contains("[RED indeterminate]"),
+        "an unreadable claim is not the same as no claim: {}",
+        last.text
+    );
 }
 
 #[test]
@@ -1837,7 +1870,7 @@ fn tool_start_humanized_verb_is_shown_verbatim() {
 }
 
 #[test]
-fn tool_card_result_without_class_is_visibly_indeterminate() {
+fn tool_card_result_without_class_is_visibly_unclassified() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
         tool_name: "evaluate_material".into(),
@@ -1853,10 +1886,10 @@ fn tool_card_result_without_class_is_visibly_indeterminate() {
         last.kind,
         LineKind::ToolResult { success: true, .. }
     ));
-    assert_eq!(
-        last.text,
-        "[RED indeterminate] evaluate_material: density=7.8"
-    );
+    // The tool declared no class. That is "nobody said", not "the model
+    // asserted this with no grounding" — RED is reserved for the latter, and
+    // for failures, so it still means something when it appears.
+    assert_eq!(last.text, "[unclassified] evaluate_material: density=7.8");
 }
 
 #[test]
@@ -2059,10 +2092,7 @@ fn tool_card_content_with_ansi_stores_sanitized_text() {
         data: None,
     });
     let last = app.messages.last().unwrap();
-    assert_eq!(
-        last.text,
-        "[RED indeterminate] evaluate_material: density=7.8"
-    );
+    assert_eq!(last.text, "[unclassified] evaluate_material: density=7.8");
     assert_no_terminal_controls(&last.text);
 }
 

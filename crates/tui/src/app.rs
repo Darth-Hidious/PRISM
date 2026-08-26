@@ -51,7 +51,16 @@ pub enum LineKind {
         content: String,
         elapsed_ms: u64,
         success: bool,
-        evidence_class: EvidenceClass,
+        /// What the TOOL said about its own grounding, or `None` when it said
+        /// nothing.
+        ///
+        /// Not the same as `Indeterminate`, which means "model assertion with
+        /// no grounding". Only one tool in the tree emits a class at all, so
+        /// defaulting silence to Indeterminate painted 140+ tools RED — a
+        /// federated database lookup with provenance is not an ungrounded
+        /// assertion, and an indicator that says RED for everything hides the
+        /// one result that genuinely is.
+        evidence_class: Option<EvidenceClass>,
         /// Figures this tool produced, so the transcript can DRAW them.
         ///
         /// The engine has always sent these — `ui.card`'s `data.images` carries
@@ -496,23 +505,38 @@ fn evidence_class_from_value(value: &Value) -> Option<EvidenceClass> {
     None
 }
 
-fn tool_result_evidence(data: Option<&Value>, content: &str) -> EvidenceClass {
-    data.and_then(evidence_class_from_value)
-        .or_else(|| {
-            serde_json::from_str::<Value>(content)
-                .ok()
-                .as_ref()
-                .and_then(evidence_class_from_value)
-        })
-        .unwrap_or_default()
+/// The class the tool declared, or `None` if it declared none.
+///
+/// It used to `unwrap_or_default()` into `Indeterminate`. That turned "nobody
+/// said" into "ungrounded model assertion" for every tool that never emits a
+/// class — which is nearly all of them.
+fn tool_result_evidence(data: Option<&Value>, content: &str) -> Option<EvidenceClass> {
+    data.and_then(evidence_class_from_value).or_else(|| {
+        serde_json::from_str::<Value>(content)
+            .ok()
+            .as_ref()
+            .and_then(evidence_class_from_value)
+    })
 }
 
-pub(crate) fn evidence_token(evidence_class: EvidenceClass) -> String {
-    format!(
-        "[{} {}]",
-        evidence_class.color().to_ascii_uppercase(),
-        evidence_class.as_str()
-    )
+/// The badge for a result's grounding.
+///
+/// There is ALWAYS a badge: an unmarked result reads as a verified one, and the
+/// rule here is that nothing looks better than it is. But `None` is not
+/// `Indeterminate`. Indeterminate means "model assertion with no grounding";
+/// `None` means the tool never said. Painting silence RED made 140+ tools —
+/// including federated database lookups that carry full provenance — look like
+/// ungrounded assertions, which is its own dishonesty and, worse, hid the
+/// results that genuinely are ungrounded among all the ones that are not.
+pub(crate) fn evidence_token(evidence_class: Option<EvidenceClass>) -> String {
+    match evidence_class {
+        Some(class) => format!(
+            "[{} {}]",
+            class.color().to_ascii_uppercase(),
+            class.as_str()
+        ),
+        None => "[unclassified]".to_string(),
+    }
 }
 
 /// Link picker (`o` in chat focus) — collects http(s) URLs from the
@@ -5102,10 +5126,14 @@ impl App {
                 // backend may supply either PRISM evidence_class or RHEA-JAX
                 // claim_status; missing, unknown, and failed results are RED.
                 let success = card_type != "error";
+                // A FAILED result is genuinely ungrounded, so it keeps the red
+                // Indeterminate class. A successful one carries whatever the
+                // tool declared — and nothing at all when it declared nothing,
+                // which is not the same as declaring itself ungrounded.
                 let evidence_class = if success {
                     tool_result_evidence(data.as_ref(), &content)
                 } else {
-                    EvidenceClass::Indeterminate
+                    Some(EvidenceClass::Indeterminate)
                 };
                 let token = evidence_token(evidence_class);
                 let clean_name = sanitize_for_render(&tool_name);
@@ -5709,7 +5737,12 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
             v["content"] = content.clone().into();
             v["elapsed_ms"] = (*elapsed_ms).into();
             v["success"] = (*success).into();
-            v["evidence_class"] = evidence_class.as_str().into();
+            // Absent stays absent on the wire too: a consumer must be able to
+            // tell "the tool said nothing" from "the tool said indeterminate".
+            v["evidence_class"] = match evidence_class {
+                Some(class) => class.as_str().into(),
+                None => serde_json::Value::Null,
+            };
         }
         LineKind::Approval { tool_name, message } => {
             v["event"] = "approval".into();
@@ -6115,7 +6148,7 @@ mod tests {
                     content: body.to_string(),
                     elapsed_ms: elapsed,
                     success: ok,
-                    evidence_class: prism_provenance::emmo::EvidenceClass::Indeterminate,
+                    evidence_class: None,
                     image_paths: Vec::new(),
                 },
             });

@@ -435,9 +435,15 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     // secondary so the eye goes to the result, not the noise.
                     _ => ("⚙", t.warn, Style::default().fg(t.dim)),
                 };
-                let evidence_class = match kind {
+                // Two different absences, so two levels. The OUTER `None`
+                // means "this line is not a tool result at all" and gets no
+                // badge. The INNER `None` means "it is a tool result and the
+                // tool said nothing about its grounding", which does get a
+                // badge — a muted `[unclassified]`, because an unmarked result
+                // reads as a verified one.
+                let evidence_class: Option<Option<EvidenceClass>> = match kind {
                     LineKind::ToolResult { evidence_class, .. } => Some(*evidence_class),
-                    LineKind::Error(_) => Some(EvidenceClass::Indeterminate),
+                    LineKind::Error(_) => Some(Some(EvidenceClass::Indeterminate)),
                     _ => None,
                 };
                 // A finished RESULT is prose the reader studies, so its body
@@ -1026,7 +1032,9 @@ struct ToolEntry {
     status: ToolStatus,
     elapsed_ms: Option<u64>,
     finding: Option<String>,
-    evidence_class: EvidenceClass,
+    /// What the tool said about its own grounding, or `None` when it said
+    /// nothing — see `LineKind::ToolResult`.
+    evidence_class: Option<EvidenceClass>,
 }
 
 fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
@@ -1284,12 +1292,16 @@ fn status_glyph(status: ToolStatus, t: Theme) -> (&'static str, Color) {
     }
 }
 
-fn evidence_color(evidence_class: EvidenceClass, t: Theme) -> Color {
+fn evidence_color(evidence_class: Option<EvidenceClass>, t: Theme) -> Color {
     match evidence_class {
-        EvidenceClass::ReferenceValidated => t.ok,
-        EvidenceClass::Screening => t.warn,
-        EvidenceClass::Research => t.accent,
-        EvidenceClass::Indeterminate => t.err,
+        Some(EvidenceClass::ReferenceValidated) => t.ok,
+        Some(EvidenceClass::Screening) => t.warn,
+        Some(EvidenceClass::Research) => t.accent,
+        Some(EvidenceClass::Indeterminate) => t.err,
+        // Muted, not red: the tool said nothing about its grounding, which is
+        // not the same as claiming it has none. Still visible, so the result
+        // never reads as verified.
+        None => t.muted,
     }
 }
 
@@ -1358,7 +1370,9 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
                     status: ToolStatus::Running,
                     elapsed_ms: None,
                     finding: None,
-                    evidence_class: EvidenceClass::Indeterminate,
+                    // Still running: it has not said anything about grounding
+                    // yet, which is absence, not a claim of ungroundedness.
+                    evidence_class: None,
                 });
             }
             LineKind::ToolResult {
