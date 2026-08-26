@@ -728,6 +728,13 @@ pub struct App {
     /// words that stand for them, never payloads: what a reference points at
     /// is fetched when the pointer lands on it.
     pub references: crate::refs::ReferenceRegistry,
+    /// The transcript line the reader clicked, and which message it came from.
+    ///
+    /// Held verbatim as it was DRAWN. Markdown transforms a message before it
+    /// reaches the screen, so a rendered row is often not a slice of the
+    /// source — what the reader pointed at is what they saw, so that is what
+    /// gets quoted back to the model.
+    pub selected_line: Option<(usize, String)>,
     /// The panel shown for the reference under the pointer, or `None`.
     ///
     /// Opened by `pointer_moved`, never by the renderer — resolution is a
@@ -887,6 +894,7 @@ impl App {
             view_scroll: std::cell::Cell::new(0),
             sidebar_visible: std::cell::Cell::new(true),
             references: crate::refs::ReferenceRegistry::default(),
+            selected_line: None,
             ref_panel: None,
             ref_cache: std::collections::HashMap::new(),
             ref_fetch: None,
@@ -1372,6 +1380,14 @@ impl App {
                 self.hovered = Some(crate::hit_map::HitTarget::Reference { id });
                 return;
             }
+            Some(crate::hit_map::HitTarget::TranscriptLine { message, text }) => {
+                // Selecting is not asking. The reader picks the line, sees it
+                // marked, and then decides — pressing `e` is the ask. Firing a
+                // turn on a stray click would spend a model call on a misclick.
+                self.selected_line = Some((message, text.clone()));
+                self.focus = Focus::Chat;
+                return;
+            }
             Some(crate::hit_map::HitTarget::RefPanelClose) => {
                 self.ref_panel = None;
                 // Return without touching `hovered`: the close was the whole
@@ -1554,6 +1570,12 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => {
                 self.anchor_user_turn.set(false);
                 self.auto_scroll = true;
+            }
+            // `e` explains the line the reader clicked. Selecting marks it;
+            // this is the ask. Keeping them separate means a misclick costs
+            // nothing.
+            KeyCode::Char('e') if self.selected_line.is_some() => {
+                self.explain_selected_line();
             }
             KeyCode::Char('i') | KeyCode::Enter => {
                 self.focus = Focus::Input;
@@ -4360,6 +4382,22 @@ impl App {
         true
     }
 
+    /// Ask the model what it meant by the line the reader picked.
+    ///
+    /// The quote is passed through VERBATIM — byte-identical to what was on
+    /// screen. Paraphrasing it, trimming it, or reflowing it would ask about
+    /// something the reader never saw, and the answer would be about that
+    /// other text. `explain_request` is separated out so the composition can
+    /// be tested without a backend.
+    fn explain_selected_line(&mut self) {
+        let Some((index, text)) = self.selected_line.take() else {
+            return;
+        };
+        let request = explain_request(index, &text);
+        self.push_user(&request);
+        self.send_message(&request);
+    }
+
     fn send_message(&mut self, text: &str) {
         let trimmed = text.trim();
 
@@ -7154,4 +7192,19 @@ pub enum RefPanelState {
     Failed(String),
     /// A kind PRISM records but cannot open yet, named rather than blank.
     NotResolvable(String),
+}
+
+/// Compose the message sent when the reader asks about a line.
+///
+/// Pure, so the one invariant that matters is testable without a backend: the
+/// reader's line appears in the request EXACTLY as it was on screen. A
+/// request that quietly trims or reflows it asks the model about text nobody
+/// saw, and the answer would be about that other text.
+#[must_use]
+pub fn explain_request(message_index: usize, line: &str) -> String {
+    format!(
+        "I clicked this line in your message #{message_index} and want to \
+         understand it:\n\n{line}\n\nWhat did you mean here? Explain it in \
+         plain words, and say where the claim comes from."
+    )
 }

@@ -325,6 +325,9 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // Where each message starts, so a click or a selection can say WHICH
     // message it landed in — the thing that makes "explain this line" possible.
     let mut message_lines: Vec<(usize, usize)> = Vec::new();
+    // Every rendered transcript row, as (index in `lines`, message index,
+    // the text on it). Lets a click say WHICH line, not just which message.
+    let mut line_rows: Vec<(usize, usize, String)> = Vec::new();
     // Reference marks: (index in `lines`, col_start, col_end, id). Screen rows
     // are resolved after the wrapped-row measurement below, the same way
     // figures and the anchor are.
@@ -589,6 +592,24 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // is what makes the offset map 1:1 to what's on screen. Using the
     // unwrapped `lines.len()` left the final wrapped rows unreachable and
     // drifted the scrollbar off-axis.
+    // Attribute every rendered row to its message, with the text that was
+    // drawn on it. Done here rather than inside each match arm so it covers
+    // ALL of them — prose, tool cards, thinking, errors — without eighteen
+    // call sites that can drift apart.
+    for (n, (first, idx)) in message_lines.iter().enumerate() {
+        let end = message_lines
+            .get(n + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(lines.len());
+        for (offset, line) in lines[*first..end].iter().enumerate() {
+            let text: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            if text.trim().is_empty() {
+                continue;
+            }
+            line_rows.push((first + offset, *idx, text));
+        }
+    }
+
     let viewport = area.height;
     // Where the newest user turn sits, in WRAPPED rows — the same unit
     // `Paragraph::scroll` counts in, measured with the same wrap settings.
@@ -620,6 +641,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // looks correct while its hit region sits at the top of the transcript and
     // hovering the word does nothing.
     marks.extend(reference_marks.iter().map(|(line, ..)| *line));
+    marks.extend(line_rows.iter().map(|(line, ..)| *line));
     let anchor_idx = if app.anchor_user_turn.get() {
         last_user_line
     } else {
@@ -718,6 +740,24 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 HitTarget::TranscriptMessage { index: *index },
             );
         }
+        // One region per rendered row, between the message regions and the
+        // reference marks. Order matters: `HitMap::at` searches newest-first,
+        // so a reference still wins over the line it sits on, and a line wins
+        // over the message that contains it.
+        for (line, msg_idx, text) in &line_rows {
+            let row = rows_for(*line);
+            if row < effective_scroll || row >= effective_scroll.saturating_add(area.height) {
+                continue;
+            }
+            map.push(
+                Rect::new(area.x, area.y + (row - effective_scroll), area.width, 1),
+                HitTarget::TranscriptLine {
+                    message: *msg_idx,
+                    text: text.clone(),
+                },
+            );
+        }
+
         // Reference marks go in AFTER the message regions that contain them.
         // `HitMap::at` searches newest-first, so a marked word answers for its
         // own cells while the rest of the reply still answers as a message —

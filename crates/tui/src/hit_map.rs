@@ -22,6 +22,13 @@ pub enum HitTarget {
     WorkspaceTab(WorkspaceTab),
     /// One row of the active workspace tab, by its index in that tab's list.
     WorkspaceRow { tab: WorkspaceTab, index: usize },
+    /// ONE rendered row of the transcript, carrying the text that was on it.
+    ///
+    /// The text is what was DRAWN, not a slice of the source: markdown
+    /// transforms the message before it reaches the screen, so a rendered row
+    /// is often not a substring of `ChatLine::text`. What the reader pointed
+    /// at is what they saw, so that is what gets quoted back.
+    TranscriptLine { message: usize, text: String },
     /// A message in the transcript, by its index in `App::messages`.
     TranscriptMessage { index: usize },
     /// The close control on the reference panel.

@@ -2515,10 +2515,16 @@ fn a_real_frame_records_what_it_drew() {
             .any(|t| matches!(t, HitTarget::WorkspaceRow { .. })),
         "no workspace row claimed any cell, so a listed tool cannot be clicked"
     );
+    // A rendered LINE is more specific than the message containing it, so it
+    // wins the cell — and it carries the message index, so pointing still
+    // says which reply it is. Either target answering is correct; neither
+    // answering is not.
     assert!(
-        tabs.iter()
-            .any(|t| matches!(t, HitTarget::TranscriptMessage { .. })),
-        "no transcript message claimed any cell, so pointing at a reply cannot \
+        tabs.iter().any(|t| matches!(
+            t,
+            HitTarget::TranscriptMessage { .. } | HitTarget::TranscriptLine { .. }
+        )),
+        "no transcript row claimed any cell, so pointing at a reply cannot \
          say which reply it is"
     );
 }
@@ -3060,4 +3066,74 @@ fn clicking_a_reference_opens_a_panel_that_stays() {
         crossterm::event::KeyModifiers::NONE,
     ));
     assert!(app.ref_panel.is_none(), "Esc must close a pinned panel");
+}
+
+/// B9: click a line, press `e`, and the model is asked about THAT line.
+///
+/// The invariant is the quote. The reader's line must reach the model exactly
+/// as it was on screen — a request that trims, reflows or paraphrases asks
+/// about text nobody saw, and the answer is then about that other text.
+///
+/// Selecting and asking are deliberately separate: a click marks the line, `e`
+/// spends the model call. A misclick costs nothing.
+#[test]
+fn clicking_a_line_then_e_asks_about_that_exact_line() {
+    use prism_tui::app::explain_request;
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "The solidus sits near 1878 K for this alloy.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let rendered = render_app_to_string(&app, 120, 30);
+    assert!(rendered.contains("solidus"));
+
+    // Find a transcript LINE region and click it.
+    let (cell, on_screen) = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..120u16 {
+                if let Some(HitTarget::TranscriptLine { text, .. }) = map.at(col, row)
+                    && text.contains("solidus")
+                {
+                    found = Some(((col, row), text.clone()));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("a rendered line must claim its own cells")
+    };
+
+    app.pointer_pressed(cell.0, cell.1);
+    let (idx, picked) = app
+        .selected_line
+        .clone()
+        .expect("clicking a line must select it");
+    assert_eq!(
+        picked, on_screen,
+        "the selection must hold the line as DRAWN, byte for byte"
+    );
+
+    // Clicking alone must not spend a turn.
+    let before = app.messages.len();
+    let _ = render_app_to_string(&app, 120, 30);
+    assert_eq!(
+        app.messages.len(),
+        before,
+        "selecting is not asking — a misclick must not start a turn"
+    );
+
+    // The composed request carries the line verbatim.
+    let request = explain_request(idx, &picked);
+    assert!(
+        request.contains(&picked),
+        "the request must quote the line exactly as it was on screen;\n\
+         line: {picked:?}\nrequest: {request:?}"
+    );
+    assert!(
+        request.contains("What did you mean here?"),
+        "the request must actually ask the question"
+    );
 }
