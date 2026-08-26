@@ -2650,24 +2650,37 @@ fn a_tool_result_makes_its_word_referenceable_in_the_reply() {
         "the reply must still read normally; got:\n{rendered}"
     );
 
-    // The word claims its own cells, and they resolve to the id — not to the
-    // surrounding message.
+    // The word claims ITS OWN cells. Searching the whole screen for any
+    // region would pass even if the region sat at the top of the transcript
+    // while the word was drawn further down — which is exactly what a missing
+    // row measurement does, and what this assertion exists to catch: the
+    // region must be on the same screen row as the rendered word.
+    let word_row = rendered
+        .lines()
+        .position(|l| l.contains("MoNbTaW"))
+        .expect("the word is on screen") as u16;
     let map = app.hit_map.borrow();
-    let mut found: Option<String> = None;
+    let mut found: Option<(String, u16)> = None;
     'outer: for row in 0..30u16 {
         for col in 0..120u16 {
             if let Some(HitTarget::Reference { id }) = map.at(col, row) {
-                found = Some(id.clone());
+                found = Some((id.clone(), row));
                 break 'outer;
             }
         }
     }
+    let (id, row) = found.unwrap_or_else(|| {
+        panic!(
+            "no reference region at all; the map holds {} regions",
+            map.len()
+        )
+    });
+    assert_eq!(id, "cache://e129a2e9d3");
     assert_eq!(
-        found.as_deref(),
-        Some("cache://e129a2e9d3"),
-        "the marked word must resolve to the id the engine reported, so hover \
-         can fetch it later; the map holds {} regions",
-        map.len()
+        row, word_row,
+        "the region must sit on the row the word is DRAWN on ({word_row}), not \
+         wherever a missing measurement put it ({row}) — otherwise the word \
+         looks right and hovering it does nothing"
     );
 }
 

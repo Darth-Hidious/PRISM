@@ -614,6 +614,12 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // whole transcript however finely it is cut.
     let mut marks: Vec<usize> = inline_figures.iter().map(|(idx, _)| *idx).collect();
     marks.extend(message_lines.iter().map(|(line, _)| *line));
+    // Reference lines must be measured too. Without this `rows_for` misses
+    // them and falls through to its `unwrap_or(0)`, putting every reference
+    // region on row 0 — the mark still PAINTS in the right place, so the word
+    // looks correct while its hit region sits at the top of the transcript and
+    // hovering the word does nothing.
+    marks.extend(reference_marks.iter().map(|(line, ..)| *line));
     let anchor_idx = if app.anchor_user_turn.get() {
         last_user_line
     } else {
