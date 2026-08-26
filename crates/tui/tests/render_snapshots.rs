@@ -2919,3 +2919,78 @@ fn a_hover_fetch_and_the_detail_view_do_not_take_each_others_answers() {
         );
     }
 }
+
+/// B7: the panel answers "where did this come from" and "what governs it" as
+/// two separate, labelled questions.
+///
+/// They are different facts and conflating them would let a provenance line
+/// pass for an ontology claim. The ontology answer today is a REFUSAL with a
+/// reason — measured 2026-08-26, `cache_key` appears nowhere in the provenance
+/// store, so a cached structure is not an ontology entity. Saying that plainly
+/// is the honest answer; a blank section would read as "we did not look".
+#[test]
+fn the_reference_panel_separates_sources_from_ontology_placement() {
+    use prism_tui::hit_map::HitTarget;
+    use prism_tui::structures::{StructuresStoreState, WorkspaceStructure};
+
+    let mut app = app_with_welcome();
+    // The Structures tab has been listed, so PRISM already holds provenance.
+    app.structure_store = StructuresStoreState::Ready(vec![WorkspaceStructure {
+        cache_key: "c043f8cc".into(),
+        formula: Some("Cu4".into()),
+        tool: Some("structure_import".into()),
+        source: Some("user_import".into()),
+        created_at: Some("2026-08-26T15:40:00".into()),
+        cache_ref: Some("cache://c043f8cc/structure.cif".into()),
+        n_atoms: Some(4),
+        composition: Some("Cu4".into()),
+        name: None,
+    }]);
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://c043f8cc".into(),
+        kind: "structure".into(),
+        label: "Cu4".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta("Imported Cu4 cleanly.\n".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 140, 40);
+
+    let cell = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..40u16 {
+            for col in 0..140u16 {
+                if let Some(HitTarget::Reference { .. }) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("marked word")
+    };
+    app.pointer_moved(cell.0, cell.1);
+    let rendered = render_app_to_string(&app, 140, 40);
+
+    for needed in ["sources", "ontology"] {
+        assert!(
+            rendered.contains(needed),
+            "the panel must label the {needed} section; got:\n{rendered}"
+        );
+    }
+    // Real provenance, read from what PRISM already had — no extra round trip.
+    assert!(
+        rendered.contains("structure_import") && rendered.contains("user_import"),
+        "sources must name the tool and origin PRISM actually recorded; \
+         got:\n{rendered}"
+    );
+    // And the ontology answer is the true one, stated rather than left blank.
+    assert!(
+        rendered.contains("not an ontology entity"),
+        "the ontology section must say WHY there is no placement, so a gap \
+         reads as a gap and not as 'we did not look'; got:\n{rendered}"
+    );
+}

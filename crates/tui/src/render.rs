@@ -4754,9 +4754,13 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         }
     };
     // Header + id + body + borders.
-    let height = (body.len() as u16 + 4)
+    // header + id + body + "sources" + its lines + "ontology" + its line +
+    // two borders. Computed from what will actually be pushed, so the panel
+    // never clips its own last section.
+    let prov_lines = app.reference_provenance(&panel.id).sources.len() as u16 + 3;
+    let height = (body.len() as u16 + prov_lines + 4)
         .min(area.height.saturating_sub(1))
-        .max(4);
+        .max(6);
 
     // Prefer below-right of the pointer; flip when that would fall off.
     let (px, py) = panel.anchor;
@@ -4796,6 +4800,33 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     for b in body {
         lines.push(Line::from(Span::styled(b, Style::default().fg(t.text))));
     }
+
+    // The two questions a reader actually has once they can see the thing:
+    // where did this come from, and what governs it. Kept as separate labelled
+    // sections because they are different facts — conflating them would let a
+    // provenance line pass for an ontology claim.
+    let prov = app.reference_provenance(&panel.id);
+    lines.push(Line::from(Span::styled(
+        "sources",
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    for src in &prov.sources {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", clip(src, width.saturating_sub(4) as usize)),
+            Style::default().fg(t.dim),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "ontology",
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {}",
+            clip(&prov.placement, width.saturating_sub(4) as usize)
+        ),
+        Style::default().fg(t.dim),
+    )));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.warn))

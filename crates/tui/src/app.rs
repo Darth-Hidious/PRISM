@@ -1205,6 +1205,50 @@ impl App {
         self.hovered = target;
     }
 
+    /// Where a reference came from and where it sits in the ontology.
+    ///
+    /// Reads what PRISM already holds — the structure list the Structures tab
+    /// was sent — so opening a panel costs no extra round trip.
+    #[must_use]
+    pub fn reference_provenance(&self, id: &str) -> RefProvenance {
+        let mut sources = Vec::new();
+        if let Some(key) = id.strip_prefix("cache://") {
+            let key = key.split('/').next().unwrap_or(key);
+            if let crate::structures::StructuresStoreState::Ready(rows) = &self.structure_store
+                && let Some(row) = rows.iter().find(|r| r.cache_key == key)
+            {
+                if let Some(tool) = &row.tool {
+                    sources.push(format!("produced by {tool}"));
+                }
+                if let Some(src) = &row.source {
+                    sources.push(format!("source: {src}"));
+                }
+                if let Some(at) = &row.created_at {
+                    sources.push(format!("cached {at}"));
+                }
+            }
+        }
+        if sources.is_empty() {
+            // Not "unknown": PRISM has the structure list or it does not, and
+            // saying which is the difference between a gap and a silence.
+            sources.push(match &self.structure_store {
+                crate::structures::StructuresStoreState::Ready(_) => {
+                    "not in the cache listing".to_string()
+                }
+                _ => "structure listing not loaded — open the Structures tab".to_string(),
+            });
+        }
+        RefProvenance {
+            sources,
+            // MEASURED 2026-08-26: `cache_key` appears nowhere in the
+            // provenance store, so a cached structure is not an ontology
+            // entity and no class governs it. That is the true answer, not a
+            // missing feature to paper over — and it is the honest prompt for
+            // the work that would change it.
+            placement: "not an ontology entity — cached structures carry no class".to_string(),
+        }
+    }
+
     /// Show the panel for `id`, resolving it if this is the first time.
     ///
     /// Re-hovering the same reference is a no-op beyond moving the anchor, so
@@ -7036,6 +7080,19 @@ mod tests {
             "unenforced sources must be labeled advisory: {prompt}"
         );
     }
+}
+
+/// Where a reference came from, and where it sits in the ontology.
+///
+/// Two different questions with two different answers, kept apart because a
+/// reader needs to tell them apart. `sources` says which tool produced this
+/// and when. `placement` says which ontology class governs it — or, when
+/// nothing does, WHY, because "no placement" and "we did not look" are
+/// different facts and only one of them is a gap worth chasing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefProvenance {
+    pub sources: Vec<String>,
+    pub placement: String,
 }
 
 /// The panel shown for the reference under the pointer.
