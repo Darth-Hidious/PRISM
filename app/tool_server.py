@@ -33,7 +33,8 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _handle(registry, request: dict) -> dict:
+def _handle(state: dict, request: dict) -> dict:
+    registry = state["registry"]
     method = request.get("method")
     if method is None:
         return {"error": "missing 'method' field"}
@@ -77,6 +78,36 @@ def _handle(registry, request: dict) -> dict:
         except Exception as exc:
             return {"error": str(exc)}
 
+    if method == "reload_tools":
+        # The agent can WRITE a tool (a plugin in ~/.prism/plugins) and then
+        # use it in the same session. Without this, a tool it just authored is
+        # invisible until the kernel is restarted, which throws away every
+        # variable, every loaded dataset and the whole notebook state — an
+        # absurd price for the harness to learn that a file appeared.
+        #
+        # Discovery already re-reads the directory on every call, so a rebuild
+        # picks up new AND edited plugins. Session state is configured on a
+        # module, not held by the registry, so it survives the swap.
+        before = {t.name for t in registry.list_tools()}
+        try:
+            rebuilt, _, _ = build_full_registry(
+                enable_mcp=state["enable_mcp"],
+                enable_plugins=state["enable_plugins"],
+            )
+        except Exception as exc:  # keep serving the OLD registry
+            return {
+                "error": f"tool reload failed, keeping the previous catalog: {exc}"
+            }
+        state["registry"] = rebuilt
+        after = {t.name for t in rebuilt.list_tools()}
+        return {
+            "status": "ok",
+            "count": len(after),
+            "added": sorted(after - before),
+            "removed": sorted(before - after),
+            "plugins_enabled": state["enable_plugins"],
+        }
+
     return {"error": f"unknown method: {method}"}
 
 
@@ -90,6 +121,13 @@ def main():
         enable_mcp=enable_mcp,
         enable_plugins=enable_plugins,
     )
+    # Held in a dict so `reload_tools` can swap the registry in place without
+    # tearing down the process.
+    state = {
+        "registry": tool_reg,
+        "enable_mcp": enable_mcp,
+        "enable_plugins": enable_plugins,
+    }
 
     for line in sys.stdin:
         line = line.strip()
@@ -100,7 +138,7 @@ def main():
         except json.JSONDecodeError as exc:
             response = {"error": f"invalid JSON: {exc}"}
         else:
-            response = _handle(tool_reg, request)
+            response = _handle(state, request)
 
         _PROTOCOL_OUT.write(json.dumps(response) + "\n")
         _PROTOCOL_OUT.flush()

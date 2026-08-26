@@ -278,6 +278,20 @@ impl ToolServerHandle {
         self.call(&req).await
     }
 
+    /// Rebuild the tool catalog in the RUNNING worker.
+    ///
+    /// A tool the agent wrote is invisible until the catalog is rebuilt, and
+    /// rebuilding it by restarting the kernel throws away every variable,
+    /// every loaded dataset and the notebook the human is working in. That is
+    /// an absurd price for the harness to learn that a file appeared.
+    ///
+    /// Returns the worker's report: the new count, and which tools appeared or
+    /// vanished. A failed rebuild keeps the previous catalog serving.
+    pub async fn reload_tools(&mut self) -> Result<Value, PythonBridgeError> {
+        let req = serde_json::json!({"method": "reload_tools"});
+        self.call(&req).await
+    }
+
     /// Call a named tool with the given arguments.
     pub async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value, PythonBridgeError> {
         let req = serde_json::json!({

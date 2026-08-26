@@ -118,3 +118,77 @@ def test_invalid_json(server):
     resp_line = server.stdout.readline()
     resp = json.loads(resp_line)
     assert "error" in resp
+
+
+def test_a_tool_written_during_a_session_becomes_callable_without_a_restart(tmp_path):
+    """The agent writes a tool, then uses it. No kernel restart.
+
+    Restarting to pick up a new tool throws away every variable, every loaded
+    dataset and the notebook the human is working in — an absurd price for the
+    harness to learn that a file appeared. This is the whole point of
+    `reload_tools`, so it is asserted end to end: the tool must be ABSENT
+    first, present after the reload, and actually CALLABLE.
+    """
+    import time
+
+    # The loader globs $HOME/.prism/plugins/*.py, so HOME is redirected below
+    # and the directory must sit exactly there.
+    plugin_dir = tmp_path / ".prism" / "plugins"
+    plugin_dir.mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PYTHONPATH": REPO_ROOT,
+        "PRISM_ENABLE_PLUGINS": "1",
+        "PRISM_ENABLE_MCP": "0",
+        "HOME": str(tmp_path),
+    }
+    proc = subprocess.Popen(
+        SERVER_CMD,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        close_fds=False,
+    )
+    time.sleep(0.5)
+    try:
+        before = _send(proc, {"method": "list_tools"})
+        names_before = {t["name"] for t in before["tools"]}
+        assert "probe_written_at_runtime" not in names_before
+
+        # The agent authors a tool mid-session.
+        (plugin_dir / "prism_runtime_probe.py").write_text(
+            "from app.tools.base import Tool\n"
+            "\n"
+            "def register(registry):\n"
+            "    def _run(**kwargs):\n"
+            "        return {'ok': True, 'echo': kwargs.get('text', '')}\n"
+            "    registry.tool_registry.register(Tool(\n"
+            "        name='probe_written_at_runtime',\n"
+            "        description='Written by the agent during a live session.',\n"
+            "        input_schema={'type': 'object',"
+            " 'properties': {'text': {'type': 'string'}}},\n"
+            "        func=_run,\n"
+            "        requires_approval=False,\n"
+            "    ))\n"
+        )
+
+        reloaded = _send(proc, {"method": "reload_tools"})
+        assert reloaded.get("status") == "ok", reloaded
+        assert "probe_written_at_runtime" in reloaded["added"], reloaded
+        assert reloaded["count"] == len(names_before) + 1
+
+        called = _send(
+            proc,
+            {
+                "method": "call_tool",
+                "tool": "probe_written_at_runtime",
+                "args": {"text": "hello"},
+            },
+        )
+        assert called.get("result") == {"ok": True, "echo": "hello"}, called
+    finally:
+        proc.stdin.close()
+        proc.terminate()
+        proc.wait(timeout=10)
