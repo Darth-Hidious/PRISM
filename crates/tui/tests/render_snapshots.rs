@@ -2994,3 +2994,70 @@ fn the_reference_panel_separates_sources_from_ontology_placement() {
          reads as a gap and not as 'we did not look'; got:\n{rendered}"
     );
 }
+
+/// Clicking a reference opens its panel and keeps it open.
+///
+/// Hover cannot be relied on: macOS Terminal.app does not report mouse motion
+/// without a button held (any-motion tracking, 1003), so on that terminal a
+/// hover-only panel is unreachable — the feature would exist and be invisible
+/// to the person it was built for. Clicking works on every terminal that
+/// reports mouse at all, and a click is what "point at it" means to most
+/// people.
+///
+/// A clicked panel is PINNED: there is no "leaving" a click, so an unpinned
+/// one would vanish on the next mouse move.
+#[test]
+fn clicking_a_reference_opens_a_panel_that_stays() {
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://abc123".into(),
+        kind: "structure".into(),
+        label: "Cu4".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta("Imported Cu4 cleanly.\n".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 140, 40);
+
+    let cell = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..40u16 {
+            for col in 0..140u16 {
+                if let Some(HitTarget::Reference { .. }) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("marked word")
+    };
+
+    app.pointer_pressed(cell.0, cell.1);
+    let panel = app
+        .ref_panel
+        .as_ref()
+        .expect("clicking must open the panel");
+    assert_eq!(panel.id, "cache://abc123");
+    assert!(panel.pinned, "a clicked panel must be pinned");
+
+    // Moving the pointer away does NOT close it — that is the difference
+    // between asking for something and brushing past it.
+    app.pointer_moved(0, 39);
+    assert!(
+        app.ref_panel.is_some(),
+        "a clicked panel must survive the pointer moving away"
+    );
+
+    // Esc still closes it, so it is not a trap.
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.ref_panel.is_none(), "Esc must close a pinned panel");
+}

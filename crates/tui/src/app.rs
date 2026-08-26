@@ -1197,10 +1197,15 @@ impl App {
                 let id = id.clone();
                 self.open_reference_panel(&id, column, row);
             }
-            // Moving onto anything else closes the panel. The panel exists to
-            // answer "what is this word", so it has no business outliving the
-            // pointer being on that word.
-            _ => self.ref_panel = None,
+            // Moving onto anything else closes a HOVER panel: it exists to
+            // answer "what is this word" and has no business outliving the
+            // pointer being on that word. A panel opened by a click stays —
+            // there is no "leaving" a click, and it was asked for deliberately.
+            _ => {
+                if !self.ref_panel.as_ref().is_some_and(|p| p.pinned) {
+                    self.ref_panel = None;
+                }
+            }
         }
         self.hovered = target;
     }
@@ -1275,6 +1280,7 @@ impl App {
             kind,
             state,
             anchor: (column, row),
+            pinned: false,
         });
     }
 
@@ -1347,6 +1353,20 @@ impl App {
                 self.workspace_selected = 0;
                 self.workspace_expanded = false;
                 self.focus = Focus::Workspace;
+            }
+            Some(crate::hit_map::HitTarget::Reference { id }) => {
+                // Clicking opens it PINNED. Hover cannot be relied on: macOS
+                // Terminal.app does not report motion without a button held
+                // (any-motion tracking, 1003), so on that terminal the panel
+                // would be unreachable entirely. Clicking works everywhere,
+                // and a click is what "point at it" means to most people.
+                let id = id.clone();
+                self.open_reference_panel(&id, column, row);
+                if let Some(panel) = &mut self.ref_panel {
+                    panel.pinned = true;
+                }
+                self.hovered = Some(crate::hit_map::HitTarget::Reference { id });
+                return;
             }
             Some(crate::hit_map::HitTarget::RefPanelClose) => {
                 self.ref_panel = None;
@@ -7110,6 +7130,12 @@ pub struct RefPanel {
     /// Screen cell the pointer was on, so the panel can open beside the word
     /// rather than over it.
     pub anchor: (u16, u16),
+    /// Opened by a CLICK, so it stays until dismissed.
+    ///
+    /// A hover panel closes when the pointer leaves the word, which is right
+    /// for hovering and wrong for clicking — there is no "leaving" a click, so
+    /// an unpinned click panel would vanish on the next mouse move.
+    pub pinned: bool,
 }
 
 /// How far resolution has got. Every variant says something true; none of
