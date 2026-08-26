@@ -35,6 +35,8 @@ pub mod backend;
 pub mod command;
 pub mod form;
 pub mod gh;
+pub mod hit_map;
+pub mod image_view;
 pub mod json_view;
 pub mod keymap;
 pub mod knowledge;
@@ -187,6 +189,18 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         original_hook(info);
     }));
 
+    // Ask the terminal what graphics it can draw BEFORE anything else owns
+    // stdin or stdout.
+    //
+    // The query writes an escape sequence and waits for the terminal to answer
+    // on stdin. Run later — from inside the render closure, as it first was —
+    // it stalls the draw for up to two seconds and races the crossterm event
+    // reader for the reply: the kitty answer begins `\x1b_G`, which crossterm
+    // parses as Alt+`_` followed by plain `G`, `i`, `=` and digits, and those
+    // reach the prompt and the transcript key map. Here there is no event
+    // reader yet and no frame in flight, so the reply can only go one place.
+    let image_view = image_view::ImageView::detect();
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -265,6 +279,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
 
     // Build app state
     let mut app = app::App::new(backend_handle);
+    app.set_image_view(image_view);
 
     // Launch-time resume (`prism resume` / `prism resume <id>`): an empty
     // string opens the session picker; a concrete id jumps straight into

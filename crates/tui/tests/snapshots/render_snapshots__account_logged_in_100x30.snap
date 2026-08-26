@@ -8,24 +8,24 @@ expression: rendered
                                                                    │
                                                                    │  (no activity yet)
                                                                    │
+   ┌ Account ─────────────────────────────────────────────────┐    │
+   │                                                          │    │
+   │  ● logged in                                             │    │
+   │                                                          │    │
+   │  user:    044d5402                                       │    │
+   │  org:     00000000                                       │    │
+   │  project: 00000000                                       │    │
+   │                                                          │    │
+   │  [l] login   [o] logout   [r] refresh                    │    │
+   │  login is non-interactive — use `prism login --token <PAT│    │
+   │                                                          │    │
+   │  Esc close                                               │    │
+   │                                                          │    │
+   │                                                          │    │
+   └──────────────────────────────────────────────────────────┘    │
                                                                    │
                                                                    │
                                                                    │
-                    ┌ Account ─────────────────────────────────────────────────┐
-                    │                                                          │
-                    │  ● logged in                                             │
-                    │                                                          │
-                    │  user:    044d5402                                       │
-                    │  org:     00000000                                       │
-                    │  project: 00000000                                       │
-                    │                                                          │
-                    │  [l] login   [o] logout   [r] refresh                    │
-                    │  login is non-interactive — use `prism login --token <PAT│
-                    │                                                          │
-                    │  Esc close                                               │
-                    │                                                          │
-                    │                                                          │
-                    └──────────────────────────────────────────────────────────┘
                                                                    │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │

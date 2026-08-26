@@ -11,17 +11,17 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
+ ┌ Open link ───────────────────────────────────────────────────┐  │
+ │                                                              │  │
+ │  Do you want to go to this website?                          │  │
+ │                                                              │  │
+ │  https://example.org/paper                                   │  │
+ │                                                              │  │
+ │  [y/↵] Show URL for manual opening   [n/Esc] Cancel          │  │
+ └──────────────────────────────────────────────────────────────┘  │
                                                                    │
                                                                    │
                                                                    │
-                  ┌ Open link ───────────────────────────────────────────────────┐
-                  │                                                              │
-                  │  Do you want to go to this website?                          │
-                  │                                                              │
-                  │  https://example.org/paper                                   │
-                  │                                                              │
-                  │  [y/↵] Show URL for manual opening   [n/Esc] Cancel          │
-                  └──────────────────────────────────────────────────────────────┘
                                                                    │
                                                                    │
                                                                    │

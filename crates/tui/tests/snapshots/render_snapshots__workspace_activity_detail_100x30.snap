@@ -4,32 +4,32 @@ assertion_line: 1358
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
-       ┌────────────────────────────────────────────────────────────────────────────────────┐
-❯ You  │ Activity — 2. tool                                                                 │
-▌ sampl│                                                                                    │" •
-       │{                                                                                   │ ✓
-  ✓ [YE│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                                              │
-       │  "elapsed_ms": 292,                                                                │
-       │  "event": "tool_result",                                                           │
-       │  "evidence_class": "screening",                                                    │
-       │  "role": "tool",                                                                   │
-       │  "success": true,                                                                  │
-       │  "text": "[YELLOW screening] sample_material: W0.3 Mo0.2 Ta0.3 Nb0.2",             │
-       │  "tool_name": "sample_material"                                                    │
-       │}                                                                                   │
-       │                                                                                    │
-       │  j/k scroll · Esc close                                                            │
-       │                                                                                    │
-       │                                                                                    │
-       │                                                                                    │
-       │                                                                                    │
-       │                                                                                    │
-       │                                                                                    │
-       │                                                                                    │
-┌ Promp│                                                                                    │
-│type a│                                                                                    │
-│      │                                                                                    │
-│      └────────────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+│ Activity — 2. tool                                             │ │ 1 tools · 1 ✓
+│                                                                │ │
+│{                                                               │ │  1. prompt "sample alloy" •
+│  "content": "W0.3 Mo0.2 Ta0.3 Nb0.2",                          │ │▸ 2. tool sample_material ✓
+│  "elapsed_ms": 292,                                            │ │
+│  "event": "tool_result",                                       │ │
+│  "evidence_class": "screening",                                │ │
+│  "role": "tool",                                               │ │
+│  "success": true,                                              │ │
+│  "text": "[YELLOW screening] sample_material: W0.3 Mo0.2 Ta0.3 │ │
+│  "tool_name": "sample_material"                                │ │
+│}                                                               │ │
+│                                                                │ │
+│  j/k scroll · Esc close                                        │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│type a message…  (press i to focus · ↵ send)                    │ │
+│                                                                │ │
+│                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit          │

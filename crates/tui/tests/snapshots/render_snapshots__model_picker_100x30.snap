@@ -4,32 +4,32 @@ assertion_line: 1130
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
-                                                                   │
-           ┌ Switch model ──────────────────────────────────────────────────────────────┐
-           │  current: gemma-4-12B-it-qat-UD-Q4_K_XL.gguf                               │
-           │> recommended — type to search all 2 models…    (1 shown)                   │
-           │                                                                            │
-           │ local                                                                      │
-           │ ● Gemma 4 12B (local)  gemma-4-12B-it-qat-UD-Q4_K_… free  ◀                │
-           │                                                                            │
-           │  filter · j/k move · ↵ switch · Esc close                                  │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-┌ Prompt ──│                                                                            │
-│ Type a me│                                                                            │
-│          └────────────────────────────────────────────────────────────────────────────┘
+┌ Switch model ──────────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+│  current: gemma-4-12B-it-qat-UD-Q4_K_XL.gguf                   │ │
+│> recommended — type to search all 2 models…    (1 shown)       │ │  (no activity yet)
+│                                                                │ │
+│ local                                                          │ │
+│ ● Gemma 4 12B (local)  gemma-4-12B-it-qat-UD-Q4_K_… free  ◀    │ │
+│                                                                │ │
+│  filter · j/k move · ↵ switch · Esc close                      │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

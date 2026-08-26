@@ -16,7 +16,7 @@ use crate::structures::{
 };
 use crate::theme;
 use crate::toast::{self, ToastKind};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use prism_provenance::EvidenceClass;
 use ratatui_textarea::TextArea;
 use serde_json::Value;
@@ -52,6 +52,14 @@ pub enum LineKind {
         elapsed_ms: u64,
         success: bool,
         evidence_class: EvidenceClass,
+        /// Figures this tool produced, so the transcript can DRAW them.
+        ///
+        /// The engine has always sent these — `ui.card`'s `data.images` carries
+        /// `{path, shown}` per figure — and the TUI read `data` only to pick an
+        /// evidence colour, discarding the rest. So every plot from every tool
+        /// outside the notebook was invisible, not because the information was
+        /// missing but because nobody looked at it.
+        image_paths: Vec<String>,
     },
     Approval {
         tool_name: String,
@@ -75,7 +83,7 @@ pub enum Focus {
 }
 
 /// Which tab of the Workspace sidebar is active.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Activity,
     Tools,
@@ -269,14 +277,7 @@ pub struct ModelPicker {
 /// view, in display order, so opening it isn't a wall of ~550 rows.
 /// IDs match the live MARC27 catalog; typing searches the full list.
 /// Kept in step with the CLI onboarding shortlist (`cli/onboarding.rs`).
-const CURATED_MODEL_IDS: &[&str] = &[
-    "anthropic/claude-sonnet-5",
-    "anthropic/claude-haiku-4.5",
-    "anthropic/claude-opus-4.7",
-    "anthropic/claude-fable-5",
-    "gpt-5.5",
-    "google/gemma-4-31b-it:free",
-];
+const CURATED_MODEL_IDS: &[&str] = &["gpt-5.5", "google/gemma-4-31b-it:free"];
 
 /// GPU picker state — the live compute-procurement catalog (palette entry
 /// `compute.gpus`). Populated from the `ui.gpu.list` notification; Enter
@@ -383,7 +384,7 @@ pub struct ConfigWindow {
     pub max_scroll: std::cell::Cell<u16>,
 }
 
-/// API-key window — enter/store provider keys (Anthropic, OpenAI, etc.).
+/// API-key window — enter/store provider keys (OpenAI, Google, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct ApiKeyWindow {
     pub open: bool,
@@ -584,8 +585,12 @@ pub struct FormPane {
     pub target: FormTarget,
 }
 
+/// Providers offered in the API-key window, in display order.
+///
+/// Anthropic is deliberately absent — PRISM does not ship it (see the policy
+/// block in `crates/core/providers.toml`). Adding it is a `~/.prism/providers
+/// .toml` entry, the same route as any other vendor PRISM has not shipped.
 pub const API_PROVIDERS: &[(&str, &str)] = &[
-    ("Anthropic", "ANTHROPIC_API_KEY"),
     ("OpenAI", "OPENAI_API_KEY"),
     ("Google", "GOOGLE_API_KEY"),
     ("Mistral", "MISTRAL_API_KEY"),
@@ -597,7 +602,6 @@ pub struct App {
     pub messages: Vec<ChatLine>,
     /// Maximum number of messages to keep in memory. Older messages
     /// are dropped (the backend keeps the full transcript for context).
-    pub max_messages: usize,
     pub input: TextArea<'static>,
     pub focus: Focus,
     pub scroll_offset: u16,
@@ -703,6 +707,41 @@ pub struct App {
     /// (content height − viewport). Lets key handlers clamp/anchor scrolling
     /// without knowing the terminal size.
     pub view_max_scroll: std::cell::Cell<u16>,
+    /// The scroll offset the renderer ACTUALLY drew last frame.
+    ///
+    /// `scroll_offset` is what the reader asked for; this is what appeared,
+    /// which is a different number whenever auto-follow or the user-turn
+    /// anchor overrides it. Key handlers resume from what the reader can see,
+    /// so releasing an override continues from that spot instead of teleporting
+    /// to wherever `scroll_offset` was last left.
+    pub view_scroll: std::cell::Cell<u16>,
+    /// Put the newest user turn at the TOP of the viewport instead of pinning
+    /// to the last line.
+    ///
+    /// Auto-follow pins `scroll_offset` to `max_scroll`, so a reply longer than
+    /// the viewport pushed the user's own message off the top and the chat
+    /// appeared to contain only PRISM's half of it. The message was always
+    /// there — `push_user` is unconditional — it was simply above the fold.
+    ///
+    /// Set when a turn is submitted and cleared as soon as the reader scrolls,
+    /// because a manual scroll is a statement about where they want to be.
+    pub anchor_user_turn: std::cell::Cell<bool>,
+    /// What was drawn where, refilled by the renderer each frame.
+    ///
+    /// `RefCell` because `draw` takes `&App` — the renderer records regions as
+    /// it paints, and mouse handling reads them back on the next event.
+    pub hit_map: std::cell::RefCell<crate::hit_map::HitMap>,
+    /// What the pointer is over, or `None`. Drives hover; recomputed on move.
+    pub hovered: Option<crate::hit_map::HitTarget>,
+    /// Terminal graphics capability, discovered once and then reused.
+    ///
+    /// `ImageView::detect` talks to the terminal with escape sequences, so it
+    /// must not run per frame — it would both stall the draw and interleave its
+    /// query with the frame being written. Lazily initialised rather than built
+    /// in `new()` because the tests construct `App` constantly and none of them
+    /// have a terminal to ask; the query fails there and falls back to
+    /// halfblocks, which is a working floor rather than an error.
+    image_view: std::cell::OnceCell<crate::image_view::ImageView>,
     /// Transient overlay modal (help / cost / model), dismissed by any key.
     pub modal: Option<Modal>,
     /// Optional session goal shown in the Workspace sidebar (set via /goal).
@@ -783,7 +822,6 @@ impl App {
             status_text: "Ready".to_string(),
             tool_count: 0,
             prism_version: String::new(),
-            max_messages: 500,
             tokens_received: 0,
             output_bytes: 0,
             first_token_time: None,
@@ -817,6 +855,11 @@ impl App {
             structure_list_rpc_id: None,
             structure_fetch_rpc_id: None,
             view_max_scroll: std::cell::Cell::new(0),
+            view_scroll: std::cell::Cell::new(0),
+            anchor_user_turn: std::cell::Cell::new(false),
+            hit_map: std::cell::RefCell::new(crate::hit_map::HitMap::default()),
+            hovered: None,
+            image_view: std::cell::OnceCell::new(),
             modal: None,
             goal: None,
             palette: CommandPalette::default(),
@@ -1077,8 +1120,81 @@ impl App {
         match ev.kind {
             MouseEventKind::ScrollUp => self.mouse_scroll(-3),
             MouseEventKind::ScrollDown => self.mouse_scroll(3),
+            // `ev.column`/`ev.row` used to be read nowhere in the crate: every
+            // move, press and drag arrived and was dropped, so the pointer
+            // could not refer to anything. Both arms below answer the same
+            // question — what is under the cursor — from the map the renderer
+            // fills.
+            MouseEventKind::Moved => self.pointer_moved(ev.column, ev.row),
+            MouseEventKind::Down(MouseButton::Left) => self.pointer_pressed(ev.column, ev.row),
             _ => {}
         }
+    }
+
+    /// Track what the pointer is over.
+    ///
+    /// Only the target is stored, never anything fetched for it: what a
+    /// reference points at is resolved when it is opened, not when the pointer
+    /// passes over it.
+    pub fn pointer_moved(&mut self, column: u16, row: u16) {
+        let target = self.hit_map.borrow().at(column, row).cloned();
+        self.hovered = target;
+    }
+
+    /// Act on a click.
+    ///
+    /// A click on a workspace tab or row selects it — the same state the
+    /// keyboard sets, so pointing and typing cannot disagree about what is
+    /// selected. A click on empty space clears hover rather than selecting
+    /// something arbitrary.
+    pub fn pointer_pressed(&mut self, column: u16, row: u16) {
+        let target = self.hit_map.borrow().at(column, row).cloned();
+        match target {
+            Some(crate::hit_map::HitTarget::WorkspaceTab(tab)) => {
+                self.workspace_tab = tab;
+                self.workspace_selected = 0;
+                self.workspace_expanded = false;
+                self.focus = Focus::Workspace;
+            }
+            Some(crate::hit_map::HitTarget::WorkspaceRow { tab, index }) => {
+                self.workspace_tab = tab;
+                self.workspace_selected = index;
+                self.focus = Focus::Workspace;
+            }
+            _ => {}
+        }
+        self.hovered = target;
+    }
+
+    /// True when an overlay covers the transcript.
+    ///
+    /// Mirrors the chain in `render::draw`; `home` is included because it
+    /// takes the content column, which is where the transcript is. Anything
+    /// that decides based on "can the reader see the transcript" asks here,
+    /// so the answer cannot drift between two hand-written lists.
+    #[must_use]
+    pub fn overlay_open(&self) -> bool {
+        self.approval_pending.is_some()
+            || self.palette.open
+            || self.form.is_some()
+            || self.knowledge.open
+            || self.notebook.open
+            || self.theme_picker.open
+            || self.which_key.open
+            || self.link_picker.open
+            || self.gh.open
+            || self.model_picker.open
+            || self.gpu_picker.open
+            || self.node_picker.open
+            || self.account.open
+            || self.session_picker.open
+            || self.view.open
+            || self.tools_window.open
+            || self.status_window.open
+            || self.config_window.open
+            || self.apikey_window.open
+            || self.home.open
+            || self.modal.is_some()
     }
 
     /// Route a mouse-wheel delta to the scrollable surface that is active:
@@ -1089,6 +1205,14 @@ impl App {
             let max = self.whichkey_max_scroll.get();
             let next = (self.which_key.scroll as i32).saturating_add(delta);
             self.which_key.scroll = next.clamp(0, max as i32) as u16;
+            return;
+        }
+        // Any other overlay covers the transcript, so scrolling it moves
+        // something the reader cannot see and the wheel reads as broken.
+        // Do nothing instead of moving the wrong surface: a pane that does
+        // not scroll with the wheel is honest, one that scrolls a hidden
+        // pane is not.
+        if self.overlay_open() {
             return;
         }
         if delta >= 0 {
@@ -1193,11 +1317,19 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.scroll_up(1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_down(1),
+            // Home / End are the reader taking over just as much as j/k are,
+            // so they release the user-turn anchor too. Without this, `G`
+            // silently did NOTHING: the anchor outranks `auto_scroll` in
+            // `draw_chat`, so jump-to-bottom set a flag the renderer then
+            // ignored. Found by driving the real binary, not by a test —
+            // the anchor tests only covered j/k.
             KeyCode::Char('g') | KeyCode::Home => {
+                self.anchor_user_turn.set(false);
                 self.auto_scroll = false;
                 self.scroll_offset = 0;
             }
             KeyCode::Char('G') | KeyCode::End => {
+                self.anchor_user_turn.set(false);
                 self.auto_scroll = true;
             }
             KeyCode::Char('i') | KeyCode::Enter => {
@@ -1222,19 +1354,31 @@ impl App {
         }
     }
 
+    /// Take over scrolling from whatever was placing the view.
+    ///
+    /// Auto-follow and the user-turn anchor both draw at an offset the reader
+    /// never typed, leaving `scroll_offset` stale. Resuming from the stale
+    /// value jumped the transcript somewhere else entirely on the first key —
+    /// most visibly to the bottom, because leaving auto-follow used to seed
+    /// from `view_max_scroll`. Seed from what was actually drawn instead, so
+    /// the first key moves one line from where the reader is looking.
+    fn take_scroll_control(&mut self) {
+        if self.auto_scroll || self.anchor_user_turn.get() {
+            self.scroll_offset = self.view_scroll.get();
+        }
+        self.anchor_user_turn.set(false);
+        self.auto_scroll = false;
+    }
+
     /// Scroll the transcript up by `n` lines (toward older messages).
     fn scroll_up(&mut self, n: u16) {
-        if self.auto_scroll {
-            // Leaving auto-follow: anchor at the current bottom first so the
-            // first PageUp lands one page above the newest line, not the top.
-            self.scroll_offset = self.view_max_scroll.get();
-            self.auto_scroll = false;
-        }
+        self.take_scroll_control();
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
 
     /// Scroll the transcript down by `n` lines; re-enable auto-follow at bottom.
     fn scroll_down(&mut self, n: u16) {
+        self.take_scroll_control();
         let max = self.view_max_scroll.get();
         self.scroll_offset = self.scroll_offset.saturating_add(n).min(max);
         if self.scroll_offset >= max {
@@ -4536,6 +4680,21 @@ impl App {
                 let clean_name = sanitize_for_render(&tool_name);
                 let clean_content =
                     sanitize_for_render(&crate::json_view::summarize_tool_json(&content));
+                // Read the figures the card already carries. Absent, malformed
+                // and empty all collapse to "no figures" — a tool that produced
+                // none is the normal case, not an error.
+                let image_paths: Vec<String> = data
+                    .as_ref()
+                    .and_then(|d| d.get("images"))
+                    .and_then(|v| v.as_array())
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(|entry| entry.get("path").and_then(|p| p.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let elapsed = elapsed_ms.unwrap_or(0);
                 let text = format!("{token} {clean_name}: {clean_content}");
                 if !success {
@@ -4554,6 +4713,7 @@ impl App {
                             elapsed_ms: elapsed,
                             success,
                             evidence_class,
+                            image_paths,
                         },
                     });
                 }
@@ -4852,20 +5012,51 @@ impl App {
 
     /// Append a message and trim if over the max.
     fn push_message(&mut self, line: ChatLine) {
+        // Every message is kept. There used to be a 500-entry cap here that
+        // silently `remove(0)`d the oldest, so a long session could not be
+        // scrolled back to its start and NOTHING said so — a truncated
+        // transcript rendered identically to a complete one. It also took the
+        // Workspace Activity feed with it, since that is derived from this
+        // same buffer, which left no surface where the lost turns survived.
+        //
+        // The cost this bought was render scope, not memory: `draw_chat`
+        // rebuilds every line each frame. That is the thing to window if it
+        // ever bites — bounding what is DRAWN is free, bounding what is KEPT
+        // destroys the reader's history.
         self.messages.push(line);
-        self.trim_messages();
     }
 
-    /// Drop oldest messages when over the max. Keeps a sliding window
-    /// of the most recent messages. The backend keeps the full
-    /// transcript for context — the TUI only needs the visible portion.
-    fn trim_messages(&mut self) {
-        while self.messages.len() > self.max_messages {
-            self.messages.remove(0);
-        }
+    /// Install the graphics capability discovered at startup.
+    ///
+    /// Called once by `run()` before the terminal is set up. Anything that
+    /// reaches `image_view()` without this — every test, and any caller that
+    /// forgets — falls back to halfblocks rather than querying a terminal that
+    /// may not be there to answer.
+    pub fn set_image_view(&mut self, view: crate::image_view::ImageView) {
+        // `set` fails only if something already initialised the cell, which
+        // would mean a frame was drawn before startup finished. Keep the one
+        // that was already handed out rather than swapping it mid-flight.
+        let _ = self.image_view.set(view);
     }
 
+    /// Terminal graphics.
+    ///
+    /// Detection happens in `run()`; this only falls back when it never ran,
+    /// which is every test and any headless caller. Halfblocks need no
+    /// protocol support and no query, so the fallback neither stalls nor
+    /// writes to the terminal.
+    pub fn image_view(&self) -> &crate::image_view::ImageView {
+        self.image_view
+            .get_or_init(crate::image_view::ImageView::halfblocks)
+    }
+
+    /// Add the reader's own turn and anchor the view to it.
+    ///
+    /// Anchoring here rather than in the renderer keeps the rule where the
+    /// event is: a new user turn is the only thing that should move the
+    /// viewport on its own.
     pub fn push_user(&mut self, text: &str) {
+        self.anchor_user_turn.set(true);
         let clean = sanitize_for_render(text);
         self.push_message(ChatLine {
             role: Role::User,
@@ -5050,6 +5241,7 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
             elapsed_ms,
             success,
             evidence_class,
+            ..
         } => {
             v["event"] = "tool_result".into();
             v["tool_name"] = tool_name.clone().into();

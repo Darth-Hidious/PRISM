@@ -6,27 +6,27 @@ expression: rendered
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Too Fil Obj Str Art
                                                                    │
-                                                                   │  (no activity yet)
+┌ Commands ──────────────────────────────────────────────────────┐ │  (no activity yet)
+│> type to search…                                               │ │
+│                                                                │ │
+│  ── SCIENCE ────────────────────────────────────────────────── │ │
+│    Deep research           Multi-step research with c… palette │ │
+│    Knowledge               Search & ingest — one pane  palette │ │
+│    Material properties     Structure, lattice, moduli… palette │ │
+│    Nodes                   See your connected nodes    palette │ │
+│    Notebook                Python notebook — persiste… palette │ │
+│    Predict properties      ML prediction for a compos… palette │ │
+│    Procure GPU compute     Live GPU catalog with pric… palette │ │
+│    Run simulation          Relax/MD via MACE + pyiron  palette │ │
+│    Browse web page         Read a URL as text (HTTP f… palette │ │
+│    Goal status             Check a discovery campaign… palette │ │
+│    List goals              Discovery campaigns on thi… palette │ │
+│  … 57 more — ↓ to scroll or type to filter                     │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
                                                                    │
                                                                    │
-               ┌ Commands ──────────────────────────────────────────────────────────┐
-               │> type to search…                                                   │
-               │                                                                    │
-               │  ── SCIENCE ────────────────────────────────────────────────────── │
-               │    Deep research           Multi-step research with citat… palette │
-               │    Knowledge               Search & ingest — one pane      palette │
-               │    Material properties     Structure, lattice, moduli, ba… palette │
-               │    Nodes                   See your connected nodes        palette │
-               │    Notebook                Python notebook — persistent k… palette │
-               │    Predict properties      ML prediction for a composition palette │
-               │    Procure GPU compute     Live GPU catalog with prices    palette │
-               │    Run simulation          Relax/MD via MACE + pyiron      palette │
-               │    Browse web page         Read a URL as text (HTTP fetch… palette │
-               │    Goal status             Check a discovery campaign's p… palette │
-               │    List goals              Discovery campaigns on this no… palette │
-               │  … 57 more — ↓ to scroll or type to filter                         │
-               │                                                                    │
-               └────────────────────────────────────────────────────────────────────┘
+                                                                   │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
 │                                                                │ │

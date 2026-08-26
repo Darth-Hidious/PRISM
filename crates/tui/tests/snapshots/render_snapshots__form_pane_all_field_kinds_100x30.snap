@@ -10,19 +10,19 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
+ ┌ Deep research ───────────────────────────────────────────────┐  │
+ │                                                              │  │
+ │  ▸ Question          type…                                   │  │
+ │    Depth             ‹ 1 ›  (0–5)  0 = local-only · 1+ = web │  │
+ │    Knowledge Graph   [x] on                                  │  │
+ │    Mesh/partner data [ ] off  (advisory)                     │  │
+ │    Transport         ‹ stdio ›                               │  │
+ │                                                              │  │
+ │  ↑↓ move · Space/←→ adjust · ↵ launch · Esc                  │  │
+ └──────────────────────────────────────────────────────────────┘  │
                                                                    │
                                                                    │
                                                                    │
-                  ┌ Deep research ───────────────────────────────────────────────┐
-                  │                                                              │
-                  │  ▸ Question          type…                                   │
-                  │    Depth             ‹ 1 ›  (0–5)  0 = local-only · 1+ = web │
-                  │    Knowledge Graph   [x] on                                  │
-                  │    Mesh/partner data [ ] off  (advisory)                     │
-                  │    Transport         ‹ stdio ›                               │
-                  │                                                              │
-                  │  ↑↓ move · Space/←→ adjust · ↵ launch · Esc                  │
-                  └──────────────────────────────────────────────────────────────┘
                                                                    │
                                                                    │
                                                                    │

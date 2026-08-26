@@ -1,23 +1,22 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1749
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
+· PRISM ready                                                      │ Act Too Fil Obj [Str] Art
                                                                    │
-                                                                   │  (no activity yet)
-                                                                   │
-                                                                   │
-                                                                   │
+                                                                   │  Structures not connected
+                                                                   │  Method not found: workspace.s…
                                                                    │
                                                                    │
- ┌ Set goal ────────────────────────────────────────────────────┐  │
- │                                                              │  │
- │  ▸ Standing goal     map the NiTi phase diagram  sent to the │  │
- │agent each turn; empty clears                                 │  │
- │                                                              │  │
- └──────────────────────────────────────────────────────────────┘  │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
+                                                                   │
                                                                    │
                                                                    │
                                                                    │
@@ -28,8 +27,8 @@ expression: rendered
                                                                    │
                                                                    │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
-│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│type a message…  (press i to focus · ↵ send)                    │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │
+  Ready  model: fake-backend   [WORKSPACE]    Ctrl-C quit          │

@@ -11,6 +11,7 @@ use crate::app::{
 use crate::artifact::{ArtifactPromotion, ArtifactStoreState, format_bytes};
 use crate::command;
 use crate::gh;
+use crate::hit_map::HitTarget;
 use crate::keymap;
 use crate::markdown;
 use crate::structures::{StructuresStoreState, UNKNOWN};
@@ -25,16 +26,23 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOri
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
-pub fn draw(f: &mut Frame, app: &App) {
-    let t = app.theme();
-    let area = f.area();
+/// The frame split every widget agrees on.
+///
+/// One source of truth for who owns which cells. `draw` renders into it and
+/// [`overlay_bounds`] reads it, so an overlay can never disagree with the
+/// widget whose rows it would otherwise land on.
+struct FrameLayout {
+    /// Left content column (the whole frame when the sidebar is hidden).
+    content: Rect,
+    header: Rect,
+    transcript: Rect,
+    prompt: Rect,
+    footer: Rect,
+    /// Right-hand Workspace panel, or `None` on a narrow terminal.
+    sidebar: Option<Rect>,
+}
 
-    // Paint the whole screen `background` (opencode paints its background).
-    f.render_widget(
-        Block::default().style(Style::default().bg(t.overlay_bg)),
-        area,
-    );
-
+fn frame_layout(area: Rect) -> FrameLayout {
     // Columns: left content column + right Workspace panel (opencode-style).
     // Below the threshold the sidebar is hidden entirely — a clipped sidebar
     // is worse than none, and the content column needs the room.
@@ -71,12 +79,79 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(cols[0]);
 
-    draw_header(f, app, chunks[0]);
-    draw_chat(f, app, chunks[1]);
-    draw_prompt(f, app, chunks[2]);
-    draw_footer(f, app, chunks[3]);
-    if sidebar_w > 0 {
-        draw_workspace(f, app, cols[1]);
+    FrameLayout {
+        content: cols[0],
+        header: chunks[0],
+        transcript: chunks[1],
+        prompt: chunks[2],
+        footer: chunks[3],
+        sidebar: (sidebar_w > 0).then(|| cols[1]),
+    }
+}
+
+/// The only region an overlay may claim: the content column between the
+/// header bar and the prompt box — exactly the rows the transcript owns.
+///
+/// Every overlay is drawn *after* the header, prompt, footer and sidebar, and
+/// each one starts with `Clear`. An overlay centred on the whole frame
+/// therefore wipes cells another widget already painted: at 100x30 the Tools
+/// pane left the prompt box as the fragments `┌ Prompt` / `│ Type a` on the
+/// left edge and cut the sidebar's border out of every row it covered.
+/// Centring inside these bounds instead cannot reach either.
+fn overlay_bounds(area: Rect) -> Rect {
+    let l = frame_layout(area);
+    Rect::new(
+        l.content.x,
+        l.transcript.y,
+        l.content.width,
+        l.transcript.height,
+    )
+}
+
+/// The share of the screen an overlay asks for, cropped to the region
+/// overlays may own and centred in it.
+///
+/// Cropping rather than re-taking the percentage inside the bounds keeps each
+/// overlay as large as it has always been wherever there is room — the
+/// notebook approval popup has to show every line of the cell it is asking
+/// you to run, and 72% of the content column is not 72% of the screen.
+fn overlay_area(f: &Frame, percent_x: u16, percent_y: u16) -> Rect {
+    let bounds = overlay_bounds(f.area());
+    let want = centered_rect(percent_x, percent_y, f.area());
+    let width = want.width.min(bounds.width);
+    let height = want.height.min(bounds.height);
+    Rect::new(
+        bounds.x + (bounds.width - width) / 2,
+        bounds.y + (bounds.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+pub fn draw(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = f.area();
+
+    // Last frame's regions describe a layout that no longer exists — scroll
+    // offset, terminal size and which overlay is open all move things — so the
+    // map is emptied here and refilled as this frame paints. Overlays draw
+    // last and are looked up first, so a popup answers for the cells it covers.
+    app.hit_map.borrow_mut().clear();
+
+    // Paint the whole screen `background` (opencode paints its background).
+    f.render_widget(
+        Block::default().style(Style::default().bg(t.overlay_bg)),
+        area,
+    );
+
+    let layout = frame_layout(area);
+
+    draw_header(f, app, layout.header);
+    draw_chat(f, app, layout.transcript);
+    draw_prompt(f, app, layout.prompt);
+    draw_footer(f, app, layout.footer);
+    if let Some(sidebar) = layout.sidebar {
+        draw_workspace(f, app, sidebar);
     }
 
     // Overlays: approval popup (safety-critical) > command palette >
@@ -123,8 +198,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         // The home panel lives in the content column so it shares an origin
         // and a width with the prompt box and footer stacked around it —
         // never over the workspace sidebar column.
-        let home_bounds = Rect::new(cols[0].x, chunks[1].y, cols[0].width, chunks[1].height);
-        draw_home(f, app, home_bounds);
+        draw_home(f, app, overlay_bounds(area));
     } else if let Some(modal) = app.modal {
         draw_modal(f, modal, app);
     }
@@ -176,7 +250,19 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 //
 // Transient, non-blocking notifications (opencode `ui/toast`). Rendered
 // last so they float over every overlay, but they never intercept keys.
-// Stack at the bottom-center, just above the status bar.
+// Stack at the bottom-center of the TRANSCRIPT, not of the frame.
+//
+// The frame was the bug. Measuring from `f.area()` and backing off a fixed
+// four rows put the toast ON the prompt box at the shipped 100x30: the
+// committed `toast_visible_100x30` snapshot read
+// `│ Type a message... (Ente▌ theme: forest` — the placeholder cut mid-word,
+// the prompt's right border gone, and the sidebar divider gone with it. The
+// magic `4` was standing in for "however tall the prompt and status bar
+// happen to be", which is exactly the number `frame_layout` already knows.
+//
+// `overlay_bounds` is that answer, and it is the same region every other
+// overlay was moved onto — a toast is not a special case, it is the last
+// widget that had its own idea of where the screen ends.
 
 fn draw_toasts(f: &mut Frame, app: &App) {
     let t = app.theme();
@@ -185,11 +271,15 @@ fn draw_toasts(f: &mut Frame, app: &App) {
     if live.is_empty() {
         return;
     }
-    let area = f.area();
-    let width: u16 = 50;
+    let bounds = overlay_bounds(f.area());
     let count = live.len().min(5) as u16;
-    let x = area.width.saturating_sub(width) / 2;
-    let y = area.height.saturating_sub(4).saturating_sub(count);
+    // Narrow terminals hide the sidebar, so `bounds` can be narrower than the
+    // toast's natural width; clamp rather than overflow the content column.
+    let width = 50.min(bounds.width);
+    let x = bounds.x + bounds.width.saturating_sub(width) / 2;
+    // Bottom of the transcript. No fixed offset: `bounds` already ends where
+    // the prompt begins.
+    let y = bounds.y + bounds.height.saturating_sub(count);
     let rect = Rect::new(x, y, width, count);
     f.render_widget(Clear, rect);
 
@@ -207,7 +297,7 @@ fn draw_toasts(f: &mut Frame, app: &App) {
                 Span::styled("▌", Style::default().fg(color)),
                 Span::raw(" "),
                 Span::styled(
-                    clip(&toast.message, width as usize - 3),
+                    clip(&toast.message, (width as usize).saturating_sub(3)),
                     Style::default().fg(t.text),
                 ),
             ])
@@ -216,12 +306,23 @@ fn draw_toasts(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), rect);
 }
 
+/// Rows reserved for one inline figure in the transcript.
+const FIGURE_ROWS: u16 = 12;
+
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let mut lines: Vec<Line> = Vec::new();
     let mut thinking_shown = false;
+    // Index in `lines` of the newest `❯ You` header, for the scroll anchor.
+    let mut last_user_line: Option<usize> = None;
+    // Figures to paint over reserved blank rows, as (index in `lines`, path).
+    let mut inline_figures: Vec<(usize, String)> = Vec::new();
+    // Where each message starts, so a click or a selection can say WHICH
+    // message it landed in — the thing that makes "explain this line" possible.
+    let mut message_lines: Vec<(usize, usize)> = Vec::new();
 
     for (idx, msg) in app.messages.iter().enumerate() {
+        message_lines.push((lines.len(), idx));
         // Thinking tokens: show collapsed indicator or full text
         if matches!(msg.kind, LineKind::Thinking) {
             if app.thinking_expanded {
@@ -260,6 +361,9 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         match (&msg.role, &msg.kind) {
             // ── User turn: labeled header + colored gutter bar ──────
             (Role::User, LineKind::Text) => {
+                // Recorded BEFORE the header is pushed, so the anchor lands on
+                // the header row itself rather than the first body row.
+                last_user_line = Some(lines.len());
                 lines.push(Line::from(Span::styled(
                     "❯ You",
                     Style::default().fg(t.user).add_modifier(Modifier::BOLD),
@@ -304,36 +408,76 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     LineKind::Error(_) => Some(EvidenceClass::Indeterminate),
                     _ => None,
                 };
-                for (i, line_text) in msg.text.lines().enumerate() {
-                    if i == 0 {
-                        let mut spans = vec![
-                            Span::raw("  "),
-                            Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
-                        ];
-                        if let Some(evidence_class) = evidence_class {
-                            let token = evidence_token(evidence_class);
-                            spans.push(Span::styled(
-                                token.clone(),
-                                Style::default()
-                                    .fg(evidence_color(evidence_class, t))
-                                    .add_modifier(Modifier::BOLD),
-                            ));
-                            spans.push(Span::styled(
-                                line_text
-                                    .strip_prefix(&token)
-                                    .unwrap_or(line_text)
-                                    .to_string(),
-                                style,
-                            ));
-                        } else {
-                            spans.push(Span::styled(line_text.to_string(), style));
-                        }
-                        lines.push(Line::from(spans));
+                // A finished RESULT is prose the reader studies, so its body
+                // goes through the SAME markdown renderer as PRISM's own
+                // replies. It never did: `markdown_lines` was called from
+                // exactly one place — the assistant branch a few lines above —
+                // so a table a tool emitted arrived as raw `|` pipes and `$x^2$`
+                // as literal dollar signs, while identical content written by
+                // PRISM rendered as a bordered, aligned table. Same bytes, two
+                // different qualities of display, decided by who said it.
+                //
+                // Progress and error lines are NOT routed through it: they are
+                // chrome, they carry their own colour (dim / red), and markdown
+                // styling would override the very distinction that keeps the
+                // eye on the result instead of the noise.
+                let render_body_as_markdown =
+                    matches!(kind, LineKind::ToolResult { success: true, .. });
+                let mut body = msg.text.lines();
+                if let Some(line_text) = body.next() {
+                    let mut spans = vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
+                    ];
+                    if let Some(evidence_class) = evidence_class {
+                        let token = evidence_token(evidence_class);
+                        spans.push(Span::styled(
+                            token.clone(),
+                            Style::default()
+                                .fg(evidence_color(evidence_class, t))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        spans.push(Span::styled(
+                            line_text
+                                .strip_prefix(&token)
+                                .unwrap_or(line_text)
+                                .to_string(),
+                            style,
+                        ));
                     } else {
+                        spans.push(Span::styled(line_text.to_string(), style));
+                    }
+                    lines.push(Line::from(spans));
+                }
+                let rest: Vec<&str> = body.collect();
+                if render_body_as_markdown && !rest.join("").trim().is_empty() {
+                    // Width is reduced by the 4-column indent so a table sizes
+                    // its columns to the room it will actually occupy.
+                    for md in
+                        markdown::markdown_lines(&rest.join("\n"), t, area.width.saturating_sub(4))
+                    {
+                        let mut spans = vec![Span::raw("    ")];
+                        spans.extend(md.spans);
+                        lines.push(Line::from(spans));
+                    }
+                } else {
+                    for line_text in rest {
                         lines.push(Line::from(vec![
                             Span::raw("    "),
                             Span::styled(line_text.to_string(), style),
                         ]));
+                    }
+                }
+                // Reserve room for each figure and remember where it goes. The
+                // rows are blank on purpose: the transcript is one wrapped
+                // `Paragraph`, so a picture cannot be a `Line`. It is painted
+                // over these rows afterwards, once the scroll offset is known.
+                if let LineKind::ToolResult { image_paths, .. } = kind {
+                    for path in image_paths {
+                        inline_figures.push((lines.len(), path.clone()));
+                        for _ in 0..FIGURE_ROWS {
+                            lines.push(Line::raw(""));
+                        }
                     }
                 }
             }
@@ -417,19 +561,160 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // unwrapped `lines.len()` left the final wrapped rows unreachable and
     // drifted the scrollbar off-axis.
     let viewport = area.height;
+    // Where the newest user turn sits, in WRAPPED rows — the same unit
+    // `Paragraph::scroll` counts in, measured with the same wrap settings.
+    // Counting raw `Line`s here would drift the moment any message wrapped.
+    // Computed before `lines` is moved into the paragraph below.
+    // Wrapped-row offset of each reserved figure, measured the same way the
+    // transcript is. Raw line indices would drift the moment anything above a
+    // figure wrapped, painting the picture over someone else's text.
+    //
+    // Measured in ONE accumulating pass, not one pass per mark. Wrapping is
+    // additive under `Wrap { trim: false }` — a prefix and its remainder
+    // measure the same as the whole (asserted by `wrapping_is_additive`) — so
+    // the chunks between marks can simply be summed. Measuring each mark's
+    // full prefix separately re-wrapped the entire transcript once per figure,
+    // every frame, over a transcript that is never trimmed.
+    //
+    // Rows accumulate in u32: `as u16` on a longer transcript truncates
+    // modulo 65,536, which does not clamp the view to the end — it teleports
+    // it into the middle. Saturating keeps the view at the last reachable row.
+    //
+    // Message starts join the same pass. Adding marks costs almost nothing:
+    // the chunks are disjoint, so cloning them all sums to one clone of the
+    // whole transcript however finely it is cut.
+    let mut marks: Vec<usize> = inline_figures.iter().map(|(idx, _)| *idx).collect();
+    marks.extend(message_lines.iter().map(|(line, _)| *line));
+    let anchor_idx = if app.anchor_user_turn.get() {
+        last_user_line
+    } else {
+        None
+    };
+    if let Some(idx) = anchor_idx {
+        marks.push(idx);
+    }
+    for m in &mut marks {
+        *m = (*m).min(lines.len());
+    }
+    marks.sort_unstable();
+    marks.dedup();
+
+    let measure = |chunk: &[Line<'_>]| -> u32 {
+        Paragraph::new(chunk.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(area.width) as u32
+    };
+    let mut rows_at: Vec<(usize, u32)> = Vec::with_capacity(marks.len());
+    let mut acc: u32 = 0;
+    let mut prev = 0usize;
+    for idx in marks {
+        if idx > prev {
+            acc = acc.saturating_add(measure(&lines[prev..idx]));
+            prev = idx;
+        }
+        rows_at.push((idx, acc));
+    }
+    let line_count = lines.len();
+    let rows_for = |idx: usize| -> u16 {
+        let idx = idx.min(line_count);
+        rows_at
+            .iter()
+            .find(|(at, _)| *at == idx)
+            .map(|(_, rows)| (*rows).min(u16::MAX as u32) as u16)
+            .unwrap_or(0)
+    };
+    let figure_rows: Vec<(u16, String)> = inline_figures
+        .iter()
+        .map(|(idx, path)| (rows_for(*idx), path.clone()))
+        .collect();
+    let anchor_rows = anchor_idx.map(rows_for);
+    // The tail is only measured when the pass above already ran; with no marks
+    // the paragraph measures itself below without cloning anything.
+    let tail_rows = (prev > 0).then(|| acc.saturating_add(measure(&lines[prev..])));
+
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(t.overlay_bg))
         .wrap(Wrap { trim: false });
-    let content_lines = paragraph.line_count(area.width) as u16;
+    let content_lines = tail_rows
+        .unwrap_or_else(|| paragraph.line_count(area.width) as u32)
+        .min(u16::MAX as u32) as u16;
     let max_scroll = content_lines.saturating_sub(viewport);
     app.view_max_scroll.set(max_scroll);
-    let effective_scroll = if app.auto_scroll {
+    let effective_scroll = if let Some(rows) = anchor_rows {
+        // The reader's own turn goes to the top and the reply fills downward.
+        // Clamped to `max_scroll` so a turn near the end of a short transcript
+        // does not try to scroll past the final row.
+        rows.min(max_scroll)
+    } else if app.auto_scroll {
         max_scroll
     } else {
         crate::app::clamp_scroll(app.scroll_offset, content_lines, viewport)
     };
 
+    // What was actually drawn, so a key handler taking over from auto-follow or
+    // the anchor resumes from the row the reader is looking at.
+    app.view_scroll.set(effective_scroll);
+
+    // Which message occupies which rows on screen. A message owns every row
+    // from its own first line down to the next message's, so pointing anywhere
+    // inside a reply — not only at its first line — identifies that reply.
+    {
+        let mut map = app.hit_map.borrow_mut();
+        for (n, (line, index)) in message_lines.iter().enumerate() {
+            let start = rows_for(*line);
+            let end = message_lines
+                .get(n + 1)
+                .map(|(next, _)| rows_for(*next))
+                .unwrap_or(content_lines);
+            // Clip to the visible window; a message scrolled off screen has no
+            // cells and must not answer for anyone else's.
+            let top = start.max(effective_scroll);
+            let bottom = end.min(effective_scroll.saturating_add(area.height));
+            if bottom <= top {
+                continue;
+            }
+            map.push(
+                Rect::new(
+                    area.x,
+                    area.y + (top - effective_scroll),
+                    area.width,
+                    bottom - top,
+                ),
+                HitTarget::TranscriptMessage { index: *index },
+            );
+        }
+    }
+
     f.render_widget(paragraph.scroll((effective_scroll, 0)), area);
+
+    // Paint figures over their reserved rows. A figure straddling either edge
+    // draws the part that fits, the same way at the top as at the bottom —
+    // skipping the top case left up to 11 reserved rows blank, so the picture
+    // blinked out and popped back while scrolling past it.
+    for (row, path) in &figure_rows {
+        let (offset, hidden) = match row.checked_sub(effective_scroll) {
+            Some(offset) => (offset, 0),
+            // Top edge is above the viewport: how much of the figure is gone.
+            None => (0, effective_scroll - row),
+        };
+        if offset >= area.height || hidden >= FIGURE_ROWS {
+            continue;
+        }
+        let height = (FIGURE_ROWS - hidden).min(area.height - offset);
+        let rect = Rect::new(
+            area.x + 4,
+            area.y + offset,
+            area.width.saturating_sub(4),
+            height,
+        );
+        if let Err(err) = app.image_view().draw(f, rect, path) {
+            // Never a blank gap: reserved rows that could not be filled say why.
+            f.render_widget(
+                Paragraph::new(err.line()).style(Style::default().fg(Color::Red)),
+                rect,
+            );
+        }
+    }
 
     // Scrollbar whenever the transcript overflows, so scrolling is discoverable.
     //
@@ -637,7 +922,9 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         " Workspace",
         Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
     )));
-    lines.push(workspace_tabs_line(app, t, w));
+    let (tabs_line, tab_spans) = workspace_tabs_line(app, t, w);
+    let tabs_line_index = lines.len();
+    lines.push(tabs_line);
     if let Some(stats) = workspace_stats_line(app, t) {
         lines.push(stats);
     }
@@ -649,18 +936,86 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::raw(""));
 
+    // Which entry each line belongs to, filled as the tab's rows are built.
+    // Recorded at the source rather than reconstructed afterwards: the
+    // builders skip, clip and expand entries, so counting lines from outside
+    // would drift the moment any of them changed.
+    let mut rows: PanelRows = Vec::new();
     match app.workspace_tab {
-        WorkspaceTab::Tools => build_tools_lines(app, t, &mut lines, w),
-        WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, w),
-        WorkspaceTab::Files => build_files_lines(app, t, &mut lines, w),
-        WorkspaceTab::Objects => build_objects_lines(app, t, &mut lines, w),
+        WorkspaceTab::Tools => build_tools_lines(app, t, &mut lines, &mut rows, w),
+        WorkspaceTab::Activity => build_activity_lines(app, t, &mut lines, &mut rows, w),
+        WorkspaceTab::Files => build_files_lines(app, t, &mut lines, &mut rows, w),
+        WorkspaceTab::Objects => build_objects_lines(app, t, &mut lines, &mut rows, w),
         WorkspaceTab::Structures => {
             let available = usize::from(inner.height).saturating_sub(lines.len());
-            build_structures_lines(app, t, &mut lines, w, available);
+            build_structures_lines(app, t, &mut lines, &mut rows, w, available);
         }
         WorkspaceTab::Artifacts => {
             let available = usize::from(inner.height).saturating_sub(lines.len());
-            build_artifact_lines(app, t, &mut lines, w, available);
+            build_artifact_lines(app, t, &mut lines, &mut rows, w, available);
+        }
+    }
+
+    // Record what landed where, before `lines` is moved into the paragraph.
+    //
+    // Line index is not screen row: the panel wraps, so a long entry pushes
+    // everything under it down. Measured with the same wrap settings the
+    // paragraph uses, accumulating once through the marks in order — the same
+    // additive property `draw_chat` relies on.
+    {
+        let mut marks: Vec<usize> = rows.iter().map(|(line, _)| *line).collect();
+        marks.push(tabs_line_index);
+        marks.sort_unstable();
+        marks.dedup();
+        let mut row_of: Vec<(usize, u16)> = Vec::with_capacity(marks.len());
+        let mut acc: u16 = 0;
+        let mut prev = 0usize;
+        for mark in marks {
+            let mark = mark.min(lines.len());
+            if mark > prev {
+                acc = acc.saturating_add(
+                    Paragraph::new(lines[prev..mark].to_vec())
+                        .wrap(Wrap { trim: false })
+                        .line_count(inner.width) as u16,
+                );
+                prev = mark;
+            }
+            row_of.push((mark, acc));
+        }
+        let screen_row = |line: usize| -> Option<u16> {
+            let line = line.min(lines.len());
+            let offset = row_of.iter().find(|(at, _)| *at == line)?.1;
+            (offset < inner.height).then_some(inner.y + offset)
+        };
+
+        let mut map = app.hit_map.borrow_mut();
+        if let Some(row) = screen_row(tabs_line_index) {
+            for (tab, col, width) in tab_spans {
+                map.push(
+                    Rect::new(inner.x + col, row, width, 1),
+                    HitTarget::WorkspaceTab(tab),
+                );
+            }
+        }
+        // Each entry owns every row from its own first line up to the next
+        // entry's, so clicking a tool's finding line selects that tool rather
+        // than nothing.
+        for (n, (line, entry)) in rows.iter().enumerate() {
+            let Some(top) = screen_row(*line) else {
+                continue;
+            };
+            let next = rows
+                .get(n + 1)
+                .and_then(|(next_line, _)| screen_row(*next_line))
+                .unwrap_or(inner.y + inner.height);
+            let height = next.saturating_sub(top).max(1);
+            map.push(
+                Rect::new(inner.x, top, inner.width, height),
+                HitTarget::WorkspaceRow {
+                    tab: app.workspace_tab,
+                    index: *entry,
+                },
+            );
         }
     }
 
@@ -670,14 +1025,29 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, inner);
 }
 
-fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> Line<'static> {
+/// Which entry each built panel line belongs to: `(line index, entry index)`,
+/// recorded at the moment the line is pushed. One entry may own several lines
+/// (a finding, an expanded detail), and it owns every line up to the next
+/// entry's first.
+type PanelRows = Vec<(usize, usize)>;
+
+/// The tab strip, and where each label landed.
+///
+/// The columns come back with the line because they are only knowable while
+/// it is being built — the ladder below drops labels, shortens them and elides
+/// whole tabs, so nothing downstream can work out from the finished text which
+/// cells belong to which tab. Offsets are relative to the start of the line.
+type TabSpans = Vec<(WorkspaceTab, u16, u16)>;
+
+fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> (Line<'static>, TabSpans) {
     // Full labels exceed a narrow sidebar. The sidebar is narrower on a
     // small terminal, and the paragraph wraps — "Objects" dropped onto its own
     // line, ate a row of the panel and shoved every entry down (caught at
     // 40x12). Abbreviate instead of wrapping: a cramped strip is legible, a
     // wrapped one silently costs a row of content. With six tabs the full
     // set can never fit the 42-column sidebar ceiling, so the degradation
-    // ladder is three-letter labels, then two-letter initials.
+    // ladder is three-letter labels, then two-letter initials, then whole
+    // tabs elided behind a `‹`/`›` marker.
     const SHORT: [(WorkspaceTab, &str); 6] = [
         (WorkspaceTab::Activity, "Act"),
         (WorkspaceTab::Tools, "Too"),
@@ -699,25 +1069,85 @@ fn workspace_tabs_line(app: &App, t: Theme, w: usize) -> Line<'static> {
     let width_of = |set: &[(WorkspaceTab, &str)]| -> usize {
         1 + set.iter().map(|(_, label)| label.width()).sum::<usize>() + (set.len() - 1) + 2
     };
-    let tabs = if width_of(&SHORT) <= w { &SHORT } else { &MIN };
+    let tabs: &[(WorkspaceTab, &str)] = if width_of(&SHORT) <= w { &SHORT } else { &MIN };
+
+    // Bottom rung. When even the initials overflow, emitting the whole set
+    // anyway does not shorten it — the paragraph WRAPS, so the trailing tabs
+    // land on the next row and steal a line of panel content, which is the
+    // failure this ladder exists to prevent. Elide whole tabs instead, and
+    // say so: `‹` and `›` mark tabs dropped off that side, so a missing tab
+    // reads as elided rather than as absent. Cutting the labels further is
+    // not an option — "St" shortened again is "S", which reads as a
+    // different tab, and nothing on screen would admit the cut.
+    let active = tabs
+        .iter()
+        .position(|(tab, _)| *tab == app.workspace_tab)
+        .unwrap_or(0);
+    // Rendered width of the window `lo..hi` including the markers it needs.
+    let window_width = |lo: usize, hi: usize| -> usize {
+        let labels: usize = tabs[lo..hi].iter().map(|(_, l)| l.width()).sum();
+        let markers = 2 * usize::from(lo > 0) + 2 * usize::from(hi < tabs.len());
+        1 + labels + (hi - lo - 1) + 2 + markers
+    };
+    // Shrink from the end, then from the front, never past the active tab —
+    // a strip that hides the tab you are on lies about where you are.
+    let (mut lo, mut hi) = (0usize, tabs.len());
+    while hi - lo > 1 && window_width(lo, hi) > w {
+        if hi - 1 > active {
+            hi -= 1;
+        } else {
+            lo += 1;
+        }
+    }
+    if window_width(lo, hi) > w {
+        // Not even one tab and its markers fit. Say which tab is active in
+        // whatever room there is, ellipsised, rather than overflow a row.
+        let (tab, label) = tabs[active];
+        let text = clip(&format!(" [{label}]"), w);
+        let extent = vec![(tab, 1u16, text.width().saturating_sub(1) as u16)];
+        return (
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )),
+            extent,
+        );
+    }
+
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    for (i, (tab, label)) in tabs.iter().enumerate() {
+    let mut extents: TabSpans = Vec::new();
+    // Columns are counted as the spans are pushed, so the extents cannot drift
+    // from the text: every branch that adds width adds it to both.
+    let mut col: usize = 1;
+    if lo > 0 {
+        spans.push(Span::styled("‹ ", Style::default().fg(t.muted)));
+        col += 2;
+    }
+    for (i, (tab, label)) in tabs[lo..hi].iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
+            col += 1;
         }
-        if *tab == app.workspace_tab {
+        let text = if *tab == app.workspace_tab {
             spans.push(Span::styled(
                 format!("[{label}]"),
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ));
+            format!("[{label}]")
         } else {
             spans.push(Span::styled(
                 (*label).to_string(),
                 Style::default().fg(t.muted),
             ));
-        }
+            (*label).to_string()
+        };
+        extents.push((*tab, col as u16, text.width() as u16));
+        col += text.width();
     }
-    Line::from(spans)
+    if hi < tabs.len() {
+        spans.push(Span::styled(" ›", Style::default().fg(t.muted)));
+    }
+    (Line::from(spans), extents)
 }
 
 fn status_glyph(status: ToolStatus, t: Theme) -> (&'static str, Color) {
@@ -811,6 +1241,7 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
                 elapsed_ms,
                 success,
                 evidence_class,
+                ..
             } => {
                 let status = if *success {
                     ToolStatus::Ok
@@ -842,7 +1273,13 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
     out
 }
 
-fn build_tools_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usize) {
+fn build_tools_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    rows: &mut PanelRows,
+    w: usize,
+) {
     // The Tools tab shows the LIVE catalog (the actual tools), with any
     // run-activity beneath it.
     if !app.tool_catalog.is_empty() {
@@ -852,6 +1289,7 @@ fn build_tools_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
         )));
         let sel = app.workspace_selected.min(app.tool_catalog.len() - 1);
         for (i, tool) in app.tool_catalog.iter().enumerate() {
+            rows.push((lines.len(), i));
             let focused = app.focus == Focus::Workspace && i == sel;
             let prefix = if focused { "▸ " } else { "  " };
             let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -889,6 +1327,7 @@ fn build_tools_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
     }
     let sel = app.workspace_selected.min(tools.len().saturating_sub(1));
     for (i, x) in tools.iter().enumerate() {
+        rows.push((lines.len(), i));
         let focused = app.focus == Focus::Workspace && i == sel;
         let prefix = if focused { "▸ " } else { "  " };
         let (glyph, gcolor) = status_glyph(x.status, t);
@@ -922,7 +1361,13 @@ fn build_tools_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
     }
 }
 
-fn build_activity_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usize) {
+fn build_activity_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    rows: &mut PanelRows,
+    w: usize,
+) {
     let items = app.derive_activity();
     if items.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -933,6 +1378,7 @@ fn build_activity_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: 
     }
     let sel = app.workspace_selected.min(items.len().saturating_sub(1));
     for (i, it) in items.iter().enumerate() {
+        rows.push((lines.len(), i));
         let focused = app.focus == Focus::Workspace && i == sel;
         let prefix = if focused { "▸ " } else { "  " };
         let (glyph, gcolor) = match (it.kind, it.ok) {
@@ -956,7 +1402,13 @@ fn build_activity_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: 
     }
 }
 
-fn build_files_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usize) {
+fn build_files_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    rows: &mut PanelRows,
+    w: usize,
+) {
     let files = app.derive_files();
     if files.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -967,6 +1419,7 @@ fn build_files_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
     }
     let sel = app.workspace_selected.min(files.len().saturating_sub(1));
     for (i, fe) in files.iter().enumerate() {
+        rows.push((lines.len(), i));
         let focused = app.focus == Focus::Workspace && i == sel;
         let prefix = if focused { "▸ " } else { "  " };
         lines.push(Line::from(vec![
@@ -990,19 +1443,36 @@ fn build_files_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usi
     }
 }
 
-fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: usize) {
+/// Whether an unavailable-store reason is the backend refusing the method.
+///
+/// The agent answers every method it does not implement with JSON-RPC
+/// -32601 and this exact text (`emit_error(-32601, &format!("Method not
+/// found: {method}"), id)`, crates/agent/src/protocol.rs). The reason
+/// reaches the renderer verbatim. A refused method is a feature that was
+/// never wired; a store that failed to open is a feature that was. They
+/// have different owners and different fixes, so they must not render as
+/// the same sentence.
+fn backend_refused_the_method(reason: &str) -> bool {
+    reason.starts_with("Method not found")
+}
+
+fn build_objects_lines(
+    app: &App,
+    t: Theme,
+    lines: &mut Vec<Line<'static>>,
+    rows: &mut PanelRows,
+    w: usize,
+) {
     if app.objects.is_empty() {
+        // Fed by `ui.object.update` (emitted beside the tool card, parsed in
+        // `msg.rs`). The tab never sends a request, so no error can reach it,
+        // and nothing backfills it from the cache or from history — it fills
+        // only when a tool in THIS session creates something. Report the one
+        // thing that is known, that no update arrived, and do not promise the
+        // reader that doing work will fill it.
         lines.push(Line::from(Span::styled(
-            "  (no objects yet)",
+            "  No object updates received",
             Style::default().fg(t.muted),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  Objects appear when the agent creates",
-            Style::default().fg(t.dim),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  structures, alloys, or simulations.",
-            Style::default().fg(t.dim),
         )));
         return;
     }
@@ -1010,6 +1480,7 @@ fn build_objects_lines(app: &App, t: Theme, lines: &mut Vec<Line<'static>>, w: u
         .workspace_selected
         .min(app.objects.len().saturating_sub(1));
     for (i, obj) in app.objects.iter().enumerate() {
+        rows.push((lines.len(), i));
         let focused = app.focus == Focus::Workspace && i == sel;
         let prefix = if focused { "▸ " } else { "  " };
         let glyph = obj.kind.glyph();
@@ -1083,6 +1554,7 @@ fn build_structures_lines(
     app: &App,
     t: Theme,
     lines: &mut Vec<Line<'static>>,
+    rows: &mut PanelRows,
     w: usize,
     available_lines: usize,
 ) {
@@ -1099,8 +1571,17 @@ fn build_structures_lines(
             return;
         }
         StructuresStoreState::Unavailable(reason) => {
+            // `workspace.structures.list` has no handler in the agent today,
+            // so this is the arm the user actually lands in, carrying a raw
+            // -32601 string. Name the wiring gap; keep the reason as the
+            // evidence line.
+            let headline = if backend_refused_the_method(reason) {
+                "  Structures not connected"
+            } else {
+                "  Structure cache unavailable"
+            };
             lines.push(Line::from(Span::styled(
-                "  Structure cache unavailable",
+                headline,
                 Style::default().fg(t.err).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
@@ -1110,21 +1591,14 @@ fn build_structures_lines(
             return;
         }
         StructuresStoreState::Ready(structures) if structures.is_empty() => {
+            // The session id on the response is an envelope stamp — it says
+            // which turn answered, not which turn the rows belong to. The rows
+            // come from the shared structure cache and carry no session at
+            // all, so naming the session here would claim a scope the data
+            // does not have. Empty means the cache is empty.
             lines.push(Line::from(Span::styled(
-                "  No structures yet",
+                "  No structures in the cache",
                 Style::default().fg(t.muted),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  Structures appear when this",
-                Style::default().fg(t.dim),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  session imports, looks up,",
-                Style::default().fg(t.dim),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  or computes one.",
-                Style::default().fg(t.dim),
             )));
             return;
         }
@@ -1165,6 +1639,7 @@ fn build_structures_lines(
     let end = start.saturating_add(visible_items).min(structures.len());
 
     for (index, structure) in structures.iter().enumerate().take(end).skip(start) {
+        rows.push((lines.len(), index));
         let focused = app.focus == Focus::Workspace && index == selected;
         let prefix = if focused { "▸ " } else { "  " };
 
@@ -1236,6 +1711,7 @@ fn build_artifact_lines(
     app: &App,
     t: Theme,
     lines: &mut Vec<Line<'static>>,
+    rows: &mut PanelRows,
     w: usize,
     available_lines: usize,
 ) {
@@ -1252,8 +1728,15 @@ fn build_artifact_lines(
             return;
         }
         ArtifactStoreState::Unavailable(reason) => {
+            // Same rule as the Structures tab: a method the backend does not
+            // implement is not a store that failed to open.
+            let headline = if backend_refused_the_method(reason) {
+                "  Artifacts not connected"
+            } else {
+                "  Artifact store unavailable"
+            };
             lines.push(Line::from(Span::styled(
-                "  Artifact store unavailable",
+                headline,
                 Style::default().fg(t.err).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
@@ -1263,17 +1746,15 @@ fn build_artifact_lines(
             return;
         }
         ArtifactStoreState::Ready(artifacts) if artifacts.is_empty() => {
+            // The backend lists artifacts for the current session only
+            // (`list_artifacts` is called with `session`), and rows from any
+            // other session are rejected before they reach here. So an empty
+            // list is evidence about this session, NOT about the store: the
+            // shipped store can hold rows written under an earlier session id
+            // and this pane will still be empty. Name the scope.
             lines.push(Line::from(Span::styled(
-                "  No artifacts yet",
+                "  No artifacts in this session",
                 Style::default().fg(t.muted),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  This session has not stored",
-                Style::default().fg(t.dim),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  any artifacts.",
-                Style::default().fg(t.dim),
             )));
             return;
         }
@@ -1314,6 +1795,7 @@ fn build_artifact_lines(
     let end = start.saturating_add(visible_items).min(artifacts.len());
 
     for (index, artifact) in artifacts.iter().enumerate().take(end).skip(start) {
+        rows.push((lines.len(), index));
         let focused = app.focus == Focus::Workspace && index == selected;
         let prefix = if focused { "▸ " } else { "  " };
         let (badge, badge_color) = match &artifact.promotion {
@@ -1393,7 +1875,7 @@ fn draw_modal(f: &mut Frame, modal: Modal, app: &App) {
         Modal::Model => ("Model", model_lines(app, t)),
         Modal::Tools => ("Tools & MCP", tools_lines(t, app)),
     };
-    let area = centered_rect(62, 70, f.area());
+    let area = overlay_area(f, 62, 70);
     f.render_widget(Clear, area);
     let para = Paragraph::new(lines)
         .block(
@@ -1690,7 +2172,7 @@ fn fmt_time(ts: f64) -> String {
 
 fn draw_view_panel(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(86, 86, f.area());
+    let area = overlay_area(f, 86, 86);
     f.render_widget(Clear, area);
 
     let ntabs = app.view.tabs.len().max(1);
@@ -1789,7 +2271,7 @@ fn draw_view_panel(f: &mut Frame, app: &App) {
 
 fn draw_session_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(82, 80, f.area());
+    let area = overlay_area(f, 82, 80);
     f.render_widget(Clear, area);
 
     let indices = app.session_filtered_indices();
@@ -1910,7 +2392,7 @@ fn draw_session_picker(f: &mut Frame, app: &App) {
 
 fn draw_account(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(60, 50, f.area());
+    let area = overlay_area(f, 60, 50);
     f.render_widget(Clear, area);
     let s = &app.account.status;
 
@@ -1992,7 +2474,7 @@ fn draw_account(f: &mut Frame, app: &App) {
 
 fn draw_apikey_window(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(64, 62, f.area());
+    let area = overlay_area(f, 64, 62);
     f.render_widget(Clear, area);
 
     if app.apikey_window.adding {
@@ -2158,7 +2640,7 @@ fn draw_add_provider_form(f: &mut Frame, app: &App, area: ratatui::layout::Rect)
 
 fn draw_config_window(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(86, 86, f.area());
+    let area = overlay_area(f, 86, 86);
     f.render_widget(Clear, area);
 
     let nfiles = app.config_window.files.len().max(1);
@@ -2220,7 +2702,7 @@ fn draw_config_window(f: &mut Frame, app: &App) {
 
 fn draw_status_window(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(58, 60, f.area());
+    let area = overlay_area(f, 58, 60);
     f.render_widget(Clear, area);
 
     let kv = |k: &str, v: String| -> Line<'static> {
@@ -2422,7 +2904,7 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
 
 fn draw_tools_window(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(82, 84, f.area());
+    let area = overlay_area(f, 82, 84);
     f.render_widget(Clear, area);
 
     let indices = app.tools_window_filtered();
@@ -2574,7 +3056,7 @@ fn draw_tools_window(f: &mut Frame, app: &App) {
 
 fn draw_model_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(78, 80, f.area());
+    let area = overlay_area(f, 78, 80);
     f.render_widget(Clear, area);
 
     let indices = app.model_filtered_indices();
@@ -2719,7 +3201,7 @@ fn draw_model_picker(f: &mut Frame, app: &App) {
 
 fn draw_gpu_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(78, 80, f.area());
+    let area = overlay_area(f, 78, 80);
     f.render_widget(Clear, area);
 
     let total = app.gpu_picker.gpus.len();
@@ -2906,7 +3388,7 @@ fn fmt_last_seen(iso: &str) -> String {
 
 fn draw_node_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(78, 80, f.area());
+    let area = overlay_area(f, 78, 80);
     f.render_widget(Clear, area);
 
     let total = app.node_picker.nodes.len();
@@ -3037,7 +3519,7 @@ fn draw_node_picker(f: &mut Frame, app: &App) {
 
 fn draw_gh_panel(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(82, 80, f.area());
+    let area = overlay_area(f, 82, 80);
     f.render_widget(Clear, area);
 
     let rows = gh::filtered_rows(&app.gh);
@@ -3163,7 +3645,7 @@ fn draw_gh_panel(f: &mut Frame, app: &App) {
 
 fn draw_command_palette(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(70, 60, f.area());
+    let area = overlay_area(f, 70, 60);
     f.render_widget(Clear, area);
 
     let cmds = command::fuzzy_sorted(&app.palette.query);
@@ -3312,7 +3794,7 @@ fn draw_command_palette(f: &mut Frame, app: &App) {
 
 fn draw_theme_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(60, 50, f.area());
+    let area = overlay_area(f, 60, 50);
     f.render_widget(Clear, area);
 
     let last = crate::theme::THEMES.len().saturating_sub(1);
@@ -3377,7 +3859,7 @@ fn draw_theme_picker(f: &mut Frame, app: &App) {
 
 fn draw_which_key(f: &mut Frame, app: &App) {
     let t = app.theme();
-    let area = centered_rect(80, 80, f.area());
+    let area = overlay_area(f, 80, 80);
     f.render_widget(Clear, area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -3426,7 +3908,7 @@ fn draw_link_picker(f: &mut Frame, app: &App) {
 
     // Confirm dialog: "do you want to go to this website?"
     if lp.confirm {
-        let area = centered_rect(64, 28, f.area());
+        let area = overlay_area(f, 64, 28);
         f.render_widget(Clear, area);
         let url = lp.urls.get(lp.selected).cloned().unwrap_or_default();
         let lines = vec![
@@ -3471,7 +3953,7 @@ fn draw_link_picker(f: &mut Frame, app: &App) {
 
     // List of collected links, newest turn first. 1-9 jump straight to
     // the confirm dialog for that row.
-    let area = centered_rect(72, 60, f.area());
+    let area = overlay_area(f, 72, 60);
     f.render_widget(Clear, area);
     let sel = lp.selected.min(lp.urls.len().saturating_sub(1));
 
@@ -3620,10 +4102,12 @@ fn draw_form_pane(f: &mut Frame, app: &App) {
     let form = &pane.form;
     // Size to content (fields + padding + footer + borders) instead of
     // a fixed percentage — forms are small; a mostly-empty modal reads
-    // as broken. Clamped to the terminal height.
-    let full = f.area();
-    let height = (form.fields.len() as u16 + 5).min(full.height.saturating_sub(2));
-    let width = (full.width * 64 / 100).clamp(40.min(full.width), full.width);
+    // as broken. Cropped to the region an overlay may claim, like every
+    // other overlay, so it cannot land on the prompt box or the sidebar.
+    let screen = f.area();
+    let full = overlay_bounds(screen);
+    let height = (form.fields.len() as u16 + 5).min(full.height);
+    let width = (screen.width * 64 / 100).max(40).min(full.width);
     let x = full.x + (full.width.saturating_sub(width)) / 2;
     let y = full.y + (full.height.saturating_sub(height)) / 2;
     let area = Rect::new(x, y, width, height);
@@ -3666,7 +4150,7 @@ fn draw_knowledge_pane(f: &mut Frame, app: &App) {
 
     let t = app.theme();
     let pane = &app.knowledge;
-    let area = centered_rect(72, 70, f.area());
+    let area = overlay_area(f, 72, 70);
     f.render_widget(Clear, area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -3814,7 +4298,7 @@ fn draw_knowledge_pane(f: &mut Frame, app: &App) {
 fn draw_notebook_pane(f: &mut Frame, app: &App) {
     let t = app.theme();
     let pane = &app.notebook;
-    let area = centered_rect(82, 82, f.area());
+    let area = overlay_area(f, 82, 82);
     f.render_widget(Clear, area);
 
     let outer = Block::default()
@@ -3923,7 +4407,43 @@ fn draw_notebook_pane(f: &mut Frame, app: &App) {
         .wrap(Wrap { trim: false })
         .scroll((pane.scroll, 0))
         .style(Style::default().bg(t.overlay_bg));
-    f.render_widget(history, rows[1]);
+    // Figure strip: the newest cell's image, DRAWN, in the pane the reader is
+    // already looking at.
+    //
+    // The history above still names the path — a path is useful, it is just not
+    // a picture, and reporting one instead of showing the figure was the whole
+    // defect. Only the newest figure is drawn: interleaving every cell's image
+    // with a scrolling text history means tracking each one's wrapped offset as
+    // the reader moves, and a stale offset would paint a plot over the wrong
+    // cell. One correct figure beats several that drift.
+    let newest_figure = pane
+        .cells
+        .iter()
+        .rev()
+        .find_map(|cell| cell.image_paths.last());
+    // Below this the strip is too short to read, so the history keeps the room.
+    const MIN_ROWS_FOR_A_FIGURE: u16 = 12;
+    let (history_area, figure_area) = match newest_figure {
+        Some(_) if rows[1].height >= MIN_ROWS_FOR_A_FIGURE => {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(rows[1].height / 2)])
+                .split(rows[1]);
+            (split[0], Some(split[1]))
+        }
+        _ => (rows[1], None),
+    };
+    f.render_widget(history, history_area);
+    if let (Some(figure_area), Some(path)) = (figure_area, newest_figure)
+        && let Err(err) = app.image_view().draw(f, figure_area, path)
+    {
+        // Never a blank rectangle: a figure that could not be drawn says so and
+        // names the file, because blank and broken look identical otherwise.
+        f.render_widget(
+            Paragraph::new(err.line()).style(Style::default().fg(Color::Red)),
+            figure_area,
+        );
+    }
 
     // Code editor.
     let editor_block = Block::default()
@@ -3953,7 +4473,7 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
     // the human can read exactly what they approve. Wrapped, bounded height,
     // scrollable with ↑/↓ when it doesn't fit.
     if let Some(code) = &app.approval_code {
-        let area = centered_rect(72, 70, f.area());
+        let area = overlay_area(f, 72, 70);
         f.render_widget(Clear, area);
 
         let outer = Block::default()
@@ -4041,7 +4561,7 @@ fn draw_approval_popup(f: &mut Frame, app: &App) {
         return;
     }
 
-    let area = centered_rect(60, 20, f.area());
+    let area = overlay_area(f, 60, 20);
     f.render_widget(Clear, area);
 
     let popup = Paragraph::new(vec![
@@ -4150,7 +4670,75 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
+
+    /// The workspace tab strip must never be wider than the panel it sits in.
+    /// The panel paragraph wraps, so a single column of overflow does not
+    /// truncate the strip — it pushes the trailing tabs onto the next row and
+    /// costs a line of panel content.
+    ///
+    /// Checked at every width because width alone selects the ladder rung.
+    /// The shipped layout only ever hands this a 32–41 column interior (the
+    /// sidebar is hidden below 100 terminal columns and is then at least 33
+    /// wide), so the three-letter rung always wins and the narrower rungs are
+    /// currently UNREACHABLE through `draw`. They are tested as a contract for
+    /// a future tab count, not as a live defect.
+    ///
+    /// The arithmetic, since an earlier version of this comment guessed it
+    /// wrong and said "a seventh tab": `width_of` is
+    /// `1 + labels + (n - 1) + 2`, against a 32-column floor. Seven tabs at
+    /// three letters is 30 columns, which still fits. Reaching the MIN rung
+    /// needs `4n + 2 > 32`, i.e. **n ≥ 8**; reaching the elision rung below it
+    /// needs `3n + 2 > 32`, i.e. **n ≥ 11**. Eleven tabs, not seven.
+    #[test]
+    fn workspace_tab_strip_never_exceeds_the_width_it_is_given() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        let t = app.theme();
+        for tab in [
+            WorkspaceTab::Activity,
+            WorkspaceTab::Tools,
+            WorkspaceTab::Files,
+            WorkspaceTab::Objects,
+            WorkspaceTab::Structures,
+            WorkspaceTab::Artifacts,
+        ] {
+            app.workspace_tab = tab;
+            for w in 0..=48usize {
+                let (line, _) = workspace_tabs_line(&app, t, w);
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    line.width() <= w,
+                    "{tab:?} strip is {} cols in a {w}-col panel — it wraps: {text:?}",
+                    line.width()
+                );
+            }
+        }
+    }
+
+    /// Elision must be visible and must never hide the tab you are on.
+    #[test]
+    fn a_narrowed_tab_strip_marks_the_tabs_it_dropped() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        let t = app.theme();
+        for (tab, label) in [
+            (WorkspaceTab::Activity, "Ac"),
+            (WorkspaceTab::Artifacts, "Ar"),
+        ] {
+            app.workspace_tab = tab;
+            // 12 columns: the two-letter rung needs 20, so tabs must drop.
+            let (line, _) = workspace_tabs_line(&app, t, 12);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                text.contains(&format!("[{label}]")),
+                "the active tab vanished from the strip: {text:?}"
+            );
+            assert!(
+                text.contains('‹') || text.contains('›'),
+                "tabs were dropped with nothing to say so: {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn clip_truncates_wide_text_by_display_columns() {

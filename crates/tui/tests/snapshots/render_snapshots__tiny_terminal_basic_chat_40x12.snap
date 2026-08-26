@@ -3,11 +3,11 @@ source: crates/tui/tests/render_snapshots.rs
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend
-                                       ▲
-◆ PRISM                                ║
-  Fake backend response: PRISM TUI is  █
-running in deterministic test mode.    █
-                                       ▼
+❯ You                                  ▲
+▌ Hello                                ║
+                                       █
+◆ PRISM                                █
+  Fake backend response: PRISM TUI is  ▼
 ┌ Prompt ──────────────────────────────┐
 │ Type a message... (Enter=send, /help,│
 │                                      │

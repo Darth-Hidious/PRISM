@@ -4,32 +4,32 @@ assertion_line: 1200
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
-                                                                   │
-         ┌ GitHub — Issues ───────────────────────────────────────────────────────────────┐
-         │ [Issues]  PRs  Status    ◆ Darth-Hidious/PRISM                                 │
-         │> type to filter…    (2 shown)                                                  │
-         │                                                                                │
-         │  #42    TUI crashes on startup  OPEN · alice · bug  ◀                          │
-         │  #7     Add dark mode  CLOSED · bob                                            │
-         │                                                                                │
-         │  ←/→ tabs · filter · j/k move · ↵ post link · Esc close                        │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-         │                                                                                │
-┌ Prompt │                                                                                │
-│ Type a │                                                                                │
-│        └────────────────────────────────────────────────────────────────────────────────┘
+┌ GitHub — Issues ───────────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+│ [Issues]  PRs  Status    ◆ Darth-Hidious/PRISM                 │ │
+│> type to filter…    (2 shown)                                  │ │  (no activity yet)
+│                                                                │ │
+│  #42    TUI crashes on startup  OPEN · alice · bug  ◀          │ │
+│  #7     Add dark mode  CLOSED · bob                            │ │
+│                                                                │ │
+│  ←/→ tabs · filter · j/k move · ↵ post link · Esc close        │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

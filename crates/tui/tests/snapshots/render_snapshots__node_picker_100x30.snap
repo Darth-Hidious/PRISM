@@ -4,32 +4,32 @@ assertion_line: 1176
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
-                                                                   │
-           ┌ Nodes — 2 of 4 online ─────────────────────────────────────────────────────┐
-           │   Node                Hardware                  Access   Last seen         │
-           │                                                                            │
-           │ ● lab-hpc-01          2× A100-80GB · 64 cores … org      online now  ◀     │
-           │ ● studio-mac          12 cores · 24 GB · aarch… private  online now        │
-           │ ● edge-box-eu         8 cores · 16 GB           private  provisioning…     │
-           │ ○ old-worker                                    private  offline           │
-           │                                                                            │
-           │  ↑↓ · ⏎ detail · Esc                                                       │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-           │                                                                            │
-┌ Prompt ──│                                                                            │
-│ Type a me│                                                                            │
-│          └────────────────────────────────────────────────────────────────────────────┘
+┌ Nodes — 2 of 4 online ─────────────────────────────────────────┐ │ [Act] Too Fil Obj Str Art
+│   Node                Hardware                  Access   Last s│ │
+│                                                                │ │  (no activity yet)
+│ ● lab-hpc-01          2× A100-80GB · 64 cores … org      online│ │
+│ ● studio-mac          12 cores · 24 GB · aarch… private  online│ │
+│ ● edge-box-eu         8 cores · 16 GB           private  provis│ │
+│ ○ old-worker                                    private  offlin│ │
+│                                                                │ │
+│  ↑↓ · ⏎ detail · Esc                                           │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

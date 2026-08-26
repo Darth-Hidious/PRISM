@@ -6,27 +6,27 @@ expression: rendered
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Too Fil Obj Str Art
                                                                    │
-                                                                   │  (no activity yet)
+┌ Commands ──────────────────────────────────────────────────────┐ │  (no activity yet)
+│> tool                                                          │ │
+│                                                                │ │
+│    reference ▸ Tool catalog            Browse the age… palette │ │
+│  diagnostics ▸ Show tool permissions   Tool acce… /permissions │ │
+│  marketplace ▸ Marketplace install     Install a tool… palette │ │
+│  marketplace ▸ Marketplace find        Semantic disco… palette │ │
+│   navigation ▸ Workspace: Tools        Switch sidebar to … ←/→ │ │
+│  marketplace ▸ Marketplace publish     PRISM's own to… palette │ │
+│  marketplace ▸ Marketplace search      Search downloa… palette │ │
+│      display ▸ Mission Control         The launch das… palette │ │
+│      science ▸ Node stop               Stop the local… palette │ │
+│      account ▸ Account                 Platform login… palette │ │
+│      session ▸ Set goal                Standing … /goal <text> │ │
+│   automation ▸ Show workflow           Inspect one wo… palette │ │
+│  … 26 more — ↓ to scroll or type to filter                     │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
                                                                    │
                                                                    │
-               ┌ Commands ──────────────────────────────────────────────────────────┐
-               │> tool                                                              │
-               │                                                                    │
-               │    reference ▸ Tool catalog            Browse the agent t… palette │
-               │  diagnostics ▸ Show tool permissions   Tool access &… /permissions │
-               │  marketplace ▸ Marketplace install     Install a tool or … palette │
-               │  marketplace ▸ Marketplace find        Semantic discovery… palette │
-               │   navigation ▸ Workspace: Tools        Switch sidebar to Tools ←/→ │
-               │  marketplace ▸ Marketplace publish     PRISM's own tools:… palette │
-               │  marketplace ▸ Marketplace search      Search downloadabl… palette │
-               │      display ▸ Mission Control         The launch dashboa… palette │
-               │      science ▸ Node stop               Stop the local nod… palette │
-               │      account ▸ Account                 Platform login / l… palette │
-               │      session ▸ Set goal                Standing goal… /goal <text> │
-               │   automation ▸ Show workflow           Inspect one workfl… palette │
-               │  … 27 more — ↓ to scroll or type to filter                         │
-               │                                                                    │
-               └────────────────────────────────────────────────────────────────────┘
+                                                                   │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
 │                                                                │ │

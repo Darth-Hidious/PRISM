@@ -4,32 +4,32 @@ assertion_line: 1031
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
-· PRISM ready                                                      │ [Act] Too Fil Obj Str Art
-                                                                   │
-          ┌ Keybindings — j/k scroll · ? or Esc close ───────────────────────────────────┐
-          │ Commands & palette                                                           │
-          │   Ctrl-P                Command palette — run any command                    │
-          │   ?                     This keybindings panel                               │
-          │   Ctrl-L                Clear the chat transcript                            │
-          │   Ctrl-C                Quit PRISM                                           │
-          │   /<command>            Slash commands: /help /cost /model /mcp /goal        │
-          │                                                                              │
-          │ Navigation                                                                   │
-          │   Tab                   Cycle focus: input → workspace → chat                │
-          │   i                     Focus the message input                              │
-          │   Esc                   Leave a panel / cancel                               │
-          │   PgUp / PgDn           Scroll transcript by a page                          │
-          │   ↑↓ / k j              Scroll transcript one line                           │
-          │   g / G                 Jump to top / bottom                                 │
-          │   o                     Open a link from the transcript (chat focus)         │
-          │   mouse wheel           Scroll transcript                                    │
-          │                                                                              │
-          │ Display                                                                      │
-          │   Ctrl-T                Toggle thinking tokens                               │
-          │   Ctrl-M                Toggle tok/s metrics                                 │
-┌ Prompt ─│   Ctrl-$                Toggle cost in the status bar                        │
-│ Type a m│   Ctrl-Y                Copy mode — disable mouse capture to drag-select/copy│
-│         └──────────────────────────────────────────────────────────────────────────────┘
+┌ Keybindings — j/k scroll · ? or Esc close ─────────────────────┐ │ [Act] Too Fil Obj Str Art
+│ Commands & palette                                             │ │
+│   Ctrl-P                Command palette — run any command      │ │  (no activity yet)
+│   ?                     This keybindings panel                 │ │
+│   Ctrl-L                Clear the chat transcript              │ │
+│   Ctrl-C                Quit PRISM                             │ │
+│   /<command>            Slash commands: /help /cost /model /mcp│ │
+│                                                                │ │
+│ Navigation                                                     │ │
+│   Tab                   Cycle focus: input → workspace → chat  │ │
+│   i                     Focus the message input                │ │
+│   Esc                   Leave a panel / cancel                 │ │
+│   PgUp / PgDn           Scroll transcript by a page            │ │
+│   ↑↓ / k j              Scroll transcript one line             │ │
+│   g / G                 Jump to top / bottom                   │ │
+│   o                     Open a link from the transcript (chat f│ │
+│   mouse wheel           Scroll transcript                      │ │
+│                                                                │ │
+│ Display                                                        │ │
+│   Ctrl-T                Toggle thinking tokens                 │ │
+│   Ctrl-M                Toggle tok/s metrics                   │ │
+│   Ctrl-$                Toggle cost in the status bar          │ │
+└────────────────────────────────────────────────────────────────┘ │
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
   Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │

@@ -465,7 +465,11 @@ fn prune_cell_images(dir: &Path, keep: usize) {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name.starts_with("cell-") && name.ends_with(".png")
+            // `.view.html` is written beside every figure that gets opened
+            // in a browser pane, and pruning only the `.png` left the pages
+            // behind for the life of the workspace — base64 copies of the
+            // same images, so the leftovers are larger than what was pruned.
+            name.starts_with("cell-") && (name.ends_with(".png") || name.ends_with(".view.html"))
         })
         .filter_map(|entry| {
             let modified = entry.metadata().ok()?.modified().ok()?;

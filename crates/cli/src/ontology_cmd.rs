@@ -171,7 +171,8 @@ pub enum OntologyCommands {
 #[derive(Debug, Subcommand)]
 pub enum ProposalCommands {
     /// List pending proposals with their citation counts. The review work
-    /// queue, oldest first.
+    /// queue, newest first — so the proposals from the ingest you just ran are
+    /// at the top rather than at position 342 of 346.
     List {
         /// Maximum proposals to show.
         #[arg(long, default_value_t = 50)]
@@ -204,6 +205,50 @@ pub enum ProposalCommands {
         /// Why (recorded in the disposition ledger).
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Adjudicate the pending backlog with a model, then apply the verdicts.
+    ///
+    /// The extension loop is complete except for a reviewer: a reader that
+    /// meets an unbindable term correctly refuses to guess and queues a class
+    /// proposal with its citation — and then nothing accepts it, so the term
+    /// never binds and every fact carrying it stays unclassified. Measured
+    /// 2026-08-26: 80 of 80 unbound terms already had a queued proposal, and
+    /// the queue held 346 items with zero dispositions.
+    ///
+    /// A human will not work through 346, and blanket acceptance is wrong —
+    /// the queue genuinely mixes real classes (`yield strength`) with values
+    /// (`1,311 mpa`) and procedures (`homogenized at 1,200 °c for 24 h`).
+    /// That sorting is the judgement this command automates.
+    ///
+    /// SAFE BY CONSTRUCTION: accepting writes a DRAFT artifact and never
+    /// promotes. The live ontology changes only through the separate
+    /// deliberate `promote` gate, so the worst a wrong verdict can do is put
+    /// a bad line in a draft file nobody has promoted.
+    Judge {
+        /// How many pending proposals to adjudicate.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Decide and report WITHOUT accepting, rejecting, or writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Domain id for a NEW draft artifact (as in `accept`).
+        #[arg(long)]
+        domain: Option<String>,
+        /// Draft artifact to write or extend (as in `accept`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Override the judging model's endpoint.
+        #[arg(long)]
+        llm_url: Option<String>,
+        /// Override the judging model.
+        #[arg(long)]
+        model: Option<String>,
+        /// API key for the judging model.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Machine-readable result.
+        #[arg(long)]
+        json: bool,
     },
     /// Reject proposals. FINAL for the identity: a rejected proposal is
     /// never re-queued by later ingests.
@@ -558,6 +603,29 @@ fn import_vocabulary(
 /// term that found nothing when the only vocabulary was a 50-class EMMO
 /// binds the moment a quantity-bearing ontology is promoted. Nothing is
 /// re-extracted and no document is re-read — the join is the term itself.
+/// The class population a re-resolution actually searches.
+///
+/// [`Ontology::classes`] is the EXTRACTION-facing slice — only declarations
+/// carrying an extraction label — while the resolver walks
+/// [`Ontology::ontology_classes`], the full navigable declaration. That is not
+/// incidental: `property_resolution::label_candidates` says so in its own doc
+/// comment, "the NAVIGABLE declaration is consulted (not just the smaller
+/// extraction-facing slice) because binding is post-hoc identification".
+///
+/// Counting the extraction slice here told the operator a re-resolution would
+/// search **15** classes when the real run searches **61** (measured on the
+/// bundled EMMO + MatKG set, 2026-08-26, recorded as F57). A preview that
+/// under-reports its own run by 4x is a lying surface, and a dry run exists
+/// precisely to be believed — it is the one output an operator uses to decide
+/// whether to run the thing for real.
+fn resolvable_class_population(ontologies: &prism_ingest::ontologies::OntologySet) -> usize {
+    ontologies
+        .all()
+        .iter()
+        .map(|o| o.ontology_classes().len())
+        .sum()
+}
+
 async fn rebind(
     project_root: &Path,
     dry_run: bool,
@@ -609,11 +677,7 @@ async fn rebind(
     // then discarded. Saying "N terms would be re-tried against M classes" is
     // honest; simulating a bind and throwing it away would not be.
     if dry_run {
-        let classes = ontologies
-            .all()
-            .iter()
-            .map(|o| o.classes().len())
-            .sum::<usize>();
+        let classes = resolvable_class_population(&ontologies);
         if json {
             println!(
                 "{}",
@@ -746,10 +810,11 @@ async fn proposals(command: ProposalCommands, project_root: &Path) -> Result<()>
     match command {
         ProposalCommands::List { limit, json } => {
             let pending = store.pending_ontology_proposals(limit as i64).await?;
+            let total = store.pending_ontology_proposal_count().await?;
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&pending_proposals_json(pending, limit))?
+                    serde_json::to_string_pretty(&pending_proposals_json(pending, limit, total))?
                 );
             } else {
                 if pending.is_empty() {
@@ -758,7 +823,7 @@ async fn proposals(command: ProposalCommands, project_root: &Path) -> Result<()>
                     );
                     return Ok(());
                 }
-                println!("pending ontology proposals (oldest first):");
+                println!("pending ontology proposals (newest first):");
                 for (item, sightings) in pending {
                     println!(
                         "  [{}] {} — {} citation(s) (first: {})",
@@ -860,6 +925,232 @@ async fn proposals(command: ProposalCommands, project_root: &Path) -> Result<()>
             );
             Ok(())
         }
+        ProposalCommands::Judge {
+            limit,
+            dry_run,
+            domain,
+            output,
+            llm_url,
+            model,
+            api_key,
+            json,
+        } => {
+            let pending = store.pending_ontology_proposals(limit as i64).await?;
+            let total = store.pending_ontology_proposal_count().await?;
+            if pending.is_empty() {
+                println!("no pending proposals to judge (queue empty)");
+                return Ok(());
+            }
+
+            let llm_config = crate::build_llm_config(
+                project_root,
+                llm_url.as_deref(),
+                model.as_deref(),
+                api_key.as_deref(),
+            )?;
+            let client = prism_ingest::llm::LlmClient::new(llm_config);
+            let judge_id = format!("agent:{}", client.config().model);
+
+            // Batched, because one call per proposal over a 346-item backlog
+            // is 346 round trips for a decision the model can make in groups.
+            const BATCH: usize = 25;
+            let mut verdicts: Vec<JudgedProposal> = Vec::new();
+            let mut out_of_range: Vec<usize> = Vec::new();
+            for (n, chunk) in pending.chunks(BATCH).enumerate() {
+                let listing = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (item, sightings))| {
+                        format!(
+                            "{}. label: {:?}\n   kind: {}\n   citations: {}",
+                            i + 1,
+                            item.label,
+                            item.kind,
+                            sightings
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!(
+                    "judging batch {} ({} item(s)) with {} …",
+                    n + 1,
+                    chunk.len(),
+                    client.config().model
+                );
+                let reply = client
+                    .chat(JUDGE_SYSTEM, &listing)
+                    .await
+                    .context("the judging model call failed")?;
+                for raw in parse_verdicts(&reply)? {
+                    // Resolve against THIS batch. An out-of-range index is a
+                    // dropped verdict, never a verdict applied to the wrong
+                    // proposal — reject is final, so a misapplied one is
+                    // unrecoverable.
+                    match chunk.get(raw.index.wrapping_sub(1)) {
+                        Some((item, _)) if raw.index >= 1 => verdicts.push(JudgedProposal {
+                            item_id: item.item_id.clone(),
+                            verdict: raw.verdict,
+                            reason: raw.reason,
+                        }),
+                        _ => out_of_range.push(raw.index),
+                    }
+                }
+            }
+
+            let (mut accept_ids, mut reject, mut escalate) = (Vec::new(), Vec::new(), Vec::new());
+            for v in &verdicts {
+                match v.verdict.trim().to_lowercase().as_str() {
+                    "accept" => accept_ids.push(v.item_id.clone()),
+                    "reject" => reject.push(v.clone()),
+                    // Anything the model did not say clearly is an escalation,
+                    // never an acceptance.
+                    _ => escalate.push(v.clone()),
+                }
+            }
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "judged": verdicts.len(),
+                        "pending_total": total,
+                        "accept": accept_ids.len(),
+                        "reject": reject.len(),
+                        "escalate": escalate.len(),
+                        "out_of_range_indices": out_of_range,
+                        "dry_run": dry_run,
+                        "by": judge_id,
+                    }))?
+                );
+            } else {
+                println!(
+                    "judged {} of {total} pending → accept {}, reject {}, escalate {}{}",
+                    verdicts.len(),
+                    accept_ids.len(),
+                    reject.len(),
+                    escalate.len(),
+                    if out_of_range.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} out-of-range verdict(s) DROPPED", out_of_range.len())
+                    }
+                );
+            }
+
+            if dry_run {
+                for v in escalate.iter().chain(reject.iter()).take(12) {
+                    println!("  [{}] {} — {}", v.verdict, v.item_id, v.reason);
+                }
+                println!("dry run: nothing was accepted, rejected or written");
+                return Ok(());
+            }
+
+            let decided_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+
+            if !accept_ids.is_empty() {
+                // Accepting is ALL-OR-NOTHING per call: it refuses the whole
+                // batch when any proposal references a parent the active
+                // ontology no longer declares. Measured 2026-08-26 on the real
+                // backlog — 69 accepted, ZERO written, because 6 referenced
+                // `matkg` parents that are not loaded. Refusing a dangling
+                // reference is right; losing the other 63 to it is not. So try
+                // the batch, and on refusal fall back to one at a time and
+                // report exactly which ones could not land.
+                let artifact = match accept_proposals(
+                    &store,
+                    &accept_ids,
+                    domain.as_deref(),
+                    output.clone(),
+                    project_root,
+                )
+                .await
+                {
+                    Ok(artifact) => artifact,
+                    Err(batch_err) => {
+                        println!(
+                            "batch accept refused ({batch_err}); retrying one at a time so a \
+                             single unresolvable parent does not block the rest"
+                        );
+                        let mut landed = Vec::new();
+                        let mut artifact = None;
+                        for id in &accept_ids {
+                            match accept_proposals(
+                                &store,
+                                std::slice::from_ref(id),
+                                domain.as_deref(),
+                                output.clone(),
+                                project_root,
+                            )
+                            .await
+                            {
+                                Ok(path) => {
+                                    artifact = Some(path);
+                                    landed.push(id.clone());
+                                }
+                                Err(e) => println!("  NOT accepted: {id} — {e}"),
+                            }
+                        }
+                        accept_ids = landed;
+                        match artifact {
+                            Some(path) => path,
+                            None => {
+                                println!("no proposal could be accepted into a draft artifact");
+                                return Ok(());
+                            }
+                        }
+                    }
+                };
+                for item_id in &accept_ids {
+                    let reason = verdicts
+                        .iter()
+                        .find(|v| &v.item_id == item_id)
+                        .map(|v| v.reason.clone())
+                        .unwrap_or_else(|| "judged a class".to_string());
+                    record_disposition(
+                        &store,
+                        item_id,
+                        "accepted",
+                        Some(artifact.display().to_string()),
+                        reason,
+                        &judge_id,
+                        decided_at,
+                    )
+                    .await?;
+                }
+                println!(
+                    "ACCEPTED {} → DRAFT {}\n  next: review it, then `prism ontology promote {}` — \
+                     judging does NOT promote",
+                    accept_ids.len(),
+                    artifact.display(),
+                    artifact.display()
+                );
+            }
+            for v in &reject {
+                record_disposition(
+                    &store,
+                    &v.item_id,
+                    "rejected",
+                    None,
+                    v.reason.clone(),
+                    &judge_id,
+                    decided_at,
+                )
+                .await?;
+            }
+            if !reject.is_empty() {
+                println!("REJECTED {} (final for those identities)", reject.len());
+            }
+            if !escalate.is_empty() {
+                println!(
+                    "LEFT PENDING {} for a human — the judge was not confident",
+                    escalate.len()
+                );
+            }
+            Ok(())
+        }
         ProposalCommands::Reject {
             item_ids,
             reason,
@@ -900,9 +1191,91 @@ async fn proposals(command: ProposalCommands, project_root: &Path) -> Result<()>
 
 /// The `proposals list --json` payload, factored out so the review surface's
 /// machine shape is testable without capturing stdout.
+/// What the judge decided about one proposal.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ProposalVerdict {
+    /// 1-based position in the batch as presented — NOT the item id.
+    ///
+    /// Item ids are compound and enormous
+    /// (`class|'LaserPowderBedFusion'|parents=[https://…#SynthesisMethod, …]`),
+    /// full of quotes, commas, brackets and URLs. Measured 2026-08-26 on the
+    /// real backlog: asking the model to echo them back inside JSON produced
+    /// **272 unrecognised ids out of 346** — transcription noise, not
+    /// disagreement. An integer cannot be mistranscribed into another valid
+    /// item, so the mapping happens locally where it cannot go wrong.
+    index: usize,
+    /// `accept` | `reject` | `escalate`.
+    verdict: String,
+    reason: String,
+}
+
+/// One adjudicated proposal, after the index has been resolved locally.
+#[derive(Debug, Clone)]
+struct JudgedProposal {
+    item_id: String,
+    verdict: String,
+    reason: String,
+}
+
+/// The rubric.
+///
+/// The ordering of the three rules is deliberate and so is the tie-break: a
+/// wrong ACCEPT pollutes every fact that later binds to the bad class and is
+/// expensive to undo, while an ESCALATE costs a curator ten seconds. So the
+/// bias runs toward escalation, never toward acceptance — the same principle
+/// that makes an honestly-red fact better than a wrongly-green one.
+const JUDGE_SYSTEM: &str = "\
+You curate a materials-science ontology. Each item was proposed by a reader \
+that met a term it could not bind to anything existing. Every item carries a \
+`kind`, and the kind decides which question you are answering.
+
+kind = class  -> does the label name a KIND of thing or of measurable quantity, \
+something specific instances or measurements could belong to?
+  ACCEPT: yield strength - fracture toughness - Young's modulus - keyhole pore \
+- laser powder bed fusion - solidus temperature
+  REJECT: a specific VALUE ('1,311 MPa', '3315 K'); a specific configuration or \
+dataset ('two BLSTM layers of 320 units', 'single-channel WSJ data with four \
+additive noises'); a procedure instance ('homogenized at 1,200 C for 24 h'); a \
+section heading ('experimental realization and properties'); a verb phrase \
+naming a property rather than the property itself ('has band gap' - the CLASS \
+would be 'band gap').
+
+kind = relation  -> does the label name a RELATIONSHIP that can hold between \
+two things? A relation is SUPPOSED to be a verb or a `hasX` phrase. Judge it as \
+a relation and never reject it merely for not being a class.
+  ACCEPT: catalyzes - hasActiveSite - has toughening mechanism - hasSolidusTemperature
+  REJECT: only if it names no relationship at all, or is a value, a sentence \
+fragment, or one specific event rather than a repeatable link.
+
+ESCALATE (either kind) when a careful curator would genuinely want to look.
+
+TIE-BREAK: when unsure, ESCALATE. Never ACCEPT to be helpful, and never REJECT \
+because an item is the other kind - check its `kind` field first. A wrong \
+ACCEPT contaminates every fact that binds to it; a wrong REJECT is FINAL for \
+that identity and silently loses a real concept; an ESCALATE costs ten seconds.
+
+Each item is numbered. Reply with ONLY a JSON array, one object per item, \
+no prose, using the NUMBER — never copy the id:
+[{\"index\":1,\"verdict\":\"accept|reject|escalate\",\"reason\":\"<one short clause>\"}]";
+
+fn parse_verdicts(reply: &str) -> Result<Vec<ProposalVerdict>> {
+    let start = reply.find('[');
+    let end = reply.rfind(']');
+    let (start, end) = match (start, end) {
+        (Some(s), Some(e)) if e > s => (s, e),
+        _ => bail!(
+            "the judging model did not return a JSON array; its reply began: {:?}",
+            reply.chars().take(200).collect::<String>()
+        ),
+    };
+    serde_json::from_str::<Vec<ProposalVerdict>>(&reply[start..=end])
+        .context("the judging model's JSON array did not match the expected verdict shape")
+}
+
 fn pending_proposals_json(
     pending: Vec<(prism_provenance::OntologyProposalItem, i64)>,
     limit: usize,
+    total: i64,
 ) -> serde_json::Value {
     let rows: Vec<serde_json::Value> = pending
         .into_iter()
@@ -919,7 +1292,24 @@ fn pending_proposals_json(
             })
         })
         .collect();
-    serde_json::json!({ "pending": rows, "limit": limit })
+    // `total` and `truncated` are the point: a window with no denominator is
+    // how a reader concluded an ingest had proposed NOTHING while its five new
+    // classes sat just past the limit. Measured 2026-08-25.
+    let truncated = (rows.len() as i64) < total;
+    serde_json::json!({
+        "pending": rows,
+        "limit": limit,
+        "total": total,
+        "truncated": truncated,
+        "note": if truncated {
+            format!(
+                "showing {} of {total} pending proposals, NEWEST FIRST — raise --limit to see older ones",
+                rows.len()
+            )
+        } else {
+            format!("showing all {total} pending proposals, newest first")
+        },
+    })
 }
 
 async fn record_disposition(
@@ -1398,6 +1788,12 @@ fn resolve_seed(
     Ok(seed)
 }
 
+// One parameter per CLI flag: this is the argument-dispatch boundary for
+// `prism ontology induce`, so its arity is the command's arity. Grouping the
+// flags into a struct would add a type whose only purpose is to be destructured
+// immediately, and would put the flag list one indirection away from the clap
+// definition it has to stay in step with.
+#[allow(clippy::too_many_arguments)]
 async fn induce(
     corpus_path: &Path,
     domain: &str,
@@ -1599,6 +1995,136 @@ async fn induce(
 
 #[cfg(test)]
 mod tests {
+    /// F57(b): `rebind --dry-run` must count the population the real run
+    /// searches, not the extraction-facing slice.
+    ///
+    /// `classes()` keeps only declarations carrying an extraction label;
+    /// `ontology_classes()` is the full navigable declaration, and
+    /// `property_resolution::label_candidates` walks the latter. Measured on
+    /// the bundled set the two are **15** and **61** — so the old preview told
+    /// an operator a re-resolution would search a quarter of what it does.
+    ///
+    /// The inequality is asserted as well as the equality: without it this
+    /// test would still pass if the two populations ever coincided, and would
+    /// then be guarding nothing.
+    #[test]
+    fn dry_run_counts_the_population_the_resolver_actually_searches() {
+        let ontologies =
+            prism_ingest::ontologies::loaded(None).expect("bundled ontologies must load");
+
+        let navigable: usize = ontologies
+            .all()
+            .iter()
+            .map(|o| o.ontology_classes().len())
+            .sum();
+        let extraction_slice: usize = ontologies.all().iter().map(|o| o.classes().len()).sum();
+
+        assert_eq!(
+            super::resolvable_class_population(&ontologies),
+            navigable,
+            "the dry run must report the navigable declaration the resolver walks",
+        );
+        assert!(
+            navigable > extraction_slice,
+            "expected the navigable declaration ({navigable}) to be strictly larger than the \
+             extraction slice ({extraction_slice}); if they are equal this test proves nothing \
+             and the F57 regression could return unseen",
+        );
+    }
+
+    // ── the proposal judge ──
+
+    #[test]
+    fn a_plain_verdict_array_parses() {
+        let v = parse_verdicts(
+            r#"[{"index":1,"verdict":"accept","reason":"names a quantity"},
+                {"index":2,"verdict":"reject","reason":"a value, not a kind"}]"#,
+        )
+        .expect("parses");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].verdict, "accept");
+        assert_eq!(v[1].index, 2);
+    }
+
+    #[test]
+    fn a_verdict_array_wrapped_in_prose_or_fences_still_parses() {
+        for reply in [
+            "Here are my verdicts:\n```json\n[{\"index\":1,\"verdict\":\"escalate\",\"reason\":\"unclear\"}]\n```\nHope that helps.",
+            "[{\"index\":1,\"verdict\":\"escalate\",\"reason\":\"unclear\"}]",
+        ] {
+            let v = parse_verdicts(reply).expect("tolerates wrapping");
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].verdict, "escalate");
+        }
+    }
+
+    #[test]
+    fn a_reply_with_no_array_is_an_error_not_an_empty_verdict_list() {
+        // The failure that matters: returning Ok(vec![]) here would read
+        // downstream as "nothing to decide", leave the whole backlog
+        // untouched, and REPORT SUCCESS — a silent no-op wearing a green tick.
+        for reply in [
+            "I'm sorry, I can't help with that.",
+            "",
+            "The proposals look reasonable to me.",
+        ] {
+            let err = parse_verdicts(reply).expect_err("a non-array reply must fail loudly");
+            assert!(
+                format!("{err:#}").contains("did not return a JSON array"),
+                "the error must name what went wrong: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_verdict_object_is_an_error() {
+        let err = parse_verdicts(r#"[{"index":1}]"#)
+            .expect_err("a verdict without a verdict field is not a verdict");
+        assert!(format!("{err:#}").contains("verdict shape"), "{err:#}");
+    }
+
+    #[test]
+    fn the_rubric_asks_for_a_number_never_the_item_id() {
+        // Measured 2026-08-26 on the real 346-item backlog: asking the model to
+        // echo compound ids back
+        // (`class|'LaserPowderBedFusion'|parents=[https://…, …]`) produced
+        // **272 unrecognised ids** — transcription noise, not disagreement.
+        // An integer cannot be mistranscribed into another VALID item.
+        assert!(JUDGE_SYSTEM.contains("Each item is numbered"));
+        assert!(JUDGE_SYSTEM.contains("never copy the id"));
+        assert!(
+            !JUDGE_SYSTEM.contains("item_id"),
+            "the reply shape must not ask for an id"
+        );
+    }
+
+    #[test]
+    fn the_rubric_biases_toward_escalation_never_acceptance() {
+        // The tie-break is the safety property of the whole command: a wrong
+        // ACCEPT contaminates every fact that later binds to the bad class.
+        assert!(JUDGE_SYSTEM.contains("when unsure, ESCALATE"));
+        assert!(JUDGE_SYSTEM.contains("Never ACCEPT to be helpful"));
+        // And it must teach the distinction the real backlog actually needs.
+        assert!(JUDGE_SYSTEM.contains("1,311 MPa"), "reject a VALUE");
+        assert!(JUDGE_SYSTEM.contains("yield strength"), "accept a KIND");
+        // The dry run caught this: the queue holds 296 classes AND 50
+        // relations, and a class-only rubric rejected `catalyzes` and
+        // `hasActiveSite` as "not a class" — a FINAL verdict that silently
+        // destroys a real concept. The rubric must branch on `kind`.
+        assert!(
+            JUDGE_SYSTEM.contains("kind = relation"),
+            "relations judged as relations"
+        );
+        assert!(
+            JUDGE_SYSTEM.contains("catalyzes"),
+            "a verb IS a valid relation"
+        );
+        assert!(
+            JUDGE_SYSTEM.contains("never REJECT because an item is the other kind"),
+            "the cross-kind mistake must be named explicitly"
+        );
+    }
+
     use prism_ingest::induction::{
         InducedClass, InducedOntology, InductionProvenance, OntologyStatus,
     };
@@ -1843,7 +2369,7 @@ mod tests {
         // LIST — the review surface's work queue, through the same row
         // builder the JSON output prints.
         let listed =
-            pending_proposals_json(store.pending_ontology_proposals(10).await.unwrap(), 10);
+            pending_proposals_json(store.pending_ontology_proposals(10).await.unwrap(), 10, 2);
         assert_eq!(listed["pending"].as_array().unwrap().len(), 2);
         let class_row = listed["pending"]
             .as_array()

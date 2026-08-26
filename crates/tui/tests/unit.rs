@@ -715,18 +715,36 @@ fn push_error_adds_error_line() {
     assert!(matches!(app.messages[0].kind, LineKind::Error(_)));
 }
 
+/// The transcript is KEPT, not windowed.
+///
+/// This test used to assert the opposite: `max_messages = 3` then four pushes
+/// left `["b", "c", "d"]`, with "a" dropped. That sliding window shipped as a
+/// 500-entry cap, and it deleted the reader's own history with no marker — a
+/// long session could not be scrolled back to its start and nothing said why.
+/// It also emptied the Workspace Activity feed of the same turns, because that
+/// feed is derived from this buffer, so there was no surface left where the
+/// dropped turns survived.
+///
+/// The cap was paying for render scope, not memory: `draw_chat` rebuilds every
+/// line each frame regardless. Bounding what is DRAWN is free; bounding what is
+/// KEPT destroys history. So the rule is inverted here, deliberately.
 #[test]
-fn trim_messages_enforces_sliding_window() {
+fn every_message_is_retained_and_none_are_silently_dropped() {
     let mut app = test_app();
-    app.max_messages = 3;
-    app.push_user("a");
-    app.push_user("b");
-    app.push_user("c");
-    app.push_user("d");
-    assert_eq!(app.messages.len(), 3);
-    // Oldest should be dropped
-    assert_eq!(app.messages[0].text, "b");
-    assert_eq!(app.messages[2].text, "d");
+    for text in ["a", "b", "c", "d"] {
+        app.push_user(text);
+    }
+    assert_eq!(
+        app.messages.len(),
+        4,
+        "no message may be dropped: a truncated transcript renders identically \
+         to a complete one, which is the failure this replaced"
+    );
+    assert_eq!(
+        app.messages[0].text, "a",
+        "the OLDEST message is the one the sliding window used to eat"
+    );
+    assert_eq!(app.messages[3].text, "d");
 }
 
 #[test]
@@ -3737,4 +3755,84 @@ fn a_display_name_slugs_into_a_registry_id() {
     assert_eq!(App::provider_slug("  Moonshot  "), "moonshot");
     // Nothing usable in it -> refused upstream rather than minting an empty id.
     assert_eq!(App::provider_slug("!!!"), "");
+}
+
+/// Clicking a workspace row selects it, exactly as the keyboard would.
+///
+/// Mouse presses reached `handle_mouse` all along and were discarded — only
+/// the wheel was handled, and `ev.column`/`ev.row` were read nowhere in the
+/// crate. Pointing could not refer to anything.
+///
+/// Pointing and typing must land on the SAME selection state, or the sidebar
+/// would disagree with itself depending on which you used last.
+#[test]
+fn clicking_a_workspace_row_selects_it() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use prism_tui::app::WorkspaceTab;
+    use prism_tui::hit_map::HitTarget;
+    use ratatui::layout::Rect;
+
+    let mut app = test_app();
+    app.hit_map.borrow_mut().push(
+        Rect::new(60, 8, 20, 1),
+        HitTarget::WorkspaceRow {
+            tab: WorkspaceTab::Artifacts,
+            index: 4,
+        },
+    );
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 65,
+        row: 8,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+
+    assert_eq!(app.workspace_tab, WorkspaceTab::Artifacts);
+    assert_eq!(
+        app.workspace_selected, 4,
+        "the clicked row is the selected row"
+    );
+}
+
+/// Hover records what is under the pointer and nothing else.
+///
+/// Deliberately asserts that only the reference is held: what it points at is
+/// fetched when opened, never when the pointer passes over it. Pre-resolving
+/// would do work for every mark the reader never looks at.
+#[test]
+fn hovering_records_the_target_under_the_pointer() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    use prism_tui::hit_map::HitTarget;
+    use ratatui::layout::Rect;
+
+    let mut app = test_app();
+    app.hit_map.borrow_mut().push(
+        Rect::new(4, 2, 30, 1),
+        HitTarget::Reference {
+            id: "structure:cache://a3f9".to_string(),
+        },
+    );
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 10,
+        row: 2,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.hovered,
+        Some(HitTarget::Reference {
+            id: "structure:cache://a3f9".to_string()
+        })
+    );
+
+    // Off the mark: hover clears rather than sticking to the last thing seen.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: 10,
+        row: 9,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+    assert_eq!(app.hovered, None, "moving off a mark must clear the hover");
 }

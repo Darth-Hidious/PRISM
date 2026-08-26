@@ -5,30 +5,30 @@ expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Too Fil Obj Str Art
+┌ Knowledge ─────────────────────────────────────────────────────┐ │
+│ Search  [Ingest]                                               │ │  (no activity yet)
+│                                                                │ │
+│  /data/papers   (.pdf .csv .json .tsv .parquet .pq)            │ │
+│                                                                │ │
+│    ../                                                         │ │
+│    reviews/                                                    │ │
+│    lpbf_params.csv                                             │ │
+│  ▸ niti_sma.pdf  ◀                                             │ │
+│    phase_graph.json                                            │ │
+│                                                                │ │
+│  Tab mode · ↑↓ move · ↵ open/pick · ←/Bksp up · Esc close      │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
                                                                    │
-                                                                   │  (no activity yet)
-                                                                   │
-              ┌ Knowledge ───────────────────────────────────────────────────────────┐
-              │ Search  [Ingest]                                                     │
-              │                                                                      │
-              │  /data/papers   (.pdf .csv .json .tsv .parquet .pq)                  │
-              │                                                                      │
-              │    ../                                                               │
-              │    reviews/                                                          │
-              │    lpbf_params.csv                                                   │
-              │  ▸ niti_sma.pdf  ◀                                                   │
-              │    phase_graph.json                                                  │
-              │                                                                      │
-              │  Tab mode · ↑↓ move · ↵ open/pick · ←/Bksp up · Esc close            │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-┌ Prompt ─────│                                                                      │
-│ Type a messa└──────────────────────────────────────────────────────────────────────┘
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │

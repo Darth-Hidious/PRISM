@@ -1828,3 +1828,739 @@ fn snapshot_knowledge_ingest_browser_100x30() {
     assert_no_terminal_controls(&rendered);
     insta::assert_snapshot!("knowledge_ingest_browser_100x30", rendered);
 }
+
+// ── Overlay geometry ────────────────────────────────────────────────
+
+/// Render to raw rows, one string per terminal line, **without** trimming
+/// trailing spaces — column indices must line up with buffer cells for a
+/// cell-exact comparison.
+fn render_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("failed to create TestBackend");
+    terminal.draw(|f| draw(f, app)).expect("failed to draw");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|row| {
+            (0..buffer.area.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// **An overlay may only repaint the transcript.** Every other widget on the
+/// frame — the header bar, the bordered Prompt box, the footer and the
+/// Workspace sidebar — is drawn *before* the overlay and owns its cells.
+///
+/// The Tools pane centred itself on the whole frame and opened with `Clear`,
+/// so at 100x30 it wiped the prompt box down to the fragments `┌ Prompt` and
+/// `│ Type a` on the left edge and cut the sidebar's border out of every row
+/// it covered. That is the screen the owner photographed.
+///
+/// The invariant is stated as a diff: with the same `App` state, opening an
+/// overlay must change **only** cells inside the transcript region. Anything
+/// else means the overlay claimed area another widget owns.
+#[test]
+fn an_overlay_repaints_only_the_transcript_never_the_prompt_or_sidebar() {
+    type Open = fn(&mut App);
+    let overlays: [(&str, Open); 8] = [
+        ("tools", |a| a.tools_window.open = true),
+        ("status", |a| a.status_window.open = true),
+        ("config", |a| a.config_window.open = true),
+        ("model picker", |a| a.model_picker.open = true),
+        ("theme picker", |a| a.theme_picker.open = true),
+        ("which-key", |a| a.which_key.open = true),
+        ("knowledge", |a| a.knowledge.open = true),
+        ("command palette", |a| a.open_palette()),
+    ];
+
+    // The first three are realistic terminals with the sidebar shown (it
+    // needs 100 columns), so the sidebar column is live and can be sliced.
+    // The last two are below that threshold: no sidebar, but the prompt box
+    // and footer still own their rows and the transcript is only five rows
+    // tall — the size at which an overlay is most tempted to spill.
+    for (width, height) in [(100, 30), (120, 40), (150, 42), (60, 20), (40, 12)] {
+        let mut base_app = app_with_welcome();
+        base_app.home.open = false;
+        freeze_metrics(&mut base_app);
+        let base = render_rows(&base_app, width, height);
+
+        // Mirror of the layout rule in render::frame_layout: header row,
+        // transcript, 5-row prompt box, footer row; the sidebar takes a third
+        // of the width (clamped) and only above 100 columns.
+        let transcript_rows = 1..usize::from(height) - 6;
+        let sidebar_x = if width >= 100 {
+            usize::from(width - (width / 3).clamp(24, 42))
+        } else {
+            usize::from(width)
+        };
+
+        for (name, open) in overlays {
+            let mut app = app_with_welcome();
+            app.home.open = false;
+            freeze_metrics(&mut app);
+            open(&mut app);
+            let rows = render_rows(&app, width, height);
+
+            for (y, (before, after)) in base.iter().zip(rows.iter()).enumerate() {
+                if !transcript_rows.contains(&y) {
+                    assert_eq!(
+                        before, after,
+                        "the {name} overlay repainted row {y} at {width}x{height} — that row \
+                         belongs to the header, the Prompt box or the footer.\n\
+                         without overlay: {before:?}\n   with overlay: {after:?}"
+                    );
+                    continue;
+                }
+                // Inside the transcript rows the overlay owns the content
+                // column, but the sidebar still owns its own columns — that
+                // is where the divider and the panel body live.
+                let cut = |line: &str| -> String { line.chars().skip(sidebar_x).collect() };
+                assert_eq!(
+                    cut(before),
+                    cut(after),
+                    "the {name} overlay reached into the Workspace sidebar on row {y} \
+                     at {width}x{height}.\n\
+                     without overlay: {before:?}\n   with overlay: {after:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Snapshot: the Tools pane open at 100x30 — the exact screen the owner
+/// photographed. The picture that matters is the frame *around* the pane:
+/// a whole `┌ Prompt ─…─┐` box, an unbroken sidebar divider on every row,
+/// and the tab strip still on one line.
+#[test]
+fn snapshot_tools_pane_open_100x30() {
+    let mut app = app_with_welcome();
+    app.handle_backend_message(&serde_json::json!({
+        "method": "ui.tools.catalog",
+        "params": {"tools": [
+            {"name": "execute_bash", "description": "Run a shell command", "approval": true},
+            {"name": "execute_python", "description": "Run Python in the kernel", "approval": true},
+            {"name": "materials_search", "description": "Search OPTIMADE providers", "approval": false},
+            {"name": "plot", "description": "Render a chart", "approval": false},
+        ]}
+    }));
+    freeze_metrics(&mut app);
+    app.tools_window.open = true;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("tools_pane_open_100x30", rendered);
+}
+
+/// A long reply must not push the reader's own turn off the top.
+///
+/// Auto-follow pinned the viewport to the last row, so any answer taller than
+/// the transcript hid the prompt that caused it and the chat read as if it
+/// contained only PRISM's half of the conversation. `push_user` was never at
+/// fault — the message was above the fold.
+///
+/// Asserted on CONTENT rather than as a snapshot: the property is "the user's
+/// turn is on screen", and a snapshot would also fail for an unrelated pixel
+/// and re-accepting it would quietly retire the guarantee.
+#[test]
+fn a_long_reply_does_not_scroll_the_users_own_turn_off_screen() {
+    let mut app = app_with_welcome();
+    app.push_user("what is the solidus of Ti-6Al-4V");
+    // Comfortably taller than a 30-row viewport.
+    let long_reply: String = (1..=120)
+        .map(|i| format!("line {i} of a long answer\n"))
+        .collect();
+    app.apply_agent_msg(AgentMsg::TextDelta(long_reply));
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert!(
+        rendered.contains("❯ You"),
+        "the user's own turn must stay visible under a long reply; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("what is the solidus"),
+        "the user's TEXT must be visible, not just the header; got:\n{rendered}"
+    );
+}
+
+/// Scrolling is the reader taking over: once they move, the anchor releases
+/// and the view stops jumping back to their last turn on every redraw.
+#[test]
+fn scrolling_releases_the_user_turn_anchor() {
+    let mut app = app_with_welcome();
+    app.push_user("anchor me");
+    assert!(
+        app.anchor_user_turn.get(),
+        "submitting a turn must arm the anchor"
+    );
+    // `j` only scrolls when the TRANSCRIPT has focus; with the prompt focused
+    // it is just a character. The first version of this test missed that and
+    // failed, which is itself the behaviour worth pinning.
+    app.focus = prism_tui::app::Focus::Chat;
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('j'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(
+        !app.anchor_user_turn.get(),
+        "a manual scroll must release the anchor rather than fighting the reader"
+    );
+}
+
+/// The notebook DRAWS its newest figure instead of only naming the file.
+///
+/// `render.rs` used to emit `[plot saved: /path/cell-1-0.png]` and stop there.
+/// The figure existed and the reader could not see it, so nothing in the pane
+/// said whether the plot was right, empty, or upside down.
+///
+/// Driven with a path that does not exist, because that is the case with a
+/// visible, assertable result on a `TestBackend`: pixels cannot be asserted in
+/// a test, but the honest failure line can, and reaching it proves the draw
+/// path ran rather than being skipped.
+#[test]
+fn the_notebook_draws_its_newest_figure_and_names_what_it_cannot_draw() {
+    let mut app = app_with_welcome();
+    let cell = prism_tui::notebook::NotebookCell::from_value(&serde_json::json!({
+        "execution_count": 1,
+        "origin": "agent",
+        "code": "plt.plot(x, y)",
+        "image_paths": ["/nonexistent/cell-1-0.png"],
+        "success": true,
+    }));
+    app.notebook
+        .apply_state(false, "kernel: idle".into(), vec![cell]);
+    app.notebook.open = true;
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 40);
+    assert!(
+        rendered.contains("figure missing on disk"),
+        "an undrawable figure must say so where the picture would be, not leave \
+         a blank rectangle; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("cell-1-0.png"),
+        "the failure must name the file so it can be chased; got:\n{rendered}"
+    );
+}
+
+/// A table a TOOL produced must render as a table, exactly like one PRISM
+/// wrote itself.
+///
+/// `markdown_lines` was reachable from a single place — the assistant-prose
+/// branch of `draw_chat`. Every tool result took a different path and arrived
+/// as flat text, so identical bytes rendered as a bordered, column-aligned
+/// table when PRISM said them and as raw `|` pipes when a tool did. The
+/// quality of the display depended on who was speaking, which is not a
+/// distinction a reader cares about.
+#[test]
+fn a_table_from_a_tool_renders_as_a_table_not_as_pipes() {
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "compare_materials".into(),
+        content: "comparison complete\n\n| alloy | density |\n|---|---|\n| Ti64 | 4.43 |\n| NbMoTaW | 13.7 |".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(12),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert!(
+        rendered.contains('┌') && rendered.contains('│'),
+        "a tool's table must be drawn with real borders; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("|---|"),
+        "the raw markdown separator row must not reach the screen; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Ti64") && rendered.contains("4.43"),
+        "the table's actual data must survive rendering; got:\n{rendered}"
+    );
+}
+
+/// A figure from ANY tool — not just the notebook — reaches the transcript.
+///
+/// The engine has always sent these: `ui.card`'s `data.images` carries
+/// `{path, shown}` per figure. The TUI read `data` only to choose an evidence
+/// colour and discarded the rest, so every plot from `visualization`, the ML
+/// parity plots, the correlation heatmaps and the dataset figures was
+/// invisible — not for want of information, but because nobody read it.
+///
+/// Driven with a path that does not exist, since pixels cannot be asserted on
+/// a `TestBackend` but the honest failure can, and reaching it proves the draw
+/// path ran at all.
+#[test]
+fn a_figure_from_any_tool_reaches_the_transcript() {
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "plot".into(),
+        content: "wrote the parity plot".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(30),
+        call_id: None,
+        provenance_id: None,
+        data: Some(serde_json::json!({
+            "images": [{ "path": "/nonexistent/parity.png", "shown": false }]
+        })),
+    });
+    freeze_metrics(&mut app);
+
+    let rendered = render_app_to_string(&app, 100, 40);
+    assert!(
+        rendered.contains("figure missing on disk"),
+        "a tool's figure must be drawn, and an undrawable one must say so \
+         rather than leaving blank rows; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("parity.png"),
+        "the failure must name the file so it can be chased; got:\n{rendered}"
+    );
+}
+
+/// Jump-to-bottom and jump-to-top must release the user-turn anchor.
+///
+/// The anchor outranks `auto_scroll` in `draw_chat`, so `G` setting
+/// `auto_scroll = true` while the anchor was still armed set a flag the
+/// renderer then ignored — pressing `G` did nothing at all. Caught by driving
+/// the real binary; the original anchor tests only exercised `j`/`k`, so the
+/// whole Home/End pair slipped through.
+#[test]
+fn jump_to_top_and_bottom_release_the_user_turn_anchor() {
+    for key in [
+        crossterm::event::KeyCode::Char('G'),
+        crossterm::event::KeyCode::End,
+        crossterm::event::KeyCode::Char('g'),
+        crossterm::event::KeyCode::Home,
+    ] {
+        let mut app = app_with_welcome();
+        app.push_user("anchor me");
+        assert!(app.anchor_user_turn.get(), "submitting must arm the anchor");
+        app.focus = prism_tui::app::Focus::Chat;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            key,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            !app.anchor_user_turn.get(),
+            "{key:?} is explicit navigation and must release the anchor, or it \
+             sets a flag the renderer ignores"
+        );
+    }
+}
+
+// ── Honest empty states ───────────────────────────────────────────
+
+/// Collect the Workspace sidebar text out of a rendered frame.
+///
+/// The sidebar is the column right of the last `│` on each row. Joining the
+/// rows with a space undoes the pane's word wrap, so an assertion can name a
+/// phrase without having to know where it breaks at this width.
+fn sidebar_text(rendered: &str) -> String {
+    rendered
+        .lines()
+        .filter_map(|line| line.rsplit('│').next())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render the Workspace sidebar for one tab of an already-prepared `App`.
+fn sidebar_for(app: &mut App, tab: prism_tui::app::WorkspaceTab) -> String {
+    app.focus = Focus::Workspace;
+    app.workspace_tab = tab;
+    let rendered = render_app_to_string(app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    sidebar_text(&rendered)
+}
+
+/// Objects, Structures and Artifacts all go blank, for three DIFFERENT
+/// reasons: no `ui.object.update` has arrived and nothing backfills the tab
+/// from history, the shared structure cache holds nothing, and the artifact
+/// list is session-scoped so rows stored under another session are not
+/// listed. Rendering all three as "nothing here yet" hands the reader one
+/// screen for three problems with three different owners, so each empty pane
+/// must name its own cause and no two may read alike.
+#[test]
+fn empty_workspace_panes_name_their_own_cause() {
+    use prism_tui::app::WorkspaceTab;
+
+    // 1. Objects: the notification feed has produced nothing.
+    let mut objects_app = app_with_welcome();
+    let objects = sidebar_for(&mut objects_app, WorkspaceTab::Objects);
+    assert!(
+        objects.contains("No object updates received"),
+        "the Objects pane must report that the feed sent nothing, not promise \
+         that working will fill it: {objects}"
+    );
+
+    // 2. Structures refused by the backend: a missing handler, not a broken
+    //    cache. This is what the owner sees today.
+    let mut refused_app = app_with_welcome();
+    refused_app.session_id = Some("session-structures".into());
+    refused_app.apply_agent_msg(AgentMsg::StructureStoreUnavailable {
+        message: "Method not found: workspace.structures.list".into(),
+    });
+    let refused = sidebar_for(&mut refused_app, WorkspaceTab::Structures);
+    assert!(
+        refused.contains("Structures not connected"),
+        "a refused method must read as not connected, not as a cache fault: {refused}"
+    );
+
+    // 3. Structures cache fault: a real failure of a connected feature must
+    //    stay distinct from case 2.
+    let mut broken_app = app_with_welcome();
+    broken_app.session_id = Some("session-structures".into());
+    broken_app.apply_agent_msg(AgentMsg::StructureStoreUnavailable {
+        message: "structure cache directory could not be opened: permission denied".into(),
+    });
+    let broken = sidebar_for(&mut broken_app, WorkspaceTab::Structures);
+    assert!(
+        broken.contains("Structure cache unavailable") && !broken.contains("not connected"),
+        "a store fault must not be reported as a wiring gap: {broken}"
+    );
+
+    // 4. Structures answered, with nothing in it.
+    let mut empty_structures_app = app_with_welcome();
+    empty_structures_app.session_id = Some("session-structures".into());
+    empty_structures_app.apply_agent_msg(AgentMsg::StructuresListed {
+        session_id: "session-structures".into(),
+        structures: vec![],
+    });
+    let empty_structures = sidebar_for(&mut empty_structures_app, WorkspaceTab::Structures);
+    assert!(
+        empty_structures.contains("No structures in the cache"),
+        "an answered-but-empty list must name what it is empty over — the \
+         shared cache, which is where the rows come from; structure rows carry \
+         no session, so naming one claims a scope the data does not have: \
+         {empty_structures}"
+    );
+
+    // 5. Artifacts answered, with nothing in it. ~/.prism/artifacts.db holds
+    //    rows under session `default`; a new session lists none of them, so
+    //    the pane must say the list is session-scoped rather than imply the
+    //    store is empty.
+    let mut empty_artifacts_app = app_with_welcome();
+    empty_artifacts_app.artifact_store = ArtifactStoreState::Ready(Vec::new());
+    let empty_artifacts = sidebar_for(&mut empty_artifacts_app, WorkspaceTab::Artifacts);
+    assert!(
+        empty_artifacts.contains("No artifacts in this session"),
+        "an empty session list must name the scope it is empty over: {empty_artifacts}"
+    );
+
+    // No two of the five may collapse into the same screen.
+    let panes = [
+        ("objects", &objects),
+        ("structures refused", &refused),
+        ("structures broken", &broken),
+        ("structures empty", &empty_structures),
+        ("artifacts empty", &empty_artifacts),
+    ];
+    for (i, (left_name, left)) in panes.iter().enumerate() {
+        for (right_name, right) in panes.iter().skip(i + 1) {
+            assert_ne!(
+                left, right,
+                "`{left_name}` and `{right_name}` render the same pane for different causes"
+            );
+        }
+    }
+}
+
+/// The same rule on the Artifacts tab: a backend that does not implement
+/// `workspace.artifacts.list` must not be reported as a broken store. The
+/// agent answers any unknown method with -32601 (`protocol.rs`), so this is
+/// one regression away at all times.
+#[test]
+fn artifacts_refused_by_the_backend_reads_as_not_connected() {
+    use prism_tui::app::WorkspaceTab;
+
+    let mut refused = app_with_welcome();
+    refused.apply_agent_msg(AgentMsg::ArtifactStoreUnavailable {
+        message: "Method not found: workspace.artifacts.list".into(),
+    });
+    let refused = sidebar_for(&mut refused, WorkspaceTab::Artifacts);
+    assert!(
+        refused.contains("Artifacts not connected"),
+        "a refused method must read as not connected: {refused}"
+    );
+
+    let mut broken = app_with_welcome();
+    broken.apply_agent_msg(AgentMsg::ArtifactStoreUnavailable {
+        message: "database could not be opened: permission denied".into(),
+    });
+    let broken = sidebar_for(&mut broken, WorkspaceTab::Artifacts);
+    assert!(
+        broken.contains("Artifact store unavailable") && !broken.contains("not connected"),
+        "a store fault must not be reported as a wiring gap: {broken}"
+    );
+}
+
+/// Snapshot: the Structures tab as the owner sees it today. The agent has no
+/// `workspace.structures.list` arm, so the request comes back -32601. That is
+/// a wiring gap, and the pane must not read like a cache that failed to open.
+#[test]
+fn snapshot_workspace_structures_not_connected_100x30() {
+    use prism_tui::app::WorkspaceTab;
+
+    let mut app = app_with_welcome();
+    app.session_id = Some("session-structures".into());
+    app.apply_agent_msg(AgentMsg::StructureStoreUnavailable {
+        message: "Method not found: workspace.structures.list".into(),
+    });
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Structures;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_structures_not_connected_100x30", rendered);
+}
+
+/// Snapshot: the same rule on the Artifacts tab.
+#[test]
+fn snapshot_workspace_artifacts_not_connected_100x30() {
+    use prism_tui::app::WorkspaceTab;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ArtifactStoreUnavailable {
+        message: "Method not found: workspace.artifacts.list".into(),
+    });
+    app.focus = Focus::Workspace;
+    app.workspace_tab = WorkspaceTab::Artifacts;
+
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("workspace_artifacts_not_connected_100x30", rendered);
+}
+
+/// Taking over from the anchor continues from the row on screen.
+///
+/// `draw_chat` places the view at the anchor, but `scroll_offset` still held
+/// whatever the reader last typed, and leaving auto-follow used to seed from
+/// `view_max_scroll`. So the first `k` after any turn abandoned the anchored
+/// position and jumped to the bottom of the transcript — the reader pressed
+/// "up" and the view went down. Only a real render catches this: the two
+/// numbers are only ever compared through what was drawn.
+#[test]
+fn the_first_scroll_after_a_turn_resumes_from_what_is_on_screen() {
+    let mut app = app_with_welcome();
+    // A transcript long enough that the anchor and the bottom differ a lot.
+    for i in 0..200 {
+        app.push_user(&format!("question {i}"));
+        app.apply_agent_msg(AgentMsg::TextDelta(format!("answer {i}\n")));
+        app.apply_agent_msg(AgentMsg::TextFlush);
+    }
+    app.push_user("the turn I want to keep in view");
+    // A reply longer than the viewport — the case the anchor exists for, and
+    // the only one where the anchored row and the bottom differ.
+    for i in 0..60 {
+        app.apply_agent_msg(AgentMsg::TextDelta(format!("reply line {i}\n")));
+    }
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert!(
+        rendered.contains("the turn I want to keep in view"),
+        "the anchored turn must be on screen before the handoff is meaningful; \
+         got:\n{rendered}"
+    );
+    let drawn = app.view_scroll.get();
+    let bottom = app.view_max_scroll.get();
+    assert!(
+        drawn < bottom,
+        "the anchor must place the view above the bottom for this to test \
+         anything (drawn {drawn}, bottom {bottom})"
+    );
+
+    app.focus = prism_tui::app::Focus::Chat;
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('k'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        app.scroll_offset,
+        drawn.saturating_sub(1),
+        "one press of `k` must move ONE row up from what was drawn ({drawn}), \
+         not jump to the bottom ({bottom})"
+    );
+}
+
+/// Wrapping is additive, which is what lets `draw_chat` measure figure and
+/// anchor positions in one accumulating pass instead of re-wrapping the whole
+/// transcript once per mark.
+///
+/// If a ratatui upgrade ever makes a chunk measure differently from its place
+/// in the whole, every inline figure lands on the wrong row. This asserts the
+/// property directly rather than leaving it as an assumption in a comment.
+#[test]
+fn wrapping_is_additive() {
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Wrap};
+
+    let lines: Vec<Line<'static>> = (0..120)
+        .map(|i| match i % 4 {
+            0 => Line::raw(""),
+            1 => Line::raw("short"),
+            2 => Line::raw(
+                "a considerably longer line that is certain to wrap at every \
+                 width this test uses, several times over at the narrow end",
+            ),
+            _ => Line::raw("    indented body text that also wraps at narrow widths"),
+        })
+        .collect();
+
+    let count = |chunk: &[Line<'static>], width: u16| {
+        Paragraph::new(chunk.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+    };
+
+    for width in [10u16, 20, 37, 80, 100] {
+        let whole = count(&lines, width);
+        for split in [1usize, 7, 60, 119] {
+            let head = count(&lines[..split], width);
+            let tail = count(&lines[split..], width);
+            assert_eq!(
+                head + tail,
+                whole,
+                "wrapping must be additive at width {width}, split {split}: \
+                 {head} + {tail} != {whole}"
+            );
+        }
+    }
+}
+
+/// Drawing never asks the terminal what it can draw.
+///
+/// The graphics query writes an escape sequence and waits up to two seconds
+/// for the reply on stdin. Run from inside the render closure — where it first
+/// was — it stalls every draw and races the crossterm event reader for the
+/// answer: the kitty reply starts `\x1b_G`, which crossterm turns into Alt+`_`
+/// and then plain `G`, `i`, `=` and digits, and those land in the prompt and
+/// the transcript key map. Detection belongs in `run()`, before the terminal
+/// is set up. The query count is the only observable difference, because a
+/// failed query and the halfblocks floor produce the same working picker.
+#[test]
+fn rendering_never_queries_the_terminal_for_graphics() {
+    use prism_tui::image_view::ImageView;
+
+    let before = ImageView::detections();
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "[plot saved: /nonexistent/figure.png]\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 100, 30);
+    // Touch the accessor directly too — the path a future renderer would take.
+    let _ = app.image_view().protocol();
+    assert_eq!(
+        ImageView::detections(),
+        before,
+        "drawing must not query the terminal: detection belongs in run(), \
+         before raw mode and the event reader exist"
+    );
+}
+
+/// The renderer fills the hit map, so a click means something.
+///
+/// The map, the lookup and the mouse handlers all existed and were all tested —
+/// but nothing ever put a region IN, so `at()` always answered None and every
+/// click and every pointer move was discarded. The two tests that covered it
+/// seeded the map themselves, so they passed against a dead feature. This one
+/// draws a real frame and then asks what is under a cell.
+#[test]
+fn a_real_frame_records_what_it_drew() {
+    use prism_tui::app::WorkspaceTab;
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.push_user("what is the solidus of Ti-6Al-4V");
+    app.apply_agent_msg(AgentMsg::TextDelta("about 1878 K\n".into()));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "materials_search".into(),
+        verb: "Running".into(),
+        call_id: Some("call-1".into()),
+        preview: None,
+        approval_required: Some(false),
+    });
+    app.workspace_tab = WorkspaceTab::Tools;
+    let _ = render_app_to_string(&app, 100, 30);
+
+    let map = app.hit_map.borrow();
+    assert!(
+        !map.is_empty(),
+        "a drawn frame recorded nothing — the map is filled by the renderer, \
+         and a map that stays empty makes every click a no-op"
+    );
+
+    // A tab label must answer for its own cells.
+    let tabs: Vec<&HitTarget> = (0..100u16)
+        .filter_map(|col| {
+            map.at(col, 0)
+                .into_iter()
+                .chain((0..30u16).filter_map(|row| map.at(col, row)))
+                .next()
+        })
+        .collect();
+    assert!(
+        tabs.iter().any(|t| matches!(t, HitTarget::WorkspaceTab(_))),
+        "no tab label claimed any cell, so clicking the strip cannot switch tabs"
+    );
+    assert!(
+        tabs.iter()
+            .any(|t| matches!(t, HitTarget::WorkspaceRow { .. })),
+        "no workspace row claimed any cell, so a listed tool cannot be clicked"
+    );
+    assert!(
+        tabs.iter()
+            .any(|t| matches!(t, HitTarget::TranscriptMessage { .. })),
+        "no transcript message claimed any cell, so pointing at a reply cannot \
+         say which reply it is"
+    );
+}
+
+/// Clicking a tab label switches to THAT tab, not to whatever is nearby.
+///
+/// The strip shortens labels and elides whole tabs as the sidebar narrows, so
+/// the columns are only knowable while the strip is built. A drawn frame is the
+/// only honest way to check they line up.
+#[test]
+fn clicking_a_tab_label_switches_to_that_tab() {
+    use prism_tui::app::WorkspaceTab;
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.workspace_tab = WorkspaceTab::Activity;
+    let _ = render_app_to_string(&app, 100, 30);
+
+    // Find the cell the Structures label occupies, then click it.
+    let target = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..30u16 {
+            for col in 0..100u16 {
+                if let Some(HitTarget::WorkspaceTab(WorkspaceTab::Structures)) = map.at(col, row) {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("the Structures label must claim cells in a 100-column layout")
+    };
+
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: target.0,
+        row: target.1,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+    assert_eq!(
+        app.workspace_tab,
+        WorkspaceTab::Structures,
+        "clicking the Structures label must open Structures"
+    );
+}

@@ -10,19 +10,19 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
+ ┌ Deep research — background run ──────────────────────────────┐  │
+ │                                                              │  │
+ │  ▸ Question          high-entropy alloys for hot structures  │  │
+ │    Depth             ‹ 1 ›  (0–5)  0 = local-only · 1+ = web │  │
+ │    Web               [x] on  off forces depth 0              │  │
+ │    Knowledge Graph   [x] on  (advisory)                      │  │
+ │    Provenance/memory [ ] off  (advisory)                     │  │
+ │    Mesh/partner data [ ] off  (advisory)                     │  │
+ │                                                              │  │
+ │  ↑↓ move · Space/←→ adjust · ↵ launch · Esc                  │  │
+ └──────────────────────────────────────────────────────────────┘  │
                                                                    │
                                                                    │
-                  ┌ Deep research — background run ──────────────────────────────┐
-                  │                                                              │
-                  │  ▸ Question          high-entropy alloys for hot structures  │
-                  │    Depth             ‹ 1 ›  (0–5)  0 = local-only · 1+ = web │
-                  │    Web               [x] on  off forces depth 0              │
-                  │    Knowledge Graph   [x] on  (advisory)                      │
-                  │    Provenance/memory [ ] off  (advisory)                     │
-                  │    Mesh/partner data [ ] off  (advisory)                     │
-                  │                                                              │
-                  │  ↑↓ move · Space/←→ adjust · ↵ launch · Esc                  │
-                  └──────────────────────────────────────────────────────────────┘
                                                                    │
                                                                    │
                                                                    │

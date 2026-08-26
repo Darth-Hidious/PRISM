@@ -26,9 +26,9 @@ expression: rendered
                                                                    │
                                                                    │
                                                                    │
-                                                                   │
+        ▌ theme: forest                                            │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
-│ Type a message... (Ente▌ theme: forest
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │

@@ -6,27 +6,27 @@ expression: rendered
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Too Fil Obj Str Art
                                                                    │
-❯ You                                                              │  1. prompt "compare these so… •
-▌ compare these sources                                            │
+┌ Links ─────────────────────────────────────────────────────────┐ │  1. prompt "compare these so… •
+│  2 link(s) in the transcript — newest first                    │ │
+│                                                                │ │
+│  1 https://alpha.example.org/a  ◀                              │ │
+│  2 https://beta.example.org/b                                  │ │
+│                                                                │ │
+│  1-9 open · j/k move · ↵ open · Esc close                      │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
                                                                    │
-◆ PRISM       ┌ Links ───────────────────────────────────────────────────────────────┐
-  See alpha an│  2 link(s) in the transcript — newest first                          │
-              │                                                                      │
-              │  1 https://alpha.example.org/a  ◀                                    │
-              │  2 https://beta.example.org/b                                        │
-              │                                                                      │
-              │  1-9 open · j/k move · ↵ open · Esc close                            │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              │                                                                      │
-              └──────────────────────────────────────────────────────────────────────┘
+                                                                   │
+                                                                   │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │type a message…  (press i to focus · ↵ send)                    │ │
 │                                                                │ │

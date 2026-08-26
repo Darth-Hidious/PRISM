@@ -5,30 +5,30 @@ expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
 · PRISM ready                                                      │ [Act] Too Fil Obj Str Art
+┌────────────────────────────────────────────────────────────────┐ │
+│  ⚠ APPROVAL REQUIRED                                           │ │  1. prompt "analyze the data" •
+│                                                                │ │
+│  Tool: notebook_exec  —  Allow notebook_exec?                  │ │
+│┌ Cell code — review before answering ─────────────────────────┐│ │
+││import os                                                     ││ │
+││secrets = {k: v for k, v in os.environ.items()}               ││ │
+││print(secrets)                                                ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+││                                                              ││ │
+│└──────────────────────────────────────────────────────────────┘│ │
+│  [y] Allow   [a] Allow all   [n] Deny                          │ │
+└────────────────────────────────────────────────────────────────┘ │
                                                                    │
-❯ You                                                              │  1. prompt "analyze the data" •
-▌ analyze the data                                                 │
-              ┌──────────────────────────────────────────────────────────────────────┐
-· notebook_exe│  ⚠ APPROVAL REQUIRED                                                 │
-              │                                                                      │
-              │  Tool: notebook_exec  —  Allow notebook_exec?                        │
-              │┌ Cell code — review before answering ───────────────────────────────┐│
-              ││import os                                                           ││
-              ││secrets = {k: v for k, v in os.environ.items()}                     ││
-              ││print(secrets)                                                      ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              ││                                                                    ││
-              │└────────────────────────────────────────────────────────────────────┘│
-┌ Prompt ─────│  [y] Allow   [a] Allow all   [n] Deny                                │
-│tool approval└──────────────────────────────────────────────────────────────────────┘
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│tool approval pending…  (y allow · a always allow this tool · n │ │
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
