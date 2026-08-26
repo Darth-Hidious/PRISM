@@ -2564,3 +2564,51 @@ fn clicking_a_tab_label_switches_to_that_tab() {
         "clicking the Structures label must open Structures"
     );
 }
+
+/// Keystrokes must never disappear into a pane that is not on screen.
+///
+/// The Workspace sidebar is dropped entirely below 100 columns. Focus did not
+/// follow it, so a reader who was in the sidebar and then narrowed the terminal
+/// kept focus on something invisible: arrows did nothing and typed characters
+/// were SILENTLY DROPPED, because `handle_workspace_key` has no
+/// printable-character fallback the way `handle_chat_key` does.
+///
+/// Measured live in tmux at 90x30 while driving the real binary: the footer
+/// read `[WORKSPACE]`, two Downs did nothing, and `xyz` vanished with the
+/// prompt still empty. A real render is required — `sidebar_visible` is
+/// recorded by the renderer, so nothing about this reproduces without drawing.
+#[test]
+fn input_is_never_routed_to_a_sidebar_that_is_not_drawn() {
+    let mut app = app_with_welcome();
+    app.focus = prism_tui::app::Focus::Workspace;
+
+    // Wide: the sidebar is drawn, so Workspace focus is legitimate.
+    let _ = render_app_to_string(&app, 120, 30);
+    assert!(
+        app.sidebar_visible.get(),
+        "120 columns must draw the sidebar"
+    );
+
+    // Narrow: the sidebar is gone.
+    let _ = render_app_to_string(&app, 90, 30);
+    assert!(
+        !app.sidebar_visible.get(),
+        "90 columns must drop the sidebar entirely"
+    );
+
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        app.focus,
+        prism_tui::app::Focus::Input,
+        "focus must leave a pane that is not drawn"
+    );
+    let rendered = render_app_to_string(&app, 90, 30);
+    assert!(
+        rendered.contains('x'),
+        "the keystroke must land somewhere the reader can see it, not be \
+         dropped; got:\n{rendered}"
+    );
+}

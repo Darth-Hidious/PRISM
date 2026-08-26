@@ -593,7 +593,7 @@ pub static CATALOG: &[Command] = &[
     Command {
         id: "workspace.structures",
         title: "Workspace: Structures",
-        description: "Switch sidebar to session Structures & CIF",
+        description: "Switch sidebar to cached Structures & CIF",
         category: "Navigation",
         keybind: "←/→",
         suggested: false,

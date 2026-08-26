@@ -715,6 +715,12 @@ pub struct App {
     /// so releasing an override continues from that spot instead of teleporting
     /// to wherever `scroll_offset` was last left.
     pub view_scroll: std::cell::Cell<u16>,
+    /// Whether the renderer drew the Workspace sidebar last frame.
+    ///
+    /// It is dropped entirely below a width threshold, and focus has no way to
+    /// know that on its own. Recorded here so key routing can refuse to send
+    /// input to a pane nobody can see.
+    pub sidebar_visible: std::cell::Cell<bool>,
     /// Put the newest user turn at the TOP of the viewport instead of pinning
     /// to the last line.
     ///
@@ -856,6 +862,7 @@ impl App {
             structure_fetch_rpc_id: None,
             view_max_scroll: std::cell::Cell::new(0),
             view_scroll: std::cell::Cell::new(0),
+            sidebar_visible: std::cell::Cell::new(true),
             anchor_user_turn: std::cell::Cell::new(false),
             hit_map: std::cell::RefCell::new(crate::hit_map::HitMap::default()),
             hovered: None,
@@ -1099,6 +1106,18 @@ impl App {
                 Focus::Approval => Focus::Input,
             };
             return;
+        }
+
+        // Below the sidebar's width threshold the Workspace pane is not drawn
+        // at all. Focus does not follow it, so a reader who was in the sidebar
+        // and then narrowed the terminal kept a focus on something invisible:
+        // arrows did nothing, and typed characters were SILENTLY DROPPED
+        // because `handle_workspace_key` has no printable-character fallback.
+        // Measured live in tmux at 90x30 — three keystrokes vanished with the
+        // footer still reading [WORKSPACE]. Send input where the reader can
+        // actually see it.
+        if self.focus == Focus::Workspace && !self.sidebar_visible.get() {
+            self.focus = Focus::Input;
         }
 
         match self.focus {

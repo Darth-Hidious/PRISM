@@ -150,6 +150,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_chat(f, app, layout.transcript);
     draw_prompt(f, app, layout.prompt);
     draw_footer(f, app, layout.footer);
+    app.sidebar_visible.set(layout.sidebar.is_some());
     if let Some(sidebar) = layout.sidebar {
         draw_workspace(f, app, sidebar);
     }
