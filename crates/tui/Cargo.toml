@@ -8,7 +8,7 @@ authors.workspace = true
 
 [dependencies]
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
-crossterm = { workspace = true, features = ["event-stream"] }
+crossterm = { workspace = true, features = ["event-stream", "bracketed-paste"] }
 ratatui-textarea = "0.9"
 # Artifacts the agent produces must be SEEN, not reported as a file path. This
 # renders them as a normal ratatui widget taking a `Rect`, so PRISM keeps one

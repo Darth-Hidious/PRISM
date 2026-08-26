@@ -61,7 +61,7 @@ pub mod toast;
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -185,6 +185,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
             io::stdout(),
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableBracketedPaste,
             Show
         );
         original_hook(info);
@@ -205,7 +206,17 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    // Bracketed paste turns a pasted block into ONE event instead of one key
+    // per character. Without it the loop redraws the whole screen between
+    // every character of a paste, and a pasted research question arrived
+    // truncated — "Screen refra" out of a full sentence.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        Hide
+    )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     // Terminal::new() queries the cursor position via `\x1b[6n` (DSR).
     // Some PTY environments (pexpect, CI runners, non-interactive pipes)
@@ -221,6 +232,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
                 io::stdout(),
                 LeaveAlternateScreen,
                 DisableMouseCapture,
+                DisableBracketedPaste,
                 Show
             );
             anyhow::bail!(
@@ -396,6 +408,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
                     match ev {
                         Event::Key(key) => app.handle_key(key),
                         Event::Mouse(m) => app.handle_mouse(m),
+                        Event::Paste(text) => app.handle_paste(&text),
                         _ => {}
                     }
                 }
@@ -418,6 +431,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
                     match ev {
                         Event::Key(key) => app.handle_key(key),
                         Event::Mouse(m) => app.handle_mouse(m),
+                        Event::Paste(text) => app.handle_paste(&text),
                         _ => {}
                     }
                 }
@@ -450,6 +464,7 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         io::stdout(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
         Show
     )?;
 

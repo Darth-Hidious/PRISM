@@ -931,6 +931,37 @@ impl App {
         }
     }
 
+    /// Insert pasted text in one go.
+    ///
+    /// Bracketed paste delivers a pasted block as ONE event. Without it the
+    /// block arrived as one key event per character, and since the loop
+    /// redraws the whole screen between events, a pasted research question
+    /// came through truncated — "Screen refra" out of a full sentence.
+    ///
+    /// Routed by focus, exactly like typing: whichever editor would have
+    /// received the characters receives the text. An overlay that is not a
+    /// text field ignores a paste rather than swallowing it as commands —
+    /// pasting into an approval prompt must never answer it.
+    pub fn handle_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // Carriage returns arrive from other platforms and terminals; they are
+        // not "submit". A paste never sends a message — the human still
+        // presses Enter — so newlines stay as newlines in the editor.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.approval_pending.is_some() {
+            return;
+        }
+        if self.notebook.open {
+            self.notebook.input.insert_str(&text);
+            return;
+        }
+        if matches!(self.focus, Focus::Input) {
+            self.input.insert_str(&text);
+        }
+    }
+
     /// Handle a crossterm key event.
     pub fn handle_key(&mut self, key: KeyEvent) {
         // An approval prompt is drawn OVER every pane (see render.rs — it is
@@ -6121,6 +6152,68 @@ mod tests {
         let app = fresh();
         let report = app.tool_reference_report("never_called");
         assert!(report.contains("No completed call"), "{report}");
+    }
+
+    /// A pasted research question arrived as "Screen refra" out of a full
+    /// sentence: without bracketed paste the block came in one key event per
+    /// character, and the loop redraws the whole screen between events.
+    #[test]
+    fn a_pasted_block_arrives_whole() {
+        let mut app = fresh();
+        app.focus = Focus::Input;
+        let question = "Screen refractory high-entropy alloys in the Nb-Mo-Ta-W \
+                        system for a high-temperature structural application.";
+
+        app.handle_paste(question);
+
+        assert_eq!(
+            app.input.lines().join("\n"),
+            question,
+            "every character of the paste must land, not just the first few"
+        );
+    }
+
+    /// Newlines are text, not submission. A pasted multi-line question must
+    /// sit in the editor until the human presses Enter — sending on paste
+    /// would fire a turn the reader never asked for.
+    #[test]
+    fn a_multiline_paste_does_not_send_and_normalises_line_endings() {
+        let mut app = fresh();
+        app.focus = Focus::Input;
+
+        app.handle_paste("first line\r\nsecond line\rthird line");
+
+        assert_eq!(
+            app.input.lines(),
+            ["first line", "second line", "third line"],
+            "CRLF and bare CR are line breaks, not stray characters"
+        );
+        assert!(
+            app.messages.iter().all(|m| !matches!(m.role, Role::User)),
+            "a paste must never send the message by itself"
+        );
+    }
+
+    /// Pasting while an approval prompt is up must not answer it. The prompt
+    /// intercepts keys for exactly this reason; a paste containing a `y` would
+    /// otherwise approve a tool the human never looked at.
+    #[test]
+    fn a_paste_cannot_answer_an_approval_prompt() {
+        let mut app = fresh();
+        app.focus = Focus::Input;
+        app.approval_pending = Some(("execute_bash".into(), "Allow execute_bash?".into()));
+
+        app.handle_paste("yes please run it");
+
+        assert!(
+            app.approval_pending.is_some(),
+            "the prompt must still be waiting for a real answer"
+        );
+        assert_eq!(
+            app.input.lines().join("\n"),
+            "",
+            "the paste must not be smuggled into the prompt editor either"
+        );
     }
 
     fn fresh() -> App {
