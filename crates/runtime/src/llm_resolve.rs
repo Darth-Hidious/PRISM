@@ -238,10 +238,26 @@ pub fn resolve_llm_with(
                 .clone()
                 .unwrap_or_else(|| providers::default_api_key_env(&registry, provider));
             let provider_key = std::env::var(&env_name).ok();
+            let resolved = provider_key.or(api_key);
+            // Refuse HERE, where the variable's name is known, rather than
+            // sending an unauthenticated request and relaying whatever the
+            // vendor says about it. With the key unset the human saw
+            // `HTTP 401: Authentication parameter not received in Header` —
+            // the provider's words about its own wire format, useless to
+            // someone who just needs to know which variable to set. PRISM
+            // reads that name out of its own config; it can say it.
+            let Some(resolved) = resolved.filter(|key| !key.trim().is_empty()) else {
+                anyhow::bail!(
+                    "no API key for provider `{provider}`: set {env_name} in your \
+                     environment (PRISM reads that name from `[llm].api_key_env` \
+                     in ~/.prism/config.toml), or put the key inline as \
+                     `[llm].api_key`."
+                );
+            };
             (
                 provider_endpoint(&registry, provider),
                 model.clone(),
-                provider_key.or(api_key),
+                Some(resolved),
                 None,
             )
         }
@@ -547,26 +563,95 @@ mod tests {
             std::env::set_var("PRISM_PLATFORM_PROVIDER", "supabase");
         }
 
-        let targets = [
-            chat_config::ChatTarget::Local {
+        // A local target needs no key at all, so "no key" IS the assertion.
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Local {
                 url: "https://local-or-operator.example/v1".to_string(),
                 model: "local-model".to_string(),
                 api_key: None,
-            },
-            chat_config::ChatTarget::Provider {
+            }),
+        )
+        .expect("non-platform target resolution");
+        assert_eq!(
+            resolved.api_key, None,
+            "stored platform bearer reached a local LLM target"
+        );
+
+        // A named provider needs a key and now refuses without one, so absence
+        // can no longer be the assertion here. Giving it its OWN key proves the
+        // same property more strongly: not merely that the platform bearer is
+        // absent, but that the provider's declared key is what gets used.
+        unsafe {
+            std::env::set_var("TEST_DIRECT_PROVIDER_KEY", "provider-own-key");
+        }
+        let resolved = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Provider {
                 provider: "openai".to_string(),
                 model: "direct-model".to_string(),
                 api_key_env: Some("TEST_DIRECT_PROVIDER_KEY".to_string()),
-            },
-        ];
-        for target in targets {
-            let resolved = resolve_llm_with(directory.path(), &paths, Some(target))
-                .expect("non-platform target resolution");
-            assert_eq!(
-                resolved.api_key, None,
-                "stored platform bearer reached a non-platform LLM target"
-            );
+            }),
+        )
+        .expect("non-platform target resolution");
+        assert_eq!(
+            resolved.api_key.as_deref(),
+            Some("provider-own-key"),
+            "a direct provider must use its own declared key"
+        );
+        assert_ne!(
+            resolved.api_key.as_deref(),
+            Some("stored-platform-bearer-must-not-leak"),
+            "stored platform bearer reached a direct provider target"
+        );
+        unsafe {
+            std::env::remove_var("TEST_DIRECT_PROVIDER_KEY");
         }
+    }
+
+    /// With the key unset, the human saw the PROVIDER's complaint about its own
+    /// wire format — "Authentication parameter not received in Header" — which
+    /// says nothing about what to do. PRISM reads the variable's name out of
+    /// its own config, so it can name it instead of making a doomed request.
+    #[test]
+    fn a_missing_provider_key_names_the_variable_instead_of_calling_out() {
+        let _lock = crate::tests::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _environment = PlatformEnvironmentGuard::clear();
+        let directory = tempfile::tempdir().expect("isolated runtime paths");
+        let paths = PrismPaths {
+            config_dir: directory.path().join("config"),
+            cache_dir: directory.path().join("cache"),
+            data_dir: directory.path().join("data"),
+            state_dir: directory.path().join("state"),
+        };
+        unsafe {
+            std::env::remove_var("TEST_ABSENT_PROVIDER_KEY");
+        }
+
+        let error = resolve_llm_with(
+            directory.path(),
+            &paths,
+            Some(chat_config::ChatTarget::Provider {
+                provider: "openai".to_string(),
+                model: "direct-model".to_string(),
+                api_key_env: Some("TEST_ABSENT_PROVIDER_KEY".to_string()),
+            }),
+        )
+        .expect_err("a provider with no key must refuse, not call out unauthenticated")
+        .to_string();
+
+        assert!(
+            error.contains("TEST_ABSENT_PROVIDER_KEY"),
+            "the refusal must name the variable to set: {error}"
+        );
+        assert!(
+            error.contains("openai"),
+            "and which provider needs it: {error}"
+        );
     }
 
     #[test]
