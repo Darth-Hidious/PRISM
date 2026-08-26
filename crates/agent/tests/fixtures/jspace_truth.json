@@ -38,8 +38,9 @@
     {
       "id": "case_004",
       "expected": {
-        "name": "deploy_list",
+        "name": "deploy_read",
         "arguments": {
+          "action": "list",
           "status": "running"
         }
       }
@@ -47,8 +48,9 @@
     {
       "id": "case_005",
       "expected": {
-        "name": "deploy_status",
+        "name": "deploy_read",
         "arguments": {
+          "action": "status",
           "deployment_id": "dep-bench-005"
         }
       }
@@ -56,8 +58,9 @@
     {
       "id": "case_006",
       "expected": {
-        "name": "deploy_health",
+        "name": "deploy_read",
         "arguments": {
+          "action": "health",
           "deployment_id": "dep-bench-006"
         }
       }
@@ -65,8 +68,9 @@
     {
       "id": "case_007",
       "expected": {
-        "name": "deploy_stop",
+        "name": "deploy_write",
         "arguments": {
+          "action": "stop",
           "deployment_id": "dep-bench-007"
         }
       }
@@ -103,8 +107,9 @@
     {
       "id": "case_011",
       "expected": {
-        "name": "models_list",
+        "name": "models_read",
         "arguments": {
+          "action": "list",
           "provider": "google"
         }
       }
@@ -112,8 +117,9 @@
     {
       "id": "case_012",
       "expected": {
-        "name": "models_search",
+        "name": "models_read",
         "arguments": {
+          "action": "search",
           "query": "Gemma",
           "provider": "google"
         }
@@ -122,8 +128,9 @@
     {
       "id": "case_013",
       "expected": {
-        "name": "models_info",
+        "name": "models_read",
         "arguments": {
+          "action": "info",
           "model_id": "gemini-3.1-pro-preview"
         }
       }
@@ -131,22 +138,27 @@
     {
       "id": "case_014",
       "expected": {
-        "name": "compute_gpus",
-        "arguments": {}
+        "name": "compute_read",
+        "arguments": {
+          "action": "gpus"
+        }
       }
     },
     {
       "id": "case_015",
       "expected": {
-        "name": "compute_providers",
-        "arguments": {}
+        "name": "compute_read",
+        "arguments": {
+          "action": "providers"
+        }
       }
     },
     {
       "id": "case_016",
       "expected": {
-        "name": "compute_status",
+        "name": "compute_read",
         "arguments": {
+          "action": "status",
           "job_id": "job-bench-016"
         }
       }

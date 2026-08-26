@@ -1772,7 +1772,31 @@ async fn execute_manual_tool_call(
             };
             (raw_content, is_error)
         }
-        Err(error) => (format!("Tool error: {error}"), true),
+        Err(error) => {
+            // A timed-out call leaves its response owed on the pipe, so the
+            // handle refuses everything afterwards. Without this, one slow tool
+            // ends the session: every later, unrelated tool fails too. Replace
+            // the child now so the next call has a working worker, and rebind
+            // the session id the fresh process does not know about.
+            match tool_server.recover().await {
+                Ok(true) => {
+                    if let Some(session_id) = session_store.current_id().map(str::to_string) {
+                        sync_tool_server_session(tool_server, &session_id).await;
+                    }
+                    tracing::warn!(
+                        tool = tool_name,
+                        "replaced the tool server after a failed call"
+                    );
+                }
+                Ok(false) => {}
+                Err(spawn_error) => tracing::error!(
+                    tool = tool_name,
+                    error = %spawn_error,
+                    "tool server is desynchronized and could not be replaced"
+                ),
+            }
+            (format!("Tool error: {error}"), true)
+        }
     };
 
     // Post-hooks from the SAME bytes the transcript shows, via the agent loop's

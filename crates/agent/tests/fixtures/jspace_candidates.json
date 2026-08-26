@@ -6,21 +6,21 @@
   },
   "ordered_names": [
     "query",
-    "deploy_list",
-    "deploy_status",
-    "deploy_health",
-    "deploy_stop",
+    "research_query",
+    "deploy_read",
+    "deploy_write",
+    "compute_read",
+    "compute_submit",
+    "compute_cancel",
     "workflow_list",
     "workflow_show",
     "workflow_run",
-    "models_list",
-    "models_search",
-    "models_info",
-    "compute_gpus",
-    "compute_providers",
-    "compute_status"
+    "models_read",
+    "mesh_read",
+    "mesh_write",
+    "node_read"
   ],
   "selection_cardinality": 4,
   "max_final_prompt_tokens": 8192,
-  "expected_definitions_sha256": "dd8228e231ec494d9175071782f0420965f045e2135be0e493fb2a47666c460d"
+  "expected_definitions_sha256": "94dd3ad71335b4071b02fb4e565bc04a3a5d009f82ee2586549b6c70c334da22"
 }

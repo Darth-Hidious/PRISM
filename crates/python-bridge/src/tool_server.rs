@@ -88,6 +88,14 @@ pub struct ToolServerHandle {
     /// corruption, not a glitch. Pool lanes discard + respawn the child;
     /// bare-handle owners must spawn a replacement.
     desynchronized: Option<&'static str>,
+    /// How this child was spawned, kept so a desynchronized handle can replace
+    /// it with an IDENTICAL one — see [`ToolServerHandle::recover`].
+    origin: ToolServer,
+    /// Whether the child was spawned with a cleared environment. Recovery must
+    /// preserve this: respawning a `spawn_with_clean_environment` handle
+    /// through the inheriting path would silently widen the LocalOnly
+    /// credential boundary that flag exists to draw.
+    clean_environment: bool,
 }
 
 impl ToolServer {
@@ -143,6 +151,8 @@ impl ToolServer {
             stdin,
             stdout: BufReader::new(stdout),
             desynchronized: None,
+            origin: self.clone(),
+            clean_environment: clear_environment,
         })
     }
 }
@@ -223,6 +233,40 @@ impl ToolServerHandle {
     /// Whether this handle refused/will refuse calls because a previous call
     /// broke request/response alignment. A desynchronized child must be
     /// replaced, never reused (a pool does this automatically on lane return).
+    /// Replace a desynchronized child with an identical fresh one.
+    ///
+    /// A timed-out call leaves its response still owed on the pipe, so the
+    /// handle refuses every further call rather than misattribute it. That is
+    /// correct, but for a long-lived owner it also means one slow tool ends the
+    /// session: every later tool, unrelated to the one that stalled, fails.
+    /// Observed live — a `structure` build overran the ceiling and the next
+    /// call, `prior_art_search`, died with it.
+    ///
+    /// Pool lanes already discard and replace such a child. This gives the same
+    /// recovery to a bare handle. The old child is dropped, and `kill_on_drop`
+    /// reaps it, so the stalled worker cannot linger and write its late
+    /// response to a pipe someone is still reading.
+    ///
+    /// Returns `Ok(false)` when the handle was healthy and nothing was done, so
+    /// a caller can log an actual replacement without guessing. Session state
+    /// does NOT survive: the replacement is a new process, and an owner that
+    /// bound a session id to the old child must bind it again.
+    pub async fn recover(&mut self) -> Result<bool, PythonBridgeError> {
+        if self.desynchronized.is_none() {
+            return Ok(false);
+        }
+        let replacement = if self.clean_environment {
+            self.origin.spawn_with_clean_environment().await?
+        } else {
+            self.origin.spawn().await?
+        };
+        // Assign only after the replacement exists: a failed spawn must leave
+        // the handle refusing calls, never holding a half-replaced child.
+        *self = replacement;
+        tracing::info!("replaced desynchronized python tool server");
+        Ok(true)
+    }
+
     #[must_use]
     pub fn is_desynchronized(&self) -> bool {
         self.desynchronized.is_some()
@@ -443,5 +487,155 @@ for line in sys.stdin:
                 "{raw:?} must fall back to the default ceiling"
             );
         }
+    }
+
+    /// Refusing after a desync is correct, but for a long-lived owner it also
+    /// means one slow tool ends the session. Recovery must give back a WORKING
+    /// handle whose answers are its own — the stalled child's late
+    /// `caller-A` line must never surface as a later caller's result.
+    #[tokio::test]
+    async fn recovery_replaces_the_child_and_never_serves_the_stale_answer() {
+        let Some(python_bin) = python_executable() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let project = tempfile::tempdir().expect("temp project");
+        let app = project.path().join("app");
+        std::fs::create_dir_all(&app).expect("create app package");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        // First request is slow enough to blow a short deadline; later ones
+        // answer immediately, so a healthy child is visibly responsive.
+        std::fs::write(
+            app.join("tool_server.py"),
+            r#"import json, sys, time
+first = True
+for line in sys.stdin:
+    request = json.loads(line)
+    if first:
+        first = False
+        time.sleep(1.5)
+    sys.stdout.write(json.dumps({"result": {"token": request.get("args", {}).get("token")}}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .expect("write worker");
+
+        let server = ToolServer {
+            python_bin,
+            project_root: project.path().to_path_buf(),
+            env: BTreeMap::new(),
+        };
+        let mut worker = server.spawn().await.expect("spawn worker");
+
+        let slow = serde_json::json!({
+            "method": "call_tool", "tool": "echo", "args": { "token": "caller-A" },
+        });
+        worker
+            .call_with_timeout(&slow, std::time::Duration::from_millis(100))
+            .await
+            .expect_err("the 1.5s response cannot beat a 100ms deadline");
+        assert!(
+            worker.is_desynchronized(),
+            "the timeout must poison the handle"
+        );
+
+        assert!(
+            worker.recover().await.expect("respawn the worker"),
+            "a desynchronized handle reports that it actually replaced the child"
+        );
+        assert!(
+            !worker.is_desynchronized(),
+            "the replacement must accept calls again"
+        );
+
+        let fresh = serde_json::json!({
+            "method": "call_tool", "tool": "echo", "args": { "token": "caller-B" },
+        });
+        let response = worker
+            .call_with_timeout(&fresh, std::time::Duration::from_secs(10))
+            .await
+            .expect("the replacement child answers");
+        assert_eq!(
+            response["result"]["token"], "caller-B",
+            "the fresh child must answer for caller-B, never replay caller-A"
+        );
+
+        assert!(
+            !worker.recover().await.expect("healthy recover is a no-op"),
+            "a healthy handle must not be needlessly replaced"
+        );
+        worker.shutdown().await.expect("shutdown worker");
+    }
+
+    /// `spawn_with_clean_environment` draws the LocalOnly credential boundary.
+    /// Recovery respawns the child, so it must respawn through the SAME path —
+    /// otherwise a stalled tool silently converts a clean-environment worker
+    /// into an inheriting one, and the parent's credentials appear in a child
+    /// that was created precisely to exclude them.
+    #[tokio::test]
+    async fn recovery_preserves_the_clean_environment_boundary() {
+        let Some(python_bin) = python_executable() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let project = tempfile::tempdir().expect("temp project");
+        let app = project.path().join("app");
+        std::fs::create_dir_all(&app).expect("create app package");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        // Reports whether a variable that exists only in the PARENT leaked in.
+        std::fs::write(
+            app.join("tool_server.py"),
+            r#"import json, os, sys, time
+first = True
+for line in sys.stdin:
+    json.loads(line)
+    if first:
+        first = False
+        time.sleep(1.5)
+    sys.stdout.write(json.dumps({"result": {"leaked": os.environ.get("PRISM_PARENT_ONLY_SECRET")}}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .expect("write worker");
+
+        // SAFETY: single-threaded test setup, before any child is spawned.
+        unsafe { std::env::set_var("PRISM_PARENT_ONLY_SECRET", "must-not-leak") };
+
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        );
+        let server = ToolServer {
+            python_bin,
+            project_root: project.path().to_path_buf(),
+            env,
+        };
+        let mut worker = server
+            .spawn_with_clean_environment()
+            .await
+            .expect("spawn clean worker");
+
+        let request = serde_json::json!({ "method": "call_tool", "tool": "env", "args": {} });
+        worker
+            .call_with_timeout(&request, std::time::Duration::from_millis(100))
+            .await
+            .expect_err("the 1.5s response cannot beat a 100ms deadline");
+        assert!(worker.is_desynchronized());
+        assert!(worker.recover().await.expect("respawn the clean worker"));
+
+        let response = worker
+            .call_with_timeout(&request, std::time::Duration::from_secs(10))
+            .await
+            .expect("the replacement answers");
+        assert_eq!(
+            response["result"]["leaked"],
+            serde_json::Value::Null,
+            "the replacement must still be a cleared-environment child"
+        );
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("PRISM_PARENT_ONLY_SECRET") };
+        worker.shutdown().await.expect("shutdown worker");
     }
 }
