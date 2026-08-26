@@ -68,6 +68,25 @@ async fn approval_gate_outcome(
         return ApprovalGateOutcome::Proceed;
     }
 
+    // A tool that affirmatively declares it needs no approval is not asked
+    // about. The declaration belongs to the tool, not to a list in Rust: the
+    // Python side already decides this deliberately ("No compute spent →
+    // requires_approval=False", while anything that costs money or writes
+    // declares True), and a hardcoded name list in the agent could only ever
+    // drift away from it — every real research tool was missing from that list
+    // and got gated for no reason, which made an ordinary multi-step search
+    // stop and wait four separate times.
+    //
+    // `declared_free` is not `!requires_approval`: silence means the author
+    // never decided, and silence is gated. Only an explicit `false` from the
+    // tool buys it past the prompt.
+    if tool_catalog
+        .find(tool_name)
+        .is_some_and(|tool| tool.declared_free)
+    {
+        return ApprovalGateOutcome::Proceed;
+    }
+
     let tool_meta = tool_catalog.find(tool_name);
     // Feed the TUI the loaded tool metadata so approval prompts can explain
     // *why* something like execute_bash is gated.

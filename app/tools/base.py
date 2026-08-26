@@ -34,7 +34,12 @@ class Tool:
     description: str
     input_schema: dict
     func: Callable
-    requires_approval: bool = False
+    # None means the author never decided. That is NOT the same as "free":
+    # the agent gates anything undeclared, so forgetting to think about a tool
+    # can never silently make it auto-run. Declare False for a tool that spends
+    # nothing and writes nothing; declare True for anything that costs money,
+    # touches the filesystem, or leaves the machine.
+    requires_approval: Optional[bool] = None
     source: str = "builtin"
     source_detail: Optional[str] = None
     # Memory subsystem opt-out. Tools that ARE the memory subsystem

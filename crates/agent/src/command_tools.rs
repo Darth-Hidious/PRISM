@@ -7188,6 +7188,9 @@ fn loaded_tool(spec: &CommandToolSpec) -> LoadedTool {
         description: spec.description.to_string(),
         input_schema: schema_for_spec(spec),
         requires_approval: spec.requires_approval,
+        // A command tool's spec IS its declaration — every one of them states
+        // this explicitly in COMMAND_TOOLS, so there is no undeclared case.
+        declared_free: !spec.requires_approval,
         permission_mode: spec.permission_mode,
         source: Some("prism-command".to_string()),
         source_detail: None,

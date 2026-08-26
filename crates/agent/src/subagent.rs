@@ -122,6 +122,7 @@ pub fn definition() -> LoadedTool {
         // (each still individually gated inside the nested turn) — gate the
         // spawn itself like the other code-running meta-tools.
         requires_approval: true,
+        declared_free: false,
         permission_mode: PermissionMode::WorkspaceWrite,
         source: Some("builtin".to_string()),
         source_detail: Some("orchestration".to_string()),

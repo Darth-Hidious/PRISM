@@ -370,6 +370,8 @@ fn to_loaded_tool(server: &str, tool: &rmcp::model::Tool) -> LoadedTool {
         description,
         input_schema: Value::Object(tool.input_schema.as_ref().clone()),
         requires_approval: true,
+        // An external MCP server does not get to declare itself harmless.
+        declared_free: false,
         permission_mode: get_tool_permission(&name),
         source: Some("mcp".to_string()),
         source_detail: Some(server.to_string()),

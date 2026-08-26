@@ -142,6 +142,12 @@ pub struct LoadedTool {
     pub description: String,
     pub input_schema: Value,
     pub requires_approval: bool,
+    /// The tool itself said, in so many words, that it needs no approval.
+    ///
+    /// Distinct from `!requires_approval`, which is also true when the author
+    /// never decided. Only an affirmative declaration lets a call skip the
+    /// prompt; silence is gated.
+    pub declared_free: bool,
     pub permission_mode: PermissionMode,
     pub source: Option<String>,
     pub source_detail: Option<String>,
@@ -231,10 +237,18 @@ impl ToolCatalog {
                      explicit honest-empty with additionalProperties:false",
                 );
             }
+            // Absent or null means the tool's author never decided. That is
+            // NOT the same as "free" — it is gated, so forgetting to think
+            // about a tool can never silently make it auto-run. Only an
+            // explicit `false` from the tool itself buys it past the prompt.
             let requires_approval = tool
                 .get("requires_approval")
                 .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .unwrap_or(true);
+            let declared_free = tool
+                .get("requires_approval")
+                .and_then(Value::as_bool)
+                .is_some_and(|value| !value);
             let source_detail = tool
                 .get("source_detail")
                 .and_then(Value::as_str)
@@ -247,6 +261,7 @@ impl ToolCatalog {
                 description,
                 input_schema,
                 requires_approval,
+                declared_free,
                 source,
                 source_detail,
             });
@@ -726,6 +741,7 @@ mod tests {
             description: "Run prism query".to_string(),
             input_schema: json!({ "type": "object" }),
             requires_approval: false,
+            declared_free: true,
             permission_mode: PermissionMode::ReadOnly,
             source: None,
             source_detail: None,
@@ -891,6 +907,7 @@ mod tests {
             description: "x".to_string(),
             input_schema: json!({ "type": "object" }),
             requires_approval: false,
+            declared_free: true,
             permission_mode: PermissionMode::ReadOnly,
             source: None,
             source_detail: None,

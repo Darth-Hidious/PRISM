@@ -6640,15 +6640,29 @@ fn build_tool_card_content(
                             // Formula first: it is what a person recognises.
                             // The database id is the fallback, because a row
                             // identified by `mp-aaaaaiof` is still identified.
-                            let title = r
-                                .get("title")
-                                .or_else(|| r.get("name"))
-                                .or_else(|| r.get("formula_pretty"))
-                                .or_else(|| r.get("formula"))
-                                .or_else(|| r.get("material_id"))
-                                .or_else(|| r.get("id"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("untitled");
+                            // Fall through on a key that is PRESENT but unusable,
+                            // not only on an absent one. `or_else` fires on
+                            // `None`; a proxied row carrying `"title": null`
+                            // returns `Some(Null)`, so the chain stopped at the
+                            // first key and every materials hit rendered as
+                            // "untitled" even though `formula_pretty` was right
+                            // there. Presence is not an answer.
+                            let title = [
+                                "title",
+                                "name",
+                                "formula_pretty",
+                                "formula",
+                                "material_id",
+                                "id",
+                            ]
+                            .into_iter()
+                            .find_map(|key| {
+                                r.get(key)
+                                    .and_then(|v| v.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                            })
+                            .unwrap_or("untitled");
                             let snippet = r
                                 .get("snippet")
                                 .or_else(|| r.get("description"))
@@ -9466,6 +9480,46 @@ mod tests {
     /// The `material_id` case is asserted separately because a provider that
     /// omits the formula still returns an identified row, and falling back to
     /// "untitled" there would repeat the same erasure one field later.
+    /// The formula fallbacks were already in place and every row STILL
+    /// rendered as `untitled` on a live run. `or_else` fires on an ABSENT key;
+    /// a proxied row carrying `"title": null` hands back `Some(Null)`, so the
+    /// chain stopped dead at the first key while `formula_pretty` sat unused
+    /// one line below. Presence is not an answer.
+    #[test]
+    fn a_present_but_empty_label_falls_through_to_the_formula() {
+        let content = serde_json::json!({
+            "source": "marc27_platform_proxy",
+            "count": 3,
+            "results": [
+                { "title": null, "formula_pretty": "NbMoTaW", "material_id": "mp-1" },
+                { "title": "", "name": "   ", "formula": "W", "material_id": "mp-2" },
+                { "title": 42, "material_id": "mp-3" }
+            ]
+        })
+        .to_string();
+
+        let (rendered, _) =
+            super::build_tool_card_content("query_materials_project", &content, None, None);
+
+        assert!(
+            rendered.contains("NbMoTaW"),
+            "a null title must fall through to the formula: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n2. W\n") || rendered.trim_end().ends_with("2. W"),
+            "blank and whitespace-only labels are not labels, so the formula \
+             wins — and it wins over the id, which is why mp-2 is not shown: {rendered}"
+        );
+        assert!(
+            rendered.contains("mp-3"),
+            "a non-string label falls through to the id: {rendered}"
+        );
+        assert!(
+            !rendered.contains("untitled"),
+            "nothing here is unidentifiable: {rendered}"
+        );
+    }
+
     #[test]
     fn a_materials_hit_is_named_by_formula_not_untitled() {
         let content = serde_json::json!({

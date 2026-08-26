@@ -311,6 +311,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 "additionalProperties": false
             }),
             requires_approval: true,
+            declared_free: false,
             permission_mode: PermissionMode::WorkspaceWrite,
             source: Some("builtin".to_string()),
             source_detail: Some("workspace-edit".to_string()),
@@ -354,6 +355,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 }
             }),
             requires_approval: false,
+            declared_free: true,
             permission_mode: PermissionMode::ReadOnly,
             source: Some("builtin".to_string()),
             source_detail: Some("durable-memory".to_string()),
@@ -379,6 +381,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 }
             }),
             requires_approval: false,
+            declared_free: true,
             permission_mode: PermissionMode::ReadOnly,
             source: Some("builtin".to_string()),
             source_detail: Some("durable-memory".to_string()),
@@ -407,6 +410,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 "required": ["query"]
             }),
             requires_approval: false,
+            declared_free: true,
             permission_mode: PermissionMode::ReadOnly,
             source: Some("builtin".to_string()),
             source_detail: Some("tool-discovery".to_string()),
@@ -443,6 +447,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 "required": ["name", "description", "code"]
             }),
             requires_approval: true,
+            declared_free: false,
             permission_mode: PermissionMode::WorkspaceWrite,
             source: Some("builtin".to_string()),
             source_detail: Some("self-authoring".to_string()),
@@ -466,6 +471,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 "required": ["name"]
             }),
             requires_approval: true,
+            declared_free: false,
             permission_mode: PermissionMode::WorkspaceWrite,
             source: Some("builtin".to_string()),
             source_detail: Some("self-authoring".to_string()),
@@ -478,6 +484,7 @@ pub fn definitions() -> Vec<LoadedTool> {
                 .to_string(),
             input_schema: json!({ "type": "object", "properties": {} }),
             requires_approval: false,
+            declared_free: true,
             permission_mode: PermissionMode::ReadOnly,
             source: Some("builtin".to_string()),
             source_detail: Some("self-authoring".to_string()),

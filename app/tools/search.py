@@ -345,6 +345,10 @@ def create_search_tools(registry: ToolRegistry) -> None:
     # most prior-art queries.
     registry.register(Tool(
         name="prior_art_search",
+        # Reads a federated/local source and returns what it found. Spends
+        # nothing, writes nothing, so the human is not asked. Declared
+        # explicitly: an undeclared tool is gated.
+        requires_approval=False,
         description=(
             "Federated prior-art search across scientific literature "
             "(arXiv, Semantic Scholar), patents (whichever patent backend the "

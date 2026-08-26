@@ -1102,6 +1102,7 @@ pub fn definition() -> LoadedTool {
         // budget visible in the prompt — see the module docs ("Approval
         // shape") for the design reasoning. Never auto-approved.
         requires_approval: true,
+        declared_free: false,
         permission_mode: PermissionMode::WorkspaceWrite,
         source: Some("builtin".to_string()),
         source_detail: Some("orchestration".to_string()),
