@@ -294,9 +294,22 @@ def create_qe_tools(registry: ToolRegistry) -> None:
         func=_qe_parse_output,
         output_schema={
             "type": "object",
+            # `status` and `converged` are the two keys BOTH shapes carry, so
+            # they are what may be required. `total_energy_ev` is absent on the
+            # failure path and must not be promised.
+            "required": ["status", "converged"],
             "properties": {
-                "status": {"type": "string", "enum": ["ok"]},
+                # The parser returns `{"status": "failed", "converged": false,
+                # "reason": ...}` for an unparseable or unconverged run. The
+                # enum here admitted only "ok", so the tool's own failure shape
+                # violated its own schema — and a consumer validating against it
+                # would reject the very result that tells it what went wrong.
+                "status": {"type": "string", "enum": ["ok", "failed"]},
                 "converged": {"type": "boolean"},
+                "reason": {
+                    "type": "string",
+                    "description": "Why the parse failed. Present only when status is failed.",
+                },
                 "total_energy_ev": {"type": "number"},
                 "forces_ev_per_angstrom": {"type": ["array", "null"]},
                 "stress_ev_per_angstrom3": {"type": ["array", "null"]},

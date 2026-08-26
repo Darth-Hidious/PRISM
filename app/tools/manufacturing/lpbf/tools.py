@@ -247,10 +247,36 @@ def create_lpbf_tools(registry: ToolRegistry) -> None:
                         "latent_heat_j_kg": 100000.0,
                         "absorptivity": 0.5,
                     },
+                    # Abbreviated for readability, but every value below is
+                    # what this input actually produces — and it carries
+                    # `points`, which `output_schema` requires and the validity
+                    # gate checks. The previous example stopped at `grid_shape`,
+                    # so the tool's own documented output failed both its own
+                    # schema and its own gate.
                     "output": {
                         "status": "ok",
                         "model": "Rosenthal 3D moving surface point source",
                         "grid_shape": [1, 1],
+                        "points": [
+                            {
+                                "power_w": 20.0,
+                                "scan_velocity_m_per_s": 0.1,
+                                "regime": "keyholing",
+                                "melt_pool": {
+                                    "liquidus": {
+                                        "width_m": 2.0790402734371954e-04,
+                                        "depth_m": 1.0395201367185977e-04,
+                                        "length_m": 2.3425741587390116e-04,
+                                    }
+                                },
+                                "metrics": {
+                                    "normalized_enthalpy": 8.184693783246416,
+                                    "deposited_enthalpy_density_j_per_m3": (
+                                        9003163161.571058
+                                    ),
+                                },
+                            }
+                        ],
                     },
                 }
             ],
