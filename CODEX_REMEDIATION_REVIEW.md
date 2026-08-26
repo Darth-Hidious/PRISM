@@ -67,5 +67,11 @@ its source: no iteration ceiling (`needs_follow_up` is set on both tool call and
 tool error), mid-turn compaction that continues rather than ending the turn, and
 user messages preserved verbatim newest-first under a 20,000-token budget.
 
-PRISM has none of these. `agent_loop.rs:2957` applies
-`iteration_cap(config.max_iterations)` — a step ceiling codex does not have.
+PRISM has the first one already, and I overstated the gap when I first wrote
+this. `iteration_cap` treats `0` as unlimited and the default is **200**
+(`types.rs:151`), raised from 20 after a polymer literature question spent 19
+tool calls and got cut off. The doc is explicit: "PRISM does not decide how long
+a research turn is allowed to think; this is a runaway backstop the operator can
+switch off entirely." So the real gaps are the other two — mid-turn compaction
+that continues rather than ending the turn, and user messages preserved verbatim
+newest-first under their own token budget.
