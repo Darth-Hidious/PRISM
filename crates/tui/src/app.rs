@@ -1216,7 +1216,11 @@ impl App {
     /// was sent — so opening a panel costs no extra round trip.
     #[must_use]
     pub fn reference_provenance(&self, id: &str) -> RefProvenance {
-        let mut sources = Vec::new();
+        // The id goes HERE, not in the header. It is provenance — where the
+        // thing lives — not identity a reader scans for, and repeating it at
+        // the top of every panel spent the most visible line on the least
+        // readable string.
+        let mut sources = vec![id.to_string()];
         if let Some(key) = id.strip_prefix("cache://") {
             let key = key.split('/').next().unwrap_or(key);
             if let crate::structures::StructuresStoreState::Ready(rows) = &self.structure_store
@@ -1233,7 +1237,7 @@ impl App {
                 }
             }
         }
-        if sources.is_empty() {
+        if sources.len() == 1 {
             // Not "unknown": PRISM has the structure list or it does not, and
             // saying which is the difference between a gap and a silence.
             sources.push(match &self.structure_store {

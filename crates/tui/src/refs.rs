@@ -208,6 +208,90 @@ fn width_of(s: &str) -> u16 {
     u16::try_from(s.width()).unwrap_or(u16::MAX)
 }
 
+/// How many rows each part of a reference panel gets, decided bottom-up from
+/// what the panel is FOR rather than top-down from the screen.
+///
+/// The panel exists to answer two questions: where did this come from, and
+/// what governs it. So identity, sources and ontology are never cut. The body
+/// — a preview of the thing itself — is sacrificial and elides FIRST, which is
+/// the inverse of the obvious implementation, where clamping the height cuts
+/// whatever happens to be last and that is always the two sections the panel
+/// exists for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefPanelLayout {
+    pub width: u16,
+    pub height: u16,
+    /// Body lines that fit. The rest are counted, never dropped in silence.
+    pub body_shown: usize,
+    /// Source lines that fit.
+    pub sources_shown: usize,
+    /// True when the ontology line survived.
+    pub ontology_shown: bool,
+}
+
+impl RefPanelLayout {
+    /// Body lines withheld, for the marker. Zero means nothing was cut.
+    #[must_use]
+    pub fn body_hidden(&self, body_total: usize) -> usize {
+        body_total.saturating_sub(self.body_shown)
+    }
+    /// Source lines withheld.
+    #[must_use]
+    pub fn sources_hidden(&self, sources_total: usize) -> usize {
+        sources_total.saturating_sub(self.sources_shown)
+    }
+}
+
+/// Plan a panel that always fits.
+///
+/// Pure: takes sizes, returns sizes. Testable as a property across terminal
+/// dimensions we never enumerate, rather than as a snapshot of one.
+#[must_use]
+pub fn plan_ref_panel(
+    area_width: u16,
+    area_height: u16,
+    body_total: usize,
+    sources_total: usize,
+) -> RefPanelLayout {
+    let width = 56.min(area_width.saturating_sub(2)).max(12);
+    // Two borders, the identity line, the "sources" label, the "ontology"
+    // label and its one line. Everything below is spent from what remains.
+    let fixed: u16 = 2 + 1 + 1 + 1 + 1;
+    let budget = area_height.saturating_sub(1);
+
+    // Sources come before the body: they are half the reason the panel exists.
+    let room_after_fixed = budget.saturating_sub(fixed);
+    let sources_shown = (sources_total as u16).min(room_after_fixed) as usize;
+    let sources_hidden = sources_total.saturating_sub(sources_shown);
+    // A "+N more sources" marker costs a row, and only when something is cut.
+    let sources_marker =
+        u16::from(sources_hidden > 0).min(room_after_fixed.saturating_sub(sources_shown as u16));
+
+    let room_for_body = room_after_fixed
+        .saturating_sub(sources_shown as u16)
+        .saturating_sub(sources_marker);
+    // Reserve one row for the elision marker when the body will not fit whole.
+    let body_shown = if (body_total as u16) <= room_for_body {
+        body_total
+    } else {
+        room_for_body.saturating_sub(1) as usize
+    };
+    let body_marker =
+        u16::from(body_total > body_shown).min(room_for_body.saturating_sub(body_shown as u16));
+
+    let height = (fixed + sources_shown as u16 + sources_marker + body_shown as u16 + body_marker)
+        .min(budget);
+    RefPanelLayout {
+        width,
+        height,
+        body_shown,
+        sources_shown,
+        // The ontology line is inside `fixed`, so it survives whenever the
+        // panel has room to exist at all.
+        ontology_shown: height >= fixed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +409,64 @@ mod tests {
         let lines = crate::markdown::markdown_lines("MoNbTaW again.", t, 80);
         let (_, regions) = annotate_references(lines, &reg, t);
         assert_eq!(regions.len(), 1, "one entry, one region: {regions:?}");
+    }
+
+    /// The panel fits at EVERY terminal size, and never cuts anything in
+    /// silence.
+    ///
+    /// A property, not a snapshot: it has to hold for sizes nobody enumerated.
+    /// The failure it guards is the obvious implementation's — clamp the
+    /// height and whatever is last gets cut, which is always `sources` and
+    /// `ontology`, the two things the panel exists to show.
+    #[test]
+    fn the_panel_always_fits_and_never_cuts_in_silence() {
+        const BODY: usize = 30;
+        const SOURCES: usize = 5;
+        for w in [5u16, 20, 40, 80, 120, 200] {
+            for h in [3u16, 10, 16, 24, 40, 60] {
+                let plan = super::plan_ref_panel(w, h, BODY, SOURCES);
+
+                assert!(
+                    plan.height <= h.saturating_sub(1),
+                    "{w}x{h}: panel height {} exceeds the screen",
+                    plan.height
+                );
+                assert!(
+                    plan.width <= w.max(12),
+                    "{w}x{h}: panel width {} exceeds the screen",
+                    plan.width
+                );
+                assert_eq!(
+                    plan.body_shown + plan.body_hidden(BODY),
+                    BODY,
+                    "{w}x{h}: body lines went missing rather than being counted"
+                );
+                assert_eq!(
+                    plan.sources_shown + plan.sources_hidden(SOURCES),
+                    SOURCES,
+                    "{w}x{h}: source lines went missing rather than being counted"
+                );
+                // The body is sacrificial BEFORE the sources are.
+                if plan.sources_hidden(SOURCES) > 0 {
+                    assert_eq!(
+                        plan.body_shown, 0,
+                        "{w}x{h}: cut a source while still showing {} body \
+                         lines — the preview is sacrificial, the provenance is not",
+                        plan.body_shown
+                    );
+                }
+            }
+        }
+    }
+
+    /// With room for everything, everything is shown and nothing is marked as
+    /// withheld — so the elision path cannot mask a permanent truncation.
+    #[test]
+    fn a_large_terminal_shows_the_whole_panel() {
+        let plan = super::plan_ref_panel(200, 60, 30, 5);
+        assert_eq!(plan.body_shown, 30);
+        assert_eq!(plan.sources_shown, 5);
+        assert_eq!(plan.body_hidden(30), 0);
+        assert!(plan.ontology_shown);
     }
 }
