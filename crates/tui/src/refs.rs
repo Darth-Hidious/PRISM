@@ -95,6 +95,56 @@ pub struct RefRegion {
     pub id: String,
 }
 
+/// Find the next machine identifier in `hay` at or after `from`.
+///
+/// Returns `(start, end, canonical_id)`. Models paste these into prose
+/// whatever the system prompt says — and the prompt cannot be relied on,
+/// because the model is swappable. So the TUI recognises them itself.
+fn next_machine_id(hay: &str, from: usize) -> Option<(usize, usize, String)> {
+    const PREFIXES: &[&str] = &["cache://", "file://"];
+    let mut best: Option<(usize, usize, String)> = None;
+    for prefix in PREFIXES {
+        let Some(rel) = hay[from..].find(prefix) else {
+            continue;
+        };
+        let start = from + rel;
+        // Runs to the first character that cannot be part of an id. Trailing
+        // sentence punctuation is deliberately excluded so "…cif." keeps its
+        // full stop in the prose.
+        let rest = &hay[start + prefix.len()..];
+        let len: usize = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+            .map(|(i, c)| i + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        let mut end = start + prefix.len() + len;
+        while end > start && matches!(hay.as_bytes()[end - 1], b'.' | b'-') {
+            end -= 1;
+        }
+        if end <= start + prefix.len() {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(bs, _, _)| start < *bs) {
+            best = Some((start, end, hay[start..end].to_string()));
+        }
+    }
+    best
+}
+
+/// The short form shown in prose for an id PRISM knows.
+///
+/// Deterministic and purely presentational: the full id is never lost, it
+/// lives in the panel the mark opens. The prose stops paying forty hex
+/// characters for something nobody reads character by character.
+#[must_use]
+pub fn id_sigil(id: &str) -> String {
+    let body = id.split_once("://").map(|(_, rest)| rest).unwrap_or(id);
+    let head: String = body.chars().take(8).collect();
+    let scheme = id.split_once("://").map(|(s, _)| s).unwrap_or("id");
+    format!("{scheme}:{head}…")
+}
+
 /// Whether a match at `start..end` inside `hay` stands alone rather than
 /// sitting inside a longer word.
 ///
@@ -148,6 +198,39 @@ pub fn annotate_references(
             let mut cursor = 0usize;
             let mut emitted_any = false;
             loop {
+                // A raw machine id in the prose wins over token matching: it
+                // IS the identity, not a word that stands for one. Known ids
+                // collapse to a sigil and stay pointable; unknown ids are left
+                // exactly as written, and deliberately NOT given the reference
+                // colour — that colour promises a resolvable identity, and
+                // painting an unregistered token with it would be a lie.
+                if let Some((ms, me, id)) = next_machine_id(&text, cursor) {
+                    let known = reg.get(&id).is_some();
+                    if ms > cursor {
+                        let head = text[cursor..ms].to_string();
+                        col += width_of(&head);
+                        spans.push(Span::styled(head, span.style));
+                    }
+                    if known {
+                        let sigil = id_sigil(&id);
+                        let w = width_of(&sigil);
+                        regions.push(RefRegion {
+                            row,
+                            col_start: col,
+                            col_end: col + w,
+                            id: id.clone(),
+                        });
+                        col += w;
+                        spans.push(Span::styled(sigil, style));
+                    } else {
+                        let raw = text[ms..me].to_string();
+                        col += width_of(&raw);
+                        spans.push(Span::styled(raw, span.style));
+                    }
+                    cursor = me;
+                    emitted_any = true;
+                    continue;
+                }
                 let mut best: Option<(usize, usize, &str)> = None;
                 for entry in reg.entries() {
                     for token in &entry.tokens {
@@ -468,5 +551,74 @@ mod tests {
         assert_eq!(plan.sources_shown, 5);
         assert_eq!(plan.body_hidden(30), 0);
         assert!(plan.ontology_shown);
+    }
+
+    /// Every machine id in the prose is accounted for EXACTLY once on screen:
+    /// a known id as a pointable mark, an unknown id verbatim. None vanishes.
+    ///
+    /// This is the layer the guarantee lives at. The model is swappable, so
+    /// nothing may depend on it choosing not to paste ids — a system-prompt
+    /// rule saying "do not print cache refs" was removed for exactly that
+    /// reason. Presentation is the TUI's job, and this asserts it does it.
+    #[test]
+    fn every_machine_id_is_accounted_for_exactly_once() {
+        let t = crate::theme::get(0);
+        let mut reg = super::ReferenceRegistry::default();
+        reg.insert(super::ReferenceEntry {
+            id: "cache://known123/structure.cif".into(),
+            kind: super::RefKind::Structure,
+            tokens: vec!["Cu4".into()],
+        });
+
+        let prose = "Imported cache://known123/structure.cif and also \
+                     cache://unregistered999/structure.cif for comparison.";
+        let lines = crate::markdown::markdown_lines(prose, t, 200);
+        let (out, regions) = super::annotate_references(lines, &reg, t);
+
+        let rendered: String = out
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+            .collect();
+
+        // The known id collapsed, and is pointable, carrying its FULL id.
+        assert_eq!(regions.len(), 1, "one known id, one region: {regions:?}");
+        assert_eq!(regions[0].id, "cache://known123/structure.cif");
+        assert!(
+            !rendered.contains("cache://known123/structure.cif"),
+            "a known id must collapse to a sigil, not keep eating the line: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("cache:known123"),
+            "the sigil must still name the thing: {rendered}"
+        );
+
+        // The unknown id survives EXACTLY as written. Never silently dropped.
+        assert!(
+            rendered.contains("cache://unregistered999/structure.cif"),
+            "an id PRISM does not know must be left verbatim, not hidden: \
+             {rendered}"
+        );
+        // ...and must NOT be dressed as resolvable.
+        assert!(
+            !regions.iter().any(|r| r.id.contains("unregistered")),
+            "an unregistered id must not be given a reference region — the \
+             colour promises an identity PRISM can resolve"
+        );
+    }
+
+    /// The sigil is short, deterministic, and keeps the scheme.
+    #[test]
+    fn the_sigil_is_short_and_says_what_it_points_at() {
+        assert_eq!(
+            super::id_sigil("cache://c1d48df2abc/structure.cif"),
+            "cache:c1d48df2…"
+        );
+        assert_eq!(super::id_sigil("file:///tmp/x/note.md"), "file:/tmp/x/n…");
+        // Same input, same output — nothing time- or state-dependent.
+        assert_eq!(
+            super::id_sigil("cache://abc"),
+            super::id_sigil("cache://abc")
+        );
     }
 }

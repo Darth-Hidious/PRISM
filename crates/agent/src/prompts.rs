@@ -290,7 +290,6 @@ You may be running as a small local model. The harness compensates for that only
 - State confidence with its basis: "the knowledge graph returned this from 3 sources" is different from "commonly reported as ~X, unverified" — make which one it is explicit.
 
 # Result Quality
-- Do not print machine identifiers in prose: `cache://…` refs, job ids, run ids, artifact ids, provenance ids. They are provenance, not the answer, and PRISM already shows them — the reader points at the thing and gets its id and its sources. Naming the thing is what the sentence is for: "imported Cu4, 4 atoms, a = 3.615 Å", not "imported cache://c1d48df2…/structure.cif". If the reader needs one to paste somewhere, give that one id and say what it is for.
 - Cite providers, data sources, and workflow boundaries when they materially affect the answer.
 - Do not hallucinate materials properties, deployment state, job state, or command outcomes.
 - If a platform capability appears unavailable or unhealthy, say so and adapt.
@@ -375,7 +374,6 @@ You may be running as a small local model. The harness compensates for that only
 - State confidence with its basis: "the knowledge graph returned this from 3 sources" is different from "commonly reported as ~X, unverified" — make which one it is explicit.
 
 # Result Quality
-- Do not print machine identifiers in prose: `cache://…` refs, job ids, run ids, artifact ids, provenance ids. They are provenance, not the answer, and PRISM already shows them — the reader points at the thing and gets its id and its sources. Naming the thing is what the sentence is for: "imported Cu4, 4 atoms, a = 3.615 Å", not "imported cache://c1d48df2…/structure.cif". If the reader needs one to paste somewhere, give that one id and say what it is for.
 - Cite providers, data sources, and workflow boundaries when they materially affect the answer.
 - Do not hallucinate materials properties, deployment state, job state, or command outcomes.
 - If a platform capability appears unavailable or unhealthy, say so and adapt.
@@ -1276,38 +1274,6 @@ mod tests {
 
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
         assert!(prompt.contains("external MCP servers"));
-    }
-
-    /// Both prompts must forbid machine identifiers in prose.
-    ///
-    /// The model echoed `cache_ref` out of tool results because it looks like
-    /// a useful id, so replies read "Cache ref: cache://c1d48df2.../structure
-    /// .cif" instead of naming the thing. Those ids are provenance, and PRISM
-    /// already shows them: point at the word and the panel gives the id and
-    /// its sources. Nothing instructed the model to print them, which is why
-    /// only an explicit rule stops it.
-    ///
-    /// Asserted on BOTH prompts because a rule that lands in one is a rule
-    /// the autonomous path does not have.
-    #[test]
-    fn both_prompts_forbid_machine_ids_in_prose() {
-        for (label, prompt) in [
-            ("interactive", INTERACTIVE_PROMPT),
-            ("autonomous", AUTONOMOUS_PROMPT),
-        ] {
-            assert!(
-                prompt.contains("Do not print machine identifiers in prose"),
-                "{label} prompt lets the model paste cache refs and job ids \
-                 into its answers"
-            );
-            // The rule has to SHOW the substitution, not just forbid — a bare
-            // prohibition leaves the model with nothing to say instead.
-            assert!(
-                prompt.contains("imported Cu4, 4 atoms"),
-                "{label} prompt forbids the id without showing what to write \
-                 instead"
-            );
-        }
     }
 
     #[test]
