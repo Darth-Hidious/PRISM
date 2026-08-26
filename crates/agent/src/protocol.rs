@@ -5894,7 +5894,7 @@ fn emit_agent_event(event: AgentEvent) {
                 is_error,
             );
             emit_notification("ui.card", payload);
-            if let Some(object) = object_update_from_result(&tool_name, &content, is_error) {
+            for object in object_updates_from_result(&tool_name, &content, is_error) {
                 emit_notification("ui.object.update", object);
             }
             // When the AGENT ran a notebook cell, mirror it into the human's
@@ -5968,6 +5968,128 @@ fn emit_agent_event(event: AgentEvent) {
 ///
 /// `id` is that identity, so a later result about the same structure or
 /// job updates the row instead of adding a second one.
+/// How many papers one search may register.
+///
+/// A literature search returns 45 or 60 hits; every one of them becoming a row
+/// would bury the structures and jobs the reader is actually tracking. The cap
+/// is on what is REGISTERED, and the tool's own result still lists everything
+/// it found — so this bounds the sidebar, never the search.
+const MAX_PAPER_OBJECTS_PER_SEARCH: usize = 12;
+
+/// Everything in a tool result worth pointing at.
+///
+/// Was `Option<Value>` — exactly one object per call — which is why a search
+/// returning sixty papers produced none. A paper is the thing a reader most
+/// wants to interrogate ("what does this actually say?"), and until now
+/// hovering one resolved to nothing because papers never became objects at all.
+fn object_updates_from_result(tool_name: &str, content: &str, is_error: bool) -> Vec<Value> {
+    if is_error {
+        return Vec::new();
+    }
+    let Some(single) = object_update_from_result(tool_name, content, is_error) else {
+        return papers_from_result(content);
+    };
+    vec![single]
+}
+
+/// One object per paper, carrying what a reader needs to judge it.
+///
+/// The abstract and the link travel in `detail` rather than as new wire fields:
+/// the reference panel renders text, and a paper a human can read the abstract
+/// of and click through to is worth more than a schema change.
+fn papers_from_result(content: &str) -> Vec<Value> {
+    let Ok(parsed) = serde_json::from_str::<Value>(content) else {
+        return Vec::new();
+    };
+    let Some(results) = parsed.get("results").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in results {
+        if out.len() >= MAX_PAPER_OBJECTS_PER_SEARCH {
+            break;
+        }
+        let Some(paper) = entry.as_object() else {
+            continue;
+        };
+        if paper.get("type").and_then(Value::as_str) != Some("paper") {
+            continue;
+        }
+        let field = |name: &str| {
+            paper
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let title = match field("title") {
+            Some(title) => title,
+            // A paper with no title cannot be labelled, and a row reading
+            // "untitled" is not a reference to anything.
+            None => continue,
+        };
+        // Prefer the DOI: it is the paper's identity everywhere else in the
+        // system, so a fact ingested from it and this row agree on who they
+        // are talking about. The URL is a fallback identity, not a preference.
+        let Some(id) = field("doi")
+            .map(|doi| format!("doi:{doi}"))
+            .or_else(|| field("url").map(str::to_string))
+        else {
+            continue;
+        };
+
+        let mut detail = String::new();
+        let authors: Vec<&str> = paper
+            .get("authors")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_str).take(4).collect())
+            .unwrap_or_default();
+        if !authors.is_empty() {
+            detail.push_str(&authors.join(", "));
+            if paper
+                .get("authors")
+                .and_then(Value::as_array)
+                .is_some_and(|list| list.len() > 4)
+            {
+                detail.push_str(" et al.");
+            }
+        }
+        if let Some(year) = paper.get("year").and_then(Value::as_i64) {
+            detail.push_str(&format!(" ({year})"));
+        }
+        if let Some(journal) = field("journal") {
+            if !detail.is_empty() {
+                detail.push_str(" · ");
+            }
+            detail.push_str(journal);
+        }
+        if let Some(abstract_text) = field("abstract") {
+            if !detail.is_empty() {
+                detail.push_str("\n\n");
+            }
+            detail.push_str(abstract_text);
+        }
+        // Last, so it survives truncation of a long abstract: the link is the
+        // one part the reader cannot reconstruct for themselves.
+        if let Some(url) = field("fulltext_url").or_else(|| field("url")) {
+            if !detail.is_empty() {
+                detail.push_str("\n\n");
+            }
+            detail.push_str(url);
+        }
+
+        out.push(serde_json::json!({
+            "id": id,
+            "kind": "paper",
+            "label": title,
+            // It was found and read back; nothing about it is in flight.
+            "status": "completed",
+            "detail": detail,
+        }));
+    }
+    out
+}
+
 fn object_update_from_result(tool_name: &str, content: &str, is_error: bool) -> Option<Value> {
     if is_error {
         return None;
@@ -11195,6 +11317,104 @@ mod browse_slash_tests {
             2,
             "a bare array still resolves"
         );
+    }
+}
+
+#[cfg(test)]
+mod paper_object_tests {
+    use super::*;
+
+    fn search_result() -> String {
+        serde_json::json!({
+            "count": 2,
+            "source": "literature",
+            "results": [
+                {
+                    "type": "paper",
+                    "title": "Oxidation of Nb-based alloys in oxygen-rich combustion",
+                    "authors": ["A Reyes", "B Okonkwo", "C Lindqvist", "D Mehta", "E Farouk"],
+                    "year": 2021,
+                    "journal": "Acta Materialia",
+                    "doi": "10.1016/j.actamat.2021.00001",
+                    "abstract": "We report isothermal oxidation kinetics of three Nb-Si alloys.",
+                    "url": "https://doi.org/10.1016/j.actamat.2021.00001",
+                    "fulltext_url": "https://example.org/full.pdf"
+                },
+                { "type": "paper", "title": "No identity here" },
+                { "type": "structure", "title": "not a paper" }
+            ]
+        })
+        .to_string()
+    }
+
+    /// A literature search returning sixty papers produced ZERO objects, because
+    /// the derivation returned at most one thing per call. A paper is the thing
+    /// a reader most wants to interrogate, and hovering one resolved to nothing.
+    #[test]
+    fn a_search_registers_its_papers() {
+        let objects = object_updates_from_result("prior_art_search", &search_result(), false);
+        assert_eq!(objects.len(), 1, "one paper is identifiable: {objects:?}");
+        let paper = &objects[0];
+        assert_eq!(paper["kind"], "paper");
+        assert_eq!(paper["id"], "doi:10.1016/j.actamat.2021.00001");
+        assert_eq!(
+            paper["label"], "Oxidation of Nb-based alloys in oxygen-rich combustion",
+            "the label is the title, because that is the word that stands for it in prose"
+        );
+    }
+
+    /// The panel exists to answer "what does this actually say?" — so the
+    /// abstract and a link the reader can click must both survive.
+    #[test]
+    fn the_detail_carries_what_a_reader_needs_to_judge_it() {
+        let objects = object_updates_from_result("prior_art_search", &search_result(), false);
+        let detail = objects[0]["detail"].as_str().expect("detail");
+        assert!(detail.contains("A Reyes"), "{detail}");
+        assert!(
+            detail.contains("et al."),
+            "five authors is not four: {detail}"
+        );
+        assert!(detail.contains("(2021)"), "{detail}");
+        assert!(detail.contains("Acta Materialia"), "{detail}");
+        assert!(detail.contains("isothermal oxidation kinetics"), "{detail}");
+        assert!(
+            detail.trim_end().ends_with("https://example.org/full.pdf"),
+            "the link goes LAST so it survives a long abstract being cut: {detail}"
+        );
+    }
+
+    /// A paper with neither DOI nor URL cannot be addressed, and a row that
+    /// cannot be pointed at is worse than no row.
+    #[test]
+    fn a_paper_with_no_identity_is_not_registered() {
+        let objects = object_updates_from_result("prior_art_search", &search_result(), false);
+        assert!(objects.iter().all(|o| o["label"] != "No identity here"));
+    }
+
+    /// Sixty hits must not bury the structures and jobs the reader is tracking.
+    /// The cap bounds the SIDEBAR; the tool's own result still lists everything.
+    #[test]
+    fn a_large_search_is_capped() {
+        let many: Vec<Value> = (0..40)
+            .map(|n| {
+                serde_json::json!({
+                    "type": "paper",
+                    "title": format!("Paper {n}"),
+                    "doi": format!("10.0000/{n}")
+                })
+            })
+            .collect();
+        let content = serde_json::json!({ "results": many }).to_string();
+        let objects = object_updates_from_result("prior_art_search", &content, false);
+        assert_eq!(objects.len(), MAX_PAPER_OBJECTS_PER_SEARCH);
+    }
+
+    /// A failed search must not populate the sidebar with its own error.
+    #[test]
+    fn a_failed_search_registers_nothing() {
+        let content = serde_json::json!({ "error": "upstream 503", "results": [] }).to_string();
+        assert!(object_updates_from_result("prior_art_search", &content, true).is_empty());
+        assert!(object_updates_from_result("prior_art_search", &content, false).is_empty());
     }
 }
 

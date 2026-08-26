@@ -1486,6 +1486,26 @@ impl App {
                     Err(e) => RefPanelState::Failed(format!("{path}: {e}")),
                 }
             }
+            Some(crate::refs::RefKind::Doi) => {
+                // Answered from the object the search already produced: its
+                // label is the title and its detail carries authors, journal,
+                // the abstract and the link. No fetch, so hovering a paper
+                // cannot cost a round trip or disagree with the row the reader
+                // is looking at.
+                let Some(object) = self.objects.iter().find(|o| o.id == id) else {
+                    return RefPanelState::Failed(format!(
+                        "no paper recorded under {id} in this session"
+                    ));
+                };
+                let mut body = object.label.clone();
+                if let Some(detail) = &object.detail
+                    && !detail.trim().is_empty()
+                {
+                    body.push_str("\n\n");
+                    body.push_str(detail);
+                }
+                RefPanelState::Ready(body)
+            }
             Some(crate::refs::RefKind::Tool) => {
                 let Some(name) = id.strip_prefix("tool://") else {
                     return RefPanelState::Failed(format!("not a tool ref: {id}"));
@@ -1495,9 +1515,6 @@ impl App {
                 // and cannot disagree with what the reader was shown.
                 RefPanelState::Ready(self.tool_reference_report(name))
             }
-            Some(other) => RefPanelState::NotResolvable(format!(
-                "{other:?} references are recorded but cannot be opened yet"
-            )),
             None => {
                 RefPanelState::NotResolvable("this reference is no longer registered".to_string())
             }

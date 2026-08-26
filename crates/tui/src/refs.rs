@@ -341,8 +341,16 @@ pub fn plan_ref_panel(
     area_height: u16,
     body_total: usize,
     sources_total: usize,
+    preferred_width: u16,
 ) -> RefPanelLayout {
-    let width = 56.min(area_width.saturating_sub(2)).max(12);
+    // The caller asks for what its content needs — an abstract is prose and
+    // reads badly at the 56 columns that suit a cache key or a file path — and
+    // the terminal still decides. `preferred_width` can only ever be reduced
+    // here, never granted beyond what fits.
+    let width = preferred_width
+        .max(12)
+        .min(area_width.saturating_sub(2))
+        .max(12);
     // Two borders, the identity line, the "sources" label, the "ontology"
     // label and its one line. Everything below is spent from what remains.
     let fixed: u16 = 2 + 1 + 1 + 1 + 1;
@@ -513,7 +521,7 @@ mod tests {
         const SOURCES: usize = 5;
         for w in [5u16, 20, 40, 80, 120, 200] {
             for h in [3u16, 10, 16, 24, 40, 60] {
-                let plan = super::plan_ref_panel(w, h, BODY, SOURCES);
+                let plan = super::plan_ref_panel(w, h, BODY, SOURCES, 56);
 
                 assert!(
                     plan.height <= h.saturating_sub(1),
@@ -552,7 +560,7 @@ mod tests {
     /// withheld — so the elision path cannot mask a permanent truncation.
     #[test]
     fn a_large_terminal_shows_the_whole_panel() {
-        let plan = super::plan_ref_panel(200, 60, 30, 5);
+        let plan = super::plan_ref_panel(200, 60, 30, 5, 56);
         assert_eq!(plan.body_shown, 30);
         assert_eq!(plan.sources_shown, 5);
         assert_eq!(plan.body_hidden(30), 0);

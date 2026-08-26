@@ -4841,7 +4841,20 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     // screen. Identity, sources and ontology are never cut; the body preview
     // is sacrificial and elides first, with the remainder counted on screen.
     let prov = app.reference_provenance(&panel.id);
-    let plan = crate::refs::plan_ref_panel(area.width, area.height, body.len(), prov.sources.len());
+    // A paper's panel is the one a reader actually reads: title, authors,
+    // abstract, link. 56 columns is right for a cache key and wrong for prose,
+    // so papers ask for more and the terminal grants what it can.
+    let preferred_width = match panel.kind {
+        Some(crate::refs::RefKind::Doi) => 92,
+        _ => 56,
+    };
+    let plan = crate::refs::plan_ref_panel(
+        area.width,
+        area.height,
+        body.len(),
+        prov.sources.len(),
+        preferred_width,
+    );
     let height = plan.height;
 
     // Prefer below-right of the pointer; flip when that would fall off.

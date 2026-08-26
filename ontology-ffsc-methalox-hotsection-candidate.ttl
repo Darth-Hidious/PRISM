@@ -1,0 +1,51 @@
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix prism: <https://prism.mirdyne.com/ontology/meta#> .
+@prefix : <https://prism.mirdyne.com/ontology/ffsc-methalox-hotsection#> .
+
+<https://prism.mirdyne.com/ontology/ffsc-methalox-hotsection> a owl:Ontology ;
+    owl:versionIRI <https://prism.mirdyne.com/ontology/ffsc-methalox-hotsection/version/.38530771> ;
+    rdfs:label "ffsc-methalox-hotsection"@en ;
+    prism:domain "ffsc-methalox-hotsection" ;
+    prism:status "draft" ;
+    dcterms:created "2026-08-26T22:50:04Z"^^xsd:dateTime ;
+    prov:wasGeneratedBy :inductionRun .
+
+:inductionRun a prov:Activity ;
+    rdfs:label "PRISM ontology induction"@en ;
+    prism:model "ontology-proposal-governance" ;
+    prism:promptVersion "" ;
+    prism:corpusHash "sha256:385307712d912c5b055c042f2c43d108b2f0600894d27e6ba70c60e05ff8334d" ;
+    prism:documentsTotal 0 ;
+    prism:documentsFailed 0 ;
+    prism:windowsRead 0 ;
+    prism:windowsAttempted 0 ;
+    prism:malformedItems 0 ;
+    prism:semanticValidation "{\"policy\":{\"enabled\":true,\"maximum_cosine_distance\":0.08,\"maximum_normalized_edit_distance\":0.2,\"maximum_neighbors_per_entity\":8,\"maximum_findings\":20},\"proposals\":[],\"near_duplicates\":{\"status\":\"unavailable\",\"candidates\":0,\"evaluated\":0,\"passed\":null,\"findings\":[],\"message\":\"legacy ontology artifact carries no semantic validation report\"}}" .
+
+:BiDirectionalSwirlCoaxialInjectorElement a owl:Class ;
+    skos:prefLabel "bi-directional swirl coaxial injector element"@en ;
+    rdfs:comment "Injector element design in which oxidizer flows through a central passage and fuel through an annular passage, with counter-rotating swirl components imparted by tangential oxidizer entry and helical vanes in the fuel passage, often with positive oxidizer-post recess. Used in the seven-element LOx-methane rocket combustor studied here."@en ;
+    rdfs:subClassOf :PhysicalObject ;
+    skos:exactMatch <https://w3id.org/emmo#BiDirectionalSwirlCoaxialInjectorElement> .
+
+:PhysicalObject a owl:Class ;
+    skos:prefLabel "PhysicalObject"@en ;
+    prism:alignment "unmatched" ;
+    prism:declaredByReference true .
+
+:Process a owl:Class ;
+    skos:prefLabel "Process"@en ;
+    prism:alignment "unmatched" ;
+    prism:declaredByReference true .
+
+:SelfSustainedHighFrequencyCombustionInstabilityLimitCycle a owl:Class ;
+    skos:prefLabel "self-sustained high-frequency combustion instability limit cycle"@en ;
+    rdfs:comment "Self-sustained, high-amplitude thermoacoustic oscillation (limit cycle) driven by coupling between unsteady heat release and chamber longitudinal acoustic modes, triggered in supercritical LOx-methane combustion when the fuel injection temperature falls below a critical boundary (about 219 K here), accompanied by reduced fuel-to-oxidizer velocity ratio and incomplete combustion signatures."@en ;
+    rdfs:subClassOf :Process ;
+    skos:exactMatch <https://w3id.org/emmo#SelfSustainedLongitudinalCombustionInstability> .
+
