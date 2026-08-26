@@ -1247,6 +1247,72 @@ impl App {
         }
     }
 
+    /// Register every tool the agent has run as a reference.
+    ///
+    /// A tool name is the word a reader is most likely to point at — it is
+    /// literally the answer to "why did it do that?" — and until now it was
+    /// the one coloured word on screen that resolved to nothing. The identity
+    /// is the tool's own name, which the ENGINE produced by dispatching it,
+    /// never a name a model wrote in prose.
+    fn register_tool_references(&mut self) {
+        let names: std::collections::BTreeSet<String> = self
+            .messages
+            .iter()
+            .filter_map(|m| match &m.kind {
+                LineKind::ToolResult { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
+            })
+            .filter(|n| !n.is_empty())
+            .collect();
+        for name in names {
+            self.references.insert(crate::refs::ReferenceEntry {
+                id: format!("tool://{name}"),
+                kind: crate::refs::RefKind::Tool,
+                tokens: vec![name],
+            });
+        }
+    }
+
+    /// Everything this session knows about one tool, read from the transcript.
+    ///
+    /// No round trip: the calls are already in `messages`, so the panel that
+    /// answers "why did it run this?" is assembled from what the reader has
+    /// already been shown rather than from a fresh query that could disagree
+    /// with it.
+    fn tool_reference_report(&self, name: &str) -> String {
+        let mut calls: Vec<(usize, &str, u64, bool)> = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            if let LineKind::ToolResult {
+                tool_name,
+                content,
+                elapsed_ms,
+                success,
+                ..
+            } = &message.kind
+                && tool_name == name
+            {
+                calls.push((index, content.as_str(), *elapsed_ms, *success));
+            }
+        }
+        if calls.is_empty() {
+            return format!("{name}\n\nNo completed call in this session.");
+        }
+        let mut out = format!(
+            "{name}\n\ncalled {} time{} this session\n",
+            calls.len(),
+            if calls.len() == 1 { "" } else { "s" }
+        );
+        for (n, (_, content, elapsed, ok)) in calls.iter().enumerate() {
+            let status = if *ok { "ok" } else { "FAILED" };
+            let summary: String = content.lines().take(6).collect::<Vec<_>>().join("\n  ");
+            out.push_str(&format!(
+                "\n#{} · {status} · {elapsed}ms\n  {summary}\n",
+                n + 1
+            ));
+        }
+        out
+    }
+
     /// Where a reference came from and where it sits in the ontology.
     ///
     /// Reads what PRISM already holds — the structure list the Structures tab
@@ -1364,6 +1430,15 @@ impl App {
                     Ok(text) => RefPanelState::Ready(text),
                     Err(e) => RefPanelState::Failed(format!("{path}: {e}")),
                 }
+            }
+            Some(crate::refs::RefKind::Tool) => {
+                let Some(name) = id.strip_prefix("tool://") else {
+                    return RefPanelState::Failed(format!("not a tool ref: {id}"));
+                };
+                // Answered from the transcript, like FileLine is answered from
+                // disk: the calls are already here, so this costs no round trip
+                // and cannot disagree with what the reader was shown.
+                RefPanelState::Ready(self.tool_reference_report(name))
             }
             Some(other) => RefPanelState::NotResolvable(format!(
                 "{other:?} references are recorded but cannot be opened yet"
@@ -5360,6 +5435,7 @@ impl App {
         if matches!(line.kind, LineKind::ToolResult { .. }) {
             self.push_message_inner(line);
             self.register_file_references();
+            self.register_tool_references();
             return;
         }
         self.push_message_inner(line);
@@ -5991,6 +6067,60 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A tool name is the word a reader points at to ask "why did it do that?".
+    /// Until tools were registered it was the one coloured word on screen that
+    /// resolved to nothing, so hovering it did nothing at all.
+    #[test]
+    fn a_tool_the_agent_ran_is_hoverable_and_reports_its_calls() {
+        let mut app = fresh();
+        for (elapsed, ok, body) in [(120u64, true, "5 results"), (90, false, "upstream 404")] {
+            app.push_message(ChatLine {
+                role: Role::Tool,
+                text: "lookup_structure".to_string(),
+                kind: LineKind::ToolResult {
+                    tool_name: "lookup_structure".to_string(),
+                    content: body.to_string(),
+                    elapsed_ms: elapsed,
+                    success: ok,
+                    evidence_class: prism_provenance::emmo::EvidenceClass::Indeterminate,
+                    image_paths: Vec::new(),
+                },
+            });
+        }
+        app.register_tool_references();
+
+        let found = app
+            .references
+            .get("tool://lookup_structure")
+            .expect("the tool the agent ran must be a resolvable reference");
+        assert_eq!(found.kind, crate::refs::RefKind::Tool);
+        assert!(
+            found.tokens.iter().any(|t| t == "lookup_structure"),
+            "the word in prose that stands for it must be the tool's own name"
+        );
+
+        let report = app.tool_reference_report("lookup_structure");
+        assert!(report.contains("called 2 times"), "{report}");
+        assert!(
+            report.contains("5 results"),
+            "the outcome is shown: {report}"
+        );
+        assert!(
+            report.contains("FAILED"),
+            "a failed call must not read as a success: {report}"
+        );
+        assert!(report.contains("120ms"), "how long it took: {report}");
+    }
+
+    /// A tool that never ran must say so rather than render an empty panel —
+    /// an empty box and an unanswerable one look identical to a reader.
+    #[test]
+    fn a_tool_with_no_calls_says_so_instead_of_showing_nothing() {
+        let app = fresh();
+        let report = app.tool_reference_report("never_called");
+        assert!(report.contains("No completed call"), "{report}");
     }
 
     fn fresh() -> App {

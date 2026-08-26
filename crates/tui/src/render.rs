@@ -689,6 +689,24 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // the paragraph measures itself below without cloning anything.
     let tail_rows = (prev > 0).then(|| acc.saturating_add(measure(&lines[prev..])));
 
+    // A clicked line is MARKED, not merely remembered. Selection was stored
+    // and never drawn, so pointing at a line looked like nothing happened —
+    // the reader had no way to know the app had heard them.
+    //
+    // Style only: no span is added or removed, because the reference marks and
+    // the hit map are both computed from column positions on these same lines,
+    // and a one-cell shift would send every hover to the wrong word.
+    if let Some((selected_message, selected_text)) = &app.selected_line
+        && let Some((line_index, _, _)) = line_rows
+            .iter()
+            .find(|(_, message, text)| message == selected_message && text == selected_text)
+        && let Some(line) = lines.get_mut(*line_index)
+    {
+        for span in &mut line.spans {
+            span.style = span.style.bg(t.panel).add_modifier(Modifier::BOLD);
+        }
+    }
+
     let paragraph = Paragraph::new(lines)
         .style(Style::default().bg(t.overlay_bg))
         .wrap(Wrap { trim: false });
@@ -930,6 +948,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     spans.push(Span::styled(focus_indicator, Style::default().fg(t.warn)));
+    // What the reader can do with the line they just clicked. Selection is
+    // only half of pointing: without this the mark appears and the reader is
+    // left to guess what it bought them.
+    if app.selected_line.is_some() {
+        spans.push(Span::styled(
+            "   e ask about this line · Esc clear",
+            Style::default().fg(t.reference),
+        ));
+    }
     spans.push(Span::styled("   Ctrl-C quit", Style::default().fg(t.muted)));
 
     let line = Line::from(spans);
@@ -4831,6 +4858,7 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
                 Some(crate::refs::RefKind::Structure) => "  structure",
                 Some(crate::refs::RefKind::Doi) => "  paper",
                 Some(crate::refs::RefKind::FileLine) => "  source",
+                Some(crate::refs::RefKind::Tool) => "  tool",
                 None => "  unregistered",
             },
             Style::default().fg(t.muted),

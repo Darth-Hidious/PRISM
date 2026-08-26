@@ -39,6 +39,12 @@ pub enum RefKind {
     Doi,
     /// A place in the source, `path:line`.
     FileLine,
+    /// A tool the agent ran (`tool://lookup_structure`).
+    ///
+    /// A tool name is the most-pointed-at word on the screen — it is what the
+    /// reader sees when they ask "why did it do that?" — and it was the only
+    /// coloured word that resolved to nothing.
+    Tool,
 }
 
 /// One referenceable thing, and the words that stand for it in prose.
