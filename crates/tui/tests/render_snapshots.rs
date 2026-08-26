@@ -2612,3 +2612,88 @@ fn input_is_never_routed_to_a_sidebar_that_is_not_drawn() {
          dropped; got:\n{rendered}"
     );
 }
+
+/// B4 end to end: a tool result makes a word in the reply referenceable.
+///
+/// The agent already knew the identity of what it made — a structure's
+/// `cache://…` — and the prose arrived as flat text, so a reader who saw
+/// "MoNbTaW" had no way to ask what it was. Now the engine's own object
+/// notification registers the identity, and the renderer marks the word and
+/// records where it landed.
+///
+/// Nothing is resolved here, deliberately: the hit target carries only the id.
+/// What it points at is fetched when the pointer arrives, not now.
+#[test]
+fn a_tool_result_makes_its_word_referenceable_in_the_reply() {
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    // The engine reports what it made — exactly what protocol.rs emits after a
+    // tool returns a cache_ref.
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://e129a2e9d3".into(),
+        kind: "structure".into(),
+        label: "MoNbTaW".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "The MoNbTaW cell relaxed cleanly.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+
+    let rendered = render_app_to_string(&app, 120, 30);
+    assert!(
+        rendered.contains("MoNbTaW"),
+        "the reply must still read normally; got:\n{rendered}"
+    );
+
+    // The word claims its own cells, and they resolve to the id — not to the
+    // surrounding message.
+    let map = app.hit_map.borrow();
+    let mut found: Option<String> = None;
+    'outer: for row in 0..30u16 {
+        for col in 0..120u16 {
+            if let Some(HitTarget::Reference { id }) = map.at(col, row) {
+                found = Some(id.clone());
+                break 'outer;
+            }
+        }
+    }
+    assert_eq!(
+        found.as_deref(),
+        Some("cache://e129a2e9d3"),
+        "the marked word must resolve to the id the engine reported, so hover \
+         can fetch it later; the map holds {} regions",
+        map.len()
+    );
+}
+
+/// A word nothing produced is not a reference.
+///
+/// Guards the false-positive direction: if every capitalised token became a
+/// mark, the transcript would be a field of orange and pointing would mean
+/// nothing.
+#[test]
+fn prose_with_no_registered_object_has_no_reference_regions() {
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "The MoNbTaW cell relaxed cleanly.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 120, 30);
+
+    let map = app.hit_map.borrow();
+    for row in 0..30u16 {
+        for col in 0..120u16 {
+            assert!(
+                !matches!(map.at(col, row), Some(HitTarget::Reference { .. })),
+                "nothing was registered, so no cell may claim to be a reference"
+            );
+        }
+    }
+}

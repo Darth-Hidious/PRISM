@@ -721,6 +721,13 @@ pub struct App {
     /// know that on its own. Recorded here so key routing can refuse to send
     /// input to a pane nobody can see.
     pub sidebar_visible: std::cell::Cell<bool>,
+    /// Words in the transcript that are backed by something openable.
+    ///
+    /// Filled from tool results as they arrive — an identity the ENGINE
+    /// produced, never something a model was asked to write. Holds ids and the
+    /// words that stand for them, never payloads: what a reference points at
+    /// is fetched when the pointer lands on it.
+    pub references: crate::refs::ReferenceRegistry,
     /// Put the newest user turn at the TOP of the viewport instead of pinning
     /// to the last line.
     ///
@@ -863,6 +870,7 @@ impl App {
             view_max_scroll: std::cell::Cell::new(0),
             view_scroll: std::cell::Cell::new(0),
             sidebar_visible: std::cell::Cell::new(true),
+            references: crate::refs::ReferenceRegistry::default(),
             anchor_user_turn: std::cell::Cell::new(false),
             hit_map: std::cell::RefCell::new(crate::hit_map::HitMap::default()),
             hovered: None,
@@ -4972,6 +4980,23 @@ impl App {
                 // collapses onto ONE row, so two unrelated simulations would
                 // overwrite each other's status and progress in front of the
                 // user. An unaddressable update is dropped, not guessed at.
+                // Every object the engine reports is referenceable: its id
+                // is what hover resolves, its label is the word that stands
+                // for it in prose. Registered before the empty-id guard below
+                // returns, because an object with no id is not addressable
+                // either way.
+                if !id.trim().is_empty() && !label.trim().is_empty() {
+                    let ref_kind = match kind.as_str() {
+                        "structure" => crate::refs::RefKind::Structure,
+                        "paper" | "doi" => crate::refs::RefKind::Doi,
+                        _ => crate::refs::RefKind::FileLine,
+                    };
+                    self.references.insert(crate::refs::ReferenceEntry {
+                        id: id.clone(),
+                        kind: ref_kind,
+                        tokens: vec![label.clone()],
+                    });
+                }
                 if id.trim().is_empty() {
                     return;
                 }

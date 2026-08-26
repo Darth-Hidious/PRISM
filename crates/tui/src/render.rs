@@ -321,6 +321,10 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // Where each message starts, so a click or a selection can say WHICH
     // message it landed in — the thing that makes "explain this line" possible.
     let mut message_lines: Vec<(usize, usize)> = Vec::new();
+    // Reference marks: (index in `lines`, col_start, col_end, id). Screen rows
+    // are resolved after the wrapped-row measurement below, the same way
+    // figures and the anchor are.
+    let mut reference_marks: Vec<(usize, u16, u16, String)> = Vec::new();
 
     for (idx, msg) in app.messages.iter().enumerate() {
         message_lines.push((lines.len(), idx));
@@ -382,9 +386,29 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     "◆ PRISM",
                     Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                 )));
-                for md in markdown::markdown_lines(&msg.text, t, area.width.saturating_sub(2)) {
+                // Mark the words backed by something openable. Coordinates
+                // come back in the coordinates of the ANNOTATED lines, so the
+                // two-space indent below is added to `col_start` rather than
+                // being present while matching — mixing those up would shift
+                // every region two cells left and hover the wrong word.
+                let (annotated, refs) = crate::refs::annotate_references(
+                    markdown::markdown_lines(&msg.text, t, area.width.saturating_sub(2)),
+                    &app.references,
+                    t,
+                );
+                for (n, md) in annotated.into_iter().enumerate() {
                     let mut spans = vec![Span::raw("  ")];
                     spans.extend(md.spans);
+                    // `lines.len()` is this line's index BEFORE the push, which
+                    // is what the wrapped-row measurement downstream keys on.
+                    for r in refs.iter().filter(|r| r.row == n) {
+                        reference_marks.push((
+                            lines.len(),
+                            r.col_start + 2,
+                            r.col_end + 2,
+                            r.id.clone(),
+                        ));
+                    }
                     lines.push(Line::from(spans));
                 }
             }
@@ -682,6 +706,30 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     bottom - top,
                 ),
                 HitTarget::TranscriptMessage { index: *index },
+            );
+        }
+        // Reference marks go in AFTER the message regions that contain them.
+        // `HitMap::at` searches newest-first, so a marked word answers for its
+        // own cells while the rest of the reply still answers as a message —
+        // pointing at the word gets the reference, pointing beside it gets the
+        // message.
+        for (line, col_start, col_end, id) in &reference_marks {
+            let row = rows_for(*line);
+            if row < effective_scroll || row >= effective_scroll.saturating_add(area.height) {
+                continue;
+            }
+            let width = col_end.saturating_sub(*col_start);
+            if width == 0 || *col_start >= area.width {
+                continue;
+            }
+            map.push(
+                Rect::new(
+                    area.x + col_start,
+                    area.y + (row - effective_scroll),
+                    width.min(area.width - col_start),
+                    1,
+                ),
+                HitTarget::Reference { id: id.clone() },
             );
         }
     }

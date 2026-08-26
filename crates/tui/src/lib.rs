@@ -44,6 +44,7 @@ pub mod latex;
 pub mod markdown;
 pub mod msg;
 pub mod notebook;
+pub mod refs;
 /// Render module — public for integration snapshot tests only.
 ///
 /// This module is NOT stable API. It exists as `pub` so that the
