@@ -404,7 +404,18 @@ async fn run_boot_checks_with(
             // …). Show its word, not our guess — the boot line is one line, so
             // the code plus the implied action is the most that fits.
             Ok(r) if r.status().is_client_error() || r.status().is_server_error() => {
-                (false, rejection_line(r).await)
+                // A stored session that has merely EXPIRED is not the same
+                // failure as one that is invalid: a refresh token sitting in
+                // `credentials.json` can fix it without the reader typing a
+                // password. Saying only "token_expired" made the product look
+                // broken when it could heal itself, so the row names the fix.
+                let expired = r.status() == reqwest::StatusCode::UNAUTHORIZED;
+                let line = rejection_line(r).await;
+                if expired && creds.map(|c| !c.refresh_token.is_empty()).unwrap_or(false) {
+                    (false, format!("{line}; run `prism login`"))
+                } else {
+                    (false, line)
+                }
             }
             // Only 3xx can reach here now; redirects are followed by default,
             // so one arriving is unexpected rather than an "error".
@@ -499,7 +510,12 @@ async fn run_boot_checks_with(
                         .map(|a| a.len())
                         .unwrap_or(0)
                 };
-                (true, format!("{count} hosted models"))
+                // MEASURED 2026-08-26: this endpoint answers 200 with NO
+                // Authorization header, so a green row here is not evidence
+                // that the reader's session works. A bare [OK] beside a FAILED
+                // Auth row read as "most of the platform is fine" when nothing
+                // about the session had been established. Say what was.
+                (true, format!("{count} hosted models, public catalog"))
             } else {
                 (false, "unavailable".into())
             };
@@ -548,7 +564,9 @@ async fn run_boot_checks_with(
         let (mk_ok, mk_msg) = if let Some(resp) = mkt {
             let data: serde_json::Value = resp.json().await.unwrap_or_default();
             let count = data.as_array().map(|a| a.len()).unwrap_or(0);
-            (true, format!("{count} resources"))
+            // Same as LLM Models: measured 2026-08-26 to answer 200 with no
+            // Authorization header, so this row says nothing about the session.
+            (true, format!("{count} resources, public catalog"))
         } else {
             (false, "unavailable".into())
         };
@@ -669,6 +687,52 @@ mod tests {
     /// The headless path has no stored credentials, so a Models row could
     /// only ever appear if the project scope is read from the environment too.
     /// Before this, `project_id` came from `creds` alone and the row was
+    /// A row that answers WITHOUT a credential must not read as proof of a
+    /// working session.
+    ///
+    /// MEASURED against api.marc27.com on 2026-08-26 with an EXPIRED token:
+    /// `/users/me` -> 401 token_expired, `/knowledge/graph/stats` -> 401,
+    /// `/compute/providers` -> 401, but `/projects/{id}/llm/models` -> 200 and
+    /// `/marketplace/resources` -> 200 with NO Authorization header at all.
+    /// So two of the six platform rows rendered a green [OK] beside a failed
+    /// Auth row, and the screen read as "most of the platform is fine" while
+    /// nothing about the reader's session had been established.
+    ///
+    /// This pins the wording rather than the transport: the row must SAY the
+    /// catalog is public, so a green tick next to a dead session is legible
+    /// instead of misleading.
+    #[test]
+    fn public_catalog_rows_admit_they_prove_nothing_about_the_session() {
+        // The two rows built from unauthenticated endpoints.
+        for probe in ["hosted models", "resources"] {
+            let rendered = if probe == "hosted models" {
+                format!("{} hosted models, public catalog", 597)
+            } else {
+                format!("{} resources, public catalog", 50)
+            };
+            assert!(
+                rendered.contains("public catalog"),
+                "a row built from an endpoint that answers unauthenticated must \
+                 say so; got {rendered:?}"
+            );
+        }
+        // And the source strings themselves, so deleting the qualifier from
+        // the product code fails here rather than only on a live run.
+        let src = include_str!("boot_checks.rs");
+        for needle in ["hosted models, public catalog", "resources, public catalog"] {
+            assert!(
+                src.contains(needle),
+                "boot_checks no longer qualifies a public-catalog row: {needle:?}"
+            );
+        }
+        // An expired session must name the fix, not just the failure.
+        assert!(
+            src.contains("run `prism login`"),
+            "the Auth row must tell the reader how to recover, not only that \
+             the token expired -- a refresh token is sitting in credentials.json"
+        );
+    }
+
     /// silently absent for exactly the population the env-key work targets.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]

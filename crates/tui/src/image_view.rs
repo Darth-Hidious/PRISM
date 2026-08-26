@@ -51,6 +51,25 @@ impl ImageDrawError {
 /// Times [`ImageView::detect`] has queried the terminal this process.
 static DETECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether PRISM is running inside tmux or GNU screen.
+///
+/// Both refuse to forward a terminal graphics query unless passthrough is
+/// configured, so asking is a guaranteed 2s stall plus an orphaned thread that
+/// disables raw mode after the fact.
+fn in_multiplexer() -> bool {
+    multiplexer_from(
+        std::env::var_os("TMUX").is_some(),
+        std::env::var_os("STY").is_some(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+/// The rule itself, taking its inputs rather than reading the environment, so
+/// it can be tested without racing every other test for the process env.
+fn multiplexer_from(tmux: bool, sty: bool, term: Option<&str>) -> bool {
+    tmux || sty || term.is_some_and(|t| t.starts_with("screen") || t.starts_with("tmux"))
+}
+
 /// Terminal graphics capability plus a decode cache.
 ///
 /// One per app. [`Picker::from_query_stdio`] talks to the terminal with escape
@@ -87,7 +106,25 @@ impl ImageView {
     #[must_use]
     pub fn detect() -> Self {
         DETECTIONS.fetch_add(1, Ordering::Relaxed);
-        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        // Inside a multiplexer the query is not just useless, it is HARMFUL.
+        //
+        // `from_query_stdio` spawns a thread that enables raw mode, writes the
+        // query, waits for a reply, and disables raw mode on its way out.
+        // tmux and screen do not forward that query, so the wait always hits
+        // its 2s timeout -- and the orphaned thread then turns raw mode OFF
+        // underneath the TUI that has meanwhile finished starting. Measured
+        // 2026-08-26 in tmux: every keystroke echoed into the status line and
+        // the prompt never received a character. The binary was unusable.
+        //
+        // Halfblocks need no query and no thread. They are a working floor,
+        // not a failure: the picture still draws, coarsely. A terminal that
+        // can do better is still detected when PRISM runs outside a
+        // multiplexer.
+        let picker = if in_multiplexer() {
+            Picker::halfblocks()
+        } else {
+            Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+        };
         Self::with_picker(picker)
     }
 
@@ -287,6 +324,38 @@ mod tests {
         for path in &paths {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// Never query the terminal from inside tmux or screen.
+    ///
+    /// `Picker::from_query_stdio` spawns a thread that enables raw mode,
+    /// writes a graphics query, waits for a reply, and disables raw mode on
+    /// its way out. A multiplexer does not forward that query, so the wait
+    /// always hits its 2s timeout -- and the ORPHANED thread then turns raw
+    /// mode off underneath the TUI that has meanwhile finished starting.
+    ///
+    /// MEASURED 2026-08-26, driving the real binary in tmux: every keystroke
+    /// echoed into the status line as literal text (`^[[C`, `hello123`) and
+    /// the prompt never received a character. The same build with the query
+    /// skipped put typed text in the prompt box, as did the release binary
+    /// that predates the change. The TUI was unusable inside tmux.
+    #[test]
+    fn a_multiplexer_is_never_asked_what_it_can_draw() {
+        assert!(
+            multiplexer_from(true, false, Some("xterm-256color")),
+            "TMUX set"
+        );
+        assert!(
+            multiplexer_from(false, true, Some("xterm-256color")),
+            "STY set"
+        );
+        assert!(multiplexer_from(false, false, Some("screen-256color")));
+        assert!(multiplexer_from(false, false, Some("tmux-256color")));
+        // A real terminal outside a multiplexer must still be asked -- losing
+        // kitty/sixel detection everywhere would trade one bug for a worse one.
+        assert!(!multiplexer_from(false, false, Some("xterm-kitty")));
+        assert!(!multiplexer_from(false, false, Some("xterm-256color")));
+        assert!(!multiplexer_from(false, false, None));
     }
 
     /// Halfblocks are the floor, not an error: on a terminal with no graphics
