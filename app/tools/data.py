@@ -292,6 +292,11 @@ def create_data_tools(registry: ToolRegistry) -> None:
     registry.register(
         Tool(
             name="query_materials_project",
+            # Reads only: spends nothing, writes nothing, leaves no state
+            # behind. Declared explicitly because silence now means GATED,
+            # and a free lookup that stops a long research run to ask
+            # permission is the thing that stops long research runs.
+            requires_approval=False,
             description=(
                 "Query Materials Project for detailed material properties — "
                 "band gap, formation energy, bulk modulus, etc. Use this "

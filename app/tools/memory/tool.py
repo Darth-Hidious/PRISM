@@ -338,6 +338,11 @@ def create_memory_tools(registry: ToolRegistry) -> None:
     """
     registry.register(Tool(
         name="search_artifacts",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=_RECALL_DESCRIPTION,
         input_schema=_RECALL_SCHEMA,
         func=_recall,
@@ -345,6 +350,11 @@ def create_memory_tools(registry: ToolRegistry) -> None:
     ))
     registry.register(Tool(
         name="fetch_artifact",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=_FETCH_DESCRIPTION,
         input_schema=_FETCH_SCHEMA,
         func=_fetch_artifact,
@@ -352,6 +362,11 @@ def create_memory_tools(registry: ToolRegistry) -> None:
     ))
     registry.register(Tool(
         name="list_artifacts",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=_LIST_DESCRIPTION,
         input_schema=_LIST_SCHEMA,
         func=_list_artifacts,

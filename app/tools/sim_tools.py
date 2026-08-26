@@ -988,6 +988,11 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
     # Catalog query — different concept (database lookup, not action on structure)
     registry.register(Tool(
         name="list_potentials",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=(
             "List interatomic potentials (EAM, MEAM, Tersoff, LJ, ...) "
             "available in the pyiron LAMMPS potential database for a given "

@@ -218,3 +218,84 @@ def test_report_current_adoption(tools, capsys):
             print(f"    {field:<14} {n:3d}  {100 * n / total:5.1f}%")
         print(f"    {'ALL FOUR':<14} {full:3d}  {100 * full / total:5.1f}%")
     assert total > 0
+
+
+# QUDT/EMMO tags PRISM already uses, mapped to the SymPy unit expression they
+# mean. A tag absent from here is not "wrong" — it is unverified, and the test
+# below says which, rather than silently accepting anything shaped like a tag.
+_UNIT_DIMENSIONS = {
+    "QUDT:W": "watt",
+    "QUDT:M": "meter",
+    "QUDT:M-PER-SEC": "meter/second",
+    "QUDT:J-PER-M3": "joule/meter**3",
+    "QUDT:K": "kelvin",
+    "QUDT:PA": "pascal",
+    "QUDT:KiloGM-PER-M3": "kilogram/meter**3",
+    "EMMO:eV": "electronvolt",
+    "EMMO:second": "second",
+    "EMMO:eV-per-angstrom": "electronvolt/angstrom",
+    "EMMO:eV-per-cubic-angstrom": "electronvolt/angstrom**3",
+}
+
+
+def test_every_declared_unit_resolves_to_a_real_dimension(tools):
+    """A unit tag must name a quantity SymPy can reason about.
+
+    `units` exists so a number can be dimensionally checked rather than taken
+    on faith — PRISM already ships that machinery (`symbolic_check` mode
+    `dimensional`, on `sympy.physics.units` with `dimsys_SI`). A tag that no
+    unit system resolves cannot be checked by anything, so it is decoration
+    wearing the costume of rigour.
+
+    This is the cheap half: the tags themselves are verified here, without
+    running a single tool.
+    """
+    sympy_units = pytest.importorskip("sympy.physics.units")
+    from sympy.parsing.sympy_parser import parse_expr
+
+    unverified = []
+    for tool in tools:
+        if not _declares(tool, "units"):
+            continue
+        for field, tag in tool.units.items():
+            expression = _UNIT_DIMENSIONS.get(tag)
+            if expression is None:
+                unverified.append(f"{tool.name}.{field} = {tag}")
+                continue
+            local = {
+                name: getattr(sympy_units, name)
+                for name in dir(sympy_units)
+                if not name.startswith("_")
+            }
+            try:
+                resolved = parse_expr(expression, local_dict=local)
+            except Exception as error:  # pragma: no cover - a mapping typo
+                pytest.fail(f"{tool.name}.{field}: {tag} -> {expression!r} ({error})")
+            assert resolved is not None, f"{tool.name}.{field}: {tag} resolved to nothing"
+            assert sympy_units.Dimension is not None
+
+    assert not unverified, (
+        "unit tags with no dimensional meaning on record — add them to "
+        f"_UNIT_DIMENSIONS so they are checkable, or fix the tag: {unverified}"
+    )
+
+
+def test_the_dimensional_checker_stays_approval_gated(tools):
+    """`symbolic_check` is gated, and it must stay gated.
+
+    It is tempting to free it — it spends nothing, and a verification step
+    behind a prompt is one that gets skipped. That reasoning is wrong here, and
+    this test exists so nobody has to rediscover why: `parse_expr` EVALS. Its
+    blast radius equals `execute_python`, and a confirmed RCE once reached
+    `open()` through a dimensional unit string (`f"{open('/tmp/x','w')}"`) on
+    Python 3.11, invisible to the attribute-access scan because PEP 701 had not
+    yet exposed the inner tokens.
+
+    Approval is not only about money. It is about what a call can do.
+    """
+    checker = next((t for t in tools if t.name == "symbolic_check"), None)
+    assert checker is not None, "symbolic_check must exist for numeric claims to be checkable"
+    assert checker.requires_approval is True, (
+        "symbolic_check evaluates expressions; freeing it would put an "
+        "execute_python-class blast radius behind no prompt"
+    )

@@ -263,6 +263,11 @@ def create_system_tools(registry: ToolRegistry) -> None:
     # because internal helpers (and tests) may call it directly.
     registry.register(Tool(
         name="show_scratchpad",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=(
             "Print the agent's execution log for this chat session — an "
             "ordered list of every tool the agent has called so far, "

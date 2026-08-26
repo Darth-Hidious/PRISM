@@ -73,6 +73,11 @@ def create_property_selection_tools(registry: ToolRegistry) -> None:
     """Register property selection tools."""
     registry.register(Tool(
         name="list_predictable_properties",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=(
             "List numeric properties in a dataset that can be predicted with ML. "
             "Shows coverage, existing models, and already-predicted columns."

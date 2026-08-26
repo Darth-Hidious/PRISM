@@ -501,6 +501,11 @@ def create_prediction_tools(registry: ToolRegistry) -> None:
     ))
     registry.register(Tool(
         name="list_models",
+        # Reads only: spends nothing, writes nothing, leaves no state
+        # behind. Declared explicitly because silence now means GATED,
+        # and a free lookup that stops a long research run to ask
+        # permission is the thing that stops long research runs.
+        requires_approval=False,
         description=_LIST_MODELS_DESCRIPTION,
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         func=_list_models,
