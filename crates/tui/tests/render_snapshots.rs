@@ -3137,3 +3137,71 @@ fn clicking_a_line_then_e_asks_about_that_exact_line() {
         "the request must actually ask the question"
     );
 }
+
+/// B8: a file a tool touched becomes referenceable, and opening it shows the
+/// real source — not a generated summary of it.
+///
+/// The identity comes from the tool RESULT, the same rule as structures: the
+/// engine produced the path, no model invented it. Resolution reads the file
+/// from disk, so there is no round trip and no model call. A generated
+/// summary of code the reader can simply see would be a guess placed above
+/// the evidence.
+#[test]
+fn a_file_a_tool_touched_opens_its_real_source() {
+    use prism_tui::app::RefPanelState;
+    use prism_tui::hit_map::HitTarget;
+
+    // A real file with known content, written where the test can reach it.
+    let dir = std::env::temp_dir().join("prism_b8_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("informatics_probe.rs");
+    std::fs::write(&path, "fn known_marker() -> u8 {\n    42\n}\n").unwrap();
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut app = app_with_welcome();
+    // The shape a real file write produces: `extract_path` reads the path off
+    // the first line of the tool result.
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "file".into(),
+        content: format!("Wrote {path_str}"),
+        card_type: "file".into(),
+        elapsed_ms: Some(3),
+        call_id: Some("c1".into()),
+        provenance_id: None,
+        data: None,
+    });
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "I read informatics_probe.rs to check.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let _ = render_app_to_string(&app, 140, 40);
+
+    // The file name is marked in the prose.
+    let cell = {
+        let map = app.hit_map.borrow();
+        let mut found = None;
+        'outer: for row in 0..40u16 {
+            for col in 0..140u16 {
+                if let Some(HitTarget::Reference { id }) = map.at(col, row)
+                    && id.starts_with("file://")
+                {
+                    found = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+        found.expect("the file name in the reply must be referenceable")
+    };
+
+    app.pointer_pressed(cell.0, cell.1);
+    let panel = app.ref_panel.as_ref().expect("clicking opens the panel");
+    match &panel.state {
+        RefPanelState::Ready(body) => assert!(
+            body.contains("known_marker"),
+            "the panel must show the REAL source read from disk, not a \
+             summary of it; got: {body}"
+        ),
+        other => panic!("the file should have resolved from disk; got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&path);
+}

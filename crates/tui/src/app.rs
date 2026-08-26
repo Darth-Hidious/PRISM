@@ -1218,6 +1218,35 @@ impl App {
         self.hovered = target;
     }
 
+    /// Register every file a tool has touched as a reference.
+    ///
+    /// Costs no wire change: `derive_files` already extracts real paths from
+    /// tool results for the Files tab, so the identities are ones the ENGINE
+    /// produced — the same rule as structures, never a name a model invented.
+    ///
+    /// Called before each frame's marks are computed rather than on a
+    /// notification, because file paths arrive inside tool RESULTS rather than
+    /// as objects, and there is no `ui.file.touched` to hook.
+    fn register_file_references(&mut self) {
+        for f in self.derive_files() {
+            // The token is the file NAME, not the whole path: prose says
+            // "informatics.rs", not "/Users/.../crates/agent/src/informatics.rs".
+            // The id keeps the full path, because that is what opens it.
+            let name = f
+                .path
+                .rsplit('/')
+                .next()
+                .filter(|n| !n.is_empty())
+                .unwrap_or(&f.path)
+                .to_string();
+            self.references.insert(crate::refs::ReferenceEntry {
+                id: format!("file://{}", f.path),
+                kind: crate::refs::RefKind::FileLine,
+                tokens: vec![name],
+            });
+        }
+    }
+
     /// Where a reference came from and where it sits in the ontology.
     ///
     /// Reads what PRISM already holds — the structure list the Structures tab
@@ -1321,6 +1350,19 @@ impl App {
                         RefPanelState::Fetching
                     }
                     Err(error) => RefPanelState::Failed(format!("{error}")),
+                }
+            }
+            Some(crate::refs::RefKind::FileLine) => {
+                let Some(path) = id.strip_prefix("file://") else {
+                    return RefPanelState::Failed(format!("not a file ref: {id}"));
+                };
+                // Read straight from disk. No model call, no round trip: the
+                // file IS the answer, and a generated summary of code the
+                // reader can simply see would be a guess placed above the
+                // evidence.
+                match std::fs::read_to_string(path) {
+                    Ok(text) => RefPanelState::Ready(text),
+                    Err(e) => RefPanelState::Failed(format!("{path}: {e}")),
                 }
             }
             Some(other) => RefPanelState::NotResolvable(format!(
@@ -5312,6 +5354,18 @@ impl App {
 
     /// Append a message and trim if over the max.
     fn push_message(&mut self, line: ChatLine) {
+        // A tool result may have named a file. Refresh here rather than on a
+        // notification: paths arrive inside RESULTS and there is no
+        // `ui.file.touched` to hook.
+        if matches!(line.kind, LineKind::ToolResult { .. }) {
+            self.push_message_inner(line);
+            self.register_file_references();
+            return;
+        }
+        self.push_message_inner(line);
+    }
+
+    fn push_message_inner(&mut self, line: ChatLine) {
         // Every message is kept. There used to be a 500-entry cap here that
         // silently `remove(0)`d the oldest, so a long session could not be
         // scrolled back to its start and NOTHING said so — a truncated
