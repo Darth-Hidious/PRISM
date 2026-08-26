@@ -40,6 +40,8 @@ import ast
 import base64
 import io
 import json
+import queue
+import threading
 import os
 import sys
 import traceback
@@ -411,6 +413,26 @@ class JupyterKernel:
                 return True
         return False
 
+    def interrupt(self):
+        """Interrupt the running cell. Returns (ok, detail).
+
+        The machinery already existed for the timeout path; it simply was not
+        reachable by a human. A scientist watching a cell they know is wrong —
+        a runaway sweep, a mistyped bound — could not stop it, and because the
+        kernel is single-occupancy a wrong cell blocked every other cell and
+        the agent with it. The only escape was resetting the kernel, which
+        throws away every variable in the session.
+
+        SIGINT is a request, not a guarantee: a GIL-bound C loop ignores it.
+        Say which happened rather than reporting success and leaving the human
+        to wonder why nothing stopped.
+        """
+        try:
+            self.manager.interrupt_kernel()
+        except Exception as exc:
+            return False, f"interrupt could not be delivered: {exc}"
+        return True, "interrupt sent"
+
     def shutdown(self):
         try:
             self.client.stop_channels()
@@ -548,6 +570,19 @@ class BuiltinKernel:
         note = f"[{failed} plot(s) failed to capture]" if failed else None
         return images, note
 
+    def interrupt(self):
+        """The exec fallback runs the cell inline; there is nothing to signal.
+
+        Reported honestly rather than returning success: a control that claims
+        to have stopped something and did not is worse than one that says it
+        cannot. Rust's hard wall-clock guard still reaps a wedged process.
+        """
+        return False, (
+            "this session is running the built-in exec fallback, which cannot be "
+            "interrupted — install ipykernel and jupyter_client for an "
+            "interruptible kernel, or reset the notebook"
+        )
+
     def shutdown(self):
         self.globals.clear()
 
@@ -598,19 +633,45 @@ def main():
         }
     )
 
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception:
-            continue
+    # `execute` blocks, and an interrupt that has to wait for the cell it is
+    # meant to stop is not an interrupt. So stdin is read on its own thread:
+    # `interrupt` is answered THERE, immediately, while everything else is
+    # queued and executed in arrival order exactly as before.
+    requests: "queue.Queue[dict]" = queue.Queue()
+
+    def _read_stdin():
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                req = json.loads(raw)
+            except Exception:
+                continue
+            if req.get("op") == "interrupt":
+                ok, detail = kernel.interrupt()
+                _emit(
+                    {
+                        "event": "interrupted",
+                        "id": req.get("id"),
+                        "ok": ok,
+                        "detail": detail,
+                    }
+                )
+                continue
+            requests.put(req)
+        requests.put({"op": "shutdown", "_eof": True})
+
+    threading.Thread(target=_read_stdin, daemon=True).start()
+
+    while True:
+        req = requests.get()
 
         op = req.get("op")
         if op == "shutdown":
             kernel.shutdown()
-            _emit({"event": "goodbye", "ok": True})
+            if not req.get("_eof"):
+                _emit({"event": "goodbye", "ok": True})
             return
         if op != "execute":
             _emit({"event": "error", "id": req.get("id"), "message": f"unknown op: {op}"})
