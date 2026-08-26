@@ -79,7 +79,7 @@ pub fn append_runtime_tool_guidance(
         &["workflow_list", "workflow_show", "workflow_run", "workflow"],
     ) {
         bullets.push(
-            "Treat workflows as the primary orchestration surface for YAML-defined pipelines. Prefer typed workflow tools before falling back to the root `workflow` command wrapper."
+            "Treat workflows as the primary orchestration surface for YAML-defined pipelines. Use the typed workflow tools: `workflow_list`, `workflow_show`, `workflow_run`."
                 .to_string(),
         );
     }
@@ -98,92 +98,51 @@ pub fn append_runtime_tool_guidance(
         );
     }
 
-    if has_any_tools(
-        &tool_names,
-        &[
-            "discourse_create",
-            "discourse_list",
-            "discourse_run",
-            "discourse_status",
-        ],
-    ) {
+    if has_any_tools(&tool_names, &["discourse_read", "discourse_write"]) {
         bullets.push(
-            "Use discourse for structured multi-agent debate or comparison runs. Prefer the typed discourse tools over manually assembling command arguments."
+            "Use `discourse_read` and `discourse_write` for structured multi-agent debate or comparison runs."
                 .to_string(),
         );
     }
 
-    if has_any_tools(
-        &tool_names,
-        &["models_list", "models_search", "models_info"],
-    ) {
+    if has_tool(&tool_names, "models_read") {
         bullets.push(
-            "Use the models tools to discover available hosted LLMs and their metadata instead of assuming provider names, model IDs, pricing, or context windows."
+            "Use `models_read` to discover available hosted LLMs and their metadata instead of assuming provider names, model IDs, pricing, or context windows."
                 .to_string(),
         );
     }
 
-    if has_any_tools(
-        &tool_names,
-        &[
-            "marketplace_search",
-            "marketplace_info",
-            "marketplace_install",
-            "marketplace",
-        ],
-    ) {
+    if has_any_tools(&tool_names, &["marketplace_read", "marketplace_write"]) {
         bullets.push(
-            "Use marketplace tools when the task depends on installing or inspecting published workflows and tools. Do not assume a workflow is locally available until you have checked the marketplace or local workflow catalog."
+            "Use `marketplace_read` to search or inspect published workflows and tools, and `marketplace_write` to install them. Do not assume a workflow is locally available until you have checked the marketplace or local workflow catalog."
                 .to_string(),
         );
     }
 
-    if has_any_tools(
-        &tool_names,
-        &[
-            "deploy_create",
-            "deploy_list",
-            "deploy_status",
-            "deploy_health",
-            "deploy_stop",
-        ],
-    ) {
+    if has_any_tools(&tool_names, &["deploy_read", "deploy_write"]) {
         bullets.push(
-            "Use deploy tools for persistent serving or target-based deployment. Do not treat deployment as an ad hoc shell process when the PRISM deploy surface already covers it."
+            "Use `deploy_read` and `deploy_write` for persistent serving or target-based deployment. Do not treat deployment as an ad hoc shell process when the PRISM deploy surface already covers it."
                 .to_string(),
         );
     }
 
-    if has_any_tools(
-        &tool_names,
-        &[
-            "node_probe",
-            "node_status",
-            "node_logs",
-            "mesh_discover",
-            "mesh_peers",
-            "mesh_publish",
-            "mesh_subscribe",
-            "mesh_unsubscribe",
-            "mesh_subscriptions",
-        ],
-    ) {
+    if has_any_tools(&tool_names, &["node_read", "mesh_read", "mesh_write"]) {
         bullets.push(
-            "Use node tools to inspect local capability, visibility, and operator state before assuming compute or storage exists. Use mesh tools for discovery, publication, and subscription flows between nodes instead of treating deployment or ingest as the same thing."
+            "Use `node_read` to check what this machine can do, and whether the daemon is running, before assuming compute or storage exists. Use `mesh_read` and `mesh_write` for discovery, publication and subscription between nodes — that is a different thing from deploying or ingesting."
                 .to_string(),
         );
     }
 
     if has_any_tools(&tool_names, &["run_submit", "run"]) {
         bullets.push(
-            "Use `run_submit` for one-off compute jobs across local, hosted-platform, or BYOC backends instead of hand-building `run` argv or shell wrappers."
+            "Use `run_submit` for one-off compute jobs across local, hosted-platform, or BYOC backends instead of shell wrappers."
                 .to_string(),
         );
     }
 
     if has_any_tools(&tool_names, &["publish_artifact", "publish"]) {
         bullets.push(
-            "Use `publish_artifact` for structured model, dataset, or workflow publishing instead of manually assembling `publish` arguments."
+            "Use `publish_artifact` for structured model, dataset, or workflow publishing."
                 .to_string(),
         );
     }
@@ -288,7 +247,7 @@ You are an execution agent, not an advice-only assistant. The user asks for an o
 - Keep context lean. Ground truth lives in files, the graph, and the store — inspect the specific symbol, section, or entity you need, not whole files or full logs. Re-fetch to verify rather than holding large dumps in context.
 
 # Planning And Clarification
-- DO NOT ASK CLARIFYING QUESTIONS. A deterministic pre-flight already screened this message; the cases it catches — a misrouted request, or an opening directive that names nothing — never reach you. It does not catch everything, and it is not meant to: when an input is still missing, proceed on the safest assumption and state it in one line. That is the owner's documented preference, and a second round of questions on top of the pre-flight is what makes the product unusable for experts.
+- DO NOT ASK CLARIFYING QUESTIONS. A deterministic pre-flight already screened this message. When an input is still missing, proceed on the safest assumption and state it in one line.
 - The single exception is an irreversible or external action (deploy, publish, delete, spend, send) with an ambiguous target: confirm that, and nothing else.
 - If the runtime hands you a PRE-FLIGHT ROUTING line, it is the classified intent of this request. Honour it. When it says a capability does not exist, say so plainly — never substitute a web search presented as a materials-science answer.
 - For multi-step work, give a short plan after the first read-only observation, not before it, and wait for approval when the user is steering interactively.
@@ -303,15 +262,15 @@ You are an execution agent, not an advice-only assistant. The user asks for an o
 
 # PRISM Workflow
 - Treat workflows as the primary orchestration surface for YAML-defined pipelines.
-- Use query for targeted retrieval, research for iterative retrieval-and-synthesis loops, and discourse for structured multi-agent debate.
+- Use query for targeted retrieval, research_query for iterative retrieval-and-synthesis loops, and discourse_read/discourse_write for structured multi-agent debate.
 - For DEEP research that would take minutes, use start_background_research (a separate platform agent works while you keep helping the user) and collect the result later with check_background_research — do not block the conversation on the synchronous research tool for big questions, and do not busy-poll.
-- Use models to discover available hosted LLMs instead of assuming model names.
-- Use marketplace when a workflow, tool, or artifact may need to be discovered or installed before execution.
-- Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
-- Use node to inspect or prepare local capability, and use mesh for discovery/publication/subscription between nodes.
+- Use models_read to discover available hosted LLMs instead of assuming model names.
+- Use marketplace_read when a workflow, tool, or artifact may need to be discovered, and marketplace_write to install it, before execution.
+- Use deploy_read/deploy_write for persistent serving or target-based deployment rather than ad hoc shell processes.
+- Use node to inspect or prepare local capability, and use mesh_read/mesh_write for discovery/publication/subscription between nodes.
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless the user explicitly asks for low-level control.
 - Use find_tools to discover tools, agent_capabilities to inspect providers/models/connectivity, and status/tools for the local environment before planning.
-- ACQUIRING NEW TOOLS: when no loaded tool fits, follow discover -> install -> connect -> verify: find_tools first (already have it?), then marketplace_search/marketplace_info, then marketplace_install (lands in ~/.prism/tools or ~/.prism/workflows; never overwrites local edits). Installed workflows are runnable immediately; installed Python tools load at the NEXT tool-server start — say so honestly and verify with list_tools before claiming a tool is callable. Full playbook: read docs/TOOL_ACQUISITION.md in the PRISM repo (file, action='read') when you need the complete procedure, publishing steps, or the anti-spoof/approval rules.
+- ACQUIRING NEW TOOLS: when no loaded tool fits, follow discover -> install -> connect -> verify: find_tools first (already have it?), then marketplace_read (action search or info), then marketplace_write (action install; lands in ~/.prism/tools or ~/.prism/workflows; never overwrites local edits). Installed workflows are runnable immediately; installed Python tools load at the NEXT tool-server start — say so honestly, and verify the new name appears in tools before claiming it is callable. Full playbook: read docs/TOOL_ACQUISITION.md in the PRISM repo (file, action='read') when you need the complete procedure, publishing steps, or the anti-spoof/approval rules.
 - Keep local, platform-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Tool Use
@@ -387,15 +346,15 @@ You are an execution agent, not an advice-only assistant. The user asks for an o
 
 # PRISM Workflow
 - Treat workflows as the primary orchestration surface for YAML-defined pipelines.
-- Use query for targeted retrieval, research for iterative retrieval-and-synthesis loops, and discourse for structured multi-agent debate.
+- Use query for targeted retrieval, research_query for iterative retrieval-and-synthesis loops, and discourse_read/discourse_write for structured multi-agent debate.
 - For DEEP research that would take minutes, use start_background_research (a separate platform agent works while you keep helping the user) and collect the result later with check_background_research — do not block the conversation on the synchronous research tool for big questions, and do not busy-poll.
-- Use models to discover available hosted LLMs instead of assuming model names.
-- Use marketplace when a workflow, tool, or artifact may need to be discovered or installed before execution.
-- Use deploy for persistent serving or target-based deployment rather than ad hoc shell processes.
-- Use node to inspect or prepare local capability, and use mesh for discovery/publication/subscription between nodes.
+- Use models_read to discover available hosted LLMs instead of assuming model names.
+- Use marketplace_read when a workflow, tool, or artifact may need to be discovered, and marketplace_write to install it, before execution.
+- Use deploy_read/deploy_write for persistent serving or target-based deployment rather than ad hoc shell processes.
+- Use node to inspect or prepare local capability, and use mesh_read/mesh_write for discovery/publication/subscription between nodes.
 - Use ingest as one end-to-end command. Do not split extraction, embedding, and graph loading into separate user-facing steps unless low-level control is explicitly required by the task.
 - Use find_tools to discover tools, agent_capabilities to inspect providers/models/connectivity, and status/tools for the local environment before planning.
-- ACQUIRING NEW TOOLS: when no loaded tool fits, follow discover -> install -> connect -> verify: find_tools first (already have it?), then marketplace_search/marketplace_info, then marketplace_install (lands in ~/.prism/tools or ~/.prism/workflows; never overwrites local edits). Installed workflows are runnable immediately; installed Python tools load at the NEXT tool-server start — say so honestly and verify with list_tools before claiming a tool is callable. Full playbook: read docs/TOOL_ACQUISITION.md in the PRISM repo (file, action='read') when you need the complete procedure, publishing steps, or the anti-spoof/approval rules.
+- ACQUIRING NEW TOOLS: when no loaded tool fits, follow discover -> install -> connect -> verify: find_tools first (already have it?), then marketplace_read (action search or info), then marketplace_write (action install; lands in ~/.prism/tools or ~/.prism/workflows; never overwrites local edits). Installed workflows are runnable immediately; installed Python tools load at the NEXT tool-server start — say so honestly, and verify the new name appears in tools before claiming it is callable. Full playbook: read docs/TOOL_ACQUISITION.md in the PRISM repo (file, action='read') when you need the complete procedure, publishing steps, or the anti-spoof/approval rules.
 - Keep local, platform-hosted, and BYOC boundaries explicit in your reasoning when you choose a compute or storage path.
 
 # Tool Use
@@ -443,8 +402,12 @@ const COMPACT_DROP_SECTIONS: &[&str] = &["Result Quality"];
 
 /// A short chain-of-thought nudge appended only under `ReasoningMode::PromptedCoT`
 /// (models without native thinking). Rendered in the profile's structure style.
+/// The nudge shapes the ORDER of reasoning and deliberately sets no length
+/// ceiling on it: the harness never caps how long a model may think (owner
+/// rule — a reasoning budget is the operator's choice, not the harness's).
+/// "Do not pad the answer" governs the answer, not the reasoning.
 const COT_TITLE: &str = "Reasoning";
-const COT_BODY: &str = "Think step by step before acting. In one or two lines, state what the user needs, which tool fits, and what could go wrong — then take a single concrete action. Reason briefly, then act; do not pad the answer.";
+const COT_BODY: &str = "Think step by step before acting. State what the user needs, which tool fits, and what could go wrong, then take a single concrete action. Do not pad the answer.";
 
 /// A parsed section of a canonical prompt. `title == None` is the pre-header
 /// preamble (the identity line). `body` carries no trailing blank lines.
@@ -904,16 +867,60 @@ mod tests {
         assert!(compact.contains("Knowing Your Limits"));
     }
 
-    /// PromptedCoT appends a reasoning nudge; other modes do not.
+    /// PromptedCoT appends a reasoning nudge; other modes do not. The nudge
+    /// may shape the order of reasoning but never its length — "In one or two
+    /// lines" was removed as a harness-imposed reasoning cap (a muzzle), and
+    /// this pins it out.
     #[test]
     fn prompted_cot_appends_reasoning_section() {
         let unknown = profile_for_model("some-local-model-7b");
         assert_eq!(unknown.reasoning_invocation, ReasoningMode::PromptedCoT);
         let with_cot = render_system_prompt(INTERACTIVE_PROMPT, &unknown);
         assert!(with_cot.contains("Think step by step before acting"));
+        assert!(
+            !with_cot.contains("In one or two lines") && !with_cot.contains("Reason briefly"),
+            "the CoT nudge reinstated a cap on reasoning length"
+        );
 
         let no_cot = render_system_prompt(INTERACTIVE_PROMPT, &markdown_full());
         assert!(!no_cot.contains("Think step by step before acting"));
+    }
+
+    /// The static PRISM Workflow sections must speak the offered tool surface.
+    /// After the read/write collapse the old typed names (models_list,
+    /// marketplace_search, ...) and the `list_tools` RPC method are not
+    /// callable by the model; a prompt naming them sends the model at tools it
+    /// cannot see.
+    #[test]
+    fn static_prompts_name_only_offered_tools() {
+        for (label, prompt) in [
+            ("interactive", INTERACTIVE_PROMPT),
+            ("autonomous", AUTONOMOUS_PROMPT),
+        ] {
+            for stale in [
+                "marketplace_search",
+                "marketplace_info",
+                "marketplace_install",
+                "models_list",
+                "list_tools",
+            ] {
+                assert!(
+                    !prompt.contains(stale),
+                    "{label} prompt names `{stale}`, which is not offered to the model"
+                );
+            }
+            for current in [
+                "marketplace_read",
+                "marketplace_write",
+                "models_read",
+                "research_query",
+            ] {
+                assert!(
+                    prompt.contains(current),
+                    "{label} prompt lost the offered tool name `{current}`"
+                );
+            }
+        }
     }
 
     /// The load-bearing clauses of the Agent Execution Contract. If a prompt
@@ -1136,12 +1143,17 @@ mod tests {
         assert!(prompt.contains("agent_capabilities"));
     }
 
+    /// Updated for the read/write collapse (mesh 9 -> 2, marketplace -> 2,
+    /// node 4 -> 2, see `command_tools::COLLAPSED_INTO_ACTION_TOOLS`): the
+    /// offered catalog carries `mesh_write` / `marketplace_read` / `node_read`,
+    /// never the old typed names, so the guidance must key on — and speak —
+    /// the collapsed surface.
     #[test]
     fn runtime_guidance_mentions_node_mesh_and_marketplace() {
         let mut catalog = ToolCatalog::default();
         catalog.extend(vec![
             LoadedTool {
-                name: "node_probe".to_string(),
+                name: "node_read".to_string(),
                 description: "Inspect node".to_string(),
                 input_schema: json!({ "type": "object" }),
                 requires_approval: false,
@@ -1150,7 +1162,7 @@ mod tests {
                 source_detail: None,
             },
             LoadedTool {
-                name: "mesh_publish".to_string(),
+                name: "mesh_write".to_string(),
                 description: "Publish to mesh".to_string(),
                 input_schema: json!({ "type": "object" }),
                 requires_approval: true,
@@ -1159,7 +1171,7 @@ mod tests {
                 source_detail: None,
             },
             LoadedTool {
-                name: "marketplace_search".to_string(),
+                name: "marketplace_read".to_string(),
                 description: "Search marketplace".to_string(),
                 input_schema: json!({ "type": "object" }),
                 requires_approval: false,
@@ -1170,8 +1182,74 @@ mod tests {
         ]);
 
         let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
-        assert!(prompt.contains("Use node tools to inspect local capability"));
-        assert!(prompt.contains("Use marketplace tools"));
+        assert!(prompt.contains("Use `node_read` to check what this machine can do"));
+        assert!(prompt.contains("Use `marketplace_read` to search or inspect"));
+    }
+
+    /// The tool families were collapsed into read/write pairs
+    /// (`command_tools::COLLAPSED_INTO_ACTION_TOOLS`); the hidden typed names
+    /// never appear in an offered catalog. Guidance keyed on those names was
+    /// dead — the discourse/models/deploy bullets stopped rendering entirely.
+    /// This pins that each bullet fires from the collapsed names, and that the
+    /// rendered guidance names no tool the model cannot see.
+    #[test]
+    fn runtime_guidance_keys_on_the_collapsed_read_write_surface() {
+        let mut catalog = ToolCatalog::default();
+        catalog.extend(
+            [
+                "models_read",
+                "discourse_read",
+                "discourse_write",
+                "deploy_read",
+                "deploy_write",
+                "mesh_read",
+                "mesh_write",
+                "marketplace_read",
+                "marketplace_write",
+            ]
+            .into_iter()
+            .map(|name| LoadedTool {
+                name: name.to_string(),
+                description: name.to_string(),
+                input_schema: json!({ "type": "object" }),
+                requires_approval: false,
+                permission_mode: PermissionMode::ReadOnly,
+                source: None,
+                source_detail: None,
+            })
+            .collect::<Vec<_>>(),
+        );
+
+        let prompt = append_runtime_tool_guidance(SYSTEM_PROMPT, &catalog, &markdown_full());
+        for offered in [
+            "`models_read`",
+            "`discourse_read` and `discourse_write`",
+            "`deploy_read` and `deploy_write`",
+            "`mesh_read` and `mesh_write`",
+            "`marketplace_read`",
+        ] {
+            assert!(
+                prompt.contains(offered),
+                "guidance must name the offered tool: {offered}"
+            );
+        }
+        let guidance = prompt
+            .split("# Loaded Tool Strategy")
+            .nth(1)
+            .expect("guidance section rendered");
+        for hidden in [
+            "models_list",
+            "discourse_create",
+            "deploy_create",
+            "mesh_publish",
+            "marketplace_search",
+            "marketplace_install",
+        ] {
+            assert!(
+                !guidance.contains(hidden),
+                "guidance names `{hidden}`, which is no longer offered"
+            );
+        }
     }
 
     #[test]

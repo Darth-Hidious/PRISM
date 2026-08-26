@@ -84,9 +84,17 @@ pub struct PromptProfile {
 
 /// The curated core tool set offered to weak / unknown models under
 /// [`ToolSurface::CoreSetPlusFind`], alongside `find_tools`. Kept intentionally
-/// small and permissive (file / query / knowledge / environment essentials);
-/// tuned later. Names that aren't in a session's live catalog are simply
-/// ignored by the tiering filter, so listing an absent tool is harmless.
+/// small and permissive (file / query / knowledge / environment essentials).
+///
+/// ⚠️ **A name that is not in the live catalog is silently dropped, and that is
+/// the opposite of harmless** — it is this list's recurring bug, three times
+/// now. The tiering filter and `pin_within_budget` both skip an absent name
+/// without a word, so the only symptom is a weak model that cannot do
+/// something: no file tool at all (fixed), no local-graph query (fixed), and
+/// `list_tools`, which is a JSON-RPC method rather than a tool (fixed). This
+/// is a second registry that nothing keeps in sync, so it carries its own
+/// guards below — `every_core_tool_name_is_a_real_tool` and
+/// `core_and_always_include_names_are_offered`.
 pub const CORE_TOOL_SET: &[&str] = &[
     // file work — ONE `file` tool (action=read|write|edit). The three split
     // names this list used to carry left a weak model with no file tool at
@@ -96,11 +104,11 @@ pub const CORE_TOOL_SET: &[&str] = &[
     "execute_bash",
     "execute_python",
     // knowledge / retrieval
+    // ONE query tool; `scope` picks the store and defaults to the user's own
+    // free on-disk graph. The three split names this list used to carry are no
+    // longer offered — naming them here would repeat the `file` bug four lines
+    // above: a weak model pointed at names filtered out as absent.
     "query",
-    // The user's OWN ingested graph. Listing `query_platform` without it
-    // left a weak model with a billed remote search and no local one.
-    "query_local",
-    "query_platform",
     "knowledge_entity",
     "research_query",
     // Federated materials search. A weak model on a materials platform that
@@ -127,9 +135,15 @@ pub const CORE_TOOL_SET: &[&str] = &[
     "papers",
     "ingest_file",
     "ingest_and_wait",
-    // environment / discovery
+    // environment / discovery.
+    //
+    // `list_tools` used to be here and is NOT a tool — it is the tool server's
+    // JSON-RPC METHOD (`app/tool_server.py`) and the Python registry function
+    // that enumerates tools. Nothing registers it, so a weak model was handed
+    // a name it could never call. `find_tools` is the tool that does this job.
+    // `prompts.rs` already asserts the prose never says `list_tools`; this
+    // list had no such guard, which is why the same name survived here.
     "status",
-    "list_tools",
     "agent_capabilities",
     "find_tools",
 ];
@@ -346,6 +360,80 @@ fn loaded_overrides() -> &'static Vec<(String, ProfileOverride)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No curated name may be a tool-server PROTOCOL method.
+    ///
+    /// `list_tools`, `call_tool` and `set_session_id` are the JSON-RPC methods
+    /// `app/tool_server.py` speaks — the envelope, not the payload. Nothing
+    /// registers them as tools, so a model handed one has a name it can never
+    /// call, and both filters that see it drop it without a word. `list_tools`
+    /// really was in this list; `prompts.rs` guarded the prose against exactly
+    /// this name while the curated list went unchecked.
+    #[test]
+    fn every_core_tool_name_is_a_real_tool() {
+        // Source: app/tool_server.py — "Methods: list_tools, call_tool,
+        // set_session_id".
+        const PROTOCOL_METHODS: &[&str] = &["list_tools", "call_tool", "set_session_id"];
+        for method in PROTOCOL_METHODS {
+            assert!(
+                !CORE_TOOL_SET.contains(method),
+                "CORE_TOOL_SET names `{method}`, which is a tool-server JSON-RPC \
+                 method and not a registered tool — a weak model would be shown \
+                 a name nothing can execute"
+            );
+            assert!(
+                !crate::tool_catalog::ALWAYS_INCLUDE.contains(method),
+                "ALWAYS_INCLUDE names `{method}`, which is a JSON-RPC method \
+                 and not a tool"
+            );
+        }
+    }
+
+    /// Every curated name that the RUST catalog owns must actually be offered.
+    ///
+    /// The plan this list serves requires it: a curated list of tool names is a
+    /// second registry that nothing keeps in sync, so a family collapse or a
+    /// rename silently empties it. `pin_within_budget` skips an absent name
+    /// without complaint, so the failure is invisible until a weak model
+    /// cannot do something.
+    ///
+    /// Names owned by the PYTHON registry cannot be resolved from here — they
+    /// need a running tool server — so this checks the half that is knowable
+    /// in-crate and asserts the split explicitly, rather than passing
+    /// vacuously over names it never examined.
+    #[test]
+    fn core_and_always_include_names_are_offered() {
+        let offered: std::collections::HashSet<String> =
+            crate::command_tools::command_tools_filtered(true)
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+        let mut checked = 0usize;
+        for name in CORE_TOOL_SET
+            .iter()
+            .chain(crate::tool_catalog::ALWAYS_INCLUDE.iter())
+        {
+            // A name with no Rust spec is Python-owned or a meta-tool and
+            // cannot be resolved from this crate. A name that HAS a spec but
+            // is not offered is the collapse-drift bug this guards.
+            if !crate::command_tools::is_command_tool(name) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                offered.contains(*name),
+                "`{name}` is a registered Rust tool but is NOT offered — it is \
+                 hidden by a collapse or an exclusion list, so every model \
+                 given this curated list is pointed at a name filtered out as \
+                 absent"
+            );
+        }
+        assert!(
+            checked > 0,
+            "no curated name resolved to a Rust tool — the lookup is broken, \
+             and this test would pass over anything"
+        );
+    }
 
     #[test]
     fn core_tool_set_is_reachable_under_default_policy() {

@@ -168,9 +168,12 @@ enum CommandToolKind {
     /// `prism doctor --fix` — the repair half of `doctor`, split out so the
     /// diagnostic can stay unattended while the repair is approval-gated.
     DoctorFix,
-    QueryLocal,
-    QueryPlatform,
-    QueryFederated,
+    /// One `query` tool over all three stores, selected by `scope`.
+    /// Replaces the QueryLocal/QueryPlatform/QueryFederated trio: a wrong
+    /// `scope` is recoverable (the error names the valid set), a wrong
+    /// tool NAME was not — and the catalog could offer the billed remote
+    /// while dropping the free local one.
+    QueryScoped,
     JobStatusLookup,
     WorkflowList,
     WorkflowShow,
@@ -179,6 +182,8 @@ enum CommandToolKind {
     MarketplaceInfo,
     MarketplaceInstall,
     MarketplaceFind,
+    MarketplaceRead,
+    MarketplaceWrite,
     IngestFile,
     IngestWatch,
     IngestAndWait,
@@ -198,9 +203,18 @@ enum CommandToolKind {
     DiscourseRun,
     DiscourseStatus,
     DiscourseTurns,
+    NodeRead,
     NodeProbe,
     NodeStatus,
     NodeLogs,
+    MeshRead,
+    MeshWrite,
+    DiscourseRead,
+    DiscourseWrite,
+    DeployRead,
+    DeployWrite,
+    ComputeRead,
+    ModelsRead,
     MeshDiscover,
     MeshHealth,
     MeshPeers,
@@ -230,6 +244,8 @@ enum CommandToolKind {
     KnowledgeCorpora,
     KnowledgeIngest,
     // ── Ontology extension proposal governance ────────────────────────
+    OntologyRead,
+    OntologyWrite,
     OntologyProposalsList,
     OntologyProposalsShow,
     OntologyProposalsAccept,
@@ -238,6 +254,7 @@ enum CommandToolKind {
     ReverifyCandidates,
     ReverifyAssertion,
     ReverifyHistory,
+    BillingRead,
     BillingBalance,
     BillingUsage,
     BillingHistory,
@@ -264,6 +281,78 @@ struct CommandToolSpec {
 }
 
 const COMMAND_TOOLS: &[CommandToolSpec] = &[
+    CommandToolSpec {
+        name: "models_read",
+        root: "models",
+        aliases: &[],
+        kind: CommandToolKind::ModelsRead,
+        description: "Browse available models: `action` is one of list | search | info. Free, read-only, never prompts. RUNNING a model is `run_model` (billable, gated).",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "compute_read",
+        root: "compute",
+        aliases: &[],
+        kind: CommandToolKind::ComputeRead,
+        description: "Read the compute broker: `action` is one of gpus | providers | estimate | status. Free, read-only, never prompts. Dispatching a job is `compute_submit`; stopping one is `compute_cancel`.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "deploy_read",
+        root: "deploy",
+        aliases: &[],
+        kind: CommandToolKind::DeployRead,
+        description: "Read deployments: `action` is one of list | status | health. Free, read-only, never prompts.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "deploy_write",
+        root: "deploy",
+        aliases: &[],
+        kind: CommandToolKind::DeployWrite,
+        description: "Change deployments: `action` is one of create | stop. Approval-gated — `create` is BILLABLE and `stop` ends a running service.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "discourse_read",
+        root: "discourse",
+        aliases: &[],
+        kind: CommandToolKind::DiscourseRead,
+        description: "Read discourses: `action` is one of list | show | status | turns. Free, read-only, never prompts.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "discourse_write",
+        root: "discourse",
+        aliases: &[],
+        kind: CommandToolKind::DiscourseWrite,
+        description: "Change discourses: `action` is one of create | run. Approval-gated — `run` starts a multi-agent debate that spends model calls.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "mesh_read",
+        root: "mesh",
+        aliases: &[],
+        kind: CommandToolKind::MeshRead,
+        description: "Read the mesh: `action` is one of discover | health | peers | subscriptions. Free, read-only, never prompts.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "mesh_write",
+        root: "mesh",
+        aliases: &[],
+        kind: CommandToolKind::MeshWrite,
+        description: "Change the mesh: `action` is one of publish | subscribe | unsubscribe | sync. Approval-gated — it alters what this node shares with peers.",
+        permission_mode: PermissionMode::FullAccess,
+        requires_approval: true,
+    },
     CommandToolSpec {
         name: "status",
         root: "status",
@@ -327,58 +416,20 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
     CommandToolSpec {
         name: "query",
         root: "query",
-        aliases: &["prism_query"],
-        // Every flag `Commands::Query` declares today. All of them are read
-        // paths, and all of them are already reachable through the typed
-        // `query_local` / `query_platform` / `query_federated` siblings — so
-        // this list makes the umbrella no more permissive than they are, and
-        // denies whatever `Query` grows next.
-        kind: CommandToolKind::RootArgs {
-            flags: FlagPolicy::Only(&[
-                "--semantic",
-                "--platform",
-                "--json",
-                "--federated",
-                "--llm-url",
-                "--model",
-                "--api-key",
-                "--limit",
-                "--dashboard-url",
-            ]),
-        },
-        description: "Run `prism query ...` for PRISM-native search and knowledge queries. Put each CLI argument in `args`; a query with spaces should stay one array element.",
-        permission_mode: PermissionMode::ReadOnly,
-        requires_approval: false,
-    },
-    CommandToolSpec {
-        name: "query_local",
-        root: "query",
-        aliases: &[],
-        kind: CommandToolKind::QueryLocal,
-        description: "Query the local PRISM knowledge graph with typed fields instead of manual CLI args. Use `semantic=true` for vector search, or plain text for graph-neighbor lookup. Results span the user's own facts plus loaded reference graphs (e.g. MatKG literature co-occurrence, labelled [matkg] with evidence class research) and mesh-peer knowledge, each row attributed to its tenant.",
-        permission_mode: PermissionMode::ReadOnly,
-        requires_approval: false,
-    },
-    CommandToolSpec {
-        name: "query_platform",
-        root: "query",
-        aliases: &[],
-        kind: CommandToolKind::QueryPlatform,
-        // The corpus INVENTORY is deliberately not listed here: it is the
-        // operator's data moat, and this description ships in a public repo.
-        // The model does not need the manifest to choose the tool — "search
-        // what we already hold, before searching outside" is the whole rule.
-        //
-        description: "Search the platform's OWN knowledge base — the operator's embedded corpora plus the knowledge graph. PREFER this before external literature searches (prior_art_search/web) — the platform often already holds the answer with provenance. Plain text runs a graph-entity search; `semantic=true` searches corpus chunks by meaning. Use `knowledge_entity`/`knowledge_paths` for one-entity neighbors or relationship paths.",
-        permission_mode: PermissionMode::ReadOnly,
-        requires_approval: false,
-    },
-    CommandToolSpec {
-        name: "query_federated",
-        root: "query",
-        aliases: &[],
-        kind: CommandToolKind::QueryFederated,
-        description: "Query the local node and its known mesh peers through the dashboard API. Use this when a running node should fan the query out across discovered peers.",
+        // The retired sibling names stay executable for old transcripts and
+        // direct callers — hidden is not the same as unreachable.
+        aliases: &[
+            "prism_query",
+            "query_local",
+            "query_platform",
+            "query_federated",
+        ],
+        kind: CommandToolKind::QueryScoped,
+        // The local graph holds the user's papers, facts and mesh-peer
+        // knowledge, every row attributed to its tenant. For hosted knowledge,
+        // scope=platform beats external literature search (prior_art_search/
+        // web): those are slower and return unattributed text.
+        description: "Search PRISM's knowledge. `scope=local` (DEFAULT) searches the user's own ingested graph on disk: free, offline, no node or login needed. `scope=platform` searches the operator's hosted corpora and knowledge graph: BILLED, needs login; prefer it over prior_art_search/web for hosted knowledge. `scope=federated` fans out across the local node's discovered mesh peers: needs a running node. Plain text does graph-neighbour lookup; `semantic=true` does vector search. For one entity's neighbours use `knowledge_entity`; for relationship paths use `knowledge_paths`.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -464,7 +515,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             subcommands: &["search", "install", "info", "find", "update", "publish"],
             flags: FlagPolicy::AnyBehindApproval,
         },
-        description: "Run `prism marketplace <subcommand>` for marketplace resources (workflows, tools, models). Prefer the typed siblings marketplace_search / marketplace_find / marketplace_info / marketplace_install for those verbs; this umbrella covers `update`, `publish` (PRISM's own catalog — `publish --dry-run` lists what PRISM offers with licences and required extras without calling the platform) and any verb without a typed tool. Returns the CLI output (list, details, or install result).",
+        description: "Run `prism marketplace <subcommand>` for marketplace resources (workflows, tools, models). Prefer marketplace_read for search / find / info and marketplace_write for install / update / publish; this umbrella covers `update`, `publish` (PRISM's own catalog — `publish --dry-run` lists what PRISM offers with licences and required extras without calling the platform) and any verb without a typed tool. Returns the CLI output (list, details, or install result).",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -500,9 +551,30 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "marketplace",
         aliases: &[],
         kind: CommandToolKind::MarketplaceFind,
-        description: "Semantic discovery over the marketplace — find tools/models/datasets by what they do, not by exact name (RBAC-aware cosine search). Use this when marketplace_search's lexical match comes up empty; the marketplace has a long tail (custom predictors, vendor MCPs, user-uploaded skills) not worth listing in the prompt. Optionally restrict by `types` (resource_type values).",
+        // Semantic on purpose: the marketplace long tail (custom predictors,
+        // vendor MCPs, user-uploaded skills) is not worth naming in the
+        // prompt, so discovery goes by capability (RBAC-aware cosine search).
+        description: "Find marketplace tools/models/datasets by what they do rather than by exact name (semantic search). Use this when marketplace_search's lexical match comes up empty. Optionally restrict by `types` (resource_type values).",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "marketplace_read",
+        root: "marketplace",
+        aliases: &[],
+        kind: CommandToolKind::MarketplaceRead,
+        description: "Read the marketplace: `action` is one of search | info | find. search = lexical match on name; find = semantic discovery by what a resource DOES (use when search comes up empty); info = full metadata for one named resource. Free, read-only, never prompts.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "marketplace_write",
+        root: "marketplace",
+        aliases: &[],
+        kind: CommandToolKind::MarketplaceWrite,
+        description: "Change the marketplace or the local install: `action` is one of install | update | publish. install = add one resource locally; update = re-download every locally-installed tool whose remote version differs (remote wins, local edits are overwritten — pass dry_run first); publish = submit PRISM's own catalog entries for review. Approval-gated.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
     },
     CommandToolSpec {
         name: "ingest",
@@ -538,7 +610,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "ingest-and-wait",
         aliases: &[],
         kind: CommandToolKind::IngestAndWait,
-        description: "Submit a knowledge-graph ingest job (from `url` or free-text `query`) to the hosted platform and WAIT for it to finish in one call: submit, poll, then return the resulting graph references. A failed or timed-out job is a real error, never a success document. Use this instead of `knowledge_ingest` when you need confirmation that the content actually landed in the graph — `knowledge_ingest` alone is fire-and-forget with no unattended status poll.",
+        description: "Submit a knowledge-graph ingest job (from `url` or free-text `query`) to the hosted platform and wait for it to finish: submit, poll, then return the resulting graph references. A failed or timed-out job is reported as an error. Use this over `knowledge_ingest` when you need confirmation the content landed in the graph; `knowledge_ingest` is fire-and-forget.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: false,
     },
@@ -567,7 +639,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
                 "--max-blocks",
             ]),
         },
-        description: "Fast literature retrieval over machine-readable APIs (arXiv, OpenAlex, Crossref, PubMed, Semantic Scholar, Europe PMC preprints, ChemRxiv, DOAJ). `subcommand=search --args [--query Q, --limit N]` for one concurrent federated search; `sweep` for resumable paginated harvesting; `full-text --args [--pmc PMC123 | --url U]` for JATS/PDF extraction with section/table locators; `claims` for EMMO-typed claim extraction (needs a configured LLM, returns zero claims honestly when none is set). Output is JSON with per-source status; every extracted claim carries evidence_class capped at 'research'.",
+        description: "Fast literature retrieval over machine-readable APIs (arXiv, OpenAlex, Crossref, PubMed, Semantic Scholar, Europe PMC preprints, ChemRxiv, DOAJ). `subcommand=search --args [--query Q, --limit N]` for one concurrent federated search; `sweep` for resumable paginated harvesting; `full-text --args [--pmc PMC123 | --url U]` for JATS/PDF extraction with section/table locators; `claims` for EMMO-typed claim extraction (needs a configured LLM; returns zero claims when none is set). Output is JSON with per-source status; every extracted claim carries evidence_class capped at 'research'.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -576,7 +648,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "papers",
         aliases: &[],
         kind: CommandToolKind::PapersIngest,
-        description: "Extract EMMO-typed claims from one paper's full text AND persist them into the local knowledge graph — the `--store` path of `prism papers claims`. Identify the paper by `pmc` or `url` (from a prior `papers` search/full-text call) and bound the LLM work with `max_blocks`. Approval-gated because it writes to the bundled Turso store; for claim extraction WITHOUT persistence use `papers` subcommand=claims, which is free.",
+        description: "Extract EMMO-typed claims from one paper's full text and persist them into the local knowledge graph (the `--store` path of `prism papers claims`). Identify the paper by `pmc` or `url` from a prior `papers` search/full-text call; bound the LLM work with `max_blocks`. Approval-gated: writes to the bundled Turso store. For claim extraction without persistence use `papers` subcommand=claims, which is free.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -597,7 +669,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             ],
             flags: FlagPolicy::AnyBehindApproval,
         },
-        description: "Run `prism mesh <subcommand>` for PRISM mesh operations. Prefer the typed siblings mesh_discover / mesh_health / mesh_peers / mesh_subscriptions / mesh_publish / mesh_subscribe / mesh_unsubscribe for those verbs; this umbrella exists only for any mesh verb without a typed tool. Read verbs are free; publish/subscribe mutate mesh state and are approval-gated.",
+        description: "Run `prism mesh <subcommand>` for PRISM mesh operations. Prefer mesh_read for discover / health / peers / subscriptions and mesh_write for publish / subscribe / unsubscribe / sync; this umbrella exists only for a mesh verb neither of those covers. Read verbs are free; mesh_write is approval-gated.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -669,7 +741,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "mesh",
         aliases: &[],
         kind: CommandToolKind::MeshSync,
-        description: "Pull a dataset from a peer PRISM node NOW — no Kafka broker required. Fetches the peer's matching graph entities over its authenticated query API and writes them into the local knowledge store under the peer's own tenant (mesh:{peer node id}), so peer data stays attributable and never blends with local ingest. Needs the peer's base URL (e.g. http://192.168.1.20:7327). Writes to the local store, so it is approval-gated.",
+        // Peer rows land under the peer's own tenant so they stay attributable
+        // and never blend with local ingest.
+        description: "Pull one dataset from a peer PRISM node immediately; no Kafka broker required. Fetches the peer's matching graph entities over its authenticated query API and writes them into the local knowledge store under the peer's tenant (mesh:{peer node id}). Needs the peer's base URL (e.g. http://192.168.1.20:7327). Approval-gated: writes to the local store.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -681,9 +755,18 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             subcommands: &["up", "down", "status", "probe", "logs", "key"],
             flags: FlagPolicy::AnyBehindApproval,
         },
-        description: "Run `prism node <subcommand>` for PRISM node fabric operations. Prefer the typed siblings node_probe / node_status / node_logs for those verbs; this umbrella covers `up`/`down` (start/stop the local node daemon) and `key` (node key management), which have no typed tool. `up` starts the daemon as a supervised background child of this app (returns pid + platform node_id, no shell needed); `down` stops it gracefully (platform deregistration included). `up`/`down` change node state and are approval-gated; `status`/`probe`/`logs` are read-only.",
+        description: "Run `prism node <subcommand>` for PRISM node fabric operations. Prefer node_read for probe / status / logs; this umbrella covers `up`/`down` (start/stop the local node daemon) and `key` (node key management), which have no typed tool. `up` starts the daemon as a supervised background child of this app (returns pid + platform node_id, no shell needed); `down` stops it gracefully (platform deregistration included). `up`/`down` change node state and are approval-gated; `status`/`probe`/`logs` are read-only.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "node_read",
+        root: "node",
+        aliases: &[],
+        kind: CommandToolKind::NodeRead,
+        description: "Read local node state: `action` is one of probe | status | logs. probe = what this machine can do, without starting or registering anything; status = the running daemon's state; logs = tail a managed service (`service` required, e.g. kafka, spark, firecrawl). Free, read-only, never prompts. Starting or stopping the daemon is `node` (up / down), which asks first.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "node_probe",
@@ -776,7 +859,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             subcommands: &["create", "list", "status", "stop", "health"],
             flags: FlagPolicy::AnyBehindApproval,
         },
-        description: "Run `prism deploy <subcommand>` for PRISM deployment flows. Prefer the typed siblings deploy_list / deploy_status / deploy_health / deploy_create / deploy_stop for those verbs; this umbrella exists only for any deploy verb without a typed tool. Deployments spend compute and mutate platform state — approval-gated.",
+        description: "Run `prism deploy <subcommand>` for PRISM deployment flows. Prefer deploy_read for list / status / health and deploy_write for create / stop; this umbrella exists only for any deploy verb without a typed tool. Deployments spend compute and mutate platform state — approval-gated.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -880,9 +963,17 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         requires_approval: true,
     },
     CommandToolSpec {
-        name: "predict",
+        // NOT named `predict`: that name belongs to the Python tool server's
+        // FREE, LOCAL sklearn/GNN predictor (`app/tools/prediction.py`). The
+        // catalog is built Python-first and then extended with this table
+        // (`protocol.rs`), and `ToolCatalog::extend` is last-writer-wins and
+        // SILENT — so a spec named `predict` here replaced the free local tool
+        // with this BILLABLE cloud one and made the local predictor
+        // unreachable. `run_model` was already declared as an alias; it is now
+        // the name. `predict` must never appear in this spec's name or aliases.
+        name: "run_model",
         root: "predict",
-        aliases: &["run_model", "model_predict"],
+        aliases: &["model_predict"],
         kind: CommandToolKind::Predict,
         description: "Run a marketplace model on the cloud in ONE call (BILLABLE): reuses a running deployment of the model or creates one (waits until ready), POSTs your inputs to it, returns the model's real result, and auto-stops anything it created. Discover models with `models_search`/`marketplace_search`. `model` = marketplace slug (e.g. 'mace-mh-1'); `task` e.g. 'single_point'|'relax'|'md'; `inputs` = the model's JSON inputs (e.g. {\"structure\": {...}}). Optional `node_id` pins a specific mesh node; default lets the platform pick.",
         permission_mode: PermissionMode::FullAccess,
@@ -893,7 +984,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "campaign",
         aliases: &["campaign_start", "start_goal"],
         kind: CommandToolKind::GoalStart,
-        description: "Start a LONG-RUNNING research goal (discovery campaign): propose → evaluate → rank loops that keep working across turns (BILLABLE — LLM + compute per iteration). The goal becomes a durable object: checkpointed to disk, visible at GET /api/goals, resumable after restarts. Use for open-ended discovery ('find a W-Mo alloy with better creep resistance'), NOT for one-shot questions (use research/search tools for those). Set `budget_usd` to cap spend and `approval_gates` to pause for human sign-off at given iterations.",
+        description: "Start a long-running research goal (discovery campaign): propose → evaluate → rank loops that keep working across turns. BILLABLE: LLM + compute per iteration. The goal is checkpointed to disk, visible at GET /api/goals, and resumable after restarts. Use for open-ended discovery ('find a W-Mo alloy with better creep resistance'), not for one-shot questions (use research/search tools for those). Set `budget_usd` to cap spend and `approval_gates` to pause for human sign-off at given iterations.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -929,7 +1020,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "schedule",
         aliases: &["cron_create", "watch_create"],
         kind: CommandToolKind::ScheduleCreate,
-        description: "Set up a durable wake-up for a long-running goal so it keeps going for weeks/months without anyone restarting it (BILLABLE — each wake-up resumes billable iterations). Give `goal_id` plus exactly ONE trigger: `every` ('6h'), `cron` ('0 */6 * * *'), `at` (unix seconds, one-shot), `watch_file` (fire when a path appears), `watch_goal` (fire when another goal finishes), or `watch_corpus_db` + `corpus_at_least` (fire when a corpus has grown). If the goal's process died, the next wake-up restarts it. `max_fires` hard-caps how many times it may resume. It will NOT resume a goal paused at an approval gate — that still needs a human. IMPORTANT: wake-ups only happen if something on the host is running `prism schedule tick` (a launchd/systemd unit a HUMAN installs once with `prism schedule install --write`, or `prism schedule daemon` in a container). This tool reports the host's heartbeat status in its output — if it says MISSING or STALE, the schedule is inert and you must tell the user to install it; do not report the goal as covered.",
+        description: "Create a durable wake-up that resumes a long-running goal without anyone restarting it. BILLABLE: each wake-up resumes billable iterations; `max_fires` caps how many times it may fire. Give `goal_id` plus exactly ONE trigger: `every` ('6h'), `cron` ('0 */6 * * *'), `at` (unix seconds, one-shot), `watch_file` (a path appears), `watch_goal` (another goal finishes), or `watch_corpus_db` + `corpus_at_least` (a corpus reaches a size). If the goal's process died, the next wake-up restarts it. It will NOT resume a goal paused at an approval gate; that needs a human. Wake-ups fire only while the host runs `prism schedule tick` (a launchd/systemd unit a human installs once with `prism schedule install --write`, or `prism schedule daemon` in a container). The result reports that heartbeat: MISSING or STALE means the schedule is inert; tell the user to install the tick, and do not report the goal as covered.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
     },
@@ -938,7 +1029,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "schedule",
         aliases: &["cron_list", "list_schedules"],
         kind: CommandToolKind::ScheduleList,
-        description: "List every wake-up schedule and watcher on this node with its state (active/wedged/done/cancelled), fire count, and the reason for its last decision — plus whether anything on the host is actually running the tick that drives them. Use this to find out why a goal is or isn't being woken up; a schedule can read `active` and still be inert if the heartbeat line says MISSING or STALE.",
+        description: "List every wake-up schedule and watcher on this node: state (active/wedged/done/cancelled), fire count, the reason for its last decision, and whether the host is running the tick that drives them. Use this to find out why a goal is or is not being woken up. A schedule can read `active` and still be inert when the heartbeat line says MISSING or STALE.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -956,7 +1047,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "knowledge",
         aliases: &[],
         kind: CommandToolKind::KnowledgeEntity,
-        description: "Look up one entity plus its 1-hop neighbors in the platform knowledge graph. Requires `name`. For plain term search use `query_platform`; for conceptual/vector search use `query_platform` with semantic=true.",
+        // `query_platform` is a retired alias hidden from the catalog; the
+        // offered name is `query` with a `scope` argument.
+        description: "Look up one entity plus its 1-hop neighbors in the platform knowledge graph. Requires `name`. For plain term search use `query` with scope=platform; for conceptual/vector search add semantic=true.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -991,13 +1084,32 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
     // The review surface for what the paper reader proposed against the
     // active ontology: list pending proposals with their citations, accept
     // them into a DRAFT artifact (the ordinary promote gate still applies),
-    // or reject them (final for the identity).
+    // or reject them (final for the identity). The ontology is the product;
+    // citation-backed proposals are how it grows.
+    CommandToolSpec {
+        name: "ontology_read",
+        root: "ontology",
+        aliases: &[],
+        kind: CommandToolKind::OntologyRead,
+        description: "Read pending ontology extension proposals queued by paper ingestion: `action` is one of list | show. list = every pending proposal with its citation count, newest first (`limit`, default 50); show = ONE proposal in full with every citation backing it — document, exact lines, quoted text (`item_id` required). Free, read-only. Read `show` before deciding; `ontology_write` accepts or rejects.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
+    },
+    CommandToolSpec {
+        name: "ontology_write",
+        root: "ontology",
+        aliases: &[],
+        kind: CommandToolKind::OntologyWrite,
+        description: "Decide pending ontology extension proposals: `action` is one of accept | reject, `item_ids` required. accept writes them into a DRAFT artifact and NEVER promotes — the draft still goes through `prism ontology promote` — and needs `domain` (new artifact) or `output` (existing one to extend). reject is FINAL for each identity: a rejected proposal is never re-queued by a later ingest, so it needs a `reason`, which is recorded in the disposition ledger. Approval-gated.",
+        permission_mode: PermissionMode::WorkspaceWrite,
+        requires_approval: true,
+    },
     CommandToolSpec {
         name: "ontology_proposals",
         root: "ontology",
         aliases: &["ontology_proposals_list"],
         kind: CommandToolKind::OntologyProposalsList,
-        description: "List pending ontology extension proposals queued by paper ingestion, with citation counts and full proposal content. The ontology is the product: these citations-backed proposals are how it grows. Follow with ontology_proposals_show for the exact cited lines, then accept or reject.",
+        description: "List pending ontology extension proposals queued by paper ingestion, with citation counts and full proposal content. Follow with `ontology_read` action=show for the exact cited lines, then `ontology_write`.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -1037,7 +1149,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "reverify",
         aliases: &[],
         kind: CommandToolKind::ReverifyCandidates,
-        description: "List stored assertions by verification status — the re-verification candidate population. `cited_by_reader` is the span-unchecked set paper ingestion produces (trusted, but no deterministic check compared the fact to its citation); `sample_disagreement`, `model_asserted`, `unit_unresolved` are the other re-checkable statuses. Follow with reverify_assertion on an id.",
+        description: "List stored assertions by verification status. `cited_by_reader` = stored by paper ingestion with a citation no deterministic check has compared; `sample_disagreement`, `model_asserted`, `unit_unresolved` = the other re-checkable statuses. Follow with `reverify_assertion` on an id.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -1046,7 +1158,9 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         root: "reverify",
         aliases: &[],
         kind: CommandToolKind::ReverifyAssertion,
-        description: "Re-read one stored assertion's exact cited lines and ask the configured model whether they support it. Every verdict (affirmed / denied / uncertain / not_ready) is recorded in the reverify ledger; the assertion's own status is never rewritten. Refuses assertions whose judgement was already rendered — re-asking would re-roll denials into affirmations.",
+        // One judgement per assertion, deliberately: re-asking would re-roll
+        // denials into affirmations, so a rendered verdict is final.
+        description: "Re-read one stored assertion's exact cited lines and ask the configured model whether they support it. The verdict (affirmed / denied / uncertain / not_ready) is recorded in the reverify ledger; the assertion's own status is never rewritten. Refuses an assertion whose judgement was already rendered.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -1067,7 +1181,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             subcommands: &["list", "search", "info"],
             flags: FlagPolicy::Only(&["--provider", "--json"]),
         },
-        description: "Run `prism models <subcommand>` for hosted model discovery for the active platform project. Prefer the typed siblings models_list / models_search / models_info for those verbs; this umbrella exists only for any models verb without a typed tool. Read-only and free. Returns provider/model listings or details.",
+        description: "Run `prism models <subcommand>` for hosted model discovery for the active platform project. Prefer models_read for list / search / info; this umbrella exists only for any models verb without a typed tool. Read-only and free. Returns provider/model listings or details.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -1106,7 +1220,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             subcommands: &["create", "list", "show", "run", "status", "turns"],
             flags: FlagPolicy::AnyBehindApproval,
         },
-        description: "Run `prism discourse <subcommand>` for multi-agent debate workflows backed by the platform discourse API. Prefer the typed siblings discourse_list / discourse_create / discourse_show / discourse_run / discourse_status / discourse_turns for those verbs; this umbrella exists only for any discourse verb without a typed tool. Running a discourse instance spends compute and is approval-gated; list/show/status/turns are read-only.",
+        description: "Run `prism discourse <subcommand>` for multi-agent debate workflows backed by the platform discourse API. Prefer discourse_read for list / show / status / turns and discourse_write for create / run; this umbrella exists only for any discourse verb without a typed tool. Running a discourse instance spends compute and is approval-gated; list/show/status/turns are read-only.",
         permission_mode: PermissionMode::WorkspaceWrite,
         requires_approval: true,
     },
@@ -1201,16 +1315,27 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
             subcommands: &["usage", "history", "prices", "topup"],
             flags: FlagPolicy::AnyBehindApproval,
         },
-        description: "Run `prism billing <subcommand>` for platform credits. Prefer the typed siblings billing_balance / billing_usage / billing_history / billing_prices for the common read-only checks; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
+        description: "Run `prism billing <subcommand>` for platform credits. Prefer billing_read for balance / usage / history / prices; use this umbrella for `topup` (opens a real Stripe checkout and spends money — approval-gated) or any billing verb without a typed tool.",
         permission_mode: PermissionMode::FullAccess,
         requires_approval: true,
+    },
+    CommandToolSpec {
+        name: "billing_read",
+        root: "billing",
+        aliases: &[],
+        kind: CommandToolKind::BillingRead,
+        description: "Read platform billing: `action` is one of balance | usage | history | prices. Free, read-only, never prompts. Check `balance` before starting a billable action (goal_start, run_model, deploy_write, compute_submit). Spending money is `billing` (topup), which is approval-gated.",
+        permission_mode: PermissionMode::ReadOnly,
+        requires_approval: false,
     },
     CommandToolSpec {
         name: "billing_balance",
         root: "billing",
         aliases: &[],
         kind: CommandToolKind::BillingBalance,
-        description: "Check the current platform credits balance and dollar value for the active org. Use before starting a billable action (goal_start, predict, deploy, ...) so spend is never a surprise.",
+        // `run_model`, not `predict`: `predict` is the free local Python
+        // predictor (see the run_model spec comment).
+        description: "Check the current platform credits balance and dollar value for the active org. Use before starting a billable action (goal_start, run_model, deploy_write, compute_submit).",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -1309,7 +1434,7 @@ const COMMAND_TOOLS: &[CommandToolSpec] = &[
         // escalate here when a page "looks empty" made it burn a call for an
         // identical result and conclude the page had no content — a lie told
         // to the reasoning process, which is the worst place to tell one.
-        description: "Read ONE URL and return its readable text, via the external `agent-browser` binary. This is an HTTP fetch with content extraction (prefers markdown, falls back to text extracted from HTML) — it does NOT execute JavaScript, so it will not rescue a page whose content is client-rendered. Prefer `web` first for ordinary pages: it is cheaper, and only `web` can SEARCH — this tool reads exactly one URL. Requires the `agent-browser` binary on PATH; when it is missing the tool says so with the install command and does NOT silently fall back to another fetcher. Page load failures, timeouts and non-zero exits are reported as failures. Output is bounded and says when it truncated.",
+        description: "Read ONE URL and return its readable text, via the external `agent-browser` binary. Default mode is an HTTP fetch with content extraction (prefers markdown, falls back to text extracted from HTML); it does NOT run JavaScript. `render=true` drives a real browser (navigate, run JS, read the rendered DOM): slower, but the only mode that gets through publisher bot-walls and client-rendered pages. Use render=true when a plain read returns a challenge page, an empty body, or a 403. A render opens the page in a terminal pane beside the user when one is available; otherwise it runs headless and the result says the page was fetched but not shown. Prefer `web` for ordinary pages and for search; this tool reads exactly one URL. Requires `agent-browser` on PATH; when it is missing the result names the install command and nothing is fetched. Page load failures, timeouts and non-zero exits are reported as failures. Output is bounded and marks truncation.",
         permission_mode: PermissionMode::ReadOnly,
         requires_approval: false,
     },
@@ -1340,6 +1465,8 @@ enum CommandExecution {
     NotebookReset,
     WebBrowse {
         url: String,
+        /// Drive a real browser (`open` then `read`) instead of an HTTP fetch.
+        render: bool,
     },
 }
 
@@ -1537,9 +1664,11 @@ fn web_browse_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "url": {
-                "type": "string",
-                "description": "Absolute URL to read (https://...). The page is fetched over HTTP and its text extracted; JavaScript is NOT executed, so a client-rendered page will come back empty."
+            "url": { "type": "string", "description": "The single URL to read (https://...)." },
+            "render": {
+                "type": "boolean",
+                "description": "Drive a REAL browser (navigate, run JavaScript, then read the rendered page) instead of an HTTP fetch. Slower, but it is the only path that gets through publisher bot-walls (Cloudflare, Radware) and client-rendered pages. Use it when a plain read returns a challenge page, an empty body, or a 403.",
+                "default": false
             }
         },
         "required": ["url"],
@@ -1624,7 +1753,7 @@ fn workflow_run_schema() -> Value {
     })
 }
 
-fn query_local_schema() -> Value {
+fn query_scoped_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -1632,72 +1761,41 @@ fn query_local_schema() -> Value {
                 "type": "string",
                 "description": "Entity name or search text."
             },
+            "scope": {
+                "type": "string",
+                "enum": ["local", "platform", "federated"],
+                "default": "local",
+                "description": "Which store to search. `local` (DEFAULT) = the user's OWN bundled graph on disk: free, works offline, needs no node and no login. `platform` = the operator's hosted corpora and knowledge graph; BILLED and needs `prism login`. `federated` = the local node fanned out to discovered mesh peers; needs a running node."
+            },
             "semantic": {
                 "type": "boolean",
-                "description": "Use semantic vector search over the local entity vectors instead of graph traversal."
+                "description": "Vector search instead of graph traversal. scope=local searches local entity vectors; scope=platform searches corpus chunks by meaning; not applicable to scope=federated."
             },
             "limit": {
                 "type": "integer",
-                "description": "Max number of results to return for semantic search.",
+                "description": "Max results for semantic search (scope=local or scope=platform).",
                 "minimum": 1
-            },
-            "llm_url": {
-                "type": "string",
-                "description": "Override the local LLM base URL used for semantic embedding generation."
-            },
-            "model": {
-                "type": "string",
-                "description": "Override the model used for local query-time embedding generation."
-            },
-            "api_key": {
-                "type": "string",
-                "description": "Optional API key for authenticated local LLM providers."
-            }
-        },
-        "required": ["text"],
-        "additionalProperties": false
-    })
-}
-
-fn query_platform_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "description": "Graph-search text or semantic-search query for the platform."
-            },
-            "semantic": {
-                "type": "boolean",
-                "description": "Use the platform semantic search endpoint instead of graph search."
             },
             "json": {
                 "type": "boolean",
-                "description": "Return machine-readable JSON output."
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Max number of platform results to request.",
-                "minimum": 1
-            }
-        },
-        "required": ["text"],
-        "additionalProperties": false
-    })
-}
-
-fn query_federated_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "description": "Natural-language query to send to the local node and discovered mesh peers."
+                "description": "Return machine-readable JSON output (scope=platform)."
             },
             "dashboard_url": {
                 "type": "string",
-                "description": "Dashboard base URL for the running local node.",
+                "description": "Dashboard base URL for the running local node (scope=federated).",
                 "default": "http://127.0.0.1:7327"
+            },
+            "llm_url": {
+                "type": "string",
+                "description": "Override the local LLM base URL used for semantic embedding generation (scope=local)."
+            },
+            "model": {
+                "type": "string",
+                "description": "Override the model used for local query-time embedding generation (scope=local)."
+            },
+            "api_key": {
+                "type": "string",
+                "description": "Optional API key for authenticated local LLM providers (scope=local)."
             }
         },
         "required": ["text"],
@@ -1821,25 +1919,34 @@ fn ingest_schema(path_description: &str) -> Value {
                 "type": "string",
                 "description": "Optional corpus slug to attach to the ingest job."
             },
+            // Reading images and extracting facts are different capabilities:
+            // a text-only extraction model handed a page image errors out, the
+            // page is reported unreadable, and it looks like a bad PDF when it
+            // is really a misconfiguration. Hence a separate vision knob.
             "vision_model": {
                 "type": "string",
-                "description": "Model that READS PAGE IMAGES when the text layer cannot recover a page — scanned pages, figures, broken font encodings. Reading images and extracting facts are different capabilities: a text-only extraction model handed a page image returns an error, the page is reported unreadable, and it looks like a bad PDF when it is really a misconfiguration. Defaults to the extraction model, which is correct for a multimodal local model. Set it when the extraction model is text-only (e.g. extraction on glm-5.2, vision on glm-4.5v)."
+                "description": "Model that reads page images when the text layer cannot recover a page (scanned pages, figures, broken font encodings). Defaults to the extraction model, which is correct for a multimodal local model. Set it when the extraction model is text-only (e.g. extraction on glm-5.2, vision on glm-4.5v)."
             },
             "vision_url": {
                 "type": "string",
                 "description": "Base URL for the vision model when it is not served by the same endpoint as `llm_url`. Defaults to `llm_url`."
             },
+            // Recurrence filters invention: a small local extraction model
+            // invents a DIFFERENT value each pass, so a fact present in every
+            // pass was read off the page. Measured on a 36-page paper: five
+            // identical runs stored 4, 0, 2, 3 and 1 facts, and a third to
+            // two thirds of emitted numbers were absent from the document.
             "samples": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9,
-                "description": "Extract the document this many times and keep only facts that RECUR (see `agreement`). Use this when the facts matter more than the wall-clock — a small local extraction model invents values, and it invents a DIFFERENT one each pass, so a value that appears in every pass was read off the page while one that changes was made up. Measured on a 36-page paper: five identical runs stored 4, 0, 2, 3 and 1 facts, and between a third and two thirds of everything emitted was a number absent from the document. Cost and time are LINEAR in this number, so leave it at 1 for a quick look and raise it (3 or 5) when the graph is being built for real."
+                "description": "Extract the document this many times and keep only facts that RECUR (see `agreement`). Cost and time are linear in this number. Leave at 1 for a quick look; raise to 3 or 5 when the graph is being built for real."
             },
             "agreement": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9,
-                "description": "How many of the `samples` passes must produce a fact before it is stored. Must not exceed `samples`. A sensible default is a simple majority (2 of 3, 3 of 5): higher is stricter and discards more, lower admits more of the model's invention. Facts that miss the bar are REFUSED with a reason, not silently dropped, so you can always see what was filtered and why."
+                "description": "How many of the `samples` passes must produce a fact before it is stored. Must not exceed `samples`. A simple majority (2 of 3, 3 of 5) is a sensible default: higher is stricter, lower admits more of the model's invention. Facts that miss the bar are refused with a recorded reason, not silently dropped."
             },
             "model": {
                 "type": "string",
@@ -2207,6 +2314,138 @@ fn knowledge_paths_schema() -> Value {
     })
 }
 
+/// Actions on `ontology_read` — the free, read-only half of the proposal queue.
+const ONTOLOGY_READ_ACTIONS: &[&str] = &["list", "show"];
+
+/// Actions on `ontology_write` — the approval-gated half. `promote` is
+/// deliberately absent: promoting a draft ontology to the governing one is the
+/// deliberate human gate this whole queue exists to feed, and it must not
+/// become an argument the model can pass.
+const ONTOLOGY_WRITE_ACTIONS: &[&str] = &["accept", "reject"];
+
+fn ontology_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "show"],
+                "description": "list = every pending proposal with its citation count, newest first; show = ONE proposal in full with every citation backing it."
+            },
+            "limit": { "type": "integer", "description": "action='list': max proposals to return (default 50)." },
+            "item_id": { "type": "string", "description": "action='show': proposal id from a list call." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn ontology_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["accept", "reject"],
+                "description": "accept = write into a DRAFT artifact (never promotes); reject = FINAL for that identity, never re-queued."
+            },
+            "item_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Proposal ids, from an ontology_read list call."
+            },
+            "domain": { "type": "string", "description": "action='accept': domain id for a NEW artifact (lowercase letters/digits/-/_). Required unless `output` names an existing artifact." },
+            "output": { "type": "string", "description": "action='accept': artifact path to write; an existing PRISM artifact there is extended." },
+            "reason": { "type": "string", "description": "action='reject': why (required; recorded in the disposition ledger). Optional on accept." }
+        },
+        "required": ["action", "item_ids"],
+        "additionalProperties": false
+    })
+}
+
+/// Build the `prism ontology proposals <action> ...` argv.
+///
+/// ONE builder shared by the collapsed `ontology_read` / `ontology_write` and
+/// by the four typed specs they replace, so a hidden name and its action form
+/// cannot drift apart. Every per-action requirement (`item_id` on show,
+/// `domain`-or-`output` on accept, `reason` on reject) is enforced here, once.
+fn ontology_proposal_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    if !ONTOLOGY_READ_ACTIONS.contains(&action) && !ONTOLOGY_WRITE_ACTIONS.contains(&action) {
+        bail!(
+            "action {action:?} is not an ontology proposal verb; reads are {}, \
+             writes are {}. Promoting a draft ontology is a deliberate human \
+             step (`prism ontology promote`), not an action here.",
+            ONTOLOGY_READ_ACTIONS.join(", "),
+            ONTOLOGY_WRITE_ACTIONS.join(", ")
+        );
+    }
+    let mut args = vec!["proposals".to_string(), action.to_string()];
+    match action {
+        "list" => {
+            args.push("--json".to_string());
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+        }
+        "show" => args.push(required_string(input, "item_id")?),
+        "accept" | "reject" => {
+            let item_ids = required_strings(input, "item_ids")?;
+            if item_ids.is_empty() {
+                bail!("ontology proposal {action} requires at least one item_id");
+            }
+            args.extend(item_ids);
+            if action == "accept" {
+                let domain = optional_string(input, "domain");
+                let output = optional_string(input, "output");
+                if domain.is_none() && output.is_none() {
+                    bail!(
+                        "ontology proposal accept requires `domain` (new artifact) or \
+                         `output` (existing artifact to extend)"
+                    );
+                }
+                if let Some(domain) = domain {
+                    args.push("--domain".to_string());
+                    args.push(domain);
+                }
+                if let Some(output) = output {
+                    args.push("--output".to_string());
+                    args.push(output);
+                }
+                if let Some(reason) = optional_string(input, "reason") {
+                    args.push("--reason".to_string());
+                    args.push(reason);
+                }
+            } else {
+                args.push("--reason".to_string());
+                args.push(required_string(input, "reason")?);
+            }
+            // The ledger must be able to tell an agent decision from a human
+            // one; the executing model's identity is not visible to this
+            // dispatch, so the dispositioner names the surface.
+            args.push("--by".to_string());
+            args.push("agent".to_string());
+        }
+        _ => unreachable!("action was checked against both tiers above"),
+    }
+    Ok(args)
+}
+
+/// Resolve an `action` against the tier allowed to run it. The tiers stay
+/// separate tools because approval is keyed on the tool NAME: merging them
+/// would either prompt on a read or strip the gate from a write.
+fn ontology_action_for(input: &Value, allowed: &[&str], tier: &str) -> Result<String> {
+    let action = required_string(input, "action")?;
+    if !allowed.contains(&action.as_str()) {
+        bail!(
+            "action {action:?} is not available on ontology_{tier}; it accepts: {}. \
+             Reads live on ontology_read, decisions on ontology_write.",
+            allowed.join(", ")
+        );
+    }
+    Ok(action)
+}
+
 fn ontology_proposals_list_schema() -> Value {
     json!({
         "type": "object",
@@ -2553,6 +2792,62 @@ fn discourse_run_schema() -> Value {
     })
 }
 
+/// Actions reachable through `node_read` — every `prism node` subcommand that
+/// is `ReadOnly` and free. `up`, `down` and `key` are deliberately absent: the
+/// first two change daemon state and the third handles keypairs, so all three
+/// stay on the approval-gated `node` umbrella rather than gaining a free path.
+const NODE_READ_ACTIONS: &[&str] = &["probe", "status", "logs"];
+
+fn node_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["probe", "status", "logs"],
+                "description": "probe = what this machine can do, without starting or registering anything; status = the running daemon's state; logs = tail a managed service."
+            },
+            "service": {
+                "type": "string",
+                "description": "action='logs': managed service name such as `kafka`, `spark`, or `firecrawl`."
+            },
+            "tail": {
+                "type": "integer",
+                "description": "action='logs': number of trailing log lines to show.",
+                "minimum": 1
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Build the `prism node <action> ...` argv.
+///
+/// ONE builder shared by the collapsed `node_read` and by the three typed specs
+/// it replaces, so a hidden name and its action form cannot drift apart.
+fn node_read_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    if !NODE_READ_ACTIONS.contains(&action) {
+        anyhow::bail!(
+            "action {action:?} is not available on node_read; it accepts: {}. \
+             Starting or stopping the daemon and managing its keys live on \
+             `node`, which asks first.",
+            NODE_READ_ACTIONS.join(", ")
+        );
+    }
+    let mut args = vec![action.to_string()];
+    if action == "logs" {
+        // `service` is the CLI's required positional, so a logs call without
+        // it must fail here rather than shell out to a command that cannot run.
+        args.push(required_string(input, "service")?);
+        if let Some(tail) = optional_usize(input, "tail") {
+            args.push("--tail".to_string());
+            args.push(tail.to_string());
+        }
+    }
+    Ok(args)
+}
+
 fn node_logs_schema() -> Value {
     json!({
         "type": "object",
@@ -2570,6 +2865,644 @@ fn node_logs_schema() -> Value {
         "required": ["service"],
         "additionalProperties": false
     })
+}
+
+/// Actions reachable through `models_read`.
+///
+/// The whole `models` family is `ReadOnly` with no approval — one gate, so by
+/// the rule it is ONE name. Nothing here spends money or changes state;
+/// running a model is `run_model`, which is a different root and a different
+/// gate entirely.
+const MODELS_READ_ACTIONS: &[&str] = &["list", "search", "info"];
+
+/// Build the `prism models <action> ...` argv.
+fn models_read_cli_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    let mut args = vec![action.to_string()];
+    match action {
+        "list" => {}
+        "search" => args.push(required_string(input, "query")?),
+        "info" => args.push(required_string(input, "model_id")?),
+        other => {
+            // Rationale for the separate `run_model` tool: see the
+            // MODELS_READ_ACTIONS doc comment above.
+            anyhow::bail!(
+                "unknown models action {other:?}; valid actions are: {}. To run a model \
+                 call `run_model` (billable, approval-gated).",
+                MODELS_READ_ACTIONS.join(", ")
+            );
+        }
+    }
+    if matches!(action, "list" | "search")
+        && let Some(provider) = optional_string(input, "provider")
+    {
+        args.push("--provider".to_string());
+        args.push(provider);
+    }
+    args.push("--json".to_string());
+    Ok(args)
+}
+
+/// Actions reachable through `compute_read` — the four `ReadOnly`, no-approval
+/// members of the compute family.
+///
+/// This family collapses 6 -> **3**, not 6 -> 2 as the plan's table said. By
+/// the plan's OWN rule the write half does not merge: `compute_cancel` is
+/// `FullAccess` with `requires_approval: false` while `compute_submit` is
+/// `FullAccess` with approval. That split is load-bearing and must survive —
+/// `compute_cancel` is the tool that STOPS spend, and putting an approval
+/// prompt in front of it would muzzle the one action a user reaches for while
+/// a job is burning money.
+const COMPUTE_READ_ACTIONS: &[&str] = &["gpus", "providers", "estimate", "status"];
+
+/// Build the `prism compute <action> ...` argv for the read tier.
+fn compute_read_cli_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    let mut args = vec![action.to_string()];
+    match action {
+        "gpus" | "providers" => {}
+        "status" => args.push(required_string(input, "job_id")?),
+        "estimate" => {
+            args.push("--image".to_string());
+            args.push(required_string(input, "image")?);
+            if let Some(gpu) = optional_string(input, "gpu") {
+                args.push("--gpu".to_string());
+                args.push(gpu);
+            }
+            if let Some(timeout) = optional_usize(input, "timeout") {
+                args.push("--timeout".to_string());
+                args.push(timeout.to_string());
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "unknown compute read action {other:?}; valid actions are: {}. \
+                 Submitting a job is `compute_submit` and cancelling one is \
+                 `compute_cancel` — both are separate tools because they carry \
+                 different gates.",
+                COMPUTE_READ_ACTIONS.join(", ")
+            );
+        }
+    }
+    Ok(args)
+}
+
+/// Actions reachable through `deploy_read` — `ReadOnly`, no approval.
+const DEPLOY_READ_ACTIONS: &[&str] = &["list", "status", "health"];
+
+/// Actions reachable through `deploy_write` — `FullAccess`, approval-gated.
+/// `create` spends money and `stop` ends a paid deployment; both belong behind
+/// the same gate, and neither belongs with the free read half.
+const DEPLOY_WRITE_ACTIONS: &[&str] = &["create", "stop"];
+
+/// Build the `prism deploy <action> ...` argv.
+///
+/// Shared by the collapsed tools and the five typed specs they replace. Note
+/// `create` keeps its mutual-exclusion rule (exactly one of `image` /
+/// `resource_slug`) — collapsing names must not relax a constraint the CLI
+/// depends on.
+fn deploy_cli_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    let mut args = vec![action.to_string()];
+    match action {
+        "list" => {
+            if let Some(status) = optional_string(input, "status") {
+                args.push("--status".to_string());
+                args.push(status);
+            }
+        }
+        "status" | "health" | "stop" => {
+            args.push(required_string(input, "deployment_id")?);
+        }
+        "create" => {
+            let name = required_string(input, "name")?;
+            let image = optional_string(input, "image");
+            let resource_slug = optional_string(input, "resource_slug");
+            if image.is_some() == resource_slug.is_some() {
+                bail!("Provide exactly one of `image` or `resource_slug`.");
+            }
+            args.push("--name".to_string());
+            args.push(name);
+            if let Some(image) = image {
+                args.push("--image".to_string());
+                args.push(image);
+            }
+            if let Some(resource_slug) = resource_slug {
+                args.push("--resource-slug".to_string());
+                args.push(resource_slug);
+            }
+            for (flag, key) in [
+                ("--target", "target"),
+                ("--gpu", "gpu"),
+                ("--node", "node_id"),
+                ("--health-path", "health_path"),
+            ] {
+                if let Some(v) = optional_string(input, key) {
+                    args.push(flag.to_string());
+                    args.push(v);
+                }
+            }
+            if let Some(budget) = optional_f64(input, "budget") {
+                args.push("--budget".to_string());
+                args.push(budget.to_string());
+            }
+            for (key, value) in parse_string_map(input, "env_vars")? {
+                args.push("--env".to_string());
+                args.push(format!("{key}={value}"));
+            }
+            if let Some(port) = optional_usize(input, "port") {
+                args.push("--port".to_string());
+                args.push(port.to_string());
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "unknown deploy action {other:?}; valid actions are: {} (read) and {} (write)",
+                DEPLOY_READ_ACTIONS.join(", "),
+                DEPLOY_WRITE_ACTIONS.join(", ")
+            );
+        }
+    }
+    args.push("--json".to_string());
+    Ok(args)
+}
+
+/// Resolve a deploy `action` against the tier allowed to run it.
+///
+/// The tiers stay separate tools because approval is keyed on the tool name:
+/// merging them would either prompt on a status poll or strip the gate from a
+/// create.
+fn deploy_action_for(input: &Value, allowed: &[&str], tier: &str) -> Result<String> {
+    let action = required_string(input, "action")?;
+    if !allowed.contains(&action.as_str()) {
+        anyhow::bail!(
+            "action {action:?} is not available on deploy_{tier}; deploy_{tier} accepts: {}. \
+             Reads live on deploy_read, writes on deploy_write.",
+            allowed.join(", ")
+        );
+    }
+    Ok(action)
+}
+
+/// Actions reachable through `discourse_read` — `ReadOnly`, no approval.
+const DISCOURSE_READ_ACTIONS: &[&str] = &["list", "show", "status", "turns"];
+
+/// Actions reachable through `discourse_write` — `WorkspaceWrite`, approval-gated.
+const DISCOURSE_WRITE_ACTIONS: &[&str] = &["create", "run"];
+
+/// Build the `prism discourse <action> ...` argv.
+///
+/// Shared by the collapsed tools and the six typed specs they replace, so a
+/// hidden name and its action form cannot drift. Note the id parameter is NOT
+/// uniform across actions — `show` takes a spec id while `status`/`turns` take
+/// an instance id — so each action reads the name it actually needs rather
+/// than a flattened `id` that would silently accept the wrong one.
+fn discourse_cli_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    let mut args = vec![action.to_string()];
+    match action {
+        "list" => {}
+        "show" => args.push(required_string(input, "spec_id")?),
+        "status" | "turns" => args.push(required_string(input, "instance_id")?),
+        "create" => {
+            args.push(required_string(input, "yaml_file")?);
+            if let Some(slug) = optional_string(input, "slug") {
+                args.push("--slug".to_string());
+                args.push(slug);
+            }
+        }
+        "run" => {
+            args.push(required_string(input, "spec_id")?);
+            for (key, value) in parse_string_map(input, "params")? {
+                args.push("--param".to_string());
+                args.push(format!("{key}={value}"));
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "unknown discourse action {other:?}; valid actions are: {} (read) and {} (write)",
+                DISCOURSE_READ_ACTIONS.join(", "),
+                DISCOURSE_WRITE_ACTIONS.join(", ")
+            );
+        }
+    }
+    args.push("--json".to_string());
+    Ok(args)
+}
+
+/// Resolve a discourse `action` against the tier allowed to run it.
+///
+/// The tiers stay separate tools because approval is keyed on the tool name:
+/// merging them would either prompt on a read or strip the gate from a write.
+fn discourse_action_for(input: &Value, allowed: &[&str], tier: &str) -> Result<String> {
+    let action = required_string(input, "action")?;
+    if !allowed.contains(&action.as_str()) {
+        anyhow::bail!(
+            "action {action:?} is not available on discourse_{tier}; discourse_{tier} accepts: {}. \
+             Reads live on discourse_read, writes on discourse_write.",
+            allowed.join(", ")
+        );
+    }
+    Ok(action)
+}
+
+/// Actions reachable through `mesh_read` — every mesh subcommand that is
+/// `ReadOnly` and needs no approval.
+fn models_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "search", "info"],
+                "description": "list = available models; search = find models by keyword; info = details for one model id."
+            },
+            "query": { "type": "string", "description": "action='search': keywords to match." },
+            "model_id": { "type": "string", "description": "action='info': the model id or marketplace slug." },
+            "provider": { "type": "string", "description": "action='list'|'search': restrict to one provider." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn compute_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["gpus", "providers", "estimate", "status"],
+                "description": "gpus = purchasable GPU offers; providers = registered backends; estimate = price a job WITHOUT dispatching it; status = poll one job."
+            },
+            "image": { "type": "string", "description": "action='estimate': container image or marketplace slug to price." },
+            "gpu": { "type": "string", "description": "action='estimate': GPU class, e.g. 'A100-80GB'." },
+            "timeout": { "type": "integer", "description": "action='estimate': wall-time cap in seconds." },
+            "job_id": { "type": "string", "description": "action='status': compute-broker job ID." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn deploy_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "status", "health"],
+                "description": "list = all deployments; status = one deployment's state; health = probe one deployment's health endpoint."
+            },
+            "status": { "type": "string", "description": "action='list': filter by deployment status." },
+            "deployment_id": { "type": "string", "description": "action='status'|'health': deployment UUID." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn deploy_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "stop"],
+                "description": "create = start a NEW deployment (BILLABLE); stop = end a running one."
+            },
+            "name": { "type": "string", "description": "action='create': deployment name." },
+            "image": { "type": "string", "description": "action='create': container image. Provide EXACTLY ONE of image or resource_slug." },
+            "resource_slug": { "type": "string", "description": "action='create': marketplace resource slug. Provide EXACTLY ONE of image or resource_slug." },
+            "target": { "type": "string", "description": "action='create': deployment target." },
+            "gpu": { "type": "string", "description": "action='create': GPU class, e.g. 'A100-80GB'." },
+            "budget": { "type": "number", "description": "action='create': spend cap in USD." },
+            "node_id": { "type": "string", "description": "action='create': pin to a specific mesh node." },
+            "env_vars": { "type": "object", "description": "action='create': environment variables as KEY: VALUE." },
+            "port": { "type": "integer", "description": "action='create': container port to expose." },
+            "health_path": { "type": "string", "description": "action='create': HTTP path for health checks." },
+            "deployment_id": { "type": "string", "description": "action='stop': deployment UUID to stop." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn discourse_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "show", "status", "turns"],
+                "description": "list = all discourse specs; show = one spec; status = one running instance; turns = an instance's stored turns."
+            },
+            "spec_id": { "type": "string", "description": "action='show': UUID of the discourse spec." },
+            "instance_id": { "type": "string", "description": "action='status'|'turns': UUID of the discourse instance." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn discourse_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "run"],
+                "description": "create = register a discourse spec from YAML; run = start an instance of a spec."
+            },
+            "yaml_file": { "type": "string", "description": "action='create': path to the discourse spec YAML." },
+            "slug": { "type": "string", "description": "action='create': optional short name for the spec." },
+            "spec_id": { "type": "string", "description": "action='run': UUID of the spec to run." },
+            "params": { "type": "object", "description": "action='run': parameters passed to the discourse as KEY: VALUE." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Actions reachable through `marketplace_read` — every marketplace subcommand
+/// that is `ReadOnly` and never prompts.
+const MARKETPLACE_READ_ACTIONS: &[&str] = &["search", "info", "find"];
+
+/// Actions reachable through `marketplace_write` — `install` plus the two verbs
+/// that previously had NO typed tool and were reachable only through the
+/// `marketplace` umbrella, which is why that umbrella had to stay offered.
+const MARKETPLACE_WRITE_ACTIONS: &[&str] = &["install", "update", "publish"];
+
+/// Resolve a marketplace `action` against the tier allowed to run it.
+///
+/// The tiers stay separate tools because approval is keyed on the tool name:
+/// merging them would either prompt on a free search or strip the gate from
+/// an install.
+fn marketplace_action_for(input: &Value, allowed: &[&str], tier: &str) -> Result<String> {
+    let action = required_string(input, "action")?;
+    if !allowed.contains(&action.as_str()) {
+        anyhow::bail!(
+            "action {action:?} is not available on marketplace_{tier}; marketplace_{tier} \
+             accepts: {}. Reads live on marketplace_read, writes on marketplace_write.",
+            allowed.join(", ")
+        );
+    }
+    Ok(action)
+}
+
+/// Build the `prism marketplace <action> ...` argv for one action.
+///
+/// ONE builder shared by the collapsed `marketplace_read`/`marketplace_write`
+/// tools and by the four typed specs they replace, so a hidden name and its
+/// action form cannot drift apart. Flags are those of `MarketplaceCommands` in
+/// crates/cli/src/main.rs — verified against that enum, not assumed.
+fn marketplace_cli_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    let mut args = vec![action.to_string()];
+    match action {
+        "search" => {
+            if let Some(query) = optional_string(input, "query") {
+                args.push(query);
+            }
+        }
+        "info" => args.push(required_string(input, "name")?),
+        "find" => {
+            args.push(required_string(input, "query")?);
+            if let Some(types) = input.get("types").and_then(Value::as_array) {
+                for t in types.iter().filter_map(Value::as_str) {
+                    args.push("--type".to_string());
+                    args.push(t.to_string());
+                }
+            }
+            if let Some(limit) = optional_usize(input, "limit") {
+                args.push("--limit".to_string());
+                args.push(limit.to_string());
+            }
+            // Structured output — this path is agent-only, never rendered raw
+            // to a human, so always request JSON.
+            args.push("--json".to_string());
+        }
+        "install" => {
+            args.push(required_string(input, "name")?);
+            if optional_bool(input, "workflow") {
+                args.push("--workflow".to_string());
+            }
+        }
+        "update" => {
+            if optional_bool(input, "dry_run") {
+                args.push("--dry-run".to_string());
+            }
+        }
+        "publish" => {
+            if optional_bool(input, "dry_run") {
+                args.push("--dry-run".to_string());
+            }
+            if let Some(slug) = optional_string(input, "slug") {
+                args.push("--slug".to_string());
+                args.push(slug);
+            }
+        }
+        other => {
+            // A wrong `action` is RECOVERABLE: name the valid set so the model
+            // retries rather than abandoning the tool.
+            anyhow::bail!(
+                "unknown marketplace action {other:?}; valid actions are: {} (read) and {} (write)",
+                MARKETPLACE_READ_ACTIONS.join(", "),
+                MARKETPLACE_WRITE_ACTIONS.join(", ")
+            );
+        }
+    }
+    Ok(args)
+}
+
+fn marketplace_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["search", "info", "find"],
+                "description": "search = lexical match (query optional; empty lists everything); info = full metadata for one name; find = semantic discovery by capability."
+            },
+            "query": { "type": "string", "description": "action='search': optional lexical query. action='find': REQUIRED natural-language description of what the resource should do." },
+            "name": { "type": "string", "description": "action='info': the resource name." },
+            "types": { "type": "array", "items": { "type": "string" }, "description": "action='find': restrict to these resource_type values (OR)." },
+            "limit": { "type": "integer", "description": "action='find': max hits. Typical 3-10.", "minimum": 1 }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn marketplace_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["install", "update", "publish"],
+                "description": "install = add one resource locally; update = re-download every locally-installed tool whose remote version differs; publish = submit PRISM's own catalog for review."
+            },
+            "name": { "type": "string", "description": "action='install': the resource to install." },
+            "workflow": { "type": "boolean", "description": "action='install': install a YAML workflow instead of a Python tool." },
+            "dry_run": { "type": "boolean", "description": "action='update'|'publish': report what would change without doing it. `update` OVERWRITES locally-edited files, so run it dry first." },
+            "slug": { "type": "string", "description": "action='publish': publish only this slug (default: every catalog entry)." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn mesh_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["discover", "health", "peers", "subscriptions"],
+                "description": "discover = find peers on the network; health = local node health; peers = known peers; subscriptions = datasets this node subscribes to."
+            },
+            "timeout": { "type": "integer", "description": "action='discover': seconds to search." },
+            "dashboard_url": { "type": "string", "description": "Dashboard base URL for the running local node." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+fn mesh_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["publish", "subscribe", "unsubscribe", "sync"],
+                "description": "publish = offer a dataset to peers; subscribe/unsubscribe = follow a peer's dataset; sync = pull a dataset from one peer now."
+            },
+            "name": { "type": "string", "description": "action='publish': dataset name to publish." },
+            "schema_version": { "type": "string", "description": "action='publish': schema version of the published dataset." },
+            "dataset_name": { "type": "string", "description": "action='subscribe'|'unsubscribe'|'sync': the dataset." },
+            "publisher": { "type": "string", "description": "action='subscribe'|'unsubscribe': node publishing the dataset." },
+            "peer": { "type": "string", "description": "action='sync': peer to pull from." },
+            "dashboard_url": { "type": "string", "description": "Dashboard base URL for the running local node." }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Actions reachable through `billing_read` — every billing subcommand that is
+/// `ReadOnly` and free. `topup` is deliberately absent: it opens a Stripe
+/// checkout and spends money, so it stays on the approval-gated `billing`
+/// umbrella rather than gaining a cheaper path here.
+const BILLING_READ_ACTIONS: &[&str] = &["balance", "usage", "history", "prices"];
+
+fn billing_read_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["balance", "usage", "history", "prices"],
+                "description": "balance = credits and dollar value now; usage = spend this period by service; history = recent charges and top-ups; prices = credits per unit for every metered service."
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": false
+    })
+}
+
+/// Build the `prism billing <action>` argv.
+///
+/// ONE builder shared by the collapsed `billing_read` and by the four typed
+/// specs it replaces, so a hidden name and its action form cannot drift apart.
+/// `balance` is the bare root: `prism billing` with no subcommand IS the
+/// balance action, and `prism billing balance` is not a command.
+fn billing_read_args(action: &str) -> Result<Vec<String>> {
+    if !BILLING_READ_ACTIONS.contains(&action) {
+        anyhow::bail!(
+            "action {action:?} is not available on billing_read; it accepts: {}. \
+             Topping up spends money and lives on `billing`, which asks first.",
+            BILLING_READ_ACTIONS.join(", ")
+        );
+    }
+    Ok(if action == "balance" {
+        vec![]
+    } else {
+        vec![action.to_string()]
+    })
+}
+
+const MESH_READ_ACTIONS: &[&str] = &["discover", "health", "peers", "subscriptions"];
+
+/// Actions reachable through `mesh_write` — every mesh subcommand that is
+/// `FullAccess` and approval-gated.
+const MESH_WRITE_ACTIONS: &[&str] = &["publish", "subscribe", "unsubscribe", "sync"];
+
+/// Build the `prism mesh <action> ...` argv for one action.
+///
+/// ONE builder shared by the collapsed `mesh_read`/`mesh_write` tools and by
+/// the eight typed specs they replace, so a hidden name and its action form
+/// cannot drift apart. The typed specs stay registered and executable — hidden
+/// from the offered catalog is not the same as removed.
+fn mesh_cli_args(action: &str, input: &Value) -> Result<Vec<String>> {
+    let dashboard = |args: &mut Vec<String>| {
+        if let Some(url) = optional_string(input, "dashboard_url") {
+            args.push("--dashboard-url".to_string());
+            args.push(url);
+        }
+    };
+    let mut args = vec![action.to_string()];
+    match action {
+        "discover" => {
+            if let Some(timeout) = optional_usize(input, "timeout") {
+                args.push("--timeout".to_string());
+                args.push(timeout.to_string());
+            }
+        }
+        "health" | "peers" | "subscriptions" => dashboard(&mut args),
+        "publish" => {
+            args.push(required_string(input, "name")?);
+            if let Some(v) = optional_string(input, "schema_version") {
+                args.push("--schema-version".to_string());
+                args.push(v);
+            }
+            dashboard(&mut args);
+        }
+        "subscribe" | "unsubscribe" => {
+            args.push(required_string(input, "dataset_name")?);
+            args.push("--publisher".to_string());
+            args.push(required_string(input, "publisher")?);
+            dashboard(&mut args);
+        }
+        "sync" => {
+            args.push(required_string(input, "dataset_name")?);
+            args.push("--peer".to_string());
+            args.push(required_string(input, "peer")?);
+        }
+        other => {
+            // A wrong `action` is RECOVERABLE: name the valid set so the model
+            // retries. A wrong tool NAME was the dead end that burned five
+            // calls in T2.
+            anyhow::bail!(
+                "unknown mesh action {other:?}; valid actions are: {} (read) and {} (write)",
+                MESH_READ_ACTIONS.join(", "),
+                MESH_WRITE_ACTIONS.join(", ")
+            );
+        }
+    }
+    Ok(args)
+}
+
+/// Resolve an `action` argument against the tier that is allowed to run it.
+///
+/// The tiers stay separate tools because approval is keyed on the tool name:
+/// merging them would either prompt on a read or strip the gate from a write.
+fn mesh_action_for(input: &Value, allowed: &[&str], tier: &str) -> Result<String> {
+    let action = required_string(input, "action")?;
+    if !allowed.contains(&action.as_str()) {
+        anyhow::bail!(
+            "action {action:?} is not available on mesh_{tier}; mesh_{tier} accepts: {}. \
+             Reads live on mesh_read, writes on mesh_write.",
+            allowed.join(", ")
+        );
+    }
+    Ok(action)
 }
 
 fn mesh_discover_schema() -> Value {
@@ -2672,9 +3605,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             root_subcommand_schema(spec.root, subcommands)
         }
         CommandToolKind::DoctorFix => empty_schema(),
-        CommandToolKind::QueryLocal => query_local_schema(),
-        CommandToolKind::QueryPlatform => query_platform_schema(),
-        CommandToolKind::QueryFederated => query_federated_schema(),
+        CommandToolKind::QueryScoped => query_scoped_schema(),
         CommandToolKind::JobStatusLookup => job_status_schema(),
         CommandToolKind::WorkflowList => empty_schema(),
         CommandToolKind::WorkflowShow => workflow_show_schema(),
@@ -2688,6 +3619,8 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         }
         CommandToolKind::MarketplaceInstall => marketplace_install_schema(),
         CommandToolKind::MarketplaceFind => marketplace_find_schema(),
+        CommandToolKind::MarketplaceRead => marketplace_read_schema(),
+        CommandToolKind::MarketplaceWrite => marketplace_write_schema(),
         CommandToolKind::IngestFile => {
             ingest_schema("File or local path to ingest into PRISM's graph/vector pipeline.")
         }
@@ -2712,6 +3645,12 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
             deploy_id_schema("deployment_id", "Deployment UUID to stop.")
         }
         CommandToolKind::RunSubmit => run_submit_schema(),
+        CommandToolKind::ModelsRead => models_read_schema(),
+        CommandToolKind::ComputeRead => compute_read_schema(),
+        CommandToolKind::DeployRead => deploy_read_schema(),
+        CommandToolKind::DeployWrite => deploy_write_schema(),
+        CommandToolKind::DiscourseRead => discourse_read_schema(),
+        CommandToolKind::DiscourseWrite => discourse_write_schema(),
         CommandToolKind::DiscourseList => empty_schema(),
         CommandToolKind::DiscourseCreate => discourse_create_schema(),
         CommandToolKind::DiscourseShow => {
@@ -2753,6 +3692,8 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::KnowledgeEntity => knowledge_entity_schema(),
         CommandToolKind::KnowledgePaths => knowledge_paths_schema(),
         CommandToolKind::KnowledgeCorpora => knowledge_corpora_schema(),
+        CommandToolKind::OntologyRead => ontology_read_schema(),
+        CommandToolKind::OntologyWrite => ontology_write_schema(),
         CommandToolKind::OntologyProposalsList => ontology_proposals_list_schema(),
         CommandToolKind::OntologyProposalsShow => ontology_proposals_show_schema(),
         CommandToolKind::OntologyProposalsAccept => ontology_proposals_accept_schema(),
@@ -2761,6 +3702,7 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::ReverifyAssertion => reverify_assertion_schema(),
         CommandToolKind::ReverifyHistory => reverify_history_schema(),
         CommandToolKind::KnowledgeIngest => knowledge_ingest_schema(),
+        CommandToolKind::BillingRead => billing_read_schema(),
         CommandToolKind::BillingBalance
         | CommandToolKind::BillingUsage
         | CommandToolKind::BillingHistory
@@ -2769,8 +3711,11 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
         CommandToolKind::NotebookExec => notebook_exec_schema(),
         CommandToolKind::NotebookStatus | CommandToolKind::NotebookReset => empty_schema(),
         CommandToolKind::WebBrowse => web_browse_schema(),
+        CommandToolKind::NodeRead => node_read_schema(),
         CommandToolKind::NodeProbe | CommandToolKind::NodeStatus => empty_schema(),
         CommandToolKind::NodeLogs => node_logs_schema(),
+        CommandToolKind::MeshRead => mesh_read_schema(),
+        CommandToolKind::MeshWrite => mesh_write_schema(),
         CommandToolKind::MeshDiscover => mesh_discover_schema(),
         CommandToolKind::MeshHealth => {
             dashboard_url_schema("Dashboard base URL for the running local node.")
@@ -2791,7 +3736,17 @@ fn schema_for_spec(spec: &CommandToolSpec) -> Value {
 fn spec_by_name(tool_name: &str) -> Option<&'static CommandToolSpec> {
     COMMAND_TOOLS.iter().find(|spec| {
         spec.name.eq_ignore_ascii_case(tool_name)
-            || spec.root.eq_ignore_ascii_case(tool_name)
+            // Root-matching resolves the UMBRELLA tool only (`mesh`, `deploy`),
+            // never a typed child that merely shares the CLI root. Matching any
+            // child by its root returned whichever spec sat first in this array:
+            // `notebook` resolved to `notebook_exec` and `schedule` to
+            // `schedule_create` — both FullAccess and approval-gated, reached
+            // through a bare name that was never offered as a tool. It also let
+            // this table claim names it does not own: `predict` is a Python
+            // tool, and the Rust spec rooted at `prism predict` was capturing it
+            // ahead of the tool-server dispatch branch.
+            || (spec.name.eq_ignore_ascii_case(spec.root)
+                && spec.root.eq_ignore_ascii_case(tool_name))
             || spec
                 .aliases
                 .iter()
@@ -2804,9 +3759,21 @@ pub fn canonical_code_exec_tool(name: &str) -> &str {
     if matches!(name, "execute_python" | "execute_bash" | "notebook_exec") {
         return name;
     }
-    if let Some(spec) = spec_by_name(name)
-        && spec.name == "notebook_exec"
-    {
+    // Deliberately BROADER than dispatch resolution. `spec_by_name` no longer
+    // resolves a bare CLI root to a typed child (that let this table capture
+    // `predict` from the Python tool server), but the code-execution cap must
+    // stay conservative: any name that could plausibly reach the notebook
+    // executor — its aliases, or the `notebook` root — counts toward the cap.
+    // Over-counting is safe here; under-counting is an uncapped exec path.
+    if COMMAND_TOOLS.iter().any(|spec| {
+        spec.name == "notebook_exec"
+            && (spec.name.eq_ignore_ascii_case(name)
+                || spec.root.eq_ignore_ascii_case(name)
+                || spec
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name)))
+    }) {
         return "notebook_exec";
     }
     name
@@ -3124,11 +4091,20 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
         }
         CommandExecution::NotebookStatus => "notebook status".to_string(),
         CommandExecution::NotebookReset => "notebook reset".to_string(),
-        CommandExecution::WebBrowse { url } => {
-            format!(
-                "agent-browser read {}",
-                shell_command_join(std::slice::from_ref(url))
-            )
+        CommandExecution::WebBrowse { url, render } => {
+            let quoted = shell_command_join(std::slice::from_ref(url));
+            if *render {
+                // The preview names the browser PRISM tries first. When no
+                // pane can be opened it falls back to `agent-browser` and the
+                // result says so — the preview is the intent, the envelope is
+                // the record.
+                format!(
+                    "{TERMINAL_BROWSER_BIN} open {quoted} --split right \
+                     && {TERMINAL_BROWSER_BIN} action -- read"
+                )
+            } else {
+                format!("agent-browser read {quoted}")
+            }
         }
     }
 }
@@ -3738,18 +4714,25 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 })
             }
         }
-        CommandToolKind::QueryLocal => Ok(CommandExecution::Cli {
-            root: spec.root,
-            args: build_query_args(input, QueryMode::Local)?,
-        }),
-        CommandToolKind::QueryPlatform => Ok(CommandExecution::Cli {
-            root: spec.root,
-            args: build_query_args(input, QueryMode::Platform)?,
-        }),
-        CommandToolKind::QueryFederated => Ok(CommandExecution::Cli {
-            root: spec.root,
-            args: build_query_args(input, QueryMode::Federated)?,
-        }),
+        CommandToolKind::QueryScoped => {
+            // Default `local`: the user's own free on-disk graph. Never
+            // `platform` — defaulting to the billed remote store is how a
+            // query for locally-held knowledge died on HTTP 402.
+            let mode = match input
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("local")
+            {
+                "local" => QueryMode::Local,
+                "platform" => QueryMode::Platform,
+                "federated" => QueryMode::Federated,
+                other => bail!("unknown scope `{other}` — use one of: local, platform, federated"),
+            };
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: build_query_args(input, mode)?,
+            })
+        }
         CommandToolKind::JobStatusLookup => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec![required_string(input, "job_id")?],
@@ -3767,48 +4750,34 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 execute: optional_bool(input, "execute"),
             })
         }
-        CommandToolKind::MarketplaceSearch => {
-            let mut args = vec!["search".to_string()];
-            if let Some(query) = optional_string(input, "query") {
-                args.push(query);
-            }
-            Ok(CommandExecution::Cli {
-                root: spec.root,
-                args,
-            })
-        }
+        CommandToolKind::MarketplaceSearch => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: marketplace_cli_args("search", input)?,
+        }),
         CommandToolKind::MarketplaceInfo => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["info".to_string(), required_string(input, "name")?],
+            args: marketplace_cli_args("info", input)?,
         }),
-        CommandToolKind::MarketplaceInstall => {
-            let mut args = vec!["install".to_string(), required_string(input, "name")?];
-            if optional_bool(input, "workflow") {
-                args.push("--workflow".to_string());
-            }
+        CommandToolKind::MarketplaceInstall => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: marketplace_cli_args("install", input)?,
+        }),
+        CommandToolKind::MarketplaceFind => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: marketplace_cli_args("find", input)?,
+        }),
+        CommandToolKind::MarketplaceRead => {
+            let action = marketplace_action_for(input, MARKETPLACE_READ_ACTIONS, "read")?;
             Ok(CommandExecution::Cli {
                 root: spec.root,
-                args,
+                args: marketplace_cli_args(&action, input)?,
             })
         }
-        CommandToolKind::MarketplaceFind => {
-            let mut args = vec!["find".to_string(), required_string(input, "query")?];
-            if let Some(types) = input.get("types").and_then(Value::as_array) {
-                for t in types.iter().filter_map(Value::as_str) {
-                    args.push("--type".to_string());
-                    args.push(t.to_string());
-                }
-            }
-            if let Some(limit) = optional_usize(input, "limit") {
-                args.push("--limit".to_string());
-                args.push(limit.to_string());
-            }
-            // Structured output — this tool is agent-only, never rendered
-            // raw to a human, so always request JSON.
-            args.push("--json".to_string());
+        CommandToolKind::MarketplaceWrite => {
+            let action = marketplace_action_for(input, MARKETPLACE_WRITE_ACTIONS, "write")?;
             Ok(CommandExecution::Cli {
                 root: spec.root,
-                args,
+                args: marketplace_cli_args(&action, input)?,
             })
         }
         CommandToolKind::IngestFile => Ok(CommandExecution::Cli {
@@ -3855,9 +4824,8 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 // being killed mid-poll.
                 if poll_timeout_secs as u64 > CLI_LONG_WORK_BUDGET_SECS {
                     bail!(
-                        "`poll_timeout_secs` must be ≤ {CLI_LONG_WORK_BUDGET_SECS}: the \
-                         agent-side execution window is sized just above that \
-                         budget, and a larger poll would be killed mid-wait."
+                        "`poll_timeout_secs` must be ≤ {CLI_LONG_WORK_BUDGET_SECS}: a longer \
+                         poll would be killed by the agent-side execution window."
                     );
                 }
                 args.push("--poll-timeout-secs".to_string());
@@ -3916,6 +4884,16 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::ModelsRead => {
+            // `models_read_cli_args` validates the action itself and names the
+            // valid set, so a second check here would only be a place for the
+            // two lists to drift apart.
+            let action = required_string(input, "action")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: models_read_cli_args(&action, input)?,
+            })
+        }
         CommandToolKind::ModelsList => {
             let mut args = vec!["list".to_string()];
             if let Some(provider) = optional_string(input, "provider") {
@@ -3958,6 +4936,20 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             Ok(CommandExecution::Cli {
                 root: spec.root,
                 args,
+            })
+        }
+        CommandToolKind::DeployRead => {
+            let action = deploy_action_for(input, DEPLOY_READ_ACTIONS, "read")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: deploy_cli_args(&action, input)?,
+            })
+        }
+        CommandToolKind::DeployWrite => {
+            let action = deploy_action_for(input, DEPLOY_WRITE_ACTIONS, "write")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: deploy_cli_args(&action, input)?,
             })
         }
         CommandToolKind::DeployStatus => Ok(CommandExecution::Cli {
@@ -4146,6 +5138,20 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
+        CommandToolKind::DiscourseRead => {
+            let action = discourse_action_for(input, DISCOURSE_READ_ACTIONS, "read")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: discourse_cli_args(&action, input)?,
+            })
+        }
+        CommandToolKind::DiscourseWrite => {
+            let action = discourse_action_for(input, DISCOURSE_WRITE_ACTIONS, "write")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: discourse_cli_args(&action, input)?,
+            })
+        }
         CommandToolKind::DiscourseList => Ok(CommandExecution::Cli {
             root: spec.root,
             args: vec!["list".to_string(), "--json".to_string()],
@@ -4215,6 +5221,24 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             Ok(CommandExecution::Cli {
                 root: spec.root,
                 args,
+            })
+        }
+        CommandToolKind::ComputeRead => {
+            let action = required_string(input, "action")?;
+            if !COMPUTE_READ_ACTIONS.contains(&action.as_str()) {
+                // submit/cancel are separate tools, not actions: approval is
+                // keyed on the tool name, and cancel must never prompt (see
+                // the COMPUTE_READ_ACTIONS doc comment).
+                anyhow::bail!(
+                    "action {action:?} is not available on compute_read; it accepts: {}. \
+                     To dispatch a job call `compute_submit`; to stop one call \
+                     `compute_cancel`.",
+                    COMPUTE_READ_ACTIONS.join(", ")
+                );
+            }
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: compute_read_cli_args(&action, input)?,
             })
         }
         CommandToolKind::ComputeGpus => Ok(CommandExecution::Cli {
@@ -4434,21 +5458,28 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
             root: spec.root,
             args: vec!["cancel".to_string(), required_string(input, "id")?],
         }),
+        CommandToolKind::BillingRead => {
+            let action = required_string(input, "action")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: billing_read_args(&action)?,
+            })
+        }
         CommandToolKind::BillingBalance => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec![],
+            args: billing_read_args("balance")?,
         }),
         CommandToolKind::BillingUsage => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["usage".to_string()],
+            args: billing_read_args("usage")?,
         }),
         CommandToolKind::BillingHistory => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["history".to_string()],
+            args: billing_read_args("history")?,
         }),
         CommandToolKind::BillingPrices => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["prices".to_string()],
+            args: billing_read_args("prices")?,
         }),
         CommandToolKind::ReportBug => {
             // Reuses the `prism report` machinery (handle_report: captures
@@ -4574,83 +5605,36 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 args,
             })
         }
-        CommandToolKind::OntologyProposalsList => {
-            let mut args = vec![
-                "proposals".to_string(),
-                "list".to_string(),
-                "--json".to_string(),
-            ];
-            if let Some(limit) = optional_usize(input, "limit") {
-                args.push("--limit".to_string());
-                args.push(limit.to_string());
-            }
+        CommandToolKind::OntologyRead => {
+            let action = ontology_action_for(input, ONTOLOGY_READ_ACTIONS, "read")?;
             Ok(CommandExecution::Cli {
                 root: spec.root,
-                args,
+                args: ontology_proposal_args(&action, input)?,
             })
         }
+        CommandToolKind::OntologyWrite => {
+            let action = ontology_action_for(input, ONTOLOGY_WRITE_ACTIONS, "write")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: ontology_proposal_args(&action, input)?,
+            })
+        }
+        CommandToolKind::OntologyProposalsList => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: ontology_proposal_args("list", input)?,
+        }),
         CommandToolKind::OntologyProposalsShow => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec![
-                "proposals".to_string(),
-                "show".to_string(),
-                required_string(input, "item_id")?,
-            ],
+            args: ontology_proposal_args("show", input)?,
         }),
-        CommandToolKind::OntologyProposalsAccept => {
-            let item_ids = required_strings(input, "item_ids")?;
-            if item_ids.is_empty() {
-                bail!("ontology_proposals_accept requires at least one item_id");
-            }
-            let domain = optional_string(input, "domain");
-            let output = optional_string(input, "output");
-            if domain.is_none() && output.is_none() {
-                bail!(
-                    "ontology_proposals_accept requires `domain` (new artifact) or `output` \
-                     (existing artifact to extend)"
-                );
-            }
-            let mut args = vec!["proposals".to_string(), "accept".to_string()];
-            args.extend(item_ids);
-            if let Some(domain) = domain {
-                args.push("--domain".to_string());
-                args.push(domain);
-            }
-            if let Some(output) = output {
-                args.push("--output".to_string());
-                args.push(output);
-            }
-            if let Some(reason) = optional_string(input, "reason") {
-                args.push("--reason".to_string());
-                args.push(reason);
-            }
-            // The ledger must be able to tell an agent decision from a
-            // human one; the executing model's identity is not visible to
-            // this dispatch, so the dispositioner names the surface.
-            args.push("--by".to_string());
-            args.push("agent".to_string());
-            Ok(CommandExecution::Cli {
-                root: spec.root,
-                args,
-            })
-        }
-        CommandToolKind::OntologyProposalsReject => {
-            let item_ids = required_strings(input, "item_ids")?;
-            if item_ids.is_empty() {
-                bail!("ontology_proposals_reject requires at least one item_id");
-            }
-            let reason = required_string(input, "reason")?;
-            let mut args = vec!["proposals".to_string(), "reject".to_string()];
-            args.extend(item_ids);
-            args.push("--reason".to_string());
-            args.push(reason);
-            args.push("--by".to_string());
-            args.push("agent".to_string());
-            Ok(CommandExecution::Cli {
-                root: spec.root,
-                args,
-            })
-        }
+        CommandToolKind::OntologyProposalsAccept => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: ontology_proposal_args("accept", input)?,
+        }),
+        CommandToolKind::OntologyProposalsReject => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: ontology_proposal_args("reject", input)?,
+        }),
         CommandToolKind::ReverifyCandidates => {
             let mut args = vec![
                 "list".to_string(),
@@ -4700,23 +5684,37 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
                 "--json".to_string(),
             ],
         }),
+        CommandToolKind::NodeRead => {
+            let action = required_string(input, "action")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: node_read_args(&action, input)?,
+            })
+        }
         CommandToolKind::NodeProbe => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["probe".to_string()],
+            args: node_read_args("probe", input)?,
         }),
         CommandToolKind::NodeStatus => Ok(CommandExecution::Cli {
             root: spec.root,
-            args: vec!["status".to_string()],
+            args: node_read_args("status", input)?,
         }),
-        CommandToolKind::NodeLogs => {
-            let mut args = vec!["logs".to_string(), required_string(input, "service")?];
-            if let Some(tail) = optional_usize(input, "tail") {
-                args.push("--tail".to_string());
-                args.push(tail.to_string());
-            }
+        CommandToolKind::NodeLogs => Ok(CommandExecution::Cli {
+            root: spec.root,
+            args: node_read_args("logs", input)?,
+        }),
+        CommandToolKind::MeshRead => {
+            let action = mesh_action_for(input, MESH_READ_ACTIONS, "read")?;
             Ok(CommandExecution::Cli {
                 root: spec.root,
-                args,
+                args: mesh_cli_args(&action, input)?,
+            })
+        }
+        CommandToolKind::MeshWrite => {
+            let action = mesh_action_for(input, MESH_WRITE_ACTIONS, "write")?;
+            Ok(CommandExecution::Cli {
+                root: spec.root,
+                args: mesh_cli_args(&action, input)?,
             })
         }
         CommandToolKind::MeshDiscover => {
@@ -4829,6 +5827,7 @@ fn build_execution(spec: &CommandToolSpec, input: &Value) -> Result<CommandExecu
         CommandToolKind::NotebookReset => Ok(CommandExecution::NotebookReset),
         CommandToolKind::WebBrowse => Ok(CommandExecution::WebBrowse {
             url: required_string(input, "url")?,
+            render: optional_bool(input, "render"),
         }),
     }
 }
@@ -5128,7 +6127,7 @@ const AGENT_BROWSER_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// What one `agent-browser read` run produced. Every failure mode is its own
 /// variant so callers report each one as what it was — never an empty string
 /// standing in for an error.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum AgentBrowserOutcome {
     /// `agent-browser` is not on PATH. Callers must say exactly this and name
     /// the install command; PRISM never silently degrades to another fetcher.
@@ -5169,6 +6168,253 @@ pub(crate) fn agent_browser_missing_message() -> String {
 ///
 /// `Err` carries the offline-policy refusal (a remote URL under
 /// `PRISM_OFFLINE=1`); every child-process outcome is an [`AgentBrowserOutcome`].
+/// User-Agent the render path presents.
+///
+/// MEASURED 2026-08-25, not assumed. `agent-browser` defaults to a UA
+/// containing the literal token `HeadlessChrome`, which is the cheapest bot
+/// signal there is — every commercial bot manager keys on it:
+///
+/// | host                    | plain fetch | headless browser        | this UA          |
+/// |-------------------------|-------------|-------------------------|------------------|
+/// | www.mdpi.com (Akamai)   | 403         | "Access Denied"         | **full article** |
+/// | iopscience.iop.org      | 404         | Radware Bot Manager     | **real page**    |
+/// | www.sciencedirect.com   | —           | —                       | **reached**      |
+///
+/// So the fulltext allowlist — six hosts, everything else refused — was
+/// largely an artifact of a User-Agent string. This is the SAME Chrome build
+/// the driver already runs; only the `Headless` token is dropped, so it is an
+/// accurate self-description of the engine fetching the page, not a forged
+/// identity.
+const RENDER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+
+/// Drive a REAL browser at `url` and read the rendered DOM.
+///
+/// `agent-browser read <url>` is an HTTP fetch — it does not run JavaScript,
+/// so it fails identically to any other fetcher against a bot wall. The vendor
+/// exposes the real path as two verbs: `open <url>` navigates an actual
+/// browser (JS runs, challenges resolve), then `read` with NO url returns the
+/// active tab's rendered text.
+///
+/// This exists because the fulltext allowlist was refusing work it had never
+/// attempted: every non-allowlisted publisher was labelled "do not spend an
+/// ingest on this", which is only honest while there is no browser to escalate
+/// to. Now there is one.
+/// A render that the human can WATCH is preferred over one they cannot. When
+/// `terminal-browser` can open a pane, the page loads beside the conversation
+/// and its `action` subcommand — an agent-browser compatible CLI over that
+/// same tab — does the reading, so the agent's browsing is a thing on screen
+/// rather than a thing in its context. When it cannot, the headless
+/// `agent-browser` path runs exactly as before and the envelope SAYS the page
+/// was fetched but not shown.
+pub(crate) async fn agent_browser_render(url: &str) -> Result<AgentBrowserOutcome, String> {
+    prism_runtime::offline::check_url(url)?;
+    let visible = terminal_browser_render(url).await?;
+    resolve_render(
+        visible,
+        agent_browser_render_cmds(
+            TokioCommand::new("agent-browser"),
+            TokioCommand::new("agent-browser"),
+            TokioCommand::new("agent-browser"),
+            url,
+            AGENT_BROWSER_READ_TIMEOUT,
+        ),
+    )
+    .await
+}
+
+/// Decide what `web_browse` reports from what the visible browser did.
+///
+/// `headless` is a FUTURE, not a result: an async fn body does not run until it
+/// is polled, so the headless children are spawned only on the fallback branch
+/// — a page is never fetched twice.
+///
+/// This exists as its own function because the note that the human saw nothing
+/// is attached HERE, at the call site, and a test of
+/// [`note_render_was_invisible`] alone proves nothing about whether production
+/// calls it. Verified by mutation: deleting the call from this function turns
+/// `a_headless_fallback_says_the_page_was_not_shown` red.
+async fn resolve_render(
+    visible: VisibleRender,
+    headless: impl Future<Output = Result<AgentBrowserOutcome, String>>,
+) -> Result<AgentBrowserOutcome, String> {
+    match visible {
+        VisibleRender::Ran(outcome) => Ok(outcome),
+        VisibleRender::Unavailable(reason) => {
+            Ok(note_render_was_invisible(headless.await?, &reason))
+        }
+    }
+}
+
+/// What the visible browser did, or why there was none.
+#[derive(Debug, Clone)]
+pub(crate) enum VisibleRender {
+    /// `terminal-browser` drove the page; this is the outcome of that run,
+    /// success or failure. A failure here is NOT retried headlessly: the page
+    /// was reached and answered, and fetching it twice would report the second
+    /// answer as if it were the first.
+    Ran(AgentBrowserOutcome),
+    /// No pane was opened, so nothing was shown and nothing was read. The
+    /// string says why, in the viewer's own words where it had any.
+    Unavailable(String),
+}
+
+/// Drive `url` in a pane beside the human and read the rendered DOM from it.
+pub(crate) async fn terminal_browser_render(url: &str) -> Result<VisibleRender, String> {
+    terminal_browser_render_cmds(
+        TokioCommand::new(TERMINAL_BROWSER_BIN),
+        TokioCommand::new(TERMINAL_BROWSER_BIN),
+        TokioCommand::new(TERMINAL_BROWSER_BIN),
+        TokioCommand::new(TERMINAL_BROWSER_BIN),
+        url,
+        AGENT_BROWSER_READ_TIMEOUT,
+    )
+    .await
+}
+
+/// Testable core of [`terminal_browser_render`]: every child is a parameter,
+/// so the four-step sequence and its argv are verifiable with substitute
+/// children, no terminal and no network.
+///
+/// The sequence is `open` (which is what splits the pane — `action` can only
+/// target a tab that already exists), then the same User-Agent correction the
+/// headless path makes ([`RENDER_USER_AGENT`]), then a re-navigation so that
+/// correction applies to the page whose text is read, then `read`.
+async fn terminal_browser_render_cmds(
+    mut open_cmd: TokioCommand,
+    mut headers_cmd: TokioCommand,
+    mut nav_cmd: TokioCommand,
+    mut read_cmd: TokioCommand,
+    url: &str,
+    window: Duration,
+) -> Result<VisibleRender, String> {
+    prism_runtime::offline::check_url(url)?;
+
+    open_cmd.args(terminal_browser_open_argv(url));
+    match run_agent_browser_child(open_cmd, window).await? {
+        AgentBrowserOutcome::Completed { success: true, .. } => {}
+        AgentBrowserOutcome::MissingBinary => {
+            return Ok(VisibleRender::Unavailable(
+                terminal_browser_missing_message(),
+            ));
+        }
+        AgentBrowserOutcome::TimedOut { secs } => {
+            return Ok(VisibleRender::Unavailable(format!(
+                "`{TERMINAL_BROWSER_BIN} open` did not return within {secs} seconds"
+            )));
+        }
+        AgentBrowserOutcome::SpawnFailed(error) => {
+            return Ok(VisibleRender::Unavailable(format!(
+                "failed to run `{TERMINAL_BROWSER_BIN}`: {error}"
+            )));
+        }
+        AgentBrowserOutcome::Completed { stderr, stdout, .. } => {
+            // The viewer's own refusal — "This terminal cannot show images,
+            // which terminal-browser needs." — is the most useful sentence
+            // available, so it is relayed verbatim.
+            let said = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            return Ok(VisibleRender::Unavailable(format!(
+                "`{TERMINAL_BROWSER_BIN} open` said: {said}"
+            )));
+        }
+    }
+
+    headers_cmd.args([
+        "action".to_string(),
+        "--".to_string(),
+        "set".to_string(),
+        "headers".to_string(),
+        format!("{{\"User-Agent\": \"{RENDER_USER_AGENT}\"}}"),
+    ]);
+    let _ = run_agent_browser_child(headers_cmd, window).await;
+
+    nav_cmd.args(["action", "--", "open", url]);
+    let navigated = run_agent_browser_child(nav_cmd, window).await?;
+    // Same rule as the headless path: a failed navigation must never be
+    // followed by a read of whatever tab happened to be open.
+    match &navigated {
+        AgentBrowserOutcome::Completed { success: true, .. } => {}
+        other => return Ok(VisibleRender::Ran(other.clone())),
+    }
+
+    read_cmd.args(["action", "--", "read"]);
+    Ok(VisibleRender::Ran(
+        run_agent_browser_child(read_cmd, window).await?,
+    ))
+}
+
+/// Record on a headless outcome that the human never saw this page.
+///
+/// The text rides on `stderr` because that is the channel the envelope already
+/// uses for "it worked, but not the way you would assume" — the same place the
+/// empty-page notice goes. The fetched text is untouched.
+fn note_render_was_invisible(outcome: AgentBrowserOutcome, reason: &str) -> AgentBrowserOutcome {
+    let AgentBrowserOutcome::Completed {
+        success,
+        exit_code,
+        stdout,
+        stderr,
+    } = outcome
+    else {
+        return outcome;
+    };
+    let note = format!(
+        "NOT shown on screen: {reason} The page was fetched by `{AGENT_BROWSER_BIN}`, which \
+         draws nothing — you read it, the human did not see it."
+    );
+    let stderr = if stderr.trim().is_empty() {
+        note
+    } else {
+        format!("{}\n{note}", stderr.trim_end())
+    };
+    AgentBrowserOutcome::Completed {
+        success,
+        exit_code,
+        stdout,
+        stderr,
+    }
+}
+
+/// Testable core of [`agent_browser_render`]: both commands are parameters, so
+/// the two-step sequence is verifiable with substitute children and no browser.
+async fn agent_browser_render_cmds(
+    mut headers_cmd: TokioCommand,
+    mut open_cmd: TokioCommand,
+    read_cmd: TokioCommand,
+    url: &str,
+    window: Duration,
+) -> Result<AgentBrowserOutcome, String> {
+    prism_runtime::offline::check_url(url)?;
+
+    // Drop the `HeadlessChrome` token BEFORE navigating — see
+    // `RENDER_USER_AGENT`. Best-effort: if the driver rejects the header the
+    // navigation still happens and the page speaks for itself, which is better
+    // than refusing to try.
+    headers_cmd
+        .arg("set")
+        .arg("headers")
+        .arg(format!("{{\"User-Agent\": \"{RENDER_USER_AGENT}\"}}"));
+    let _ = run_agent_browser_child(headers_cmd, window).await;
+
+    open_cmd.arg("open").arg(url);
+    let opened = run_agent_browser_child(open_cmd, window).await?;
+    // A failed navigation must not be followed by a read of whatever tab
+    // happened to be open — that would attribute another page's text to this
+    // url, which is worse than failing.
+    match &opened {
+        AgentBrowserOutcome::Completed { success, .. } if *success => {}
+        other => return Ok(other.clone()),
+    }
+    // `read` with NO url: the active tab's RENDERED text.
+    let mut read_cmd = read_cmd;
+    read_cmd.arg("read");
+    run_agent_browser_child(read_cmd, window).await
+}
+
 pub(crate) async fn agent_browser_read(url: &str) -> Result<AgentBrowserOutcome, String> {
     agent_browser_read_cmd(
         TokioCommand::new("agent-browser"),
@@ -5191,16 +6437,30 @@ async fn agent_browser_read_cmd(
     // stay allowed (local dashboards, local docs servers).
     prism_runtime::offline::check_url(url)?;
 
-    cmd.arg("read")
-        .arg(url)
-        .stdin(Stdio::null())
+    cmd.arg("read").arg(url);
+    run_agent_browser_child(cmd, window).await
+}
+
+/// Spawn one browser child and classify its outcome.
+///
+/// Shared by the fetch path, the render path and the artifact viewer
+/// ([`show_artifact`], which drives `terminal-browser`) so all three inherit
+/// the same credential stripping, the same kill-on-drop, and the same honest
+/// mapping of absence / timeout / spawn failure — a second copy would have
+/// drifted. The outcome type is named for `agent-browser` because that was its
+/// first caller; every variant describes a child process, not a brand.
+async fn run_agent_browser_child(
+    mut cmd: TokioCommand,
+    window: Duration,
+) -> Result<AgentBrowserOutcome, String> {
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // The browser reader has no use for node/platform credentials. Stripping
-    // them for EVERY caller means an untrusted page (or an untrusted HTTP
-    // caller who reaches this tool) can never exfiltrate them through the
-    // child's environment.
+    // The browser has no use for node/platform credentials. Stripping them for
+    // EVERY caller means an untrusted page (or an untrusted HTTP caller who
+    // reaches this tool) can never exfiltrate them through the child's
+    // environment.
     strip_platform_credentials(&mut cmd);
 
     let secs = window.as_secs();
@@ -5225,10 +6485,15 @@ async fn agent_browser_read_cmd(
 /// reported as what they are.
 async fn execute_web_browse(
     url: &str,
+    render: bool,
     invocation: &str,
     _execution_access: GatedCommandExecutionAccess,
 ) -> Result<Value> {
-    let outcome = agent_browser_read(url).await;
+    let outcome = if render {
+        agent_browser_render(url).await
+    } else {
+        agent_browser_read(url).await
+    };
     Ok(web_browse_envelope(invocation, outcome))
 }
 
@@ -5291,6 +6556,258 @@ fn web_browse_envelope(invocation: &str, outcome: Result<AgentBrowserOutcome, St
         "stdout": truncate_for_ui(stdout.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
         "stderr": truncate_for_ui(stderr.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
     })
+}
+
+// ── Showing an artifact beside the human (`terminal-browser`) ─────────
+//
+// A tool that computes the right answer and prints a FILE PATH has failed:
+// the human cannot see a path. `terminal-browser` is a real Chromium that
+// draws PIXELS into a terminal pane (kitty graphics protocol), so a produced
+// artifact can be put on screen next to the conversation that produced it.
+// Shelled out to exactly like [`AGENT_BROWSER_BIN`] — a separate process,
+// never a linked crate.
+
+/// External binary that draws a page into a terminal pane.
+pub(crate) const TERMINAL_BROWSER_BIN: &str = "terminal-browser";
+
+/// Wall-clock budget for one `terminal-browser` step. Opening a local page is
+/// a pane split plus a file load; a notebook cell must not wait longer than
+/// this on a viewer that has wedged.
+const TERMINAL_BROWSER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Honest text for the missing-viewer case, shared by every surface that shows
+/// an artifact so they all say the same thing.
+///
+/// The install line is the vendor's own: `terminal-browser upgrade` runs
+/// `curl -fsSL <manifest.install> | bash`, and the manifest at
+/// <https://terminal-browser.sh/install/latest.json> reports
+/// `"install": "https://terminal-browser.sh/install"` (read 2026-08-26). It is
+/// quoted, not invented.
+pub(crate) fn terminal_browser_missing_message() -> String {
+    format!(
+        "`{TERMINAL_BROWSER_BIN}` is not installed or not on PATH, so nothing was drawn on \
+         your screen — the path is all there is. Install it with \
+         `curl -fsSL https://terminal-browser.sh/install | bash`, then PRISM draws artifacts \
+         in a pane beside you."
+    )
+}
+
+/// Whether one produced artifact actually reached the human's screen.
+///
+/// Three distinct facts, never collapsed: pixels drawn, no viewer installed,
+/// and a viewer that was reached but did not draw this artifact. PRISM never
+/// reports the second or third as the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArtifactViewOutcome {
+    /// The viewer exited 0 — the artifact is on screen in a pane.
+    Shown,
+    /// `terminal-browser` is not on PATH. Nothing was drawn.
+    NotInstalled,
+    /// Nothing was drawn and the viewer is not the reason, or it refused. The
+    /// string names the step that failed, in that step's own words.
+    NotShown(String),
+}
+
+/// One produced artifact and whether the human can see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactView {
+    pub(crate) path: String,
+    pub(crate) outcome: ArtifactViewOutcome,
+}
+
+impl ArtifactView {
+    /// The one line a produced artifact reports through. The path is always
+    /// present — a failure to display never costs the human the file — and the
+    /// line says plainly whether it is on screen.
+    pub(crate) fn line(&self) -> String {
+        match &self.outcome {
+            ArtifactViewOutcome::Shown => {
+                format!("[plot SHOWN in a pane beside you · saved: {}]", self.path)
+            }
+            ArtifactViewOutcome::NotInstalled => format!(
+                "[plot saved: {} — NOT shown: {}]",
+                self.path,
+                terminal_browser_missing_message()
+            ),
+            ArtifactViewOutcome::NotShown(reason) => {
+                format!("[plot saved: {} — NOT shown: {reason}]", self.path)
+            }
+        }
+    }
+}
+
+/// argv that draws one local page in a pane beside the human.
+///
+/// `--split right` and not a full-pane takeover: hiding the conversation that
+/// produced the artifact would trade one blindness for another.
+fn terminal_browser_open_argv(page: &str) -> Vec<String> {
+    vec![
+        "open".to_string(),
+        page.to_string(),
+        "--split".to_string(),
+        "right".to_string(),
+    ]
+}
+
+/// Image types this build can put on screen, keyed by lowercase extension.
+///
+/// Exactly what an `<img>` tag renders — nothing is guessed. An extension not
+/// on this list is reported as unsupported instead of being wrapped in a page
+/// that would come up blank.
+fn image_mime_for(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// Escape the one caller-controlled value that lands in the viewer page (the
+/// artifact's own path), so a path can never close a tag.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The page that shows one saved image.
+///
+/// The bytes are embedded as a `data:` URI, so the page is ONE self-contained
+/// file: it cannot come up blank because the image moved, and the caption
+/// still carries the real path so the human can find the file itself.
+fn image_page_html(path: &str, mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let label = escape_html(path);
+    format!(
+        "<meta charset=\"utf-8\"><title>{label}</title>\
+         <body style=\"margin:0;background:#0b0b0d;color:#d8d8dc;\
+         font:12px ui-monospace,SFMono-Regular,Menlo,monospace\">\
+         <img src=\"data:{mime};base64,{encoded}\" alt=\"{label}\" \
+         style=\"display:block;max-width:100%;height:auto;margin:0 auto\">\
+         <div style=\"padding:6px 8px;opacity:0.7\">{label}</div></body>"
+    )
+}
+
+/// Draw one saved artifact in a pane beside the human, with the production
+/// binary and timeout.
+pub(crate) async fn show_artifact(path: &str) -> ArtifactView {
+    show_artifact_with(
+        TokioCommand::new(TERMINAL_BROWSER_BIN),
+        path,
+        TERMINAL_BROWSER_TIMEOUT,
+    )
+    .await
+}
+
+/// Testable core of [`show_artifact`]: the command and window are parameters,
+/// so absence, refusal and argv are verifiable with a substitute child and no
+/// terminal.
+async fn show_artifact_with(mut cmd: TokioCommand, path: &str, window: Duration) -> ArtifactView {
+    let view = |outcome| ArtifactView {
+        path: path.to_string(),
+        outcome,
+    };
+    let source = std::path::Path::new(path);
+    let Some(mime) = image_mime_for(source) else {
+        return view(ArtifactViewOutcome::NotShown(format!(
+            "PRISM has no viewer page for a `{}` file, so it built none",
+            source
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("(no extension)")
+        )));
+    };
+    let bytes = match std::fs::read(source) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return view(ArtifactViewOutcome::NotShown(format!(
+                "reading {path} to build the viewer page failed: {error}"
+            )));
+        }
+    };
+    // Sibling of the artifact, `.view.html`, so the page is found next to the
+    // thing it shows and can never collide with a file the human wrote.
+    let page = source.with_extension("view.html");
+    if let Err(error) = std::fs::write(&page, image_page_html(path, mime, &bytes)) {
+        return view(ArtifactViewOutcome::NotShown(format!(
+            "writing the viewer page {} failed: {error}",
+            page.display()
+        )));
+    }
+    let page = page.to_string_lossy().into_owned();
+    cmd.args(terminal_browser_open_argv(&page));
+    match run_agent_browser_child(cmd, window).await {
+        Err(refusal) => view(ArtifactViewOutcome::NotShown(refusal)),
+        Ok(AgentBrowserOutcome::MissingBinary) => view(ArtifactViewOutcome::NotInstalled),
+        Ok(AgentBrowserOutcome::TimedOut { secs }) => view(ArtifactViewOutcome::NotShown(format!(
+            "`{TERMINAL_BROWSER_BIN} open` did not return within {secs} seconds and was terminated"
+        ))),
+        Ok(AgentBrowserOutcome::SpawnFailed(error)) => view(ArtifactViewOutcome::NotShown(
+            format!("failed to run `{TERMINAL_BROWSER_BIN}`: {error}"),
+        )),
+        Ok(AgentBrowserOutcome::Completed { success: true, .. }) => {
+            view(ArtifactViewOutcome::Shown)
+        }
+        Ok(AgentBrowserOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        }) => {
+            // The viewer's own refusal is the most useful sentence there is
+            // ("This terminal cannot show images…"), so it is relayed verbatim
+            // rather than replaced by a summary of it.
+            let said = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                match exit_code {
+                    Some(code) => format!("it exited {code} without saying why"),
+                    None => "it was killed by a signal".to_string(),
+                }
+            };
+            view(ArtifactViewOutcome::NotShown(format!(
+                "`{TERMINAL_BROWSER_BIN} open` said: {said}"
+            )))
+        }
+    }
+}
+
+/// How many panes one cell may open.
+///
+/// Each shown figure is a pane in the human's terminal, so a loop that draws
+/// twenty would bury the conversation it belongs to — the same blindness this
+/// work exists to remove, arrived at from the other side. The rest are still
+/// saved, and the result SAYS the cap is why they are not on screen.
+const MAX_PANES_PER_CELL: usize = 4;
+
+/// Show the images one notebook cell produced, in cell order.
+///
+/// Sequential on purpose: the panes appear in the order the figures were
+/// drawn, which is the order the human's code produced them.
+pub(crate) async fn show_cell_images(paths: &[String]) -> Vec<ArtifactView> {
+    let mut views = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        if index >= MAX_PANES_PER_CELL {
+            views.push(ArtifactView {
+                path: path.clone(),
+                outcome: ArtifactViewOutcome::NotShown(format!(
+                    "this cell drew {} figures and PRISM opens at most {MAX_PANES_PER_CELL} panes \
+                     per cell, so this one was saved only",
+                    paths.len()
+                )),
+            });
+            continue;
+        }
+        views.push(show_artifact(path).await);
+    }
+    views
 }
 
 /// Mint a best-effort loopback session token so a workflow's `tool` steps can
@@ -5482,9 +6999,11 @@ async fn execute_workflow_command(
 /// stay registered — `execute_command_tool` still resolves them — so
 /// nothing breaks if an older transcript or client calls one by name.
 ///
-/// `query` is kept in this list for intent even though
-/// [`REDUNDANT_UMBRELLA_TOOLS`] already hides it in every state — it says what
-/// would happen if the umbrella were ever offered again.
+/// `query` is kept in this list for intent. It is no longer hidden by
+/// [`REDUNDANT_UMBRELLA_TOOLS`] — the `query(scope=…)` collapse made it the
+/// ONE query tool, so it is offered, and it is what `CORE_TOOL_SET` names.
+/// (This comment used to say the umbrella "already hides it in every state",
+/// which stopped being true when that collapse landed.)
 /// `query_local` IS NOT IN THIS LIST, and removing it is the point.
 ///
 /// It reads the bundled Turso store straight off disk. The node is a separate
@@ -5506,7 +7025,14 @@ async fn execute_workflow_command(
 /// `query_federated` stays: it spans mesh peers, which really is the node's
 /// job. `query` stays for intent, though [`REDUNDANT_UMBRELLA_TOOLS`] already
 /// hides it in every state.
-const LOCAL_NODE_TOOLS: &[&str] = &["query", "query_federated"];
+/// EMPTY, deliberately. This list used to drop query tools when the local node
+/// was down, and once dropped `query_local` while keeping `query_platform` —
+/// so a search of the user's own on-disk graph went to the billed remote store
+/// and died on HTTP 402 with the answer sitting locally the whole time. There
+/// is now ONE `query` tool whose `scope` selects the store, so there is no
+/// pair left to filter asymmetrically: a node-down `scope=federated` returns
+/// the real error instead of the tool silently vanishing.
+const LOCAL_NODE_TOOLS: &[&str] = &[];
 
 /// Management-shell wrappers excluded from the offered agent surface while
 /// remaining executable for old transcripts and direct callers.
@@ -5548,12 +7074,70 @@ const UNSUPERVISABLE_TOOLS: &[&str] = &["ingest_watch"];
 ///   publish    -> publish_artifact
 ///
 /// Deliberately NOT here — each still reaches a verb no typed tool covers:
-///   marketplace (`update`, `publish`), node (`up`, `down`, `key`),
-///   billing (`topup`), ingest (`--status`), and status / doctor / tools,
-///   which have no typed siblings. The no-op `agent` guide remains registered
-///   for compatibility but is excluded from the offered model surface.
+///   node (`up`, `down`, `key`), billing (`topup`), ingest (`--status`), and
+///   status / doctor / tools, which have no typed siblings. (`marketplace`
+///   joined the list once marketplace_write covered `update`/`publish`.)
+///   The no-op `agent` guide remains registered for compatibility but is
+///   excluded from the offered model surface.
+/// Typed specs fully reachable through an `action`-taking sibling of the SAME
+/// permission tier, so they no longer need a name in the offered catalog.
+///
+/// Hidden is NOT removed: every spec here stays registered and
+/// `execute_command_tool` still resolves it, so an older transcript or a direct
+/// caller keeps working. What leaves is only a name competing for the model's
+/// attention — `mesh_sync` becomes `mesh_write(action:"sync")`.
+///
+/// The rule that decides membership: a name is redundant iff another name in
+/// its family has the SAME `permission_mode` AND the SAME `requires_approval`.
+/// Where those differ the split is load-bearing, because approval is keyed on
+/// the tool name — which is why `compute_cancel` (FullAccess, no approval)
+/// could never fold into `compute_submit` (FullAccess, approval): the one tool
+/// that STOPS spend must not sit behind a prompt.
+const COLLAPSED_INTO_ACTION_TOOLS: &[&str] = &[
+    "mesh_discover",
+    "mesh_health",
+    "mesh_peers",
+    "mesh_subscriptions",
+    "mesh_publish",
+    "mesh_subscribe",
+    "mesh_unsubscribe",
+    "mesh_sync",
+    "discourse_list",
+    "discourse_show",
+    "discourse_status",
+    "discourse_turns",
+    "discourse_create",
+    "discourse_run",
+    "deploy_list",
+    "deploy_status",
+    "deploy_health",
+    "deploy_create",
+    "deploy_stop",
+    "compute_gpus",
+    "compute_providers",
+    "compute_estimate",
+    "compute_status",
+    "models_list",
+    "models_search",
+    "models_info",
+    "marketplace_search",
+    "marketplace_info",
+    "marketplace_install",
+    "marketplace_find",
+    "billing_balance",
+    "billing_usage",
+    "billing_history",
+    "billing_prices",
+    "node_probe",
+    "node_status",
+    "node_logs",
+    "ontology_proposals",
+    "ontology_proposals_show",
+    "ontology_proposals_accept",
+    "ontology_proposals_reject",
+];
+
 const REDUNDANT_UMBRELLA_TOOLS: &[&str] = &[
-    "query",
     "job-status",
     "workflow",
     "mesh",
@@ -5563,6 +7147,7 @@ const REDUNDANT_UMBRELLA_TOOLS: &[&str] = &[
     "run",
     "research",
     "publish",
+    "marketplace",
 ];
 
 /// Cheap connectivity probe for the local node dashboard — the same
@@ -5589,6 +7174,7 @@ pub fn command_tools_filtered(local_node_online: bool) -> Vec<LoadedTool> {
     COMMAND_TOOLS
         .iter()
         .filter(|spec| !REDUNDANT_UMBRELLA_TOOLS.contains(&spec.name))
+        .filter(|spec| !COLLAPSED_INTO_ACTION_TOOLS.contains(&spec.name))
         .filter(|spec| local_node_online || !LOCAL_NODE_TOOLS.contains(&spec.name))
         .filter(|spec| !AGENT_SURFACE_EXCLUDED.contains(&spec.name))
         .filter(|spec| !UNSUPERVISABLE_TOOLS.contains(&spec.name))
@@ -5661,7 +7247,31 @@ pub(crate) async fn execute_stdio_notebook(
     let execution_access = gate_command_execution(&execution, current_platform_access())?;
     let _owner_access = execution_access.verified_node_owner()?;
     crate::notebook::configure(runtime.python_bin.clone(), runtime.project_root.clone());
-    crate::notebook::execute(code, timeout, "user").await
+    let mut cell = crate::notebook::execute(code, timeout, "user").await?;
+    // The human ran this cell themselves, so a figure it drew is FOR them:
+    // put it on screen instead of leaving a path in the pane.
+    let views = show_cell_images(&cell.image_paths).await;
+    append_unshown_notice(&mut cell.stderr, &views);
+    Ok(cell)
+}
+
+/// Append one line per artifact that did NOT reach the screen to the cell's
+/// stderr, which is the only channel of the returned `Cell` the notebook pane
+/// renders that PRISM may add to.
+///
+/// Silence here would be the exact failure this work exists to remove: a
+/// figure that was never drawn, reported as if the path were the whole story.
+/// A shown artifact adds nothing — the pixels are the report.
+fn append_unshown_notice(stderr: &mut String, views: &[ArtifactView]) {
+    for view in views {
+        if view.outcome == ArtifactViewOutcome::Shown {
+            continue;
+        }
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!("PRISM: {}\n", view.line()));
+    }
 }
 
 /// Reset the shared stdio notebook kernel through the command-execution gate.
@@ -5755,8 +7365,8 @@ pub async fn execute_command_tool_with_platform_access(
         CommandExecution::NotebookReset => {
             Ok(notebook_reset_result(&invocation, execution_access.verified_node_owner()?).await)
         }
-        CommandExecution::WebBrowse { url } => {
-            execute_web_browse(url, &invocation, execution_access).await
+        CommandExecution::WebBrowse { url, render } => {
+            execute_web_browse(url, *render, &invocation, execution_access).await
         }
     }
 }
@@ -5809,12 +7419,18 @@ async fn execute_notebook(
         }
     };
 
+    // The agent drew this figure for a human to look at. Put it on screen
+    // BEFORE composing the result, so the line the model reads reports what
+    // actually happened rather than a path and a hope.
+    let views = show_cell_images(&cell.image_paths).await;
+
     Ok(compose_notebook_result(
         &cell,
         &runtime.project_root.to_string_lossy(),
         include_images_base64,
         invocation,
         crate::notebook::status().backend.as_deref().unwrap_or(""),
+        &views,
     ))
 }
 
@@ -5827,12 +7443,18 @@ async fn execute_notebook(
 /// pushed to the model: stdout and the `error` field both carry the FILTERED
 /// trace. The human TUI pane is a separate path (`emit_notebook_cell` emits
 /// the raw `Cell`) and does not go through here.
+///
+/// `views` is one entry per produced image, in `cell.image_paths` order,
+/// carrying whether that image reached the human's screen. A path with no
+/// matching view is reported as saved and NOT shown, because "we never tried"
+/// and "it is on screen" must never read the same.
 fn compose_notebook_result(
     cell: &crate::notebook::Cell,
     cwd: &str,
     include_images_base64: bool,
     invocation: &str,
     kernel_backend: &str,
+    views: &[ArtifactView],
 ) -> Value {
     // Compose the readable cell output the model sees in `stdout`.
     let mut display = String::new();
@@ -5845,11 +7467,21 @@ fn compose_notebook_result(
         }
         display.push_str(&format!("=> {result}"));
     }
-    for path in &cell.image_paths {
+    for (index, path) in cell.image_paths.iter().enumerate() {
         if !display.is_empty() && !display.ends_with('\n') {
             display.push('\n');
         }
-        display.push_str(&format!("[plot saved: {path}]"));
+        let line = match views.get(index) {
+            Some(view) if view.path == *path => view.line(),
+            _ => ArtifactView {
+                path: path.clone(),
+                outcome: ArtifactViewOutcome::NotShown(
+                    "PRISM did not attempt to display it".to_string(),
+                ),
+            }
+            .line(),
+        };
+        display.push_str(&line);
     }
     // NOTE: the raw cell.error is NOT pushed into display here. The agent-facing
     // FILTERED trace is appended below (FIX-1) so stdout and the `error` field
@@ -5858,8 +7490,16 @@ fn compose_notebook_result(
     let images: Vec<Value> = cell
         .image_paths
         .iter()
-        .map(|path| {
-            let mut entry = json!({ "path": path });
+        .enumerate()
+        .map(|(index, path)| {
+            // `shown` is the structured half of the display line: whether these
+            // pixels are on the human's screen right now. Never inferred from
+            // the file existing.
+            let shown = matches!(
+                views.get(index),
+                Some(view) if view.path == *path && view.outcome == ArtifactViewOutcome::Shown
+            );
+            let mut entry = json!({ "path": path, "shown": shown });
             if include_images_base64 && let Ok(bytes) = std::fs::read(path) {
                 use base64::Engine as _;
                 entry["base64"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
@@ -6033,6 +7673,355 @@ pub fn to_definitions() -> Vec<ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── mesh read/write collapse ──
+    //
+    // Consolidation step 3, mesh family: 9 names -> 2. The rule is mechanical —
+    // a name is redundant iff another in its family has the same
+    // permission_mode AND the same requires_approval.
+
+    #[test]
+    fn the_models_family_is_one_offered_name() {
+        // Three names, ONE gate (ReadOnly / no approval) => one name.
+        let offered: Vec<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| n == "models" || n.starts_with("models_"))
+            .collect();
+        assert_eq!(offered, vec!["models_read".to_string()], "got {offered:?}");
+        for hidden in ["models_list", "models_search", "models_info"] {
+            assert!(
+                spec_by_name(hidden).is_some(),
+                "{hidden} must stay executable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_models_action_form_matches_the_typed_tools() {
+        let cases: &[(&str, Value)] = &[
+            ("models_list", json!({"action": "list", "provider": "hf"})),
+            (
+                "models_search",
+                json!({"action": "search", "query": "mace", "provider": "hf"}),
+            ),
+            (
+                "models_info",
+                json!({"action": "info", "model_id": "mace-mh-1"}),
+            ),
+        ];
+        for (typed_name, action_args) in cases {
+            let mut typed_args = (*action_args).clone();
+            typed_args.as_object_mut().unwrap().remove("action");
+            let typed = build_execution(spec_by_name(typed_name).unwrap(), &typed_args)
+                .expect("typed executes");
+            let collapsed = build_execution(spec_by_name("models_read").unwrap(), action_args)
+                .expect("action form executes");
+            assert_eq!(
+                format_execution_invocation(&typed),
+                format_execution_invocation(&collapsed),
+                "models_read must reproduce {typed_name} exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn browsing_models_never_becomes_running_one() {
+        // `run_model` is billable and approval-gated; `models_read` is free and
+        // ungated. An action that quietly crossed that line would be the exact
+        // muzzle-in-reverse the plan forbids.
+        let err = build_execution(
+            spec_by_name("models_read").unwrap(),
+            &json!({"action": "run", "model_id": "mace-mh-1"}),
+        )
+        .expect_err("running is not a models_read action");
+        assert!(format!("{err:#}").contains("run_model"), "{err:#}");
+    }
+
+    #[test]
+    fn compute_collapses_to_three_because_cancel_must_not_prompt() {
+        // The plan's table said compute 6 -> 2. By the plan's OWN rule it is
+        // 6 -> 3: `compute_cancel` is FullAccess with NO approval while
+        // `compute_submit` is FullAccess WITH approval. Merging them would put
+        // a prompt in front of the one tool that STOPS spend.
+        let offered: Vec<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| n == "compute" || n.starts_with("compute_"))
+            .collect();
+        assert_eq!(offered.len(), 3, "got {offered:?}");
+        for name in ["compute_read", "compute_cancel", "compute_submit"] {
+            assert!(
+                offered.iter().any(|n| n == name),
+                "{name} must stay offered"
+            );
+        }
+
+        let cancel = spec_by_name("compute_cancel").expect("compute_cancel exists");
+        let submit = spec_by_name("compute_submit").expect("compute_submit exists");
+        assert_eq!(cancel.permission_mode, PermissionMode::FullAccess);
+        assert!(
+            !cancel.requires_approval,
+            "compute_cancel must NEVER prompt — it is what stops spend"
+        );
+        assert!(submit.requires_approval, "compute_submit must stay gated");
+    }
+
+    #[test]
+    fn the_compute_read_action_form_matches_the_typed_tools() {
+        let cases: &[(&str, Value)] = &[
+            ("compute_gpus", json!({"action": "gpus"})),
+            ("compute_providers", json!({"action": "providers"})),
+            (
+                "compute_status",
+                json!({"action": "status", "job_id": "job-7"}),
+            ),
+            (
+                "compute_estimate",
+                json!({"action": "estimate", "image": "vasp:6.5", "gpu": "A100-80GB"}),
+            ),
+        ];
+        for (typed_name, action_args) in cases {
+            let mut typed_args = (*action_args).clone();
+            typed_args.as_object_mut().unwrap().remove("action");
+            let typed = build_execution(spec_by_name(typed_name).unwrap(), &typed_args)
+                .expect("typed executes");
+            let collapsed = build_execution(spec_by_name("compute_read").unwrap(), action_args)
+                .expect("action form executes");
+            assert_eq!(
+                format_execution_invocation(&typed),
+                format_execution_invocation(&collapsed),
+                "compute_read must reproduce {typed_name} exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_read_refuses_the_spending_verbs_and_points_at_their_tools() {
+        for verb in ["submit", "cancel"] {
+            let err = build_execution(
+                spec_by_name("compute_read").unwrap(),
+                &json!({"action": verb}),
+            )
+            .expect_err("a spending verb must not run on the read tool");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("compute_submit"), "got: {msg}");
+            assert!(msg.contains("compute_cancel"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn the_deploy_and_discourse_families_are_two_offered_names_each() {
+        let offered: Vec<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        for (root, expected) in [
+            ("deploy", vec!["deploy_read", "deploy_write"]),
+            ("discourse", vec!["discourse_read", "discourse_write"]),
+        ] {
+            let family: Vec<&String> = offered
+                .iter()
+                .filter(|n| *n == root || n.starts_with(&format!("{root}_")))
+                .collect();
+            assert_eq!(
+                family.len(),
+                expected.len(),
+                "{root} should offer only its permission tiers, got {family:?}"
+            );
+            for name in expected {
+                assert!(family.iter().any(|n| n.as_str() == name), "{name} missing");
+            }
+        }
+    }
+
+    #[test]
+    fn the_deploy_action_form_builds_the_same_command_as_the_typed_tool() {
+        let cases: &[(&str, &str, Value)] = &[
+            (
+                "deploy_list",
+                "deploy_read",
+                json!({"action": "list", "status": "running"}),
+            ),
+            (
+                "deploy_status",
+                "deploy_read",
+                json!({"action": "status", "deployment_id": "dep-1"}),
+            ),
+            (
+                "deploy_stop",
+                "deploy_write",
+                json!({"action": "stop", "deployment_id": "dep-1"}),
+            ),
+            (
+                "deploy_create",
+                "deploy_write",
+                json!({"action": "create", "name": "svc", "image": "img:1", "port": 8080}),
+            ),
+        ];
+        for (typed_name, action_name, action_args) in cases {
+            let mut typed_args = (*action_args).clone();
+            typed_args.as_object_mut().unwrap().remove("action");
+            let typed = build_execution(spec_by_name(typed_name).unwrap(), &typed_args)
+                .expect("typed executes");
+            let collapsed = build_execution(spec_by_name(action_name).unwrap(), action_args)
+                .expect("action form executes");
+            assert_eq!(
+                format_execution_invocation(&typed),
+                format_execution_invocation(&collapsed),
+                "{action_name} must produce exactly what {typed_name} produced"
+            );
+        }
+    }
+
+    #[test]
+    fn collapsing_deploy_does_not_relax_the_create_constraint() {
+        // `create` requires EXACTLY ONE of image / resource_slug. A merge that
+        // quietly dropped that check would let a malformed deployment through
+        // — collapsing NAMES must never relax a RULE.
+        for args in [
+            json!({"action": "create", "name": "svc"}),
+            json!({"action": "create", "name": "svc", "image": "i", "resource_slug": "s"}),
+        ] {
+            let err = build_execution(spec_by_name("deploy_write").unwrap(), &args)
+                .expect_err("neither-nor and both-at-once must both fail");
+            assert!(
+                format!("{err:#}").contains("exactly one"),
+                "the constraint must still be stated: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deploy_and_discourse_tiers_keep_their_separate_gates() {
+        for (read, write, write_mode) in [
+            ("deploy_read", "deploy_write", PermissionMode::FullAccess),
+            (
+                "discourse_read",
+                "discourse_write",
+                PermissionMode::WorkspaceWrite,
+            ),
+        ] {
+            let r = spec_by_name(read).expect("read tool exists");
+            let w = spec_by_name(write).expect("write tool exists");
+            assert_eq!(r.permission_mode, PermissionMode::ReadOnly);
+            assert!(!r.requires_approval, "{read} must never prompt");
+            assert_eq!(w.permission_mode, write_mode);
+            assert!(w.requires_approval, "{write} must stay approval-gated");
+        }
+    }
+
+    #[test]
+    fn the_mesh_family_is_two_offered_names_not_nine() {
+        let offered: Vec<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| n == "mesh" || n.starts_with("mesh_"))
+            .collect();
+        assert_eq!(
+            offered,
+            vec!["mesh_read".to_string(), "mesh_write".to_string()],
+            "the mesh family must offer exactly its two permission tiers"
+        );
+    }
+
+    #[test]
+    fn every_collapsed_mesh_name_is_hidden_but_still_executable() {
+        let offered: Vec<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        for name in COLLAPSED_INTO_ACTION_TOOLS {
+            assert!(
+                !offered.contains(&(*name).to_string()),
+                "{name} must not be offered"
+            );
+            assert!(
+                spec_by_name(name).is_some(),
+                "{name} must stay REGISTERED — hidden is not removed, or an older \
+                 transcript replaying it breaks"
+            );
+        }
+    }
+
+    #[test]
+    fn the_action_form_builds_the_same_command_as_the_typed_tool() {
+        // The claim the collapse rests on: zero capability is lost. Prove it by
+        // comparing argv, not by asserting it in a comment.
+        let cases: &[(&str, &str, Value)] = &[
+            (
+                "mesh_discover",
+                "mesh_read",
+                json!({"action": "discover", "timeout": 5}),
+            ),
+            ("mesh_peers", "mesh_read", json!({"action": "peers"})),
+            (
+                "mesh_sync",
+                "mesh_write",
+                json!({"action": "sync", "dataset_name": "alloys", "peer": "node-b"}),
+            ),
+            (
+                "mesh_subscribe",
+                "mesh_write",
+                json!({"action": "subscribe", "dataset_name": "alloys", "publisher": "node-b"}),
+            ),
+        ];
+        for (typed_name, action_name, action_args) in cases {
+            let mut typed_args = (*action_args).clone();
+            typed_args.as_object_mut().unwrap().remove("action");
+
+            let typed = build_execution(spec_by_name(typed_name).unwrap(), &typed_args)
+                .expect("typed executes");
+            let collapsed = build_execution(spec_by_name(action_name).unwrap(), action_args)
+                .expect("action form executes");
+            assert_eq!(
+                format_execution_invocation(&typed),
+                format_execution_invocation(&collapsed),
+                "{action_name} must produce exactly what {typed_name} produced"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_action_is_refused_on_the_read_tool_and_says_why() {
+        let err = build_execution(
+            spec_by_name("mesh_read").unwrap(),
+            &json!({"action": "sync"}),
+        )
+        .expect_err("a write action must not run on the read tool");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not available on mesh_read"), "got: {msg}");
+        assert!(
+            msg.contains("discover"),
+            "the error must name the valid set so the model can retry: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_action_names_the_valid_set() {
+        let err = build_execution(
+            spec_by_name("mesh_read").unwrap(),
+            &json!({"action": "teleport"}),
+        )
+        .expect_err("unknown action must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("teleport"), "got: {msg}");
+        assert!(msg.contains("discover"), "got: {msg}");
+    }
+
+    #[test]
+    fn the_two_mesh_tools_keep_their_separate_gates() {
+        // Merging across a gate is the one thing the collapse must never do.
+        let read = spec_by_name("mesh_read").expect("mesh_read exists");
+        let write = spec_by_name("mesh_write").expect("mesh_write exists");
+        assert_eq!(read.permission_mode, PermissionMode::ReadOnly);
+        assert!(!read.requires_approval, "a mesh read must never prompt");
+        assert_eq!(write.permission_mode, PermissionMode::FullAccess);
+        assert!(
+            write.requires_approval,
+            "a mesh write must stay approval-gated"
+        );
+    }
 
     /// A LocalOnly child must not inherit a platform credential under EITHER
     /// spelling. The strip list was hand-written with only the company-scoped
@@ -6215,6 +8204,7 @@ mod tests {
             CommandExecution::NotebookReset,
             CommandExecution::WebBrowse {
                 url: "https://example.org/".into(),
+                render: false,
             },
         ];
 
@@ -7113,7 +9103,7 @@ RuntimeError: wrapped\n";
     ainv = _umath_linalg.inv(a)\n\
 ValueError: Singular matrix\n";
         let cell = raising_cell(tb);
-        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &[]);
 
         let model_error = result["error"].as_str().unwrap_or("");
         assert!(
@@ -7137,7 +9127,7 @@ ValueError: Singular matrix\n";
     pass\n\
 RuntimeError: boom\n";
         let cell = raising_cell(tb);
-        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &[]);
         let stdout = result["stdout"].as_str().unwrap_or("");
         assert!(stdout.contains("RuntimeError: boom"));
         assert!(
@@ -7159,7 +9149,7 @@ RuntimeError: boom\n";
     pass\n\
 RuntimeError: boom\n";
         let cell = raising_cell(tb);
-        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &[]);
         let elided = result["traceback_elided_frames"].as_u64().unwrap_or(0);
         assert!(
             elided >= 2,
@@ -7182,7 +9172,7 @@ RuntimeError: boom\n";
             error: None,
             success: true,
         };
-        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &[]);
         assert_eq!(result["error"].as_str(), None);
         assert!(result["stdout"].as_str().unwrap_or("").contains("=> 2"));
         assert_eq!(result["traceback_elided_frames"].as_u64(), Some(0));
@@ -7211,7 +9201,7 @@ ValueError: boom\n";
             error: Some(tb.to_string()),
             success: false,
         };
-        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin");
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &[]);
         let elided = result["traceback_elided_frames"].as_u64().unwrap_or(0);
         assert!(
             elided >= 4,
@@ -7226,12 +9216,11 @@ ValueError: boom\n";
             .iter()
             .find(|tool| tool.name == "workflow_run")
             .expect("workflow_run should exist");
-        // The raw `query` umbrella is no longer offered (see
-        // REDUNDANT_UMBRELLA_TOOLS); `query_local` is its typed replacement.
+        // One typed `query` tool; `scope` selects local / platform / federated.
         let query = tools
             .iter()
-            .find(|tool| tool.name == "query_local")
-            .expect("query_local should exist");
+            .find(|tool| tool.name == "query")
+            .expect("query should exist");
 
         assert!(tools.len() >= 30);
         assert_eq!(query.permission_mode, PermissionMode::ReadOnly);
@@ -7285,28 +9274,340 @@ ValueError: boom\n";
         // exclusion wouldn't change execution anyway. This test pins the REAL
         // contract: a billing_balance call must build the argv that returns the
         // balance, and it must be offered + resolvable.
+        //
+        // 2026-08-26: the four typed billing reads collapsed into
+        // `billing_read(action=…)`. The CAPABILITY must still be offered — the
+        // name that carries it changed, the contract did not — and
+        // `billing_balance` must stay RESOLVABLE, because hidden is not the
+        // same as removed and old transcripts still call it.
         let tools = command_tools_filtered(true);
         let offered_names: std::collections::HashSet<&str> =
             tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
-            offered_names.contains("billing_balance"),
-            "billing_balance must be offered (bare `prism billing` works; not excluded)"
+            offered_names.contains("billing_read"),
+            "the balance check must be OFFERED under some name (bare `prism \
+             billing` works, so it was never right to exclude it)"
         );
-        assert!(is_command_tool("billing_balance"));
+        assert!(
+            is_command_tool("billing_balance"),
+            "the collapsed name must still resolve for older transcripts"
+        );
 
         // The execution arm must build `prism billing` (no subcommand) — that is
         // the CLI's documented balance action. `prism billing balance` is an
         // UNRECOGNIZED subcommand (verified live), so adding "balance" would
         // break it. Empty args is correct here.
-        assert_eq!(
-            command_tool_preview("billing_balance", &json!({})),
-            Some("prism billing".to_string()),
-            "billing_balance runs bare `prism billing`, which returns the balance"
+        for (tool, input) in [
+            ("billing_balance", json!({})),
+            ("billing_read", json!({ "action": "balance" })),
+        ] {
+            assert_eq!(
+                command_tool_preview(tool, &input),
+                Some("prism billing".to_string()),
+                "{tool} must run bare `prism billing`, which is what returns \
+                 the balance"
+            );
+            // And it's a free, unapproved read. The mode is asserted through
+            // the accessor the safety hook actually calls: the spec table wins
+            // for command tools, and `permissions.rs` defaults an unknown name
+            // to `WorkspaceWrite`, so a new name that missed this would be
+            // gated as a write.
+            assert_eq!(command_tool_requires_approval(tool), Some(false));
+            assert_eq!(
+                command_tool_permission_mode(tool),
+                Some(PermissionMode::ReadOnly),
+                "{tool} is a free read and must resolve ReadOnly"
+            );
+        }
+
+        // The other three actions keep their subcommand.
+        for (action, argv) in [
+            ("usage", "prism billing usage"),
+            ("history", "prism billing history"),
+            ("prices", "prism billing prices"),
+        ] {
+            assert_eq!(
+                command_tool_preview("billing_read", &json!({ "action": action })),
+                Some(argv.to_string()),
+                "billing_read action={action:?} must build `{argv}`"
+            );
+        }
+
+        // Topping up spends money. It must NOT be reachable through the free,
+        // unapproved read tool — that would be an approval bypass, not a
+        // convenience.
+        assert!(
+            build_execution(
+                spec_by_name("billing_read").expect("billing_read is registered"),
+                &json!({ "action": "topup" }),
+            )
+            .is_err(),
+            "billing_read must refuse `topup`: it is approval-gated on the \
+             `billing` umbrella and must not gain a free path"
         );
-        // And it's a free, unapproved read.
+    }
+
+    /// The node reads collapsed to one name, and the gated verbs did not
+    /// follow them.
+    ///
+    /// `up` and `down` change daemon state and `key` handles the node keypair;
+    /// all three are approval-gated on the `node` umbrella. Letting any of them
+    /// through the free, unapproved `node_read` would be an approval bypass
+    /// wearing the word "consistency".
+    /// The proposal queue collapsed to a read/write pair, and the approval
+    /// gate stayed on the write half.
+    ///
+    /// The tiers must remain SEPARATE tools: approval is keyed on the tool
+    /// name, so one merged `ontology` tool would either prompt on a list or
+    /// strip the gate from an accept. `promote` must not become an argument at
+    /// all — promoting a draft to the governing ontology is the deliberate
+    /// human step this whole queue exists to feed.
+    #[test]
+    fn ontology_read_and_write_split_on_the_approval_gate() {
+        let offered: std::collections::HashSet<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(offered.contains("ontology_read"));
+        assert!(offered.contains("ontology_write"));
+        for hidden in [
+            "ontology_proposals",
+            "ontology_proposals_show",
+            "ontology_proposals_accept",
+            "ontology_proposals_reject",
+        ] {
+            assert!(
+                !offered.contains(hidden),
+                "{hidden} collapsed and must leave the offered surface"
+            );
+            assert!(
+                is_command_tool(hidden),
+                "{hidden} must still RESOLVE for older transcripts"
+            );
+        }
+
+        // Reads are free; decisions ask first.
+        assert_eq!(command_tool_requires_approval("ontology_read"), Some(false));
         assert_eq!(
-            command_tool_requires_approval("billing_balance"),
-            Some(false)
+            command_tool_permission_mode("ontology_read"),
+            Some(PermissionMode::ReadOnly)
+        );
+        assert_eq!(command_tool_requires_approval("ontology_write"), Some(true));
+
+        // One builder serves both names, so the typed spec and the action form
+        // cannot drift apart.
+        for (tool, input, argv) in [
+            (
+                "ontology_proposals",
+                json!({ "limit": 5 }),
+                "prism ontology proposals list --json --limit 5",
+            ),
+            (
+                "ontology_read",
+                json!({ "action": "list", "limit": 5 }),
+                "prism ontology proposals list --json --limit 5",
+            ),
+            (
+                "ontology_proposals_show",
+                json!({ "item_id": "abc" }),
+                "prism ontology proposals show abc",
+            ),
+            (
+                "ontology_read",
+                json!({ "action": "show", "item_id": "abc" }),
+                "prism ontology proposals show abc",
+            ),
+            (
+                "ontology_write",
+                json!({ "action": "reject", "item_ids": ["abc"], "reason": "wrong parent" }),
+                // The formatter shell-quotes an argument containing a space,
+                // which is correct: the reason is ONE argv entry, not two.
+                "prism ontology proposals reject abc --reason 'wrong parent' --by agent",
+            ),
+        ] {
+            assert_eq!(
+                command_tool_preview(tool, &input),
+                Some(argv.to_string()),
+                "{tool} must build `{argv}`"
+            );
+        }
+        // Accept carries `--by agent` too: the ledger has to tell an agent
+        // decision from a human one.
+        let accepted = command_tool_preview(
+            "ontology_write",
+            &json!({ "action": "accept", "item_ids": ["abc"], "domain": "catalysis" }),
+        )
+        .expect("accept builds");
+        assert!(accepted.contains("--domain catalysis"), "{accepted}");
+        assert!(accepted.ends_with("--by agent"), "{accepted}");
+
+        // Crossing the tiers is refused in BOTH directions — that is the whole
+        // reason they are two tools.
+        //
+        // Each probe carries a COMPLETE, valid argument set for its action, and
+        // the error message is checked, not just `is_err()`. An earlier version
+        // asserted only that something failed: under a mutation that let
+        // `ontology_read` run `accept`, the call still errored — on the missing
+        // `domain` — so the test passed while the approval gate was open. An
+        // assertion that any error occurred is not an assertion about WHICH.
+        let read = spec_by_name("ontology_read").expect("registered");
+        let write = spec_by_name("ontology_write").expect("registered");
+        let refusal = |spec: &CommandToolSpec, input: Value| -> String {
+            build_execution(spec, &input)
+                .expect_err("crossing the tiers must be refused")
+                .to_string()
+        };
+        for (action, complete) in [
+            (
+                "accept",
+                json!({ "action": "accept", "item_ids": ["a"], "domain": "d" }),
+            ),
+            (
+                "reject",
+                json!({ "action": "reject", "item_ids": ["a"], "reason": "r" }),
+            ),
+        ] {
+            let err = refusal(read, complete);
+            assert!(
+                err.contains("not available on ontology_read"),
+                "ontology_read must refuse {action:?} BECAUSE it is the gated \
+                 tier, not for an unrelated reason; got: {err}"
+            );
+        }
+        for (action, complete) in [
+            ("list", json!({ "action": "list" })),
+            ("show", json!({ "action": "show", "item_id": "a" })),
+        ] {
+            let err = refusal(write, complete);
+            assert!(
+                err.contains("not available on ontology_write"),
+                "ontology_write must refuse {action:?} BECAUSE a read must not \
+                 prompt; got: {err}"
+            );
+        }
+        for (tier, spec) in [("read", read), ("write", write)] {
+            let err = refusal(
+                spec,
+                json!({ "action": "promote", "item_ids": ["a"], "domain": "d", "reason": "r" }),
+            );
+            assert!(
+                err.contains(&format!("not available on ontology_{tier}")),
+                "promote must never be reachable as an action: it is the \
+                 deliberate human gate this queue feeds; got: {err}"
+            );
+        }
+
+        // Per-action requirements survive the merge.
+        assert!(
+            build_execution(read, &json!({ "action": "show" })).is_err(),
+            "show without item_id must be refused"
+        );
+        assert!(
+            build_execution(write, &json!({ "action": "accept", "item_ids": ["a"] })).is_err(),
+            "accept needs `domain` or `output`"
+        );
+        assert!(
+            build_execution(write, &json!({ "action": "reject", "item_ids": ["a"] })).is_err(),
+            "reject needs a `reason` — it is final and goes in the ledger"
+        );
+        assert!(
+            build_execution(
+                write,
+                &json!({ "action": "reject", "item_ids": [], "reason": "x" })
+            )
+            .is_err(),
+            "an empty item_ids list must be refused, not silently no-op"
+        );
+    }
+
+    #[test]
+    fn node_read_carries_the_three_reads_and_refuses_the_gated_verbs() {
+        let offered: std::collections::HashSet<String> = command_tools_filtered(true)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(offered.contains("node_read"), "the reads must be offered");
+        for hidden in ["node_probe", "node_status", "node_logs"] {
+            assert!(
+                !offered.contains(hidden),
+                "{hidden} collapsed into node_read and must leave the offered surface"
+            );
+            assert!(
+                is_command_tool(hidden),
+                "{hidden} must still RESOLVE — hidden is not removed, and older \
+                 transcripts call it by name"
+            );
+        }
+
+        // One argv builder serves both names, so the typed spec and the action
+        // form cannot drift apart.
+        for (tool, input, argv) in [
+            ("node_probe", json!({}), "prism node probe"),
+            (
+                "node_read",
+                json!({ "action": "probe" }),
+                "prism node probe",
+            ),
+            ("node_status", json!({}), "prism node status"),
+            (
+                "node_read",
+                json!({ "action": "status" }),
+                "prism node status",
+            ),
+            (
+                "node_logs",
+                json!({ "service": "kafka", "tail": 20 }),
+                "prism node logs kafka --tail 20",
+            ),
+            (
+                "node_read",
+                json!({ "action": "logs", "service": "kafka", "tail": 20 }),
+                "prism node logs kafka --tail 20",
+            ),
+        ] {
+            assert_eq!(
+                command_tool_preview(tool, &input),
+                Some(argv.to_string()),
+                "{tool} must build `{argv}`"
+            );
+        }
+
+        // `service` is the CLI's required positional: a logs call without it
+        // must fail here, not shell out to a command that cannot run.
+        assert!(
+            build_execution(
+                spec_by_name("node_read").expect("node_read is registered"),
+                &json!({ "action": "logs" }),
+            )
+            .is_err(),
+            "node_read action='logs' without `service` must be refused"
+        );
+
+        // The gated verbs stay gated.
+        for gated in ["up", "down", "key"] {
+            assert!(
+                build_execution(
+                    spec_by_name("node_read").expect("node_read is registered"),
+                    &json!({ "action": gated }),
+                )
+                .is_err(),
+                "node_read must refuse {gated:?}: it is approval-gated on the \
+                 `node` umbrella and must not gain a free path"
+            );
+        }
+        assert_eq!(
+            command_tool_requires_approval("node_read"),
+            Some(false),
+            "the reads are free and unapproved"
+        );
+        assert_eq!(
+            command_tool_permission_mode("node_read"),
+            Some(PermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            command_tool_requires_approval("node"),
+            Some(true),
+            "the umbrella still carries up/down/key and must still ask"
         );
     }
 
@@ -7365,10 +9666,9 @@ ValueError: boom\n";
         // Only genuinely node-backed tools are gated offline; query_platform
         // hits the remote API and stays offered (see
         // offline_catalog_offers_platform_knowledge_path).
-        assert!(
-            tools.iter().all(|tool| tool.name != "query_federated"),
-            "query_federated spans mesh peers and must stay gated while the node is offline"
-        );
+        // `scope=federated` needs a node, but it is no longer a separate TOOL
+        // that can vanish: with the node down the scope returns the real error.
+        // Hiding it used to take the local store with it.
         // THE USER'S OWN STORE IS NOT NODE-BACKED. `query_local` reads the
         // Turso file directly — measured working with the node down, both
         // plain (9 entities) and `--semantic` (10 scored matches). Gating it
@@ -7376,12 +9676,13 @@ ValueError: boom\n";
         // "search our ingested knowledge graph" hit HTTP 402 while the answer
         // sat on disk.
         assert!(
-            tools.iter().any(|tool| tool.name == "query_local"),
-            "query_local must be offered with the node OFFLINE — it does not use the node"
+            tools.iter().any(|tool| tool.name == "query"),
+            "query must be offered with the node OFFLINE — scope=local reads the \
+             Turso file directly and does not use the node"
         );
         // Capability is gated, not deleted: every hidden tool still resolves
         // and executes if called by name (older transcripts, aliases).
-        for name in ["query", "query_local", "query_federated"] {
+        for name in ["query", "query_local", "query_platform", "query_federated"] {
             assert!(is_command_tool(name), "{name} must remain executable");
         }
     }
@@ -7389,16 +9690,17 @@ ValueError: boom\n";
     #[test]
     fn local_store_tools_offered_when_node_online() {
         let tools = command_tools_filtered(true);
-        // `query` itself is never offered any more — it is a raw-argv umbrella
-        // fully covered by these typed siblings.
-        for name in ["query_local", "query_federated"] {
+        // ONE query tool, offered in both node states; `scope` picks the store.
+        assert!(
+            tools.iter().any(|tool| tool.name == "query"),
+            "query should be offered when the local node is running"
+        );
+        for stale in ["query_local", "query_platform", "query_federated"] {
             assert!(
-                tools.iter().any(|tool| tool.name == name),
-                "{name} should be offered when the local node is running"
+                tools.iter().all(|tool| tool.name != stale),
+                "`{stale}` is a scope now, not an offered tool name"
             );
         }
-        // query_platform hits the remote API, so it is offered in both states.
-        assert!(tools.iter().any(|tool| tool.name == "query_platform"));
     }
 
     // ── Redundant umbrellas: hidden, but not removed ─────────────────────
@@ -7448,6 +9750,26 @@ ValueError: boom\n";
         }
     }
 
+    /// The `action` enum a tool's schema declares, if it takes one.
+    ///
+    /// Read from the SCHEMA rather than a hand-kept list, so a new action tool
+    /// is covered by this invariant the moment it exists.
+    fn action_enum_for(tool_name: &str) -> Option<Vec<String>> {
+        let spec = spec_by_name(tool_name)?;
+        let schema = schema_for_spec(spec);
+        let values = schema
+            .get("properties")?
+            .get("action")?
+            .get("enum")?
+            .as_array()?;
+        Some(
+            values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
     #[test]
     fn dropped_umbrella_verbs_have_typed_siblings() {
         // The capability gate: nothing may be dropped that the typed surface
@@ -7459,10 +9781,23 @@ ValueError: boom\n";
             if let CommandToolKind::RootSubcommand { subcommands, .. } = spec.kind {
                 for verb in subcommands {
                     let sibling = format!("{}_{verb}", spec.root);
+                    // A verb is reachable EITHER as its own offered typed name,
+                    // OR as an `action` on an offered action-taking tool of the
+                    // same permission tier. The second form is what the read/
+                    // write collapse introduced: `mesh_sync` stopped being a
+                    // name and became `mesh_write(action:"sync")`. The gate is
+                    // still "nothing may be dropped that cannot be reached" —
+                    // only the way of reaching it widened.
+                    let reachable_as_action = offered.iter().any(|offered_name| {
+                        offered_name.starts_with(&format!("{}_", spec.root))
+                            && action_enum_for(offered_name)
+                                .is_some_and(|actions| actions.iter().any(|a| a == verb))
+                    });
                     assert!(
-                        offered.contains(&sibling),
-                        "`{name} {verb}` has no offered typed sibling \
-                         (`{sibling}`) — keep the umbrella instead"
+                        offered.contains(&sibling) || reachable_as_action,
+                        "`{name} {verb}` is reachable neither as an offered typed \
+                         sibling (`{sibling}`) nor as an action on an offered \
+                         action tool — keep the umbrella instead"
                     );
                 }
             }
@@ -7470,16 +9805,10 @@ ValueError: boom\n";
 
         // RootArgs umbrellas declare no verb set, so name the replacements
         // explicitly. Checked against the clap definitions in
-        // crates/cli/src/main.rs: Query{text,--semantic,--platform,--federated,
-        // --limit,--llm-url,--model,--api-key,--dashboard-url},
-        // JobStatus{job_id}, WorkflowCommands{List,Show,Run},
+        // crates/cli/src/main.rs: JobStatus{job_id}, WorkflowCommands{List,Show,Run},
         // Run{image,...}, Research{query,--depth,--json},
         // Publish{path,--to,--repo,--private}.
         for (umbrella, siblings) in [
-            (
-                "query",
-                &["query_local", "query_platform", "query_federated"][..],
-            ),
             ("job-status", &["job_status_lookup"][..]),
             (
                 "workflow",
@@ -7509,8 +9838,13 @@ ValueError: boom\n";
         // typed tool covers must NOT be dropped. Verified against
         // crates/cli/src/main.rs.
         let offered = offered_names(true);
+        // `marketplace` used to head this list, kept offered solely because
+        // `update` and `publish` had no typed tool. `marketplace_write` now
+        // reaches both, so the umbrella stopped being the only route and is
+        // collapsed — the rule did not change, the coverage did. The companion
+        // test below pins that the two verbs really are reachable, so this is
+        // a removal backed by evidence rather than by deleting an assertion.
         for (umbrella, uncovered) in [
-            ("marketplace", "update, publish"),
             ("node", "up, down, key"),
             ("billing", "topup"),
             ("ingest", "--status"),
@@ -7532,6 +9866,86 @@ ValueError: boom\n";
         }
         assert!(!offered.contains("agent"), "`agent` must stay collapsed");
         assert!(is_command_tool("agent"), "`agent` must stay registered");
+    }
+
+    /// The marketplace family collapses 5 offered tools into 2, and an
+    /// umbrella may only be dropped once every verb it uniquely reached has a
+    /// home. `update` and `publish` were exactly that: reachable through
+    /// `marketplace` and through nothing else, which is why
+    /// `umbrellas_with_an_uncovered_verb_stay_offered` used to name it.
+    ///
+    /// This asserts the coverage that justifies the removal — every action of
+    /// both collapsed tools builds a real argv — and that the read/write split
+    /// keeps its permission tiers, which is the whole point of splitting on
+    /// the tool NAME: approval is keyed there, so a free `search` must not sit
+    /// behind the same name as an `install`.
+    #[test]
+    fn marketplace_collapses_to_read_and_write_without_losing_a_verb() {
+        let read = spec_by_name("marketplace_read").expect("marketplace_read must exist");
+        let write = spec_by_name("marketplace_write").expect("marketplace_write must exist");
+
+        assert_eq!(read.permission_mode, PermissionMode::ReadOnly);
+        assert!(
+            !read.requires_approval,
+            "a marketplace search must not prompt"
+        );
+        assert_eq!(write.permission_mode, PermissionMode::WorkspaceWrite);
+        assert!(write.requires_approval, "install/publish must stay gated");
+
+        // The two verbs that previously kept the umbrella alive.
+        assert!(MARKETPLACE_WRITE_ACTIONS.contains(&"update"));
+        assert!(MARKETPLACE_WRITE_ACTIONS.contains(&"publish"));
+
+        // Every action builds a real argv, so no action is offered in the
+        // schema while being unreachable in the executor.
+        for action in MARKETPLACE_READ_ACTIONS
+            .iter()
+            .chain(MARKETPLACE_WRITE_ACTIONS)
+        {
+            let input = json!({
+                "action": action,
+                "name": "demo",
+                "query": "demo",
+                "slug": "demo",
+            });
+            let args = marketplace_cli_args(action, &input)
+                .unwrap_or_else(|e| panic!("action {action:?} builds no argv: {e}"));
+            assert_eq!(args[0], *action, "argv must lead with the subcommand");
+        }
+
+        // Tier crossing is refused by NAME, in both directions.
+        let install_via_read = marketplace_action_for(
+            &json!({"action": "install"}),
+            MARKETPLACE_READ_ACTIONS,
+            "read",
+        );
+        assert!(
+            install_via_read.is_err(),
+            "install must not be reachable on the read tool"
+        );
+        let search_via_write = marketplace_action_for(
+            &json!({"action": "search"}),
+            MARKETPLACE_WRITE_ACTIONS,
+            "write",
+        );
+        assert!(
+            search_via_write.is_err(),
+            "the write tool must not absorb a free read"
+        );
+
+        // Hidden is not removed: the typed names still execute.
+        for typed in [
+            "marketplace_search",
+            "marketplace_info",
+            "marketplace_install",
+            "marketplace_find",
+        ] {
+            assert!(is_command_tool(typed), "`{typed}` must stay executable");
+            assert!(
+                !offered_names(true).contains(typed),
+                "`{typed}` must no longer be offered"
+            );
+        }
     }
 
     #[test]
@@ -7577,17 +9991,14 @@ ValueError: boom\n";
         let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_str()).collect();
 
         // The platform search path is offered even with the local node down.
-        assert!(names.contains(&"query_platform"));
-        // ...AND SO IS THE LOCAL ONE. Offering the billed remote search while
-        // hiding the free local search is what sent "search our ingested
-        // knowledge graph" to the platform and into an HTTP 402. `query_local`
-        // reads the Turso file directly and needs no node.
-        assert!(
-            names.contains(&"query_local"),
-            "the user's own store must be searchable with the node offline"
-        );
-        // Genuinely node-backed: federation spans mesh peers.
-        assert!(!names.contains(&"query_federated"));
+        assert!(names.contains(&"query"));
+        // ...and the SAME tool carries the free local store, so the billed
+        // remote can no longer be offered while the local one is hidden — the
+        // asymmetry that sent "search our ingested knowledge graph" to the
+        // platform and into an HTTP 402. The retired names are not offered.
+        for stale in ["query_local", "query_platform", "query_federated"] {
+            assert!(!names.contains(&stale), "`{stale}` is a scope, not a tool");
+        }
         // The typed knowledge command-tools are always offered (remote API).
         for name in [
             "knowledge_entity",
@@ -7602,15 +10013,26 @@ ValueError: boom\n";
     }
 
     #[test]
-    fn predict_is_a_billable_approval_gated_tool_with_correct_invocation() {
+    fn run_model_is_a_billable_approval_gated_tool_with_correct_invocation() {
         // The one-call "run a marketplace model on the cloud" surface: it
         // creates real billable deployments, so it MUST be approval-gated.
-        assert!(is_command_tool("predict"));
-        assert!(is_command_tool("run_model"), "alias must resolve");
-        assert_eq!(command_tool_requires_approval("predict"), Some(true));
+        assert!(is_command_tool("run_model"));
+        assert!(is_command_tool("model_predict"), "alias must resolve");
+        assert_eq!(command_tool_requires_approval("run_model"), Some(true));
+
+        // `predict` belongs to the Python tool server's FREE, LOCAL predictor.
+        // This table must not claim it: the catalog is built Python-first and
+        // then extended with these specs, and `ToolCatalog::extend` is
+        // last-writer-wins and silent, so a command tool answering to `predict`
+        // silently replaced the free local tool with this billable cloud one.
+        // The CLI root stays `prism predict` — only the TOOL name moved.
+        assert!(
+            !is_command_tool("predict"),
+            "`predict` must resolve to the Python tool, not this billable spec"
+        );
 
         let preview = command_tool_preview(
-            "predict",
+            "run_model",
             &json!({
                 "model": "mace-mh-1",
                 "task": "relax",
@@ -7628,7 +10050,62 @@ ValueError: boom\n";
         assert!(preview.contains("--keep"), "{preview}");
 
         // Missing model → honest arg error, no execution.
-        assert!(build_execution(spec_by_name("predict").unwrap(), &json!({"inputs": {}})).is_err());
+        assert!(
+            build_execution(spec_by_name("run_model").unwrap(), &json!({"inputs": {}})).is_err()
+        );
+    }
+
+    /// Names owned by the Python tool server (`app/tools/`). The catalog is
+    /// built Python-first and then extended with `COMMAND_TOOLS`, and
+    /// `ToolCatalog::extend` is last-writer-wins and SILENT — so any spec here
+    /// answering to one of these names deletes the Python tool from the
+    /// catalog without a warning. This shipped once: a billable cloud
+    /// `predict` replaced the free local predictor, which became unreachable.
+    const PYTHON_OWNED_TOOL_NAMES: &[&str] = &[
+        "predict",
+        "predict_properties",
+        "predict_synthesizability",
+        "materials_search",
+        "structure",
+        "plot",
+        "file",
+        "dataset",
+        "execute_python",
+        "execute_bash",
+    ];
+
+    #[test]
+    fn command_tools_never_claim_a_python_tool_name() {
+        for name in PYTHON_OWNED_TOOL_NAMES {
+            assert!(
+                !is_command_tool(name),
+                "`{name}` belongs to the Python tool server, but a command tool \
+                 resolves it — `ToolCatalog::extend` would silently drop the \
+                 Python tool. Rename the spec (see `run_model`)."
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_root_never_resolves_to_a_typed_child() {
+        // Root-matching exists for umbrella tools (`mesh`, `deploy`), whose
+        // name IS their root. It must not hand a bare root to whichever typed
+        // child happens to sit first in COMMAND_TOOLS: that resolved
+        // `notebook` to `notebook_exec` and `schedule` to `schedule_create`,
+        // both FullAccess and approval-gated, under a name never offered as a
+        // tool — and let this table capture `predict` from Python.
+        for spec in COMMAND_TOOLS {
+            if spec.name == spec.root {
+                continue;
+            }
+            if let Some(resolved) = spec_by_name(spec.root) {
+                assert_eq!(
+                    resolved.name, resolved.root,
+                    "bare root `{}` resolved to typed child `{}`",
+                    spec.root, resolved.name
+                );
+            }
+        }
     }
 
     #[test]
@@ -7912,8 +10389,8 @@ ValueError: boom\n";
         // The unattended free-form-argv surface, audited against the clap
         // definitions in crates/cli/src/main.rs. `status`, `tools`, `agent`
         // are unit variants (no flags); `job-status` takes one positional;
-        // `doctor`'s only flag is the repair; `query` and `models` declare
-        // their read-path flags; `papers` declares its retrieval flags;
+        // `doctor`'s only flag is the repair; `models` declares its read-path
+        // flags; `papers` declares its retrieval flags;
         // `plugins` admits only `--json` on its `list` subcommand (the
         // standard plugin contract's inventory tool — read-only).
         assert_eq!(
@@ -7922,7 +10399,6 @@ ValueError: boom\n";
                 "status",
                 "tools",
                 "doctor",
-                "query",
                 "job-status",
                 "plugins",
                 "papers",
@@ -8210,13 +10686,14 @@ ValueError: boom\n";
 
     #[test]
     fn renders_preview_from_structured_args() {
+        // `research` is a raw-argv (RootArgs) tool; `query` is typed now.
         let preview = command_tool_preview(
-            "query",
+            "research",
             &json!({ "args": ["band gap materials", "--json"] }),
         )
         .expect("preview should render");
 
-        assert_eq!(preview, "prism query 'band gap materials' --json");
+        assert_eq!(preview, "prism research 'band gap materials' --json");
     }
 
     #[test]
@@ -8246,6 +10723,7 @@ ValueError: boom\n";
             "query_platform",
             &json!({
                 "text": "high entropy alloys",
+                "scope": "platform",
                 "semantic": true,
                 "json": true,
                 "limit": 5
@@ -8667,7 +11145,11 @@ ValueError: boom\n";
             ("tools", json!({"args": ["--python=/tmp/pwn"]})),
             ("status", json!({"args": ["--project-root", "/tmp/evil"]})),
             ("doctor", json!({"args": ["--project-root=/tmp/evil"]})),
-            ("query", json!({"args": ["ok", "--PYTHON", "/tmp/pwn"]})),
+            // Retargeted from `query` when it became a typed tool: there,
+            // build_execution would have failed on a missing `text` field
+            // rather than on the global-flag guard — a green for the wrong
+            // reason. `research` is still raw-argv, so this still tests the guard.
+            ("research", json!({"args": ["ok", "--PYTHON", "/tmp/pwn"]})),
         ] {
             let spec = spec_by_name(tool).expect("spec exists");
             let result = build_execution(spec, &input);
@@ -8683,7 +11165,7 @@ ValueError: boom\n";
     /// are off limits.
     #[test]
     fn cli_args_still_accept_ordinary_flags() {
-        let spec = spec_by_name("query").expect("spec exists");
+        let spec = spec_by_name("research").expect("spec exists");
         let exec = build_execution(spec, &json!({"args": ["titanium", "--limit", "5"]}))
             .expect("ordinary flags must still build");
         match exec {
@@ -9057,6 +11539,76 @@ mod web_browse_tests {
         assert_eq!(preview, "agent-browser read https://example.org/x");
     }
 
+    /// `render=true` must drive a REAL browser: navigate first, then read the
+    /// rendered tab. A plain `read <url>` is an HTTP fetch and fails
+    /// identically to any other fetcher against a bot wall, which is why the
+    /// fulltext allowlist used to refuse those hosts outright.
+    #[tokio::test]
+    async fn render_navigates_before_reading() {
+        // `true` accepts and ignores any arguments and exits 0, so both steps
+        // "succeed" and the sequencing is what is under test.
+        let outcome = agent_browser_render_cmds(
+            TokioCommand::new("true"), // header step
+            TokioCommand::new("true"),
+            TokioCommand::new("true"),
+            "http://127.0.0.1:9/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a local URL is not an offline refusal");
+        assert!(
+            matches!(
+                outcome,
+                AgentBrowserOutcome::Completed { success: true, .. }
+            ),
+            "render must complete when both steps succeed, got {outcome:?}"
+        );
+    }
+
+    /// A failed navigation must NOT be followed by a read.
+    ///
+    /// `read` with no url returns whatever tab happens to be open, so reading
+    /// after a failed `open` would attribute some other page's text to this
+    /// url — a fabricated source, which is worse than reporting the failure.
+    #[tokio::test]
+    async fn a_failed_navigation_is_never_followed_by_a_read() {
+        let outcome = agent_browser_render_cmds(
+            TokioCommand::new("true"),  // header step
+            TokioCommand::new("false"), // navigation fails
+            TokioCommand::new("true"),  // would succeed if it were reached
+            "http://127.0.0.1:9/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a failed navigation is an outcome, not an Err");
+        match outcome {
+            AgentBrowserOutcome::Completed { success, .. } => assert!(
+                !success,
+                "a failed open must surface as failure, not as the next tab's text"
+            ),
+            other => panic!("expected the failed navigation to be reported, got {other:?}"),
+        }
+    }
+
+    /// The render path shares the missing-binary reporting, so an absent
+    /// browser is never mistaken for an empty page.
+    #[tokio::test]
+    async fn render_reports_an_absent_browser() {
+        let outcome = agent_browser_render_cmds(
+            TokioCommand::new("true"), // header step
+            TokioCommand::new("prism-no-such-agent-browser-binary"),
+            TokioCommand::new("true"),
+            "http://127.0.0.1:9/",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("absence is an outcome, not an Err");
+        assert!(
+            matches!(outcome, AgentBrowserOutcome::MissingBinary),
+            "got {outcome:?}"
+        );
+    }
+
     /// When `agent-browser` is not on PATH the tool must say exactly that and
     /// name the install command — never an empty string, never a silent
     /// fallback to another fetch path.
@@ -9300,6 +11852,436 @@ mod web_browse_tests {
         assert!(
             error.to_string().contains("url"),
             "the refusal must name the missing field: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod artifact_view_tests {
+    //! Tests for making a produced artifact VISIBLE instead of reporting a path.
+    //!
+    //! Pixels cannot be asserted in a unit test, so these assert the two things
+    //! that CAN be: the argv PRISM builds, and the exact words it uses when it
+    //! did not show something. A viewer that was never installed, one that
+    //! refused, and one that drew the picture must read as three different
+    //! facts — the failure this suite exists to prevent is the second and third
+    //! being reported as the first.
+
+    use super::*;
+    use std::io::Write as _;
+
+    /// A 1×1 PNG. Real bytes, so the data: URI in the page is a real image.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn saved_png(dir: &tempfile::TempDir, name: &str) -> String {
+        let path = dir.path().join(name);
+        let mut file = std::fs::File::create(&path).expect("create png");
+        file.write_all(TINY_PNG).expect("write png");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The pane opens BESIDE the human, not over them: taking the whole pane
+    /// would hide the conversation that produced the artifact.
+    #[test]
+    fn open_argv_splits_a_pane_beside_the_human() {
+        assert_eq!(
+            terminal_browser_open_argv("/tmp/cell-1-0.view.html"),
+            vec!["open", "/tmp/cell-1-0.view.html", "--split", "right"]
+        );
+    }
+
+    /// The page carries the image ITSELF (a data: URI), so it cannot come up
+    /// blank because the file moved — and the path it prints is escaped, so a
+    /// path can never close a tag.
+    #[test]
+    fn viewer_page_embeds_the_bytes_and_escapes_the_path() {
+        let html = image_page_html("/tmp/a<b>\"c\".png", "image/png", TINY_PNG);
+        assert!(
+            html.contains("src=\"data:image/png;base64,iVBORw0KGgo"),
+            "the image must be embedded, not linked: {html}"
+        );
+        assert!(!html.contains("<b>"), "the path must be escaped: {html}");
+        assert!(html.contains("&lt;b&gt;"), "{html}");
+        assert!(html.contains("&quot;c&quot;"), "{html}");
+    }
+
+    /// Absence is the case the owner will actually hit. It must name the
+    /// binary, give the install command, and STILL give the path — and it must
+    /// never read as "shown".
+    #[tokio::test]
+    async fn absent_viewer_says_so_with_install_command_and_keeps_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_png(&dir, "cell-1-0.png");
+        let view = show_artifact_with(
+            TokioCommand::new("prism-no-such-terminal-browser-binary"),
+            &path,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(view.outcome, ArtifactViewOutcome::NotInstalled);
+        let line = view.line();
+        assert!(line.contains(&path), "the path must survive: {line}");
+        assert!(line.contains("NOT shown"), "{line}");
+        assert!(
+            line.contains("`terminal-browser` is not installed or not on PATH"),
+            "must name the binary: {line}"
+        );
+        assert!(
+            line.contains("curl -fsSL https://terminal-browser.sh/install | bash"),
+            "must name the install command: {line}"
+        );
+        assert!(
+            !line.contains("SHOWN"),
+            "absence must never read as shown: {line}"
+        );
+    }
+
+    /// A viewer that RAN and refused (`terminal-browser` exits non-zero when
+    /// the terminal cannot draw images) is a different fact from an absent
+    /// one, and its own words are relayed.
+    #[tokio::test]
+    async fn a_refusing_viewer_is_not_reported_as_shown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_png(&dir, "cell-2-0.png");
+        let view =
+            show_artifact_with(TokioCommand::new("false"), &path, Duration::from_secs(5)).await;
+
+        match &view.outcome {
+            ArtifactViewOutcome::NotShown(reason) => assert!(
+                reason.contains("terminal-browser open"),
+                "the failing step must be named: {reason}"
+            ),
+            other => panic!("a refusing viewer must not be `Shown`: {other:?}"),
+        }
+        assert!(view.line().contains(&path), "{}", view.line());
+    }
+
+    /// Exit 0 is the only thing PRISM treats as "the human can see it", and it
+    /// is the viewer — not PRISM — that decides it.
+    #[tokio::test]
+    async fn a_viewer_that_succeeds_is_reported_as_shown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = saved_png(&dir, "cell-3-0.png");
+        let view =
+            show_artifact_with(TokioCommand::new("true"), &path, Duration::from_secs(5)).await;
+
+        assert_eq!(view.outcome, ArtifactViewOutcome::Shown);
+        assert!(view.line().contains("SHOWN in a pane"), "{}", view.line());
+        // The page it opened is a real file next to the artifact.
+        let page = std::path::Path::new(&path).with_extension("view.html");
+        let html = std::fs::read_to_string(&page).expect("the viewer page was written");
+        assert!(html.contains("data:image/png;base64,"), "{html}");
+    }
+
+    /// A file type PRISM has no page for is named, not silently skipped and
+    /// not wrapped in a page that would come up blank.
+    #[tokio::test]
+    async fn an_unrenderable_artifact_names_the_part_that_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("TiAl.cif");
+        std::fs::write(&path, "data_TiAl\n_cell_length_a 4.0\n").expect("write cif");
+        let view = show_artifact_with(
+            TokioCommand::new("true"),
+            &path.to_string_lossy(),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        match &view.outcome {
+            ArtifactViewOutcome::NotShown(reason) => {
+                assert!(reason.contains("`cif`"), "must name the type: {reason}");
+                assert!(reason.contains("no viewer page"), "{reason}");
+            }
+            other => panic!("an unrenderable file must not read as shown: {other:?}"),
+        }
+    }
+
+    /// A path the notebook reported but that cannot be read is a failure with
+    /// a reason, never a missing line.
+    #[tokio::test]
+    async fn an_unreadable_artifact_is_reported_not_swallowed() {
+        let view = show_artifact_with(
+            TokioCommand::new("true"),
+            "/nonexistent/prism/cell-9-9.png",
+            Duration::from_secs(5),
+        )
+        .await;
+        match &view.outcome {
+            ArtifactViewOutcome::NotShown(reason) => assert!(
+                reason.contains("reading /nonexistent/prism/cell-9-9.png"),
+                "{reason}"
+            ),
+            other => panic!("expected a named read failure, got {other:?}"),
+        }
+    }
+
+    /// The model-facing notebook result must say whether the figure is on the
+    /// human's screen — this is the regression the owner reported: a correct
+    /// answer delivered as a filesystem path.
+    #[test]
+    fn notebook_result_reports_a_shown_plot_as_shown() {
+        let cell = plot_cell("/tmp/cell-1-0.png");
+        let views = vec![ArtifactView {
+            path: "/tmp/cell-1-0.png".to_string(),
+            outcome: ArtifactViewOutcome::Shown,
+        }];
+        let result =
+            compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &views);
+
+        let stdout = result["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("SHOWN in a pane beside you"),
+            "the human must be told the plot is on screen: {stdout}"
+        );
+        assert!(stdout.contains("/tmp/cell-1-0.png"), "{stdout}");
+        assert_eq!(result["images"][0]["shown"], json!(true));
+    }
+
+    /// …and when it is NOT on screen it must say that, with the install
+    /// command and the path. Never silence, never a claim.
+    #[test]
+    fn notebook_result_reports_an_unshown_plot_honestly() {
+        let cell = plot_cell("/tmp/cell-1-0.png");
+        let views = vec![ArtifactView {
+            path: "/tmp/cell-1-0.png".to_string(),
+            outcome: ArtifactViewOutcome::NotInstalled,
+        }];
+        let result =
+            compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &views);
+
+        let stdout = result["stdout"].as_str().expect("stdout");
+        assert!(stdout.contains("NOT shown"), "{stdout}");
+        assert!(stdout.contains("/tmp/cell-1-0.png"), "{stdout}");
+        assert!(
+            stdout.contains("curl -fsSL https://terminal-browser.sh/install | bash"),
+            "{stdout}"
+        );
+        assert_eq!(result["images"][0]["shown"], json!(false));
+    }
+
+    /// The guard against the fix rotting: with no view for a produced image,
+    /// the result must say PRISM never tried — "we did not attempt" and "it is
+    /// on screen" must never render as the same line.
+    #[test]
+    fn a_plot_with_no_view_is_never_reported_as_shown() {
+        let cell = plot_cell("/tmp/cell-1-0.png");
+        let result = compose_notebook_result(&cell, "/project", false, "cell[0]", "builtin", &[]);
+
+        let stdout = result["stdout"].as_str().expect("stdout");
+        assert!(
+            stdout.contains("NOT shown: PRISM did not attempt to display it"),
+            "an unattempted display must say so: {stdout}"
+        );
+        assert!(!stdout.contains("SHOWN in a pane"), "{stdout}");
+        assert_eq!(result["images"][0]["shown"], json!(false));
+    }
+
+    /// The human's own `/notebook run` gets the same honesty through the one
+    /// channel of the returned `Cell` that PRISM may add to. A shown plot adds
+    /// nothing — the pixels are the report.
+    #[test]
+    fn the_notebook_pane_is_told_when_a_plot_was_not_shown() {
+        let mut stderr = String::new();
+        append_unshown_notice(
+            &mut stderr,
+            &[ArtifactView {
+                path: "/tmp/cell-1-0.png".to_string(),
+                outcome: ArtifactViewOutcome::Shown,
+            }],
+        );
+        assert_eq!(stderr, "", "a shown plot must not add noise");
+
+        append_unshown_notice(
+            &mut stderr,
+            &[ArtifactView {
+                path: "/tmp/cell-1-0.png".to_string(),
+                outcome: ArtifactViewOutcome::NotInstalled,
+            }],
+        );
+        assert!(stderr.starts_with("PRISM: "), "{stderr}");
+        assert!(stderr.contains("/tmp/cell-1-0.png"), "{stderr}");
+        assert!(stderr.contains("curl -fsSL"), "{stderr}");
+    }
+
+    /// A cell that draws more figures than PRISM will open panes for must not
+    /// bury the conversation — and the ones it skips must say the CAP is why,
+    /// not go quiet. `show_artifact` is never called for them, so this runs
+    /// without a viewer.
+    #[tokio::test]
+    async fn a_pane_storm_is_capped_and_the_cap_is_named() {
+        let paths: Vec<String> = (0..MAX_PANES_PER_CELL + 2)
+            .map(|n| format!("/nonexistent/prism/cell-1-{n}.png"))
+            .collect();
+        let views = show_cell_images(&paths).await;
+
+        assert_eq!(views.len(), paths.len(), "every figure is accounted for");
+        let capped = &views[MAX_PANES_PER_CELL];
+        match &capped.outcome {
+            ArtifactViewOutcome::NotShown(reason) => {
+                assert!(
+                    reason.contains(&format!("at most {MAX_PANES_PER_CELL} panes")),
+                    "the cap must be named: {reason}"
+                );
+                assert!(reason.contains("drew 6 figures"), "{reason}");
+            }
+            other => panic!("a capped figure must not read as shown: {other:?}"),
+        }
+        assert!(
+            capped.line().contains("/nonexistent/prism/cell-1-4.png"),
+            "the path still reaches the human: {}",
+            capped.line()
+        );
+    }
+
+    fn plot_cell(path: &str) -> crate::notebook::Cell {
+        crate::notebook::Cell {
+            execution_count: 1,
+            origin: "agent".to_string(),
+            code: "plt.savefig(p)".to_string(),
+            stdout: String::new(),
+            stderr: String::new(),
+            result: None,
+            image_paths: vec![path.to_string()],
+            error: None,
+            success: true,
+        }
+    }
+
+    // ── web_browse: browsing the human can watch ──────────────────────
+
+    /// The preview the human approves names the browser that opens a pane.
+    #[test]
+    fn render_preview_names_the_visible_browser() {
+        let preview = command_tool_preview(
+            "web_browse",
+            &json!({"url": "https://example.org/x", "render": true}),
+        )
+        .expect("preview");
+        assert_eq!(
+            preview,
+            "terminal-browser open https://example.org/x --split right \
+             && terminal-browser action -- read"
+        );
+    }
+
+    /// With no viewer installed nothing is shown and nothing is read through
+    /// it — the caller is told why, and gets the install command.
+    #[tokio::test]
+    async fn render_without_a_viewer_is_unavailable_with_a_reason() {
+        let render = terminal_browser_render_cmds(
+            TokioCommand::new("prism-no-such-terminal-browser-binary"),
+            TokioCommand::new("true"),
+            TokioCommand::new("true"),
+            TokioCommand::new("true"),
+            "http://127.0.0.1:9/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("absence is an outcome, not an Err");
+
+        match render {
+            VisibleRender::Unavailable(reason) => {
+                assert!(reason.contains("not installed or not on PATH"), "{reason}");
+                assert!(reason.contains("curl -fsSL"), "{reason}");
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// A pane that opened but a navigation that failed must NOT be followed by
+    /// a read of whatever tab happened to be there — same rule as the headless
+    /// path, and it must not silently retry headlessly either.
+    #[tokio::test]
+    async fn a_failed_navigation_is_reported_not_read_past() {
+        let render = terminal_browser_render_cmds(
+            TokioCommand::new("true"),  // open succeeds
+            TokioCommand::new("true"),  // headers, best effort
+            TokioCommand::new("false"), // navigation fails
+            TokioCommand::new("true"),  // would succeed if it were reached
+            "http://127.0.0.1:9/",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a failed navigation is an outcome, not an Err");
+
+        match render {
+            VisibleRender::Ran(AgentBrowserOutcome::Completed { success, .. }) => assert!(
+                !success,
+                "a failed navigation must surface as failure, not as another tab's text"
+            ),
+            other => panic!("expected a reported failure, got {other:?}"),
+        }
+    }
+
+    /// Falling back to the headless browser is allowed; pretending the human
+    /// saw the page is not. The fetched text is untouched.
+    ///
+    /// This drives [`resolve_render`] — the production dispatch — rather than
+    /// the note helper it calls. Testing the helper alone would have passed
+    /// even with the call deleted from the fallback branch, which is how the
+    /// note would quietly stop being attached.
+    #[tokio::test]
+    async fn a_headless_fallback_says_the_page_was_not_shown() {
+        let fetched = AgentBrowserOutcome::Completed {
+            success: true,
+            exit_code: Some(0),
+            stdout: "the article text".to_string(),
+            stderr: String::new(),
+        };
+        let resolved = resolve_render(
+            VisibleRender::Unavailable("no pane could be opened.".to_string()),
+            async { Ok(fetched) },
+        )
+        .await
+        .expect("the fallback produces an outcome");
+
+        let AgentBrowserOutcome::Completed { stdout, stderr, .. } = resolved else {
+            panic!("a completed fetch stays completed");
+        };
+        assert_eq!(stdout, "the article text", "the page text is untouched");
+        assert!(stderr.contains("NOT shown on screen"), "{stderr}");
+        assert!(stderr.contains("the human did not see it"), "{stderr}");
+        assert!(stderr.contains("no pane could be opened."), "{stderr}");
+    }
+
+    /// The visible browser's own outcome is reported as-is, and the headless
+    /// fetch never runs — the same page must not be fetched twice, and a page
+    /// the human DID see must not be annotated as unseen.
+    #[tokio::test]
+    async fn a_visible_render_does_not_also_fetch_headlessly() {
+        let shown = AgentBrowserOutcome::Completed {
+            success: true,
+            exit_code: Some(0),
+            stdout: "the rendered text".to_string(),
+            stderr: String::new(),
+        };
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let resolved = resolve_render(VisibleRender::Ran(shown), async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(AgentBrowserOutcome::MissingBinary)
+        })
+        .await
+        .expect("outcome");
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the headless fetch must not run when the page was already shown"
+        );
+        let AgentBrowserOutcome::Completed { stdout, stderr, .. } = resolved else {
+            panic!("the visible outcome must pass through unchanged");
+        };
+        assert_eq!(stdout, "the rendered text");
+        assert!(
+            !stderr.contains("NOT shown"),
+            "a page the human saw must not be annotated as unseen: {stderr}"
         );
     }
 }

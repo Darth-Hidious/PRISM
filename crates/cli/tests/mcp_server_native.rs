@@ -161,10 +161,11 @@ fn tools_list_surfaces_requires_approval() {
     };
 
     assert!(approval_of("doctor_fix"), "doctor_fix is approval-gated");
-    assert!(
-        approval_of("mesh_publish"),
-        "mesh_publish is approval-gated"
-    );
+    // `mesh_publish` folded into `mesh_write(action:"publish")`; the approval
+    // rode the name, so the gated surface is the one to assert on. A test
+    // naming a collapsed tool fails on the name and says nothing about the
+    // rule it exists to guard.
+    assert!(approval_of("mesh_write"), "mesh_write is approval-gated");
     assert!(!approval_of("doctor"), "doctor runs unattended");
     // compute_cancel is NOT approval-gated — the OPA policy gate is the only
     // thing standing between an MCP host and a spend-affecting broker call,
