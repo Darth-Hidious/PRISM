@@ -399,9 +399,12 @@ def _exercise_sidecar_provisioning(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(_sidecar, "SIDECAR_VENV", tmp_path / "venv-sci")
     monkeypatch.setattr(_sidecar, "find_base_python", lambda: sys.executable)
-    # Nothing to install, so pip refuses in its own words. Keeps this offline
-    # and ~1s while still running both real spawns end to end.
-    monkeypatch.setattr(_sidecar, "SIDECAR_PACKAGES", [])
+    # One capability with nothing in it, so the resolver refuses in its own
+    # words. Keeps this offline and ~1s while still running both real spawns
+    # end to end. Patched on SIDECAR_CAPABILITIES, which is what the install
+    # loop iterates — the flat SIDECAR_PACKAGES is a derived view and patching
+    # it would leave this test passing without exercising anything.
+    monkeypatch.setattr(_sidecar, "SIDECAR_CAPABILITIES", {"probe": []})
 
     err = _sidecar.ensure_sidecar(install=True)
 
@@ -409,8 +412,10 @@ def _exercise_sidecar_provisioning(tmp_path, monkeypatch) -> None:
         f"`python -m venv` never ran, so the first spawn died; ensure_sidecar "
         f"reported it as {err!r}"
     )
-    assert err and "requirement" in err.lower(), (
-        f"expected pip's own complaint about an empty install list, got {err!r}"
+    assert err, "an install that resolved nothing must not report success"
+    lowered = err.lower()
+    assert "requirement" in lowered or "probe" in lowered, (
+        f"expected the resolver's complaint about an empty install list, got {err!r}"
     )
 
 

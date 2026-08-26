@@ -32,9 +32,22 @@ SIDECAR_VENV = Path.home() / ".prism" / "venv-sci"
 # Newest first; 3.13 excluded on purpose — the point is escaping >=3.13 caps.
 _PYTHON_CANDIDATES = ["python3.12", "python3.11"]
 
-# Packages the sidecar needs. Kept here (not per-tool) so provisioning is
-# one pip run; both are small enough to install together.
-SIDECAR_PACKAGES = ["pyiron_atomistics>=0.5,<0.6", "pycalphad"]
+# Packages the sidecar needs, grouped by CAPABILITY.
+#
+# They used to be one list installed in one run, which meant the two
+# capabilities shared a fate they do not share in reality: on macOS arm64,
+# pyiron_atomistics 0.5.x pins mpi4py<=3.1.6, which ships no wheel for this
+# platform and needs an MPI compiler to build. Bundled, that unsatisfiable
+# requirement took CALPHAD down with it — and CALPHAD alone resolves to 32
+# packages in 102ms. So a capability that CAN be installed now is, and one that
+# cannot says exactly why without silencing the other.
+SIDECAR_CAPABILITIES: "dict[str, list[str]]" = {
+    "calphad": ["pycalphad"],
+    "pyiron": ["pyiron_atomistics>=0.5,<0.6"],
+}
+
+# Flat view, kept for callers that only want to know what the sidecar is for.
+SIDECAR_PACKAGES = [pkg for pkgs in SIDECAR_CAPABILITIES.values() for pkg in pkgs]
 
 _PROVISION_TIMEOUT_SECS = 900
 _CALL_TIMEOUT_SECS = 600
@@ -52,7 +65,9 @@ def find_base_python() -> Optional[str]:
     return None
 
 
-def ensure_sidecar(install: bool = True) -> Optional[str]:
+def ensure_sidecar(
+    install: bool = True, capability: Optional[str] = None
+) -> Optional[str]:
     """Make sure the sidecar venv exists with its packages.
 
     Returns None when ready, else a human-readable error string.
@@ -61,7 +76,21 @@ def ensure_sidecar(install: bool = True) -> Optional[str]:
     """
     marker = SIDECAR_VENV / ".provisioned"
     if marker.exists():
-        return None
+        if capability is None:
+            return None
+        # The marker lists what actually installed, so a partially provisioned
+        # venv must not answer "ready" for a capability it does not have. That
+        # is precisely how a half-installed sidecar passes for a whole one and
+        # the caller discovers the truth as an ImportError deep inside a tool.
+        have = {line.strip() for line in marker.read_text().splitlines() if line.strip()}
+        wanted = SIDECAR_CAPABILITIES.get(capability, [])
+        if all(pkg in have for pkg in wanted):
+            return None
+        return (
+            f"science sidecar has no {capability} support: "
+            f"{', '.join(wanted) or capability} did not install. "
+            "Run `prism pyiron install` to retry, and see the recorded reason."
+        )
     if not install:
         return "science sidecar venv not provisioned — run `prism pyiron install`"
 
@@ -79,7 +108,27 @@ def ensure_sidecar(install: bool = True) -> Optional[str]:
                 capture_output=True,
                 timeout=120,
             )
-        pip_command = [str(_sidecar_python()), "-m", "pip", "install"]
+        # Resolve with uv when it is on PATH, else pip.
+        #
+        # Not a preference: pip CANNOT install this set. pyiron_atomistics and
+        # pycalphad together defeat its resolver outright —
+        # "resolution-too-deep: Dependency resolution exceeded maximum depth" —
+        # and pip's own hint (add lower bounds) does not help; measured, it
+        # still fails with `pycalphad>=0.10`. uv resolves the same two
+        # requirements to 146 packages in 25ms. So on a machine with only pip
+        # the science sidecar has simply never been installable, which is why
+        # `structure` reported a sidecar failure on an ordinary run.
+        uv = shutil.which("uv")
+        if uv:
+            pip_command = [
+                uv,
+                "pip",
+                "install",
+                "--python",
+                str(_sidecar_python()),
+            ]
+        else:
+            pip_command = [str(_sidecar_python()), "-m", "pip", "install"]
         wheelhouse = os.environ.get(
             "PRISM_WHEELHOUSE", str(Path.home() / ".prism" / "wheelhouse")
         )
@@ -91,17 +140,44 @@ def ensure_sidecar(install: bool = True) -> Optional[str]:
                     "`prism provision wheels` on a connected machine"
                 )
             pip_command.extend(["--no-index", "--find-links", wheelhouse])
-        pip_command.extend(SIDECAR_PACKAGES)
-        result = spawn.run(
-            pip_command,
-            capture_output=True,
-            timeout=_PROVISION_TIMEOUT_SECS,
-        )
-        if result.returncode != 0:
-            tail = result.stderr.decode(errors="replace")[-400:]
-            return f"sidecar pip install failed: {tail}"
-        marker.write_text("\n".join(SIDECAR_PACKAGES) + "\n")
-        return None
+        resolver = "uv" if uv else "pip"
+        installed: "list[str]" = []
+        failures: "list[str]" = []
+        for capability, packages in SIDECAR_CAPABILITIES.items():
+            result = spawn.run(
+                pip_command + packages,
+                capture_output=True,
+                timeout=_PROVISION_TIMEOUT_SECS,
+            )
+            if result.returncode == 0:
+                installed.extend(packages)
+                continue
+            tail = result.stderr.decode(errors="replace")[-300:]
+            failures.append(f"{capability}: {tail}")
+
+        # Record what is ACTUALLY present, not what was asked for. A marker
+        # listing packages that failed to install is how a half-provisioned
+        # venv passes for a complete one.
+        marker.write_text("\n".join(installed) + "\n")
+
+        if not failures:
+            return None
+        if installed:
+            # Partial success is not failure: the capabilities that installed
+            # are usable now, and saying so is the difference between "CALPHAD
+            # works, pyiron does not" and "the sidecar is broken".
+            return (
+                f"sidecar partially provisioned ({resolver}): "
+                + f"{len(installed)} package(s) installed; "
+                + "; ".join(failures)
+            )
+        hint = ""
+        if not uv:
+            hint = (
+                " — pip cannot resolve this dependency set at all; install "
+                "uv (https://docs.astral.sh/uv/) and retry"
+            )
+        return f"sidecar install failed ({resolver}){hint}: " + "; ".join(failures)
     except subprocess.TimeoutExpired:
         return "sidecar provisioning timed out — retry, or install manually"
     except Exception as exc:
