@@ -293,6 +293,13 @@ const BUILTIN_COMMANDS: &[SlashCommandSpec] = &[
 ];
 
 const CLI_BACKED_ROOTS: &[&str] = &[
+    // `use` was MISSING while three shipped surfaces promised it:
+    // `/help` registers `/use show` and `/use list` (and a test asserts it),
+    // `prism use --help` says "Identical to the in-chat `/use` slash command",
+    // and providers.toml tells the reader to run `/use provider ...` in the
+    // TUI. Every one of them was answered with "Unsupported slash command
+    // root: use". Measured live 2026-08-26 by typing it into the running TUI.
+    "use",
     "setup",
     "login",
     "status",
@@ -380,6 +387,70 @@ pub fn is_cli_backed_slash_root(root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{builtin_help_text, is_cli_backed_slash_root};
+
+    /// Every command `/help` advertises must actually be reachable.
+    ///
+    /// `/use show` and `/use list` were registered in the help table, asserted
+    /// by `help_text_lists_core_commands`, documented by `prism use --help` as
+    /// "identical to the in-chat /use slash command" — and rejected at runtime
+    /// with "Unsupported slash command root: use", because the allowlist that
+    /// gates dispatch is a SECOND list that nothing kept in sync with the
+    /// first. Found by typing it into the running TUI, not by any test.
+    #[test]
+    fn every_slash_root_that_help_advertises_is_dispatchable() {
+        let help = builtin_help_text();
+        let mut checked = 0usize;
+        // Every root the help table advertises that ALSO names a `prism`
+        // CLI subcommand must be dispatchable. Roots handled entirely inside
+        // the agent (context, usage, help, …) never reach the allowlist, so
+        // they are identified by not being CLI subcommands at all — the set
+        // below is exactly the CLI's own command list.
+        const CLI_SUBCOMMANDS: &[&str] = &[
+            "use",
+            "billing",
+            "models",
+            "marketplace",
+            "mesh",
+            "node",
+            "deploy",
+            "discourse",
+            "workflow",
+            "ingest",
+            "query",
+            "research",
+            "compute",
+            "status",
+            "login",
+            "setup",
+            "tools",
+            "report",
+            "publish",
+        ];
+        for token in help.split_whitespace() {
+            let Some(cmd) = token.strip_prefix('/') else {
+                continue;
+            };
+            let root: String = cmd
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                .collect();
+            if !CLI_SUBCOMMANDS.contains(&root.as_str()) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                is_cli_backed_slash_root(&root),
+                "/help advertises `/{root}` and `prism {root}` exists, but the \
+                 dispatch allowlist rejects it — a reader who follows the help \
+                 gets \"Unsupported slash command root: {root}\""
+            );
+        }
+        assert!(
+            checked > 0,
+            "no CLI-backed command was examined; the parse is broken and this \
+             test would pass over anything"
+        );
+    }
 
     #[test]
     fn help_text_lists_core_commands() {
