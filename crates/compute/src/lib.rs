@@ -136,7 +136,11 @@ pub struct ExperimentPlan {
 
 impl ExperimentPlan {
     /// A plan that takes each backend's default resources.
-    pub fn new(name: impl Into<String>, image: impl Into<String>, inputs: serde_json::Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        image: impl Into<String>,
+        inputs: serde_json::Value,
+    ) -> Self {
         Self {
             name: name.into(),
             image: image.into(),
@@ -174,7 +178,10 @@ mod tests {
     #[test]
     fn a_default_spec_asks_for_nothing() {
         let spec = ResourceSpec::default();
-        assert!(spec.is_empty(), "default must mean 'the backend's own defaults'");
+        assert!(
+            spec.is_empty(),
+            "default must mean 'the backend's own defaults'"
+        );
         assert!(!spec.wants_gpu());
         // Serialising a default spec must add no keys, so a plan that asks for
         // nothing is wire-identical to one from before this type existed.
@@ -186,14 +193,23 @@ mod tests {
         // `Some(0)` is an explicit "no accelerator", not "some accelerator".
         // Treating it as a request would emit `--gres=gpu:0`, which allocation
         // clusters reject outright.
-        let spec = ResourceSpec { gpus: Some(0), ..Default::default() };
+        let spec = ResourceSpec {
+            gpus: Some(0),
+            ..Default::default()
+        };
         assert!(!spec.wants_gpu());
     }
 
     #[test]
     fn naming_a_class_alone_is_a_gpu_request() {
-        let spec = ResourceSpec { gpu_class: Some("A100-80GB".into()), ..Default::default() };
-        assert!(spec.wants_gpu(), "asking for an A100 without a count still wants a GPU");
+        let spec = ResourceSpec {
+            gpu_class: Some("A100-80GB".into()),
+            ..Default::default()
+        };
+        assert!(
+            spec.wants_gpu(),
+            "asking for an A100 without a count still wants a GPU"
+        );
     }
 
     #[test]
@@ -215,7 +231,10 @@ mod tests {
     #[test]
     fn a_plan_carries_its_resources_through_serde() {
         let plan = ExperimentPlan::new("mg-dislocation", "vasp:6.5", serde_json::json!({}))
-            .with_resources(ResourceSpec { gpus: Some(4), ..Default::default() });
+            .with_resources(ResourceSpec {
+                gpus: Some(4),
+                ..Default::default()
+            });
         let round: ExperimentPlan =
             serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         assert_eq!(round.resources.gpus, Some(4));
@@ -245,7 +264,7 @@ mod tests {
             name: "test".into(),
             image: "python:3.11".into(),
             inputs: serde_json::json!({"key": "value"}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ExperimentPlan = serde_json::from_str(&json).unwrap();
@@ -273,7 +292,7 @@ mod tests {
                     "nested": { "deep": { "value": null } }
                 }
             }),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ExperimentPlan = serde_json::from_str(&json).unwrap();
@@ -292,7 +311,7 @@ mod tests {
             name: "empty-inputs".into(),
             image: "busybox:latest".into(),
             inputs: serde_json::Value::Null,
-        resources: Default::default(),
+            resources: Default::default(),
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: ExperimentPlan = serde_json::from_str(&json).unwrap();
@@ -304,7 +323,7 @@ mod tests {
             name: "empty-obj".into(),
             image: "busybox:latest".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         let json2 = serde_json::to_string(&plan_obj).unwrap();
         let parsed2: ExperimentPlan = serde_json::from_str(&json2).unwrap();

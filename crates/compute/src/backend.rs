@@ -381,7 +381,7 @@ mod tests {
             name: "test".into(),
             image: "python:3.11".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(router.backend_name(&plan), "local");
     }
@@ -396,7 +396,7 @@ mod tests {
             name: "test".into(),
             image: "marc27/calphad-runner:latest".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(router.backend_name(&plan), "marc27");
     }
@@ -411,7 +411,7 @@ mod tests {
             name: "t".into(),
             image: "alpine:latest".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(router.backend_name(&plan), "local");
     }
@@ -425,7 +425,7 @@ mod tests {
             name: "t".into(),
             image: "platform-runner:latest".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         // "platform" in image name triggers the heuristic, but since marc27 is
         // None the router returns the default backend which is "local".
@@ -442,7 +442,7 @@ mod tests {
             name: "t".into(),
             image: "platform/experiment:v1".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(router.backend_name(&plan), "marc27");
     }
@@ -494,7 +494,7 @@ mod tests {
             name: "long-job".into(),
             image: "worker.sif".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(hq_router().backend_name(&plan), "hyperqueue");
     }
@@ -510,7 +510,7 @@ mod tests {
             name: "long-job".into(),
             image: "worker.sif".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(router.backend_name(&single), "byoc");
     }
@@ -521,7 +521,7 @@ mod tests {
             name: "one-task".into(),
             image: "ignored".into(),
             inputs: serde_json::json!({"command": ["echo", "hi"]}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert_eq!(hq_router().backend_name(&plan), "hyperqueue");
     }

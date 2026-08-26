@@ -282,7 +282,7 @@ mod tests {
             name: "n".into(),
             image: "img".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
 
         let refusals = [

@@ -29,14 +29,49 @@ pub struct ToolServer {
     pub env: BTreeMap<String, String>,
 }
 
-/// Hard ceiling on how long the agent waits for ANY tool-server response.
+/// Default ceiling on how long the agent waits for ANY tool-server response.
 ///
-/// S5: the Python tools have their own internal deadlines (e.g.
-/// materials_search's timeout_seconds), but without this ceiling a
-/// wedged/looping tool could pin the agent forever. 60s is generous — it only
-/// fires when something is genuinely broken (the tool ignored its own
-/// deadline), in which case surfacing the timeout is correct.
+/// The Python tools have their own internal deadlines (e.g.
+/// materials_search's timeout_seconds), but without a ceiling a wedged or
+/// looping tool could pin the agent forever.
+///
+/// 60s is the DEFAULT, not a law. It was documented as "generous — it only
+/// fires when something is genuinely broken", and that turned out to be false:
+/// a plain `structure` build for tungsten exceeded it on an ordinary run and
+/// took the following tool call down with it. Legitimate scientific work is
+/// allowed to be slow, so the operator can raise the ceiling — see
+/// [`call_timeout`]. What is never allowed is an unattributable response,
+/// which is why exceeding the ceiling still desynchronizes the handle.
 pub const DEFAULT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The operator's response ceiling: `PRISM_TOOL_CALL_TIMEOUT_SECS`, else
+/// [`DEFAULT_CALL_TIMEOUT`].
+///
+/// Read per call rather than cached so a long-running session can be retuned
+/// without a restart. A value that is not a positive integer is ignored in
+/// favour of the default: a malformed ceiling must not silently become "no
+/// ceiling" (the agent would hang) or "zero" (every call would fail).
+#[must_use]
+pub fn call_timeout() -> std::time::Duration {
+    parse_call_timeout(
+        std::env::var("PRISM_TOOL_CALL_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`call_timeout`]'s decision, separated from the environment so it is
+/// testable without mutating global state.
+#[must_use]
+pub fn parse_call_timeout(raw: Option<&str>) -> std::time::Duration {
+    match raw.map(str::trim) {
+        Some(value) if !value.is_empty() => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
+            _ => DEFAULT_CALL_TIMEOUT,
+        },
+        _ => DEFAULT_CALL_TIMEOUT,
+    }
+}
 
 /// Handle to a running tool server child process.
 pub struct ToolServerHandle {
@@ -114,9 +149,10 @@ impl ToolServer {
 
 impl ToolServerHandle {
     /// Send a JSON request and read one JSON-line response, waiting at most
-    /// [`DEFAULT_CALL_TIMEOUT`] (see its doc for why the ceiling exists).
+    /// [`call_timeout`] (see [`DEFAULT_CALL_TIMEOUT`] for why a ceiling exists
+    /// and why the operator may raise it).
     pub async fn call(&mut self, request: &Value) -> Result<Value, PythonBridgeError> {
-        self.call_with_timeout(request, DEFAULT_CALL_TIMEOUT).await
+        self.call_with_timeout(request, call_timeout()).await
     }
 
     /// [`Self::call`] with an explicit response deadline (pool policies and
@@ -361,5 +397,51 @@ for line in sys.stdin:
             "the refusal must name the original fault: {err}"
         );
         worker.shutdown().await.expect("shutdown worker");
+    }
+
+    /// The ceiling documented itself as only firing "when something is
+    /// genuinely broken". A real `structure` build for tungsten exceeded it,
+    /// so an operator must be able to raise it. Pinning the default here as
+    /// well means a silent change to either value fails this test.
+    #[test]
+    fn the_operator_can_raise_the_response_ceiling() {
+        assert_eq!(
+            parse_call_timeout(Some("900")),
+            std::time::Duration::from_secs(900),
+            "an explicit ceiling must be honoured, not clamped to the default"
+        );
+        assert_eq!(
+            parse_call_timeout(Some("  900  ")),
+            std::time::Duration::from_secs(900),
+            "surrounding whitespace is not a malformed value"
+        );
+        assert_eq!(parse_call_timeout(None), DEFAULT_CALL_TIMEOUT);
+        assert_eq!(
+            DEFAULT_CALL_TIMEOUT,
+            std::time::Duration::from_secs(60),
+            "the default is 60s; changing it is a deliberate act, not a drift"
+        );
+    }
+
+    /// A malformed ceiling must not become "no ceiling" (the agent would hang
+    /// forever on a wedged tool) or "zero" (every call would fail instantly).
+    /// Both failure modes are worse than ignoring the value.
+    #[test]
+    fn a_malformed_ceiling_falls_back_rather_than_disabling_the_bound() {
+        for raw in [
+            "0",
+            "-5",
+            "abc",
+            "",
+            "   ",
+            "12.5",
+            "9999999999999999999999",
+        ] {
+            assert_eq!(
+                parse_call_timeout(Some(raw)),
+                DEFAULT_CALL_TIMEOUT,
+                "{raw:?} must fall back to the default ceiling"
+            );
+        }
     }
 }

@@ -1033,9 +1033,16 @@ mod tests {
         // must produce exactly the JDF it produced before `request` existed,
         // so an already-working HQ setup cannot break on this change.
         assert!(jdf_request(&ResourceSpec::default()).is_none());
-        let jdf = build_jdf("j", &[HqTask::new(vec!["true".into()])], &ResourceSpec::default())
-            .unwrap();
-        assert!(!jdf.contains("request"), "default JDF must carry no request table: {jdf}");
+        let jdf = build_jdf(
+            "j",
+            &[HqTask::new(vec!["true".into()])],
+            &ResourceSpec::default(),
+        )
+        .unwrap();
+        assert!(
+            !jdf.contains("request"),
+            "default JDF must carry no request table: {jdf}"
+        );
         assert!(!jdf.contains("resources"), "got: {jdf}");
     }
 
@@ -1044,8 +1051,12 @@ mod tests {
         let jdf = build_jdf(
             "j",
             &[HqTask::new(vec!["true".into()])],
-            &ResourceSpec { gpus: Some(2), cpus: Some(8), walltime_secs: Some(600),
-                            ..Default::default() },
+            &ResourceSpec {
+                gpus: Some(2),
+                cpus: Some(8),
+                walltime_secs: Some(600),
+                ..Default::default()
+            },
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&jdf).unwrap();
@@ -1057,8 +1068,11 @@ mod tests {
 
     #[test]
     fn a_walltime_alone_still_produces_a_request() {
-        let req = jdf_request(&ResourceSpec { walltime_secs: Some(30), ..Default::default() })
-            .expect("a time limit is a request even with no resources");
+        let req = jdf_request(&ResourceSpec {
+            walltime_secs: Some(30),
+            ..Default::default()
+        })
+        .expect("a time limit is a request even with no resources");
         assert!(req.resources.is_empty());
         assert_eq!(req.time_limit.as_deref(), Some("30s"));
     }
@@ -1127,21 +1141,21 @@ mod tests {
             name: "s".into(),
             image: "i".into(),
             inputs: serde_json::json!({ "command": ["true"] }),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert!(plan_is_task_set(&single));
         let byoc_shaped = ExperimentPlan {
             name: "b".into(),
             image: "img.sif".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert!(!plan_is_task_set(&byoc_shaped));
         let tasks_not_array = ExperimentPlan {
             name: "x".into(),
             image: "i".into(),
             inputs: serde_json::json!({ "tasks": "oops" }),
-        resources: Default::default(),
+            resources: Default::default(),
         };
         assert!(!plan_is_task_set(&tasks_not_array));
     }
@@ -1490,7 +1504,13 @@ mod tests {
     #[tokio::test]
     async fn empty_task_set_is_refused() {
         let backend = local_backend(Path::new("/tmp/never-used"));
-        let err = format!("{:#}", backend.submit_tasks("t", &[], &ResourceSpec::default()).await.unwrap_err());
+        let err = format!(
+            "{:#}",
+            backend
+                .submit_tasks("t", &[], &ResourceSpec::default())
+                .await
+                .unwrap_err()
+        );
         assert!(err.contains("empty"), "{err}");
     }
 

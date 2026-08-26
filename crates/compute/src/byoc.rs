@@ -1168,13 +1168,22 @@ mod tests {
     fn gres_is_absent_when_no_accelerator_was_asked_for() {
         assert_eq!(slurm_gres(&ResourceSpec::default()), None);
         // An explicit zero is "no GPU", not "gpu:0" — clusters reject that.
-        assert_eq!(slurm_gres(&ResourceSpec { gpus: Some(0), ..Default::default() }), None);
+        assert_eq!(
+            slurm_gres(&ResourceSpec {
+                gpus: Some(0),
+                ..Default::default()
+            }),
+            None
+        );
     }
 
     #[test]
     fn gres_carries_the_count_and_the_class() {
         assert_eq!(
-            slurm_gres(&ResourceSpec { gpus: Some(2), ..Default::default() }),
+            slurm_gres(&ResourceSpec {
+                gpus: Some(2),
+                ..Default::default()
+            }),
             Some("gpu:2".into())
         );
         assert_eq!(
@@ -1187,7 +1196,10 @@ mod tests {
         );
         // A class with no count means one of that class, never zero.
         assert_eq!(
-            slurm_gres(&ResourceSpec { gpu_class: Some("h100".into()), ..Default::default() }),
+            slurm_gres(&ResourceSpec {
+                gpu_class: Some("h100".into()),
+                ..Default::default()
+            }),
             Some("gpu:h100:1".into())
         );
     }
@@ -1237,8 +1249,14 @@ mod tests {
     fn a_per_job_memory_total_replaces_a_per_cpu_default() {
         // sbatch_directives refuses both --mem and --mem-per-cpu, so the
         // overlay must clear the one it supersedes rather than collide.
-        let cluster = SlurmJobConfig { mem_per_cpu: Some("4G".into()), ..Default::default() };
-        let job = cluster.overlaid_with(&ResourceSpec { memory_gb: Some(256), ..Default::default() });
+        let cluster = SlurmJobConfig {
+            mem_per_cpu: Some("4G".into()),
+            ..Default::default()
+        };
+        let job = cluster.overlaid_with(&ResourceSpec {
+            memory_gb: Some(256),
+            ..Default::default()
+        });
         assert_eq!(job.mem.as_deref(), Some("256G"));
         assert_eq!(job.mem_per_cpu, None);
         assert!(sbatch_directives(&Uuid::nil(), "gpu", &job).is_ok());
@@ -1255,7 +1273,10 @@ mod tests {
         });
         let directives = sbatch_directives(&Uuid::nil(), "gpu", &job).unwrap();
         let script = directives.join("\n");
-        assert!(script.contains("#SBATCH --gres=gpu:a100:4"), "got: {script}");
+        assert!(
+            script.contains("#SBATCH --gres=gpu:a100:4"),
+            "got: {script}"
+        );
         assert!(script.contains("#SBATCH --time=06:00:00"), "got: {script}");
         assert!(script.contains("#SBATCH --nodes=2"), "got: {script}");
     }
@@ -1289,7 +1310,7 @@ mod tests {
             name: "n".into(),
             image: "img".into(),
             inputs: serde_json::json!({}),
-        resources: Default::default(),
+            resources: Default::default(),
         };
 
         let refusals = [
