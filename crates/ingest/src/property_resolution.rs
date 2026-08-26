@@ -109,6 +109,17 @@ pub struct PropertyBinding {
     pub score: Option<f64>,
     /// Embedding model behind `score`.
     pub model: Option<String>,
+    /// The class this term was scored AGAINST, recorded even when the score
+    /// fell below threshold and nothing bound.
+    ///
+    /// It was already computed — and then written only into the PROSE of the
+    /// proposal description ("Nearest loaded class label: …"), where nothing
+    /// can query it. A score with no candidate cannot calibrate a threshold
+    /// and cannot be adjudicated, which is what the recorded scores are for.
+    pub nearest_class_iri: Option<String>,
+    /// Label of [`Self::nearest_class_iri`] — the human-readable half a
+    /// reviewer or a judge actually reasons over.
+    pub nearest_label: Option<String>,
     /// Governance queue item id when rung 4 enqueued a proposal.
     pub proposal_item_id: Option<String>,
     /// How many graph entities the bind stamped (`class_iri` filled where it
@@ -541,6 +552,8 @@ pub async fn resolve_property_terms(
                 canonical,
                 class_iri: Some(candidate.class_iri.clone()),
                 ontology_id: Some(candidate.ontology_id.to_string()),
+                nearest_class_iri: Some(candidate.class_iri.clone()),
+                nearest_label: Some(candidate.label.clone()),
                 rung,
                 score: None,
                 model: None,
@@ -598,6 +611,8 @@ pub async fn resolve_property_terms(
             Some(neighbor) => outcomes.push(PropertyBinding {
                 term: pending.verbatim,
                 canonical: pending.canonical,
+                nearest_class_iri: Some(neighbor.class_iri.clone()),
+                nearest_label: Some(neighbor.label.clone()),
                 class_iri: Some(neighbor.class_iri),
                 ontology_id: Some(neighbor.ontology_id),
                 rung: BindingRung::Semantic,
@@ -655,6 +670,11 @@ pub async fn resolve_property_terms(
                     canonical: pending.canonical,
                     class_iri: None,
                     ontology_id: None,
+                    // Unbound, but NOT unexplained: keep what it nearly
+                    // matched. `score` without a candidate cannot calibrate
+                    // the threshold and cannot be judged.
+                    nearest_class_iri: neighbor.as_ref().map(|n| n.class_iri.clone()),
+                    nearest_label: neighbor.as_ref().map(|n| n.label.clone()),
                     rung: BindingRung::Proposed,
                     score,
                     model: score.and(model_id.clone()),
@@ -684,6 +704,8 @@ pub async fn resolve_property_terms(
                 model: outcome.model.clone(),
                 proposal_item_id: outcome.proposal_item_id.clone(),
                 resolved_at: resolved_at.clone(),
+                nearest_class_iri: outcome.nearest_class_iri.clone(),
+                nearest_label: outcome.nearest_label.clone(),
             })
             .await?;
         if outcome.recorded
@@ -974,7 +996,7 @@ mod tests {
         assert_eq!(descriptor.ontology_id.as_deref(), Some("matkg"));
         assert_eq!(
             descriptor.class_iri.as_deref(),
-            Some("https://marc27.com/ontology/matkg#Descriptor")
+            Some("https://mirdyne.com/ontology/matkg#Descriptor")
         );
 
         // The rows are durable and carry the rung.

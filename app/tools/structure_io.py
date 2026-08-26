@@ -108,6 +108,15 @@ def _structure_import(**kwargs) -> dict:
         })
         cache_ref = f"cache://{key}/structure.cif"
 
+        # The mace_* consumers are registered only when the [mace] extra
+        # imports (app/plugins/bootstrap.py gates create_mace_tools on
+        # check_mace_available). Listing them unconditionally sent the agent
+        # to tool names that are not in the catalog at all — and the
+        # pyiron-absent note told it to do exactly that.
+        from app.tools.simulation.mace_bridge import check_mace_available
+
+        mace_available = check_mace_available()
+
         # 2. pyiron StructureStore, when available in this interpreter.
         pyiron_structure_id = None
         pyiron_note = None
@@ -119,13 +128,25 @@ def _structure_import(**kwargs) -> dict:
             else:
                 pyiron_note = (
                     "pyiron not importable here — sim tools run in the "
-                    "science sidecar and cannot see this in-process store; "
-                    "use the cache_ref with the mace_* tools instead"
+                    "science sidecar and cannot see this in-process store"
+                    + ("; use the cache_ref with the mace_* tools instead"
+                       if mace_available else "")
                 )
         except Exception as e:
             pyiron_note = f"pyiron StructureStore unavailable: {e}"
 
-        return {
+        usable_by = []
+        if mace_available:
+            usable_by += [
+                "mace_md_equilibrate(cache_ref=...)",
+                "mace_compute_elastic(cache_ref=...)",
+                "mace_phonon_harmonic(cache_ref=...)",
+                "mace_get_cached_structure(cache_uri=...)",
+            ]
+        if pyiron_structure_id:
+            usable_by.append("structure(action='info', structure_id=...)")
+
+        result = {
             "imported": True,
             "cache_ref": cache_ref,
             "formula": formula,
@@ -133,13 +154,17 @@ def _structure_import(**kwargs) -> dict:
             "composition": composition,
             "pyiron_structure_id": pyiron_structure_id,
             **({"pyiron_note": pyiron_note} if pyiron_note else {}),
-            "usable_by": [
-                "mace_md_equilibrate(cache_ref=...)",
-                "mace_compute_elastic(cache_ref=...)",
-                "mace_phonon_harmonic(cache_ref=...)",
-                "mace_get_cached_structure(cache_uri=...)",
-            ] + (["structure(action='info', structure_id=...)"] if pyiron_structure_id else []),
+            "usable_by": usable_by,
         }
+        if not mace_available:
+            from app.tools._extras import install_command
+
+            result["mace_note"] = (
+                "the mace_* tools are not registered in this install (the "
+                "[mace] extra is missing), so no tool here can consume this "
+                f"cache_ref yet — {install_command('mace')}"
+            )
+        return result
     except ValueError as e:
         return {"error": str(e)}
     except Exception as e:

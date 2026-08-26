@@ -132,7 +132,7 @@ def build_full_registry(
     except Exception:
         pass
 
-    # Knowledge plane is SPINE and lives in Rust: `query_platform` (graph +
+    # Knowledge plane is SPINE and lives in Rust: `query` (graph +
     # semantic search), `knowledge_entity`/`knowledge_paths`/`knowledge_corpora`
     # (graph/catalog reads) and `knowledge_ingest` (background extraction job)
     # command-tools drive `prism query --platform` / `prism knowledge …` →

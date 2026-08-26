@@ -1486,6 +1486,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_entry_persists_the_arguments_it_was_called_with() {
+        // F44: the durable record used to hold every tool's ANSWER and none of
+        // their QUESTIONS. `data: None` at every production tool write site
+        // meant no call was reproducible and a failed call taught nothing,
+        // because the input that caused it was gone when the process exited.
+        let (mut store, tmp) = make_store();
+        let sid = store.new_session("test-model");
+
+        store.append_message(
+            "tool",
+            "{\"kou_index_k\": 0.0}",
+            "lpbf_kou_cracking_index",
+            "call_abc",
+            Some(serde_json::json!({ "args": { "alloy": "polymer-nonsense" } })),
+        );
+
+        let store2 = reopen_store(&tmp);
+        let msgs = store2.load_messages(&sid).expect("session loads");
+        let tool = msgs
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .expect("the tool entry is on disk");
+
+        // `scan_session_log` spreads the stored `data` object across the
+        // message top level, so `data: {args: ...}` reads back as `args`.
+        assert_eq!(
+            tool["args"]["alloy"], "polymer-nonsense",
+            "the arguments must survive to disk, not just the result"
+        );
+        assert_eq!(tool["tool_name"], "lpbf_kou_cracking_index");
+        assert_eq!(tool["tool_call_id"], "call_abc");
+    }
+
+    #[test]
     fn append_and_resume_roundtrip() {
         let (mut store, tmp) = make_store();
         let sid = store.new_session("test-model");

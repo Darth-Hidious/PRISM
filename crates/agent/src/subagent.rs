@@ -42,7 +42,7 @@
 //!   LocalOnly caller gets an honest refusal at the spawn instead of a nested
 //!   turn that spends frontier-model tokens before failing at the inner gates.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use prism_ingest::llm::LlmClient;
@@ -109,7 +109,7 @@ pub fn definition() -> LoadedTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Default 'claude-fable-5'."
+                    "description": "Defaults to your model."
                 },
                 "max_tokens": {
                     "type": "integer",
@@ -191,6 +191,26 @@ fn depth_cap_error(config: &AgentConfig) -> Option<Value> {
             ),
         })
     })
+}
+
+/// Context attached to EVERY failed delegated turn, in `spawn_subagent` and in
+/// every `orchestrate_agents` item.
+///
+/// A nested turn that died because its endpoint does not serve its model used
+/// to surface as a bare `LLM call failed: LLM returned HTTP 400 …` — the two
+/// facts an operator needs (WHICH model was asked of WHICH endpoint) were the
+/// two facts the error did not carry, so the same misroute was diagnosed twice.
+/// This names both, plus the two ways out, on the delegated turn's own error.
+///
+/// Deliberately unconditional rather than pattern-matched on the provider's
+/// error body: provider error shapes differ, and a model/endpoint pair is
+/// worth naming on ANY delegated failure.
+pub(crate) fn delegation_failure_context(label: &str, model: &str, base_url: &str) -> String {
+    format!(
+        "delegated turn ({label}) failed while running model `{model}` against `{base_url}` \
+         — if that endpoint does not serve `{model}`, name a model it does serve in the \
+         `model` argument, or switch the session's model with /model"
+    )
 }
 
 // ── Execution ─────────────────────────────────────────────────────────
@@ -285,7 +305,24 @@ async fn execute_spawn_subagent_inner(
     if let Some(err) = depth_cap_error(parent_config) {
         return Ok(err);
     }
-    let sub = parse_args(args, &parent_config.model)?;
+    // The inherited model comes from the LIVE `LlmClient`, never from
+    // `AgentConfig.model`.
+    //
+    // There are TWO model fields and only one of them is ever populated from
+    // the resolved chat route. `LlmConfig.model` is what goes on the wire
+    // (`crates/llm/src/lib.rs`, `"model": self.config.model`) and what a
+    // mid-session `/model` switch mutates (`protocol.rs`). `AgentConfig.model`
+    // is never assigned from the resolved route anywhere in production — the
+    // one construction site is `AgentConfig { system_prompt, ..Default::default() }`
+    // (`protocol.rs`), so it holds the `impl Default` literal for the whole
+    // session while every real request goes out on the other field.
+    //
+    // The 2026-08-20 inheritance fix below was right about WHAT to inherit and
+    // read the wrong field, so on a z.ai session the parent ran `glm-5.3` and
+    // every unnamed subagent asked that endpoint for the Default literal and
+    // died with `1214 modelCode does not exist`. Reading the client instead of
+    // the config cannot drift from the wire, and survives `/model`.
+    let sub = parse_args(args, &llm.config().model)?;
 
     // Own tool-server lane. With a pool, the subagent's Python tool calls run
     // on a child of its OWN instead of serializing behind (and mutably
@@ -492,6 +529,18 @@ async fn execute_spawn_subagent_inner(
     drop(own_lane);
 
     run_heartbeat.stop().await;
+
+    // Name the model and the endpoint on the way out — see
+    // `delegation_failure_context`. Applied BEFORE the ledger row is closed so
+    // the durable `last_error` carries the same named message the model sees;
+    // `with_context` is lazy, so a healthy turn formats nothing.
+    let nested_result = nested_result.with_context(|| {
+        delegation_failure_context(
+            &crate::agent_loop::agent_run_label(&sub.task),
+            &sub.model,
+            &sub_llm.config().base_url,
+        )
+    });
 
     let (status, last_error) = match &nested_result {
         Ok(()) => (prism_provenance::AgentRunStatus::Completed, None),

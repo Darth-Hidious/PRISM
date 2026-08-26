@@ -199,7 +199,31 @@ class TestCalphadBridge:
         mock_pycalphad.equilibrium = MagicMock(return_value=mock_eq)
         mock_pycalphad.variables = mock_v
 
-        with patch.dict(sys.modules, {"pycalphad": mock_pycalphad}):
+        # `calculate_equilibrium` applies the PEP 649 Workspace shim first, and
+        # that does `from pycalphad.core import workspace`. A bare ModuleType
+        # has no submodules, so mocking only the top-level name made the shim
+        # raise ModuleNotFoundError — the mock has to carry the shape the code
+        # actually imports, not just the names this test reads back.
+        mock_workspace_mod = types.ModuleType("pycalphad.core.workspace")
+
+        class _Workspace:
+            #: The shim copies the CLASS annotations onto the instance; an
+            #: annotated attribute is what makes that copy meaningful.
+            conditions: dict
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+        mock_workspace_mod.Workspace = _Workspace
+        mock_core = types.ModuleType("pycalphad.core")
+        mock_core.workspace = mock_workspace_mod
+        mock_pycalphad.core = mock_core
+
+        with patch.dict(sys.modules, {
+            "pycalphad": mock_pycalphad,
+            "pycalphad.core": mock_core,
+            "pycalphad.core.workspace": mock_workspace_mod,
+        }):
             bridge = CalphadBridge(base_dir=tmp_path)
             result = bridge.calculate_equilibrium(
                 database_name="test",

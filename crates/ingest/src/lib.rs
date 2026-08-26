@@ -227,6 +227,9 @@ mod tests {
             embedding_model: Some("nomic-embed-text".into()),
             max_sample_rows: 5,
             timeout_secs: 60,
+            // 0 = never. PRISM imposes no deadline on a thinking model; the
+            // operator opts in. See `default_read_idle_timeout_secs`.
+            read_idle_timeout_secs: 0,
             context_window: None,
             max_output_tokens: None,
             credential_kind: None,

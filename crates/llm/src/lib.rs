@@ -31,10 +31,12 @@ mod local;
 mod minja;
 mod model_artifact;
 mod overflow;
+mod transient;
 pub use local::{LOCAL_GGUF_URL, default_model_dir, is_local_gguf_url, resolve_model_path};
 pub use minja::render as render_minja_template;
 pub use model_artifact::{BUNDLED_GEMMA, ModelArtifactManifest, sha256_hex, verify_model_artifact};
 pub use overflow::{error_is_context_window_exceeded, is_context_window_exceeded};
+pub use transient::{error_is_transient_transport, is_transient_transport};
 
 /// Canonical text and identity produced by the embedded GGUF's own template.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +183,10 @@ pub struct LlmConfig {
     /// Request timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Seconds a request may send NOTHING before it is treated as dead.
+    /// `0` (default) = never; only an operator may bound a thinking model.
+    #[serde(default = "default_read_idle_timeout_secs")]
+    pub read_idle_timeout_secs: u64,
     /// The model's context window in tokens. Hosted values come from the
     /// platform catalog; an embedded GGUF client replaces them with the
     /// active context derived from model metadata. `None` means unknown.
@@ -238,11 +244,76 @@ fn default_max_sample_rows() -> usize {
     10
 }
 /// How long one HTTP request may send NOTHING before it is treated as dead.
+/// `0` = never, and that is the DEFAULT.
 ///
-/// Not a cap on how long a request may take: data resets it. It exists so a
-/// wedged socket cannot silently consume a run, which `timeout_secs = 0`
-/// (no total deadline, deliberately) otherwise allows forever.
-const READ_IDLE_TIMEOUT_SECS: u64 = 600;
+/// Not a cap on how long a request may take — data resets it — but a fixed
+/// ceiling here is still a muzzle on the knowledge path, and it was one.
+///
+/// Measured 2026-08-25: GLM-5.3 is a reasoning model that emits
+/// `reasoning_content` for **17.5 minutes** before its first character of
+/// `content`, and with a tools array in the request the server stalls for up
+/// to **115 s** between chunks. A 600 s ceiling sits inside that envelope: a
+/// legitimately thinking model, on a healthy connection, gets killed for
+/// thinking. Four consecutive attempts to write one source file died this way
+/// while the endpoint answered a bare probe in 3.87 s.
+///
+/// This now follows the rule `default_timeout_secs` already states for the
+/// total deadline — *"Research runs are long by nature; the operator may
+/// impose a deadline, PRISM does not impose one on them."* The wedged-socket
+/// case the old constant guarded (an induction sat on a dead connection for 90
+/// minutes) is real, but it is the OPERATOR's call to bound it, not ours: set
+/// `read_idle_timeout_secs` when you want that bound.
+fn default_read_idle_timeout_secs() -> u64 {
+    0
+}
+
+#[cfg(test)]
+mod no_muzzle_on_the_knowledge_path {
+    use super::*;
+
+    /// PRISM imposes NO deadline on a thinking model. Both the total deadline
+    /// and the idle ceiling default to "never"; only an operator sets one.
+    ///
+    /// This is a product rule, not a tuning choice. A fixed ceiling here killed
+    /// four consecutive attempts to write one source file: GLM-5.3 reasons for
+    /// 17.5 minutes before emitting any content, and the old constant was 600 s.
+    /// Raising the number would only move the muzzle; the default has to be off.
+    #[test]
+    fn prism_imposes_no_request_deadline_by_default() {
+        assert_eq!(
+            default_read_idle_timeout_secs(),
+            0,
+            "an idle ceiling on the LLM stream is a muzzle — the operator opts in"
+        );
+        assert_eq!(
+            default_timeout_secs(),
+            0,
+            "no total deadline either; research runs are long by nature"
+        );
+    }
+
+    /// The `Default` impl and the serde defaults must not disagree.
+    ///
+    /// They did: serde said 0, `Default` said 300. Every caller using
+    /// `..Default::default()` — including the CHAT agent in
+    /// `crates/cli/src/main.rs` — silently inherited a 5-minute total deadline
+    /// while the documented policy was "no deadline". Two answers to one
+    /// question, and the harsher one wins in silence.
+    #[test]
+    fn the_default_impl_agrees_with_the_serde_defaults() {
+        let d = LlmConfig::default();
+        assert_eq!(
+            d.timeout_secs,
+            default_timeout_secs(),
+            "Default::default() must not impose a deadline serde does not"
+        );
+        assert_eq!(
+            d.read_idle_timeout_secs,
+            default_read_idle_timeout_secs(),
+            "same for the idle ceiling"
+        );
+    }
+}
 
 fn default_timeout_secs() -> u64 {
     // 0 = no read deadline. Research runs are long by nature; the operator may
@@ -273,7 +344,22 @@ impl Default for LlmConfig {
             credential_kind: None,
             embedding_model: None,
             max_sample_rows: 10,
-            timeout_secs: 300,
+            // MUST agree with the serde default. They disagreed — serde said 0
+            // ("PRISM does not impose one on them"), this said 300 — and every
+            // caller using `..Default::default()` silently got a 300-SECOND
+            // TOTAL DEADLINE on the knowledge path. `crates/cli/src/main.rs`
+            // builds the CHAT agent's config exactly that way, so the agent
+            // has been running under a 5-minute ceiling while the stated
+            // policy was "no deadline".
+            //
+            // `crates/core/src/config.rs::default_llm_timeout` already fixed
+            // this once for the ingest path and left the note: "This used to be
+            // 120 while crates/llm defaulted to 300 — two disagreeing
+            // deadlines, and the shorter one silently won." Same bug, second
+            // path. A `Default` impl that contradicts the serde default is two
+            // answers to one question, and the harsher one always wins.
+            timeout_secs: default_timeout_secs(),
+            read_idle_timeout_secs: default_read_idle_timeout_secs(),
             context_window: None,
             max_output_tokens: None,
             streaming: true,
@@ -617,7 +703,11 @@ impl LlmClient {
                     // nothing until generation completes, so this must exceed
                     // the slowest legitimate single generation. It bounds one
                     // request, never the run — a long run is many requests.
-                    .read_timeout(Duration::from_secs(READ_IDLE_TIMEOUT_SECS));
+                    ;
+                if config.read_idle_timeout_secs > 0 {
+                    builder =
+                        builder.read_timeout(Duration::from_secs(config.read_idle_timeout_secs));
+                }
                 if config.timeout_secs > 0 {
                     builder = builder.timeout(Duration::from_secs(config.timeout_secs));
                 }
@@ -2526,8 +2616,9 @@ const TOOL_GUIDANCE_BLOCK: &str = "\
         relying on a single one. Which tool serves which data is stated by each \
         tool's own description — read them, and prefer the specialised tool over a \
         general-purpose one.\n\n\
-        - **Knowledge-graph queries**: `query_platform` (term or semantic \
-        search) and `knowledge_entity` (one entity + its neighbours) for \
+        - **Knowledge-graph queries**: `query` (its `scope` picks the store: \
+        `local` for the user's own ingested graph, `platform` for the hosted \
+        corpora) and `knowledge_entity` (one entity + its neighbours) for \
         platform-internal provenance. Use them before external sources when \
         the user is asking about a specific project / dataset rather than a \
         general question.\n\n\
@@ -4458,12 +4549,7 @@ mod tests {
     // out of this block into the tools' own descriptions (see
     // `guidance_block_carries_no_domain_vocabulary`), so the only names the
     // block may still mention are the platform-generic ones.
-    const GUIDANCE_TOOL_NAMES: &[&str] = &[
-        "find_tools",
-        "research",
-        "query_platform",
-        "knowledge_entity",
-    ];
+    const GUIDANCE_TOOL_NAMES: &[&str] = &["find_tools", "research", "query", "knowledge_entity"];
 
     #[test]
     fn guidance_tool_names_appear_in_prompt() {
@@ -4733,17 +4819,12 @@ mod tests {
         }
 
         // Spine tools live in Rust, not app/tools/*.py: `find_tools` is an
-        // always-on meta-tool (crates/agent/src/meta_tools.rs); `query_platform`
+        // always-on meta-tool (crates/agent/src/meta_tools.rs); `query`
         // and `research` are Rust command-tools (crates/agent/src/command_tools.rs)
         // that replaced retired Python tools (knowledge.py / research.py). They
         // are real, just not Python-registered — exempt them from the Python
         // cross-check (the anti-dead-tool intent still covers the rest).
-        const RUST_NATIVE: &[&str] = &[
-            "find_tools",
-            "query_platform",
-            "knowledge_entity",
-            "research",
-        ];
+        const RUST_NATIVE: &[&str] = &["find_tools", "query", "knowledge_entity", "research"];
 
         let missing: Vec<&str> = GUIDANCE_TOOL_NAMES
             .iter()

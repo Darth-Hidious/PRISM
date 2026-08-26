@@ -128,9 +128,12 @@ _DESCRIPTION = (
     "structural issues, missing metadata, statistical anomalies. Heavier "
     "than 'validate'; use when the user asks 'is this dataset publishable "
     "/ ready for analysis?'.\n"
-    "  • action='visualize' — generate visual summaries. See the "
-    "visualization skill for supported chart kinds. Use when the user "
-    "wants 'show me this dataset's distribution / relationships'.\n"
+    "  • action='visualize' — generate visual summaries: a histogram per "
+    "numeric column and a scatter plot per numeric column pair. Optional: "
+    "`chart_types` (subset of ['distribution', 'comparison'], default both) "
+    "and `properties` (restrict to named columns, default all numeric). "
+    "Use when the user wants 'show me this dataset's distribution / "
+    "relationships'.\n"
     "\n"
     "NOT for ad-hoc plots of arbitrary data (use `plot` for that) and "
     "NOT for searching materials databases (use `materials_search`)."
@@ -164,11 +167,29 @@ _SCHEMA = {
             ),
             "default": 3.0,
         },
-        "kind": {
-            "type": "string",
+        # `kind` used to sit here and reached nothing: `_visualize_dataset`
+        # never reads it, so a caller asking for one chart kind still got every
+        # chart (measured — kind='distribution' and kind='not-a-real-kind'
+        # returned byte-identical plot lists). Worse, `additionalProperties:
+        # False` made the two knobs the implementation DOES read unreachable.
+        # These are those two.
+        "chart_types": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["distribution", "comparison"]},
+            "default": ["distribution", "comparison"],
             "description": (
-                "Visualization kind for action='visualize'. See the "
-                "visualization skill for supported values."
+                "Which charts to generate for action='visualize'. "
+                "'distribution' = one histogram per numeric column; "
+                "'comparison' = a scatter plot per numeric column pair. "
+                "Default: both."
+            ),
+        },
+        "properties": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Restrict action='visualize' to these dataset columns. "
+                "Default: every numeric column."
             ),
         },
         # Import action

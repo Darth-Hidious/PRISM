@@ -85,7 +85,7 @@ TOOL_GRAPH = {
     },
 
     # ── Knowledge graph → reasoning chains ──────────────────────────
-    "query_platform": {
+    "query": {
         "outputs": ["results", "entities", "relationships"],
         "feeds_into": [
             {
@@ -161,7 +161,7 @@ LOGICAL_FORMS = [
         "tool_sequence": [
             {"tool": "search_materials", "role": "primary",
              "reason": "Federated OPTIMADE search across 20+ providers"},
-            {"tool": "query_platform", "role": "complement",
+            {"tool": "query", "role": "complement",
              "reason": "Search platform knowledge graph"},
             {"tool": "alpha_predict", "role": "followup",
              "reason": "Evaluate search results"},
@@ -301,7 +301,7 @@ def _keyword_tool_suggestions(query: str) -> list[dict]:
         "modulus": ["alpha_predict"],
         "density": ["alpha_predict"],
         "stability": ["alpha_predict"],
-        "search": ["search_materials", "query_platform"],
+        "search": ["search_materials", "query"],
         "discover": ["search_materials", "alpha_predict"],
         "compute": ["compute", "compute_submit"],
         "mesh": ["mesh_health", "mesh_peers", "mesh_subscriptions"],

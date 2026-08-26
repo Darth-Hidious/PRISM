@@ -31,6 +31,37 @@ class TestCompositionFeaturesBasic:
         from app.tools.ml.features import _composition_features_basic
         assert _composition_features_basic("") == {}
 
+    def test_partial_coverage_emits_no_property_statistics(self):
+        """An element the table does not carry must not be silently dropped.
+
+        BSb, BOs and TcB used to come back with the full 22-feature shape
+        holding nothing but boron's numbers (avg_electronegativity 2.04,
+        min == max == boron), so three different compounds were identical in
+        feature space and the predictor returned one value for all of them.
+        """
+        from app.tools.ml.features import ELEMENT_DATA, _composition_features_basic
+
+        assert "Sb" not in ELEMENT_DATA and "B" in ELEMENT_DATA
+        f = _composition_features_basic("BSb")
+        boron = ELEMENT_DATA["B"]["electronegativity"]
+        for stat in ("avg", "min", "max", "range", "std"):
+            assert f"{stat}_electronegativity" not in f, (
+                f"{stat}_electronegativity for BSb describes boron alone"
+            )
+        assert boron not in f.values()
+        # The parse itself is still honest, and full coverage is untouched.
+        assert f["n_elements"] == 2
+        assert len(_composition_features_basic("B2O3")) == 22
+
+    def test_zero_atom_formula_returns_empty(self):
+        """"Fe0" parses to a real element with zero atoms; dividing by that
+        total raised ZeroDivisionError out of the featurizer instead of
+        returning the documented empty dict."""
+        from app.tools.ml.features import _composition_features_basic
+
+        assert _composition_features_basic("Fe0") == {}
+        assert _composition_features_basic("H0") == {}
+
     def test_feature_count(self):
         from app.tools.ml.features import _composition_features_basic
         features = _composition_features_basic("SiO2")
@@ -85,6 +116,31 @@ class TestParseFormula:
     def test_no_count(self):
         from app.tools.ml.features import _parse_formula
         assert _parse_formula("NaCl") == {"Na": 1.0, "Cl": 1.0}
+
+    def test_ascii_oxide_dot_is_an_adduct_separator(self):
+        """A "." not followed by a digit cannot be a decimal point.
+
+        Oxide/cement notation put one straight into the count group, where
+        float(".") raised ValueError out of the tokenizer and took the whole
+        predict_property batch — valid formulas included — down with it.
+        """
+        from app.tools.ml.features import _parse_formula, composition_features
+
+        # MgO.Al2O3 is spinel MgAl2O4; 3CaO.SiO2 is alite Ca3SiO5 (the
+        # leading 3 belongs to its own segment, not to the whole string).
+        assert _parse_formula("MgO.Al2O3") == {"Mg": 1.0, "Al": 2.0, "O": 4.0}
+        assert _parse_formula("3CaO.SiO2") == {"Ca": 3.0, "Si": 1.0, "O": 5.0}
+        assert len(composition_features("MgO.Al2O3")) == 22
+
+    def test_decimal_stoichiometry_is_not_split(self):
+        """A dot BETWEEN DIGITS stays with the numeric parser — splitting it
+        would corrupt every Mg1.5Si0.5O4-style composition."""
+        from app.tools.ml.features import _parse_formula
+
+        assert _parse_formula("Mg1.5Si0.5O4") == {"Mg": 1.5, "Si": 0.5, "O": 4.0}
+        assert _parse_formula("CuSO4.5H2O") == {
+            "Cu": 1.0, "S": 1.0, "O": 5.5, "H": 2.0
+        }
 
 
 class TestPretrainedModels:

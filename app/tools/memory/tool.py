@@ -18,10 +18,46 @@ from app.tools.memory.embedder import Embedder
 from app.tools.memory.recorder import (
     get_embedder,
     get_store,
+    is_recording_enabled,
     resolve_session_id,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _empty_note(store, *, session_id: Optional[str], widen: str) -> Optional[str]:
+    """Explain a zero-result read, or return None if there is nothing to add.
+
+    A zero-length result list is ambiguous. Two causes look identical to the
+    caller and both are live here: the recorder is switched off, so no tool
+    output has been written since; and rows exist under other session ids,
+    which the session filter excludes. Reporting neither is what made an
+    empty Artifacts tab indistinguishable from an empty store.
+
+    `widen` is the argument that drops the session filter for the calling
+    tool (they differ: recall takes scope='all', list takes session='*').
+    """
+    parts: list[str] = []
+    if not is_recording_enabled():
+        parts.append(
+            "Artifact recording is off; new tool outputs are not stored. "
+            "Set PRISM_ARTIFACT_RECORDING=1 to store them."
+        )
+    if session_id is not None:
+        try:
+            elsewhere = store.count_artifacts() - store.count_artifacts(
+                session_id=session_id
+            )
+        except Exception as e:  # a diagnostic must never break the read
+            logger.debug("artifact count for empty-result note failed: %s", e)
+            elsewhere = 0
+        if elsewhere > 0:
+            noun = "artifact is" if elsewhere == 1 else "artifacts are"
+            parts.append(
+                f"{elsewhere} {noun} stored under other session ids. "
+                f"Use {widen} to include them."
+            )
+    return " ".join(parts) or None
 
 
 def _recall(**kwargs) -> dict:
@@ -59,12 +95,17 @@ def _recall(**kwargs) -> dict:
         tool_name=tool_filter,
         limit=limit,
     )
-    return {
+    out = {
         "query": query,
         "scope": scope,
         "hits": hits,
         "count": len(hits),
     }
+    if not hits:
+        note = _empty_note(store, session_id=session_id, widen="scope='all'")
+        if note:
+            out["note"] = note
+    return out
 
 
 def _fetch_artifact(**kwargs) -> dict:
@@ -125,17 +166,27 @@ def _list_artifacts(**kwargs) -> dict:
     if session_filter is None and kwargs.get("scope", "session") == "session":
         session_filter = resolve_session_id()
 
+    scoped = session_filter if session_filter != "*" else None
     rows = store.list_artifacts(
-        session_id=session_filter if session_filter != "*" else None,
+        session_id=scoped,
         tool_name=kwargs.get("tool"),
         since=kwargs.get("since"),
         limit=int(kwargs.get("limit", 20)),
     )
-    return {
+    out = {
         "artifacts": rows,
         "count": len(rows),
         "session_filter": session_filter,
     }
+    # `note` is additive: the Rust workspace reader (crates/agent/src/protocol.rs,
+    # parse_artifact_list_response) reads session_filter/artifacts/count and
+    # treats a top-level `error` key as a failure, so the key must not be named
+    # `error` and must not replace any of those three.
+    if not rows:
+        note = _empty_note(store, session_id=scoped, widen="session='*'")
+        if note:
+            out["note"] = note
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +195,12 @@ def _list_artifacts(**kwargs) -> dict:
 
 _RECALL_DESCRIPTION = (
     "Hybrid recall (BM25 keyword + semantic vector, RRF-fused) over the "
-    "agent's local artifact store. Every meaningful tool output from this "
-    "and prior sessions has been auto-indexed. Use this when the user "
+    # The previous wording promised "every meaningful tool output from this and
+    # prior sessions has been auto-indexed". Measured false: the recorder is off
+    # unless PRISM_ARTIFACT_RECORDING is set, so nothing has been indexed since
+    # 2026-07-03. Say what the tool searches, not what the store is assumed to hold.
+    "agent's local artifact store. Covers tool outputs that were recorded "
+    "as artifacts. Use this when the user "
     "refers to earlier results: 'which of those Ti alloys had the highest "
     "density', 'show me the DFT result from yesterday', 'what did we find "
     "about Inconel 718'. The hit list contains stable artifact_ids — pass "

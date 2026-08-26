@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 
+from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,15 @@ def _describe_structure_tool() -> Tool:
             from robocrystallographer.structure import StructureDescriber
             from pymatgen.core import Structure
         except ImportError:
-            return {"error": "robocrystallographer not installed (pip install prism-platform[ml]; note: no Python 3.14 wheel — use 3.12/3.13)", "tool_available": False}
+            # One missing-dependency shape (app/tools/_extras.py). The hint
+            # this replaced was `pip install prism-platform[ml]`, which 404s —
+            # prism-platform is on no index (see _extras.install_command).
+            return missing_extra_error(
+                "ml",
+                "robocrystallographer not installed (note: no Python 3.14 wheel "
+                "— use 3.12/3.13)",
+                tool_available=False,
+            )
 
         # Get a structure: from CIF text, or from the federation.
         if cif:
@@ -165,6 +174,18 @@ def _predict_synthesizability_tool() -> Tool:
                     score += hull_score
                     factors.append({"factor": "convex_hull_distance", "value_eV_per_atom": round(ehull, 4),
                                     "classification": cls, "contribution": round(hull_score, 2)})
+            else:
+                # The dominant signal is ABSENT, not zero. Dropping it from the
+                # factor list silently made "MP has no entry for this formula"
+                # look identical to "the hull factor was never part of the
+                # score" — while the note still claimed the score combines
+                # hull distance. Say which one it was.
+                factors.append({
+                    "factor": "convex_hull_distance",
+                    "available": False,
+                    "reason": "no Materials Project entry for this formula; "
+                              "the dominant signal is missing, not zero",
+                })
         except Exception as exc:
             factors.append({"factor": "convex_hull_distance", "error": f"MP lookup failed: {type(exc).__name__}"})
 
@@ -182,9 +203,14 @@ def _predict_synthesizability_tool() -> Tool:
             pass
 
         # Factor 3: known in MP = existence evidence (already synthesized or computed).
+        # Guarding on `res.get("results")` made the -0.1 "absent from MP" branch
+        # unreachable — n_hits was > 0 by construction — so a formula MP has
+        # never heard of scored the same as one it simply wasn't asked about.
+        # Gate on the QUERY succeeding instead; `res` is unbound when the hull
+        # lookup itself raised, and a failed lookup is not evidence of absence.
         try:
-            if isinstance(res, dict) and res.get("results"):
-                n_hits = len(res["results"])
+            if isinstance(res, dict) and "error" not in res:
+                n_hits = len(res.get("results") or [])
                 existence = 0.1 if n_hits > 0 else -0.1
                 score += existence
                 factors.append({"factor": "database_existence", "mp_hits": n_hits, "contribution": round(existence, 2)})

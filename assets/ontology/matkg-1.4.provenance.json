@@ -3,43 +3,43 @@
   "class_mappings": [
     {
       "extraction_label": "Application",
-      "iri": "https://marc27.com/ontology/matkg#Application",
+      "iri": "https://mirdyne.com/ontology/matkg#Application",
       "matkg_code": "APL",
       "upstream_pref_label": "Application"
     },
     {
       "extraction_label": "CharacterisationMethod",
-      "iri": "https://marc27.com/ontology/matkg#CharacterisationMethod",
+      "iri": "https://mirdyne.com/ontology/matkg#CharacterisationMethod",
       "matkg_code": "CMT",
       "upstream_pref_label": "CharacterisationMethod"
     },
     {
       "extraction_label": "Chemical",
-      "iri": "https://marc27.com/ontology/matkg#Chemical",
+      "iri": "https://mirdyne.com/ontology/matkg#Chemical",
       "matkg_code": "CHM",
       "upstream_pref_label": "Chemical"
     },
     {
       "extraction_label": "Descriptor",
-      "iri": "https://marc27.com/ontology/matkg#Descriptor",
+      "iri": "https://mirdyne.com/ontology/matkg#Descriptor",
       "matkg_code": "DSC",
       "upstream_pref_label": "Descriptor"
     },
     {
       "extraction_label": "Property",
-      "iri": "https://marc27.com/ontology/matkg#Property",
+      "iri": "https://mirdyne.com/ontology/matkg#Property",
       "matkg_code": "PRO",
       "upstream_pref_label": "Property"
     },
     {
       "extraction_label": "SymmetryPhaseLabel",
-      "iri": "https://marc27.com/ontology/matkg#SymmetryPhaseLabel",
+      "iri": "https://mirdyne.com/ontology/matkg#SymmetryPhaseLabel",
       "matkg_code": "SPL",
       "upstream_pref_label": "SymmetryPhaseLabel"
     },
     {
       "extraction_label": "SynthesisMethod",
-      "iri": "https://marc27.com/ontology/matkg#SynthesisMethod",
+      "iri": "https://mirdyne.com/ontology/matkg#SynthesisMethod",
       "matkg_code": "SMT",
       "upstream_pref_label": "SynthesisMethod"
     }
@@ -50,7 +50,7 @@
   ],
   "dataset_doi": "10.5281/zenodo.10144972",
   "derivation": {
-    "namespace_note": "Class IRIs are PRISM-minted under https://marc27.com/ontology/matkg#. Upstream MatKG identifies entities and their types only under the placeholder namespace http://example.com/, and entity_uri_mapping.pickle (144,484 names) resolves every entity name to that same placeholder namespace, so no upstream canonical identity exists to reuse and http://example.com/ must not be propagated as identity. The original placeholder URI of each loaded entity is preserved additively in the entity's props_json as matkg_uri.",
+    "namespace_note": "Class IRIs are PRISM-minted under https://mirdyne.com/ontology/matkg#. Upstream MatKG identifies entities and their types only under the placeholder namespace http://example.com/, and entity_uri_mapping.pickle (144,484 names) resolves every entity name to that same placeholder namespace, so no upstream canonical identity exists to reuse and http://example.com/ must not be propagated as identity. The original placeholder URI of each loaded entity is preserved additively in the entity's props_json as matkg_uri.",
     "reification": "Each SUBRELOBJ sro_row node carries exactly one hasSubject, hasRelationship, hasObject, and hasCount statement (measured: 5,396,084 rows, 21,584,336 statements, zero missing or duplicate fields). The loader joins the four statements per row; the entity class is the URI path segment of hasSubject/hasObject.",
     "relationship_note": "hasRelationship values are type-pair-shaped strings (e.g. CHM-PRO) that disagree with the subject/object URI type segments in the majority of rows measured (27,218 of 32,331 fully-joined rows in a 6M-line window), because the same name pair is tallied under multiple per-mention NER type contexts while entity URIs carry one canonical type per name. The value is therefore not trusted as a class or relation source; every loaded fact uses the single declared relationship cooccursWith, and the four-way join still requires the statement's presence.",
     "semantics": "The seven MatKG NER categories re-expressed as flat OWL classes (no subclass axioms are claimed upstream or asserted here), plus one object property for the statistical co-occurrence relationship. No OWL axioms beyond declarations and labels are asserted.",
@@ -62,44 +62,44 @@
         "emmo_iri": "https://w3id.org/emmo#EMMO_abf7efbe_6b04_41b8_8326_4dd0f6be753e",
         "emmo_pref_label": "Chemical",
         "match": "skos:closeMatch",
-        "matkg_iri": "https://marc27.com/ontology/matkg#Chemical",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#Chemical",
         "rationale": "MatKG CHM entities are chemicals/compounds/materials named in text; EMMO 1.0.3 declares Chemical in the vendored subset. closeMatch, not exactMatch, because MatKG members are NER strings, not curated chemical individuals."
       },
       {
         "emmo_iri": "https://w3id.org/emmo#EMMO_b7bcff25_ffc3_474e_9ab5_01b1664bd4ba",
         "emmo_pref_label": "Property",
         "match": "skos:closeMatch",
-        "matkg_iri": "https://marc27.com/ontology/matkg#Property",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#Property",
         "rationale": "MatKG PRO entities are material properties named in text; EMMO 1.0.3 declares Property in the vendored subset. closeMatch for the same NER-string reason."
       }
     ],
     "scope": "Alignment was asserted only against classes verifiably present in PRISM's vendored EMMO 1.0.3 subset (assets/ontology/emmo-1.0.3.materialised.ttl). An invented alignment is worse than an absent one.",
     "unmatched": [
       {
-        "matkg_iri": "https://marc27.com/ontology/matkg#SynthesisMethod",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#SynthesisMethod",
         "rationale": "The nearest vendored EMMO class, Process, is strictly broader than a synthesis method (and MatKG SMT members include heavy NER noise); asserting closeMatch would overclaim. EMMO's Manufacturing branch is a candidate for future alignment but is not in the vendored subset to verify."
       },
       {
-        "matkg_iri": "https://marc27.com/ontology/matkg#Application",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#Application",
         "rationale": "No application/use-context class exists in the vendored EMMO subset."
       },
       {
-        "matkg_iri": "https://marc27.com/ontology/matkg#SymmetryPhaseLabel",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#SymmetryPhaseLabel",
         "rationale": "EMMO PhaseOfMatter denotes states of matter, while SPL members are symmetry/structure labels (and heavily noisy); the correspondence is not genuine enough for closeMatch."
       },
       {
-        "matkg_iri": "https://marc27.com/ontology/matkg#CharacterisationMethod",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#CharacterisationMethod",
         "rationale": "No measurement/characterisation-method class exists in the vendored EMMO subset; EMMO's characterisation vocabulary lives in the separate CHAMEO module, which PRISM does not vendor."
       },
       {
-        "matkg_iri": "https://marc27.com/ontology/matkg#Descriptor",
+        "matkg_iri": "https://mirdyne.com/ontology/matkg#Descriptor",
         "rationale": "MatKG DSC is a catch-all sample-descriptor category with no EMMO counterpart."
       }
     ]
   },
   "license": "CC-BY-4.0",
   "license_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
-  "materialised_sha256": "c18cf4f9700774a2ff2441f8063f9502fc0f6e378df926775a7a50c30aff63c9",
+  "materialised_sha256": "86dde78b6a956ccb7535487352520010f3cca40461406b772bcb668eb0437282",
   "measured": {
     "count_max": 206811,
     "count_min_observed": ">= 25 across all 5,396,084 rows",
@@ -116,13 +116,13 @@
       "SPL": 1084139
     }
   },
-  "ontology_iri": "https://marc27.com/ontology/matkg",
+  "ontology_iri": "https://mirdyne.com/ontology/matkg",
   "paper": "Venugopal, V. & Olivetti, E. MatKG: An autonomously generated knowledge graph in Material Science. Scientific Data 11, 217 (2024).",
   "paper_doi": "10.1038/s41597-024-03039-z",
   "prefixes": {
     "dcterms": "http://purl.org/dc/terms/",
     "emmo": "https://w3id.org/emmo#",
-    "matkg": "https://marc27.com/ontology/matkg#",
+    "matkg": "https://mirdyne.com/ontology/matkg#",
     "owl": "http://www.w3.org/2002/07/owl#",
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
     "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
@@ -131,7 +131,7 @@
   "relation_mappings": [
     {
       "extraction_label": "COOCCURS_WITH",
-      "iri": "https://marc27.com/ontology/matkg#cooccursWith",
+      "iri": "https://mirdyne.com/ontology/matkg#cooccursWith",
       "rationale": "The only relationship the SUBRELOBJ distribution actually carries is statistical co-occurrence; hasRelationship type-pair strings are not trusted (see derivation.relationship_note).",
       "upstream_pref_label": "cooccursWith"
     }
@@ -154,5 +154,5 @@
     }
   ],
   "upstream_url": "https://zenodo.org/records/10144972",
-  "version_iri": "https://marc27.com/ontology/matkg/1.4"
+  "version_iri": "https://mirdyne.com/ontology/matkg/1.4"
 }

@@ -239,6 +239,19 @@ def test_availability_gate_detects_missing_dependency():
 
 
 def test_direct_tool_call_returns_structured_missing_dependency_result():
+    """OLD ORACLE (wrong): this pinned install_hint to
+    ``pip install 'prism-platform[lpbf]'``. `app/tools/_extras.py` records that
+    `prism-platform` is on no index (HTTP 404), which is exactly why
+    `missing_extra_error` puts the distribution names in `install_hint` and
+    demotes the extra form to `install_extra_hint` — and why
+    `tests/test_marketplace_catalog.py::test_missing_extra_error_shape` asserts
+    ``"prism-platform[" not in install_hint``. The old oracle froze the 404 in
+    place and, by asserting only `error` and `install_hint`, let the gate ship
+    with no `requires_extra` for a caller to branch on. Guard the real rule:
+    this gate must produce the one shape from `_extras`.
+    """
+    from app.tools import _extras
+
     with patch(
         "app.tools.manufacturing.lpbf.tools.check_lpbf_available",
         return_value=False,
@@ -248,7 +261,11 @@ def test_direct_tool_call_returns_structured_missing_dependency_result():
         )
 
     assert "error" in result
-    assert result["install_hint"] == "pip install 'prism-platform[lpbf]'"
+    assert result["requires_extra"] == "lpbf"
+    assert result["install_hint"] == _extras.install_command("lpbf")
+    assert "prism-platform[" not in result["install_hint"]
+    assert result["install_extra_hint"] == "pip install 'prism-platform[lpbf]'"
+    assert result["missing_capability"]
 
 
 def test_tools_absent_from_registry_when_dependencies_missing(monkeypatch):

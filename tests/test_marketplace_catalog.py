@@ -16,6 +16,7 @@ Plus a shape check: the payload each entry publishes must match the fields
 """
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -60,10 +61,40 @@ def test_every_registry_tool_has_a_verdict(registry_tool_names):
     )
 
 
+#: A tool name is declared at its registration site as `name="..."`. The
+#: catalog spells the same names as `"name": "..."` in JSON, so this pattern
+#: cannot match the catalog itself and accidentally vouch for a phantom.
+_TOOL_NAME_DECLARATION = re.compile(r'name="([a-z0-9_]+)"')
+
+
+def _tool_names_declared_in_source() -> set[str]:
+    """Every tool name some `create_*_tools` function registers, extras or not."""
+    declared: set[str] = set()
+    for path in (REPO_ROOT / "app").rglob("*.py"):
+        declared |= set(_TOOL_NAME_DECLARATION.findall(path.read_text(errors="ignore")))
+    return declared
+
+
 def test_catalog_names_no_phantom_tools(registry_tool_names):
+    """A catalog entry must not name a tool that no longer exists.
+
+    The registry alone cannot answer that. `bootstrap.py` registers whole
+    families only when their optional extra imports — mace behind
+    `check_mace_available()`, and likewise polymer and precipitation — so on a
+    default install those tools are legitimately absent. Asserting against the
+    registry therefore fails on provisioning, not on drift, and the fix would
+    have been to DELETE truthful catalog entries.
+
+    The question is whether the tool still exists, so the fallback oracle is
+    the source: `app/tools/mace.py` imports and registers all ten of its tools
+    with no mace-torch present. A name that is in neither the registry nor any
+    registration site is a real phantom and still fails.
+    """
     judged = set(catalog.published_tools()) | set(catalog.bundled())
-    assert judged - registry_tool_names == set(), (
-        "catalog names tools the registry no longer has"
+    missing = judged - registry_tool_names
+    phantom = missing - _tool_names_declared_in_source()
+    assert phantom == set(), (
+        f"catalog names tools that exist nowhere in app/: {sorted(phantom)}"
     )
 
 
@@ -193,17 +224,27 @@ def test_absent_extra_reports_the_hint_instead_of_raising(registry_tool_names, m
     # test asserts the gate, not the provisioner.
     from app.tools.base import ToolRegistry
     from app.tools.calphad import create_calphad_tools
+    from app.tools.mace import create_mace_tools
     from app.tools.sim_tools import create_simulation_tools
 
     local = ToolRegistry()
     create_calphad_tools(local)
     create_simulation_tools(local)
+    # bootstrap registers the mace family only when the extra imports, so the
+    # gated tools are absent from `registry` exactly when this test has
+    # something to check. They define fine without mace-torch present.
+    create_mace_tools(local)
     tools.update({t.name: t for t in local.list_tools()})
 
+    # Probe a tool that needs the WHOLE extra. `structure_import` was the wrong
+    # choice for mace: it is published under that extra but only ever imports
+    # `ase`, which several extras provide, so on a machine with ase and no
+    # mace-torch it correctly does its job — and the probe read that success as
+    # a missing gate, then blamed a deliberately unparseable CIF.
     probes = {
         "calphad": ("calphad", {"action": "list_phases", "database_name": "x"}),
         "simulation": ("list_potentials", {}),
-        "mace": ("structure_import", {"cif": "data_x\n"}),
+        "mace": ("mace_relax_structure", {"structure_ref": "cache://nonexistent"}),
         "ml": ("model_train", {"property_name": "band_gap"}),
     }
     checked = 0

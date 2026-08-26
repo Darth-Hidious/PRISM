@@ -479,6 +479,26 @@ class ArtifactStore:
         finally:
             conn.close()
 
+    def count_artifacts(self, *, session_id: Optional[str] = None) -> int:
+        """Number of stored artifacts, optionally restricted to one session.
+
+        Used by the read tools to tell "the store is empty" apart from "the
+        session filter excluded everything". Those two look identical to a
+        caller that only sees a zero-length result list.
+        """
+        conn = self._connect()
+        try:
+            if session_id:
+                row = conn.execute(
+                    "SELECT count(*) FROM artifacts WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT count(*) FROM artifacts").fetchone()
+            return int(row[0])
+        finally:
+            conn.close()
+
     def list_artifacts(
         self,
         *,

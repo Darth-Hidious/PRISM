@@ -156,6 +156,17 @@ def is_configured() -> bool:
     return _CONFIG["store"] is not None
 
 
+def is_recording_enabled() -> bool:
+    """True when `record_if_enabled` will actually write.
+
+    Bootstrap configures the store for reads but leaves `record_enabled`
+    off unless PRISM_ARTIFACT_RECORDING is set, so a read tool can return
+    nothing simply because nothing is being written any more. The read
+    tools call this to say so instead of reporting an empty store.
+    """
+    return _CONFIG["store"] is not None and bool(_CONFIG["record_enabled"])
+
+
 def get_store() -> Optional[ArtifactStore]:
     return _CONFIG["store"]
 

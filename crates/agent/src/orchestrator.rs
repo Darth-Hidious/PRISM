@@ -93,7 +93,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, watch};
@@ -107,7 +107,10 @@ use crate::hooks::HookRegistry;
 use crate::models::get_model_config;
 use crate::permissions::{PermissionMode, SharedPermissionOverrides, ToolPermissionContext};
 use crate::scratchpad::Scratchpad;
-use crate::subagent::{DEFAULT_SUBAGENT_BUDGET_TOKENS, DEFAULT_SUBAGENT_MODEL, MAX_SUBAGENT_DEPTH};
+use crate::subagent::{
+    DEFAULT_SUBAGENT_BUDGET_TOKENS, DEFAULT_SUBAGENT_MODEL, MAX_SUBAGENT_DEPTH,
+    delegation_failure_context,
+};
 use crate::tool_catalog::{LoadedTool, ToolCatalog};
 use crate::transcript::{TranscriptStore, TurnBudget};
 use crate::types::{AgentConfig, AgentEvent};
@@ -1488,7 +1491,16 @@ impl ItemAgent for OrchestratedAgent {
                 .expect("orchestration usage roll-up is never held across a panic")
                 .absorb(&live.metrics);
 
-            nested_result?;
+            // Name the model and the endpoint on the way out — see
+            // `delegation_failure_context`. Lazy, so a healthy item formats
+            // nothing.
+            nested_result.with_context(|| {
+                delegation_failure_context(
+                    &self.spec.id,
+                    &self.spec.model,
+                    &live.llm.config().base_url,
+                )
+            })?;
 
             let answer = final_text
                 .filter(|text| !text.trim().is_empty())
@@ -1622,7 +1634,13 @@ pub(crate) fn execute_orchestrate_agents<'a>(
             }));
         };
 
-        let (specs, policy_spec) = parse_args(args, &parent_config.model)?;
+        // Inherit from the LIVE `LlmClient`, never from `AgentConfig.model` —
+        // same reason as `subagent::execute_spawn_subagent_inner`, which
+        // carries the full account: `AgentConfig.model` is never populated
+        // from the resolved chat route, so reading it asked the parent's own
+        // endpoint for the `impl Default` literal and every orchestrated item
+        // died with `1214 modelCode does not exist`.
+        let (specs, policy_spec) = parse_args(args, &llm.config().model)?;
         let lane_bound = Some(pool.policy().max_lanes);
 
         let mut config_template = parent_config.clone();

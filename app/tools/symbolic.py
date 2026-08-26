@@ -798,12 +798,41 @@ def _run_check_subprocess(
         "elapsed_ms": elapsed,
     }
     if not out:
-        # Child crashed before printing (e.g. import error). success:false.
+        # Child produced nothing. SAY WHY — the bare "check did not produce a
+        # result" with an empty stderr was undiagnosable: measured 2026-08-25,
+        # a live run got this back at 6ms and 37ms with empty stderr, and the
+        # agent could not tell a broken tool from bad input from a machine out
+        # of resources. It burned 7 checks and 13 patch attempts on the
+        # ambiguity, then declined to deliver rather than guess (correctly).
+        #
+        # A negative returncode is POSIX for "killed by signal -rc": that is
+        # the difference between "your expression is wrong" and "the host
+        # killed my child", and only one of them is worth retrying.
+        rc = proc.returncode
+        if rc is not None and rc < 0:
+            why = (
+                f"the check subprocess was killed by signal {-rc} before it produced output "
+                f"(after {elapsed}ms) — this is a HOST condition, not a problem with the "
+                f"expressions. Memory pressure and concurrent heavy builds are the usual "
+                f"causes; retrying once the machine is quiet is reasonable."
+            )
+        elif rc:
+            why = (
+                f"the check subprocess exited {rc} without producing output after {elapsed}ms; "
+                f"its stderr is reported below (empty stderr means it died before it could "
+                f"report anything)"
+            )
+        else:
+            why = (
+                f"the check subprocess exited cleanly but printed nothing after {elapsed}ms — "
+                f"the check did not run"
+            )
         return {
             **base,
             "success": False,
             "verdict": "inconclusive",
-            "reason": "check did not produce a result",
+            "reason": why,
+            "exit_code": rc,
             "stderr": proc.stderr.strip()[:1000],
         }
     try:

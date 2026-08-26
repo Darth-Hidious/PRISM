@@ -178,6 +178,8 @@ def _screen_materials_tool() -> Tool:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
         materials = search_result.get("materials", [])
+        warnings = list(search_result.get("warnings", []))
+        rank_coverage: dict[str, Any] | None = None
         # Rank by the requested property; missing props sort last. Direction is
         # property-aware: formation_energy is an energy where MORE NEGATIVE =
         # MORE STABLE, so stability ranking sorts ASCENDING (a descending sort
@@ -200,6 +202,27 @@ def _screen_materials_tool() -> Tool:
 
             materials = sorted(materials, key=_rank_val, reverse=not ascending)
 
+            # A rank the data cannot support is not a rank. `_rank_val` sends
+            # every candidate lacking the property to the SAME sentinel, so a
+            # pool where nobody reports it comes back in the federation's own
+            # order under a `ranked_by` label that says otherwise. Measured
+            # live: elements=['Cu','O'], rank_by='band_gap' returned three
+            # candidates, all with `properties: {}` and `ranked_by:
+            # "band_gap"`. Report the coverage, and say so when it is zero.
+            ranked_slice = materials[:limit]
+            with_value = sum(1 for m in ranked_slice if _rank_val(m) != missing)
+            rank_coverage = {
+                "property": rank_by,
+                "candidates_with_value": with_value,
+                "candidates_without_value": len(ranked_slice) - with_value,
+            }
+            if ranked_slice and with_value == 0:
+                warnings.append(
+                    f"ranked_by={rank_by!r} but none of the {len(ranked_slice)} "
+                    "returned candidates reports that property — the order is "
+                    "the federation's, not a ranking"
+                )
+
         candidates = [
             {
                 "formula": m.get("formula"),
@@ -216,9 +239,10 @@ def _screen_materials_tool() -> Tool:
             "count": len(candidates),
             "screened_from": search_result.get("count", 0),
             "ranked_by": rank_by,
+            "rank_coverage": rank_coverage,
             "coverage": search_result.get("coverage", {}),
             "providers_summary": search_result.get("providers_summary", {}),
-            "warnings": search_result.get("warnings", []),
+            "warnings": warnings,
         }
 
     return Tool(

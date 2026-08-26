@@ -27,6 +27,7 @@ from app.tools.memory.recorder import (
     get_embedder,
     get_store,
     is_configured,
+    is_recording_enabled,
     record_if_enabled,
     reset,
     resolve_session_id,
@@ -53,6 +54,7 @@ __all__ = [
     # Recorder
     "configure",
     "is_configured",
+    "is_recording_enabled",
     "get_store",
     "get_embedder",
     "resolve_session_id",

@@ -3,7 +3,12 @@ import numpy as np
 from typing import Dict, Optional
 
 from app.tools import _provenance as prov
-from app.tools.ml.features import composition_features, feature_backend_id
+from app.tools.ml.features import (
+    ELEMENT_DATA,
+    composition_features,
+    feature_backend_id,
+    uncovered_elements,
+)
 from app.tools.ml.registry import ModelRegistry
 
 #: Units for the Materials Project summary fields model_train can source.
@@ -85,6 +90,25 @@ class Predictor:
         feature_names = meta.get("feature_names") or sorted(features.keys())
         missing = [k for k in feature_names if k not in features]
         if missing:
+            # Name the ACTUAL cause. The built-in fallback covers 43 elements,
+            # so the usual reason a feature cannot be computed is an element
+            # outside that table (Ag, Ac, Sb, Tc, ...) — not a backend
+            # mismatch. Reporting "the model was likely trained with the
+            # matminer backend" for Ag sent the reader after the wrong thing.
+            uncovered = uncovered_elements(formula)
+            if uncovered:
+                return {
+                    "error": (
+                        f"Cannot featurize {formula}: the built-in element table has "
+                        f"no data for {uncovered}. It covers {len(ELEMENT_DATA)} "
+                        f"elements, so {len(missing)} of the model's features "
+                        f"(e.g. {missing[:3]}) are unavailable for this formula and "
+                        "none of them is guessed. Install matminer for full "
+                        "periodic-table coverage, then retrain with "
+                        f"model_train(property_name={property_name!r}, "
+                        f"algorithm={algorithm!r})."
+                    )
+                }
             return {
                 "error": (
                     f"Feature backend mismatch: {len(missing)} training features "

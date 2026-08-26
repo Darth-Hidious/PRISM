@@ -311,10 +311,16 @@ class SearchEngine:
         # watcher fires the moment we have enough results and cancels every
         # not-yet-complete task so the gather returns promptly instead of
         # waiting on the laggards.
+        # Which providers THIS ENGINE cancelled for sufficiency. Their
+        # CancelledError says nothing about them, so it must not be read as
+        # one (see the failure loop below).
+        early_cancelled: set[str] = set()
+
         async def _early_canceller():
             await early_event.wait()
-            for t in tasks.values():
+            for pid, t in tasks.items():
                 if not t.done():
+                    early_cancelled.add(pid)
                     t.cancel()
 
         canceller = asyncio.create_task(_early_canceller())
@@ -356,6 +362,45 @@ class SearchEngine:
         # `warnings` may already carry the whole-fan-out deadline notice set above.
         for pid, result in provider_results.items():
             provider = next(p for p in providers if p.id == pid)
+            if pid in early_cancelled and isinstance(result, asyncio.CancelledError):
+                # THE ENGINE cancelled this provider because the fast ones had
+                # already returned 2x the requested limit. That is a decision
+                # of ours, not evidence about the provider — the same rule the
+                # offline branch below applies to a policy refusal.
+                #
+                # It was read as evidence: the CancelledError fell into the
+                # failure branch, was logged status="timeout" /
+                # error_type="CancelledError" / error_message="unknown error"
+                # (str(CancelledError()) is empty), raised a warning reading
+                # "Provider 'x' failed", and fed record_failure(). Measured
+                # against a healthy local endpoint: consecutive_failures 1
+                # after one search, 2 after the second, circuit_state "open",
+                # should_query() False — a provider that answered correctly
+                # both times excluded for the 300s cooldown, and persisted to
+                # ~/.prism/cache/provider_health.json.
+                #
+                # "skipped" is the status the not-yet-started path in
+                # _guarded_query already records for exactly this event; only
+                # tasks that had entered the semaphore were being slandered.
+                # release_probe_claim for the same reason as the offline
+                # branch: should_query() may have claimed the half-open probe,
+                # and neither record_success nor record_failure will run.
+                self._health.get(pid).release_probe_claim()
+                query_log.append(ProviderQueryLog(
+                    provider_id=pid,
+                    provider_name=provider.name,
+                    endpoint_url=self._get_endpoint_url(provider),
+                    query_description=_safe_describe(provider, query),
+                    started_at=start,
+                    completed_at=time.time(),
+                    latency_ms=(time.time() - start) * 1000,
+                    status="skipped",
+                    pages_fetched=0,
+                    error_message=(
+                        "Early termination — enough results from fast providers"
+                    ),
+                ))
+                continue
             if isinstance(result, BaseException):
                 # A refusal by the hard-offline policy is NOT evidence about
                 # the provider, so it must not touch the breaker.
@@ -422,7 +467,17 @@ class SearchEngine:
                     error_raw=str(result)[:2000] or None,
                 )
                 query_log.append(log)
-                warnings.append(f"Provider '{pid}' failed: {type(result).__name__}")
+                # The exception TYPE alone is not actionable: "Provider
+                # 'mp_native' failed: RuntimeError" tells the agent nothing
+                # about whether that was a missing key, a rate limit or a
+                # network error, so it cannot choose a different route. The
+                # sanitized one-liner is already computed for the query log
+                # (`log.error_message`) — surface it here too.
+                detail = log.error_message or ""
+                warnings.append(
+                    f"Provider '{pid}' failed: {type(result).__name__}"
+                    + (f": {detail}" if detail else "")
+                )
             else:
                 materials, log_entry = result
                 all_materials.extend(materials)

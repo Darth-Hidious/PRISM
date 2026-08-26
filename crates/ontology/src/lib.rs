@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(graph.sha256(), digest);
         assert_eq!(
             graph.version_iri().as_str(),
-            "https://marc27.com/ontology/matkg/1.4"
+            "https://mirdyne.com/ontology/matkg/1.4"
         );
     }
 

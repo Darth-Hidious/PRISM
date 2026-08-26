@@ -20,6 +20,7 @@ Two groups:
 """
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 from unittest.mock import patch
 
@@ -305,3 +306,62 @@ def test_temperature_time_schedule(tmp_path):
     assert temps[0] == pytest.approx(723.15)
     assert max(temps) >= 743.0, "trajectory never reached the second plateau"
     assert result["phases"]["AL3ZR"]["volume_fraction"][-1] > 0.0
+
+
+def test_missing_dependency_gate_carries_the_one_extras_shape():
+    """The dependency gate must be branchable, and its hint must resolve.
+
+    The hand-rolled dict this replaced carried no `requires_extra` and named
+    `pip install 'prism-platform[precipitation]'` as its primary hint —
+    `app/tools/_extras.py` records that distribution as absent from every index
+    (HTTP 404), which is why `install_command` names kawin directly.
+    """
+    from app.tools import _extras
+    from app.tools.materials.precipitation.tools import _precipitation_kinetics
+
+    with patch("app.tools.materials.precipitation."
+               "check_precipitation_available", return_value=False):
+        result = _precipitation_kinetics(
+            database="unused.tdb", components=["AL", "ZR"],
+            matrix_phase="FCC_A1", precipitates=[], matrix_composition={},
+            diffusivity={}, matrix_molar_volume_m3_per_mol=1e-5,
+            matrix_atoms_per_unit_cell=4,
+        )
+
+    assert result["requires_extra"] == "precipitation"
+    assert result["install_hint"] == _extras.install_command("precipitation")
+    assert "prism-platform[" not in result["install_hint"]
+    assert result["converged"] is False
+
+
+def test_run_kwn_without_kawin_returns_the_hint_instead_of_raising(tmp_path):
+    """Failure discipline (module docstring): nothing raises out of run_kwn.
+
+    Regression: the kawin imports at the top of `_build_and_solve` sat outside
+    every try, so a direct call whose inputs all validated — a real TDB on disk
+    is all `_validate_inputs` checks — escaped as a bare ModuleNotFoundError
+    with no install hint. Simulate the absent extra so this runs on machines
+    that do have kawin.
+    """
+    from app.tools import _extras
+    from app.tools.materials.precipitation.kinetics import run_kwn
+
+    tdb = tmp_path / "staged.tdb"
+    tdb.write_text("ELEMENT AL FCC_A1 26.98 4577.3 28.322!\n")
+    inputs = _base_inputs(tdb)
+
+    real_import = builtins.__import__
+
+    def import_without_kawin(name, *args, **kwargs):
+        if name == "kawin" or name.startswith("kawin."):
+            raise ImportError("simulated missing kawin")
+        return real_import(name, *args, **kwargs)
+
+    with patch("builtins.__import__", side_effect=import_without_kawin):
+        result = run_kwn(**inputs)  # must not raise
+
+    assert result["status"] == "failed"
+    assert result["stage"] == "dependency"
+    assert result["requires_extra"] == "precipitation"
+    assert result["install_hint"] == _extras.install_command("precipitation")
+    _assert_no_numeric_content(result)

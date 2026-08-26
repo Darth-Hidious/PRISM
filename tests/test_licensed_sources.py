@@ -123,6 +123,14 @@ def test_request_outside_coverage_returns_structured_refusal_without_number(
         remote_provider=RecordingProvider(),
     )
     monkeypatch.setattr("app.tools.licensed_sources._RESOLVER", resolver)
+    # `calphad_compute` checks the CALPHAD engine before it resolves a source
+    # (an engine-less install must be told so, not sent to buy a TDB licence).
+    # This test is about the coverage refusal, so assert the engine is there
+    # and keep the assertion exercising the resolver on any interpreter.
+    monkeypatch.setattr(
+        "app.tools.simulation.calphad_bridge.check_calphad_available",
+        lambda: True,
+    )
 
     result = _calphad_compute(
         action="equilibrium",

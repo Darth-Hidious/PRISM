@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{ComputeBackend, ExperimentPlan, JobStatus};
+use crate::{ComputeBackend, ExperimentPlan, JobStatus, ResourceSpec};
 
 /// Supported BYOC target types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,7 +343,10 @@ impl ComputeBackend for ByocBackend {
                 let job_id = Uuid::new_v4();
                 let inputs_json = serde_json::to_string(&plan.inputs)?;
 
-                let script = sbatch_script(&job_id, partition, config, &inputs_json)?;
+                // Cluster defaults first, then this job's own request on top.
+                let job_config = config.overlaid_with(&plan.resources);
+                let job_partition = plan.resources.partition.as_deref().unwrap_or(partition);
+                let script = sbatch_script(&job_id, job_partition, &job_config, &inputs_json)?;
                 let ssh_command = format!("echo '{}' | sbatch", script.replace('\'', "'\\''"));
 
                 tracing::info!(
@@ -806,6 +809,69 @@ fn is_valid_sif_path(s: &str) -> bool {
 /// Build the `#SBATCH` directive lines for a job. Absent fields are
 /// omitted, never emitted empty. Errors on invalid or mutually
 /// exclusive values instead of guessing.
+impl SlurmJobConfig {
+    /// Apply one job's [`ResourceSpec`] over these cluster-level defaults.
+    ///
+    /// The `SlurmJobConfig` is attached to the *target* and so applied
+    /// identically to every job submitted to that cluster — two jobs could not
+    /// ask for different numbers of GPUs. The cluster config remains the
+    /// default; whatever the job actually asks for wins.
+    pub fn overlaid_with(&self, spec: &ResourceSpec) -> Self {
+        let mut cfg = self.clone();
+        if let Some(account) = &spec.account {
+            cfg.account = Some(account.clone());
+        }
+        if let Some(secs) = spec.walltime_secs {
+            cfg.time = Some(format_slurm_time(secs));
+        }
+        if let Some(gres) = slurm_gres(spec) {
+            cfg.gres = Some(gres);
+        }
+        if let Some(gb) = spec.memory_gb {
+            // `--mem` and `--mem-per-cpu` are mutually exclusive and
+            // `sbatch_directives` refuses both; an explicit per-job total
+            // replaces a cluster-level per-CPU default rather than colliding.
+            cfg.mem = Some(format!("{gb}G"));
+            cfg.mem_per_cpu = None;
+        }
+        if let Some(cpus) = spec.cpus {
+            cfg.cpus_per_task = Some(cpus);
+        }
+        if let Some(nodes) = spec.nodes {
+            cfg.nodes = Some(nodes);
+        }
+        if let Some(ntasks) = spec.ntasks {
+            cfg.ntasks = Some(ntasks);
+        }
+        cfg
+    }
+}
+
+/// `--gres` for a resource request: `gpu:2`, or `gpu:a100:2` when a class is
+/// named. Returns `None` when no accelerator was asked for, so a CPU job never
+/// picks up an empty `--gres` directive that allocation-based clusters reject.
+fn slurm_gres(spec: &ResourceSpec) -> Option<String> {
+    if !spec.wants_gpu() {
+        return None;
+    }
+    let count = spec.gpus.unwrap_or(1).max(1);
+    Some(match &spec.gpu_class {
+        Some(class) => format!("gpu:{class}:{count}"),
+        None => format!("gpu:{count}"),
+    })
+}
+
+/// SLURM `--time`: `HH:MM:SS`, widening to `D-HH:MM:SS` past a day.
+fn format_slurm_time(secs: u64) -> String {
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    if days > 0 {
+        format!("{days}-{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
+    }
+}
+
 fn sbatch_directives(job_id: &Uuid, partition: &str, cfg: &SlurmJobConfig) -> Result<Vec<String>> {
     if !is_valid_slurm_token(partition) {
         bail!("invalid SLURM partition {partition:?}");
@@ -1092,6 +1158,108 @@ fn is_valid_docker_image(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    // ── per-job resources ──
+    //
+    // SlurmJobConfig hangs off the TARGET, so before `overlaid_with` every job
+    // sent to a cluster got byte-identical directives: two jobs could not ask
+    // for different numbers of GPUs.
+
+    #[test]
+    fn gres_is_absent_when_no_accelerator_was_asked_for() {
+        assert_eq!(slurm_gres(&ResourceSpec::default()), None);
+        // An explicit zero is "no GPU", not "gpu:0" — clusters reject that.
+        assert_eq!(slurm_gres(&ResourceSpec { gpus: Some(0), ..Default::default() }), None);
+    }
+
+    #[test]
+    fn gres_carries_the_count_and_the_class() {
+        assert_eq!(
+            slurm_gres(&ResourceSpec { gpus: Some(2), ..Default::default() }),
+            Some("gpu:2".into())
+        );
+        assert_eq!(
+            slurm_gres(&ResourceSpec {
+                gpus: Some(2),
+                gpu_class: Some("a100".into()),
+                ..Default::default()
+            }),
+            Some("gpu:a100:2".into())
+        );
+        // A class with no count means one of that class, never zero.
+        assert_eq!(
+            slurm_gres(&ResourceSpec { gpu_class: Some("h100".into()), ..Default::default() }),
+            Some("gpu:h100:1".into())
+        );
+    }
+
+    #[test]
+    fn slurm_time_widens_past_a_day() {
+        assert_eq!(format_slurm_time(0), "00:00:00");
+        assert_eq!(format_slurm_time(3600), "01:00:00");
+        assert_eq!(format_slurm_time(3661), "01:01:01");
+        assert_eq!(format_slurm_time(90_000), "1-01:00:00");
+    }
+
+    #[test]
+    fn the_jobs_own_request_beats_the_cluster_default() {
+        let cluster = SlurmJobConfig {
+            account: Some("cluster-alloc".into()),
+            time: Some("00:10:00".into()),
+            gres: Some("gpu:1".into()),
+            cpus_per_task: Some(1),
+            ..Default::default()
+        };
+        let job = cluster.overlaid_with(&ResourceSpec {
+            gpus: Some(8),
+            walltime_secs: Some(7200),
+            cpus: Some(32),
+            account: Some("my-alloc".into()),
+            ..Default::default()
+        });
+        assert_eq!(job.gres.as_deref(), Some("gpu:8"));
+        assert_eq!(job.time.as_deref(), Some("02:00:00"));
+        assert_eq!(job.cpus_per_task, Some(32));
+        assert_eq!(job.account.as_deref(), Some("my-alloc"));
+    }
+
+    #[test]
+    fn an_empty_request_leaves_the_cluster_config_untouched() {
+        let cluster = SlurmJobConfig {
+            account: Some("cluster-alloc".into()),
+            gres: Some("gpu:1".into()),
+            mem_per_cpu: Some("4G".into()),
+            ..Default::default()
+        };
+        assert_eq!(cluster.overlaid_with(&ResourceSpec::default()), cluster);
+    }
+
+    #[test]
+    fn a_per_job_memory_total_replaces_a_per_cpu_default() {
+        // sbatch_directives refuses both --mem and --mem-per-cpu, so the
+        // overlay must clear the one it supersedes rather than collide.
+        let cluster = SlurmJobConfig { mem_per_cpu: Some("4G".into()), ..Default::default() };
+        let job = cluster.overlaid_with(&ResourceSpec { memory_gb: Some(256), ..Default::default() });
+        assert_eq!(job.mem.as_deref(), Some("256G"));
+        assert_eq!(job.mem_per_cpu, None);
+        assert!(sbatch_directives(&Uuid::nil(), "gpu", &job).is_ok());
+    }
+
+    #[test]
+    fn a_gpu_request_reaches_the_sbatch_script() {
+        let job = SlurmJobConfig::default().overlaid_with(&ResourceSpec {
+            gpus: Some(4),
+            gpu_class: Some("a100".into()),
+            walltime_secs: Some(21_600),
+            nodes: Some(2),
+            ..Default::default()
+        });
+        let directives = sbatch_directives(&Uuid::nil(), "gpu", &job).unwrap();
+        let script = directives.join("\n");
+        assert!(script.contains("#SBATCH --gres=gpu:a100:4"), "got: {script}");
+        assert!(script.contains("#SBATCH --time=06:00:00"), "got: {script}");
+        assert!(script.contains("#SBATCH --nodes=2"), "got: {script}");
+    }
+
     fn ssh_to(host: &str) -> ByocTarget {
         ByocTarget::Ssh {
             host: host.into(),
@@ -1121,6 +1289,7 @@ mod tests {
             name: "n".into(),
             image: "img".into(),
             inputs: serde_json::json!({}),
+        resources: Default::default(),
         };
 
         let refusals = [

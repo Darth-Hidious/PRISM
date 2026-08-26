@@ -44,8 +44,29 @@ class AlgorithmRegistry:
         return self._algorithms.get(name, {}).get("pretrained", False)
 
 
+_DEFAULT_REGISTRY: "AlgorithmRegistry | None" = None
+
+
 def get_default_registry() -> AlgorithmRegistry:
-    """Pre-loaded with the built-in algorithms."""
+    """The ONE process-wide registry, pre-loaded with the built-in algorithms.
+
+    It has to be a singleton, not a fresh build per call. `app/plugins/
+    bootstrap.py` passes the result to plugins so they can register their own
+    algorithms, and `app/tools/ml/trainer.py` resolves every training request
+    through it. While each call built its own instance those were two
+    different objects: a plugin registered `extra_trees` successfully,
+    `has("extra_trees")` said True, and `train_model(algorithm="extra_trees")`
+    still raised "Unknown algorithm: extra_trees" — the documented extension
+    point was wired to nothing on the only path that consumes it.
+    """
+    global _DEFAULT_REGISTRY
+    if _DEFAULT_REGISTRY is None:
+        _DEFAULT_REGISTRY = _build_default_registry()
+    return _DEFAULT_REGISTRY
+
+
+def _build_default_registry() -> AlgorithmRegistry:
+    """Construct a registry holding the built-in algorithms."""
     reg = AlgorithmRegistry()
 
     # -- Composition-based (sklearn, need training) --------------------------

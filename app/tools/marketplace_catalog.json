@@ -102,6 +102,7 @@
       "author": "Mirdyne (PRISM)",
       "version": "1.0.0",
       "requires_extras": [],
+      "optional_extras": ["ml"],
       "tools": [
         {"name": "materials_search", "requires_extras": []},
         {"name": "query_materials_project", "requires_extras": []}
@@ -112,6 +113,7 @@
         "kind": "agent_tools",
         "tools": ["materials_search", "query_materials_project"],
         "requires_extras": [],
+        "optional_extras": ["ml"],
         "install": {
           "method": "bundled",
           "package": "prism-platform",
@@ -271,7 +273,7 @@
       "author": "Mirdyne (PRISM)",
       "version": "1.0.0",
       "requires_extras": [],
-      "optional_extras": ["reports"],
+      "optional_extras": ["reports", "ml"],
       "tools": [
         {"name": "dataset", "requires_extras": []},
         {"name": "select_materials", "requires_extras": []},
@@ -285,7 +287,7 @@
         "kind": "agent_tools",
         "tools": ["dataset", "select_materials", "plot", "generate_report", "plan_simulations"],
         "requires_extras": [],
-        "optional_extras": ["reports"],
+        "optional_extras": ["reports", "ml"],
         "install": {
           "method": "bundled",
           "package": "prism-platform",

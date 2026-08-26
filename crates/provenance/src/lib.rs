@@ -578,7 +578,7 @@ fn opt_to_value(s: &Option<String>) -> Value {
 /// the ALTER raises "duplicate column name"; we swallow that specific case so
 /// the migration is idempotent across opens. Any OTHER error (e.g. the table
 /// itself missing — which would indicate a corrupted schema) is propagated.
-async fn add_column_if_absent(
+pub(crate) async fn add_column_if_absent(
     conn: &turso::Connection,
     table: &str,
     column: &str,
@@ -2093,8 +2093,35 @@ impl ProvenanceStore {
         })
     }
 
-    /// Pending proposals, oldest first, with the number of citations backing
-    /// each. The review surface's work queue.
+    /// How many proposals are pending in total.
+    ///
+    /// Returned alongside a truncated listing so "100 of 346" is visible. A
+    /// list that silently shows a window is the same defect as a reader that
+    /// reports a prefix as the whole document.
+    pub async fn pending_ontology_proposal_count(&self) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM ontology_proposal_queue", ())
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(0);
+        };
+        Ok(row.get_value(0)?.as_integer().copied().unwrap_or(0))
+    }
+
+    /// Pending proposals, **newest first**, with the number of citations
+    /// backing each. The review surface's work queue.
+    ///
+    /// Newest first, and the total is reported separately by
+    /// [`Self::pending_ontology_proposal_count`], because the question this
+    /// surface is actually asked is "did the ingest I just ran propose
+    /// anything?" — and oldest-first + a LIMIT made that question
+    /// unanswerable. Measured 2026-08-25: an ingest queued five catalysis
+    /// classes (SingleAtomCatalyst, ElectrochemicalCO2Reduction, ...) and a
+    /// `list --limit 100` issued FOURTEEN SECONDS later could not see them,
+    /// because they sat at positions ~342-346 of 346. The reader concluded the
+    /// ontology had proposed nothing and reported that — a false negative
+    /// produced entirely by sort order.
     pub async fn pending_ontology_proposals(
         &self,
         limit: i64,
@@ -2107,7 +2134,7 @@ impl ProvenanceStore {
                  FROM ontology_proposal_queue q \
                  LEFT JOIN ontology_proposal_sighting s ON s.item_id = q.item_id \
                  GROUP BY q.item_id \
-                 ORDER BY q.enqueued_at, q.item_id LIMIT ?1",
+                 ORDER BY q.enqueued_at DESC, q.item_id DESC LIMIT ?1",
                 vec![Value::Integer(limit)],
             )
             .await?;
@@ -3031,6 +3058,62 @@ pub fn new_record(
 
 #[cfg(test)]
 mod tests {
+
+    /// F52b: proposals list NEWEST first, and reports the total.
+    ///
+    /// Oldest-first + a LIMIT made the one question this surface exists to
+    /// answer — "did the ingest I just ran propose anything?" — unanswerable.
+    /// Measured 2026-08-25: five catalysis classes were queued and a
+    /// `list --limit 100` fourteen seconds later could not see them, because
+    /// they were rows ~342-346 of 346.
+    #[tokio::test]
+    async fn the_newest_proposals_are_visible_first_and_the_total_is_reported() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = ProvenanceStore::open(&dir.path().join("p.db"))
+            .await
+            .expect("store opens");
+
+        for (i, label) in ["OldestClass", "MiddleClass", "NewestClass"]
+            .iter()
+            .enumerate()
+        {
+            store
+                .enqueue_ontology_proposal(
+                    &OntologyProposalItem {
+                        item_id: format!("item-{i}"),
+                        kind: "class".into(),
+                        label: (*label).into(),
+                        document: format!("doc-{i}"),
+                        tenant: "t".into(),
+                        proposal_json: "{}".into(),
+                        enqueued_at: 1000.0 + i as f64,
+                    },
+                    "{}",
+                    1000.0 + i as f64,
+                )
+                .await
+                .expect("enqueue");
+        }
+
+        // A window of ONE must show the NEWEST, not the oldest.
+        let page = store.pending_ontology_proposals(1).await.expect("list");
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            page[0].0.label, "NewestClass",
+            "a limited listing must surface the most recent proposal, or an ingest's \
+             own output is invisible to the run that produced it"
+        );
+
+        // And the caller must be able to tell the window is a window.
+        assert_eq!(
+            store
+                .pending_ontology_proposal_count()
+                .await
+                .expect("count"),
+            3,
+            "the total must be reachable so 1-of-3 is distinguishable from all-of-1"
+        );
+    }
     use super::*;
 
     fn repair_item(id: &str, class: &str) -> RepairItem {

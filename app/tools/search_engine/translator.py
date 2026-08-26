@@ -54,6 +54,32 @@ def optimade_reduced_formula(formula: str) -> str | None:
     )
 
 
+def _it_number_for_symbol(symbol: str) -> int | None:
+    """Hermann-Mauguin symbol -> International Tables number, or None.
+
+    `space_group_symbol_hermann_mauguin` is an OPTIONAL OPTIMADE field.
+    Measured 2026-08-25: sending it made cod, mpds, matterverse, nmd and tcod
+    all return **400 Bad Request** — they reject the WHOLE query rather than
+    ignoring one unsupported term, so a space-group filter silently cost every
+    result from those providers. `space_group_it_number` is the widely
+    supported form.
+
+    The mapping comes from pymatgen (already a dependency of the `ml` extra),
+    never from a hand-typed table: a wrong space group is worse than no filter.
+    If pymatgen is absent or the symbol is unrecognised, return None and let the
+    caller fall back to the symbol form — degrading to the old behaviour, never
+    to a WRONG number.
+    """
+    try:
+        from pymatgen.symmetry.groups import SpaceGroup
+    except ImportError:
+        return None
+    try:
+        return int(SpaceGroup(str(symbol).strip()).int_number)
+    except Exception:
+        return None
+
+
 class QueryTranslator:
     """Converts MaterialSearchQuery into provider-specific query formats."""
 
@@ -95,6 +121,10 @@ class QueryTranslator:
             sg = query.space_group
             if isinstance(sg, int) or str(sg).strip().isdigit():
                 parts.append(f"space_group_it_number={int(str(sg).strip())}")
+            elif (it_number := _it_number_for_symbol(sg)) is not None:
+                # Prefer the widely-supported numeric field; sending the
+                # optional symbol field 400s most providers outright.
+                parts.append(f"space_group_it_number={it_number}")
             else:
                 parts.append(f'space_group_symbol_hermann_mauguin="{sg}"')
 

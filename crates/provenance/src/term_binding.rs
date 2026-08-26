@@ -58,6 +58,19 @@ pub struct TermBinding {
     /// Governance-queue item id when rung 4 enqueued a class proposal —
     /// the pending-extension pointer a fact stays associated with.
     pub proposal_item_id: Option<String>,
+    /// The class this term was scored AGAINST — recorded even when the score
+    /// fell below threshold and nothing was bound.
+    ///
+    /// Without it `score` is uninterpretable and the threshold cannot be
+    /// tuned, which is the stated reason scores are recorded at all.
+    /// Measured 2026-08-26 on a real corpus: 80 rows carried a score, **zero**
+    /// named the candidate, so "0.761" meant 0.761-against-what. It also
+    /// blocks adjudication — a judge asked "are these the same concept?"
+    /// needs BOTH names, and only one was stored.
+    pub nearest_class_iri: Option<String>,
+    /// Human-readable label of [`Self::nearest_class_iri`], so a reviewer or
+    /// a judge sees "solidus temperature", not an opaque IRI.
+    pub nearest_label: Option<String>,
     /// RFC 3339 timestamp of the resolution.
     pub resolved_at: String,
 }
@@ -96,12 +109,18 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
             threshold REAL,
             model TEXT,
             proposal_item_id TEXT,
+            nearest_class_iri TEXT,
+            nearest_label TEXT,
             resolved_at TEXT NOT NULL,
             PRIMARY KEY (tenant, term)
         )"#,
         (),
     )
     .await?;
+    // Legacy stores predate the near-miss candidate columns; CREATE TABLE IF
+    // NOT EXISTS does not upgrade them.
+    crate::add_column_if_absent(conn, "ontology_term_binding", "nearest_class_iri", "TEXT").await?;
+    crate::add_column_if_absent(conn, "ontology_term_binding", "nearest_label", "TEXT").await?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_ontology_term_binding_tenant \
          ON ontology_term_binding(tenant)",
@@ -197,8 +216,9 @@ impl ProvenanceStore {
             .execute(
                 r#"INSERT INTO ontology_term_binding
                    (tenant, term, verbatim, class_iri, ontology_id, rung,
-                    score, threshold, model, proposal_item_id, resolved_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    score, threshold, model, proposal_item_id, resolved_at,
+                    nearest_class_iri, nearest_label)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                    ON CONFLICT(tenant, term) DO UPDATE SET
                        verbatim = excluded.verbatim,
                        class_iri = excluded.class_iri,
@@ -208,6 +228,8 @@ impl ProvenanceStore {
                        threshold = excluded.threshold,
                        model = excluded.model,
                        proposal_item_id = excluded.proposal_item_id,
+                       nearest_class_iri = excluded.nearest_class_iri,
+                       nearest_label = excluded.nearest_label,
                        resolved_at = excluded.resolved_at
                    WHERE ontology_term_binding.class_iri IS NULL
                       OR excluded.rung <= ontology_term_binding.rung"#,
@@ -223,6 +245,8 @@ impl ProvenanceStore {
                     opt_text(&binding.model),
                     opt_text(&binding.proposal_item_id),
                     Value::Text(binding.resolved_at.clone()),
+                    opt_text(&binding.nearest_class_iri),
+                    opt_text(&binding.nearest_label),
                 ],
             )
             .await?;
@@ -234,7 +258,8 @@ impl ProvenanceStore {
         let mut bindings = self
             .query_bindings(
                 "SELECT tenant, term, verbatim, class_iri, ontology_id, rung, \
-                 score, threshold, model, proposal_item_id, resolved_at \
+                 score, threshold, model, proposal_item_id, resolved_at, \
+                      nearest_class_iri, nearest_label \
                  FROM ontology_term_binding WHERE tenant = ?1 AND term = ?2",
                 vec![
                     Value::Text(tenant.to_string()),
@@ -249,7 +274,8 @@ impl ProvenanceStore {
     pub async fn term_bindings(&self, tenant: &str) -> Result<Vec<TermBinding>> {
         self.query_bindings(
             "SELECT tenant, term, verbatim, class_iri, ontology_id, rung, \
-             score, threshold, model, proposal_item_id, resolved_at \
+             score, threshold, model, proposal_item_id, resolved_at, \
+                  nearest_class_iri, nearest_label \
              FROM ontology_term_binding WHERE tenant = ?1 ORDER BY term",
             vec![Value::Text(tenant.to_string())],
         )
@@ -260,7 +286,8 @@ impl ProvenanceStore {
     pub async fn unbound_term_bindings(&self, tenant: &str) -> Result<Vec<TermBinding>> {
         self.query_bindings(
             "SELECT tenant, term, verbatim, class_iri, ontology_id, rung, \
-             score, threshold, model, proposal_item_id, resolved_at \
+             score, threshold, model, proposal_item_id, resolved_at, \
+                  nearest_class_iri, nearest_label \
              FROM ontology_term_binding \
              WHERE tenant = ?1 AND class_iri IS NULL ORDER BY term",
             vec![Value::Text(tenant.to_string())],
@@ -288,6 +315,8 @@ impl ProvenanceStore {
                 model: get_opt_str(&row, 8)?,
                 proposal_item_id: get_opt_str(&row, 9)?,
                 resolved_at: get_str(&row, 10)?,
+                nearest_class_iri: get_opt_str(&row, 11)?,
+                nearest_label: get_opt_str(&row, 12)?,
             });
         }
         Ok(bindings)
@@ -510,6 +539,8 @@ mod tests {
             model: score.map(|_| "test:mock".into()),
             proposal_item_id: None,
             resolved_at: "2026-08-24T00:00:00Z".into(),
+            nearest_class_iri: None,
+            nearest_label: None,
         }
     }
 
@@ -528,6 +559,44 @@ mod tests {
     /// upgradable by anything (that IS re-resolution), a bound row refuses a
     /// weaker rung, accepts an equal-rung refresh, and accepts a stronger
     /// rung.
+    /// A below-threshold term must keep the class it nearly matched.
+    ///
+    /// Measured 2026-08-26: 80 rows carried a score and ZERO named the
+    /// candidate, so "0.761" meant 0.761-against-what — the threshold could
+    /// not be calibrated from its own recorded data, and a judge asked "are
+    /// these the same concept?" had only one of the two names.
+    #[tokio::test]
+    async fn a_near_miss_records_what_it_nearly_matched() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.expect("store opens");
+
+        let mut miss = unbound(Some(0.761), None);
+        miss.nearest_class_iri = Some("https://w3id.org/emmo#SolidusTemperature".into());
+        miss.nearest_label = Some("solidus temperature".into());
+        store.record_term_binding(&miss).await.expect("record");
+
+        let back = store
+            .term_binding(&miss.tenant, &miss.term)
+            .await
+            .expect("read")
+            .expect("row exists");
+
+        assert!(
+            back.class_iri.is_none(),
+            "still unbound — this is a near MISS"
+        );
+        assert_eq!(back.score, Some(0.761));
+        assert_eq!(
+            back.nearest_label.as_deref(),
+            Some("solidus temperature"),
+            "a score with no candidate cannot calibrate a threshold or be judged"
+        );
+        assert_eq!(
+            back.nearest_class_iri.as_deref(),
+            Some("https://w3id.org/emmo#SolidusTemperature")
+        );
+    }
+
     #[tokio::test]
     async fn bound_rows_never_downgrade_and_unbound_rows_upgrade() {
         let db = TempDb::new();

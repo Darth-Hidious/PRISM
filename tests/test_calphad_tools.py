@@ -196,3 +196,47 @@ class TestCalculateToolsWithMock:
 
         result = _list_phases(database_name="nonexistent")
         assert "error" in result
+
+
+class TestComputeGateOrder:
+    """`calphad_compute` must check pycalphad BEFORE resolving a TDB source.
+
+    Regression: source resolution ran first, so on a machine without
+    pycalphad the agent was handed a licensing refusal ("No validated TDB
+    covers Al-Ni") whose install_hint told it to configure or *acquire* an
+    entitled thermodynamic database. Following that hint costs money and
+    still leaves the tool unable to compute, because the engine itself is
+    missing. The missing-extra shape was unreachable for every caller
+    without an entitled source, and a platform entitlement lookup was made
+    for a computation that could never run.
+    """
+
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_missing_pycalphad_short_circuits_source_resolution(self, _check):
+        from app.tools.calphad import _calphad_compute
+
+        resolver = MagicMock()
+        with patch(
+            "app.tools.licensed_sources.get_licensed_source_resolver",
+            return_value=resolver,
+        ):
+            result = _calphad_compute(
+                action="gibbs",
+                components=["Al", "Ni"],
+                phases=["FCC_A1"],
+                temperature=1000.0,
+            )
+
+        resolver.resolve.assert_not_called()
+        assert result["requires_extra"] == "calphad"
+        assert "pycalphad" in result["error"]
+        assert result["install_hint"] == "pip install pycalphad scheil"
+
+    @patch("app.tools.simulation.calphad_bridge.check_calphad_available", return_value=False)
+    def test_argument_errors_still_beat_the_engine_gate(self, _check):
+        """Cheap local argument validation stays first — a missing `action`
+        must still say so rather than be masked by the dependency gate."""
+        from app.tools.calphad import _calphad_compute
+
+        assert "Missing 'action'" in _calphad_compute()["error"]
+        assert "components" in _calphad_compute(action="gibbs")["error"]

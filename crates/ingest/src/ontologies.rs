@@ -1962,7 +1962,7 @@ mod tests {
         let ontology = active(Some(MATKG_ONTOLOGY_ID)).expect("matkg is built in");
         assert_eq!(
             ontology.version_iri().as_str(),
-            "https://marc27.com/ontology/matkg/1.4"
+            "https://mirdyne.com/ontology/matkg/1.4"
         );
         let labels: Vec<&str> = ontology
             .classes()
@@ -1991,7 +1991,7 @@ mod tests {
                 class
                     .iri
                     .as_str()
-                    .starts_with("https://marc27.com/ontology/matkg#"),
+                    .starts_with("https://mirdyne.com/ontology/matkg#"),
                 "MatKG identities are PRISM-minted, never http://example.com: {}",
                 class.iri
             );
@@ -2004,7 +2004,7 @@ mod tests {
             .expect("the one MatKG relationship resolves");
         assert_eq!(
             relation.iri.as_str(),
-            "https://marc27.com/ontology/matkg#cooccursWith"
+            "https://mirdyne.com/ontology/matkg#cooccursWith"
         );
 
         let tenant = storage_tenant("local", MATKG_ONTOLOGY_ID);

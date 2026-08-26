@@ -14,8 +14,9 @@ of silently extrapolating. For HEA single-phase screening use
 
 Python 3.14 note: pycalphad depends on symengine, which has no 3.14 wheel yet.
 On 3.14 these tools degrade with an honest error pointing to the install path
-(`pip install prism-platform[calphad]`) or the py3.12 sidecar — exactly like the
-existing calphad_compute tool. On 3.12/3.13 they run natively.
+(app/tools/_extras.py names the distributions directly — `prism-platform` is on
+no index) or the py3.12 sidecar — exactly like the existing calphad_compute
+tool. On 3.12/3.13 they run natively.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -120,19 +122,21 @@ def _calphad_available() -> bool:
 
 
 def _missing_error() -> dict:
-    return {
-        "error": (
+    # One missing-dependency shape (app/tools/_extras.py). The hand-rolled
+    # dict this replaced carried no `requires_extra` for a caller to branch
+    # on, and its `install_hint` was `pip install prism-platform[calphad]` —
+    # prism-platform is on no index, so that command 404s (see
+    # _extras.install_command).
+    return missing_extra_error(
+        "calphad",
+        (
             "pycalphad is not installed. This tool needs the [calphad] extra. "
-            "Use `prism provision extra calphad` (or pip install "
-            "prism-platform[calphad]). Note: pycalphad depends on "
-            "symengine, which has no Python 3.14 wheel yet — on 3.14 use the "
-            "py3.12 sidecar (`prism doctor` checks it). On 3.12/3.13 it installs "
-            "natively."
+            "Note: pycalphad depends on symengine, which has no Python 3.14 "
+            "wheel yet — on 3.14 use the py3.12 sidecar (`prism doctor` checks "
+            "it). On 3.12/3.13 it installs natively."
         ),
-        "install_hint": "pip install prism-platform[calphad]",
-        "provision_command": "prism provision extra calphad",
-        "tool_available": False,
-    }
+        tool_available=False,
+    )
 
 
 def _resolve_tdb_path(database: str | None) -> Path | None:

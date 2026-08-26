@@ -118,9 +118,21 @@ for _line in _PAIR_DATA.strip().split("\n"):
         _DH_MIX_PAIRS[(_b, _a)] = float(_val)
 
 
-def _dh_mix_for_pair(a: str, b: str) -> float:
-    """Binary mixing enthalpy ΔH_mix(A,B) in kJ/mol (0 = ideal)."""
-    return _DH_MIX_PAIRS.get((a, b), 0.0)
+def _dh_mix_for_pair(a: str, b: str) -> float | None:
+    """Binary mixing enthalpy ΔH_mix(A,B) in kJ/mol, or None if untabulated.
+
+    None is NOT zero. The Takeuchi-Inoue table carries genuine zeros — Fe-W,
+    Nb-Ta, Ti-V, Mo-W and Hf-Ti among them — so an absent pair defaulted to
+    0.0 would be indistinguishable from a measured ideal-solution pair, in the
+    payload and in every downstream average.
+
+    It also errs in the dangerous direction. Ω = Tm·ΔS_mix / |ΔH_mix| grows as
+    |ΔH_mix| shrinks, so invented zeros inflate Ω and make `solid_solution` the
+    MORE likely verdict. The pair table spans 19 elements while `_VEC` spans
+    54, so this is the common case for anything outside the classic 3d and
+    refractory families, not a corner.
+    """
+    return _DH_MIX_PAIRS.get((a, b))
 
 
 def _validate_composition_components(
@@ -338,8 +350,10 @@ def compute_hea_descriptors(
       - δ (atomic-size mismatch, %, Goldschmidt CN12 metallic radii)
       - Δχ (electronegativity difference, Pauling)
       - phase_prediction (solid_solution | solid_solution_segregation_risk |
-        intermetallic_or_segregated) via Yang Ω+δ, with a demixing flag for
-        positive-ΔH_mix compositions (e.g. Cu-bearing 3d HEAs)
+        intermetallic_or_segregated | undetermined) via Yang Ω+δ, with a
+        demixing flag for positive-ΔH_mix compositions (e.g. Cu-bearing 3d
+        HEAs). `undetermined` means the criteria could not be evaluated —
+        see `data_gaps` for the missing datum, never a silent zero.
     """
     elems, fracs = _validate_composition_components(elems, fracs)
     n = len(elems)
@@ -349,14 +363,31 @@ def compute_hea_descriptors(
     dS_mix = -R * sum(f * math.log(f) for f in fracs if f > 0)
 
     # ΔH_mix = 4 Σ_{i≠j} c_i c_j ΔH_mix(i,j)  (Miedema, regular-solution form)
-    dH_mix = 0.0
-    for i in range(n):
-        for j in range(i + 1, n):
-            dH_mix += fracs[i] * fracs[j] * _dh_mix_for_pair(elems[i], elems[j])
-    dH_mix *= 4.0  # kJ/mol
+    #
+    # One untabulated pair makes the SUM unknown, not partial — there is no
+    # honest number to contribute in its place, and a term silently omitted is
+    # a term asserted to be zero.
+    pair_values = {
+        (i, j): _dh_mix_for_pair(elems[i], elems[j])
+        for i in range(n)
+        for j in range(i + 1, n)
+    }
+    missing_pairs = [f"{elems[i]}-{elems[j]}" for (i, j), value in pair_values.items() if value is None]
+    dH_mix: float | None = None
+    if not missing_pairs:
+        dH_mix = 4.0 * sum(  # kJ/mol
+            fracs[i] * fracs[j] * value
+            for (i, j), value in pair_values.items()
+            if value is not None
+        )
 
-    # VEC = Σ c_i VEC_i  (Guo/Liu)
-    vec = sum(fracs[i] * _VEC.get(elems[i], 0.0) for i in range(n))
+    # VEC = Σ c_i VEC_i  (Guo/Liu). An element absent from the table has no
+    # honest contribution either: 0.0 drags the weighted mean down and hands
+    # the Guo/Liu threshold a fabricated structure call.
+    missing_vec = [element for element in elems if element not in _VEC]
+    vec: float | None = None
+    if not missing_vec:
+        vec = sum(fracs[i] * _VEC[elems[i]] for i in range(n))
 
     # δ = sqrt(Σ c_i (1 - r_i/r_bar)^2)  ×100 (%)  (atomic-size mismatch,
     # Goldschmidt CN12 metallic radii — the convention of the HEA δ literature)
@@ -395,13 +426,16 @@ def compute_hea_descriptors(
 
     # Ω = Tm·ΔS_mix / |ΔH_mix|  (Yang solid-solution parameter; ΔS in kJ for unit match)
     omega = None
-    if tm_bar and abs(dH_mix) > 1e-9:
+    if tm_bar and dH_mix is not None and abs(dH_mix) > 1e-9:
         omega = (tm_bar * (dS_mix / 1000.0)) / abs(dH_mix)  # ΔS→kJ/(mol·K)
 
     # Phase prediction (Yang 2012 + Guo/Liu 2011):
     #  Solid solution likely when Ω ≥ 1.1 AND δ ≤ 6.6%
     #  VEC ≥ 8.0 → FCC; VEC < 6.87 → BCC; 6.87 ≤ VEC < 8.0 → FCC+BCC mixed
-    phase = "intermetallic_or_segregated"
+    # Default only applies when the criteria were actually evaluated; an
+    # un-evaluated screen reports `undetermined` rather than borrowing the
+    # negative verdict, which reads identically to a real one downstream.
+    phase = "intermetallic_or_segregated" if (omega is not None and delta is not None) else "undetermined"
     criterion_notes = []
     if omega is not None and delta is not None:
         if omega >= 1.1 and delta <= 6.6:
@@ -420,15 +454,15 @@ def compute_hea_descriptors(
     # second FCC phase via spinodal-like segregation). Flag it, never silently
     # return solid_solution.
     segregation_risk = False
-    if phase == "solid_solution" and dH_mix > 0:
+    if phase == "solid_solution" and dH_mix is not None and dH_mix > 0:
         segregation_risk = True
         phase = "solid_solution_segregation_risk"
         pos_pairs = sorted(
             (
-                (elems[i], elems[j], _dh_mix_for_pair(elems[i], elems[j]))
+                (elems[i], elems[j], value)
                 for i in range(n)
                 for j in range(i + 1, n)
-                if _dh_mix_for_pair(elems[i], elems[j]) > 0
+                if (value := _dh_mix_for_pair(elems[i], elems[j])) is not None and value > 0
             ),
             key=lambda p: -p[2],
         )
@@ -453,16 +487,59 @@ def compute_hea_descriptors(
         else:
             criterion_notes.append(f"VEC={vec:.2f} ≥ 8.0 → FCC favored (Guo & Liu 2011)")
 
+    # A null with no reason is indistinguishable from a bug. Say WHICH datum
+    # is missing, so the caller can go and get it instead of guessing.
+    data_gaps: list[str] = []
+    if missing_pairs:
+        data_gaps.append(
+            "delta_H_mix, omega and the Yang criterion are unavailable: no tabulated "
+            f"Takeuchi-Inoue mixing enthalpy for {', '.join(missing_pairs)}"
+        )
+    if missing_vec:
+        data_gaps.append(
+            "VEC and the Guo/Liu structure call are unavailable: no tabulated "
+            f"valence electron concentration for {', '.join(missing_vec)}"
+        )
+    # `undetermined` with an EMPTY data_gaps list is the null-with-no-reason
+    # this contract exists to prevent, and the pair table's genuine zeros reach
+    # it: Nb0.5Ta0.5 has every pair tabulated, ΔH_mix = 0.0, and Ω is then a
+    # division by zero — the tool returned phase_prediction "undetermined",
+    # omega null and data_gaps [], with nothing saying which datum was missing.
+    # Same for a missing melting point or metallic radius.
+    if dH_mix is not None and omega is None:
+        if tm_bar is None:
+            data_gaps.append(
+                "omega and the Yang criterion are unavailable: pymatgen has no "
+                f"melting point for at least one of {', '.join(elems)}, so the "
+                "Tm estimate Ω needs could not be formed"
+            )
+        else:
+            data_gaps.append(
+                f"omega and the Yang criterion are unavailable: delta_H_mix is "
+                f"{dH_mix:.2f} kJ/mol, so Yang's Ω = Tm·ΔS_mix/|ΔH_mix| is a "
+                "division by zero. The Takeuchi-Inoue pair values are tabulated "
+                "to whole kJ/mol, so a summed zero is not evidence of an exactly "
+                "athermal solution — it is a resolution limit"
+            )
+    if delta is None:
+        data_gaps.append(
+            "delta_radius_pct and the Yang criterion are unavailable: pymatgen "
+            f"has no Goldschmidt CN12 metallic radius for at least one of "
+            f"{', '.join(elems)}"
+        )
+    criterion_notes.extend(data_gaps)
+
     result = {
-        "delta_H_mix_kJ_per_mol": round(dH_mix, 2),
+        "delta_H_mix_kJ_per_mol": round(dH_mix, 2) if dH_mix is not None else None,
         "delta_S_mix_J_per_molK": round(dS_mix, 2),
         "omega": round(omega, 3) if omega is not None else None,
-        "VEC": round(vec, 3),
+        "VEC": round(vec, 3) if vec is not None else None,
         "delta_radius_pct": round(delta, 3) if delta is not None else None,
         "delta_chi": round(dchi, 4) if dchi is not None else None,
         "Tm_estimate_K": round(tm_bar, 1) if tm_bar is not None else None,
         "phase_prediction": phase,
         "segregation_risk": segregation_risk,
+        "data_gaps": data_gaps,
         "criterion": "Yang (Ω, δ) + Guo/Liu (VEC) — empirical screening, not phase equilibria",
         "rationale": criterion_notes,
         "n_elements": n,

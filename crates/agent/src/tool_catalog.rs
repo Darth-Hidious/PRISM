@@ -96,7 +96,10 @@ pub fn definition_tokens(def: &ToolDefinition) -> usize {
 /// The umbrella `query` does not cover the gap. Its description ("run `prism
 /// query ...`") says nothing about which store it reads, so it loses to a
 /// sibling that describes itself confidently.
-pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search", "query_local", "query_platform"];
+/// `query` now carries every store behind its `scope` argument, so pinning the
+/// one name pins all three. The old four-name list existed because the local
+/// and platform tools could be admitted independently — and once were, wrongly.
+pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search"];
 
 /// Tool names this codebase has renamed away from.
 ///
@@ -108,6 +111,12 @@ pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search", "query_local"
 /// all of them.
 pub const RENAMED_AWAY: &[&str] = &[
     "search_materials",
+    // Collapsed into `query(scope=local|platform|federated)`. They remain
+    // executable as aliases, but they are no longer OFFERED names, so no
+    // model-facing list may name them.
+    "query_local",
+    "query_platform",
+    "query_federated",
     "knowledge_search",
     "predict_property",
     "semantic_search",
@@ -492,6 +501,43 @@ mod tests {
     /// permission map — so a weak model never got the materials tool at all and
     /// the live tool fell through to the `WorkspaceWrite` default. One list
     /// being guarded is not the same as the drift being caught.
+    /// The complement of the RENAMED_AWAY guard below, and the bug that guard
+    /// cannot see: a name that is NOT renamed away, IS a real command tool, and
+    /// is still never offered because a filter removes it.
+    ///
+    /// `CORE_TOOL_SET` named `"query"` while `REDUNDANT_UMBRELLA_TOOLS`
+    /// guaranteed it was never in the catalog — so the weak models that get
+    /// ONLY that curated list were pointed at a name filtered out as absent.
+    /// Its own comment records the identical bug already shipping for the three
+    /// split `file` names. A curated list of tool names is a second registry,
+    /// and nothing was keeping it in sync with the first.
+    #[test]
+    fn curated_lists_only_name_tools_the_catalog_actually_offers() {
+        for (list_name, names) in [
+            ("ALWAYS_INCLUDE", ALWAYS_INCLUDE),
+            ("CORE_TOOL_SET", crate::prompt_profile::CORE_TOOL_SET),
+        ] {
+            for name in names {
+                // Python tool-server names cannot be resolved from here; this
+                // guard covers the half that CAN be checked, which is the half
+                // that broke.
+                if !crate::command_tools::is_command_tool(name) {
+                    continue;
+                }
+                for node_online in [true, false] {
+                    assert!(
+                        crate::command_tools::command_tools_filtered(node_online)
+                            .iter()
+                            .any(|tool| tool.name == *name),
+                        "{list_name} names `{name}`, which IS a command tool but \
+                         is filtered out of the offered catalog (node_online={node_online}) \
+                         — the model is told to use a tool it is never given"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn stale_tool_names_are_gone_from_every_model_facing_list() {
         for stale in RENAMED_AWAY {
@@ -523,22 +569,55 @@ mod tests {
     /// the free one.
     #[test]
     fn the_local_graph_is_always_offered_alongside_the_platform() {
+        // The pair can no longer be filtered apart: there is ONE `query` tool
+        // and the store is chosen by `scope`. So the invariant moves down a
+        // level — it is now about the scope enum, not about two tool names.
         assert!(
-            ALWAYS_INCLUDE.contains(&"query_local"),
+            ALWAYS_INCLUDE.contains(&"query"),
             "the user's own ingested graph must survive keyword filtering"
         );
-        assert_eq!(
-            ALWAYS_INCLUDE.contains(&"query_local"),
-            ALWAYS_INCLUDE.contains(&"query_platform"),
-            "local and platform search must be offered together — offering only \
-             the billed remote one is how the agent skipped the user's own data"
-        );
+        for stale in ["query_local", "query_platform", "query_federated"] {
+            assert!(
+                !ALWAYS_INCLUDE.contains(&stale),
+                "`{stale}` is no longer an offered name — it is a `query` scope"
+            );
+        }
+
+        let spec = crate::command_tools::command_tools_filtered(false)
+            .into_iter()
+            .find(|tool| tool.name == "query")
+            .expect(
+                "query must be offered with the node OFFLINE — the local \
+                     store is a file on disk and needs no node",
+            );
+        let scopes = spec.input_schema["properties"]["scope"]["enum"]
+            .as_array()
+            .expect("scope is an enum")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
         assert!(
-            crate::prompt_profile::CORE_TOOL_SET.contains(&"query_local"),
+            scopes.contains(&"local"),
+            "the free local store must always be reachable"
+        );
+        assert_eq!(
+            scopes.contains(&"local"),
+            scopes.contains(&"platform"),
+            "local and platform must be offered together — offering only the \
+             billed remote one is how the agent skipped the user's own data"
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["scope"]["default"], "local",
+            "an unspecified scope must read the user's FREE local graph, never \
+             the billed remote one"
+        );
+
+        assert!(
+            crate::prompt_profile::CORE_TOOL_SET.contains(&"query"),
             "a weak model must be able to read the local graph without credits"
         );
         assert_eq!(
-            get_tool_permission("query_local"),
+            get_tool_permission("query"),
             PermissionMode::ReadOnly,
             "reading the user's own local graph must not require approval"
         );

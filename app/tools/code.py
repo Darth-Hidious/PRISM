@@ -324,7 +324,7 @@ def _filter_traceback(raw_stderr: str, cwd: str = "", persist: bool = True) -> d
 def _child_env() -> dict:
     """Environment for the code subprocess.
 
-    Two headless-safety defaults (caller env wins if already set):
+    Headless-safety and legibility defaults (caller env wins if already set):
       - MPLBACKEND=Agg — the child is headless; matplotlib's default macOS
         backend ('macosx') can crash on plot/savefig. Force non-interactive Agg.
       - PYTHONFAULTHANDLER=1 — if a native library (numpy/torch/BLAS, …) segfaults
@@ -334,6 +334,17 @@ def _child_env() -> dict:
     env = {**os.environ}
     env.setdefault("MPLBACKEND", "Agg")
     env.setdefault("PYTHONFAULTHANDLER", "1")
+    # Python 3.13+ colourises tracebacks by default, and the child's stderr
+    # goes straight into the MODEL's context. Measured on 3.14: a plain
+    # `raise ValueError('boom')` came back as
+    #   \x1b[1;35mValueError\x1b[0m: \x1b[35mboom\x1b[0m
+    # so the literal text "ValueError: boom" was not present at all. That
+    # breaks any downstream matching on the error, and spends the agent's
+    # context on terminal escape codes it cannot use. PYTHON_COLORS is the
+    # interpreter's own switch; NO_COLOR is the cross-tool convention, so
+    # child processes that are not Python behave too. Caller env still wins.
+    env.setdefault("PYTHON_COLORS", "0")
+    env.setdefault("NO_COLOR", "1")
     return env
 
 

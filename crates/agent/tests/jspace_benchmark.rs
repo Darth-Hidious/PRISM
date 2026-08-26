@@ -209,7 +209,10 @@ fn retriever_fixtures_do_not_contain_evaluator_labels() {
     let cases = load_cases(CASES).expect("retriever case fixture must load");
     let pool = load_candidate_pool(CANDIDATES).expect("candidate fixture must load");
     assert_eq!(cases.len(), 16);
-    assert_eq!(pool.definitions.len(), 16);
+    // 14, not 16: `query_local`/`query_platform`/`query_federated` collapsed
+    // into one `query(scope=...)` candidate. Benchmark numbers from before that
+    // change are NOT comparable — the candidate pool shrank by two.
+    assert_eq!(pool.definitions.len(), 14);
 
     for case in &cases {
         for candidate_name in &pool.manifest.ordered_names {
@@ -222,7 +225,7 @@ fn retriever_fixtures_do_not_contain_evaluator_labels() {
     }
 
     let mut leaked: Value = serde_json::from_str(CASES).expect("fixture JSON");
-    leaked["cases"][0]["expected"] = json!({"name": "query_local"});
+    leaked["cases"][0]["expected"] = json!({"name": "query"});
     let leaked_raw = serde_json::to_string(&leaked).expect("mutated fixture serializes");
     let error = load_cases(&leaked_raw).expect_err("unknown truth fields must be rejected");
     assert!(

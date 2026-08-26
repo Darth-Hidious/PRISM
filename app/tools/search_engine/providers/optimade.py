@@ -229,9 +229,21 @@ class OptimadeProvider(Provider):
 
         returned = materials[:limit]
         # Truncated means "less than what was asked for despite more
-        # existing": a mid-chain failure, the safety cap, or a server that
-        # stopped serving next links while its own total says more matched.
-        truncated = len(returned) < limit and (
+        # existing": a mid-chain failure, the safety cap, a server that
+        # stopped serving next links while its own total says more matched,
+        # or THIS endpoint's own `behavior.max_results` cap clipping the
+        # request.
+        #
+        # "What was asked for" is `query.limit`, not `limit`: `limit` was
+        # already clipped to `behavior.max_results` above, so this compared
+        # the endpoint's own cap with itself and could never fire for the
+        # capped case. Live, against a stub reporting meta.data_returned=50
+        # with the endpoint configured max_results=5: limit=20 requested, 5
+        # rows returned, truncated=False. oqmd ships max_results=500 and the
+        # tool's limit goes to 10000, so this is the ordinary path, not an
+        # edge case — and it made the engine's `complete` flag read True on
+        # a 5-of-50 answer.
+        truncated = len(returned) < query.limit and (
             note is not None
             or (available is not None and available > len(returned))
         )

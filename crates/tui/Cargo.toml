@@ -10,6 +10,21 @@ authors.workspace = true
 ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true, features = ["event-stream"] }
 ratatui-textarea = "0.9"
+# Artifacts the agent produces must be SEEN, not reported as a file path. This
+# renders them as a normal ratatui widget taking a `Rect`, so PRISM keeps one
+# layout engine and the workspace pane cannot be drawn over (the failure in
+# tui-3-still-broken.png). Kitty / Sixel / iTerm2 with a halfblocks fallback,
+# protocol detected at runtime.
+#
+# `default-features = false` deliberately: the default set enables `chafa-dyn`,
+# which needs pkg-config and the chafa C library at build time. The terminal
+# graphics protocols are built in and do not depend on it, so dropping it costs
+# nothing and keeps the build free of a system dependency.
+# Decoding the artifact before `ratatui-image` re-encodes it for the
+# terminal. Pinned to the same major `ratatui-image` resolves (^0.25.6) so one
+# `DynamicImage` type crosses the boundary rather than two incompatible ones.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

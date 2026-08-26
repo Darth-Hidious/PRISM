@@ -58,6 +58,45 @@ def test_tier0_evaluation_produces_provenanced_properties():
     )
 
 
+def test_the_reproduce_string_and_candidate_echo_actually_replay():
+    """Provenance that cannot be replayed is not provenance.
+
+    `_reduced_formula` rounded every fraction to 4 dp, so for the most ordinary
+    HEA input there is — an equiatomic ternary — the composition echoed in
+    `result["candidate"]` and the `reproduce` line stamped into provenance both
+    summed to 0.9999 and were REJECTED by the very parser the reproduce line
+    tells you to feed them: "composition fractions must sum to 1.0 ± 0.000001;
+    got 0.999900". `result["candidate"]["fractions"]` had the same defect one
+    order down (0.999999 against a 1e-6 tolerance).
+    """
+    from app.tools.materials.hea import _parse_composition_or_raise
+
+    third = 1.0 / 3.0
+    result = ev.evaluate_candidate(
+        {"fractions": {"W": third, "Ta": third, "Mo": third}}, tier=0
+    )
+    echoed = result["candidate"]
+
+    # 1. The echoed formula parses back to the fractions actually evaluated.
+    elems, fracs = _parse_composition_or_raise(echoed["composition"])
+    assert elems == echoed["elements"]
+    assert fracs == pytest.approx([third, third, third], abs=0.0)
+
+    # 2. The echoed fraction list is the composition evaluated, not a rounding.
+    _parse_composition_or_raise(dict(zip(echoed["elements"], echoed["fractions"])))
+    assert echoed["fractions"] == pytest.approx([third, third, third], abs=0.0)
+
+    # 3. Replaying the reproduce string re-runs the SAME candidate.
+    reproduce = result["tiers"]["0"]["provenance"]["reproduce"]
+    assert echoed["composition"] in reproduce
+    replayed = ev.evaluate_candidate({"composition": echoed["composition"]}, tier=0)
+    assert "error" not in replayed, f"reproduce line does not replay: {replayed}"
+    assert (
+        replayed["tiers"]["0"]["properties"]["omega"]
+        == result["tiers"]["0"]["properties"]["omega"]
+    )
+
+
 def test_higher_tiers_are_opt_in():
     """Default fidelity is tier 0 — nothing expensive runs unasked."""
     result = ev.evaluate_candidate(WTM)

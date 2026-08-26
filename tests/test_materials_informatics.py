@@ -175,3 +175,55 @@ def test_screen_requires_at_least_one_filter():
     create_materials_informatics_tools(reg)
     out = reg.get("screen_materials").func()
     assert "error" in out
+
+
+def test_screen_materials_reports_rank_coverage():
+    """`ranked_by` must not assert a ranking the data cannot support.
+
+    `_rank_val` sends every candidate lacking the property to the SAME
+    sentinel, so a pool where nobody reports it comes back in the
+    federation's own order while the response still says
+    `ranked_by: "band_gap"`. Measured live: elements=['Cu','O'],
+    rank_by='band_gap' returned three candidates, all with
+    `properties: {}`, `ranked_by: "band_gap"` and `warnings: []`.
+    """
+    from app.tools.base import ToolRegistry
+    from app.tools.materials import create_materials_informatics_tools
+
+    reg = ToolRegistry()
+    create_materials_informatics_tools(reg)
+    screen = reg.get("screen_materials")
+
+    def _run(materials):
+        fake_ms = MagicMock()
+        fake_ms.func.return_value = {
+            "materials": materials,
+            "count": len(materials),
+            "coverage": {},
+            "providers_summary": {"succeeded": 1, "failed": 0},
+            "warnings": [],
+        }
+        with patch("app.tools.materials._shared.get_shared_registry") as mock_reg:
+            mock_reg.return_value = MagicMock(get=MagicMock(return_value=fake_ms))
+            return screen.func(elements=["Cu"], rank_by="band_gap", limit=10)
+
+    blind = _run([_fake_material("A"), _fake_material("B"), _fake_material("C")])
+    assert blind["rank_coverage"] == {
+        "property": "band_gap",
+        "candidates_with_value": 0,
+        "candidates_without_value": 3,
+    }, blind["rank_coverage"]
+    assert any("not a ranking" in w for w in blind["warnings"]), (
+        "a ranking over a property nobody reports must be flagged, not asserted: "
+        f"{blind['warnings']}"
+    )
+
+    partial = _run([_fake_material("A", band_gap=3.0), _fake_material("B")])
+    assert partial["rank_coverage"] == {
+        "property": "band_gap",
+        "candidates_with_value": 1,
+        "candidates_without_value": 1,
+    }, partial["rank_coverage"]
+    assert not any("not a ranking" in w for w in partial["warnings"]), (
+        "a real partial ranking must not be flagged as no ranking at all"
+    )

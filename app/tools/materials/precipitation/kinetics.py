@@ -284,14 +284,30 @@ def _validate_inputs(
 def _build_and_solve(spec: dict) -> dict:
     """Construct the kawin model and solve it. Called only after
     validation passed; any exception becomes a structured failure."""
-    from kawin.precipitation import (
-        MatrixParameters,
-        PrecipitateModel,
-        PrecipitateParameters,
-        TemperatureParameters,
-        VolumeParameter,
-    )
-    from kawin.thermo import BinaryThermodynamics, MulticomponentThermodynamics
+    try:
+        from kawin.precipitation import (
+            MatrixParameters,
+            PrecipitateModel,
+            PrecipitateParameters,
+            TemperatureParameters,
+            VolumeParameter,
+        )
+        from kawin.thermo import BinaryThermodynamics, MulticomponentThermodynamics
+    except ImportError as e:
+        # Failure discipline (module docstring): nothing raises out of run_kwn.
+        # The tool wrapper gates on check_precipitation_available(), but a direct
+        # call with a stageable TDB got a bare ModuleNotFoundError instead of the
+        # one missing-dependency shape.
+        from app.tools._extras import missing_extra_error
+
+        return missing_extra_error(
+            "precipitation",
+            "Precipitation kinetics (KWN) needs kawin, which is not importable "
+            f"in this PRISM install: {e}",
+            status="failed",
+            stage="dependency",
+            converged=False,
+        )
 
     # Python 3.14 / PEP 649 fix for pycalphad 0.11.2's Workspace (no-op
     # elsewhere). Without it every CALPHAD lookup inside kawin raises

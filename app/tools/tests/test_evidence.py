@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from app.tools.evidence import (
     EvidenceClass,
     EvidenceSource,
@@ -66,6 +68,12 @@ def test_evaluator_result_inherits_orange_boundary_condition() -> None:
 
 
 def test_polymer_computation_inherits_literature_input() -> None:
+    # This test evaluates a real candidate, so it needs the polymer extra. It
+    # carried no guard and therefore failed outright (RuntimeError, now the
+    # structured install hint) on any machine without RDKit — unnoticed because
+    # pyproject's `testpaths = ["tests"]` never collects this directory. Same
+    # idiom as app/tools/tests/test_polymer_flexibility.py.
+    pytest.importorskip("rdkit.Chem")
     from app.tools.materials.polymer.tools import evaluate_polymer_insulation
 
     candidate = json.dumps(
@@ -85,7 +93,46 @@ def test_polymer_computation_inherits_literature_input() -> None:
     tg = result["property_status"]["glass_transition_temperature_k"]
     assert tg["value"] == 448.0
     assert tg["unit"] == "QUDT:K"
+    # The rule this test is named for: a CITED_COMPUTATION is capped by its
+    # worst input, so a research-class identity keeps the Tg at research.
     assert tg["evidence_class"] == "research"
-    assert result["evidence_class"] == "research"
-    assert result["evidence_color"] == "orange"
+
+    # OLD ORACLE (wrong): this also asserted result["evidence_class"] ==
+    # "research" / colour orange. That was never a property of the evaluator —
+    # it was a property of a bug. `smiles` was the one representation whose
+    # structure the flexibility lookup could not reach, so this candidate
+    # reported exactly one value and the roll-up saw only the Tg. Handing the
+    # SAME molecule ("CC") to the repeat_unit or monomer representation already
+    # rolled up to indeterminate before that was fixed, because
+    # rotatable_bond_fraction is stamped MODEL_ASSERTION and roll_up_evidence
+    # takes the WORST reported property. Guard that rule instead, and guard it
+    # identically across representations so a silently dropped property can
+    # never satisfy this oracle again.
+    flexibility = result["property_status"]["rotatable_bond_fraction"]
+    assert flexibility["status"] == "computed", flexibility.get("reason")
+    assert flexibility["evidence_class"] == "indeterminate"
+    assert result["evidence_class"] == "indeterminate"
+    assert result["evidence_color"] == "red"
+
+    same_molecule_as_repeat_unit = evaluate_polymer_insulation(
+        json.dumps(
+            {
+                "representation": "repeat_unit",
+                "repeat_unit": "ethylene-like",
+                "repeat_unit_smiles": "CC",
+                "evidence_class": "research",
+                "fox_flory": {
+                    "number_average_molar_mass_g_per_mol": 50000.0,
+                    "tg_infinity_k": 450.0,
+                    "k_k_g_per_mol": 100000.0,
+                    "parameter_citation": "customer literature record",
+                },
+            }
+        )
+    )
+    assert (
+        same_molecule_as_repeat_unit["property_status"]
+        == result["property_status"]
+    )
+    assert same_molecule_as_repeat_unit["evidence_class"] == "indeterminate"
     assert result["rdkit_version"] == "2026.03.5"

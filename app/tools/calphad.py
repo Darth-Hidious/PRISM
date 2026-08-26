@@ -223,6 +223,17 @@ def _calphad_compute(**kwargs) -> dict:
         if "temperature" not in kwargs:
             return {"error": "Action 'gibbs' requires `temperature`"}
 
+    # The engine gate comes BEFORE source resolution. Every _calculate_*
+    # already calls _guard(), but resolution refuses first on any machine
+    # without an entitled TDB, so on a pycalphad-less install the agent only
+    # ever saw a licensing refusal whose install_hint says "configure/acquire
+    # a TDB" — advice that costs money and still would not let the tool run.
+    # Checking the local, free precondition first also avoids a platform
+    # entitlement round-trip for a computation that cannot happen.
+    err = _guard()
+    if err:
+        return err
+
     from app.tools.licensed_sources import (
         SourceRefusal,
         SourceRequest,

@@ -288,6 +288,56 @@ def test_s3_early_completion_cancels_slow_providers():
     assert statuses["fast2"] == "success"
 
 
+def test_s3_early_cancellation_is_never_charged_to_the_provider():
+    """A provider the ENGINE cancelled for sufficiency is not a failed one.
+
+    The cancellation is our decision, so it is no evidence about the provider
+    — the same rule the offline-policy branch already applies. Before the fix
+    the CancelledError fell into the failure branch: logged status="timeout",
+    error_type="CancelledError", error_message="unknown error"
+    (str(CancelledError()) is empty), a warning reading "Provider 'slowpoke'
+    failed", and record_failure(). Two searches were enough to reach
+    consecutive_failures >= 2 and OPEN the circuit of a provider that had done
+    nothing wrong, locking it out for the whole 300s cooldown and persisting
+    that to provider_health.json.
+
+    Two searches, because that is exactly what it took to open the circuit.
+    """
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.engine import SearchEngine
+
+    reg = ProviderRegistry()
+    reg.register(_ok_provider("fast1", delay=0.01, n=6))
+    reg.register(_ok_provider("fast2", delay=0.01, n=6))
+    reg.register(_slow_fail_provider("slowpoke", delay=30.0))
+    health = HealthManager(persist_path=None)
+    engine = SearchEngine(
+        registry=reg,
+        cache=SearchCache(disk_dir=None),
+        health_manager=health,
+    )
+
+    # Distinct queries so neither search is served from the cache.
+    for elements in (["Fe"], ["Ni"]):
+        result = asyncio.run(
+            engine.search(MaterialSearchQuery(elements=elements, limit=5))
+        )
+        statuses = {log.provider_id: log.status for log in result.query_log}
+        assert statuses["slowpoke"] == "skipped", (
+            f"cancelled for sufficiency, reported as {statuses['slowpoke']!r}"
+        )
+        assert not any("slowpoke" in w for w in result.warnings), result.warnings
+
+    h = health.get("slowpoke")
+    assert h.failure_count == 0, "our own cancellation must not count as a failure"
+    assert h.consecutive_failures == 0
+    assert h.circuit_state == "closed"
+    assert h.should_query() is True, (
+        "a healthy provider must not be locked out by the engine's own "
+        "early-termination"
+    )
+
+
 def test_engine_records_providers_own_query_description():
     """The audit trail records each provider's OWN intended query
     (describe_query), not a blanket OPTIMADE translation."""

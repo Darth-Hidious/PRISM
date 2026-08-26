@@ -250,3 +250,36 @@ def test_an_offline_refusal_hands_back_the_half_open_probe_slot(monkeypatch):
     # No probe ran, so nothing is known: the breaker must not have moved either.
     assert h.consecutive_failures == 2
     assert h.should_query() is True
+
+
+def test_provider_failure_warning_names_the_cause_not_just_the_exception_type():
+    """A warning of "failed: RuntimeError" is not actionable.
+
+    Measured live during the T5 baseline run: every federated failure surfaced
+    as `Provider 'mp_native' failed: RuntimeError` — no message, no cause. The
+    agent could not tell a missing API key from a rate limit from a malformed
+    filter, so it could not choose a different route and burned a whole turn
+    re-querying. The sanitized one-liner was ALREADY being computed for the
+    query log (`ProviderQueryLog.error_message`); it just never reached the
+    caller.
+
+    With the cause attached, the same run reported the real reasons — five
+    providers returning `400 Bad Request` on an unsupported OPTIMADE field, and
+    "MP platform proxy: cannot serve elements-only queries via the
+    platform-proxy path" — which is a diagnosis rather than a shrug.
+    """
+    import asyncio
+
+    from app.tools.search_engine.resilience.circuit_breaker import HealthManager
+    from app.tools.search_engine.query import MaterialSearchQuery
+
+    engine = _engine_with(HealthManager(persist_path=None))
+    result = asyncio.run(engine.search(MaterialSearchQuery(elements=["Fe"], limit=5)))
+
+    warning = next((w for w in result.warnings if "Provider 'p' failed" in w), None)
+    assert warning is not None, f"expected a provider-failure warning: {result.warnings}"
+    assert "ConnectionError" in warning, "the exception type is still useful"
+    assert "offline mode" in warning, (
+        "the CAUSE must ride the warning — without it the agent only learns that "
+        f"something threw: {warning!r}"
+    )

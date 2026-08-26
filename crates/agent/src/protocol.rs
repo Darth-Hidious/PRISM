@@ -63,6 +63,21 @@ fn install_sink(tx: std::sync::mpsc::Sender<Value>) {
     *slot.lock().unwrap() = Some(tx);
 }
 
+/// Test-only: collect everything `f` emits instead of writing it to stdout.
+///
+/// Exercises the real emit path — the notifications captured here are byte
+/// for byte the ones a frontend receives.
+#[cfg(test)]
+fn capture_emissions(f: impl FnOnce()) -> Vec<Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    install_sink(tx);
+    f();
+    if let Some(slot) = SINK.get() {
+        *slot.lock().unwrap() = None;
+    }
+    rx.try_iter().collect()
+}
+
 fn emit_raw(value: &Value) {
     if let Some(slot) = SINK.get()
         && let Some(tx) = slot.lock().unwrap().as_ref()
@@ -463,6 +478,265 @@ async fn emit_workspace_artifact(runtime: &mut ServerRuntime, requested_artifact
             );
         }
     }
+}
+
+// ── Workspace structures ──────────────────────────────────────────
+//
+// The Structures tab reads the content-addressed cache the materials
+// tools write (`app/tools/simulation/mace/cache/store.py`): one directory
+// per sha256, holding `structure.cif` and a `meta.json` of whatever the
+// writing tool knew.
+//
+// Unlike artifacts, this list is NOT fetched through the Python tool
+// server, because no registered tool can produce it: `structure_import`
+// writes to the cache, `mace_get_cached_structure` resolves ONE ref, and
+// `mace_list_jobs` lists jobs, not cache entries. The mace family is also
+// gated on the `[mace]` extra, so on an install without it the only tool
+// that reads the cache is not registered at all. The cache is a plain
+// documented directory tree, so the read happens here.
+
+/// Cache bytes sent for one CIF. The TUI applies its own display cap on
+/// top (`StructurePolicy::cif_bytes`); this one keeps a large supercell
+/// from becoming a multi-megabyte JSON-RPC line.
+const STRUCTURE_CIF_MAX_BYTES: usize = 1024 * 1024;
+
+/// Value of `key` as the materials tools see it.
+///
+/// `mace/auth.py::load_env` merges `~/.config/mace-mcp/.env` (or
+/// `MACE_MCP_ENV_FILE`) and then lets the OS environment win. The tool
+/// server inherits this process's environment, so the OS half already
+/// matches; the file half is read here so a cache root configured only in
+/// that file does not send this list to a different directory than the
+/// one the tools write to.
+fn mace_env(key: &str) -> Option<String> {
+    if let Ok(value) = std::env::var(key)
+        && !value.trim().is_empty()
+    {
+        return Some(value);
+    }
+    let env_file = match std::env::var("MACE_MCP_ENV_FILE") {
+        Ok(path) if !path.trim().is_empty() => PathBuf::from(expand_home(&path)),
+        _ => dirs::home_dir()?.join(".config/mace-mcp/.env"),
+    };
+    let text = fs::read_to_string(env_file).ok()?;
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches("export ").trim();
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Expand a leading `~` the way Python's `Path.expanduser` does.
+fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match dirs::home_dir() {
+            Some(home) => home.join(rest).to_string_lossy().into_owned(),
+            None => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
+/// Root of the structure cache — the same directory
+/// `mace/auth.py::get_cache_dir` resolves.
+fn structure_cache_root() -> Option<PathBuf> {
+    if let Some(custom) = mace_env("MACE_MCP_CACHE_DIR") {
+        return Some(PathBuf::from(expand_home(&custom)));
+    }
+    if let Some(state) = mace_env("MACE_MCP_STATE_DIR") {
+        return Some(PathBuf::from(expand_home(&state)).join("cache"));
+    }
+    Some(dirs::home_dir()?.join(".local/state/mace-mcp/cache"))
+}
+
+/// Whether `key` is safe to join onto the cache root.
+///
+/// The key arrives from the frontend and is used as a path segment, so a
+/// separator or `..` would read a file outside the cache. Real keys are
+/// sha256 hex digests; the check stays a character class so a future key
+/// format does not need a new rule here.
+fn is_safe_cache_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// One row for the Structures tab, or `None` when the entry holds no
+/// structure.
+///
+/// The row is the entry's `meta.json` plus the two identity fields the
+/// frontend needs. Meta is passed through VERBATIM: the writers disagree
+/// about which fields they record (`structure_import` writes `tool`/
+/// `formula`/`source`, the job runner writes `tool_name`/`head`/`phase`),
+/// and the frontend already renders a missing field as `unknown`. An
+/// entry without `structure.cif` is a job result, not a structure, and is
+/// left out of a list whose rows all promise a fetchable CIF.
+fn structure_cache_row(root: &std::path::Path, key: &str) -> Option<Value> {
+    if !is_safe_cache_key(key) {
+        return None;
+    }
+    let entry = root.join(key);
+    if !entry.join("structure.cif").is_file() {
+        return None;
+    }
+    let mut row = fs::read_to_string(entry.join("meta.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    row.insert("cache_key".to_string(), Value::String(key.to_string()));
+    row.insert(
+        "cache_ref".to_string(),
+        Value::String(format!("cache://{key}/structure.cif")),
+    );
+    Some(Value::Object(row))
+}
+
+/// Every cached structure, newest first, capped at `limit`.
+///
+/// A missing cache root is not an error: the tools create it on first
+/// write, so "not there yet" is an empty cache, not a broken one. A root
+/// that exists but cannot be read IS an error and says so.
+fn read_structure_cache(root: &std::path::Path, limit: u64) -> Result<Vec<Value>, String> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(root).map_err(|error| format!("{}: {error}", root.display()))?;
+    let mut rows: Vec<Value> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| structure_cache_row(root, &entry.file_name().to_string_lossy()))
+        .collect();
+    // `created_at` is ISO-8601 UTC from the same writer for every entry, so
+    // string order is time order. Entries without one sort last rather than
+    // being dropped or given a made-up timestamp.
+    rows.sort_by(|a, b| {
+        let created = |row: &Value| {
+            row.get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        created(b).cmp(&created(a))
+    });
+    rows.truncate(limit as usize);
+    Ok(rows)
+}
+
+fn emit_workspace_structure_list(session_id: Option<&str>, limit: u64) {
+    let Some(session_id) = session_id else {
+        let message = "no active session is available";
+        tracing::warn!(message, "workspace structure list failed");
+        emit_notification(
+            "ui.structures.unavailable",
+            serde_json::json!({ "message": message }),
+        );
+        return;
+    };
+
+    let structures = match structure_cache_root() {
+        Some(root) => read_structure_cache(&root, limit),
+        None => Err("no home directory to resolve the structure cache".to_string()),
+    };
+
+    match structures {
+        Ok(structures) => emit_notification(
+            "ui.structures.list",
+            serde_json::json!({
+                "session_id": session_id,
+                "structures": structures,
+            }),
+        ),
+        Err(message) => {
+            tracing::warn!(
+                session_id,
+                error = %message,
+                "workspace structure list failed"
+            );
+            emit_notification(
+                "ui.structures.unavailable",
+                serde_json::json!({ "message": message }),
+            );
+        }
+    }
+}
+
+fn emit_workspace_structure(session_id: Option<&str>, cache_key: &str) {
+    let Some(session_id) = session_id else {
+        let message = "no active session is available";
+        tracing::warn!(cache_key, message, "workspace structure fetch failed");
+        emit_notification(
+            "ui.structure.error",
+            serde_json::json!({
+                "cache_key": cache_key,
+                "message": message,
+            }),
+        );
+        return;
+    };
+
+    let cif = read_structure_cif(cache_key);
+
+    match cif {
+        Ok((cif, truncated)) => emit_notification(
+            "ui.structure.fetched",
+            serde_json::json!({
+                "session_id": session_id,
+                "cache_key": cache_key,
+                "cif": cif,
+                "truncated": truncated,
+            }),
+        ),
+        Err(message) => {
+            tracing::warn!(
+                session_id,
+                cache_key,
+                error = %message,
+                "workspace structure fetch failed"
+            );
+            emit_notification(
+                "ui.structure.error",
+                serde_json::json!({
+                    "cache_key": cache_key,
+                    "message": message,
+                }),
+            );
+        }
+    }
+}
+
+/// CIF text for one cache key, and whether it was cut at
+/// [`STRUCTURE_CIF_MAX_BYTES`].
+fn read_structure_cif(cache_key: &str) -> Result<(String, bool), String> {
+    if !is_safe_cache_key(cache_key) {
+        return Err("cache key is not a valid cache entry name".to_string());
+    }
+    let Some(root) = structure_cache_root() else {
+        return Err("no home directory to resolve the structure cache".to_string());
+    };
+    let path = root.join(cache_key).join("structure.cif");
+    let mut cif = fs::read_to_string(&path)
+        .map_err(|error| format!("no cached structure for {cache_key}: {error}"))?;
+    if cif.len() <= STRUCTURE_CIF_MAX_BYTES {
+        return Ok((cif, false));
+    }
+    let mut end = STRUCTURE_CIF_MAX_BYTES;
+    while end > 0 && !cif.is_char_boundary(end) {
+        end -= 1;
+    }
+    cif.truncate(end);
+    Ok((cif, true))
 }
 
 #[allow(dead_code)]
@@ -1352,6 +1626,7 @@ async fn execute_manual_tool_call(
             call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
             content: message.clone(),
+            tool_args: args.clone(),
             summary: Some(summary),
             preview,
             elapsed_ms: 0,
@@ -1408,6 +1683,7 @@ async fn execute_manual_tool_call(
             call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
             content: message.clone(),
+            tool_args: args.clone(),
             summary: Some(format!("{tool_name}: blocked")),
             preview,
             elapsed_ms: 0,
@@ -1434,6 +1710,7 @@ async fn execute_manual_tool_call(
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
             content: message.clone(),
+            tool_args: args.clone(),
             summary: Some(format!("{tool_name}: policy engine unavailable")),
             preview: None,
             elapsed_ms: 0,
@@ -1465,6 +1742,7 @@ async fn execute_manual_tool_call(
                 call_id: call_id.clone(),
                 tool_name: tool_name.to_string(),
                 content: message.clone(),
+                tool_args: args.clone(),
                 summary: Some(format!("{tool_name}: denied by policy")),
                 preview,
                 elapsed_ms: 0,
@@ -1520,6 +1798,7 @@ async fn execute_manual_tool_call(
         call_id: call_id.clone(),
         tool_name: tool_name.to_string(),
         content: raw_content,
+        tool_args: args.clone(),
         summary: Some(summary),
         preview,
         elapsed_ms,
@@ -2607,14 +2886,28 @@ fn emit_permissions_state(
 fn format_tools_summary_report(tools: &ToolCatalog, permissions: &ToolPermissionContext) -> String {
     let (read_only, workspace_write, full_access, approval_required, tool_names) =
         loaded_tools_by_access(tools);
-    let auto_approved = tool_names
-        .iter()
-        .filter(|name| permissions.auto_approves(name))
-        .count();
+    // Three runtime states, computed as a PARTITION of the loaded tools so the
+    // numbers a reader adds up actually add up.
+    //
+    // They used to be three independent predicates printed as a list under the
+    // access breakdown, which does partition. Measured on a real session:
+    // 54 + 83 + 25 = 162 loaded, then "approval-required 56 / auto-approved 54 /
+    // blocked 0" — 110, with 52 tools unaccounted for and no way to tell that
+    // the second group was not a breakdown of the first. `approval_required` is
+    // a STATIC property of a tool; whether it prompts RIGHT NOW also depends on
+    // the session mode and any overrides, so the two were never the same
+    // question and must not be read as one column.
     let blocked = tool_names
         .iter()
         .filter(|name| permissions.blocks(name))
         .count();
+    let auto_approved = tool_names
+        .iter()
+        .filter(|name| !permissions.blocks(name) && permissions.auto_approves(name))
+        .count();
+    // Everything not blocked and not auto-approved will stop and ask. Derived
+    // by subtraction so the three can never disagree with the total.
+    let will_prompt = tool_names.len().saturating_sub(blocked + auto_approved);
     let external_mcp = tools
         .iter()
         .filter(|tool| tool.source.as_deref() == Some("mcp"))
@@ -2633,19 +2926,58 @@ fn format_tools_summary_report(tools: &ToolCatalog, permissions: &ToolPermission
 
     truncate_for_ui(
         &format!(
-            "Tools\n  loaded: {}\n  external MCP: {}\n  read-only: {}\n  workspace-write: {}\n  full-access: {}\n  approval-required: {}\n  auto-approved now: {}\n  blocked now: {}\n  execute_bash: {}",
+            "Tools\n  loaded: {}\n  external MCP: {}\n\n  by access (sums to {}):\n    read-only: {}\n    workspace-write: {}\n    full-access: {}\n\n  right now (sums to {}):\n    auto-approved: {}\n    will prompt: {}\n    blocked: {}\n\n  declared approval-required: {} (a tool property; what prompts NOW is the group above)\n  execute_bash: {}",
             tools.len(),
             external_mcp,
+            tools.len(),
             read_only.len(),
             workspace_write.len(),
             full_access.len(),
-            approval_required.len(),
+            tool_names.len(),
             auto_approved,
+            will_prompt,
             blocked,
+            approval_required.len(),
             bash_status.as_deref().unwrap_or("not loaded"),
         ),
         30_000,
     )
+}
+
+/// Render the tools summary through the SAME path a live `/tools` uses:
+/// `build_effective_permission_context` for the session mode and overrides,
+/// then `format_tools_summary_report`.
+///
+/// Exists so `tests/tools_summary_counts.rs` can pin the count honesty of the
+/// summary without `SessionMode`, `PermissionOverrides` layering or the
+/// context builders leaking into the shipped API. A test that built its own
+/// permission context would only be checking its own arithmetic; this one
+/// drives production dispatch.
+///
+/// `mode` accepts exactly `"chat"` or `"plan"` and panics otherwise — a
+/// test-only helper must never silently substitute a mode the caller did not
+/// ask for, because that is precisely the class of bug it is here to catch.
+#[cfg(any(test, feature = "test-guard"))]
+pub fn tools_summary_for_test(
+    tools: &ToolCatalog,
+    mode: &str,
+    allow: &[String],
+    deny: &[String],
+) -> String {
+    let session_mode = match mode {
+        "chat" => SessionMode::Chat,
+        "plan" => SessionMode::Plan,
+        other => panic!("unknown session mode {other:?}; expected \"chat\" or \"plan\""),
+    };
+    let mut overrides = PermissionOverrides::default();
+    for name in allow {
+        overrides.allow(name);
+    }
+    for name in deny {
+        overrides.deny(name);
+    }
+    let permissions = build_effective_permission_context(session_mode, tools, &overrides);
+    format_tools_summary_report(tools, &permissions)
 }
 
 fn format_usage_report(transcript: &TranscriptStore, session_store: &SessionStore) -> String {
@@ -5517,6 +5849,9 @@ fn emit_agent_event(event: AgentEvent) {
             call_id,
             tool_name,
             content,
+            // The UI card renders the answer; the arguments go to the durable
+            // session record, not onto the card.
+            tool_args: _,
             summary,
             preview,
             elapsed_ms,
@@ -5535,6 +5870,9 @@ fn emit_agent_event(event: AgentEvent) {
                 is_error,
             );
             emit_notification("ui.card", payload);
+            if let Some(object) = object_update_from_result(&tool_name, &content, is_error) {
+                emit_notification("ui.object.update", object);
+            }
             // When the AGENT ran a notebook cell, mirror it into the human's
             // notebook pane so both see the one shared kernel live.
             // G5f: also match the root canonical name "notebook" (was omitted —
@@ -5594,6 +5932,76 @@ fn emit_agent_event(event: AgentEvent) {
             emit_notification("ui.turn.complete", serde_json::json!({}));
         }
     }
+}
+
+/// The domain object a finished tool call created, if it created one.
+///
+/// The Objects tab is a list of things that exist, so a row is emitted
+/// only when the result carries the identity of one: a `cache_ref` (the
+/// structure the call stored in the cache) or a `job_id` (the run it
+/// submitted). Everything else — a search, a read, a prediction — answers
+/// a question without creating anything to point at, and emits nothing.
+///
+/// `id` is that identity, so a later result about the same structure or
+/// job updates the row instead of adding a second one.
+fn object_update_from_result(tool_name: &str, content: &str, is_error: bool) -> Option<Value> {
+    if is_error {
+        return None;
+    }
+    let result = serde_json::from_str::<Value>(content).ok()?;
+    let result = result.as_object()?;
+    // Tools report failure in-band as `{"error": ...}` with no transport
+    // error, so `is_error` alone would let a failed call create a row.
+    if result.get("error").is_some_and(|error| !error.is_null()) {
+        return None;
+    }
+
+    let text = |field: &str| {
+        result
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+
+    if let Some(cache_ref) = text("cache_ref").filter(|r| r.starts_with("cache://")) {
+        let label = text("name")
+            .or_else(|| text("formula"))
+            .unwrap_or(cache_ref)
+            .to_string();
+        let detail = match result.get("n_atoms").and_then(Value::as_u64) {
+            Some(n_atoms) => format!("{n_atoms} atoms, {cache_ref}"),
+            None => cache_ref.to_string(),
+        };
+        return Some(serde_json::json!({
+            "id": cache_ref,
+            "kind": "structure",
+            "label": label,
+            // The cache is content-addressed: the ref exists because the
+            // structure was written under it.
+            "status": "completed",
+            "detail": detail,
+        }));
+    }
+
+    if let Some(job_id) = text("job_id") {
+        let label = text("job_name")
+            .or_else(|| text("workflow_type"))
+            .unwrap_or(tool_name)
+            .to_string();
+        return Some(serde_json::json!({
+            "id": job_id,
+            "kind": "simulation",
+            "label": label,
+            // Verbatim: the frontend maps what it knows and shows the rest
+            // as unknown. A queued or cancelled job must not be rounded to
+            // "running".
+            "status": text("status").unwrap_or(""),
+            "detail": text("code"),
+        }));
+    }
+
+    None
 }
 
 fn build_ui_card_payload(
@@ -6193,9 +6601,28 @@ fn build_tool_card_content(
                             sections.push(format!("{count} results via {source}"));
                         }
                         for (i, r) in results.iter().take(5).enumerate() {
+                            // `title`/`name` is the shape of a WEB or literature
+                            // hit. A materials record has neither: measured
+                            // live against the Materials Project proxy, a hit
+                            // carries exactly `formula_pretty`, `material_id`,
+                            // `band_gap`, `energy_above_hull`,
+                            // `formation_energy_per_atom`, `is_metal`. So every
+                            // one fell through to the literal "untitled" — a
+                            // BaTiO3 search returned 11 real structures and
+                            // displayed them as `1. untitled … 5. untitled`,
+                            // erasing the identity of every result while
+                            // reporting success.
+                            //
+                            // Formula first: it is what a person recognises.
+                            // The database id is the fallback, because a row
+                            // identified by `mp-aaaaaiof` is still identified.
                             let title = r
                                 .get("title")
                                 .or_else(|| r.get("name"))
+                                .or_else(|| r.get("formula_pretty"))
+                                .or_else(|| r.get("formula"))
+                                .or_else(|| r.get("material_id"))
+                                .or_else(|| r.get("id"))
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("untitled");
                             let snippet = r
@@ -6395,7 +6822,17 @@ fn spawn_agent_turn(
     tokio::spawn(async move {
         let llm = LlmClient::new(runtime.llm_config.clone());
         let mut turn_config = config.as_ref().clone();
-        turn_config.auto_approve = auto_approve;
+        // The request flag OR the env var `prism --auto-approve` sets. Both
+        // frontends hardcode the request flag to false, so the env var was the
+        // only path an operator had — and nothing read it.
+        turn_config.auto_approve = crate::agent_loop::auto_approve_enabled(auto_approve);
+        if turn_config.auto_approve && !auto_approve {
+            // Never silent: an operator must be able to see in the log that
+            // every gate is open for this session.
+            tracing::warn!(
+                "PRISM_AUTO_APPROVE is set — ALL tool approvals are bypassed for this session"
+            );
+        }
         let profile = profile_for_model(&runtime.llm_config.model);
         turn_config.core_tools_only =
             profile.tool_surface == crate::prompt_profile::ToolSurface::CoreSetPlusFind;
@@ -6436,11 +6873,22 @@ fn spawn_agent_turn(
                             call_id,
                             tool_name,
                             content,
+                            tool_args,
                             ..
                         } => {
-                            runtime
-                                .session_store
-                                .append_message("tool", content, tool_name, call_id, None);
+                            // Record WHAT THE TOOL WAS CALLED WITH, not only
+                            // what it answered. Without this the durable
+                            // session held every answer and no question: no
+                            // call was reproducible, and a failed call taught
+                            // nothing downstream because the input that caused
+                            // it was gone.
+                            runtime.session_store.append_message(
+                                "tool",
+                                content,
+                                tool_name,
+                                call_id,
+                                Some(serde_json::json!({ "args": tool_args })),
+                            );
                         }
                         _ => {}
                     }
@@ -8786,6 +9234,58 @@ async fn run_server_core(
                 emit_workspace_artifact(runtime_ref, artifact_id).await;
             }
 
+            "workspace.structures.list" => {
+                let Some(limit) = params.get("limit").and_then(Value::as_u64) else {
+                    emit_error(-32602, "Missing or invalid params.limit", id);
+                    continue;
+                };
+                if limit == 0 {
+                    emit_error(-32602, "params.limit must be greater than zero", id);
+                    continue;
+                }
+                emit_response(id, serde_json::json!({ "status": "ok" }));
+
+                // The running turn owns the session store — `runtime` is
+                // taken for the whole turn — and the reply is scoped to the
+                // session id it holds. Binding it here rather than asserting
+                // it exists keeps a tab refresh during a turn from taking the
+                // backend down; the frontend retries on `pending`.
+                let Some(runtime_ref) = runtime.as_ref() else {
+                    emit_notification(
+                        "ui.structures.pending",
+                        serde_json::json!({
+                            "message": "structure data is waiting for the active turn"
+                        }),
+                    );
+                    continue;
+                };
+                emit_workspace_structure_list(runtime_ref.session_store.current_id(), limit);
+            }
+
+            "workspace.structure.fetch" => {
+                let Some(cache_key) = params.get("cache_key").and_then(Value::as_str) else {
+                    emit_error(-32602, "Missing params.cache_key", id);
+                    continue;
+                };
+                if cache_key.trim().is_empty() {
+                    emit_error(-32602, "params.cache_key must not be empty", id);
+                    continue;
+                }
+                emit_response(id, serde_json::json!({ "status": "ok" }));
+
+                let Some(runtime_ref) = runtime.as_ref() else {
+                    emit_notification(
+                        "ui.structure.pending",
+                        serde_json::json!({
+                            "cache_key": cache_key,
+                            "message": "CIF is waiting for the active turn"
+                        }),
+                    );
+                    continue;
+                };
+                emit_workspace_structure(runtime_ref.session_store.current_id(), cache_key);
+            }
+
             "input.prompt_response" => {
                 let response_str = params
                     .get("response")
@@ -8930,6 +9430,47 @@ async fn run_server_core(
 
 #[cfg(test)]
 mod tests {
+    /// A materials hit must be identified by its formula, not by "untitled".
+    ///
+    /// The card's title chain read `title` then `name` — the shape of a web or
+    /// literature result. A Materials Project record carries neither: measured
+    /// live, its keys are exactly `formula_pretty`, `material_id`, `band_gap`,
+    /// `energy_above_hull`, `formation_energy_per_atom`, `is_metal`. So a real
+    /// BaTiO3 search returned 11 structures and rendered every one as
+    /// `untitled` — full success, zero identity.
+    ///
+    /// The `material_id` case is asserted separately because a provider that
+    /// omits the formula still returns an identified row, and falling back to
+    /// "untitled" there would repeat the same erasure one field later.
+    #[test]
+    fn a_materials_hit_is_named_by_formula_not_untitled() {
+        let content = serde_json::json!({
+            "source": "marc27_platform_proxy",
+            "count": 2,
+            "results": [
+                { "formula_pretty": "BaTiO3", "material_id": "mp-5020", "band_gap": 2.29 },
+                { "material_id": "mp-aaaaaiof", "band_gap": 0.0 }
+            ]
+        })
+        .to_string();
+
+        let (rendered, _) =
+            super::build_tool_card_content("query_materials_project", &content, None, None);
+
+        assert!(
+            rendered.contains("BaTiO3"),
+            "the formula is what a person recognises; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("mp-aaaaaiof"),
+            "a row with no formula is still identified by its database id; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("untitled"),
+            "no identified result may render as `untitled`; got:\n{rendered}"
+        );
+    }
+
     use super::{
         BashSlashAction, DiffSlashAction, EditSlashAction, PlanRuntimeState, PythonSlashAction,
         SessionMode, SlashCommandContext, WriteSlashAction, assemble_workflow_run_values,
@@ -10576,5 +11117,417 @@ mod browse_slash_tests {
             2,
             "a bare array still resolves"
         );
+    }
+}
+
+/// Workspace planes the frontend reads: the Structures tab (cache-backed)
+/// and the Objects tab (emitted as tools create things).
+///
+/// Both use the process-global emit sink and the Structures tests also set
+/// the cache-root environment variable the materials tools read, so they
+/// take one lock rather than running in parallel.
+#[cfg(test)]
+mod workspace_planes_tests {
+    use super::{
+        capture_emissions, emit_agent_event, emit_workspace_structure,
+        emit_workspace_structure_list, object_update_from_result, read_structure_cache,
+        structure_cache_root,
+    };
+    use crate::types::AgentEvent;
+    use serde_json::{Value, json};
+
+    static SERIAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Write one cache entry exactly as `CacheStore` lays it out.
+    fn write_entry(root: &std::path::Path, key: &str, meta: Option<Value>, cif: Option<&str>) {
+        let dir = root.join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(meta) = meta {
+            std::fs::write(
+                dir.join("meta.json"),
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+        }
+        if let Some(cif) = cif {
+            std::fs::write(dir.join("structure.cif"), cif).unwrap();
+        }
+    }
+
+    /// Meta as `structure_import` writes it (captured from a live call to
+    /// the Python tool server on 2026-08-26).
+    fn import_meta(name: &str, created_at: &str) -> Value {
+        json!({
+            "tool": "structure_import",
+            "name": name,
+            "formula": "MoNbTaW",
+            "n_atoms": 4,
+            "composition": { "Mo": 1, "Nb": 1, "Ta": 1, "W": 1 },
+            "source": "user_import",
+            "created_at": created_at,
+        })
+    }
+
+    /// Meta as the MACE job runner writes it — a different field set, on
+    /// purpose: the two writers disagree and both must list.
+    fn job_meta(created_at: &str) -> Value {
+        json!({
+            "tool_name": "relax_structure",
+            "source_job_id": "01KZ7M6ZCQA28ZF0BRWNSB6NYT",
+            "head": "omat_pbe",
+            "phase": "bcc",
+            "composition": { "Fe": 100 },
+            "n_atoms": 100,
+            "created_at": created_at,
+        })
+    }
+
+    fn only<'a>(emissions: &'a [Value], method: &str) -> &'a Value {
+        let matches: Vec<&Value> = emissions
+            .iter()
+            .filter(|value| value.get("method").and_then(Value::as_str) == Some(method))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one {method}; got:\n{emissions:#?}"
+        );
+        &matches[0]["params"]
+    }
+
+    /// The Structures tab was dead because the engine answered
+    /// `workspace.structures.list` with "Method not found". The list must
+    /// now arrive in the shape `crate::msg` (prism-tui) parses:
+    /// `ui.structures.list` with `session_id` + `structures`, every row
+    /// carrying the `cache_key` the fetch is keyed on.
+    #[test]
+    fn the_structure_cache_lists_in_the_shape_the_frontend_parses() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_entry(
+            root,
+            "aaaa1111",
+            Some(import_meta(
+                "MoNbTaW oqmd-6223708",
+                "2026-08-26T03:28:42+00:00",
+            )),
+            Some("data_MoNbTaW\n_cell_length_a 4.57\n"),
+        );
+        write_entry(
+            root,
+            "bbbb2222",
+            Some(job_meta("2026-08-05T00:12:16+00:00")),
+            Some("data_Fe100\n"),
+        );
+        // A job result with no structure: not a structure, must not list.
+        write_entry(root, "cccc3333", Some(json!({"tool_name": "md"})), None);
+        // A CIF whose meta was never written: identity is still a fact.
+        write_entry(root, "dddd4444", None, Some("data_bare\n"));
+
+        unsafe { std::env::set_var("MACE_MCP_CACHE_DIR", root) };
+        let emissions = capture_emissions(|| emit_workspace_structure_list(Some("sess-1"), 256));
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+
+        let params = only(&emissions, "ui.structures.list");
+        assert_eq!(params["session_id"], "sess-1");
+        let rows = params["structures"].as_array().unwrap();
+        let keys: Vec<&str> = rows
+            .iter()
+            .map(|row| row["cache_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["aaaa1111", "bbbb2222", "dddd4444"],
+            "newest first, and an entry with no structure.cif is not a structure"
+        );
+        assert_eq!(rows[0]["cache_ref"], "cache://aaaa1111/structure.cif");
+        // Meta travels verbatim — both writers' field names survive.
+        assert_eq!(rows[0]["formula"], "MoNbTaW");
+        assert_eq!(rows[0]["source"], "user_import");
+        assert_eq!(rows[1]["tool_name"], "relax_structure");
+        assert_eq!(rows[1]["composition"]["Fe"], 100);
+        // The frontend renders a missing field as "unknown"; it must not be
+        // handed an invented one.
+        assert!(rows[2].get("formula").is_none());
+    }
+
+    /// `Ready([])` and `Unavailable` are different facts to the user. A
+    /// cache directory the tools have not created yet is an empty cache,
+    /// not a broken one.
+    #[test]
+    fn a_cache_that_does_not_exist_yet_is_empty_not_unavailable() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("never-written");
+
+        unsafe { std::env::set_var("MACE_MCP_CACHE_DIR", &absent) };
+        let emissions = capture_emissions(|| emit_workspace_structure_list(Some("sess-1"), 8));
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+
+        let params = only(&emissions, "ui.structures.list");
+        assert_eq!(params["structures"].as_array().unwrap().len(), 0);
+    }
+
+    /// With no session there is nothing to scope the answer to, and an
+    /// empty list would read as "no structures".
+    #[test]
+    fn no_session_is_unavailable_not_an_empty_list() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let emissions = capture_emissions(|| emit_workspace_structure_list(None, 8));
+        let params = only(&emissions, "ui.structures.unavailable");
+        assert_eq!(params["message"], "no active session is available");
+    }
+
+    /// The fetch answers with the CIF the cache holds.
+    #[test]
+    fn a_cif_fetch_returns_the_stored_text() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        write_entry(
+            temp.path(),
+            "aaaa1111",
+            Some(import_meta("probe", "2026-08-26T03:28:42+00:00")),
+            Some("data_MoNbTaW\n_cell_length_a 4.57\n"),
+        );
+
+        unsafe { std::env::set_var("MACE_MCP_CACHE_DIR", temp.path()) };
+        let emissions = capture_emissions(|| emit_workspace_structure(Some("sess-1"), "aaaa1111"));
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+
+        let params = only(&emissions, "ui.structure.fetched");
+        assert_eq!(params["session_id"], "sess-1");
+        assert_eq!(params["cache_key"], "aaaa1111");
+        assert_eq!(params["cif"], "data_MoNbTaW\n_cell_length_a 4.57\n");
+        assert_eq!(params["truncated"], false);
+    }
+
+    /// The cache key arrives from the frontend and becomes a path segment.
+    /// A key containing a separator must not read a file outside the cache.
+    #[test]
+    fn a_cache_key_cannot_escape_the_cache_directory() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let secret_dir = temp.path().join("secret");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        std::fs::write(secret_dir.join("structure.cif"), "PRIVATE").unwrap();
+
+        unsafe { std::env::set_var("MACE_MCP_CACHE_DIR", &root) };
+        let emissions = capture_emissions(|| emit_workspace_structure(Some("sess-1"), "../secret"));
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+
+        let params = only(&emissions, "ui.structure.error");
+        assert_eq!(params["cache_key"], "../secret");
+        assert!(
+            !emissions
+                .iter()
+                .any(|value| value.to_string().contains("PRIVATE")),
+            "a traversal key read a file outside the cache:\n{emissions:#?}"
+        );
+    }
+
+    /// `limit` is the frontend's ceiling and the renderer warns when it is
+    /// reached, so a bounded query must actually be bounded.
+    #[test]
+    fn the_list_is_capped_at_the_requested_limit() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            write_entry(
+                temp.path(),
+                &format!("key{index}"),
+                Some(import_meta(
+                    "probe",
+                    &format!("2026-08-2{index}T00:00:00+00:00"),
+                )),
+                Some("data_x\n"),
+            );
+        }
+        let rows = read_structure_cache(temp.path(), 2).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["cache_key"], "key4");
+    }
+
+    /// The cache root must be the one the materials tools write to.
+    #[test]
+    fn the_cache_root_follows_the_tools_environment() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::set_var("MACE_MCP_CACHE_DIR", "/tmp/prism-cache-probe") };
+        assert_eq!(
+            structure_cache_root().unwrap(),
+            std::path::PathBuf::from("/tmp/prism-cache-probe")
+        );
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+        unsafe { std::env::set_var("MACE_MCP_STATE_DIR", "/tmp/prism-state-probe") };
+        assert_eq!(
+            structure_cache_root().unwrap(),
+            std::path::PathBuf::from("/tmp/prism-state-probe/cache")
+        );
+        unsafe { std::env::remove_var("MACE_MCP_STATE_DIR") };
+    }
+
+    /// The materials tools read `~/.config/mace-mcp/.env` as well as the
+    /// OS environment. A cache root configured only in that file would
+    /// otherwise send this list to a directory the tools never write to,
+    /// and the tab would show an empty cache that is not empty.
+    #[test]
+    fn a_cache_root_set_only_in_the_mace_env_file_is_honoured() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let env_file = temp.path().join(".env");
+        std::fs::write(
+            &env_file,
+            "# mace-mcp\nHF_TOKEN=xxx\nMACE_MCP_CACHE_DIR=\"/tmp/prism-dotenv-probe\"\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+        unsafe { std::env::set_var("MACE_MCP_ENV_FILE", &env_file) };
+        let from_file = structure_cache_root().unwrap();
+        // The OS environment still wins, exactly as `load_env` orders them.
+        unsafe { std::env::set_var("MACE_MCP_CACHE_DIR", "/tmp/prism-os-env-probe") };
+        let from_os_env = structure_cache_root().unwrap();
+        unsafe { std::env::remove_var("MACE_MCP_CACHE_DIR") };
+        unsafe { std::env::remove_var("MACE_MCP_ENV_FILE") };
+
+        assert_eq!(
+            from_file,
+            std::path::PathBuf::from("/tmp/prism-dotenv-probe")
+        );
+        assert_eq!(
+            from_os_env,
+            std::path::PathBuf::from("/tmp/prism-os-env-probe")
+        );
+    }
+
+    // ── Objects ───────────────────────────────────────────────────
+
+    /// The Objects tab could only ever fill in tests: `ui.object.update`
+    /// was emitted from the TUI's own test double and from nowhere in the
+    /// engine. A stored structure is a thing that exists, so the engine
+    /// must say so.
+    ///
+    /// The result below is the verbatim answer of a live `structure_import`
+    /// call against the Python tool server (2026-08-26).
+    #[test]
+    fn storing_a_structure_creates_one_object() {
+        let content = json!({
+            "imported": true,
+            "cache_ref": "cache://edb2a98d7c7e79d7e83256262e393dd30cd76160ae23ff133e2514872491eee9/structure.cif",
+            "formula": "MoNbTaW",
+            "n_atoms": 4,
+            "composition": { "Mo": 1, "Nb": 1, "Ta": 1, "W": 1 },
+            "pyiron_structure_id": Value::Null,
+            "usable_by": [],
+        })
+        .to_string();
+
+        let object = object_update_from_result("structure_import", &content, false)
+            .expect("a stored structure is a domain object");
+        assert_eq!(
+            object["id"],
+            "cache://edb2a98d7c7e79d7e83256262e393dd30cd76160ae23ff133e2514872491eee9/structure.cif"
+        );
+        assert_eq!(object["kind"], "structure");
+        assert_eq!(object["label"], "MoNbTaW");
+        assert_eq!(object["status"], "completed");
+        assert!(object["detail"].as_str().unwrap().starts_with("4 atoms"));
+    }
+
+    /// A run has a real identity and a real reported state. The state is
+    /// carried verbatim: the frontend renders a state it does not know as
+    /// unknown, and rounding "aborted" to "running" would invent one.
+    #[test]
+    fn a_job_keeps_the_status_the_tool_reported() {
+        let content =
+            json!({ "job_id": "sim_42", "code": "lammps", "status": "aborted" }).to_string();
+        let object = object_update_from_result("sim_job", &content, false).unwrap();
+        assert_eq!(object["id"], "sim_42");
+        assert_eq!(object["kind"], "simulation");
+        assert_eq!(object["status"], "aborted");
+        assert_eq!(object["detail"], "lammps");
+
+        // A later result about the same job reuses the id, so the frontend
+        // updates that row instead of adding a second one.
+        let later = json!({ "job_id": "sim_42", "status": "finished" }).to_string();
+        assert_eq!(
+            object_update_from_result("sim_job", &later, false).unwrap()["id"],
+            "sim_42"
+        );
+    }
+
+    /// A row that corresponds to nothing is worse than an empty tab. A
+    /// tool that answers a question created no object.
+    #[test]
+    fn a_tool_that_creates_nothing_emits_no_object() {
+        for (tool, content) in [
+            ("web", r#"{"results": [{"title": "a paper"}], "count": 1}"#),
+            ("predict_properties", r#"{"band_gap": 2.29, "unit": "eV"}"#),
+            ("file", r#"{"path": "/tmp/x.txt", "bytes": 12}"#),
+            (
+                "mace_list_jobs",
+                r#"{"jobs": [{"job_id": "sim_1"}], "count": 1}"#,
+            ),
+        ] {
+            assert!(
+                object_update_from_result(tool, content, false).is_none(),
+                "{tool} does not create a domain object"
+            );
+        }
+    }
+
+    /// Tools report failure in-band as `{"error": ...}`, so the transport
+    /// flag alone would let a failed call create a row for a thing that
+    /// does not exist.
+    #[test]
+    fn a_failed_call_creates_no_object() {
+        let in_band =
+            json!({ "error": "could not parse CIF", "cache_ref": "cache://x/structure.cif" })
+                .to_string();
+        assert!(object_update_from_result("structure_import", &in_band, false).is_none());
+
+        let flagged = json!({ "cache_ref": "cache://x/structure.cif" }).to_string();
+        assert!(object_update_from_result("structure_import", &flagged, true).is_none());
+    }
+
+    /// The object must reach the frontend from the engine's own tool-result
+    /// path, next to the card — not from a helper nothing calls.
+    #[test]
+    fn the_engine_emits_the_object_with_the_tool_card() {
+        let _guard = SERIAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let content = json!({
+            "imported": true,
+            "cache_ref": "cache://aaaa1111/structure.cif",
+            "formula": "MoNbTaW",
+            "n_atoms": 4,
+        })
+        .to_string();
+
+        let emissions = capture_emissions(|| {
+            emit_agent_event(AgentEvent::ToolCallResult {
+                call_id: "call-1".to_string(),
+                tool_name: "structure_import".to_string(),
+                content,
+                tool_args: json!({ "name": "probe" }),
+                summary: None,
+                preview: None,
+                elapsed_ms: 12,
+                is_error: false,
+            });
+        });
+
+        let methods: Vec<&str> = emissions
+            .iter()
+            .filter_map(|value| value.get("method").and_then(Value::as_str))
+            .collect();
+        assert!(
+            methods.contains(&"ui.object.update"),
+            "the engine emitted no object for a stored structure; got {methods:?}"
+        );
+        let params = only(&emissions, "ui.object.update");
+        assert_eq!(params["id"], "cache://aaaa1111/structure.cif");
+        assert_eq!(params["kind"], "structure");
     }
 }

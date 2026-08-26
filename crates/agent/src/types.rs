@@ -111,6 +111,14 @@ pub enum AgentEvent {
         call_id: String,
         tool_name: String,
         content: String,
+        /// The arguments the call was made with.
+        ///
+        /// Carried on the RESULT, not just on the approval request, because
+        /// the durable session record is written from this event. Without it
+        /// `~/.prism/sessions/*.jsonl` held every tool's answer and none of
+        /// their questions, so no call was reproducible and a failure taught
+        /// nothing.
+        tool_args: serde_json::Value,
         summary: Option<String>,
         preview: Option<String>,
         elapsed_ms: u64,
@@ -137,9 +145,25 @@ pub enum AgentEvent {
 // AgentConfig — session configuration
 // ---------------------------------------------------------------------------
 
+/// Default reasoning-step backstop: high enough that it never interrupts real
+/// research, low enough to stop a genuine runaway from billing forever.
+/// Set `max_iterations: 0` for no cap at all.
+pub fn default_max_iterations() -> usize {
+    200
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub system_prompt: String,
+    /// Reasoning steps one turn may take. `0` means no cap.
+    ///
+    /// This is a runaway backstop, NOT a research budget. It used to default
+    /// to 20, which is roughly a dozen web reads — measured on 2026-08-25, a
+    /// polymer literature question spent 19 tool calls establishing a correct
+    /// answer, hit the cap, and the turn ended with `text: None`. The work was
+    /// done and then thrown away. A limit low enough to interrupt ordinary
+    /// research is a muzzle; the doom-loop detector, not this number, is what
+    /// catches an agent going in circles.
     pub max_iterations: usize,
     pub auto_approve: bool,
     pub model: String,
@@ -174,7 +198,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             system_prompt: String::new(),
-            max_iterations: 20,
+            max_iterations: default_max_iterations(),
             auto_approve: false,
             model: "claude-sonnet-4-6".to_string(),
             core_tools_only: false,

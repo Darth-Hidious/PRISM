@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(nodes[0].label, "Chemical");
         assert_eq!(
             nodes[0].class_iri.as_deref(),
-            Some("https://marc27.com/ontology/matkg#Chemical")
+            Some("https://mirdyne.com/ontology/matkg#Chemical")
         );
         let nodes = store
             .graph_search_scoped("Olivine;", &[&report.tenant], 10)
@@ -1222,7 +1222,7 @@ mod tests {
         );
         assert_eq!(
             classifications[0].version_iri,
-            "https://marc27.com/ontology/matkg/1.4"
+            "https://mirdyne.com/ontology/matkg/1.4"
         );
         assert_eq!(
             classifications[0].artifact_sha256,

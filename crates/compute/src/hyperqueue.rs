@@ -51,7 +51,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{ComputeBackend, ExperimentPlan, JobStatus};
+use crate::{ComputeBackend, ExperimentPlan, JobStatus, ResourceSpec};
 
 /// How long to wait for a freshly started HQ server to accept commands.
 pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -246,7 +246,15 @@ impl HyperQueueBackend {
     ///
     /// This is the native shape of this backend. `ComputeBackend::submit`
     /// delegates here after extracting tasks from the plan inputs.
-    pub async fn submit_tasks(&self, name: &str, tasks: &[HqTask]) -> Result<Uuid> {
+    ///
+    /// `resources` applies to every task in the set; pass
+    /// [`ResourceSpec::default`] to take the HQ worker's own defaults.
+    pub async fn submit_tasks(
+        &self,
+        name: &str,
+        tasks: &[HqTask],
+        resources: &ResourceSpec,
+    ) -> Result<Uuid> {
         self.check_offline()?;
         if tasks.is_empty() {
             bail!("refusing to submit an empty HyperQueue task set");
@@ -262,7 +270,7 @@ impl HyperQueueBackend {
             .server_dir
             .join("prism-jobs")
             .join(format!("prism-{job_id}.toml"));
-        let jdf = build_jdf(name, tasks)?;
+        let jdf = build_jdf(name, tasks, resources)?;
         tokio::fs::create_dir_all(jdf_path.parent().expect("jdf path has a parent"))
             .await
             .with_context(|| {
@@ -584,7 +592,7 @@ impl ComputeBackend for HyperQueueBackend {
         let tasks = parse_plan_tasks(&plan.inputs)?;
         // `plan.image` is deliberately unused: HQ tasks are plain commands,
         // not containers. A containerised task can still wrap its command.
-        self.submit_tasks(&plan.name, &tasks).await
+        self.submit_tasks(&plan.name, &tasks, &plan.resources).await
     }
 
     async fn status(&self, job_id: Uuid) -> Result<JobStatus> {
@@ -820,11 +828,27 @@ struct JdfTask {
     env: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stdin: Option<String>,
+    /// Emitted ONLY when the job asked for something. A plan with default
+    /// resources produces a byte-identical JDF to before this field existed,
+    /// so an existing HyperQueue setup cannot regress on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<JdfRequest>,
+}
+
+/// HyperQueue per-task resource request. HQ names accelerators as generic
+/// resources (`gpus/nvidia`, `gpus/amd`) and cores as `cpus`.
+#[derive(Debug, Clone, Serialize)]
+struct JdfRequest {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    resources: BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_limit: Option<String>,
 }
 
 /// Render the task set as an HQ Job Definition File. Task ids are left to
 /// HQ's automatic numbering (0..n), so they line up with the task order.
-fn build_jdf(name: &str, tasks: &[HqTask]) -> Result<String> {
+fn build_jdf(name: &str, tasks: &[HqTask], resources: &ResourceSpec) -> Result<String> {
+    let request = jdf_request(resources);
     let file = JdfFile {
         name: name.to_string(),
         task: tasks
@@ -834,10 +858,45 @@ fn build_jdf(name: &str, tasks: &[HqTask]) -> Result<String> {
                 cwd: task.cwd.clone(),
                 env: task.env.clone(),
                 stdin: task.stdin.clone(),
+                request: request.clone(),
             })
             .collect(),
     };
     toml::to_string(&file).context("failed to serialise the HyperQueue job definition file")
+}
+
+/// Translate a [`ResourceSpec`] into HyperQueue's per-task request, or `None`
+/// when nothing was asked for.
+///
+/// The spec applies per task: HQ schedules each task independently, so "2 GPUs"
+/// means two per task, which is what a caller submitting a task-set means.
+fn jdf_request(res: &ResourceSpec) -> Option<JdfRequest> {
+    let mut resources = BTreeMap::new();
+    if let Some(cpus) = res.cpus.filter(|n| *n > 0) {
+        resources.insert("cpus".to_string(), u64::from(cpus));
+    }
+    if res.wants_gpu() {
+        resources.insert(
+            "gpus/nvidia".to_string(),
+            u64::from(res.gpus.unwrap_or(1).max(1)),
+        );
+    }
+    let time_limit = res.walltime_secs.map(|secs| format!("{secs}s"));
+    if resources.is_empty() && time_limit.is_none() {
+        return None;
+    }
+    let dropped = res.unsupported_by(&["cpus", "gpus", "walltime_secs"]);
+    if !dropped.is_empty() {
+        tracing::warn!(
+            fields = ?dropped,
+            "HyperQueue task requests cannot carry these fields; they were NOT sent. \
+             Node-level allocation belongs in the HQ autoallocator or a SLURM target."
+        );
+    }
+    Some(JdfRequest {
+        resources,
+        time_limit,
+    })
 }
 
 // ── HQ JSON parsing (shapes verified against hyperqueue 0.26.x) ──────────
@@ -965,6 +1024,44 @@ fn stdio_path(value: &Option<Value>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── per-task resource requests ──
+
+    #[test]
+    fn a_default_request_is_absent_so_existing_jdfs_are_unchanged() {
+        // The regression guard for HyperQueue: a plan that asks for nothing
+        // must produce exactly the JDF it produced before `request` existed,
+        // so an already-working HQ setup cannot break on this change.
+        assert!(jdf_request(&ResourceSpec::default()).is_none());
+        let jdf = build_jdf("j", &[HqTask::new(vec!["true".into()])], &ResourceSpec::default())
+            .unwrap();
+        assert!(!jdf.contains("request"), "default JDF must carry no request table: {jdf}");
+        assert!(!jdf.contains("resources"), "got: {jdf}");
+    }
+
+    #[test]
+    fn a_gpu_request_reaches_the_jdf() {
+        let jdf = build_jdf(
+            "j",
+            &[HqTask::new(vec!["true".into()])],
+            &ResourceSpec { gpus: Some(2), cpus: Some(8), walltime_secs: Some(600),
+                            ..Default::default() },
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&jdf).unwrap();
+        let request = &parsed["task"][0]["request"];
+        assert_eq!(request["resources"]["gpus/nvidia"].as_integer(), Some(2));
+        assert_eq!(request["resources"]["cpus"].as_integer(), Some(8));
+        assert_eq!(request["time_limit"].as_str(), Some("600s"));
+    }
+
+    #[test]
+    fn a_walltime_alone_still_produces_a_request() {
+        let req = jdf_request(&ResourceSpec { walltime_secs: Some(30), ..Default::default() })
+            .expect("a time limit is a request even with no resources");
+        assert!(req.resources.is_empty());
+        assert_eq!(req.time_limit.as_deref(), Some("30s"));
+    }
     use prism_runtime::offline::test_support::{OfflineEnvGuard, env_lock};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -981,6 +1078,7 @@ mod tests {
             name: name.into(),
             image: "ignored-by-hyperqueue".into(),
             inputs: serde_json::json!({ "tasks": tasks }),
+            resources: Default::default(),
         }
     }
 
@@ -1029,18 +1127,21 @@ mod tests {
             name: "s".into(),
             image: "i".into(),
             inputs: serde_json::json!({ "command": ["true"] }),
+        resources: Default::default(),
         };
         assert!(plan_is_task_set(&single));
         let byoc_shaped = ExperimentPlan {
             name: "b".into(),
             image: "img.sif".into(),
             inputs: serde_json::json!({}),
+        resources: Default::default(),
         };
         assert!(!plan_is_task_set(&byoc_shaped));
         let tasks_not_array = ExperimentPlan {
             name: "x".into(),
             image: "i".into(),
             inputs: serde_json::json!({ "tasks": "oops" }),
+        resources: Default::default(),
         };
         assert!(!plan_is_task_set(&tasks_not_array));
     }
@@ -1158,7 +1259,7 @@ mod tests {
             },
             HqTask::new(vec!["true".into()]),
         ];
-        let jdf = build_jdf("corpus-ingest", &tasks).unwrap();
+        let jdf = build_jdf("corpus-ingest", &tasks, &ResourceSpec::default()).unwrap();
         let parsed: toml::Value = toml::from_str(&jdf).unwrap();
         assert_eq!(parsed["name"].as_str(), Some("corpus-ingest"));
         let tasks = parsed["task"].as_array().unwrap();
@@ -1181,7 +1282,7 @@ mod tests {
             "echo".into(),
             "she said \"hi\"\nand left".into(),
         ])];
-        let jdf = build_jdf("quote's job", &tasks).unwrap();
+        let jdf = build_jdf("quote's job", &tasks, &ResourceSpec::default()).unwrap();
         let parsed: toml::Value = toml::from_str(&jdf).unwrap();
         assert_eq!(parsed["name"].as_str(), Some("quote's job"));
         assert_eq!(
@@ -1389,7 +1490,7 @@ mod tests {
     #[tokio::test]
     async fn empty_task_set_is_refused() {
         let backend = local_backend(Path::new("/tmp/never-used"));
-        let err = format!("{:#}", backend.submit_tasks("t", &[]).await.unwrap_err());
+        let err = format!("{:#}", backend.submit_tasks("t", &[], &ResourceSpec::default()).await.unwrap_err());
         assert!(err.contains("empty"), "{err}");
     }
 
@@ -1399,7 +1500,7 @@ mod tests {
         let err = format!(
             "{:#}",
             backend
-                .submit_tasks("t", &[HqTask::new(vec![])])
+                .submit_tasks("t", &[HqTask::new(vec![])], &ResourceSpec::default())
                 .await
                 .unwrap_err()
         );

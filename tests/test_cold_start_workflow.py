@@ -219,8 +219,55 @@ def test_active_learning_formula_and_exact_d_optimal_selection():
     assert phase2["scores"][0]["alpha"] == pytest.approx(
         0.4 * 1.0 + 0.2 * 2.0 + 0.3 * 3.0 + 0.1 * (1.0 - 0.25)
     )
-    assert phase2["d_optimality"]["determinant"] == pytest.approx(1.0)
+    # log|det|, not det. The selection now ranks batches by np.linalg.slogdet
+    # because a raw determinant in high dimensions overflows to inf or
+    # underflows to 0 long before its log does. Here batch_size == descriptor
+    # dimension == 2, so the batch is full rank, det == 1.0 and log|det| == 0.0.
+    assert phase2["d_optimality"]["log_determinant"] == pytest.approx(0.0)
+    assert "determinant" not in phase2["d_optimality"], (
+        "the old key held a determinant; reusing it for a log value would make "
+        "a log look like the quantity it replaced"
+    )
     assert len(phase2["selected"]) == 2
+
+
+def test_d_optimal_refuses_when_the_batch_cannot_span_the_descriptor():
+    """k < p means EVERY information matrix is singular — that is not a ranking.
+
+    The matrix is a sum of k rank-1 outer products in p dimensions, so
+    rank <= k. With k < p the determinant is identically zero for every batch,
+    the values differ only by roundoff, and the strict `>` comparison used to
+    pick a winner out of that noise. Measured before the fix with p=5, k=3:
+    determinant 2.5e-31 — mathematically zero — and the two highest-acquisition
+    candidates were dropped in favour of an arbitrary triple, reported as
+    "exact D-optimal batch selection".
+
+    This is the DEFAULT regime, not a corner case: Magpie descriptors are
+    132-dimensional and batch_size defaults to 16.
+    """
+    candidates = [
+        {
+            "id": f"c{i}",
+            "composition": {"Mo": 0.5, "Nb": 0.5},
+            "y_stability": 1,
+            "sigma": 1.0,
+            "mu": float(i),
+            "d_pareto": 1.0,
+            "rho": 0.5,
+            # 5-dimensional descriptor, batch of 3 -> rank <= 3 < 5.
+            "descriptor": [float(i), 1.0, 0.0, 0.0, 1.0],
+            "provenance": {"source": "test fixture"},
+        }
+        for i in range(1, 6)
+    ]
+
+    phase2 = run_active_learning(candidates=candidates, batch_size=3)["phase2"]
+
+    assert phase2["status"] == "unavailable", (
+        "a rank-deficient batch search must refuse, not rank roundoff"
+    )
+    assert "rank-deficient" in phase2["reason"]
+    assert phase2["selected"] == []
 
 
 def test_workflow_manifest_binds_only_registered_skills():

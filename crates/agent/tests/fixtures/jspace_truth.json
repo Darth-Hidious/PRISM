@@ -4,9 +4,10 @@
     {
       "id": "case_001",
       "expected": {
-        "name": "query_local",
+        "name": "query",
         "arguments": {
           "text": "Ti-6Al-4V fatigue",
+          "scope": "local",
           "semantic": true,
           "limit": 5
         }
@@ -15,9 +16,10 @@
     {
       "id": "case_002",
       "expected": {
-        "name": "query_platform",
+        "name": "query",
         "arguments": {
           "text": "oxygen-rich preburner alloy compatibility",
+          "scope": "platform",
           "semantic": true,
           "limit": 5
         }
@@ -26,9 +28,10 @@
     {
       "id": "case_003",
       "expected": {
-        "name": "query_federated",
+        "name": "query",
         "arguments": {
-          "text": "nickel superalloy creep"
+          "text": "nickel superalloy creep",
+          "scope": "federated"
         }
       }
     },

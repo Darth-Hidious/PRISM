@@ -901,21 +901,80 @@ def run_active_learning(
             }
         }
 
+    # RANK CHECK — without it this whole search is float noise.
+    #
+    # The information matrix is a sum of k rank-1 outer products in a
+    # descriptor_size-dimensional space, so rank(M) <= k. When k <
+    # descriptor_size the matrix is singular and det(M) == 0 for EVERY
+    # candidate batch. The determinants then differ only by roundoff, and the
+    # strict `>` below picks a winner from that noise — measured with p=5,k=3:
+    # det = 2.5e-31 (mathematically zero) and the two highest-acquisition
+    # candidates were discarded in favour of an arbitrary triple, all reported
+    # as "exact D-optimal batch selection".
+    #
+    # This is the common case, not a corner: Magpie is 132-dimensional and the
+    # default batch_size is 16. Refuse, the same way the combination-count
+    # limit above refuses, rather than label noise as an argmax.
+    if k < descriptor_size:
+        return {
+            "phase2": {
+                "status": "unavailable",
+                "reason": (
+                    f"exact D-optimal selection needs at least as many candidates as descriptor "
+                    f"dimensions (batch_size={k} < descriptor_size={descriptor_size}); every "
+                    f"information matrix is rank-deficient, so every determinant is zero"
+                ),
+                "acquisition_hint": (
+                    "Raise batch_size to at least the descriptor dimension, or reduce the "
+                    "descriptor (PCA, a screened subset). This implementation will not rank "
+                    "batches by roundoff and call it D-optimality."
+                ),
+                "weights": adapted,
+                "adaptation_rules": rules,
+                "hard_constraint_rejections": rejected,
+                "scores": scored,
+                "selected": [],
+            }
+        }
+
     ordered = sorted(range(len(scored)), key=lambda i: (-scored[i]["alpha"], str(scored[i]["id"])))
     best_indices: tuple[int, ...] | None = None
-    best_det = -math.inf
+    best_logdet = -math.inf
     for indices in combinations(ordered, k):
         information = np.zeros((descriptor_size, descriptor_size), dtype=float)
         for index in indices:
             descriptor = np.asarray(scored[index]["descriptor"], dtype=float)
             information += np.outer(descriptor, descriptor)
-        determinant = float(np.linalg.det(information))
-        if not math.isfinite(determinant):
-            raise ValueError("D-optimal determinant is non-finite")
-        if determinant > best_det:
-            best_det = determinant
+        # slogdet, not det: in high dimensions the determinant of an
+        # information matrix overflows to inf or underflows to 0 long before
+        # the log does. Comparing log|det| ranks the same batches without the
+        # overflow, and a singular batch lands at -inf instead of a
+        # roundoff-sized positive number.
+        sign, logabsdet = np.linalg.slogdet(information)
+        candidate_logdet = float(logabsdet) if sign > 0 else -math.inf
+        if candidate_logdet > best_logdet:
+            best_logdet = candidate_logdet
             best_indices = indices
-    assert best_indices is not None
+    if best_indices is None:
+        # Every batch was singular despite k >= descriptor_size — collinear
+        # descriptors. Still not a selection anyone should act on.
+        return {
+            "phase2": {
+                "status": "unavailable",
+                "reason": (
+                    "every candidate batch produced a singular information matrix; the "
+                    "descriptors are collinear, so no batch is D-optimal"
+                ),
+                "acquisition_hint": (
+                    "Check for duplicate or constant descriptor columns before re-running."
+                ),
+                "weights": adapted,
+                "adaptation_rules": rules,
+                "hard_constraint_rejections": rejected,
+                "scores": scored,
+                "selected": [],
+            }
+        }
     selected = [scored[index] for index in best_indices]
     selection_provenance = prov.build(
         tool_name="cold_start_active_learning",
@@ -941,7 +1000,10 @@ def run_active_learning(
             "scores": scored,
             "selected": selected,
             "d_optimality": {
-                "determinant": best_det,
+                # log|det|, not det: see the slogdet comment above. Reporting
+                # this as "determinant" would have made a log value look like
+                # the determinant it replaced.
+                "log_determinant": best_logdet,
                 "combination_count": combination_count,
                 "provenance": selection_provenance,
             },

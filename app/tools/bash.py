@@ -650,24 +650,41 @@ def _git_error(args: Sequence[str]) -> str | None:
     return None
 
 
+def _is_redirection_operator(token: str) -> bool:
+    """A shell redirection operator token, whatever its exact spelling.
+
+    `shlex(punctuation_chars=...)` emits a whole run of `|&;<>` as ONE token, so
+    bash's redirection family arrives here intact and is larger than the three
+    forms this guard used to enumerate. `>|` (noclobber override), `&>` and
+    `&>>` (both streams to a file) all name a path exactly like `>` does, and
+    all three walked straight past the enumeration: measured, both
+    `echo x >| /tmp/f` and `echo x &> /tmp/f` wrote OUTSIDE the project and came
+    back `success: true`, while the identical `>` form was blocked. Classify by
+    shape instead of by spelling so a redirection cannot be smuggled past the
+    path check by choosing a different operator.
+    """
+    return (
+        bool(token)
+        and set(token) <= set("<>&|")
+        and ("<" in token or ">" in token)
+    )
+
+
 def _validate_redirections(tokens: Sequence[str]) -> str | None:
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
-        if token in {"<", ">", ">>"}:
+        if _is_redirection_operator(token):
             if idx + 1 >= len(tokens):
                 return "Redirection is missing a target path."
-            direction = "Input" if token == "<" else "Output"
-            error = _ensure_safe_path(tokens[idx + 1], direction)
-            if error:
-                return error
-            idx += 2
-            continue
-        if token == ">&":
-            if idx + 1 >= len(tokens):
-                return "Redirection is missing a target."
-            if not tokens[idx + 1].isdigit():
-                error = _ensure_safe_path(tokens[idx + 1], "Output")
+            target = tokens[idx + 1]
+            # `>&1` / `<&0` duplicate a file descriptor — a digit target is a
+            # descriptor number, not a path. Only a trailing `&` makes the
+            # operator a dup form; `&>` puts the `&` in FRONT and does name a path.
+            is_fd_dup = token.endswith("&") and target.isdigit()
+            if not is_fd_dup:
+                direction = "Input" if "<" in token and ">" not in token else "Output"
+                error = _ensure_safe_path(target, direction)
                 if error:
                     return error
             idx += 2

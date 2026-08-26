@@ -2,7 +2,7 @@
 
 Two backends:
   1. matminer (preferred) — 132 Magpie features via ElementProperty
-  2. Built-in fallback — 22 features from hardcoded element data (44 elements)
+  2. Built-in fallback — 22 features from hardcoded element data (43 elements)
 
 matminer is used automatically when installed; otherwise falls back silently.
 """
@@ -44,7 +44,7 @@ def _composition_features_matminer(formula: str) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Backend 2: Built-in fallback (22 features, 44 elements)
+# Backend 2: Built-in fallback (22 features, 43 elements)
 # ---------------------------------------------------------------------------
 
 ELEMENT_DATA = {
@@ -95,11 +95,13 @@ ELEMENT_DATA = {
 
 
 # Hydrate / adduct separators. ONLY the unambiguous middle dots: an ASCII "."
-# cannot be told apart from decimal stoichiometry ("CuSO4.5H2O" is either
-# copper sulfate pentahydrate or Cu S O4.5 H2 O), and decimal compositions
-# like Mg1.5Si0.5O4 are far more common in materials datasets than ASCII-dot
-# hydrate notation. Guessing either way would silently corrupt the other, so
-# an ASCII dot is left to the numeric parser.
+# BETWEEN DIGITS cannot be told apart from decimal stoichiometry ("CuSO4.5H2O"
+# is either copper sulfate pentahydrate or Cu S O4.5 H2 O), and decimal
+# compositions like Mg1.5Si0.5O4 are far more common in materials datasets
+# than ASCII-dot hydrate notation. Guessing either way would silently corrupt
+# the other, so a dot followed by a digit is left to the numeric parser.
+# A dot NOT followed by a digit is handled in _parse_formula — it cannot be a
+# decimal point, so it is the oxide/adduct dot of "MgO.Al2O3".
 _ADDUCT_SEPARATORS = "·‧∙⋅"
 
 _FORMULA_TOKEN = __import__("re").compile(
@@ -160,9 +162,23 @@ def _parse_formula(formula: str) -> Dict[str, float]:
     WITHOUT rescaling what was already parsed.
     """
     total: Dict[str, float] = {}
-    for raw in "".join(
-        "\n" if ch in _ADDUCT_SEPARATORS else ch for ch in formula
-    ).split("\n"):
+    pieces = []
+    for i, ch in enumerate(formula):
+        # An ASCII dot NOT followed by a digit cannot be a decimal point, so
+        # it is the oxide/adduct dot of "MgO.Al2O3" or "3CaO.SiO2". It used to
+        # reach the tokenizer, where `float(".")` raised ValueError straight
+        # out of the featurizer and took the whole predict_property batch down
+        # with it. Splitting here also keeps a leading segment multiplier with
+        # its OWN segment: 3CaO.SiO2 is Ca3 Si1 O5, not 3*(CaO SiO2).
+        # A dot between digits is untouched — that is the genuinely ambiguous
+        # "CuSO4.5H2O" case the separator table above documents.
+        if ch in _ADDUCT_SEPARATORS or (
+            ch == "." and not formula[i + 1:i + 2].isdigit()
+        ):
+            pieces.append("\n")
+        else:
+            pieces.append(ch)
+    for raw in "".join(pieces).split("\n"):
         segment = raw.strip()
         if not segment:
             continue
@@ -187,6 +203,11 @@ def _composition_features_basic(formula: str) -> Dict[str, float]:
         return {}
 
     total_atoms = sum(comp.values())
+    if total_atoms <= 0:
+        # "Fe0" parses to a real element with zero atoms — there is no
+        # composition to describe, and dividing by it raised ZeroDivisionError
+        # out of the featurizer instead of the documented empty dict.
+        return {}
     fractions = {elem: count / total_atoms for elem, count in comp.items()}
 
     features = {}
@@ -196,22 +217,38 @@ def _composition_features_basic(formula: str) -> Dict[str, float]:
     for prop_name in ["atomic_mass", "atomic_number", "electronegativity", "atomic_radius"]:
         values = []
         weights = []
+        uncovered = []
         for elem, frac in fractions.items():
             if elem in ELEMENT_DATA and prop_name in ELEMENT_DATA[elem]:
                 values.append(ELEMENT_DATA[elem][prop_name])
                 weights.append(frac)
+            else:
+                uncovered.append(elem)
 
-        if not values:
+        # PARTIAL coverage is a fabrication, not a feature. Statistics over
+        # only the elements this 43-element table happens to know are emitted
+        # under names that claim to describe the WHOLE compound, and nothing
+        # downstream can tell: BSb, BOs and TcB all came back with the full
+        # 22-feature shape holding nothing but boron's numbers
+        # (avg_electronegativity 2.04, min == max == boron), so the predictor
+        # returned the SAME band gap for all three. 83 of 364 formulas in a
+        # real Materials Project pull hit this. The missing element is a data
+        # gap; it has to surface as "cannot featurize" (an empty property
+        # block, which every caller already skips), never as a plausible
+        # number for a different material.
+        if uncovered or not values:
             continue
 
         import statistics
-        # Renormalise over the elements ELEMENT_DATA actually covers. The
-        # weights are fractions of the WHOLE formula, so when an element is
-        # missing from the 44-element table they no longer sum to 1 and the
-        # "weighted average" is biased low by exactly the missing fraction —
-        # e.g. LaFeO3 (La absent) gave avg_electronegativity 2.43 instead of
-        # the 3.04 the covered Fe/O subset actually averages to. A number
-        # labelled `avg_electronegativity` has to be one.
+        # Renormalise over the covered elements. With the coverage gate above
+        # the weights already sum to 1, so this now only guards against a
+        # degenerate zero-weight composition — but it stays, because the bug
+        # it was written for was a silent one: the weights are fractions of
+        # the WHOLE formula, so any subset of them biases the "weighted
+        # average" low by exactly the missing fraction (LaFeO3 with La absent
+        # gave avg_electronegativity 2.43 instead of the 3.04 the covered
+        # Fe/O subset averages to). A number labelled `avg_electronegativity`
+        # has to be one.
         weight_sum = sum(weights)
         if weight_sum <= 0:
             continue
@@ -238,7 +275,10 @@ _USE_MATMINER = _check_matminer_available()
 #: NAMES stay the same — otherwise a model trained before the change keeps
 #: predicting from silently different inputs. v2: `avg_*` renormalised over
 #: the covered elements and the formula parser learned nested groups.
-_BASIC_BACKEND_VERSION = "v2"
+#: v3: a property block is emitted only when EVERY element in the composition
+#: is covered, so a v2 model was fitted on vectors that partly described a
+#: different material and must not be scored with v3 numbers.
+_BASIC_BACKEND_VERSION = "v3"
 
 
 def composition_features(formula: str) -> Dict[str, float]:
@@ -257,6 +297,19 @@ def composition_features(formula: str) -> Dict[str, float]:
 def get_feature_backend() -> str:
     """Return which feature backend is active."""
     return "matminer" if _USE_MATMINER else "basic"
+
+
+def uncovered_elements(formula: str) -> list:
+    """Elements of `formula` the ACTIVE backend has no data for.
+
+    Empty under matminer (Magpie covers the whole periodic table). Under the
+    built-in fallback this names exactly why a formula featurizes to fewer
+    features than a model was trained on — the caller can then say "Ag is not
+    in the table" instead of guessing at a backend mismatch.
+    """
+    if _USE_MATMINER:
+        return []
+    return sorted({el for el in _parse_formula(formula) if el not in ELEMENT_DATA})
 
 
 def feature_backend_id() -> str:

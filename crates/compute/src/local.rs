@@ -61,6 +61,53 @@ impl Default for LocalBackend {
     }
 }
 
+/// `docker run` / `podman run` flags for a job's resource request.
+///
+/// Without this the local backend ran every container on the CPU no matter
+/// what the caller asked for, which made a GPU job on a workstation silently
+/// 100x slower rather than obviously wrong.
+///
+/// `--gpus count=N` is the portable spelling of "N accelerators"; `--gpus all`
+/// when a class was named but no count, since neither runtime can select a GPU
+/// by model name. Fields with no container equivalent (`nodes`, `ntasks`,
+/// `partition`, `account`) are reported, not swallowed.
+fn container_resource_args(res: &crate::ResourceSpec) -> Vec<String> {
+    let mut args = Vec::new();
+    if res.wants_gpu() {
+        args.push("--gpus".to_string());
+        match res.gpus {
+            // The bare integer is `--gpus`'s documented shorthand for a count
+            // and is what both runtimes have accepted longest. `count=N` is
+            // only guaranteed inside the quoted device-request form, so it is
+            // the riskier spelling for a value we cannot validate here.
+            Some(n) if n > 0 => args.push(n.to_string()),
+            _ => args.push("all".to_string()),
+        }
+    }
+    if let Some(cpus) = res.cpus {
+        args.push(format!("--cpus={cpus}"));
+    }
+    if let Some(gb) = res.memory_gb {
+        args.push(format!("--memory={gb}g"));
+    }
+    let dropped = res.unsupported_by(&["gpus", "gpu_class", "cpus", "memory_gb"]);
+    if !dropped.is_empty() {
+        tracing::warn!(
+            fields = ?dropped,
+            "a single container has no equivalent for these resource fields; \
+             they were NOT applied. Use a BYOC/SLURM target for multi-node work."
+        );
+    }
+    if res.gpu_class.is_some() {
+        tracing::warn!(
+            gpu_class = ?res.gpu_class,
+            "neither docker nor podman can select a GPU by model; \
+             every visible accelerator was offered instead"
+        );
+    }
+    args
+}
+
 /// Extra `docker run` flags imposed by hard offline mode.
 ///
 /// `--network none` on the run below does NOT make this offline-safe: it
@@ -99,6 +146,7 @@ impl ComputeBackend for LocalBackend {
         let mut command = Command::new(&self.runtime);
         command.arg("run");
         command.args(offline_pull_policy());
+        command.args(container_resource_args(&plan.resources));
         let output = command
             .args([
                 "-d",
@@ -365,6 +413,37 @@ fn which(binary: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── container resources ──
+
+    #[test]
+    fn a_plain_job_adds_no_container_flags() {
+        // A job that asks for nothing must run exactly as it did before
+        // container_resource_args existed.
+        assert!(container_resource_args(&crate::ResourceSpec::default()).is_empty());
+    }
+
+    #[test]
+    fn a_gpu_request_becomes_a_gpus_flag() {
+        let args = container_resource_args(&crate::ResourceSpec {
+            gpus: Some(2),
+            cpus: Some(8),
+            memory_gb: Some(64),
+            ..Default::default()
+        });
+        assert_eq!(args, vec!["--gpus", "2", "--cpus=8", "--memory=64g"]);
+    }
+
+    #[test]
+    fn a_named_gpu_without_a_count_offers_all_of_them() {
+        // Neither runtime can select a GPU by model, so the honest fallback is
+        // to expose every accelerator rather than silently run on the CPU.
+        let args = container_resource_args(&crate::ResourceSpec {
+            gpu_class: Some("A100-80GB".into()),
+            ..Default::default()
+        });
+        assert_eq!(args, vec!["--gpus", "all"]);
+    }
 
     #[test]
     fn container_name_is_deterministic() {

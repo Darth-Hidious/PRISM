@@ -65,6 +65,36 @@ class TestExecuteBash:
         assert result["success"] is True
         assert output.read_text() == "ok"
 
+    def test_blocks_every_output_redirection_spelling(self, tmp_path):
+        """`>|`, `&>` and `&>>` name a path exactly the way `>` does.
+
+        The guard enumerated only `< > >> >&`, so those three walked past the
+        path check entirely. Measured before the fix: `echo x >| /tmp/f` and
+        `echo x &> /tmp/f` both WROTE outside the project and came back
+        `success: true`, while the identical `>` form was blocked — the tool
+        description promises "paths outside the project are blocked".
+        """
+        project = tmp_path / "project"
+        project.mkdir()
+        outside = tmp_path / "outside.txt"
+        with patch("app.tools.bash._ALLOWED_BASE", project.resolve()):
+            for operator in (">", ">>", ">|", "&>", "&>>"):
+                result = _execute_bash(command=f"echo ESCAPED {operator} {outside}")
+                assert result["success"] is False, (
+                    f"redirection {operator!r} escaped the project sandbox: {result}"
+                )
+                assert "must stay within" in result["error"], operator
+        assert not outside.exists(), "a blocked redirection must not have written"
+
+    def test_fd_duplication_and_in_project_redirection_still_work(self, tmp_path):
+        """The fix must not turn `2>&1` or an in-project `&>` into a refusal."""
+        with patch("app.tools.bash._ALLOWED_BASE", tmp_path.resolve()):
+            dup = _execute_bash(command="ls -d . 2>&1")
+            assert dup["success"] is True, dup
+            wrote = _execute_bash(command='printf "ok" &> note.txt')
+            assert wrote["success"] is True, wrote
+        assert (tmp_path / "note.txt").read_text() == "ok"
+
     def test_timeout(self):
         result = _execute_bash(command="sleep 5", timeout=1)
         assert result["success"] is False

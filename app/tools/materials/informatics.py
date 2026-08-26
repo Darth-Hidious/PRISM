@@ -25,6 +25,7 @@ import logging
 import math
 from typing import Any
 
+from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -89,7 +90,13 @@ def _structure_similarity_tool() -> Tool:
             from pymatgen.analysis.structure_matcher import StructureMatcher
             from pymatgen.core import Structure, Composition
         except ImportError:
-            return {"error": "pymatgen not installed", "tool_available": False}
+            # One missing-dependency shape (app/tools/_extras.py). This gate
+            # gave the caller no install path at all, and the sibling gates
+            # below pointed at `pip install prism-platform[ml]`, which 404s —
+            # prism-platform is on no index (see _extras.install_command).
+            return missing_extra_error(
+                "ml", "pymatgen not installed", tool_available=False
+            )
 
         # Pull candidates from the federation (shared process-level registry —
         # not rebuilt per call, so engine cache/breaker state persists).
@@ -206,12 +213,9 @@ def _compute_descriptor_tool() -> Tool:
             from matminer.featurizers.composition import ElementProperty
             from pymatgen.core import Composition
         except ImportError:
-            return {
-                "error": "matminer not installed",
-                "install_hint": "pip install prism-platform[ml]",
-                "provision_command": "prism provision extra ml",
-                "tool_available": False,
-            }
+            return missing_extra_error(
+                "ml", "matminer not installed", tool_available=False
+            )
 
         ep = ElementProperty.from_preset("magpie")
         out = []
@@ -323,14 +327,56 @@ def _predict_property_tool() -> Tool:
             backend_label = "matminer magpie (132 features)"
         else:
             backend_label = "builtin 22-feature composition statistics (matminer not installed)"
-        X, y = [], []
+        feature_rows, y = [], []
         for f, v in rows:
             feats = composition_features(f)
             if feats:
-                X.append(feats); y.append(v)
-        if len(X) < 20:
+                feature_rows.append(feats); y.append(v)
+        if len(feature_rows) < 20:
             return {"error": "featurization failed for training data"}
-        result = train_model(np.array(X), np.array(y), model_type, prop)
+
+        # `composition_features` returns a NAME -> VALUE dict, so the design
+        # matrix has to be built against an explicit column order.
+        # `np.array(list_of_dicts)` builds an object array instead, and sklearn
+        # raises "float() argument must be a string or a real number, not
+        # 'dict'" — this tool had never returned a prediction.
+        #
+        # Row 0's key list can KeyError on a later row: the basic backend drops
+        # a whole property block for a formula whose elements it does not know.
+        #
+        # Intersecting every row's keys avoids the KeyError but pays for it in
+        # COLUMNS, and the price is the whole model. Measured on the live MP
+        # pull for formation_energy_per_atom: 35 of 364 training rows are bare
+        # elemental formulas outside the basic backend's element table, so they
+        # carry only n_elements and total_atoms_in_formula — and the
+        # intersection collapsed the design matrix to (364, 2) for EVERY row.
+        # Cu2O, Fe2O3 and NaCl then all predicted the identical 0.14046 eV/atom
+        # while model_meta.feature_backend and provenance both said
+        # "builtin 22-feature composition statistics".
+        #
+        # Drop the sparse ROWS instead: keep the key set most rows agree on,
+        # keep the rows that carry it, and report how many were dropped. The
+        # per-formula guard below already refuses to score a query formula the
+        # backend featurised more sparsely than training.
+        from collections import Counter
+
+        key_sets = Counter(frozenset(f) for f in feature_rows)
+        dominant_keys = key_sets.most_common(1)[0][0]
+        feature_names = sorted(dominant_keys)
+        if not feature_names:
+            return {"error": "no feature is shared by every training formula"}
+        kept = [(row, val) for row, val in zip(feature_rows, y) if dominant_keys <= row.keys()]
+        dropped = len(feature_rows) - len(kept)
+        if len(kept) < 20:
+            return {
+                "error": (
+                    f"only {len(kept)} of {len(feature_rows)} training formulas carry the "
+                    f"full {len(feature_names)}-feature descriptor set; too few to fit"
+                )
+            }
+        X = np.array([[row[name] for name in feature_names] for row, _ in kept])
+        y = [val for _, val in kept]
+        result = train_model(X, np.array(y), model_type, prop)
         model = result["model"]
         meta = result["metrics"]
 
@@ -341,7 +387,16 @@ def _predict_property_tool() -> Tool:
             if not feats:
                 predictions.append({"formula": f, "error": "featurization failed"})
                 continue
-            x = np.array(feats).reshape(1, -1)
+            # Predict through the SAME column order the model was fitted on;
+            # a formula the backend featurised more sparsely cannot be scored
+            # against it without silently shifting every column.
+            if not all(name in feats for name in feature_names):
+                predictions.append({
+                    "formula": f,
+                    "error": "featurization produced fewer features than training used",
+                })
+                continue
+            x = np.array([[feats[name] for name in feature_names]])
             pred = float(model.predict(x)[0])
             # Uncertainty: spread across the ensemble's independent fits.
             #
@@ -377,10 +432,16 @@ def _predict_property_tool() -> Tool:
             "predictions": predictions,
             "model_meta": {"r2": round(meta.get("r2", 0), 3), "mae": round(meta.get("mae", 0), 4),
                            "n_train": meta.get("n_train", len(X)), "model": model_type,
-                           "feature_backend": backend_label},
+                           "feature_backend": backend_label,
+                           # The COUNT the fit actually used, not the count the
+                           # backend label advertises — they diverged silently.
+                           "n_features_used": len(feature_names),
+                           "training_rows_dropped_incomplete_features": dropped},
             "provenance": (
-                f"sklearn {model_type} on {backend_label} features, trained on "
-                f"{len(X)} MP rows via platform proxy; uncertainty = tree-ensemble std"
+                f"sklearn {model_type} on {backend_label}; {len(feature_names)} feature(s) "
+                f"actually used, trained on {len(X)} MP rows via platform proxy "
+                f"({dropped} row(s) dropped for an incomplete descriptor set); "
+                "uncertainty = tree-ensemble std"
             ),
         }
 
@@ -425,8 +486,14 @@ def _pareto_screen_tool() -> Tool:
                 "type": "array",
                 "items": {"type": "object",
                           "properties": {"property": {"type": "string"},
-                                         "direction": {"enum": ["min", "max"]}}},
-                "description": "Objectives: [{property:'density',direction:'min'}, {property:'modulus',direction:'max'}].",
+                                         "direction": {"enum": ["min", "max"]}},
+                          "required": ["property", "direction"]},
+                "description": (
+                    "Objectives: [{property:'density',direction:'min'}, "
+                    "{property:'modulus',direction:'max'}]. `direction` is "
+                    "mandatory and must be exactly 'min' or 'max' — any other "
+                    "spelling is rejected, never guessed."
+                ),
             },
         },
         "required": ["candidates", "objectives"],
@@ -441,6 +508,31 @@ def _pareto_screen_tool() -> Tool:
         if len(candidates) > 200:
             return {"error": "max 200 candidates"}
 
+        # `direction` decides the SIGN of every objective, and nothing else
+        # validates it: Tool.execute does not check arguments against
+        # input_schema, so whatever the caller wrote arrives here verbatim.
+        # `obj["direction"] == "min"` therefore treated every other spelling —
+        # "minimize", "minimise", "MIN" — as MAXIMISE, and returned the
+        # HEAVIEST candidate as the Pareto-optimal minimum-density pick with
+        # no error and no warning. A missing `direction` (schema-valid: the
+        # objective item declares no `required`) raised a bare
+        # `KeyError: 'direction'` instead. Reject both, by name.
+        for i, obj in enumerate(objectives):
+            if not isinstance(obj, dict):
+                return {"error": f"objectives[{i}] must be an object with 'property' and 'direction'"}
+            prop = obj.get("property")
+            if not isinstance(prop, str) or not prop.strip():
+                return {"error": f"objectives[{i}].property must be a non-empty property name"}
+            direction = obj.get("direction")
+            if direction not in ("min", "max"):
+                return {
+                    "error": (
+                        f"objectives[{i}] ('{prop}') has direction={direction!r}; "
+                        "it must be exactly 'min' or 'max'. Refusing to guess — "
+                        "the wrong sign silently returns the opposite Pareto front."
+                    )
+                }
+
         # Extract objective vectors (handle missing as worst-case).
         def _vec(c):
             v = []
@@ -448,11 +540,28 @@ def _pareto_screen_tool() -> Tool:
                 val = c.get(obj["property"])
                 if val is None:
                     return None
+                # NaN/inf must drop out too. Every comparison with NaN is
+                # False, so a NaN candidate neither dominates nor IS dominated
+                # and therefore lands on the front unconditionally. Measured:
+                # a candidate with density=NaN, modulus=1.0 sat on the front
+                # beside the true optimum (density=1.0, modulus=300) while a
+                # strictly better real candidate was marked dominated. NaN
+                # arrives easily — any pandas column, any upstream tool
+                # emitting float("nan").
+                try:
+                    if not math.isfinite(float(val)):
+                        return None
+                except (TypeError, ValueError):
+                    return None
                 # For 'min' objectives, negate so dominated = higher-is-worse uniformly.
                 v.append(-float(val) if obj["direction"] == "min" else float(val))
             return v
 
         vecs = [(c, _vec(c)) for c in candidates]
+        # Report the drop rather than performing it silently: a candidate that
+        # vanished for want of a finite objective value is a data gap the
+        # caller needs to see, not a screening result.
+        excluded = len([1 for _, v in vecs if v is None])
         vecs = [(c, v) for c, v in vecs if v is not None]
         if not vecs:
             return {"error": "no candidates have all objective properties"}
@@ -484,6 +593,7 @@ def _pareto_screen_tool() -> Tool:
             "pareto_count": len(front),
             "dominated_count": n - len(front),
             "total_evaluated": n,
+            "excluded_non_finite_or_missing": excluded,
             "objectives": objectives,
             "provenance": "exact Pareto dominance (O(n²)); the non-dominated set across all objectives",
         }
@@ -543,6 +653,16 @@ def _suggest_next_experiments_tool() -> Tool:
             "direction": {"type": "string", "enum": ["max", "min"], "default": "max",
                           "description": "Optimize for maximum (max) or minimum (min) predicted property."},
             "beta": {"type": "number", "default": 2.0, "description": "Exploration parameter for UCB."},
+            "best_observed": {
+                "type": "number",
+                "description": (
+                    "The best MEASURED value so far — Expected Improvement's incumbent f*. "
+                    "Supply this whenever any candidate has actually been measured. Without "
+                    "it EI falls back to the maximum PREDICTED value over this pool, which is "
+                    "a model output, not an observation: the top-predicted candidate then "
+                    "scores z=0 and can never be recommended for exploitation."
+                ),
+            },
         },
         "required": ["candidates"],
         "additionalProperties": False,
@@ -557,13 +677,56 @@ def _suggest_next_experiments_tool() -> Tool:
         direction = kwargs.get("direction", "max")
         beta = kwargs.get("beta", 2.0)
 
+        # Both enums are dispatched with `== "literal" else <the other branch>`,
+        # and Tool.execute does not validate arguments against input_schema, so
+        # any other spelling silently ran the OPPOSITE thing while the response
+        # echoed what the caller asked for. Measured: direction="maximize"
+        # returned the worst candidate first under `"direction": "maximize"`,
+        # and acquisition="EI" ran UCB under `"acquisition": "EI"` with a
+        # provenance line reading "active-learning EI acquisition (scipy.stats
+        # norm for EI)". Reject rather than mislabel.
+        if acq not in ("ei", "ucb"):
+            return {
+                "error": (
+                    f"acquisition={acq!r} is not supported; use exactly 'ei' or "
+                    "'ucb'. Refusing to guess — running the other acquisition "
+                    "under the requested name misreports what was computed."
+                )
+            }
+        if direction not in ("max", "min"):
+            return {
+                "error": (
+                    f"direction={direction!r} is not supported; use exactly 'max' "
+                    "or 'min'. Refusing to guess — the wrong sign ranks the pool "
+                    "backwards."
+                )
+            }
+        try:
+            beta = float(beta)
+        except (TypeError, ValueError):
+            return {"error": f"beta={beta!r} must be a number"}
+        if not math.isfinite(beta):
+            return {"error": f"beta={beta!r} must be a finite number"}
+
         valid = [c for c in candidates if c.get("predicted") is not None and c.get("uncertainty") is not None]
         if not valid:
             return {"error": "candidates need both 'predicted' and 'uncertainty'"}
 
-        # Current best.
-        preds = [c["predicted"] for c in valid]
-        best = max(preds) if direction == "max" else min(preds)
+        # EI's incumbent f* must be the best OBSERVED value. Using the pool's
+        # best PREDICTION instead makes the top-predicted candidate score
+        # z = 0 -> EI = 0.3989*sigma, which is the SMALLEST EI in the pool
+        # whenever its sigma is small. Measured before this fix, with
+        # A(mu=10.0, sigma=0.01), B(mu=9.9, sigma=3.0), C(mu=5.0, sigma=5.0):
+        # A — the predicted optimum — ranked LAST at EI=0.004. The tool could
+        # never recommend exploitation.
+        observed = kwargs.get("best_observed")
+        if observed is not None:
+            best = float(observed)
+            incumbent_source = "observed"
+        else:
+            preds = [c["predicted"] for c in valid]
+            best = max(preds) if direction == "max" else min(preds)
+            incumbent_source = "pool_max_predicted"
 
         scored = []
         for c in valid:
@@ -593,11 +756,26 @@ def _suggest_next_experiments_tool() -> Tool:
         scored.sort(key=lambda s: s["acquisition_score"], reverse=True)
         return {
             "suggestions": scored[:n],
+            "incumbent": round(best, 4),
+            "incumbent_source": incumbent_source,
+            # Kept for callers that read the old key; it now carries the same
+            # value as `incumbent`, and `incumbent_source` says what it IS.
             "current_best": round(best, 4),
             "acquisition": acq,
             "direction": direction,
             "pool_size": len(valid),
-            "provenance": f"active-learning {acq} acquisition (scipy.stats norm for EI); ranks where sampling most improves the objective",
+            "provenance": (
+                f"active-learning {acq} acquisition (scipy.stats norm for EI); "
+                f"ranks where sampling most improves the objective. "
+                + (
+                    f"Incumbent f*={round(best, 4)} is the best MEASURED value supplied by the caller."
+                    if incumbent_source == "observed"
+                    else f"NO measured incumbent was supplied, so f*={round(best, 4)} is the best "
+                    f"PREDICTED value in this pool — a model output, not an observation. EI is "
+                    f"therefore exploration-only here: the top-predicted candidate scores z=0. "
+                    f"Pass `best_observed` once anything has been measured."
+                )
+            ),
         }
 
     return Tool(

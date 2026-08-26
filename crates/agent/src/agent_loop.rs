@@ -109,6 +109,7 @@ async fn approval_gate_outcome(
                 call_id: call_id.to_string(),
                 tool_name: tool_name.to_string(),
                 content: denied_msg.clone(),
+                tool_args: args.clone(),
                 summary: Some(format!("{tool_name}: denied")),
                 preview: preview.clone(),
                 elapsed_ms: 0,
@@ -515,7 +516,23 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
                 out.push_str(&format!("      papers_ingest {handle}\n"));
             }
             None => {
-                out.push_str("      (no fetchable full text — do not spend an ingest on this)\n")
+                // NOT a refusal any more. A direct fetch is blocked on this
+                // host, but `web_browse render=true` drives a real browser
+                // (navigate, run JS, read the rendered DOM) and gets through
+                // the bot walls that 403 a plain fetcher. Saying "do not spend
+                // an ingest on this" was only honest while there was no
+                // browser to escalate to — it refused work never attempted,
+                // and on most publishers that is where the literature is.
+                match record.get("fulltext_url").and_then(Value::as_str) {
+                    Some(url) if !url.trim().is_empty() => out.push_str(&format!(
+                        "      (direct fetch is blocked on this host — \
+                         web_browse url={url} render=true, then ingest what you need)\n"
+                    )),
+                    _ => out.push_str(
+                        "      (no full-text link on this record — search for it by title, \
+                         or read the landing page with web_browse render=true)\n",
+                    ),
+                }
             }
         }
     }
@@ -539,8 +556,9 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
     }
     if ingestable > 0 {
         out.push_str(&format!(
-            "{ingestable} of the above have full text and can be ingested directly with the \
-             url shown — you do not need to recall anything to do it.\n"
+            "{ingestable} of the above can be ingested DIRECTLY with the url shown — no recall \
+             needed. The rest are not out of reach: their hosts block a plain fetch, so read \
+             them with web_browse render=true (a real browser) and ingest from there.\n"
         ));
     }
     out.push_str(
@@ -1364,6 +1382,45 @@ async fn load_session_memory() -> Option<String> {
 fn doom_loop_signature(tool_name: &str, args: &Value) -> String {
     let args_str = serde_json::to_string(args).unwrap_or_default();
     format!("{tool_name}:{args_str}")
+}
+
+/// Consecutive discovery calls, with nothing discovered actually used, before
+/// the agent is told it is shopping instead of working.
+///
+/// Deliberately generous. This is not a cap on discovery — the model may keep
+/// calling after the advisory, exactly as with the doom-loop guard. It exists
+/// because the doom-loop signature includes the arguments, so a model that
+/// walks the catalog with a DIFFERENT query each time never trips it: measured
+/// 2026-08-25, T16 made **59 consecutive `find_tools` calls**, each returning a
+/// different five tools, and no guard fired.
+const DISCOVERY_THRASH_WINDOW: usize = 8;
+
+// T4's passing run used `find_tools` a handful of times legitimately. A
+// threshold near that would interrupt ordinary discovery, so the floor is
+// enforced at COMPILE time — a future edit that tightens it stops the build
+// rather than quietly muzzling the agent.
+const _: () = assert!(
+    DISCOVERY_THRASH_WINDOW >= 5,
+    "DISCOVERY_THRASH_WINDOW must stay generous enough not to interrupt ordinary discovery"
+);
+
+/// Tools whose only job is to surface OTHER tools.
+///
+/// Calling one of these repeatedly without ever invoking what it surfaced is
+/// unproductive by construction — which is what separates it from a legitimate
+/// run of the same tool. T4's PASSING run made 20 consecutive `web` calls and
+/// every one did work, so "same tool N times" on its own would be a muzzle.
+fn is_discovery_tool(tool_name: &str) -> bool {
+    tool_name == "find_tools"
+}
+
+/// Whether a discovery call at this streak length should draw the advisory.
+///
+/// Split out so the threshold is testable without driving a whole turn — the
+/// bug it guards was only visible in a live run, and a rule that can only be
+/// checked live is a rule that silently rots.
+fn discovery_thrash_tripped(tool_name: &str, streak: usize) -> bool {
+    is_discovery_tool(tool_name) && streak >= DISCOVERY_THRASH_WINDOW
 }
 
 fn check_doom_loop(recent: &VecDeque<String>, sig: &str) -> bool {
@@ -2521,6 +2578,45 @@ fn spawn_neural_warm(entries: Vec<(String, String)>) {
     });
 }
 
+/// Whether this turn runs unattended, from the request flag OR `PRISM_AUTO_APPROVE`.
+///
+/// `prism --auto-approve` sets `PRISM_AUTO_APPROVE=1` with the comment "set env
+/// var that the backend reads" — and until now NOTHING read it. Measured
+/// 2026-08-25: the name appeared exactly once in the whole repository, at the
+/// write site. Every frontend hardcodes `"auto_approve": false` in its request,
+/// so the documented flag ("Auto-approve all tool calls without prompting")
+/// silently did nothing and an unattended run stalled forever on the first
+/// gated tool. A live test sat blocked on one approval prompt for 12 minutes.
+///
+/// A flag that quietly does nothing is worse than no flag: the operator
+/// believes unattended mode is on and walks away. This honours what the flag
+/// already promises, and nothing more — it does not widen what may run, it
+/// makes an explicit, user-typed instruction take effect.
+pub(crate) fn auto_approve_enabled(request_flag: bool) -> bool {
+    request_flag || env_auto_approve()
+}
+
+/// `PRISM_AUTO_APPROVE` as a boolean. Set-but-empty and `0`/`false` mean OFF —
+/// an env var that exists by accident must not silently disarm every gate.
+fn env_auto_approve() -> bool {
+    std::env::var("PRISM_AUTO_APPROVE").is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
+    })
+}
+
+/// Reasoning steps a turn may take. `0` means no cap.
+///
+/// PRISM does not decide how long a research turn is allowed to think; this is
+/// a runaway backstop the operator can switch off entirely.
+pub(crate) fn iteration_cap(max_iterations: usize) -> usize {
+    if max_iterations == 0 {
+        usize::MAX
+    } else {
+        max_iterations
+    }
+}
+
 /// Run a single conversational turn through the full TAOR pipeline.
 ///
 /// Flow:
@@ -2534,7 +2630,8 @@ fn spawn_neural_warm(entries: Vec<(String, String)>) {
 ///    f. If no tool calls → compact if needed, emit TurnComplete, return
 ///    g. For each tool call → hooks, permissions, approval, execute, doom-loop,
 ///    large-result handling, scratchpad, transcript, emit result
-/// 3. If max_iterations reached → emit warning + TurnComplete
+/// 3. If the step backstop is reached → emit a completion that SAYS it was
+///    cut off; never a silent `text: None`
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     llm: &LlmClient,
@@ -2799,6 +2896,10 @@ pub(crate) async fn run_turn_inner(
     // block → chat output is byte-for-byte unchanged (chat-path-unchanged test).
     let task_block = task.and_then(crate::task::task_context_block);
     let mut recent_sigs: VecDeque<String> = VecDeque::with_capacity(DOOM_LOOP_WINDOW + 1);
+    // Consecutive discovery calls with nothing discovered used yet. Reset by
+    // any non-discovery tool call — using something you found is the proof
+    // that discovery was productive.
+    let mut discovery_streak: usize = 0;
     // Track consecutive empty results per tool name
     let mut empty_result_streak: HashMap<String, usize> = HashMap::new();
     // VS2-P1b: track consecutive FAILED code-exec calls per tool name. Resets
@@ -2853,7 +2954,8 @@ pub(crate) async fn run_turn_inner(
     let mut capability_gap_retried = false;
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
-    for iteration in 0..config.max_iterations {
+    let iteration_cap = iteration_cap(config.max_iterations);
+    for iteration in 0..iteration_cap {
         // ── 2a. Budget check ──────────────────────────────────────
         if let Some(warning) = transcript.budget_warning() {
             emit(AgentEvent::TextDelta {
@@ -3145,6 +3247,58 @@ pub(crate) async fn run_turn_inner(
                 })
                 .context("LLM call failed")?
             }
+            // TRANSPORT RECOVERY — a dropped stream is not an answer.
+            //
+            // Measured 2026-08-25: FOUR consecutive long-generation turns died
+            // on `error reading SSE chunk: … operation timed out`. Each had
+            // already read a paper, extracted its equations and provisioned a
+            // venv; all of it was discarded because the socket blinked. Short
+            // turns never hit it, so the failure scales with generation length
+            // — exactly the turns worth the most.
+            //
+            // Retrying here is safe, and the safety is structural rather than
+            // hopeful: `streamed_deltas` is BUFFERED and only emitted to the
+            // UI after a successful response (see "2e. Emit streamed content"
+            // below), and tool calls are executed later still, from
+            // `response`. A stream that failed therefore emitted nothing and
+            // ran nothing — there is no partial effect to duplicate. Clearing
+            // and re-issuing is the same move the overflow arm above makes.
+            //
+            // `error_is_transient_transport` refuses to match provider
+            // VERDICTS (402/401/quota/content-filter) precisely so this cannot
+            // re-bill a request that was never going to succeed.
+            Err(error) if prism_llm::error_is_transient_transport(&error) => {
+                // Exactly one recovery per request: the retry below is inline,
+                // so a second transport fault propagates instead of looping
+                // against a provider that is genuinely down. Same structure as
+                // the overflow arm above.
+                tracing::warn!(
+                    error = %error,
+                    "transport fault mid-stream — re-issuing this request once"
+                );
+                emit(AgentEvent::TextDelta {
+                    text: "[connection dropped — retrying]\n".to_string(),
+                });
+                streamed_deltas.clear();
+                llm.chat_with_tools_streaming(
+                    &messages,
+                    &relevant_tools,
+                    |delta: &str, is_reasoning: bool| {
+                        if !delta.is_empty() {
+                            streamed_deltas.push((delta.to_string(), is_reasoning));
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "LLM call failed after transport retry: {e:#}");
+                    emit(AgentEvent::TextDelta {
+                        text: format!("Error: {e:#}\n"),
+                    });
+                    e
+                })
+                .context("LLM call failed")?
+            }
             Err(e) => {
                 tracing::error!(error = %e, "LLM call failed: {e:#}");
                 // Surface error details in the UI, not just "LLM call failed"
@@ -3293,7 +3447,7 @@ pub(crate) async fn run_turn_inner(
                 // fabricated answer for no answer; on the last iteration the
                 // claim ships and the prompt is the only line of defence.
                 if contract_gate_firings < MAX_CONTRACT_GATE_FIRINGS
-                    && iteration + 1 < config.max_iterations
+                    && iteration + 1 < iteration_cap
                     && let Some(claim) = crate::execution_contract::unsupported_execution_claim(
                         response.message.content.as_deref().unwrap_or(""),
                         &tools_used_this_turn,
@@ -3333,7 +3487,7 @@ pub(crate) async fn run_turn_inner(
                 // or not the model would have gone looking. Bounded: once per
                 // turn, and only when retrieval actually found something.
                 if !capability_gap_retried
-                    && iteration + 1 < config.max_iterations
+                    && iteration + 1 < iteration_cap
                     && let Some(gap) = crate::tool_catalog::capability_gap_query(
                         response.message.content.as_deref().unwrap_or(""),
                     )
@@ -3452,6 +3606,7 @@ pub(crate) async fn run_turn_inner(
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
+                    tool_args: args.clone(),
                     summary: Some(format!("{tool_name}: blocked by hook")),
                     preview: preview.clone(),
                     elapsed_ms: 0,
@@ -3483,6 +3638,7 @@ pub(crate) async fn run_turn_inner(
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
+                    tool_args: args.clone(),
                     summary: Some(format!("{tool_name}: blocked by skill policy")),
                     preview: preview.clone(),
                     elapsed_ms: 0,
@@ -3513,6 +3669,7 @@ pub(crate) async fn run_turn_inner(
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
+                    tool_args: args.clone(),
                     summary: Some(format!("{tool_name}: blocked by permissions")),
                     preview: preview.clone(),
                     elapsed_ms: 0,
@@ -3552,6 +3709,7 @@ pub(crate) async fn run_turn_inner(
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: denied_msg.clone(),
+                    tool_args: args.clone(),
                     summary: Some(format!("{tool_name}: policy engine unavailable")),
                     preview: preview.clone(),
                     elapsed_ms: 0,
@@ -3583,6 +3741,7 @@ pub(crate) async fn run_turn_inner(
                             call_id: call_id.clone(),
                             tool_name: tool_name.clone(),
                             content: denied_msg.clone(),
+                            tool_args: args.clone(),
                             summary: Some(format!("{tool_name}: denied by policy")),
                             preview: preview.clone(),
                             elapsed_ms: 0,
@@ -3801,10 +3960,33 @@ pub(crate) async fn run_turn_inner(
                         tool_name,
                         command_tools::current_platform_access(),
                     ) {
-                        Ok(_) => tool_server
-                            .call_tool(tool_name, args.clone())
-                            .await
-                            .map_err(Into::into),
+                        Ok(_) => {
+                            // `show_scratchpad` reads the ordered tool-call
+                            // ledger, and that ledger lives HERE, in Rust
+                            // (`agent_loop` logs every call to it). The Python
+                            // tool was written expecting an injected
+                            // `_scratchpad` object from an `AgentCore` that
+                            // does not exist in `app/`, so it always answered
+                            // "not available in this session" — registered,
+                            // permission-mapped, described to the model, and
+                            // inert. Inject the rendered ledger here, the one
+                            // place that has it. Caller-injected, so it is
+                            // written AFTER the model's args and cannot be
+                            // spoofed by the model.
+                            let mut call_args = args.clone();
+                            if tool_name == "show_scratchpad"
+                                && let Some(obj) = call_args.as_object_mut()
+                            {
+                                obj.insert(
+                                    "_scratchpad_text".to_string(),
+                                    serde_json::Value::String(scratchpad.to_text()),
+                                );
+                            }
+                            tool_server
+                                .call_tool(tool_name, call_args)
+                                .await
+                                .map_err(Into::into)
+                        }
                         Err(error) => Err(error),
                     }
                 };
@@ -3913,6 +4095,47 @@ pub(crate) async fn run_turn_inner(
             };
 
             // ── h7. Doom-loop detection ───────────────────────────
+            //
+            // Two different failures live here. The doom-loop guard below
+            // catches being STUCK (same call, same arguments). This one
+            // catches being UNPRODUCTIVE: discovering tools over and over
+            // without ever calling one.
+            if is_discovery_tool(tool_name) {
+                discovery_streak += 1;
+            } else {
+                discovery_streak = 0;
+            }
+            if discovery_thrash_tripped(tool_name, discovery_streak) {
+                let advisory = format!(
+                    "{tool_name} has now been called {discovery_streak} times in a row and \
+                     nothing it surfaced has been called. The tools it returned are already \
+                     available to you — invoke one by name, or answer with what you have and \
+                     say plainly what you could not find. Discovering more tools is not \
+                     making progress on the question."
+                );
+                emit(AgentEvent::ToolCallResult {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: advisory.clone(),
+                    tool_args: args.clone(),
+                    summary: Some(format!("{tool_name}: discovery thrash")),
+                    preview: preview.clone(),
+                    elapsed_ms,
+                    is_error: false,
+                });
+                history.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(advisory),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                });
+                // Advisory, not abort: the streak resets so the model gets a
+                // clear run at whatever it does next rather than being nagged
+                // on every subsequent call.
+                discovery_streak = 0;
+                continue;
+            }
+
             let sig = doom_loop_signature(tool_name, &args);
             recent_sigs.push_back(sig.clone());
             if recent_sigs.len() > DOOM_LOOP_WINDOW {
@@ -3929,6 +4152,7 @@ pub(crate) async fn run_turn_inner(
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: abort_msg.clone(),
+                    tool_args: args.clone(),
                     summary: Some(format!("{tool_name}: doom loop aborted")),
                     preview: preview.clone(),
                     elapsed_ms,
@@ -3961,6 +4185,7 @@ pub(crate) async fn run_turn_inner(
                         call_id: call_id.clone(),
                         tool_name: tool_name.clone(),
                         content: abort_msg.clone(),
+                        tool_args: args.clone(),
                         summary: Some(format!("{tool_name}: empty results, stopping")),
                         preview: preview.clone(),
                         elapsed_ms,
@@ -4011,6 +4236,7 @@ pub(crate) async fn run_turn_inner(
                             call_id: call_id.clone(),
                             tool_name: canonical_tool.to_string(),
                             content: real_content.clone(),
+                            tool_args: args.clone(),
                             summary: Some(real_summary.clone()),
                             preview: preview.clone(),
                             elapsed_ms,
@@ -4026,6 +4252,7 @@ pub(crate) async fn run_turn_inner(
                             call_id: call_id.clone(),
                             tool_name: canonical_tool.to_string(),
                             content: directive.clone(),
+                            tool_args: args.clone(),
                             summary: Some(format!("{canonical_tool}: repair cap reached")),
                             preview: preview.clone(),
                             elapsed_ms,
@@ -4082,6 +4309,7 @@ pub(crate) async fn run_turn_inner(
                 call_id: call_id.clone(),
                 tool_name: tool_name.clone(),
                 content: content.clone(),
+                tool_args: args.clone(),
                 summary: Some(summary),
                 preview,
                 elapsed_ms,
@@ -4144,14 +4372,26 @@ pub(crate) async fn run_turn_inner(
     }
 
     // ── 3. Max iterations reached ─────────────────────────────────
+    //
+    // This used to emit `text: None`, so a turn that spent its whole budget
+    // doing real work ended with the user seeing nothing at all — measured on
+    // 2026-08-25, 19 tool calls that had already established the answer. The
+    // turn is over either way, but say so in the completion itself, and say
+    // what to do about it, rather than completing silently.
+    let cutoff = format!(
+        "[Turn stopped after {iteration_cap} reasoning steps — this is a runaway \
+         backstop, not a conclusion. Anything above is what was established \
+         before the cut. Ask again to continue, or raise `max_iterations` \
+         (0 = no cap) if this kind of question needs more steps.]"
+    );
     emit(AgentEvent::TextDelta {
-        text: "\n\n[Agent reached maximum iterations]".to_string(),
+        text: format!("\n\n{cutoff}"),
     });
 
     let estimated_cost = run_metrics.cost_usd;
 
     emit(AgentEvent::TurnComplete {
-        text: None,
+        text: Some(cutoff),
         has_more: false,
         usage: None,
         total_usage: Some(total_usage),
@@ -4174,6 +4414,150 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 
 #[cfg(test)]
 mod tests {
+
+    // ── discovery thrash ──
+    //
+    // Guards F47: the doom-loop signature includes the ARGUMENTS, so 59
+    // consecutive `find_tools` calls with a different query each time never
+    // tripped it. Measured live in T16.
+
+    #[test]
+    fn only_discovery_tools_can_thrash() {
+        assert!(is_discovery_tool("find_tools"));
+        // A legitimate run of the same working tool must never trip this:
+        // T4's PASSING run made 20 consecutive `web` calls.
+        assert!(!is_discovery_tool("web"));
+        assert!(!is_discovery_tool("query"));
+        assert!(!is_discovery_tool("prior_art_search"));
+    }
+
+    #[test]
+    fn a_working_tool_never_trips_the_guard_however_long_the_run() {
+        for streak in [1usize, 8, 20, 59, 500] {
+            assert!(
+                !discovery_thrash_tripped("web", streak),
+                "a productive tool must never be interrupted; {streak} web calls tripped it"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_trips_only_after_a_generous_run() {
+        assert!(!discovery_thrash_tripped("find_tools", 1));
+        assert!(!discovery_thrash_tripped(
+            "find_tools",
+            DISCOVERY_THRASH_WINDOW - 1
+        ));
+        assert!(discovery_thrash_tripped(
+            "find_tools",
+            DISCOVERY_THRASH_WINDOW
+        ));
+        assert!(discovery_thrash_tripped("find_tools", 59));
+    }
+
+    // ── unattended operation ──
+    //
+    // Guards F52: `prism --auto-approve` set PRISM_AUTO_APPROVE=1 and NOTHING
+    // read it — the name appeared exactly once in the repo, at the write site.
+    // Every frontend hardcodes the request flag false, so the documented flag
+    // did nothing and an unattended run stalled forever on the first gate.
+
+    fn with_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        // SAFETY: single-threaded test body; restored before returning.
+        let prev = std::env::var("PRISM_AUTO_APPROVE").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("PRISM_AUTO_APPROVE", v),
+                None => std::env::remove_var("PRISM_AUTO_APPROVE"),
+            }
+        }
+        let out = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("PRISM_AUTO_APPROVE", v),
+                None => std::env::remove_var("PRISM_AUTO_APPROVE"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_env_var_actually_enables_unattended_running() {
+        with_env(Some("1"), || {
+            assert!(
+                auto_approve_enabled(false),
+                "PRISM_AUTO_APPROVE=1 must open the gates — this is the whole point of the flag"
+            );
+        });
+    }
+
+    #[test]
+    fn the_request_flag_still_works_on_its_own() {
+        with_env(None, || {
+            assert!(auto_approve_enabled(true));
+            assert!(
+                !auto_approve_enabled(false),
+                "no flag, no env => gates stay closed"
+            );
+        });
+    }
+
+    #[test]
+    fn an_accidental_env_var_does_not_disarm_every_gate() {
+        // Set-but-empty, "0" and "false" must all mean OFF. An env var that
+        // exists by accident must never silently bypass approval on a
+        // destructive tool.
+        for value in ["", "0", "false", "FALSE", "  "] {
+            with_env(Some(value), || {
+                assert!(
+                    !auto_approve_enabled(false),
+                    "PRISM_AUTO_APPROVE={value:?} must NOT open the gates"
+                );
+            });
+        }
+    }
+
+    // ── the reasoning-step backstop ──
+    //
+    // Guards F41: max_iterations defaulted to 20, which is roughly a dozen web
+    // reads. A polymer literature question spent 19 tool calls establishing a
+    // correct answer, hit the cap, and the turn completed with `text: None`.
+
+    #[test]
+    fn zero_iterations_means_no_cap_not_no_work() {
+        // The trap this exists for: `for _ in 0..0` runs the loop ZERO times,
+        // so a naive "0 = unlimited" would silently do nothing at all.
+        assert_eq!(iteration_cap(0), usize::MAX);
+        assert!(iteration_cap(0) > 0, "0 must mean unlimited, never no-op");
+    }
+
+    #[test]
+    fn a_set_cap_is_honoured_exactly() {
+        assert_eq!(iteration_cap(1), 1);
+        assert_eq!(iteration_cap(200), 200);
+    }
+
+    #[test]
+    fn the_default_backstop_does_not_interrupt_research() {
+        // 19 tool calls was not enough for one literature question. Any default
+        // in that range is a muzzle, not a runaway guard.
+        let default = crate::types::default_max_iterations();
+        assert!(
+            default >= 100,
+            "a backstop low enough to cut ordinary research is a muzzle; got {default}"
+        );
+    }
+
+    #[test]
+    fn the_config_default_agrees_with_the_helper() {
+        // The F33 lesson: an `impl Default` that disagrees with the declared
+        // default is how the 300s deadline survived next to a 0s policy.
+        assert_eq!(
+            crate::types::AgentConfig::default().max_iterations,
+            crate::types::default_max_iterations()
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -5918,13 +6302,25 @@ mod tests {
             digest.contains("papers_ingest url=https://arxiv.org/pdf/1234.5678"),
             "a fetchable paper must arrive with a callable handle: {digest}"
         );
+        // The rule CHANGED: a bot-walled publisher is no longer refused. It is
+        // ROUTED — `web_browse render=true` drives a real browser and gets
+        // through. Refusing work never attempted is a muzzle, and on most
+        // publishers that is exactly where the literature lives.
         assert!(
-            digest.contains("no fetchable full text"),
-            "a blocked publisher URL must be named as unusable, not offered: {digest}"
+            !digest.contains("do not spend an ingest"),
+            "a blocked host must not be refused outright any more: {digest}"
         );
         assert!(
-            digest.contains("1 of the above have full text"),
-            "say how many can be ingested without a recall: {digest}"
+            digest.contains("direct fetch is blocked on this host"),
+            "a blocked host must be named as blocked: {digest}"
+        );
+        assert!(
+            digest.contains("web_browse url=https://www.mdpi.com/1/2/3/pdf render=true"),
+            "and must carry the exact escape route, url included: {digest}"
+        );
+        assert!(
+            digest.contains("1 of the above can be ingested DIRECTLY"),
+            "say how many need no browser: {digest}"
         );
         // The paper with no full text must NOT get a handle it cannot honour.
         assert_eq!(

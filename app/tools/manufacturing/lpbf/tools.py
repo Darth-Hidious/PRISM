@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
 from app.tools.manufacturing.lpbf import check_lpbf_available
 from app.tools.manufacturing.lpbf.physics import (
@@ -16,15 +17,18 @@ from app.tools.manufacturing.lpbf.physics import (
 
 
 def _lpbf_missing_error() -> dict:
-    """Stable structured failure for direct calls outside gated bootstrap."""
-    return {
-        "error": (
-            "LPBF scientific dependencies are not available in this PRISM install."
-        ),
-        "install_hint": "pip install 'prism-platform[lpbf]'",
-        "provision_command": "prism provision extra lpbf",
-        "missing_capability": "LPBF printability and Kou cracking analysis",
-    }
+    """Stable structured failure for direct calls outside gated bootstrap.
+
+    Built from `app/tools/_extras.py` so this gate carries `requires_extra` and
+    an `install_hint` that resolves: the hand-rolled dict this replaced named
+    `pip install 'prism-platform[lpbf]'` as its primary hint, and that
+    distribution is not on any index (see `_extras.install_command`).
+    """
+    return missing_extra_error(
+        "lpbf",
+        "LPBF scientific dependencies are not available in this PRISM install.",
+        missing_capability="LPBF printability and Kou cracking analysis",
+    )
 
 
 def _run_printability_map(**kwargs) -> dict:

@@ -1,7 +1,10 @@
 """Collect materials data from OPTIMADE and Materials Project."""
+import logging
 from typing import Dict, List, Optional
 
 from app.tools.data_collectors.base_collector import CollectorConfigError, DataCollector
+
+logger = logging.getLogger(__name__)
 
 
 def _get_fallback_providers():
@@ -30,8 +33,15 @@ class OPTIMADECollector(DataCollector):
     def collect(self, filter_string: str, max_per_provider: int = 100, provider_ids: Optional[List[str]] = None) -> List[Dict]:
         try:
             from optimade.client import OptimadeClient
-        except ImportError:
-            return []
+        except ImportError as exc:
+            # Same rule as MPCollector's C2 fix and the patent collector's
+            # missing-google-cloud-bigquery branch: an absent dependency means
+            # the source was NOT consulted. `return []` said "OPTIMADE has no
+            # such materials" instead, which is a claim about the federation.
+            raise CollectorConfigError(
+                "the optimade collector needs the `optimade` package in the "
+                f"PRISM venv (pip install optimade): {exc}"
+            ) from exc
         base_urls = []
         provider_map = {}
         for p in self.providers:
@@ -41,10 +51,20 @@ class OPTIMADECollector(DataCollector):
         try:
             client = OptimadeClient(base_urls=base_urls, max_results_per_provider=max_per_provider)
             raw = client.get(filter_string)
-        except Exception:
-            return []
+        except Exception as exc:
+            raise CollectorConfigError(
+                f"OPTIMADE query failed ({type(exc).__name__}: {exc})"
+            ) from exc
         # Response format: {endpoint: {filter: {url: {data: [entries]}}}}
         results = []
+        # OptimadeClient does not raise on a provider failure: it returns that
+        # provider's slot as {"data": [], "errors": ["ConnectError: ..."]}.
+        # Reading only `data` therefore turned every unreachable endpoint into
+        # a silent zero — measured against a dead base_url, collect() returned
+        # [] with the ConnectError discarded. Same lie MPCollector's C2 fix
+        # names ("an MP outage indistinguishable from source is empty") and
+        # OptimadeProvider._parse_response already refuses.
+        failed: List[str] = []
         for endpoint, filters in raw.items():
             if not isinstance(filters, dict):
                 continue
@@ -56,6 +76,9 @@ class OPTIMADECollector(DataCollector):
                     entries = []
                     if isinstance(response, dict):
                         entries = response.get("data", [])
+                        errors = response.get("errors") or []
+                        if errors and not entries:
+                            failed.append(f"{provider_id}: {str(errors[0])[:160]}")
                     elif isinstance(response, list):
                         entries = response
                     for entry in entries:
@@ -71,6 +94,20 @@ class OPTIMADECollector(DataCollector):
                             "space_group": attrs.get("space_group_symbol", ""),
                             "lattice_vectors": attrs.get("lattice_vectors"),
                         })
+        if failed and not results:
+            # Nothing came back and every provider that spoke, failed: this is
+            # a failed search, not an empty one, and the caller
+            # (skills/acquisition.py) already records CollectorConfigError as a
+            # named skip.
+            raise CollectorConfigError(
+                "no OPTIMADE provider answered this query — "
+                + "; ".join(failed[:5])
+            )
+        if failed:
+            logger.warning(
+                "OPTIMADE providers failed and contributed nothing: %s",
+                "; ".join(failed[:5]),
+            )
         return results
 
 

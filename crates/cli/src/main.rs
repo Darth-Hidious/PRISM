@@ -9901,7 +9901,25 @@ async fn handle_ingest(
                 no_ingest_backend_message(&local_llm::discover().await)
             );
         }
-        if locality.inference_is_on_device() {
+        if schema_only {
+            // `--schema-only` skips LLM extraction entirely, so NO document
+            // text is sent anywhere regardless of where the model lives. The
+            // remote banner below was printed here too, telling the operator
+            // their document had been transmitted when the run made no model
+            // call at all — verified: `--schema-only` on a 3795-char PDF exits
+            // 0 having contacted nothing.
+            //
+            // That is the mirror image of the lie the comment below guards
+            // against, and it is the more corrosive direction: a warning that
+            // fires when it does not apply teaches the reader to ignore it,
+            // and they will then ignore it on the run where it IS true. For a
+            // brief that must not leave the machine, this banner is the one
+            // signal that matters.
+            eprintln!(
+                "⚑ SCHEMA ONLY — measuring structure on-device; no model is called \
+                 and no document text leaves your machine"
+            );
+        } else if locality.inference_is_on_device() {
             eprintln!("⚑ LOCAL — extracting on-device, nothing leaves your machine");
         } else if locality.is_local() {
             // Local pipeline, remote model. Say so plainly: document text IS
@@ -13867,6 +13885,51 @@ async fn local_ontology_lookup(
 /// message names the problem, so a broken index is never printed as "no
 /// results". The store is counted BEFORE the backend is built, so a fresh
 /// install never pays the embedding-model init just to return nothing.
+/// Attribution for semantic hits: which SUBJECT each matched property belongs to.
+///
+/// Semantic search ranks entity vectors and returns bare entity names. For a
+/// property node that name is the property STRING — "415 MPa√m crack-initiation
+/// fracture toughness (KJIc)" — with no indication of which material it was
+/// measured on. Two alloys from the same paper then land adjacent in one result
+/// list, indistinguishable:
+///
+///   1. 235 MPa√m crack-initiation fracture toughness (KJIc)  (score: 0.8756)
+///   2. 415 MPa√m crack-initiation fracture toughness (KJIc)  (score: 0.8718)
+///
+/// Measured consequence: asked about CrCoNi, the agent reported BOTH as CrCoNi
+/// (235 belongs to CrMnFeCoNi); asked again it "corrected" itself and assigned
+/// BOTH to CrMnFeCoNi (415 belongs to CrCoNi). Half wrong each time, stated
+/// confidently, in a product whose whole claim is provenance. The model was not
+/// hallucinating — retrieval handed it unattributed numbers.
+///
+/// The plain-text path already prints the owning triple, so the data is present;
+/// only this renderer dropped it. Returns the facts in which the hit appears as
+/// the OBJECT — an exact match, so a hit that is a subject in its own right
+/// gets no invented owner.
+async fn semantic_hit_owners(
+    db_path: &Path,
+    hits: &[prism_provenance::SemanticEntityHit],
+) -> Vec<Vec<prism_provenance::RecalledFact>> {
+    let Ok(store) = prism_provenance::ProvenanceStore::open(db_path).await else {
+        // Attribution is an enrichment: if the store cannot be reopened we
+        // print what we always printed rather than failing the search.
+        return vec![Vec::new(); hits.len()];
+    };
+    let mut owners = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let facts = store
+            .recall(&hit.name, &hit.tenant, 4)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|fact| fact.object == hit.name)
+            .take(2)
+            .collect();
+        owners.push(facts);
+    }
+    owners
+}
+
 async fn local_semantic_lookup(
     db_path: &Path,
     text: &str,
@@ -14057,6 +14120,7 @@ async fn handle_query(
         // embedding — no services needed). An unusable index errors out
         // here rather than printing an empty, reassuring list.
         let results = local_semantic_lookup(&turso_db, text, limit).await?;
+        let owners = semantic_hit_owners(&turso_db, &results).await;
         println!("\nSemantic search results ({} matches):\n", results.len());
         for (i, hit) in results.iter().enumerate() {
             println!(
@@ -14066,6 +14130,27 @@ async fn handle_query(
                 hit.similarity,
                 peer_tag(&hit.tenant)
             );
+            // Name the SUBJECT this value was measured on. Without it, two
+            // alloys' toughness values sit adjacent and unattributable.
+            for fact in owners.get(i).into_iter().flatten() {
+                // SUBJECT is the whole point of this line — without it two
+                // alloys' values sit adjacent and unattributable. Everything
+                // else is kept short on purpose: the first version printed the
+                // full predicate IRI and the absolute source path on every hit,
+                // and measured at 2394 of 3546 output characters (67%), with
+                // 1110 of those (31%) being the SAME 90-character path repeated
+                // ten times. That is retrieval spending the agent's turn budget
+                // on punctuation. A 12-hex prefix identifies the snapshot
+                // uniquely and `query <hash>` still finds it.
+                let src = std::path::Path::new(&fact.source)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map_or_else(|| fact.source.clone(), |s| s.chars().take(12).collect());
+                println!(
+                    "       of: {}  (conf {:.2}, src {})",
+                    fact.subject, fact.confidence, src
+                );
+            }
         }
         if results.is_empty() {
             println!(
@@ -15436,6 +15521,12 @@ async fn handle_run(
         name: name.to_string(),
         image: image.to_string(),
         inputs: inputs_json.clone(),
+        // `prism run`'s SLURM flags (--slurm-gres, --slurm-time, ...) already
+        // reach the scheduler through `SlurmJobConfig` below. Routing the same
+        // flags through `ResourceSpec` as well would apply them twice, once as
+        // the cluster default and once as the per-job overlay. The agent-facing
+        // path (`compute_submit`) is where a per-job GPU request is expressed.
+        resources: Default::default(),
     };
 
     let (router, resolved_backend, target) = if let Some(ssh_target) = ssh {
@@ -19554,6 +19645,101 @@ data:\n\
         assert_eq!(
             echoes[0]["peer_tenants"],
             serde_json::json!(["mesh:node-a"])
+        );
+    }
+
+    /// Two alloys, one shared property NAME shape — the semantic renderer must
+    /// say which alloy each measured value belongs to.
+    ///
+    /// Regression for a measured wrong answer: semantic search returned
+    /// "235 MPa√m …" and "415 MPa√m …" adjacent with no subject, and the agent
+    /// attributed both to whichever alloy the user had asked about — wrong on
+    /// one of them, twice, in opposite directions, stated as a correction.
+    #[tokio::test]
+    async fn semantic_hits_carry_the_subject_they_were_measured_on() {
+        let db = TempProvenanceDb::new();
+        let store = prism_provenance::ProvenanceStore::open(&db.path)
+            .await
+            .expect("open temp store");
+        let now = chrono::Utc::now().to_rfc3339();
+        let prov = prism_provenance::LocalProvenance {
+            activity_id: "act_attr".into(),
+            agent_id: "prism-ingest".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: "doc:toughness".into(),
+            source_kind: "Document".into(),
+            tenant: LOCAL_ONTOLOGY_TENANT.into(),
+            started_at: now.clone(),
+            ended_at: now,
+            locality: "local".into(),
+            origin_source_id: None,
+        };
+        store.record_activity(&prov).await.expect("record activity");
+
+        // The real pair from the ingested corpus: same property phrasing,
+        // different alloys, same source document.
+        for (subject, object) in [
+            (
+                "CrCoNi medium-entropy alloy",
+                "415 MPa√m crack-initiation fracture toughness (KJIc)",
+            ),
+            (
+                "CrMnFeCoNi high-entropy alloy",
+                "235 MPa√m crack-initiation fracture toughness (KJIc)",
+            ),
+        ] {
+            store
+                .write_fact_with_classification(
+                    &prism_provenance::LocalFact {
+                        subject: subject.into(),
+                        predicate: "hasProperty".into(),
+                        object: object.into(),
+                        value: None,
+                        unit: None,
+                        confidence: Some(1.0),
+                        kind: Some("contains".into()),
+                    },
+                    &prov,
+                    prism_provenance::OntologyClassification {
+                        version_iri: "urn:test:ontology:semantic-attr",
+                        artifact_sha256:
+                            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    },
+                    prism_provenance::FactGraphShape::emmo("contains"),
+                )
+                .await
+                .expect("write fact");
+        }
+
+        // Stand in for the vector hits (the embedding backend is not exercised
+        // here — the defect was the missing JOIN, not the ranking).
+        let hits: Vec<prism_provenance::SemanticEntityHit> = [
+            "415 MPa√m crack-initiation fracture toughness (KJIc)",
+            "235 MPa√m crack-initiation fracture toughness (KJIc)",
+        ]
+        .iter()
+        .map(|name| prism_provenance::SemanticEntityHit {
+            name: (*name).to_string(),
+            tenant: LOCAL_ONTOLOGY_TENANT.to_string(),
+            similarity: 0.87,
+        })
+        .collect();
+
+        let owners = semantic_hit_owners(&db.path, &hits).await;
+        assert_eq!(owners.len(), 2);
+
+        let subject_of = |i: usize| -> String {
+            owners[i]
+                .first()
+                .unwrap_or_else(|| panic!("hit {i} must name the subject it was measured on"))
+                .subject
+                .clone()
+        };
+        assert_eq!(subject_of(0), "CrCoNi medium-entropy alloy");
+        assert_eq!(
+            subject_of(1),
+            "CrMnFeCoNi high-entropy alloy",
+            "the two values must NOT collapse onto one alloy"
         );
     }
 

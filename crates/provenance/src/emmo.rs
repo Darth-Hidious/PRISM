@@ -1057,6 +1057,92 @@ pub fn canonical_key(name: &str) -> String {
         .to_lowercase()
 }
 
+/// The concept a predicate names, stripped of how it was written.
+///
+/// `assertion_id` hashes the predicate RAW, which is correct for identity —
+/// two facts are the same fact only if they say the same thing the same way.
+/// It is wrong for AGREEMENT. Measured on a real corpus 2026-08-26, the same
+/// measurement arrives under three spellings and is stored as three separate,
+/// mutually uncorroborating facts:
+///
+/// | subject | value | stored under |
+/// |---|---|---|
+/// | ss 316l | 1658 K | `hasSolidusTemperature` AND `solidus temperature` |
+/// | ss 316l | 1723 K | `hasLiquidusTemperature` AND `liquidus temperature` |
+/// | ti-6al-4v | 3315 K | `https://w3id.org/emmo#EMMO_e1097637…` AND `boiling temperature` |
+///
+/// PRISM's own ontology mapping manufactures the duplicate that then fails to
+/// corroborate. Result on that corpus: 1,607 of 1,609 facts sat at
+/// `corroborations = 1`, which means seen once — never corroborated.
+///
+/// So: an IRI collapses to its final segment, `has`/`is` prefixes go,
+/// camelCase splits into words, and everything non-alphanumeric becomes a
+/// single space.
+#[must_use]
+pub fn predicate_concept(predicate: &str) -> String {
+    // An IRI names its concept in the last segment: take it, then treat it
+    // like any other label.
+    let tail = predicate
+        .rsplit(['#', '/'])
+        .next()
+        .unwrap_or(predicate)
+        .trim();
+
+    // camelCase / PascalCase -> spaced words, so `hasSolidusTemperature`
+    // and `solidus temperature` meet.
+    let mut spaced = String::with_capacity(tail.len() + 8);
+    let mut prev_lower = false;
+    for ch in tail.chars() {
+        if ch.is_uppercase() && prev_lower {
+            spaced.push(' ');
+        }
+        prev_lower = ch.is_lowercase() || ch.is_numeric();
+        spaced.extend(ch.to_lowercase());
+    }
+
+    let words: Vec<&str> = spaced
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    // Drop a leading `has`/`is`/`had` — ontology naming convention, not
+    // meaning. Never drop it if it is the ONLY word.
+    let start = usize::from(words.len() > 1 && matches!(words[0], "has" | "is" | "had"));
+    words[start..].join(" ")
+}
+
+/// Key on which two facts count as SAYING THE SAME THING, for corroboration.
+///
+/// Deliberately looser than [`assertion_id`]: identity must be exact, but
+/// agreement must not be, or two papers reporting one measurement in different
+/// words never corroborate each other — which is the state the corpus was
+/// measured in.
+///
+/// Returns `None` when there is no parsed numeric value. Agreement between two
+/// free-text objects is a judgement, not a hash, and pretending otherwise
+/// would manufacture false corroboration — the failure mode that matters most
+/// here, because a wrongly-green fact is worse than an honestly-red one.
+#[must_use]
+pub fn corroboration_key(
+    tenant: &str,
+    subject: &str,
+    predicate: &str,
+    value: Option<f64>,
+    unit: Option<&str>,
+) -> Option<String> {
+    let value = value.filter(|v| v.is_finite())?;
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    hash_field(&mut h, tenant.as_bytes());
+    hash_field(&mut h, canonical_key(subject).as_bytes());
+    hash_field(&mut h, predicate_concept(predicate).as_bytes());
+    // Normalise the number itself so 1658 and 1658.0 meet, without pretending
+    // 1658 and 1659 are the same measurement.
+    hash_field(&mut h, format!("{value:.6e}").as_bytes());
+    hash_field(&mut h, canonical_key(unit.unwrap_or("")).as_bytes());
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Lowercase alphanumeric-only surface used solely to prioritize trivial
 /// punctuation/spacing variants in bounded geometry result sets.
 fn lexical_key(name: &str) -> String {
@@ -1683,7 +1769,7 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     // Cheap unlocked pre-check: almost every open is of an already-stamped
     // database and must not pay for a write transaction.
-    if read_user_version(conn).await? >= SAMPLE_DISAGREEMENT_RETIRED_VERSION {
+    if read_user_version(conn).await? >= MATKG_NAMESPACE_VERSION {
         return Ok(());
     }
 
@@ -1696,7 +1782,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     let txn = begin_immediate(conn).await?;
     let result = async {
         let version = read_user_version(conn).await?;
-        if version >= SAMPLE_DISAGREEMENT_RETIRED_VERSION {
+        if version >= MATKG_NAMESPACE_VERSION {
             return Ok(());
         }
 
@@ -1717,6 +1803,9 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         if version < SAMPLE_DISAGREEMENT_RETIRED_VERSION {
             migrate_retire_sample_disagreement(conn).await?;
         }
+        if version < MATKG_NAMESPACE_VERSION {
+            migrate_matkg_namespace(conn).await?;
+        }
 
         // Stamp even when nothing needed changing — a fresh store has empty
         // tables, and returning without stamping would make every subsequent
@@ -1724,7 +1813,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         // all generations, so a crash between them re-runs from the last
         // committed generation rather than skipping one.
         conn.execute(
-            &format!("PRAGMA user_version = {SAMPLE_DISAGREEMENT_RETIRED_VERSION}"),
+            &format!("PRAGMA user_version = {MATKG_NAMESPACE_VERSION}"),
             (),
         )
         .await?;
@@ -2039,6 +2128,78 @@ const PROV_EVIDENCE_VERSION: i64 = 5;
 /// not `cited_by_reader`, or the migration would promote them past a finding
 /// that genuinely applies.
 const SAMPLE_DISAGREEMENT_RETIRED_VERSION: i64 = 6;
+
+/// Generation 7 — move the PRISM-minted MatKG namespace to `mirdyne.com`.
+///
+/// Upstream MatKG identifies its entities only under the placeholder
+/// `http://example.com/`, so PRISM mints the class IRIs itself; the host in
+/// them is ours to choose and it is now `mirdyne.com`. Stored rows written
+/// under the old host still name classes the shipped ontology no longer
+/// declares, which strands them: a bound term whose `class_iri` resolves to
+/// nothing is indistinguishable from a term that was never bound.
+///
+/// The rewrite is a pure prefix swap. Every local name is unchanged, so the
+/// old-to-new mapping is total and injective, and `class_iri` feeds no
+/// assertion digest — no identity is recomputed and no fact changes meaning.
+const MATKG_NAMESPACE_VERSION: i64 = 7;
+
+const MATKG_NAMESPACE_BEFORE: &str = "https://marc27.com/ontology/matkg";
+const MATKG_NAMESPACE_AFTER: &str = "https://mirdyne.com/ontology/matkg";
+
+/// Every stored site of that namespace, as `(table, column)`.
+///
+/// The parent IRI is embedded in `item_id`, which is the proposal queue's
+/// PRIMARY KEY and half of the sighting table's composite key, so those two
+/// have to move together or a queued proposal loses its citations;
+/// `ontology_term_binding.proposal_item_id` is the foreign key to that same
+/// string and moves with them.
+///
+/// `provenance_records.output_json` is deliberately ABSENT. Those rows are
+/// captured stdout of commands that really did run under the old namespace.
+/// Rewriting them would make the audit trail assert a history that did not
+/// happen, which is the one thing a provenance store must never do.
+const MATKG_NAMESPACE_SITES: &[(&str, &str)] = &[
+    ("emmo_entity", "class_iri"),
+    ("ontology_class_embedding", "class_iri"),
+    ("ontology_term_binding", "class_iri"),
+    ("ontology_term_binding", "nearest_class_iri"),
+    ("ontology_term_binding", "proposal_item_id"),
+    ("ontology_proposal_queue", "item_id"),
+    ("ontology_proposal_queue", "proposal_json"),
+    ("ontology_proposal_sighting", "item_id"),
+];
+
+/// Rewrite the MatKG namespace prefix everywhere it is stored.
+///
+/// Runs inside the caller's migration transaction, so a failure at any site
+/// rolls the whole generation back rather than leaving half the store on each
+/// host. A collision on one of the keyed columns would surface here as a
+/// constraint error and abort — which is the wanted behaviour, since silently
+/// replacing the colliding row would discard a real proposal.
+///
+/// The ontology tables are created lazily by the term-binding layer and the
+/// `nearest_*` columns were added later still, so a store opened before either
+/// existed is normal, not corrupt. Those two cases are skipped; anything else
+/// propagates.
+async fn migrate_matkg_namespace(conn: &turso::Connection) -> Result<()> {
+    for (table, column) in MATKG_NAMESPACE_SITES {
+        let sql = format!(
+            "UPDATE {table} SET {column} = \
+             REPLACE({column}, '{MATKG_NAMESPACE_BEFORE}', '{MATKG_NAMESPACE_AFTER}') \
+             WHERE {column} LIKE '%{MATKG_NAMESPACE_BEFORE}%'"
+        );
+        if let Err(error) = conn.execute(sql, ()).await {
+            let message = error.to_string().to_lowercase();
+            if message.contains("no such table") || message.contains("no such column") {
+                continue;
+            }
+            return Err(anyhow::anyhow!(error).context(format!(
+                "failed to rewrite MatKG namespace in {table}.{column}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Tenant to attribute a row to when the stored value is absent.
 ///
@@ -8729,6 +8890,117 @@ mod tests {
         );
     }
 
+    // ── corroboration: agreement is looser than identity ──
+    //
+    // Every case below is a REAL pair from the corpus measured 2026-08-26,
+    // where the same measurement was stored as two mutually uncorroborating
+    // facts because `assertion_id` hashes the predicate raw.
+
+    #[test]
+    fn the_ontology_iri_and_its_plain_label_name_one_concept() {
+        assert_eq!(
+            predicate_concept("hasSolidusTemperature"),
+            "solidus temperature"
+        );
+        assert_eq!(
+            predicate_concept("solidus temperature"),
+            "solidus temperature"
+        );
+        assert_eq!(
+            predicate_concept("hasLiquidusTemperature"),
+            "liquidus temperature"
+        );
+        assert_eq!(
+            predicate_concept("https://w3id.org/emmo#boilingTemperature"),
+            "boiling temperature"
+        );
+    }
+
+    #[test]
+    fn a_lone_has_is_not_stripped_into_nothing() {
+        // `has` as the ONLY word is the predicate, not a prefix.
+        assert_eq!(predicate_concept("has"), "has");
+        assert_eq!(predicate_concept("is"), "is");
+    }
+
+    #[test]
+    fn the_same_measurement_written_two_ways_corroborates() {
+        // ss 316l = 1658 K, stored under both spellings in the real corpus.
+        let a = corroboration_key(
+            "t",
+            "SS 316L",
+            "hasSolidusTemperature",
+            Some(1658.0),
+            Some("K"),
+        );
+        let b = corroboration_key(
+            "t",
+            "ss 316l",
+            "solidus temperature",
+            Some(1658.0),
+            Some("K"),
+        );
+        assert!(a.is_some());
+        assert_eq!(a, b, "these are the same measurement and must corroborate");
+
+        // And the whole point: identity still tells them apart.
+        assert_ne!(
+            assertion_id("t", "SS 316L", "hasSolidusTemperature", "1658 K"),
+            assertion_id("t", "ss 316l", "solidus temperature", "1658 K"),
+            "assertion_id must stay EXACT — agreement is a separate question"
+        );
+    }
+
+    #[test]
+    fn a_different_number_never_corroborates() {
+        let a = corroboration_key(
+            "t",
+            "SS 316L",
+            "solidus temperature",
+            Some(1658.0),
+            Some("K"),
+        );
+        let b = corroboration_key(
+            "t",
+            "SS 316L",
+            "solidus temperature",
+            Some(1659.0),
+            Some("K"),
+        );
+        assert_ne!(a, b, "1658 and 1659 are different measurements");
+    }
+
+    #[test]
+    fn a_different_unit_never_corroborates() {
+        let k = corroboration_key("t", "x", "melting point", Some(1658.0), Some("K"));
+        let c = corroboration_key("t", "x", "melting point", Some(1658.0), Some("degC"));
+        assert_ne!(k, c, "1658 K and 1658 degC are not the same measurement");
+    }
+
+    #[test]
+    fn a_different_tenant_never_corroborates() {
+        let a = corroboration_key("tenant-a", "x", "melting point", Some(9.0), Some("K"));
+        let b = corroboration_key("tenant-b", "x", "melting point", Some(9.0), Some("K"));
+        assert_ne!(a, b, "tenants must never corroborate each other");
+    }
+
+    #[test]
+    fn a_fact_with_no_number_yields_no_key() {
+        // Agreement between two free-text objects is a judgement, not a hash.
+        // Returning a key here would manufacture false corroboration, and a
+        // wrongly-green fact is worse than an honestly-red one.
+        assert!(corroboration_key("t", "x", "described as", None, None).is_none());
+        assert!(corroboration_key("t", "x", "y", Some(f64::NAN), Some("K")).is_none());
+        assert!(corroboration_key("t", "x", "y", Some(f64::INFINITY), None).is_none());
+    }
+
+    #[test]
+    fn trivial_numeric_spelling_does_not_split_a_measurement() {
+        let a = corroboration_key("t", "x", "melting point", Some(1658.0), Some("K"));
+        let b = corroboration_key("t", "x", "melting point", Some(1658.000000), Some("K"));
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn assertion_id_is_stable_and_canonical() {
         let a = assertion_id("t1", "Ti-6Al-4V", "has_phase", "alpha-beta");
@@ -9023,7 +9295,7 @@ mod tests {
         let conn = database.connect().unwrap();
         assert_eq!(
             read_user_version(&conn).await.unwrap(),
-            SAMPLE_DISAGREEMENT_RETIRED_VERSION,
+            MATKG_NAMESPACE_VERSION,
             "the stamp must be the LATEST generation, not the assertion one — \
              stamping the assertion version would leave the key migration \
              re-running on every open",
@@ -9203,7 +9475,7 @@ mod tests {
         );
         assert_eq!(
             read_user_version(&store.conn).await.unwrap(),
-            SAMPLE_DISAGREEMENT_RETIRED_VERSION,
+            MATKG_NAMESPACE_VERSION,
         );
     }
 
@@ -11517,6 +11789,202 @@ mod tests {
         assert_eq!(contribution.locator_json, None);
         assert_eq!(contribution.verification_status, None);
         assert_eq!(contribution.verification_reason, None);
+    }
+
+    /// Generation 7 moves the PRISM-minted MatKG namespace to `mirdyne.com`.
+    ///
+    /// The keyed columns are the ones that can fail quietly. `item_id` embeds
+    /// the parent IRI and is the proposal queue's PRIMARY KEY as well as half
+    /// of the sighting table's composite key, so a rewrite that moves one and
+    /// not the other detaches a queued proposal from its citations while
+    /// leaving both rows individually well-formed. The join is asserted, not
+    /// just the two counts.
+    ///
+    /// The captured stdout in `provenance_records` is asserted UNCHANGED. That
+    /// row records a command that really did run under the old namespace; a
+    /// provenance store that edits its own history is worse than one that
+    /// stores none. `ontology_term_binding` is created here WITHOUT the later
+    /// `nearest_class_iri` column, so the missing-column skip is exercised too.
+    #[tokio::test]
+    async fn generation_seven_moves_the_matkg_namespace_and_leaves_history_alone() {
+        const OLD: &str = "https://marc27.com/ontology/matkg#Property";
+        const NEW: &str = "https://mirdyne.com/ontology/matkg#Property";
+        let db = TempDb::new();
+
+        // Let production build its own schema first, then plant legacy rows
+        // into it and wind the stamp back so the generation has work to do.
+        ProvenanceStore::open(&db.path).await.unwrap();
+
+        let database = turso::Builder::new_local(db.path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+
+        for ddl in [
+            "CREATE TABLE IF NOT EXISTS ontology_proposal_queue (item_id TEXT PRIMARY KEY, \
+             kind TEXT NOT NULL CHECK (kind IN ('class', 'relation')), label TEXT NOT NULL, \
+             document TEXT NOT NULL, tenant TEXT NOT NULL, proposal_json TEXT NOT NULL, \
+             enqueued_at REAL NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS ontology_proposal_sighting (item_id TEXT NOT NULL, \
+             document TEXT NOT NULL, citation_json TEXT NOT NULL, sighted_at REAL NOT NULL, \
+             PRIMARY KEY (item_id, document, citation_json))",
+            "CREATE TABLE IF NOT EXISTS ontology_class_embedding (ontology_id TEXT NOT NULL, \
+             class_iri TEXT NOT NULL, label TEXT NOT NULL, model TEXT NOT NULL, \
+             dim INTEGER NOT NULL, vector BLOB NOT NULL, \
+             PRIMARY KEY (ontology_id, class_iri, label, model))",
+            "CREATE TABLE IF NOT EXISTS ontology_term_binding (tenant TEXT NOT NULL, \
+             term TEXT NOT NULL, verbatim TEXT NOT NULL, class_iri TEXT, ontology_id TEXT, \
+             rung INTEGER NOT NULL, score REAL, threshold REAL, model TEXT, \
+             proposal_item_id TEXT, resolved_at TEXT NOT NULL, PRIMARY KEY (tenant, term))",
+        ] {
+            conn.execute(ddl, ()).await.unwrap();
+        }
+
+        // Real queue keys embed a quoted label, so the fixture carries one and
+        // the literal doubles it rather than dodging the shape under test.
+        let item_id = format!("class|'ThermalExpansion'|parents=[{OLD}]");
+        let item_id = item_id.replace('\'', "''");
+        conn.execute(
+            format!(
+                "INSERT INTO ontology_proposal_queue VALUES \
+                 ('{item_id}', 'class', 'ThermalExpansion', 'doc:1', 'local', \
+                  '{{\"parents\":[\"{OLD}\"]}}', 1.0)"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            format!(
+                "INSERT INTO ontology_proposal_sighting VALUES ('{item_id}', 'doc:1', '{{}}', 1.0)"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            format!(
+                "INSERT INTO emmo_entity (\"key\", name, entity_type, tenant, class_iri) \
+                 VALUES ('local:thermalexpansion', 'ThermalExpansion', 'Property', 'local', '{OLD}')"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            format!(
+                "INSERT INTO ontology_class_embedding VALUES \
+                 ('matkg', '{OLD}', 'Property', 'bge-small', 2, X'0000')"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            format!(
+                "INSERT INTO ontology_term_binding \
+                 (tenant, term, verbatim, class_iri, ontology_id, rung, proposal_item_id, resolved_at) \
+                 VALUES ('local', 'thermal expansion', 'thermal expansion', '{OLD}', 'matkg', 1, \
+                         '{item_id}', '2026-01-01')"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        // Audit history: captured stdout of a run that really used the old host.
+        conn.execute(
+            format!(
+                "INSERT INTO provenance_records \
+                 (id, timestamp, session_id, action_type, actor, input_json, output_json) \
+                 VALUES ('rec-1', '2026-01-01', 's1', 'tool_call', 'agent', '{{}}', \
+                         '{{\"iri\":\"{OLD}\"}}')"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            &format!("PRAGMA user_version = {SAMPLE_DISAGREEMENT_RETIRED_VERSION}"),
+            (),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+
+        ProvenanceStore::open(&db.path).await.unwrap();
+
+        let database = turso::Builder::new_local(db.path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = database.connect().unwrap();
+        let count = |sql: String| {
+            let conn = conn.clone();
+            async move {
+                let mut rows = conn.query(sql, ()).await.unwrap();
+                rows.next()
+                    .await
+                    .unwrap()
+                    .and_then(|r| r.get_value(0).ok().and_then(|v| v.as_integer().copied()))
+                    .unwrap_or(-1)
+            }
+        };
+
+        for (table, column) in [
+            ("ontology_proposal_queue", "item_id"),
+            ("ontology_proposal_queue", "proposal_json"),
+            ("ontology_proposal_sighting", "item_id"),
+            ("emmo_entity", "class_iri"),
+            ("ontology_class_embedding", "class_iri"),
+            ("ontology_term_binding", "class_iri"),
+            ("ontology_term_binding", "proposal_item_id"),
+        ] {
+            assert_eq!(
+                count(format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {column} LIKE '%{NEW}%'"
+                ))
+                .await,
+                1,
+                "{table}.{column} was not moved to the new namespace",
+            );
+            assert_eq!(
+                count(format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {column} LIKE '%marc27.com/ontology%'"
+                ))
+                .await,
+                0,
+                "{table}.{column} still holds the old namespace",
+            );
+        }
+
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM ontology_proposal_queue q \
+                 JOIN ontology_proposal_sighting s ON s.item_id = q.item_id"
+                    .to_string()
+            )
+            .await,
+            1,
+            "the proposal lost its citations — the two halves of item_id moved apart",
+        );
+
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM provenance_records \
+                 WHERE output_json LIKE '%marc27.com/ontology%'"
+                    .to_string()
+            )
+            .await,
+            1,
+            "the migration rewrote captured stdout — provenance must not edit its own history",
+        );
+
+        assert_eq!(
+            count("PRAGMA user_version".to_string()).await,
+            MATKG_NAMESPACE_VERSION,
+            "the store was not stamped at the new generation",
+        );
     }
 
     /// Identity lookup did not exist before retrieval re-verification: a

@@ -209,3 +209,90 @@ def test_tool_registered():
     t = reg.get("hea_descriptors")
     assert t.input_schema["additionalProperties"] is False
     assert t.examples is not None and len(t.examples) >= 1
+
+
+def test_untabulated_pair_reports_a_gap_instead_of_an_ideal_solution():
+    """A missing Miedema pair must not be read as ΔH_mix = 0.
+
+    CoCrFeNiPd is a real HEA, but Pd has no Takeuchi-Inoue pairs in the
+    bundled table. The old code contributed 0.0 for each Pd pair, which is a
+    positive claim of ideality — and it errs the dangerous way: Ω scales as
+    1/|ΔH_mix|, so invented zeros inflate Ω and push the verdict toward
+    solid_solution. The screen must say it cannot answer, and say why.
+    """
+    d = compute_hea_descriptors(*_parse_composition("CoCrFeNiPd"))
+
+    assert d["delta_H_mix_kJ_per_mol"] is None
+    assert d["omega"] is None
+    assert d["phase_prediction"] == "undetermined"
+    assert d["segregation_risk"] is False
+
+    gaps = " ".join(d["data_gaps"])
+    assert "mixing enthalpy" in gaps
+    assert "Pd" in gaps
+    # δ and VEC do not depend on the pair table and must survive the gap.
+    assert d["VEC"] is not None
+    assert d["delta_radius_pct"] is not None
+
+
+def test_a_tabulated_zero_is_a_number_not_a_gap():
+    """The distinguishing case: Fe-W is a MEASURED 0.0 kJ/mol.
+
+    This is why the fix could not simply treat 0.0 as "missing" — the table
+    carries genuine zeros, so absence and ideality have to be different
+    values, not the same one. An Fe-W-bearing alloy whose every pair is
+    tabulated still gets a real ΔH_mix.
+    """
+    from app.tools.materials.hea import _dh_mix_for_pair
+
+    assert _dh_mix_for_pair("Fe", "W") == 0.0
+    assert _dh_mix_for_pair("Pd", "Fe") is None
+
+    d = compute_hea_descriptors(*_parse_composition("FeWNbTa"))
+    assert d["delta_H_mix_kJ_per_mol"] is not None
+    assert d["data_gaps"] == []
+
+
+def test_missing_vec_does_not_become_a_structure_call():
+    """VEC = Σ c_i VEC_i with a 0.0 default drags the mean down and hands the
+    Guo/Liu threshold a fabricated crystal-structure verdict. An element with
+    no tabulated VEC must null the descriptor and name itself."""
+    # Er is a real element (so composition validation accepts it) with no
+    # tabulated VEC — the reachable form of this gap, not a synthetic symbol.
+    d = compute_hea_descriptors(["Fe", "W", "Er"], [0.4, 0.4, 0.2])
+
+    assert d["VEC"] is None
+    assert not any("BCC favored" in note or "FCC favored" in note for note in d["rationale"])
+    assert any("valence electron concentration" in gap and "Er" in gap for gap in d["data_gaps"])
+
+
+def test_undetermined_always_names_the_missing_datum():
+    """`undetermined` with an EMPTY data_gaps is the null-with-no-reason this
+    contract exists to prevent, and the pair table's genuine zeros reach it.
+
+    Nb0.5Ta0.5 has every pair tabulated (Nb-Ta = 0), so there is no missing
+    pair and no missing VEC — but ΔH_mix sums to exactly 0.0, which makes
+    Yang's Ω = Tm·ΔS_mix/|ΔH_mix| a division by zero. The screen reported
+    phase_prediction 'undetermined', omega null and data_gaps [], with
+    nothing saying which datum was missing. Same for a missing metallic
+    radius.
+    """
+    d = compute_hea_descriptors(["Nb", "Ta"], [0.5, 0.5])
+    assert d["delta_H_mix_kJ_per_mol"] == 0.0
+    assert d["omega"] is None
+    assert d["phase_prediction"] == "undetermined"
+    assert d["data_gaps"], (
+        "an undetermined verdict must name the datum it is missing, not return "
+        f"an empty data_gaps: {d}"
+    )
+    gaps = " ".join(d["data_gaps"])
+    assert "omega" in gaps and "division by zero" in gaps, gaps
+    # The rationale the caller reads must carry the reason too.
+    assert any("division by zero" in note for note in d["rationale"])
+
+    # A missing Goldschmidt radius nulls δ, and that gap must be named as well.
+    no_radius = compute_hea_descriptors(["Cu", "O"], [0.5, 0.5])
+    assert no_radius["delta_radius_pct"] is None
+    assert any(
+        "metallic radius" in gap for gap in no_radius["data_gaps"]
+    ), no_radius["data_gaps"]

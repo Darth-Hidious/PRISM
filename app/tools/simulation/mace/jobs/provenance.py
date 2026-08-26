@@ -98,15 +98,34 @@ def build(
     """Build the provenance dict (not yet written to disk)."""
     # Resolved, never hardcoded: provenance must name the weights the run
     # actually used. The default moved away from the ASL-licensed MH-1 weights.
-    mace_model = {
-        **{
-            key: value
-            for key, value in _calc_signature(head, "", dtype).items()
-            if key in ("repo_id", "filename", "license")
-        },
-        "head": head,
-        "dtype": dtype,
-    }
+    #
+    # The `fake` backend loads NO weights: it returns deterministic stub
+    # values from a lookup table (backends/fake.py). Signing those numbers
+    # with a repo_id / filename / licence attributed the stub to real
+    # MIT-licensed MACE weights — the exact failure calc_signature's own
+    # docstring forbids ("provenance that names a model the run did not use
+    # is worse than none"). Say plainly that nothing was loaded instead.
+    if backend == "fake":
+        mace_model = {
+            "weights": None,
+            "weights_absent_reason": (
+                "the 'fake' backend loaded no interatomic potential — these "
+                "numbers are deterministic stub values from a lookup table, "
+                "not a MACE calculation"
+            ),
+            "head": head,
+            "dtype": dtype,
+        }
+    else:
+        mace_model = {
+            **{
+                key: value
+                for key, value in _calc_signature(head, "", dtype).items()
+                if key in ("repo_id", "filename", "license")
+            },
+            "head": head,
+            "dtype": dtype,
+        }
     versions = collect_versions()
     summary = _sanitise(result_summary)
     return {

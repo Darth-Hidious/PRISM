@@ -148,11 +148,18 @@ def _parse_candidate_composition(candidate: dict) -> tuple[list[str], list[float
 
 
 def _reduced_formula(elems: list[str], fracs: list[float]) -> str:
-    parts = []
-    for e, f in zip(elems, fracs):
-        s = f"{f:.4f}".rstrip("0").rstrip(".")
-        parts.append(e if s == "1" else f"{e}{s}")
-    return "".join(parts)
+    """Explicit atomic-fraction formula that PARSES BACK to these fractions.
+
+    Fixed 4-dp rounding made this string a lie for any fraction that is not
+    exact at 4 dp, and this string is both the candidate identity echoed in the
+    result AND the ``reproduce`` line stamped into provenance. Measured: an
+    equiatomic ternary came back as "W0.3333Ta0.3333Mo0.3333", and replaying the
+    reproduce line PRISM itself emitted returned "composition fractions must sum
+    to 1.0 ± 0.000001; got 0.999900" — provenance that cannot be replayed is not
+    provenance. ``repr(float)`` is the shortest decimal that round-trips, and
+    the formula parser accepts it (decimal and scientific suffixes both).
+    """
+    return "".join(f"{element}{float(fraction)!r}" for element, fraction in zip(elems, fracs))
 
 
 def _scale_to_atoms(fracs: dict[str, float], n_atoms: int) -> dict[str, int] | None:
@@ -870,7 +877,11 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
         "candidate": {
             "composition": _reduced_formula(elems, fracs),
             "elements": elems,
-            "fractions": [round(f, 6) for f in fracs],
+            # NOT round(f, 6): the parser's own tolerance is 1e-6, so an
+            # equiatomic ternary rounded to [0.333333]*3 sums to 0.999999 and is
+            # REJECTED when fed back — the echoed identity has to be the
+            # composition that was actually evaluated.
+            "fractions": list(fracs),
             "evidence_class": input_evidence.value,
             "evidence_color": input_evidence.color,
         },

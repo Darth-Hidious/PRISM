@@ -147,16 +147,48 @@ fn map_status(resp: JobResponse) -> JobStatus {
     }
 }
 
+/// The broker names an accelerator by class (`A100-80GB`), not by count. When
+/// a job asks for GPUs without naming one, `"any"` asks the broker to pick
+/// rather than leaving the field off, which reads as "CPU is fine".
+fn gpu_type_for(res: &crate::ResourceSpec) -> Option<String> {
+    if !res.wants_gpu() {
+        return None;
+    }
+    Some(res.gpu_class.clone().unwrap_or_else(|| "any".to_string()))
+}
+
 #[async_trait]
 impl ComputeBackend for Marc27Backend {
     async fn submit(&self, plan: &ExperimentPlan) -> Result<Uuid> {
-        // The broker's SubmitRequest accepts `image` + `inputs` (plus optional
-        // gpu_type/timeout/budget); `ExperimentPlan` only carries image + inputs,
-        // so that is exactly what we send. No invented `name` field.
-        let body = serde_json::json!({
+        // The broker's SubmitRequest accepts `image` + `inputs` plus optional
+        // gpu_type/timeout. Those used to be unreachable because
+        // `ExperimentPlan` carried no resources, so every cloud job ran on
+        // whatever the broker defaulted to and a GPU request was silently lost
+        // between the caller and the wire. `gpu_type`/`timeout_secs` are the
+        // names the platform protocol uses (`proto::PlatformMessage::SubmitJob`).
+        // No invented `name` field.
+        let mut body = serde_json::json!({
             "image": plan.image,
             "inputs": plan.inputs,
         });
+        let res = &plan.resources;
+        if let Some(gpu) = gpu_type_for(res) {
+            body["gpu_type"] = serde_json::Value::String(gpu);
+        }
+        if let Some(secs) = res.walltime_secs {
+            body["timeout_secs"] = serde_json::Value::from(secs);
+        }
+        // The broker allocates whole managed instances, so the scheduler-shaped
+        // fields have nowhere to go. Say which ones were dropped: a request
+        // that quietly loses `nodes` is how an MPI job becomes a serial one.
+        let dropped = res.unsupported_by(&["gpus", "gpu_class", "walltime_secs"]);
+        if !dropped.is_empty() {
+            tracing::warn!(
+                fields = ?dropped,
+                "the platform compute broker cannot honour these resource fields; \
+                 they were NOT sent. Use a BYOC/SLURM target for scheduler-level control."
+            );
+        }
 
         let resp = self
             .auth
@@ -250,6 +282,7 @@ mod tests {
             name: "n".into(),
             image: "img".into(),
             inputs: serde_json::json!({}),
+        resources: Default::default(),
         };
 
         let refusals = [

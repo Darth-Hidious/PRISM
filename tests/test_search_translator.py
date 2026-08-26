@@ -45,13 +45,41 @@ def test_to_optimade_combined():
     assert "nelements<=3" in f
 
 
-def test_to_optimade_space_group_symbol_uses_spec_field():
-    """`space_group_symbol` is NOT an OPTIMADE field; the spec defines
-    `space_group_symbol_hermann_mauguin` (and `space_group_it_number`)."""
+def test_to_optimade_space_group_symbol_prefers_the_numeric_field():
+    """A Hermann-Mauguin symbol is translated to `space_group_it_number`.
+
+    Both fields are in the OPTIMADE spec, but `space_group_symbol_hermann_mauguin`
+    is OPTIONAL and measured 2026-08-25 cod, mpds, matterverse, nmd and tcod all
+    answer 400 to it — they reject the whole query rather than ignore one term,
+    so emitting the symbol form silently cost every result from those providers.
+    """
     from app.tools.search_engine.translator import QueryTranslator
     q = MaterialSearchQuery(space_group="Fm-3m")
     f = QueryTranslator.to_optimade(q)
+    assert "space_group_it_number=225" in f
+    assert "hermann_mauguin" not in f
+
+
+def test_to_optimade_space_group_falls_back_to_the_symbol_field(monkeypatch):
+    """With no symbol->number mapping available, degrade to the symbol form.
+
+    This is the OLD behaviour, kept deliberately: without pymatgen the honest
+    move is the less-supported field, never a guessed number. A wrong space
+    group is worse than a filter some providers reject.
+    """
+    from app.tools.search_engine import translator as tr
+    monkeypatch.setattr(tr, "_it_number_for_symbol", lambda _symbol: None)
+    q = MaterialSearchQuery(space_group="Fm-3m")
+    f = tr.QueryTranslator.to_optimade(q)
     assert 'space_group_symbol_hermann_mauguin="Fm-3m"' in f
+
+
+def test_to_optimade_unrecognised_space_group_never_invents_a_number():
+    from app.tools.search_engine.translator import QueryTranslator
+    q = MaterialSearchQuery(space_group="not-a-space-group")
+    f = QueryTranslator.to_optimade(q)
+    assert "space_group_it_number" not in f
+    assert 'space_group_symbol_hermann_mauguin="not-a-space-group"' in f
 
 
 def test_to_optimade_space_group_number_uses_it_number():

@@ -202,6 +202,47 @@ def test_optimade_server_page_cap_without_next_is_truncated(fake_httpx):
     )
 
 
+def test_optimade_endpoint_max_results_cap_is_reported_as_truncation(fake_httpx):
+    """An endpoint clipped by its OWN behavior.max_results still owes the
+    caller the truth.
+
+    `limit` is min(query.limit, behavior.max_results) BEFORE the fetch, and
+    the truncation check compared that already-clipped value with itself, so
+    for a capped endpoint the condition could never fire. oqmd ships
+    max_results=500 while the tool's limit goes to 10000, so this is the
+    ordinary path. Measured before the fix: 20 asked, endpoint cap 5,
+    provider's own meta.data_returned=50 -> 5 rows returned, truncated=False
+    and the engine's `complete` flag True on a 5-of-50 answer.
+    """
+    fake_httpx.pages = {
+        FIRST_URL: {
+            "data": [_optimade_entry(n) for n in range(5)],
+            "meta": {"data_returned": 50},
+            "links": {"next": "https://example.org/optimade/v1/structures?page=2"},
+        },
+    }
+    ep = _endpoint()
+    ep.behavior.max_results = 5
+    p = OptimadeProvider(endpoint=ep)
+    page = asyncio.run(p.search(MaterialSearchQuery(elements=["Fe"], limit=20)))
+
+    assert len(page.materials) == 5
+    assert page.available == 50
+    assert page.truncated is True, (
+        "20 asked, 5 returned because of this endpoint's own max_results cap, "
+        "50 matched: that is a slice, not the answer"
+    )
+
+    # And the consequence the agent actually reads.
+    reg = ProviderRegistry()
+    reg.register(OptimadeProvider(endpoint=ep))
+    result = asyncio.run(
+        _isolated_engine(reg).search(MaterialSearchQuery(elements=["Fe"], limit=20))
+    )
+    assert result.query_log[0].truncated is True
+    assert result.complete is False, "a 5-of-50 answer is not a complete one"
+
+
 def test_optimade_mid_chain_failure_returns_partial_not_success_shaped_lie(fake_httpx):
     """A page-two failure keeps page one's materials but marks the result
     truncated with the verbatim reason — never a bare success."""

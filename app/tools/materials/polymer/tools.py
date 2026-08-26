@@ -34,6 +34,7 @@ import json
 import math
 from typing import Any
 
+from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
 from app.tools.evidence import (
     EvidenceClass,
@@ -181,7 +182,16 @@ def evaluate_polymer_insulation(
         from rdkit import Chem
         import rdkit
     except Exception as exc:
-        raise RuntimeError(RDKIT_INSTALL_HINT) from exc
+        # One missing-dependency shape (app/tools/_extras.py): a dependency-gated
+        # tool RETURNS the hint, it never raises. Raising here left the caller
+        # with `RuntimeError` and no `requires_extra` to branch on, and the hint
+        # it carried is the only thing worth keeping, as `restart_hint`.
+        return missing_extra_error(
+            "polymer",
+            "Polymer identity evaluation needs RDKit, which is not importable "
+            f"in this PRISM install: {exc}",
+            restart_hint=RDKIT_INSTALL_HINT,
+        )
 
     candidate = _load_identity(candidate_identity, Chem)
     input_evidence = coerce_evidence_class(
@@ -236,7 +246,13 @@ def evaluate_polymer_insulation(
     # `_load_identity` parses SMILES only to VALIDATE and discards the mol, so
     # reading a `_mol` key would be a branch that can never fire. Prefer the
     # repeat unit (what actually governs backbone flexibility) over the monomer.
+    # The third documented representation, `smiles`, carries its structure under
+    # its own key and `_load_identity` validates it there; omitting that key from
+    # this chain reported "no structure exists" for a candidate that had just
+    # supplied an RDKit-parseable one.
     smiles = candidate.get("repeat_unit_smiles") or candidate.get("monomer_smiles")
+    if not smiles and candidate.get("representation") == "smiles":
+        smiles = candidate.get("smiles")
     mol = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) else None
     if mol is not None:
         fraction = rotatable_bond_fraction(mol)
@@ -257,8 +273,9 @@ def evaluate_polymer_insulation(
         )
     else:
         status["rotatable_bond_fraction"] = _unavailable(
-            "the candidate supplied neither repeat_unit_smiles nor "
-            "monomer_smiles, so no structure exists to measure flexibility on"
+            "the candidate supplied no validated structure (repeat_unit_smiles, "
+            "monomer_smiles, or a smiles representation), so no structure "
+            "exists to measure flexibility on"
         )
 
     status["dielectric_constant"] = _unavailable(

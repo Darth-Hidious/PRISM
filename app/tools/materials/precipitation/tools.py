@@ -14,19 +14,23 @@ tool does not appear in the catalog at all.
 """
 from __future__ import annotations
 
+from app.tools._extras import missing_extra_error
 from app.tools.base import Tool, ToolRegistry
 
 
 def _missing_dep_error() -> dict:
-    return {
-        "error": (
-            "Precipitation kinetics (KWN) is not available in this PRISM "
-            "install: kawin and/or pycalphad cannot be imported."
-        ),
-        "install_hint": "pip install 'prism-platform[precipitation]'",
-        "provision_command": "prism provision extra precipitation",
-        "converged": False,
-    }
+    """The one missing-dependency shape (app/tools/_extras.py).
+
+    The hand-rolled dict this replaced carried no `requires_extra` for a caller
+    to branch on, and its primary `install_hint` named a distribution that is
+    not on any index (see `_extras.install_command`).
+    """
+    return missing_extra_error(
+        "precipitation",
+        "Precipitation kinetics (KWN) is not available in this PRISM "
+        "install: kawin and/or pycalphad cannot be imported.",
+        converged=False,
+    )
 
 
 def _precipitation_kinetics(**kwargs) -> dict:

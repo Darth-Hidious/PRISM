@@ -625,22 +625,35 @@ class TestCompositionFeatureCorrectness:
         assert _parse_formula(formula) == {k: float(v) for k, v in expected.items()}
 
     def test_weighted_average_is_an_average(self):
-        """La is not in the 44-element table. The mean over the elements that
-        ARE covered must be a real mean, not one scaled down by the missing
-        fraction."""
+        """An `avg_*` feature must be the average of the formula it is named
+        for.
+
+        This test used to assert that LaFeO3 (La absent from the 44-element
+        table) reported the mean over the covered Fe/O subset. That oracle was
+        wrong in the same way the bug before it was: 3.04 is FeO3's average
+        electronegativity, not LaFeO3's — La is a quarter of the atoms and the
+        vector said nothing about it being dropped. Two different compounds
+        reduced to the same 22 numbers. The rule is now: a fully covered
+        composition gets a real weighted mean, an uncovered one gets no
+        property statistics at all.
+        """
         from app.tools.ml.features import ELEMENT_DATA, _composition_features_basic
 
         assert "La" not in ELEMENT_DATA
         f = _composition_features_basic("LaFeO3")
+        assert "avg_electronegativity" not in f
+        assert "max_electronegativity" not in f
+        assert f["n_elements"] == 3  # the parse itself is still reported
+
         covered = {"Fe": 1.0, "O": 3.0}
         total = sum(covered.values())
         expected = sum(
             ELEMENT_DATA[el]["electronegativity"] * n / total
             for el, n in covered.items()
         )
-        assert f["avg_electronegativity"] == pytest.approx(expected)
-        # min/max/range are over covered elements and unaffected.
-        assert f["max_electronegativity"] == ELEMENT_DATA["O"]["electronegativity"]
+        g = _composition_features_basic("FeO3")
+        assert g["avg_electronegativity"] == pytest.approx(expected)
+        assert g["max_electronegativity"] == ELEMENT_DATA["O"]["electronegativity"]
 
     def test_backend_id_carries_a_version(self):
         from app.tools.ml.features import feature_backend_id, get_feature_backend

@@ -25,7 +25,14 @@ pub struct NotebookCell {
     pub stdout: String,
     pub stderr: String,
     pub result: Option<String>,
-    /// Saved PNG paths (terminals can't inline images; we show the path).
+    /// Saved PNG paths.
+    ///
+    /// A path is not a picture. The backend now DRAWS each of these in a pane
+    /// beside this one (`command_tools::show_artifact` → `terminal-browser`),
+    /// and when it could not — no viewer installed, a terminal that cannot
+    /// draw — it says so on [`Self::stderr`] as a `PRISM:` line rather than
+    /// leaving the path to stand in for the figure. So this field is the
+    /// artifact's location, never the claim that the human has seen it.
     pub image_paths: Vec<String>,
     pub error: Option<String>,
     pub success: bool,
@@ -227,6 +234,42 @@ mod tests {
         assert_eq!(cell.result.as_deref(), Some("42"));
         assert_eq!(cell.image_paths, vec!["/tmp/cell-3-0.png".to_string()]);
         assert!(cell.success);
+    }
+
+    /// A figure the backend could NOT put on screen must reach this pane as
+    /// words, not as silence. The backend writes that notice onto the cell's
+    /// `stderr` (`command_tools::append_unshown_notice`) because it is the one
+    /// channel of a returned `Cell` the pane renders and PRISM may add to.
+    ///
+    /// This test pins that channel from the pane's side: if the notice ever
+    /// moves to a payload field this parser ignores, the human goes back to
+    /// reading a path and wondering why nothing appeared — which is the exact
+    /// failure this work exists to remove.
+    #[test]
+    fn an_unshown_plot_reaches_the_pane_as_words_not_silence() {
+        let cell = NotebookCell::from_value(&serde_json::json!({
+            "execution_count": 1,
+            "origin": "user",
+            "code": "plt.plot(x, y)",
+            "stdout": "",
+            "stderr": "PRISM: [plot saved: /tmp/cell-1-0.png — NOT shown: \
+                       `terminal-browser` is not installed or not on PATH. \
+                       Install it with `curl -fsSL https://terminal-browser.sh/install | bash`]\n",
+            "image_paths": ["/tmp/cell-1-0.png"],
+            "success": true,
+        }));
+
+        assert_eq!(cell.image_paths, vec!["/tmp/cell-1-0.png".to_string()]);
+        assert!(
+            cell.stderr.contains("NOT shown"),
+            "the pane must be told the figure is not on screen: {:?}",
+            cell.stderr
+        );
+        assert!(
+            cell.stderr.contains("terminal-browser.sh/install"),
+            "and told how to fix it: {:?}",
+            cell.stderr
+        );
     }
 
     #[test]

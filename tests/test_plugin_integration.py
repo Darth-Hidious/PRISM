@@ -42,8 +42,66 @@ class TestPluginIntegration:
         result = tool.execute()
         assert result == {"status": "ok"}
 
+    def test_plugin_algorithm_reaches_train_model(self, tmp_path):
+        """The registered algorithm has to be usable by the TRAINER.
+
+        `test_local_plugin_adds_algorithm` below only queries the facade it
+        built itself, so it stayed green while the production path was dead:
+        `get_default_registry()` returned a fresh instance per call, so the
+        registry bootstrap handed the plugin and the registry `train_model`
+        resolves against were different objects and
+        `train_model(algorithm='plugin_extra_trees')` raised "Unknown
+        algorithm". This drives the real path.
+        """
+        pytest.importorskip("sklearn")
+        import numpy as np
+
+        from app.tools.ml.algorithm_registry import get_default_registry
+
+        plugin_file = tmp_path / "trainer_algo_plugin.py"
+        plugin_file.write_text(
+            "def register(registry):\n"
+            "    from sklearn.ensemble import ExtraTreesRegressor\n"
+            "    registry.algorithm_registry.register(\n"
+            "        'plugin_extra_trees', 'Extra Trees Regressor',\n"
+            "        lambda: ExtraTreesRegressor(n_estimators=5, random_state=0),\n"
+            "    )\n"
+        )
+
+        original_discover = discover_local_plugins
+
+        def patched_discover(reg, plugin_dir=None):
+            return original_discover(reg, plugin_dir=tmp_path)
+
+        # The default registry is process-wide on purpose; do not leak this
+        # plugin's algorithm into the rest of the session.
+        snapshot = dict(get_default_registry()._algorithms)
+        try:
+            with patch(
+                "app.plugins.loader.discover_local_plugins",
+                side_effect=patched_discover,
+            ):
+                build_full_registry(enable_mcp=False, enable_plugins=True)
+
+            from app.tools.ml.trainer import train_model
+
+            result = train_model(
+                np.random.rand(40, 4), np.random.rand(40),
+                algorithm="plugin_extra_trees",
+            )
+            assert type(result["model"]).__name__ == "ExtraTreesRegressor"
+            assert result["metrics"]["n_train"] == 32
+        finally:
+            registry = get_default_registry()
+            registry._algorithms.clear()
+            registry._algorithms.update(snapshot)
+
     def test_local_plugin_adds_algorithm(self, tmp_path):
-        """A plugin can register a custom ML algorithm."""
+        """A plugin can register a custom ML algorithm.
+
+        Facade-level only — see `test_plugin_algorithm_reaches_train_model`
+        for the check that the trainer can actually resolve it.
+        """
         plugin_file = tmp_path / "algo_plugin.py"
         plugin_file.write_text(
             "def register(registry):\n"

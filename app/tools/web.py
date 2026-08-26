@@ -71,6 +71,44 @@ else:
     logger.info("Firecrawl: not available, using DuckDuckGo fallback")
 
 
+# Default characters returned from one page read. Not a ceiling on what PRISM
+# can see: `offset` walks the rest of the document and `max_chars` raises the
+# window. The point of a default is to keep one incidental page from filling
+# the context, never to put a document out of reach.
+_DEFAULT_READ_CHARS = 15000
+
+
+def _window(text: str, offset: int, max_chars: int) -> dict:
+    """Return a slice of `text` plus an HONEST account of what was left out.
+
+    Both read paths used to lie in different directions: the Firecrawl path
+    sliced to 15000 chars with no marker at all, and the basic-fetch path
+    marked the cut but computed `content_length` AFTER slicing, so it reported
+    10015 for every page regardless of true size — three different Wikipedia
+    articles all came back "10015 chars". Either way the caller could not tell
+    how much it was missing, and had no way to ask for the rest.
+    """
+    total = len(text)
+    offset = max(0, min(offset, total))
+    body = text[offset:] if max_chars <= 0 else text[offset : offset + max_chars]
+    end = offset + len(body)
+    truncated = end < total
+    if truncated:
+        body += (
+            f"\n\n... [truncated at {end} of {total} chars — "
+            f"re-read this url with offset={end} for the rest]"
+        )
+    return {
+        "content": body,
+        # The TRUE size of the document, never the size of what we returned.
+        "content_length": total,
+        "returned_chars": len(body),
+        "offset": offset,
+        "truncated": truncated,
+        "next_offset": end if truncated else None,
+    }
+
+
 def _web_read(**kwargs) -> dict:
     """Read a web page and return clean text content.
 
@@ -80,6 +118,13 @@ def _web_read(**kwargs) -> dict:
     url = kwargs.get("url", "")
     if not url:
         return {"error": "url is required"}
+    offset = int(kwargs.get("offset", 0) or 0)
+    # `or _DEFAULT_READ_CHARS` swallowed the documented `max_chars=0`
+    # ("0 returns the entire document") because 0 is falsy, so the whole-document
+    # request came back windowed to 15000 chars AND flagged truncated. Only an
+    # absent/None value may fall back to the default.
+    raw_max_chars = kwargs.get("max_chars")
+    max_chars = _DEFAULT_READ_CHARS if raw_max_chars is None else int(raw_max_chars)
 
     # Try Firecrawl first (best quality — handles JS, returns markdown).
     # Direct REST call — the firecrawl-py SDK has renamed this API twice
@@ -105,9 +150,8 @@ def _web_read(**kwargs) -> dict:
             return {
                 "url": url,
                 "title": title,
-                "content": content[:15000],
                 "source": "firecrawl",
-                "content_length": len(content),
+                **_window(content, offset, max_chars),
             }
         except Exception as e:
             logger.warning(f"Firecrawl failed: {e}, falling back to basic fetch")
@@ -124,6 +168,20 @@ def _web_read(**kwargs) -> dict:
                 "User-Agent": "PRISM/2.7 (materials science research; +https://marc27.com)"
             },
         )
+        # An HTTP error page is NOT content. Without this the error body was
+        # returned under the ordinary read shape and the caller could not tell a
+        # refusal from a real page: measured, a 403 came back as content:"",
+        # content_length:0, truncated:false (indistinguishable from a genuinely
+        # empty page) and a 404 came back as a readable "Page not found" article.
+        # The tool's own description warns that repositories 403 this
+        # User-Agent — that is exactly the case that must not read as success.
+        if r.status_code >= 400:
+            return {
+                "error": f"HTTP {r.status_code} reading {url}",
+                "url": url,
+                "status_code": r.status_code,
+                "source": "basic_fetch",
+            }
 
         try:
             from bs4 import BeautifulSoup
@@ -144,15 +202,11 @@ def _web_read(**kwargs) -> dict:
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"\s+", " ", text).strip()
 
-        if len(text) > 10000:
-            text = text[:10000] + "... [truncated]"
-
         return {
             "url": url,
             "title": title,
-            "content": text,
             "source": "basic_fetch",
-            "content_length": len(text),
+            **_window(text, offset, max_chars),
         }
     except Exception as e:
         return {"error": f"Failed to read URL: {e}"}
@@ -312,7 +366,7 @@ _WEB_DESCRIPTION = (
     "(if configured) or DuckDuckGo.\n"
     "Typical sequence: action='search' → pick the best URL → action='read' on "
     "that URL. NOT for scientific papers (use prior_art_search for better "
-    "metadata + DOIs) and NOT for the platform KG (use query_platform). "
+    "metadata + DOIs) and NOT for the platform KG (use query with scope=platform). "
     "KNOWN BLOCKERS: search engines and government repositories block this "
     "tool's User-Agent — do NOT call action='read' on google.com/search, "
     "bing.com/search, duckduckgo.com, osti.gov/servlets/* or osti.gov/biblio/* "
@@ -348,6 +402,23 @@ def create_web_tools(registry: ToolRegistry) -> None:
                     "type": "integer",
                     "description": "Max results for action='search' (default 5).",
                     "default": 5,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "action='read': start reading this many characters into the "
+                        "page. A truncated result reports next_offset — pass it back "
+                        "to continue through a long document."
+                    ),
+                    "default": 0,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": (
+                        "action='read': characters to return in this window "
+                        f"(default {_DEFAULT_READ_CHARS}). Raise it for a data table "
+                        "you need whole; 0 returns the entire document."
+                    ),
                 },
             },
             "required": ["action"],

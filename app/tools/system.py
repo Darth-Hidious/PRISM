@@ -119,12 +119,25 @@ def _web_search(**kwargs) -> dict:
 
 
 def _show_scratchpad(**kwargs) -> dict:
-    """Return the agent's scratchpad as text. Requires scratchpad to be set."""
-    # The scratchpad reference is injected by the caller (AgentCore)
-    scratchpad = kwargs.get("_scratchpad")
-    if scratchpad is None:
+    """Return the agent's scratchpad as text.
+
+    The ledger lives in Rust (`crates/agent/src/scratchpad.rs`), which logs
+    every tool call; the agent loop injects the rendered text as
+    `_scratchpad_text` when it dispatches this tool. This previously read a
+    `_scratchpad` OBJECT said to be injected by an `AgentCore` that does not
+    exist anywhere in `app/`, so the tool was always inert — it answered
+    "not available in this session" on every call while the data it describes
+    was being written on every turn.
+
+    `_scratchpad_text` is caller-injected, never model-supplied, which is why
+    the public schema stays empty.
+    """
+    text = kwargs.get("_scratchpad_text")
+    if text is None:
         return {"text": "Scratchpad is not available in this session."}
-    return {"text": scratchpad.to_text()}
+    if not text.strip():
+        return {"text": "No tool calls recorded in this session yet."}
+    return {"text": text}
 
 
 _FILE_DISPATCH = {
