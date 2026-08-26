@@ -159,6 +159,47 @@ const CODE_EXEC_TOOLS: &[&str] = &["execute_python", "execute_bash", "notebook_e
 /// How many times the execution-contract gate may reject a finalization in one
 /// turn. This bounds the cost of false positives.
 const MAX_CONTRACT_GATE_FIRINGS: usize = 2;
+
+/// How many times a turn may be handed back to the model after it tried to
+/// finish with work it had itself named as outstanding.
+///
+/// A ceiling exists because a model can always find one more thing to do, and
+/// an unbounded loop spends the operator's money while they are not watching.
+/// It is deliberately generous: the point of the setting is research that keeps
+/// going, and someone who turns it on has said so.
+const MAX_CONTINUATIONS: usize = 24;
+
+/// Whether the operator asked for research that continues past the model's
+/// first attempt to stop.
+///
+/// Opt-in, and read per turn so it can be changed without a restart. PRISM does
+/// not decide on its own to keep spending: the default is exactly today's
+/// behaviour, one turn ending when the model says it is finished.
+pub(crate) fn continue_until_done() -> bool {
+    std::env::var("PRISM_CONTINUE_UNTIL_DONE")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && !value.eq_ignore_ascii_case("0")
+                && !value.eq_ignore_ascii_case("false")
+        })
+}
+
+/// The marker a model uses to say the work is genuinely finished.
+///
+/// With continuation on, ending a message is no longer the same as being done —
+/// the model must SAY it is done. That inversion is the whole mechanism: a
+/// research turn that trails off into "next highest-value step: ..." is exactly
+/// the case that should not have ended, and it is also exactly the case a
+/// stop-word check catches without asking a second model to judge.
+pub(crate) const RESEARCH_COMPLETE_MARKER: &str = "RESEARCH COMPLETE";
+
+/// Does this closing message claim the work is finished?
+#[must_use]
+pub(crate) fn claims_research_complete(text: &str) -> bool {
+    text.to_ascii_uppercase().contains(RESEARCH_COMPLETE_MARKER)
+}
 /// How many tools the capability-gap re-retrieval pins after the model admits
 /// it lacked one.
 const CAPABILITY_GAP_RETRIEVE: usize = 5;
@@ -2965,6 +3006,7 @@ pub(crate) async fn run_turn_inner(
     // the cost of a false positive; it is not a completeness guarantee.
     let mut tools_used_this_turn: Vec<String> = Vec::new();
     let mut contract_gate_firings: usize = 0;
+    let mut continuations: usize = 0;
     // Tool-definition token budget for THIS model's real context window,
     // resolved once per turn (the catalog and the model do not change mid-turn).
     let tool_token_budget =
@@ -3492,6 +3534,57 @@ pub(crate) async fn run_turn_inner(
                         content: Some(
                             crate::execution_contract::UNSUPPORTED_CLAIM_REMINDER.to_string(),
                         ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    continue;
+                }
+
+                // ── Continuation gate ─────────────────────────────
+                // The operator asked for research that does not stop at the
+                // model's first inclination to stop.
+                //
+                // Measured on a real brief: the turn ended with "Next
+                // highest-value step: ingest ... to replace the two flagged
+                // assumption blocks with quoted numbers". The model knew
+                // exactly what remained and stopped anyway, because a message
+                // with no tool call ends the turn. That is the thing being
+                // fixed — not a cap, and not the loop.
+                //
+                // With this on, ending a message no longer means being done:
+                // the model must SAY so. Bounded three ways — the operator has
+                // to opt in, the context budget still ends the turn, and
+                // MAX_CONTINUATIONS caps it regardless, because a model can
+                // always find one more thing to do and this spends real money.
+                if continue_until_done()
+                    && continuations < MAX_CONTINUATIONS
+                    && iteration + 1 < iteration_cap
+                    && !transcript.budget_exhausted()
+                    && !claims_research_complete(response.message.content.as_deref().unwrap_or(""))
+                {
+                    continuations += 1;
+                    tracing::info!(
+                        continuation = continuations,
+                        "continuation gate: turn handed back, work not declared complete"
+                    );
+                    emit(AgentEvent::TextDelta {
+                        text: format!(
+                            "\n\n[continuing — {continuations}/{MAX_CONTINUATIONS}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n"
+                        ),
+                    });
+                    history.push(ChatMessage {
+                        role: "system".to_string(),
+                        content: Some(format!(
+                            "You have not finished. Do not summarise and stop — carry out the \
+                             next step you just named, then the one after it. Prefer acting \
+                             over reporting: if you wrote that something remains to be \
+                             ingested, verified, computed or defined, do it now with a tool.\n\n\
+                             When the work is genuinely complete — not merely reported on — \
+                             end your message with `{RESEARCH_COMPLETE_MARKER}`. If you are \
+                             blocked and no tool can move you forward, say what blocks you \
+                             and end with `{RESEARCH_COMPLETE_MARKER}` as well; continuing to \
+                             restate a blocker is not progress."
+                        )),
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -4433,6 +4526,53 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 
 #[cfg(test)]
 mod tests {
+    /// Continuation is the operator's decision, never PRISM's. Off, the turn
+    /// ends exactly as it does today; a default that kept spending because the
+    /// model had more ideas would be the harness deciding to spend money.
+    #[test]
+    fn continuation_is_off_unless_the_operator_asks() {
+        // The prism-agent test binary's single env lock — env vars are
+        // process-global, so every test that sets one takes this.
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: guarded by the shared env lock, single-threaded here.
+        unsafe { std::env::remove_var("PRISM_CONTINUE_UNTIL_DONE") };
+        assert!(!continue_until_done(), "absent must mean off");
+
+        for off in ["0", "false", "FALSE", "", "   "] {
+            unsafe { std::env::set_var("PRISM_CONTINUE_UNTIL_DONE", off) };
+            assert!(!continue_until_done(), "{off:?} must mean off");
+        }
+        for on in ["1", "true", "yes", "on"] {
+            unsafe { std::env::set_var("PRISM_CONTINUE_UNTIL_DONE", on) };
+            assert!(continue_until_done(), "{on:?} must mean on");
+        }
+        unsafe { std::env::remove_var("PRISM_CONTINUE_UNTIL_DONE") };
+    }
+
+    /// With continuation on, ending a message is no longer being done — the
+    /// model has to say so. The real turn this exists for trailed off into
+    /// "Next highest-value step: ..." and stopped; that must NOT read as done.
+    #[test]
+    fn only_an_explicit_marker_counts_as_finished() {
+        assert!(claims_research_complete(
+            "everything checks out. RESEARCH COMPLETE"
+        ));
+        assert!(
+            claims_research_complete("blocked on credits — research complete"),
+            "the marker is case-insensitive, because models vary the casing"
+        );
+        assert!(
+            !claims_research_complete(
+                "Next highest-value step: ingest 20050192166.txt to replace the \
+                 two flagged assumption blocks with quoted numbers."
+            ),
+            "naming the next step is the opposite of being finished"
+        );
+        assert!(!claims_research_complete("Done for now."));
+        assert!(!claims_research_complete(""));
+    }
 
     // ── discovery thrash ──
     //
