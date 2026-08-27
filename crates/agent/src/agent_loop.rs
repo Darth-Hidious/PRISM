@@ -167,7 +167,26 @@ const MAX_CONTRACT_GATE_FIRINGS: usize = 2;
 /// an unbounded loop spends the operator's money while they are not watching.
 /// It is deliberately generous: the point of the setting is research that keeps
 /// going, and someone who turns it on has said so.
-const MAX_CONTINUATIONS: usize = 24;
+/// The handback cap in force, from `PRISM_MAX_CONTINUATIONS`.
+///
+/// UNBOUNDED unless the operator sets one. Turning on
+/// `PRISM_CONTINUE_UNTIL_DONE` is already an explicit instruction to keep
+/// going; imposing a second, compiled-in limit on top of it is the harness
+/// overriding the person who just said what they wanted. A run that stopped at
+/// 24 handbacks in the middle of a long question would report itself finished
+/// when it had merely been cut off — which is the failure this whole cycle
+/// exists to remove.
+///
+/// The loop still ends for reasons that are REAL rather than arbitrary: the
+/// model says the work is done, the context budget is genuinely exhausted, or
+/// the operator stops it. A cap remains available for anyone who wants one.
+pub(crate) fn max_continuations() -> usize {
+    std::env::var("PRISM_MAX_CONTINUATIONS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(usize::MAX)
+}
 
 /// Whether a handback should happen, and what to demand of it.
 ///
@@ -300,22 +319,33 @@ pub(crate) fn cycle_step(
             CycleStep::ContinueAfterResearch
         };
     }
-    if stalled_so_far + 1 > MAX_STALLED_CONTINUATIONS {
+    if stalled_so_far + 1 > max_stalled_rounds() {
         CycleStep::Stop
     } else {
         CycleStep::ContinueAfterStall
     }
 }
 
-/// Handbacks that may produce analysis without gathering anything new before
-/// the loop gives up.
+/// Consecutive rounds producing prose and NO tool call before the loop gives
+/// up, from `PRISM_MAX_STALLED_ROUNDS`.
 ///
-/// Research is search → read → let what you read say where to look next. A
-/// round that adds no evidence has left the cycle, and telling such a model to
-/// "keep going" only produces more prose. One recovery round is allowed,
-/// because a model can legitimately spend a turn reasoning about what it just
-/// read before acting on it.
-const MAX_STALLED_CONTINUATIONS: usize = 1;
+/// A dead-loop detector, NOT a research budget — the same distinction
+/// `default_max_iterations` draws. A round that calls a tool can never trip
+/// this however long it runs; only a model that has stopped acting entirely
+/// does, and telling such a model to "keep going" produces more prose at the
+/// operator's expense.
+///
+/// It used to be 1, which is too tight now that the gate itself can ask for a
+/// change of direction — reconsidering an approach is a legitimate use of one
+/// turn, and being killed for it is a muzzle. Three consecutive silent rounds
+/// is a loop, not a pause.
+fn max_stalled_rounds() -> usize {
+    std::env::var("PRISM_MAX_STALLED_ROUNDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
+}
 
 /// Whether the operator asked for research that continues past the model's
 /// first attempt to stop.
@@ -3715,7 +3745,7 @@ pub(crate) async fn run_turn_inner(
                 // MAX_CONTINUATIONS caps it regardless, because a model can
                 // always find one more thing to do and this spends real money.
                 if continue_until_done()
-                    && continuations < MAX_CONTINUATIONS
+                    && continuations < max_continuations()
                     && iteration + 1 < iteration_cap
                     && !transcript.budget_exhausted()
                     && !claims_research_complete(response.message.content.as_deref().unwrap_or(""))
@@ -3765,8 +3795,9 @@ pub(crate) async fn run_turn_inner(
                         );
                         emit(AgentEvent::TextDelta {
                             text: format!(
-                                "\n\n[stopping — {MAX_STALLED_CONTINUATIONS} handbacks produced \
-                                 analysis but no new evidence]\n\n"
+                                "\n\n[stopping — {} handbacks produced analysis but no new \
+                                 evidence]\n\n",
+                                max_stalled_rounds()
                             ),
                         });
                     } else {
@@ -3781,7 +3812,8 @@ pub(crate) async fn run_turn_inner(
                         );
                         emit(AgentEvent::TextDelta {
                             text: format!(
-                                "\n\n[continuing — {continuations}/{MAX_CONTINUATIONS}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n"
+                                "\n\n[continuing — {continuations}/{}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n",
+                                max_continuations()
                             ),
                         });
                         // The graph's own holes, when it has any. Asked for
@@ -4805,7 +4837,7 @@ mod tests {
         };
         assert_eq!(cycle_step(found, 0, 0), CycleStep::ContinueAfterResearch);
         assert_eq!(
-            cycle_step(found, MAX_STALLED_CONTINUATIONS + 5, 99),
+            cycle_step(found, max_stalled_rounds() + 5, 99),
             CycleStep::ContinueAfterResearch,
             "reaching new ground clears both counters, however long it had circled"
         );
@@ -4817,7 +4849,7 @@ mod tests {
     fn one_barren_round_is_forgiven_then_the_loop_stops() {
         assert_eq!(cycle_step(worked(0), 0, 0), CycleStep::ContinueAfterStall);
         assert_eq!(
-            cycle_step(worked(0), MAX_STALLED_CONTINUATIONS, 0),
+            cycle_step(worked(0), max_stalled_rounds(), 0),
             CycleStep::Stop,
             "a model that has stopped gathering will not start because it was \
              told to keep going; that is how a loop burns money writing essays"

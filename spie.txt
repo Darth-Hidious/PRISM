@@ -1,0 +1,750 @@
+Skip to main content
+Home
+Journals
+Journal of Micro/Nanop...
+Volume 25
+Issue 3
+Article
+3 Apr 2026
+|
+Journal Article
+|
+PFAS in semiconductor photolithography: a mass balance model
+Ralph R. Dammel, David E. Speed|Author Affiliations
+Journal of Micro/Nanopatterning, Materials, and Metrology, Vol. 25, Issue 3, 031405 (Apr 2026)https://doi.org/10.1117/1.JMM.25.3.031405
+PDF
+Save
+Info
+Cite
+Permissions
+Alerts
+Share
+0
+Citations
+Article
+Figures & Tables
+Cited By
+Abstract
+
+Per- and poly-fluoroalkyl substances (PFASs) have come under increased scrutiny because all members of this class of compounds exhibit very high environmental persistence (vP), and some exhibit toxicity (T) and/or bioaccumulation (B) potential. Because of these attributes, PFAS chemicals are being scrutinized by regulatory authorities for restrictions on use and releases to the environment. At the same time, PFAS are crucial components of many process materials used in semiconductor photolithography, to the extent that the manufacture of advanced chips is currently not possible without them. Although PFAS uses are crucial, the amounts used in these key applications are small relative to global PFAS production and use, a fact that may not be generally known. Our purpose is to provide a quantitative assessment of the amount of PFAS used in semiconductor photolithography and to present a mass balance model for the disposition of these materials into applicable waste streams. The model presented allows identification of key areas for prioritized action, including the need for targeted research and development.
+
+Keywords
+
+Per- and poly-fluoroalkyl substances, Photolithography, Mass balance, Semiconductors, Polymers, Optical lithography, Photoresist materials ... 
+, Semiconducting wafers, Photoacid generators, Photoresist developing, Semiconductor manufacturing, Coating,
+Data processing +5
+1. Introduction
+
+Per- and poly-fluoroalkyl substances (PFAS) are manmade fluorinated chemicals1 with numerous attributes that provide unique functionality across a wide spectrum of applications. In many situations, it is not just one particular attribute (e.g., acid strength) that makes a fluorinated organic chemical effective for an application, but the combination of several attributes that enable this class of chemical to satisfy multiple, overlapping performance requirements.
+
+The purpose of this paper is to provide a quantitative assessment of the amount of PFAS used in semiconductor photolithography and to present a mass balance model for the disposition of PFAS into the different waste streams. A previous conference presentation reported the methodology used to obtain the PFAS mass balance and applied it to PFAS sales data for the year 2021. We extend the mass balance analysis to the years 2022 through 2024.2 This report addresses only photolithography formulations and their releases from the photolithography process; the Semiconductor PFAS Consortium (Consortium), operating under the auspices of the Semiconductor Industry Association (SIA), is developing models for other industry PFAS uses.
+
+The PFAS discussion is not helped by the fact that there are several competing and mutually exclusive definitions of what a PFAS is in concurrent use. In this paper, we have chosen the broadest definition found in recent proposed regulations, which includes all chemistries and materials that contain molecules with CF2 and/or CF3 groups. This definition closely aligns with the OECD definition.1 Not all PFAS within the scope of this definition are considered bio-accumulative or toxic.
+
+PFAS have been an enabling technology in the development of ever smaller and more advanced semiconductors over the last 30 years through cutting-edge lithographic developments. PFAS materials have been designed, developed, and optimized as dedicated substances to satisfy many functions and performance needs in lithographic imaging products. Thus, replacement with a new non-PFAS material will likely require multiple solutions depending on the application, which has a significant impact on the estimated PFAS replacement timelines. In their “Review of essential use of fluorochemicals in lithographic patterning and semiconductor processing,”3 Ober et al. reported on the use of PFAS-containing chemicals in photo-acid generators (PAGs), photoresists used in advanced photolithography, antireflective coatings (ARCs), and other photolithographic formulations. Their paper concludes that currently, there are no alternatives to PFAS that match all requirements needed in the critical photolithography steps used in advanced device manufacturing, but that PFAS-free alternatives should be investigated.
+
+Given the importance of fluorinated organic chemicals in semiconductor manufacturing, the Consortium has developed a set of documents that specify the nature of materials used, their function, and options for their replacement. The documents comprise seven white papers (Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. For Fig. 1, cf. Ref. 5), three case studies, seven analyses of environmental release pathways,4 a paper detailing the “Impact of a Potential PFAS Restriction on the Semiconductor Sector”6 and a socioeconomic analysis.7 These papers identified PFAS uses in semiconductor manufacturing and assessed where their use meets the concept of “essential.”8 In their papers, which were mostly finalized in 2022 and 2023, the Consortium’s authors come to the same conclusion as Ober et al.,3 i.e., that for most PFAS use cases involving semiconductor manufacturing, PFAS-free alternatives providing the same performance characteristics are currently not available. The development of PFAS-free alternatives for semiconductor lithography was estimated to require a decades-long effort of invention, research and development, integration, demonstration, and manufacturing ramp. Once a potential alternative is identified, an iterative process of chemical and semiconductor manufacturing performance demonstration is necessary (Fig. 1). This alternative evaluation process starts at supplier proof of concept followed by an iterative process of sampling and user validation, fab integration and process of record development, chemical supplier scale up, semiconductor process reliability qualification, customer qualification of the semiconductor product, first product high-volume manufacturing (HVM), and finally, HVM proliferation. The alternative could prove to be nonviable at any of these alternative evaluation steps, requiring the evaluation to start over with another potential alternative.
+
+Fig. 1
+Download
+Full-size Image
+
+Timeline to identify and implement semiconductor alternative chemicals (Semiconductor PFAS Consortium, 2025) (Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. For Fig. 1, cf. Ref. 5).
+
+Efforts to develop alternatives that were already underway were made public in 2024 when two companies reported on the development of not only PFAS but entirely fluorine-free photoacid generators and their use in resist formulations used in applications of from 𝑖-line to 248 and 193 nm, and EUV that showed not only equivalent but, in many cases, superior performance to their PFAS-containing counterparts.9–13 In 2025, a paper at the SPIE Advanced Lithography and Patterning conference reported on the development of PFAS-free (but possibly fluorine-containing) immersion top coats, both spin-on and in situ.14 At a nonpublic industry symposium in 2025, eight suppliers reported on PFAS-free or fluorine-free materials for semiconductor photolithography (specifically for PFAS-free EUV resists, see also Ref. 15). Although this rapid development of potential photolithography material alternatives provides promising results, it must also be noted that the proof of concept or even early availability of PFAS substitutes is only the first step: the number of material/process combinations in a typical fab can reach tens of thousands, and a material change such as replacement of a PFAS-containing with a PFAS-free material requires a lengthy re-qualification not only of the individual step but also of its impact on subsequent processes. A complete substitution may quite possibly require decades (Semiconductor PFAS Consortium, 2025) (Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. For Fig. 1, cf. Ref. 5). However, both a description of the state of the art in PFAS replacements for photolithographic materials and a more precise estimate for their rate of implementation are beyond the scope of this paper.
+
+2. Supply Chain of Lithography Formulations
+
+The supply chain of a lithography formulation is summarized schematically in Fig. 2 for the example of one key raw material, PAGs. Working from the right side of the diagram, semiconductor manufacturers purchase photolithography chemicals from photolithography chemical suppliers. Photolithography chemical suppliers formulate lithography chemical mixtures using an array of chemicals that they may either synthesize themselves or purchase from a raw chemical supplier. The focus of the following discussion is the use of photolithography formulations, including but not limited to PAGs, containing PFAS by semiconductor manufacturers.
+
+Fig. 2
+Download
+Full-size Image
+
+Example supply chain for photoacid generator photolithography chemical products. Reproduced with permission from Ref. 16.
+
+3. PFAS Use Applications in Photolithography
+
+There are seven key use applications in which PFAS are currently used in semiconductor photolithography (see also Table 1 for a summary) (Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. For Fig. 1, cf. Ref. 5)16:
+
+• Photoacid generators (PAGs) are key components of the chemically amplified resists (CARs), certain chemically amplified polybenzoxazoles (PBOs) and polyimides (PIs), and bottom anti-reflective coatings (BARCs) that are used in advanced lithography.3,17 PAGs are spin-coated onto the wafer as part of the coating solution. They generate strong acids on exposure to actinic radiation, e.g., UV light. The predominant PAG chemicals are organic salts consisting of sulfonium or iodonium cations and PFAS super-acid anions, although nonionic PAGs that generate PFAS super-acids are also used in some niche applications. The high acidity of the super-acids arises from the strong electronegativity of the fluorine atoms, which makes them capable of causing the solubility change of the photoresist. Most PAGs for high-performance resists used in current photolithography processes and all PAGs for 193 nm applications are fluorinated, some with only a single CF2 unit.3 Salt-type PFAS PAGs, such as onium salts, will dissociate in aqueous media into a non-PFAS cation and a PFAS anion.
+
+Until very recently, no universally applicable viable fluorine-free alternatives existed for the vast array of PAGs contained in current resists. The reasons for the use of PFAS, PAGs, and the prospects for replacements have been discussed in detail in Consortium whitepapers.17,18 Current photoacid generators have been in development for 25 years; for an alternative to be successful, it would have to show acidity comparable to perfluoro sulfonic acids, show a similar lack of side reactions, lack volatility, and show minimum diffusivity for high-resolution patterns. In 2023, the PFAS Consortium of the Semiconductor Industry Association (SIA) estimated that alternatives would take from 15 to more than 20 years to reach production. Although, as discussed in Sec. 1, high-performing substitutes have been reported for a limited number of specific applications, it will take time and intense manpower to replace existing formulations due to the very large number of PFAS PAG-containing materials, which are currently used in fabs and the complexity of ensuring that PFAS replacement in each unique formulation and application does not negatively impact product yield or long-term reliability.
+
+• Photoresist polymers, especially in EUV applications, may contain PFAS monomers to control pattern profile. PFAS polymers increase EUV absorbance, improve dissolution properties, and increase resolution. However, replacement options are under development: beginning in 2024, there have been reports on highly performing fluorine-free EUV resists.12,13
+
+• Top antireflective coatings (TARCs) require a very low refractive index, low surface energy, and strong barrier properties, all of which are provided by fluorinated polymers. TARCs are water-based materials applied in a spin coater. Currently, no viable alternative materials exist for the 365 and 248 nm TARC applications. For 193 nm TARCs, which are only a small fraction of the market, dyed TARCs with lower PFAS levels have been described; however, these have the disadvantage of leading to a productivity loss of 25% to 30% due to exposure energy being lost to absorption in the TARC.19,20 Development of dyed TARCs for 248 and 365 nm is more challenging because at these wavelengths, chromophores are less absorbing. However, first reports of dyed TARCs for 248 nm have been published, with testing by end users just beginning.11
+
+• EUV anti-collapse rinses are used to prevent pattern collapse of fine lines due to capillary forces. These materials are water-based and are applied in the last phase of the development step. Anti-collapse rinses are also sometimes used in optical lithography. However, for EUV lithography, the capillary forces leading to pattern collapse are much larger, and it is essentially impossible to use aqueous developed CARs without them. The first generation of EUV rinses used PFAS surfactants, but new fluorine-free versions have been developed and are now commercially available.
+
+• Immersion top coatings require very low surface energy (resulting in very high water contact angles), exceptionally strong barrier properties, water insolubility but solubility in aqueous developers, and a lack of intermixing with the photoresist. Typical PFAS-based immersion top coat chemistries have been described in the literature.21 Fluorine-free systems based on silicon chemistry have been reported22 but have failed to see practical application, in part due to lens contamination concerns. A 2025 paper14 has described highly performing fluorine-free immersion topcoats, both spin-on or in situ, offering the prospect of a future PFAS-free solution also for this application. The presenter declined to comment on whether the materials were only PFAS-free or also fluorine-free; however, given the requirement profile of the application (very high contact angle, water insolubility but developer solubility, no leaching of possible lens contaminants, transparency at 193 nm, etc.), it is unlikely in our opinion that a fluorine-free topcoat can meet these multiple requirements of 193 nm immersion lithography.
+
+PFAS surfactants have unique properties, such as very low surface tension and a combination of hydrophobic and oleophobic behavior, that have been utilized in various types of photolithographic materials. They are typically added in low concentrations, of the order of 100 ppm, to these products. Applications include photoresists (248, 193 nm, immersion, thick film, etc.), PBO/PIs, BARCs, TARCs, color filter photoresists for imaging, and rinse solutions. The surfactants are used to improve film quality by suppressing Bénard cells, altering surface interaction, wetting characteristics, and component mixing, all of which help to minimize defects in the lithographic process and thus increase lithographic yield. Prospects and timelines for replacements have been discussed in an SIA PFAS Consortium white paper (Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. For Fig. 1, cf. Ref. 5). Siloxane-based surfactants have been demonstrated as non-PFAS alternatives for many applications. However, for some advanced applications, use of these alternatives has led to compromised performance (Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. Some siloxanes (cyclic molecules D4, D5, and D6, typically present as contaminants) are additionally under further regulatory restrictions. Although continued research and more development are still required, there is a general expectation that all fluorine-based surfactants will be substituted by PFAS-free versions.
+
+• Barrier layer polymers (polybenzoxazole [PBO], polyimide [PI]) are critical for advanced patterning. They typically contain CF3 groups in the polymer backbone in the form of a hexafluoroisopropyl group, which provide solubility in environmentally friendly casting solvents and can even enable aqueous development. PBO/PI polymers contribute electrical, thermal, and mechanical protection for the semiconductor device and isolate device components from the detrimental moisture impacts. This application differs from all of the above in that part of the PFAS material used remains in the final device. PFAS-containing barrier layers are the only application among those of Table 1 for which no PFAS-free replacement with equivalent performance has been reported so far. Although PFAS-free barrier layers are commercially available, they require the formation of the final imide from a precursor solution with low storage stability, and they offer lower moisture resistance than PFAS versions.
+
+Table 1
+
+Examples of key PFAS use applications in semiconductor photolithography (modified from “The impact of a potential PFAS restriction on the semiconductor sector” [Semiconductor PFAS Consortium technical white papers and case studies can be found in Ref. 4. For Fig. 1, cf. Ref. 5]).
+
+PFAS use application	Function	Example types of compounds used	PFAS provide
+Surfactants	Improved coating uniformity in photoresists and BARCs	Longer chain PFAS (C6 to C8) and telomer alcohols pending from polymer backbones. Now mostly replaced by C4 pendant chains	Low surface tension, control of contact angle
+Photoacid generators (PAGs)	Precursor for the photoacid catalyst needed for CARs and BARCs	Perfluoroalkylsulfonates C4 or lower and C4 or lower substituted superacid anions such as C1. For some advanced resists, these are bound to polymers	PFAS component of PAGs generates strong acids that do not show side reactions that interfere with the chemical amplification process
+Photoresists—polymers	Control pattern profile in EUV	C1 PFAS polymer	Increases absorbance, improves the dissolution properties, increases resolution
+EUV anti-collapse rinses	Prevent pattern collapse	Fluorinated surfactants	Lower surface tension and rinse liquid with a higher contact angle to reduce capillary forces
+TARCs	Control of thin film interference effects in resists	Fluorinated water and developer soluble polymers	High fluorine content is needed to achieve the low refractive index needed to effectively suppress film interference effects
+Immersion barriers (immersion topcoats)	Protection of the resist from immersion liquid and of the exposure tool from contamination	Spin-on barriers: Water-insoluble and developer-soluble polymers with fluorinated side chains	Barriers that are soluble in casting solvents, insoluble in water but soluble in developer, and that show no intermixing with photoresists
+Prevent water film pulling and resist component leaching in immersion topcoats	Embedded barriers (in situ top coats): oligomeric or low molecular weight polymeric highly fluorinated compounds	Hydrophobicity and control of contact angle, inert under 193 nm radiation, and transparency
+Fluoroalcohol methacrylate polymers with high water contact angles (>90 deg)
+Barrier layer polymers (PBO/PI)	Provide electrical, thermal, and mechanical protection for the semiconductor device. Also protects the device components from the impact of moisture	PFAS polymers with F3⁡C─C─CF3 groups (C1) in the backbone	C1 PFAS groups attached to the polymer backbone provide solubility in environmentally friendly casting solvents and enable aqueous development
+4. Methodology Used to Determine PFAS Mass Balance for Semiconductor Photolithography
+
+The starting point for the PFAS mass balance is the amount of PFAS contained in products provided by material suppliers to semiconductor manufacturers. These products are divided into four product classes (see Fig. 3), each of which has separately recorded quantities. SIA obtains these numbers through periodic sales surveys, details of which are provided in Sec. 5 for the surveys covering the years 2021 through 2024.
+
+Fig. 3
+Download
+Full-size Image
+
+Methodology used for calculating the mass balance for PFAS used in semiconductor manufacturing (Reproduced with permission from Ref. 23). Aq., aqueous; Org., organic.
+
+During semiconductor manufacturing, each of the product classes is used in different ways in the photoresist unit processes described in Sec. 6. These unit processes result in different release factors 𝑝𝑖⁢𝑗, which are described in Sec. 7. By combining the sales survey data with the release factors, it is now possible to develop a mass balance model for the disposition of PFAS materials into the four different waste streams (Fig. 3) based on the way the materials are used in photolithography processes.
+
+5. Amount of PFAS Used in Semiconductor Photolithography
+
+It is generally difficult to estimate the total amount of PFAS produced and used for a particular application. The difficulty arises from factors such as company and regional differences in reporting practices, information availability, differing definitions of what chemicals or portions of chemicals constitute a PFAS, and differences in the very definition of PFAS. The Annex XV restriction report published by the European Chemicals Agency (ECHA) lists a relatively wide range of between 691,168 and 983,398 metric tons for PFAS brought to market annually (∼±18% around a midpoint of 836,787 metric tons) (see Table 3 on page 55 of the Annex XV Restriction Report).24 By contrast, the amount of PFAS used for semiconductor photolithography is believed to be known fairly accurately in part because the Semiconductor Industry Association (SIA) has conducted periodic surveys of the amount of PFAS that the industry’s major photolithography chemical suppliers bring to market (Although details of the SIA survey data for 2022 to 2024 are presented here for the first time, data for 2021 were already published in Ref. 23).
+
+The most recent versions of this survey cover the years 2021 (Although details of the SIA survey data for 2022 to 2024 are presented here for the first time, data for 2021 were already published in Ref. 2) through 2024 and are the basis for release numbers developed in this study. The following suppliers responded to the survey:
+
+• Brewer Science;
+
+• Central Glass Co, Ltd.;
+
+• DuPont (formerly Dow);
+
+• EMD Electronics (a subsidiary of Merck KGaA, Darmstadt);
+
+• Fujifilm Electronics Materials U. S. A., Inc. (Fujifilm);
+
+• JSR Micro;
+
+• Nissan Chemical Corporation;
+
+• Shin-Etsu MicroSi, Inc. (MicroSi);
+
+• Sumitomo Chemical Company (Sumika);
+
+• Tokyo Ohka Kogyo Co, Ltd. (TOK).
+
+SIA estimates that the survey covers over 90% of the global semiconductor photolithography material market. The survey collects information from each supplier regarding PFAS sold by chain length (C1 − C8/C8+), and usage category and region, following which SIA bundles and anonymizes the information. PFAS-containing formulations are split up into four usage categories: aqueous/nonpolymer (aqueous matrix with nonpolymeric PFAS component), aqueous/polymer (aqueous matrix with polymeric PFAS component), organic/nonpolymer (organic matrix with nonpolymeric PFAS component), and organic/polymer (organic matrix with polymeric PFAS component). Table 2 lists which of the seven key areas of use correspond to these usage categories.
+
+Table 2
+
+Mapping of the seven key areas of photolithographic PFAS use corresponding to four usage categories of the SIA survey of worldwide PFAS sales (While details of the SIA survey data for 2022 to 2024 are presented here for the first time, data for 2021 were already published in Ref. 2).
+
+Usage category	Key area of PFAS use
+Aqueous nonpolymer	Developers, rinses
+Aqueous polymer	Top anti-reflective coatings (TARCs)
+Organic nonpolymer	Photoacid generators (PAGs) in photoresists and bottom anti-reflective coatings (BARCs)
+Organic polymer	Immersion barriers (immersion top coats), PFAS-containing EUV resist polymers, polymer-bound PFAS photoacids, dielectric polymers (PI/PBO), PFAS surfactants
+
+Table 3 provides a summary of PFAS used in semiconductor photolithography worldwide in the years 2021–2024 according to the SIA surveys in kg/year by chain length and usage category. The sales data by chain length and usage category for each of six regions [North America, Korea, Europe, China, Chinese Taipei, and all other regions (rest of world, ROW)] are provided in the Supplementary Material.
+
+Table 3
+
+PFAS sales 2021 to 2024 in units of kg/year by country and class.
+
+		North America	Korea	Japan	Europe	Chinese Taipei	China	ROW	Annual class total
+2021	Aqueous nonpolymer	3	214	—	12	—	—	1	230
+Aqueous polymer	1342	824	2120	598	6253	5343	702	17,182
+Organic nonpolymer	365	1600	2753	531	3415	855	207	9726
+Organic polymer	627	1434	2737	521	590	605	94	6608
+2021 country totals	2337	4072	7610	1662	10,258	6803	1004	33,746
+2022	Aqueous nonpolymer	1	351	—	1	3	—	1	357
+Aqueous polymer	1616	936	2266	661	6387	6811	573	19,250
+Organic nonpolymer	570	1706	1310	815	1740	1674	290	8105
+Organic polymer	2048	3919	2524	1317	741	1800	259	12,608
+2022 country totals	4235	6912	6100	2794	8871	10,285	1123	40,320
+2023	Aqueous nonpolymer	2	425	—	1	1	—	—	428
+Aqueous polymer	1345	539	1860	689	5331	5819	644	16,226
+Organic nonpolymer	488	1442	1492	829	1183	1669	318	7421
+Organic polymer	1539	2167	1546	1361	584	1301	158	8656
+2023 country totals	3374	4573	4898	2879	7099	8788	1119	32,730
+2024	Aqueous nonpolymer	1	354	0	1	—	—	—	356
+Aqueous polymer	1060	538	1924	683	5095	9390	595	19,285
+Organic nonpolymer	799	1665	1552	970	3172	2242	481	10,882
+Organic polymer	1023	1384	1401	871	563	1147	129	6517
+2024 country totals	2882	3941	4877	2525	8830	12,780	1205	37,040
+Note: Country and annual totals are shown in bold.
+
+From 2021 to 2022, organic polymer shows a large jump at the expense of organic nonpolymer. We believe that this is a result of a change in survey methodology. In 2022, the survey began requesting data for organic polymer in four sub-classes, one of which is immersion topcoat. This change was made because SIA had begun work on a complete PFAS mass balance, and organic polymer had to be subdivided into four sub-classes that differ in their disposition among the waste streams. Prior to 2022, there had been no explicit guidance as to how to report oligomeric, low molecular weight PFAS additives used in “in situ” immersion topcoats, and some respondents may have counted them in the organic nonpolymer class. We believe that with the new subclass available starting with the 2022 survey, respondents began reporting all PFAS for immersion topcoats in the new class. The amounts reported for the new subclasses of organic polymer are listed in Table 4.
+
+Table 4
+
+PFAS used in kg/year in photolithography by class and fluorocarbon chain length.
+
+Chain length	Year	Aqueous nonpolymer	Aqueous polymer	Organic nonpolymer	Organic polymer (total)	Total/year (kg PFAS)
+C1	2021	1.0	248.0	3056.0	5125.0	8430.00
+2022	7.0	175.0	3426.0	9611.0	13,219.00
+2023	3.3	232.0	3718.0	6483.0	10,436.30
+2024	8.7	203.0	4634.0	5627.0	10,472.70
+C2	2021	4.0	5932.0	3354.0	210.0	9500.00
+2022	8.0	6682.0	1816.0	1624.0	10,130.00
+2023	5.0	5569.0	1694.0	1616.0	8884.00
+2024	13.0	6651.0	1676.0	97.8	8437.80
+C3	2021	12.0	10,842.0	305.0	815.0	11,974.00
+2022	8.0	12,283.0	417.0	880.0	13,588.00
+2023	9.2	10,277.0	53.0	189.0	10,528.20
+2024	24.0	12,301.0	68.0	263.0	12,656.00
+C4	2021	195.0	—	3011.0	419.0	3625.00
+2022	333.0	—	2440.0	362.0	3135.00
+2023	410.7	—	1952.0	333.0	2695.70
+2024	310.0	—	4500.0	489.0	5299.00
+C6	2021	16.0	160.0	—	28.0	204.00
+2022	—	112.0	—	128.0	240.00
+2023	—	148.0	3.9	33.5	185.40
+2024	—	130.0	5.0	37.0	172.00
+C8	2021	—	—	—	11.0	11.00
+2022	—	—	—	4.0	4.00
+2023	—	—	—	0.9	0.90
+2024	—	—	—	3.9	3.90
+
+The global sales data show that the total amount of PFAS used worldwide in semiconductor photolithography in the years 2021 to 2024 was ∼33.7, 40.3, 32.7, and 37.4 metric tons, respectively. Figure 4 gives a breakdown of these totals in terms of the four sub-classes as defined in Table 2. Aqueous polymer oscillates around 50% of total PFAS used, with organic polymer and nonpolymer exchanging second and third places twice. Aqueous nonpolymer is by far the smallest subclass.
+
+Fig. 4
+Download
+Full-size Image
+
+PFAS in lithographic materials: worldwide data from SIA sales surveys for the years 2021–2024. PFAS intensity [SEMI reports total silicon area shipped for semiconductor photolithography annually in units of million square inches (MSi), see, e.g., Ref. 25] (we have chosen to define the PFAS intensity in metric units. The conversion factor from kg PFAS/MSi to g PFAS/m2 is 1.55) is total g PFAS sold divided by the square meters of silicon area sold in the corresponding year for semiconductor photolithography only.
+
+PFAS use in semiconductor photolithography will vary with the number of wafers coated in a year; however, it is not simply proportional to the coated wafer area. Due to device and manufacturing complexity, the amount of lithographic material used per square meter of silicon can vary from product to product. Dividing the amount of PFAS used per year by the silicon wafer area shipped annually [SEMI reports total silicon area shipped for semiconductor photolithography annually in units of million square inches (MSi), see, e.g., Ref. 25] gives the amount of PFAS used per square meter of silicon shipped for semiconductor photolithography. We propose the name “PFAS intensity” in units of g PFAS/m2 for this measure (We have chosen to define the PFAS intensity in metric units. The conversion factor from kg PFAS/MSi to g PFAS/m2 is 1.55). Although there is some annual variation, PFAS intensity shows a general upward trend with a cumulative aggregate growth rate (CAGR) of 7.7% (Fig. 4).
+
+Table 4 breaks down total PFAS used each year in terms by class and fluorocarbon chain length.
+
+There are a number of salient points that can be seen by inspection of Tables 4 and 5:
+
+• The vast majority of PFASs used in semiconductor photolithography are C4 and below (99.4% to 99.5%).
+
+• The survey reported zero amounts for C5 and C7 PFAS chain length.
+
+• There are still very small amounts of C8 PFAS reported in the Organic Polymer class, which tend to reduce with time.
+
+• C6 PFAS is reported in three classes: aqueous polymer, organic polymer, and, for the first time in 2023, also in organic nonpolymer. Aqueous polymer C6 is presumed to arise from sales of a PFAS TARC that contains a polymer-bound C6 telomer alcohol, whereas organic polymer C6 can be assumed to arise from polymeric C6 PFAS surfactants. The new use of C6 in organic nonpolymer in 2024 and 2024 was unexpected.
+
+• PAGs make up the largest part of the organic nonpolymer class. There were no sales of PAGs with PFAS chains >C⁢4 in 2021 and 2022, but a small amount of C6 was reported in 2023 and 2024 that may be PAG use. Historically, longer chain PFAS had been used as PAG anions, including PFOS. The fact that the PAG anions are now predominantly four perfluorocarbon (C4) or shorter is indicative of the concerted effort by semiconductor device makers and photolithography chemical suppliers to substitute for shorter chain PFAS that have historically been understood to be significantly less bioaccumulative.26 However, the typical PFAS analyte target list for current commercially available analytical methods—such as US EPA’s Method 1633 using LC/MS-MS—does not include ultra-short chain PFAS (Semiconductor PFAS Consortium, 2025).
+
+• In all years, over 70% of the mass of PFAS used in semiconductor photolithography is polymeric. Current standard methods approved by regulatory agencies cannot detect polymeric PFAS [with the exception of certain types of total organic fluorine (TOF) analysis], which means there is a significant gap in PFAS analytic capabilities. 19
+
+F
+
+ NMR spectroscopy can detect any kind of fluorine atoms, including polymer-bound ones, but the sensitivity of the standard method is low compared with LC MS/MS. A newly developed alternative signal analysis method, steady state free precession -complete reduction to frequency amplitude tables (SSFP-CRAFT) increases the sensitivity of 19
+
+F
+
+ NMR by a factor of at least 50× versus standard Fourier Transform analysis (for a report on the analysis of fab wastewater with SSFP-CRAFT, see Ref. 27).28 We expect that this novel method will find increasing use for the detection of polymeric as well as monomeric PFAS as it becomes more widely available.
+
+Table 5
+
+PFAS used in kg/per year in photolithography for the four sub-classes of organic polymer by fluorocarbon chain length, years 2022–2024.
+
+Chain length	Year	Immersion top coat	Polymer-bound PFAS	Solvent developed PI/PBO	Aqueous developed PI/PBO
+C1	2022	5032.0	3657.0	—	923.0
+2023	3918.0	1624.0	—	942.0
+2024	3637.0	1718.0	—	890.0
+C2	2022	42.0	1582.0	—	—
+2023	44.0	1572.0	—	—
+2024	59.0	1579.0	—	—
+C3	2022	360.0	520.0	—	—
+2023	—	189.0	—	—
+2024	—	237.0	—	—
+C4	2022	181.0	181.0	—	—
+2023	149.0	184.0	—	—
+2024	189.0	300.0	—	—
+C6	2022	—	129.0	—	—
+2023	—	33.5	—	—
+2024	—	37.0	—	—
+C8	2022	—	4.0	—	—
+2023	—	0.9	—	—
+2024	—	3.9	—	—
+
+Although the use of PFAS for photolithography is critical for semiconductor manufacturing, to the extent that fabrication of advanced chips is currently not feasible without them; the amount of PFAS used for this purpose is comparatively small in relation to the total amount of PFAS currently produced for all industrial and consumer uses: the ECHA Annex XV Restriction Report24 lists in its Table 3 on page 55 total worldwide PFAS use as between 691,168 and 982,398 metric tons per year, of which between 2541 and 6304 metric tons are for “Electronics and Semiconductors.” However, the ECHA report counts the whole weight of a fluorinated material as PFAS [i.e., it counts 1 kg of TPS PFBS (triphenylsulfonium perfluorobutane-sulfonate) as 1 kg, whereas SIA counts only the 44% as the PFBS component = 440 g]. To provide an “apples to apples” comparison between the SIA PFAS quantity and the ECHA PFAS quantity, the SIA quantity of 34 metric tons may be adjusted as follows. PFAS in aqueous polymer (i.e., almost all TARC) is ∼50% of the 34 metric tons, whereas all other products are typically lower. Overall, doubling the 34 metric tons (factor of 2) may be a good estimate. Then, annual semiconductor photolithography use is between 68/691,168 = 0.01% and 68/982,398 = 0.007% of total world PFAS “brought to market,” or between 68/2,541 = 2.7% and 68/6,304 = 1.1% of the “Electronics and Semiconductors” PFAS use. Beyond lithographic materials, semiconductor manufacturing requires the use of other essential PFAS such as fluorocarbon gases and fluorinated heat transfer fluids, which comprise a much larger fraction of industry PFAS use.
+
+Although these overall PFAS quantities used by the semiconductor industry for photolithography are comparatively small (0.01% to 0.007% of the 691,168 to 982,398 metric tons per year of PFAS estimated to be in use by ECHA), the use of aqueous process materials such as TARCs and photoresist developers leads to PFAS releases to wastewater from normal operations. The model presented herein evaluates the disposition of PFAS-containing photolithography materials to assess their magnitude and potential environmental releases, and to inform future actions, such as waste collection, treatment, and/or destruction technology development. The following sections describe the release factors that relate usage quantities for photolithographic applications to specific waste streams and subsequently will be used to develop a comprehensive PFAS mass balance model for semiconductor photolithography.
+
+6. Photolithography Unit Operations
+
+Semiconductor photolithography occurs in a series of unit operations summarized in Fig. 5. Wafers may cycle back during this sequence, e.g., for coating of TARC on photoresist or photoresist on BARC. These operations are repeated 30 to 100 times during the manufacture of a typical integrated circuit.
+
+Fig. 5
+Download
+Full-size Image
+
+Process flow diagram for photolithography unit operations. Red boxes (color: online) indicate waste streams that may contain PFAS. Note: Optional BARC/photoresist/optional TARC or immersion topcoat spin-coating operations occur in sequence, with the wafer returning to the spin-coating step between operations. Adapted with permission from Ref. 16.
+
+The unit operations shown in Fig. 5 are:
+
+• Resist (including PBO/PI) application (spin-coat): Photoresist (consisting of polymer, PAG, and organic solvent) is spin-coated on the wafer surface in an enclosed photolithographic track tool. Spin-coat is used to ensure that the resist film is thin and uniform and applied at a specific thickness. Often, the wafer surface is pre-wet with a solvent to help spread the photoresist atop the wafer surface and reduce the amount of photoresist that is needed to achieve a uniform film.
+
+• BARC: Before resist is applied, a BARC (which may contain PAG) may also be applied to the wafer surface to mitigate reflection from the wafer surface and maintain the accuracy of the pattern. This layer may use edge bead removal and is typically pre-baked prior to resist application. Wafers cycle back to resist coating after BARC application.
+
+• Edge bead removal: In some applications, a thin region of the photoresist is removed from the periphery of the wafer as an aid to wafer handling. This process would occur in the spin-bowl after the spin-coat operation. The photoresist removed during this step is typically released to a solvent waste system for off-site destruction. Edge bead removal, if used, reduces the quantity of photoresist going to the development and resist strip steps and thus reduces the quantity of photoresist that would potentially go to an aqueous waste discharge.
+
+• Pre-exposure bake (soft bake): A pre-exposure bake step, sometimes also known as a post-apply bake, is used to heat the applied photoresist and drive off excess solvent in a manner that helps produce a uniform coating of the resist on the wafer.
+
+• Spin-coating of TARC: In certain situations, the photoresist is coated with a thin layer of material to reduce the reflection of light during the imaging step. The TARC material does not contain PAG but is highly fluorinated due to the need for a low refractive index. TARC is coated on the photoresist layer, so if TARC is used, the wafer cycles back to this step after photoresist application. TARCs are fully removed during the development step.
+
+• Immersion top coatings, used in 193 immersion lithography, are very low surface energy (resulting in a hydrophobic surface that affords a high contact angle with water) and have exceptionally strong barrier properties, water insolubility but solubility in aqueous developers, and a lack of intermixing with the photoresist. Their purpose is to prevent leaching of photoresist components such as PAGs or photoacids into the immersion medium (water) and to prevent water droplet defects resulting from meniscus pulling. Immersion top coats are coated on the photoresist layer, so if an immersion coating is used, the wafer cycles back to this step after photoresist application. Some photoresists contain PFAS additives that phase segregate during the prebake and form an in situ topcoat. Both spin-on and in situ topcoats are fully removed during the development step.
+
+• Exposure (image application): The exposure step involves beaming a UV light source through a photomask to create a patterned image of the desired device structure within the photoresist. The light initiates photolysis of the PAG, which in turn releases an acid from the PAG anion and creates an acidified image in the resist film. The fraction of the wafer surface that is exposed to light varies depending on the step, but it can be estimated that, on average, half of the resist on the wafer surface is exposed. Industry experts have estimated that on the order of one-half of the onium compounds are converted to daughter products during the exposure step.29,30 Less data are available regarding the behavior of the PAG fluorinated acid anion during exposure, but it is expected to retain its structure during 248 and 193 nm exposure (although possibly not under EUV conditions).31 Research will be required to assess the actual conversion rate and the variables that may be important.
+
+• Post exposure bake (PEB): A PEB step is used to heat the resist and promote the imaging reactions that are initiated by the exposure step. PEB finalizes chemical changes in the photoresist and hardens the resist image, so it withstands the subsequent implant, deposition, and etch steps required to transfer the pattern to the wafer surface.
+
+• Development: In development, unwanted photoresist is removed from the wafer. This step typically uses the strong base, 2.38% tetramethylammonium hydroxide (TMAH), to dissolve the “deprotected” polymer and leave a three-dimensional relief pattern. The pattern serves as the locus of subsequent etch or deposition steps that are used in fabricating the integrated circuit. Most photoresists are “positive tone,” in which the exposed region is made base soluble and removed from the wafer surface using aqueous TMAH-type developer. In some photoresists, known as “negative tone photoresists,” the exposed regions are made less soluble, and the typically solvent-based developer removes the un-exposed regions from the wafer surface. Aqueous developer typically drains to wastewater. Solvent developer is collected in a separate solvent drain and collection system.
+
+• Postbake (not shown on the diagram): The postbake, sometimes also called hardbake, finalizes chemical changes in the PBO/PI and some photoresists and is designed to provide the required thermal stability and mechanical properties and hardens the patterned image, so it withstands the subsequent implant, deposition, and etch steps required to transfer the pattern to the wafer surface.
+
+• Photoresist strip: Component material is either deposited or removed from the patterned surface, and then, the remaining resist is stripped off using either a wet strip (aqueous or organic solvent) or plasma strip/ash (also called dry strip).
+
+7. PFAS Release Factors for Semiconductor Photolithography
+
+A material flow model for the principal photolithography operations as described in Sec. 6 has recently been published in an SIA PFAS Consortium whitepaper.16 The parameter values used in that materials balance model, as pertain to the flow of PFAS toward each of four principal waste stream end points, have been termed “release factors” 𝑝𝑖 and 𝑝𝑖⁢𝑗 (see Table 6 for contributions to these waste streams). The values of these release factors vary between companies and even between fabs, depending on the particular wafer product that is being built, and the processes used to build those wafer products. Earlier studies have used presumptive values believed to be typical of photolithography processing for some of the release factor values.18,32 Most recently, SIA has carried out a survey of processes used by its semiconductor manufacturer members that has provided average values for these release factors [SIA semiconductor unit processing survey, unpublished data (2024)]. The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)]. This improved understanding of waste streams arising from photolithography unit processes, which was provided by this survey, has resulted in a modification of the release factor scheme published earlier.16 Figure 6 provides the new modified general flow diagram for the photolithography unit operations of Sec. 5. Table 8 lists descriptions for each of these release factors 𝑝𝑖 and 𝑝𝑖⁢𝑗.
+
+Table 6
+
+Contributions to waste streams from the processes described in Fig. 5.
+
+Waste stream #	Description	Source(s)
+1	Solid waste	Container liners, filters, wipes, and other contaminated solids from tool cleans
+2	Solvent waste	Container residue, organic solvents from tool cleans, organic spin bowl waste, organic development, organic wet strip
+3	Aqueous wastewater	Container residues, aqueous spin bowl waste, aqueous developer waste, aqueous wet strip
+4	PFAS waste collection	Aqueous spin bowl waste, aqueous developer waste, aqueous wet strip
+Fig. 6
+Download
+Full-size Image
+
+PFAS release map for photolithography unit operations. Modified from Ref. 16 according to the results of the SIA process survey [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)].
+
+Based on the SIA survey results [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)], we have endeavored to provide typical consensus values for 𝑝𝑖 and 𝑝𝑖⁢𝑗 in a good faith effort to develop an industry-level estimate. However, it needs to be recognized that there is considerable breadth in the range of company and/or product-specific parameter values, resulting in a wide range of responses around the average values. Table 8 lists our best estimates of the release factors 𝑝𝑖 and 𝑝𝑖⁢𝑗, as defined in Table 7, which describe the fractions of material that follow along the lines of the flow diagram of Fig. 6 to the final four waste streams. The remainder of this section provides a description of the corresponding flows and their associated parameters.
+
+Table 7
+
+Descriptions of the release factors pi and pij.
+
+Parameter	Description
+𝑀	Total mass of PFAS used for the application
+𝑝0	Fraction of PFAS material remaining in the container (“container heel”)
+𝑝01	Fraction of material in the bottle going to solvent waste
+𝑝02	Fraction of material in the bottle going to aqueous waste
+𝑝03	Fraction of material in the bottle going to solid waste
+𝑝𝑑	Fraction of material in the bottle that is used for dummy dispense and line flushes
+𝑝𝑑⁢2	Fraction of 𝑝𝑑 that goes to solvent waste
+𝑝𝑑⁢3	Fraction of 𝑝𝑑 that goes to aqueous waste
+𝑝𝑑⁢4	Fraction of 𝑝𝑑 that goes to industrial wastewater
+𝑝1	Fraction of dispensed PFAS material that is collected as spin bowl waste
+𝑝11	Fraction of 𝑝1 that goes to solvent waste
+𝑝12	Fraction of 𝑝1 that goes to aqueous waste
+𝑝13	Fraction of 𝑝1 that is directly discharged to industrial wastewater
+𝑝2	Fraction of dispensed PFAS material that goes to tool cleans
+𝑝21	Fraction of material for tool cleaning that is solid waste
+𝑝22	Fraction of material for tool cleaning that is solvent waste
+𝑝3	Fraction of PFAS in the coating that is dissolved in the developer
+𝑝31	Fraction of PFAS in spent aqueous developer and rinses that goes to industrial wastewater
+𝑝32	Fraction of PFAS in spent aqueous developer and rinses that goes to solvent waste
+𝑝4	Fraction of PFAS in coating that goes to dry strip processes
+𝑝5	Fraction of PFAS in coating that goes to solvent wet strip processes
+𝑝6	Fraction of PFAS in coating that goes to aqueous wet strip processes
+𝑝7	Fraction of PFAS destroyed in dry stripping
+𝑅	Fraction of PFAS remaining in the device after all processing steps
+Table 8
+
+Parameters M, pi, and pij for the process flows of Fig. 6.
+
+Product class	Parameter	Aqueous nonpolymer	Aqueous polymer	Organic nonpolymer	Organic polymer
+Immersion TC	Solvent develop PBO/PI	Aqueous develop PBO/PI	Polymer-bound PFAS
+Mass of PFAS	M (kg/year)	Varies by year	Varies by year	Varies by year	Varies by year
+Bottle residues	𝑝0	0.012	0.012	0.014	0.012	0.017	0.017	0.014
+𝑝01	0.250	0.250	0.500	0.500	0.500	0.500	0.500
+𝑝02	0.250	0.250	—	—	—	—	—
+𝑝03	—	—	0.500	0.500	0.500	0.500	0.500
+𝑝04	0.500	0.500	—	—	—	—	—
+Dummy dispense and line flushes	𝑝𝑑	0.110	0.110	0.200	0.200	0.200	0.200	0.200
+𝑝𝑑⁢2	0.050	0.050	1.000	1.000	1.000	1.000	1.000
+𝑝𝑑⁢3	0.050	0.050	—	—	—	—	—
+𝑝𝑑⁢4	0.900	0.900	—	—	—	—	—
+Coating apply	𝑝1	—	0.011	0.050	0.017	0.110	0.110	0.050
+𝑝11	—	0.050	0.950	1.000	1.000	1.000	1.000
+𝑝12	—	0.050	—	—	—	—	—
+𝑝13	—	0.900	—	—	—	—	—
+Tool cleans	𝑝2	0.001	0.001	0.001	0.001	0.001	0.001	0.001
+𝑝21	0.200	0.200	0.500	0.500	0.500	0.500	0.500
+𝑝22	0.200	0.200	0.500	0.500	0.500	0.500	0.500
+𝑝23	0.400	0.400	—	—	—	—	—
+𝑝24	0.200	0.200	—	—	—	—	—
+Development	𝑝3	1.000	1.000	0.500	1.000	0.250	0.250	0.500
+𝑝31	1.000	1.000	0.950	1.000	—	1.000	0.950
+𝑝32	—	—	0.050	—	1.000	—	0.050
+𝑝33	—	—	—	—	—	—	—
+Stripping	𝑝4	—	—	0.750	—	—	—	0.750
+𝑝5	—	—	0.110	—	—	—	0.110
+𝑝6	—	—	0.140	—	—	—	0.140
+𝑝7	—	—	1.000	—	—	—	1.000
+7.1. Process Equipment Exhaust and Abatement
+
+Every photolithography process step indicated in Fig. 5 has an associated piece of process equipment that has air emissions, and such exhausts typically have an emissions control device. Most PFASs used in photolithography are ionic or polymeric and therefore not expected to have significant vapor pressures, or emissions components at ambient temperatures. PFBS, for instance, has a 𝑝⁢𝐾𝐴 of <1 and therefore occurs as an acid anion in aqueous solution with an estimated vapor pressure of ∼1.5⁢E−6 (Pa) at 20 C.33 Assuming 2 wt% of a TPhS-PFBS PAG, and Raoult’s law behavior, the effective vapor concentration of PFBS in equilibrium with the photoresist formulation may be on the order of less than 1  ng/m3.
+
+Scientific information regarding the potential behavior of photolithography PFAS chemicals in exhaust or exhaust abatement systems is not currently available in published, peer-reviewed reports. Future studies may be necessary to determine whether exhaust systems should be included in the release mapping.
+
+7.2. Dispense, Heels and Line Flush
+
+Photolithography tracks dispense material into the spin bowl at regular intervals, even if there is no wafer being processed. This “dummy dispense” is carried out to ensure that when a wafer is processed, the material dispensed to it is of the highest quality, free of particles, and not modified by evaporation of the casting solvent from the dispense nozzle. When a new chemical container is installed, a line flush is used to ensure that connecting lines between the container and the dispense nozzle are cleaned. Parameter 𝑝𝑑 describes the fraction of material that is used for dummy dispense and line flushing, and not, therefore, dispensed on the wafer; parameters 𝑝𝑑⁢2, 𝑝𝑑⁢3, and 𝑝𝑑⁢4 describe the fractions going to solvent waste, aqueous waste, and industrial wastewater, with 𝑝𝑑=𝑝𝑑⁢2+𝑝𝑑⁢3+𝑝𝑑⁢4. Line flushing and dummy dispensing generate no solid waste.
+
+The amounts of material used for line flushing and dummy dispensing are not small. The recent survey by SIA of its semiconductor manufacturer members [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)] returned averages of 12% to 14% of material in the container for dummy dispense of solvent-based products and 7% for line flushes (𝑝𝑑=0.20, 𝑝𝑑⁢2=1, 𝑝𝑑⁢3=𝑝𝑑⁢4=0); for aqueous-based products, the corresponding numbers were 9% and 2%, respectively (𝑝𝑑=0.11). The fractions released to the liquid waste streams were assigned the same values as for aqueous polymers (see below, 𝑝𝑑⁢2=0.05, 𝑝𝑑⁢3=0.05, 𝑝𝑑⁢4=0.9).
+
+Photolithography formulations are packaged in a variety of containers, including glass bottles and plastic containers with a collapsible polytetrafluoroethylene (PTFE) liner. A residual amount of the formulation remains in the container (Container residues (p0). Heels from organic solvent-containing containers (𝑝01) are drained to solvent waste, frequently after rinsing with a solvent, resulting in no release to wastewater [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)]. Heels of aqueous products (𝑝02) are sometimes discharged to industrial wastewater after rinsing with water. Some facilities collect and containerize heels and rinsate and send that material offsite for incineration. For formulations packaged in special plastic containers with a collapsible inner PTFE liner, liners (𝑝03) are removed and sent to hazardous waste incineration as solid waste, whereas cleaned glass and plastic bottles are recycled, incinerated, or landfilled.16
+
+An unpublished survey of unit processing parameters carried out by the SIA in 2024 collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)], heels for photoresists and organic BARCs amount to about 1.4% of material in the containers (𝑝0=0.014), whereas heels for immersion top coats are lower (𝑝0=0.012), and those for the more viscous barrier layer polymers PI/PBO) are higher (𝑝0=0.017). For these solvent-based products, heels are drained to solvent waste, in some cases with rinsing, in about half the cases (𝑝01=0.50), with the cleaned containers either being recycled or sent for incineration. In the remaining cases, liners or containers containing heels are collected and treated as solid waste (𝑝03=0.50) for incineration. None of the survey respondents reported that containers with heels were sent to landfills.
+
+For the water-based products, the survey responses showed that heels were ∼1.2% of total material (𝑝0=0.012), with half of the respondents indicating that the container residuals were drained and rinsed to aqueous waste (𝑝03=0.50), whereas a quarter indicated rinsing and draining to solvent waste (𝑝02=0.25), and the last quarter draining to industrial wastewater (𝑝04=0.25).
+
+Equipment cleaning and routine maintenance, including supply line filter change-out [Eqpt. Cleans and Filter Change-out (𝑝2)] result in the generation of contaminated solids (𝑝21). Filters are generally collected with residual material inside and disposed of by incineration. No respondents indicated that spent filters are released to landfills as solid waste. If organic solvents are used during cleaning, waste is collected as solvent waste (𝑝22). No photolithographic solvent-based material is released to wastewater or aqueous waste. Releases are generally low, of the order of 0.1% (𝑝2=0.001), with waste streams for solvent-based products going in roughly equal amounts to solid or solvent waste (𝑝21=0.50, 𝑝22=0.50). For water-based products, the survey indicated four release paths, with values of 𝑝21=0.2 for solid waste, 𝑝22=0.2 for solvent waste, 𝑝23=0.4 for aqueous waste, and 𝑝24=0.2 for industrial wastewater.
+
+BARCs, resist, immersion topcoats, and TARCs are applied via spin coat. During the coating application, the majority of the formulation is spun off the wafer and falls into the spin bowl. BARCs, resist, and immersion top coats are organic formulations, and their excess spin bowl residue goes to solvent waste (𝑝11=1, 𝑝12=0). BARCs are generally crosslinked and do not dissolve in the developer. They may contain PAGs to ensure that the same amount of photoacid diffuses for the BARC into the photoresist as from the photoresist into the BARC. The fraction of dispensed photoresist material that remains on the wafer after spin coating has been estimated in studies by the OECD and SIA18,32 to be ∼5% to 6%. This is an average over many resist types and application processes, and as such, it is an approximation. The SIA process study [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)] returned an average number of 5%, although the range of responses was high. The averages obtained from the survey for BARCs and immersion top coats were lower at 1.7% and 3.3% (𝑝1=0.017 and 0.033, respectively). This paper assumes 5% of dispensed photoresist and BARC remains on the wafer and 95% is released to the spin bowl chamber (𝑝1=0.95).
+
+7.3. Developer Disposal
+
+Coated wafers undergo patterning and development where a fraction of the PFAS-containing coating is removed. BARCs are removed in dry etch and stripping processes, so no material is removed in development (𝑝3=0). For photoresists, the OECD and SIA studies18,32 assumed an average fraction of resist removed during development of 50% (𝑝3=0.50). The SIA process survey returned an average value of 47%; however, with a very wide range of answers. This paper will use a value of 𝑝3=0.5.
+
+Most photoresists are developed using aqueous developers, with the removed PFAS material going to industrial wastewater (𝑝31=0, 𝑝32=0, 𝑝33=1). Although a few new facilities are installing PFAS collection and waste treatment systems (𝑝31=1, 𝑝32=0, 𝑝33=0), their contribution is still small. A small fraction of resists (∼5%, mostly for 193 nm exposures) is developed with solvent (negative tone development), with the developer going to solvent waste (𝑝31=0, 𝑝32=1, 𝑝33=0).
+
+TARC is applied in the form of an aqueous solution that is spun onto the resist coating. To achieve a high coating quality, TARC spin-on generally uses larger dispense volumes than photoresists or other coatings while resulting in a thinner film. The SIA process survey [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)] indicated that, on average, 1.1% of the dispense volume remains on the wafer as a solid film (𝑝1=0.011).
+
+TARC spin bowl residue disposal is handled in one of three ways (𝑝11, 𝑝12, and 𝑝13):
+
+a. Some users have installed a separate drain (𝑝11=0, 𝑝12=1, 𝑝13=0) to a PFAS waste collection system (Waste stream 4: PFAS aqueous waste collection) for treatment or offsite disposal.
+
+b. Some users send their TARC waste down the solvent waste drain (𝑝11=1, 𝑝12=0, 𝑝13=0), which feeds to a solvent waste tank (waste steam 2: PFAS to solvent waste). Solvent waste is typically sent off-site for destruction in a hazardous waste incinerator or burned as a fuel in a cement kiln. This method cannot be used at all facilities because water and photoresist may interact and create a gel that could clog the drain line and waste collection vessel.
+
+c. Some users discharge TARC to the industrial wastewater drain (𝑝11=0, 𝑝12=0, 𝑝13=1), which goes to industrial wastewater treatment (Waste stream 3: PFAS to industrial wastewater) before merging into the combined facility effluent.
+
+The above-mentioned 2024 SIA unit processing parameter survey provided limited information on the amount of TARC spin bowl waste that is disposed of by method a, b, or c. The responses indicated that 81% of TARC spin bowl waste was directly discharged to industrial wastewater (c), 5% to solvent waste (b), and 14% was collected in a collection system for aqueous PFAS waste (a). However, the responses accounted for only a small fraction of the total TARC sold. Due to the geographical distribution of the respondents, we believe that the above numbers overestimate the amount of TARC spin bowl waste collected by method (a). This paper will therefore use values of 𝑝11=0.05, 𝑝12=0.05, and 𝑝13=0.9 for aqueous waste, solvent waste, and industrial wastewater, respectively.
+
+All TARC remaining on the wafer is removed in the development step (𝑝3=1). In most facilities, development waste drains to industrial wastewater (𝑝31=0, 𝑝32=0, 𝑝33=1). A few facilities are installing TARC collection and waste treatment (𝑝31=1, 𝑝32=0, 𝑝33=0); however, their contribution is currently still small. All parameters for subsequent steps are zero.
+
+Aqueous-based rinse formulation is dispensed during the development cycle (𝑝3=1) to prevent pattern collapse due to capillary forces. There is no current way to separate out the waste from the developer and rinsewater. None of the aqueous-based rinse formulation material remains on the wafer. For most facilities, therefore, a single release pathway exists for dispensed material, all of which is discharged to industrial wastewater (𝑝31=0, 𝑝32=0, 𝑝33=1).
+
+Strip Process. Resist remaining on the wafer after development is removed in a strip process. The three different types of strip processes used are plasma strip (𝑝4), solvent strip (𝑝5), and aqueous strip (𝑝6). The SIA process survey returned averages for the relative fractions of these processes as 𝑝4=0.79, 𝑝5=0.11, and 𝑝6=0.15. To make the sum of the parameters add up to 1, this paper uses scaled values of 𝑝4=0.75, 𝑝5=0.11, and 𝑝6=0.14. Material removed in the solvent strip is routed to solvent waste (𝑝51=1), whereas material removed in the aqueous strip is directed to industrial wastewater (𝑝61=1). Plasma stripping generates gaseous waste, which is passed through exhaust scrubbers. The efficacy of PFAS removal destruction in the overall process is described by parameter 𝑝7. We have assumed that there is complete destruction of all PFAS during plasma dry stripping, corresponding to 𝑝7=0. Future studies may be appropriate to affirm whether the assumption of complete PFAS destruction during photoresist plasma stripping is correct. There are also indications that condensed-phase PFAS is being generated in dry etch processes and being captured in the scrubber blowdown water.34 This mass balance does not account for this additional PFAS. No resist remains on the wafer after stripping (𝑅=0).
+
+7.4. Parameters for the Organic Polymer Category
+
+For the organic polymer category, we divided the class into four different sub-classes, each of which is comprised of materials with different properties and use patterns. For instance, 100% of all immersion top coats that cover the wafer is released to the aqueous waste stream and none remains on the device, whereas none of the solvent that developed polyimide/polybenzoxazole (PI/PBO) material on the wafer is released to aqueous waste, whereas the majority remains in the finished chip.
+
+Immersion top coats are solvent-based materials applied via spin-coat, with the bulk of the material ending up in the spin bowl and being disposed of as solvent waste. All material remaining on the wafer is subsequently removed in the development step and discharged to industrial wastewater (𝑝3=1, 𝑝31=0, 𝑝32=0, 𝑝33=1). No material remains after development, so the parameters for subsequent processes are all zero.
+
+Solvent-developed polyimides/polybenzoxazoles (PI/PBO) are spun on from and developed with solvents. All spin bowl residues go to solvent waste (𝑝11=1, 𝑝12=0). The SIA process survey [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)] returned an average value of 7.2% for material remaining on the wafer (𝑝3=0.928), higher than for photoresist or BARC. However, the space filling of structures patterned in PI/PBO is generally much higher, and a lower percentage of material is removed during development than for photoresists. The SIA process survey indicated that an average of 25% of material on the wafer is removed. Therefore, we conclude that 75% of the material on the wafer prior to exposure is left behind on the wafer after development; this material is not stripped and remains in the final chip where it serves to insulate and protect the integrated circuit structure (𝑝4=𝑝5=𝑝6=𝑝7=0, 𝑅=0.75).
+
+Aqueous-developed polyimides/polybenzoxazoles (PI/PBO) are spun on from solvent and developed with aqueous developers. All parameters are the same as for solvent-developed PI/PBO except that now 𝑝31=0, 𝑝32=0, 𝑝33=1 because, during rinsing, all developed material is released to industrial wastewater.
+
+Polymer-bound PFAS is a solvent-based material that can be in the form of PFAS in surfactants, PFAS incorporated into polymer backbones, mostly for EUV resists, or for polymer-bound photoacids for EUV and 193 nm resists. The disposition of waste streams and all parameters are the same as for photoresists in organic/nonpolymer.
+
+The four sub-classes of organic polymer have very different dispositions to the four waste streams. Our previous publication on the 2021 mass balance23 used estimates that in retrospect turned out to be incorrect [The estimates used in our previous paper (Ref. 23) were 25% immersion topcoats, 35% solvent developed PI/PBO, 35% aqueous developed PI/PBO, and 10% polymer-bound PFAS, all by weight of PFAS. In addition, as immersion topcoat was not a selectable sub-class, some respondents may have reported lower MW PFAS additives in organic nonpolymer, leading to a reduction in that class versus 2021 in the 2022 and subsequent surveys]. For 2021, estimates for the four organic polymer sub-groups were required because the corresponding SIA sales survey did not differentiate between them and reported only a composite number for the sum of PFAS for this class. Beginning with the 2022 sales data, surveys separated the organic polymer into the four sub-classes of Table 5, thus allowing a correct disposition of their corresponding waste streams in the mass balance. To ensure that the data are comparable, we have restricted the analysis of some parts of the mass balance to the years 2022 to 2024.
+
+Table 8 lists our estimates for the parameters 𝑝𝑖 and 𝑝𝑖⁢𝑗 used for the different process flows for the above materials. These values are based on the averages reported in the SIA process survey [SIA semiconductor unit processing survey, unpublished data (2024). The survey collected process information from SIA’s semiconductor manufacturer members (a total of seven respondents)] and are believed to be generally representative of the average values used in the semiconductor industry. However, it should be noted that specific values vary between companies and even within individual companies, as the values depend on products manufactured, wafer size, and the specific recipes and processes used.
+
+8. PFAS Mass Balance for Semiconductor Photolithography
+
+The PFAS mass balance calculations were carried out using a Microsoft Excel® spreadsheet.
+
+The sales survey input numbers for the amounts sold (kg/year values) from Tables 3 and 5 were combined with the list of parameters 𝑝𝑖 and 𝑝𝑖⁢𝑗 as identified in Table 8 in the way depicted in Fig. 6. The sales/kg values for each subclass as well as the parameters from “Master input” are linked to a spreadsheet tab for each of the subclasses and their case distinctions:
+
+a. aqueous nonpolymer
+
+b. aqueous polymer
+
+c. organic nonpolymer
+
+d. organic polymer (immersion TC, solvent developed PI/PBO, aq. developed PI/PBO, polymeric PFAS surfactants, polymer-bound PFAS).
+
+These spreadsheet tabs calculate the waste streams for each class/subclass and link them up to a summary output table. The resulting PFAS mass balance is shown in Table 9 for the worldwide case of the years 2022 to 2024. The year 2021 is not included because the change in survey methodology discussed previously makes the data hard to compare.
+
+Table 9
+
+Disposition of PFAS used in kg/year for semiconductor photolithography worldwide among the different waste streams for the years 2022 to 2024.
+
+Product class	Subclass	Waste collection (kg/year)
+Total used	To wastewater	To aq. waste	To solvent waste	To solid waste	To dry strip	In device
+WORLD 2022
+Aqueous nonpolymer	—	357.0	348.5	4.2	3.1	1.1	—	—
+Aqueous polymer	—	19,250.0	17,239.5	947.5	1001.9	61.1	—	—
+Organic nonpolymer	—	8105.0	174.8	59.2	7693.6	57.9	119.4	—
+Organic polymer	Immersion TC	5615.0	75.2	—	5503.9	35.9	—	—
+Solv. develop PB/PI	—	—	—	—	—	—	—
+Aq. develop PB/PI	923.0	19.9	—	835.3	8.2	—	59.6
+Resist polymer-bound PFAS	6074.0	130.1	—	5809.6	44.8	89.5	—
+TOTALs		40,324.0	17,988.0	1010.9	20,847.5	209.0	209.0	59.6
+WORLD 2023
+Aqueous nonpolymer	—	428.1	418.0	5.1	3.7	1.4	—	—
+Aqueous polymer	—	16,225.6	14,531.0	798.6	844.5	51.5	—	—
+Organic nonpolymer	—	7421.1	160.1	54.2	7044.5	53.1	109.4	—
+Organic polymer	Immersion TC	4110.6	55.1	—	4029.3	26.3	—	—
+Solv. develop PB/PI	—	—	—	—	—	—	—
+Aq. develop PB/PI	941.7	20.3	—	852.3	8.3	—	60.8
+Resist polymer-bound PFAS	3603.3	77.2	—	3446.5	26.6	53.1	—
+TOTALs		32,730.4	15,261.5	857.9	16,220.7	167.1	162.5	60.8
+WORLD 2024
+Aqueous nonpolymer	—	355.6	347.2	4.2	3.1	1.1	—	—
+Aqueous polymer	—	19,285.3	17,271.1	949.2	1003.7	61.2	—	—
+Organic nonpolymer	—	10,881.8	234.7	79.4	10,329.5	77.8	160.4	—
+Organic polymer	Immersion TC	3784.0	50.7	—	3709.1	24.2	—	—
+Solv. develop PB/PI	—	—	—	—	—	—	—
+Aq. develop PB/PI	789.6	17.0	—	714.6	7.0	—	51.0
+Resist polymer-bound PFAS	1870.4	40.1	—	1789.0	13.8	27.6	—
+TOTALs		36,966.7	17,960.7	1032.9	17,549.1	185.1	187.9	51.0
+
+The corresponding regional data for each country are presented in the Supplementary Material.
+
+Summing up the waste streams given in Table 9 for the different materials yields the total PFAS releases for each waste stream in kg/year (Table 10). Table 11 gives the contributions to PFAS in wastewater for each of the four classes of PFAS.
+
+Table 10
+
+Summary of total disposition materials for worldwide PFAS use in semiconductor lithography: mass balance for years 2022–2024.
+
+No.	Waste stream	PFAS pathway
+2022	2023	2024
+kg/year	%	kg/year	%	kg/year	%
+1	Solid waste	209	0.5	167	0.5	185	0.5
+2	Solvent waste	20,848	51.7	16,221	49.6	17,549	47.8
+3	Aqueous waste	1011	2.5	858	2.6	1033	2.8
+4	Wastewater	17,988	44.6	15,261	46.6	17,691	48.2
+5	Plasma etching	209	0.5	162	0.5%	188	0.5
+—	Remaining in device	60	0.1	61	0.2	51	0.1
+Total	40,324	100	32,730	100	36,697	100
+Table 11
+
+Contributions to wastewater by lithographic material class 2022–2025.
+
+Product class	Subclass	PFAS in wastewater
+WORLD 2022	WORLD 2023	WORLD 2024
+kg/year	%	kg/year	%	kg/year	%
+Aqueous nonpolymer	—	348.5	1.9	418.0	2.7	347.2	1.9
+Aqueous polymer	—	17,239.5	95.8	14,531.0	95.2	17,271.1	96.2
+Organic nonpolymer	—	174.8	1.0	160.1	1.0	234.7	1.3
+Organic polymer	Immersion TC	75.2	0.4	55.1	0.4	50.7	0.3
+Solv. develop PB/PI	—	—	—	—	—	—
+Aq. develop PB/PI	19.9	0.1	20.3	0.1	17.0	0.1
+Resist polymer-bound PFAS	130.1	0.7	77.2	0.5	40.1	0.2
+Totals	17,988.0	100.0	15,261.5	100.0	17,960.7	100.0
+
+There are a few key results from this analysis:
+
+1. The total amount of PFAS released to wastewater is dominated by the aqueous polymer class, which essentially consists of TARCs. One of the unexpected results of this PFAS mass balance analysis is that TARCs currently dominate PFAS releases to wastewater, and account for well over 95% of all PFAS released to wastewater for all years. The majority of it arises from the practice of disposing of TARC spin bowl waste by discharging it into wastewater. Capture and proper disposal, non-PFAS replacement, or effective water treatment capabilities of TARC spin bowl waste could reduce the annual estimated PFAS release to wastewater by semiconductor lithography very significantly, e.g., from 16,054 kg/year to 904 kg/year worldwide in 2021 and by similar ratios in the following years. TARC spin bowl waste collection could be the biggest single contributor to reducing PFAS releases from photolithography to industrial wastewater. With full TARC spin bowl waste collection, the contribution from TARC would be greatly reduced to a few hundreds of kg/year globally, with all of it arising from the development step.
+
+2. A second contribution to releases to wastewater comes from PFAS-containing aqueous-nonpolymer materials, which are mostly anti-collapse EUV rinses. For these rinses, all of the material dispensed becomes part of the developer stream by the nature of its use process. The overall amount of PFAS from EUV rinses is small, but the use of PFAS EUV rinses is highly geographically concentrated in Korea, where it can be a noticeable contributor to wastewater (see regional results for Korea in Supplementary Material). However, as there are existing non-PFAS replacement products commercially available, it may be possible to fully phase out the use of PFAS-containing EUV rinses over time.
+
+3. Solid, solvent, and collected aqueous PFAS waste (waste streams 1 to 3 in Table 10) are generally disposed of by incineration. Provided that proper incineration methods are used,35 this should lead to complete destruction and mineralization of PFAS.
+
+There are significant analytical challenges for polymeric PFAS. Although total organic fluorine (TOF) measurements will include the amount of fluorine from polymeric PFAS, standard analytical methods such as LC MS/MS will not. Analytical methods for quantifying TARC and other photolithographic polymeric PFAS behavior in wastewater and wastewater treatment systems are currently under development and will provide additional insight regarding the fate of TARC PFAS in wastewater treatment processes, including biological wastewater treatment processes and their associated biosolids waste sludge. It is anticipated that the new SSFP-CRAFT 19
+
+F
+
+ NMR analytical capability (for a report on the analysis of fab wastewater with SSFP-CRAFT see Ref. 27 will be a key method)28 for this purpose.
+
+9. Conclusion and Next Steps
+
+The above study analyzes the results of the SIA sales surveys for PFAS used in photolithography for the years 2021 through 2024. Total amounts of PFAS used are of the order of 32.7 and 40.3 metric tons for the years with the lowest (2023) and highest amounts used (2022), i.e., a small fraction of all PFAS brought to market annually. Using a detailed mass balance model, the study provides quantitative industry-level estimates for all waste streams arising from the use of liquid process materials in semiconductor photolithography for the years 2021 through 2024. The sales data show a near-complete shift away from the use of long-chain PFAS, as most PFAS-containing products currently used in semiconductor manufacturing consist of C4 or shorter perfluorocarbon chemical substances. This shift was due to recognition in the early 2000’s by regulators, chemical suppliers, and the semiconductor manufacturers that shorter chain PFAS were believed to be more environmentally benign, and efforts were made by the WSC (World Semiconductor Council) to eliminate the use of longer chain PFAS like PFOS (C8) and PFOA (C7), both of which exhibit bioaccumulation and toxicity concerns.36,37 The waste quantities we present are based on good-faith estimates using a comprehensive materials balance approach with industry-derived values for the materials balance parameters and release factors. The material balance model has been developed as an extension of the OECD emissions scenario document for photolithography to allow individual companies to estimate their company-specific materials flows and waste streams, provided that data can be obtained on the amount of PFAS contained in the purchased materials.
+
+The industry is already using best available disposal practices for solid, solvent, and some aqueous waste primarily by thermal treatment. There are currently few demonstrated commercial alternatives to incineration for the destruction of PFAS wastes. Several start-ups and venture-capitalized companies have begun pilot studies using techniques such as granular activated carbon, supercritical water oxidation, electro- or sonochemical destruction, plasma vortex or rotating disks, and others, including enzymatic treatments. These techniques may be combined with methods such as reverse osmosis, foam fractionation, or regenerable absorbents to reduce the volume of waste that needs to be destroyed. Development and validation of these emerging technologies for semiconductor waste streams is needed.
+
+In the way semiconductor factories’ wastewater systems are currently plumbed, wastewater from the developer process is heavily diluted due to combining the photolithography process waste and other wastewaters prior to wastewater treatment. As such, the overall fab water volume is too large for capture and destruction of methodologies/infrastructure, and the replumbing needed for this is not practical in most facilities. Adsorptive treatment processes such as activated carbon and ion exchange that have conventionally been used to treat PFAS in dilute aqueous wastewaters are typically reported to have poor removal efficiency for shorter chain PFAS.38 Likewise, membrane separation systems are also typically reported to have limited separation efficiency for shorter-chain PFAS.39 Moreover, current commercially available analytical methods are not able to quantify a significant fraction of the PFAS used in photolithography and other semiconductor processes.40,41 Existing gaps in analytical methodology are a significant impediment to the development and validation of treatment technology for the semiconductor industry and represent an important research need.
+
+A key finding of this mass balance study is that TARC is currently the major component of photolithography-derived PFAS in most lithography wastewater. Replacement of PFAS TARCs with non-PFAS versions would reduce by about half the total amount of PFAS used in photolithography, and this may ultimately be the best option, if viable PFAS-free TARCs can be developed. Capturing and destroying TARC spin bowl waste is an alternative option that can be implemented comparatively quickly at most fabs. If this option were to be used globally by all TARC users, it would remove of the order of 98% of TARC from the photolithography wastewater.
+
+The semiconductor industry continues to actively identify, test, and implement improved process controls that minimize releases to the environment, including releases of PFAS-containing materials. The semiconductor industry and its suppliers are collaborating to actively identify and research prospective PFAS substitutes, a difficult, time-intensive, and expensive endeavor. The research and validation of alternatives is a lengthy process that entails identifying potential substitutes, evaluating their potential human and environmental risks, conducting laboratory and pilot tests, designing and retooling equipment, conducting verification tests, and finally implementing them into high-volume manufacturing. This work must be conducted carefully with the aid of multidisciplinary studies and pilot evaluations to prevent regrettable substitutions and assure effective, sustainable alternatives.
+
+Disclosures
+
+Ralph Dammel is employed by a vendor of PFAS-containing materials for photolithography. David Speed is employed by a company using such materials. Beyond this, the authors declare that there are no financial interests, commercial affiliations, or other potential conflicts of interest that could have influenced the objectivity of this research or the writing of this paper.
+
+Code and Data Availability
+
+All data are reported in the Tables and Figures of the paper and the Supplementary Information.
+
+Acknowledgments
+
+The authors would like to thank the members of the SIA PFAS Consortium Photolithography and Wastewater Working Groups—this study has largely built on their work and been made possible by it. We would also like to thank Laurie Beu of Beu Consulting and Melissa Gresham of Gresham Consulting for organizing the Working Groups and carrying out the surveys.
+
+References
+
+1. 
+
+, “Reconciling terminology of the universe of per- and polyfluoroalkyl substances: recommendations and practical guidance,” https://one.oecd.org/document/ENV/CBC/MONO(2021)25/En/pdf (2021). Google Scholar
+
+2. 
+
+R. R. Dammel and D. E. Speed, “PFAS in semiconductor photolithography: a mass balance model,” SPIE Proc., 12957 129570F https://doi.org/10.1117/12.3010996 (2024). Google Scholar
+
+3. 
+
+C. K. Ober, F. Käfer and J. Deng, “The essential use of fluorochemicals in lithographic patterning and semiconductor processing,” J. Micro/Nanopattern. Mater. Metrol., 21 (1), 010901 https://doi.org/10.1117/1.JMM.21.1.010901 (2022). Google Scholar
+
+4. 
+
+. https://semiconductors.org/pfas (). Google Scholar
+
+5. 
+
+L. Beu, “Fluoropolymers in the semiconductor industry,” in Presentation at the Fluoropolymer Conf. 2024, (2024). Google Scholar
+
+6. 
+
+, “The impact of a potential PFAS restriction on the semiconductor sector. Impact assessment,” https://semiconductors.org/pfas (2023). Google Scholar
+
+7. 
+
+, “The socio-economic impact of a potential PFAS restriction on the semiconductor value chain in Europe,” https://semiconductors.org/pfas (2023). Google Scholar
+
+8. 
+
+I. T. Cousins et al., “The concept of essential use for determining when uses of PFASs can be phased out,” Environ. Sci. Process. Impacts, 21 1803 –1815 https://doi.org/10.1039/C9EM00163H (2019). Google Scholar
+
+9. 
+
+D. Carja et al., “Sustainable solutions to PFAS photoacid generators used in chemically amplified resists,” Proc. SPIE, 12957 1295703 https://doi.org/10.1117/12.3010645 (2024). Google Scholar
+
+10. 
+
+H.-Y. Chen et al., “PFAS-free I-line strong photoacid generator for positive-tone and negative-tone thick-film photoresists,” Proc. SPIE, 12957 129571H https://doi.org/10.1117/12.3009506 (2024). Google Scholar
+
+11. 
+
+D. Carja et al., “Addressing the PFAS challenge in lithography: a holistic approach,” Proc. SPIE, 13428 1342810 https://doi.org/10.1117/12.3051383 (2025). Google Scholar
+
+12. 
+
+P. LaBeaume et al., “Disruptive non-fluorinated photoacid generators using computational chemistry and library design,” Proc. SPIE, 12957 129572B https://doi.org/10.1117/12.3025297 (2024). Google Scholar
+
+13. 
+
+C. Liu et al., “Commercialization of non-PFAS KrF and development of non-Pfas EUV photoresists,” Proc. SPIE, 13428 1342822 https://doi.org/10.1117/12.3050881 (2025). Google Scholar
+
+14. 
+
+Y. Kaneko et al., “PFAS free materials and resist for ARF immersion photolithography,” Proc. SPIE, 13428 134280W https://doi.org/10.1117/12.3047953 (2025). Google Scholar
+
+15. 
+
+D. De Simone and E. Gallagher, “Patterning performance of perfluoroalkyl substances (PFAS) free EUV chemically amplified resists: a step towards environmentally friendly lithographic chemicals,” Proc. SPIE, 13428 1342811 https://doi.org/10.1117/12.3052050 (2025). Google Scholar
+
+16. 
+
+, “PFAS release mapping from semiconductor photolithography processes,” https://www.semiconductors.org/download-all-pfas-release-mapping-papers/ (2023). Google Scholar
+
+17. 
+
+, “PFAS-containing photo-acid generators used in semiconductor manufacturing,” https://www.semiconductors.org/pfas/ (2023). Google Scholar
+
+18. 
+
+, “Semiconductor photoacid generator use rates and releases,” https://downloads.regulations.gov/EPA-HQ-OPPT-2020-0131-0055/attachment_1.pdf (2020). Google Scholar
+
+19. 
+
+R. R. Dammel and R. A. Norwood, “Light-absorbing antireflective coatings with improved performance due to refractive index optimization,” (2001). Google Scholar
+
+20. 
+
+W.-S. Huang et al., “New 193-nm top antireflective coatings for superior swing reduction,” Proc. SPIE, 6153 61530S https://doi.org/10.1117/12.656641 (2006). Google Scholar
+
+21. 
+
+D. P. Sanders, “Advances in patterning materials for 193 nm immersion lithography,” Chem. Rev., 110 (1), 321 –360 https://doi.org/10.1021/cr900244n (2010). Google Scholar
+
+22. 
+
+M. Hata et al., “Novel top-coat materials containing a bulky silicon group for ARF immersion lithography,” J. Photopolym. Sci. Technol., 19 (8), 579 –582 https://doi.org/10.2494/photopolymer.19.579 (2006). Google Scholar
+
+23. 
+
+R. R. Dammel and D. E. Speed, “PFAS in semiconductor photolithography: a mass balance model,” Proc. SPIE, 12957 129570F https://doi.org/10.1117/12.3010996 (2024). Google Scholar
+
+24. 
+
+. https://echa.europa.eu/documents/10162/f605d4b5-7c17-7414-8823-b49b9fd43aea (). Google Scholar
+
+25. 
+
+. https://www.semi.org/en/news-media-press/semi-press-releases/global-silicon-wafer-shipments-projected-to-log-robust-growth-through-2024-semi-reports#:~:text=Table_title:%20Global%20Silicon%20Wafer%20Shipments%20Projected%20to,October%202021%20%7C%20Actual:%20%7C%20Forecast:%20%7C (). Google Scholar
+
+26. 
+
+J. M. Conder et al., “Are PFCAS bioaccumulative? A critical review and comparison with regulatory criteria and persistent lipophilic compounds,” Environ. Sci. Technol., 42 (4), 995 –1003 https://doi.org/10.1021/es070895g (2008). Google Scholar
+
+27. 
+
+. https://www.semiconductors.org/19f-nmr-analysis-of-semiconductor-manufacturing-facility-wastewater-samples/ (). Google Scholar
+
+28. 
+
+J. R. Gauthier et al., “Steady-state free precession NMR without Fourier transform: redefining the capabilities of 19f NMR as a discovery tool,” Angew. Chem. Int. Ed., 64 e202422971 https://doi.org/10.1002/anie.202422971 (2025). Google Scholar
+
+29. 
+
+X. Z. Niu et al., “Photochemical fate of sulfonium photoacid generator cations under photolithography relevant UV irradiation,” J. Photochem. Photobiol. A, 416 113324 https://doi.org/10.1016/j.jphotochem.2021.113324 (2021). Google Scholar
+
+30. 
+
+E. Despagnet-Ayoub et al., “Triphenylsulfonium topophotochemistry,” Photochem. Photobiol. Sci., 17 27 –34 https://doi.org/10.1039/c7pp00324b (2018). Google Scholar
+
+31. 
+
+H. Hori et al., “Decomposition of environmentally persistent perfluorooctanoic acid in water by photochemical approaches,” Environ. Sci. Technol., 38 (22), 6118 –6124 https://doi.org/10.1021/es049719n (2004). Google Scholar
+
+32. 
+
+, “Emission scenario document on photoresist use in semiconductor manufacturing,” https://one.oecd.org/document/env/jm/mono(2004)14/rev1/en/pdf (2010). Google Scholar
+
+33. 
+
+, “Perfluorobutanesulfonate properties,” https://www.epa.gov (2024). Google Scholar
+
+34. 
+
+C. Jones, “PFAS in semiconductors: from awareness to action. Presentation at MIT Nano,” https://mitnano.mit.edu/events/pfas-semiconductors (2025). Google Scholar
+
+35. 
+
+M. A. Mills et al., “Thermal treatment of PFAS in environmental media: a review of the state-of-the-science,” https://cfpub.epa.gov/si/si_public_file_download.cfm?p_download_id=539973&Lab=CESER (2020). Google Scholar
+
+36. 
+
+M. G. Evich et al., “Per-and polyfluoroalkyl substances in the environment,” Science, 375 (6580), eabg9065 https://doi.org/10.1126/science.abg9065 (2022). Google Scholar
+
+37. 
+
+S. E. Fenton et al., “Per‐and polyfluoroalkyl substance toxicity and human health review: current state of knowledge and strategies for informing future research,” Environ. Toxicol. Chem., 40 (3), 606 –630 https://doi.org/10.1002/etc.4890 (2021). Google Scholar
+
+38. 
+
+C. C. Murray et al., “PFAS treatment with granular activated carbon and ion exchange resin: comparing chain length, empty bed contact time, and cost,” J. Water Process Eng., 44 102342 https://doi.org/10.1016/j.jwpe.2021.102342 (2021). Google Scholar
+
+39. 
+
+C. J. Liu, T. J. Strathmann and C. Bellona, “Rejection of per-and polyfluoroalkyl substances (PFASS) in aqueous film-forming foam by high-pressure membranes,” Water Res., 188 116546 https://doi.org/10.1016/j.watres.2020.116546 (2021). Google Scholar
+
+40. 
+
+P. Jacob and D. E. Helbling, “Exploring the evolution of organofluorine-containing compounds during simulated photolithography experiments,” Environ. Sci. Technol., 57 (34), 12819 –12828 https://doi.org/10.1021/acs.est.3c03410 (2023). Google Scholar
+
+41. 
+
+P. Jacob, K. A. Barzen-Hanson and D. E. Helbling, “Target and nontarget analysis of per- and polyfluoralkyl substances in wastewater from electronics fabrication facilities,” Environ. Sci. Technol., 55 (4), 2346 –2356 https://doi.org/10.1021/acs.est.0c06690 (2021). Google Scholar
+Biography
+
+Ralph R. Dammel received a PhD in chemistry from the J.W. Goethe University in Frankfurt/FRG in 1986. He has since worked for EMD Electronics or its predecessor organizations in Germany, the US, Hong Kong, and Thailand, and is currently employed as technology fellow for EMD Electronics. He is the author of over 200 scientific papers in chemistry and microlithography and an inventor on about 500 patents in over 110 patent families.
+
+David E. Speed is a distinguished member of the technical staff at GlobalFoundries in the Corporate EHS & Sustainability group. He has developed chemical recycling, water and waste treatment processes, air emission control systems, and led chemical substitution and manufacturing process optimization projects. He has a PhD in environmental engineering from the University of Connecticut, with BS and MS degrees from RPI and URI. He has published over 20 papers and holds 4 patents.
+
+© The Authors. Published by SPIE under a Creative Commons Attribution 4.0 International License. Distribution or reproduction of this work in whole or in part requires full attribution of the original publication, including its DOI.
+
+Citation
+Download Citation
+
+Ralph R. Dammel, David E. Speed "PFAS in semiconductor photolithography: a mass balance model," Journal of Micro/Nanopatterning, Materials, and Metrology 25(3), 031405 (3 Apr 2026) https://doi.org/10.1117/1.JMM.25.3.031405

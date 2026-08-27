@@ -99,7 +99,23 @@ pub fn definition_tokens(def: &ToolDefinition) -> usize {
 /// `query` now carries every store behind its `scope` argument, so pinning the
 /// one name pins all three. The old four-name list existed because the local
 /// and platform tools could be admitted independently — and once were, wrongly.
-pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search"];
+/// `papers_ingest` is here because a research harness that cannot WRITE is a
+/// browser. Every other name on this list reads; without it, the one tool that
+/// turns a paper into stored knowledge competes for a slot against ~167
+/// candidates and can lose.
+///
+/// Measured, the PFAS run of 2026-08-27: 156 tool calls — 48 web_browse, 25
+/// web, 22 prior_art_search — and ZERO calls to any ingest tool, against a
+/// brief that said "ingest the papers that carry the evidence rather than only
+/// listing them". Nothing was stored. That is the same failure the research
+/// DAG comment in `orchestrator` records ("17 searches, nothing persisted, no
+/// report"), and the same lesson the paragraph above learned for
+/// `query_local`: a model cannot call a tool it was never offered.
+///
+/// It is the LOCAL writer (`papers claims --store`) on purpose. The hosted
+/// `ingest_and_wait` bills, and a guaranteed slot must not be one that fails
+/// closed on an empty balance.
+pub const ALWAYS_INCLUDE: &[&str] = &["query", "materials_search", "papers_ingest"];
 
 /// Tool names this codebase has renamed away from.
 ///
@@ -684,6 +700,33 @@ mod tests {
             "expected the keyword match to outrank the always-include floor \
              (mp={mp:?}, local={local:?}); if it no longer does, the pin \
              seeding in agent_loop may be reconsidered"
+        );
+    }
+
+    /// Research that cannot WRITE is browsing. The one tool that turns a
+    /// paper into stored knowledge must never compete for a slot.
+    ///
+    /// Measured, the PFAS run of 2026-08-27: 156 tool calls and not one call
+    /// to any ingest tool, against a brief that said "ingest the papers that
+    /// carry the evidence rather than only listing them". Nothing was stored.
+    /// Every other pinned name on this list reads.
+    ///
+    /// The LOCAL writer specifically: the hosted `ingest_and_wait` bills, and
+    /// a guaranteed slot must not be one that fails closed on an empty
+    /// balance — that run started at -73.4 credits.
+    #[test]
+    fn the_write_path_is_pinned_not_ranked() {
+        assert!(
+            ALWAYS_INCLUDE.contains(&"papers_ingest"),
+            "a research harness whose write path can be ranked out can only ever read"
+        );
+        assert!(
+            crate::prompt_profile::CORE_TOOL_SET.contains(&"papers_ingest"),
+            "a weak model without an ingest tool produces a transcript, not knowledge"
+        );
+        assert!(
+            !RENAMED_AWAY.contains(&"papers_ingest"),
+            "the pinned write path must be a name that is actually offered"
         );
     }
 

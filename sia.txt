@@ -1,0 +1,439 @@
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 1 
+PFAS Release Mapping of Articles Used in Semiconductor Manufacturing 
+Semiconductor PFAS Consortium Articles Working Group  
+September 21, 2023 
+Acknowledgments: The PFAS Consortium would like to acknowledge the contributions of the 
+Semiconductor PFAS Consortium Articles technical working group. 
+  
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 2 
+This publication was developed by the Semiconductor PFAS Consortium. The contents do not necessarily 
+reflect the uses, views or stated policies of individual consortium members. 
+The Semiconductor PFAS Consortium is an international group of semiconductor industry stakeholders 
+formed to collect the technical data needed to formulate an industry approach to perfluoroalkyl and 
+polyfluoroalkyl substances (PFAS). Consortium membership comprises semiconductor manufacturers and 
+members of the supply chain, including chemical, material and equipment suppliers. 
+ 
+AGC Chemicals America Georg Fischer Robert Bosch GmbH 
+Analog Devices Inc. GlobalFoundries Samsung Austin Semiconductor 
+Applied Materials Inc. Henkel SCREEN Semiconductor Solutions Co. Ltd. 
+Arkema Hitachi High-Tech America Senju Metal Industry Co. Ltd. 
+ASML IBM Shin-Etsu MicroSi 
+BASF Intel Corp. Skywater 
+Brewer Science JSR Solvay 
+Central Glass Co. Ltd. KLA STMicroelectronics 
+Chemours Lam Research Sumitomo Chemical Co. Ltd. 
+DuPont Linde Texas Instruments Inc. 
+Edwards Microchip Tokyo Electron Ltd. 
+EMD Electronics Micron Technology Tokyo Ohka Kogyo Co. Ltd. 
+Entegris Moses Lake Industries TSMC 
+Fujifilm Electronic Materials NXP Semiconductors Zeiss 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Date  Revision Number Revision 
+9/21/2023 Rev. 0  Initial Publication  
+   
+ 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 3 
+Abstract 
+Articles used in semiconductor manufacturing represent a diverse collection of parts, components, 
+consumables, assemblages and subsystems, loosely grouped together to represent a class of essential 
+items distinct from the chemicals, gases and materials that are also required. Tubing, piping, filters, 
+drums, vessels, valves, storage boxes, seals, wafer handlers and other equipment components represent 
+just a small fraction of the objects classifiable as articles. 
+Given demanding specifications for purity, cleanliness and reliability, coupled with extreme temperatures 
+and contact with aggressive chemistries such as strong acids, bases, oxidizers and plasmas, articles must 
+be able to withstand harsh conditions, have long durability, not contribute to defectivity, and not leach 
+material from or into the contacted materials being delivered, measured or processed. 
+The properties of PFAS-containing materials include thermal and chemical resistance, extended usable 
+life, flexibility and lubricity, and manufacturability. This class of materials is undergoing increasing levels 
+of scrutiny, as some small-molecule PFAS-containing materials have been shown to have undesirable 
+health effects. 
+Understanding the potential release of PFAS-containing articles to the environment requires 
+comprehending the different types of articles, their role in the semiconductor manufacturing process, the 
+potential release points during use, and how manufacturers dispose of them at their end of life. Articles 
+range from those with a relatively short life span – ranging from single use to several months’ duration – 
+to those that are essentially permanent components of a semiconductor manufacturing facility and may 
+have a useful lifetime of 25 years or more. 
+Mapping the sources and release pathways of PFAS-containing articles throughout the life cycle of a 
+semiconductor manufacturing facility reveals the complexities and diversity of potential releases. 
+Numerous examples of different PFAS-containing articles and their potential release modes further 
+illustrate the ubiquitous nature of these items and their importance in semiconductor manufacturing. 
+Background 
+Per- and poly-fluoroalkyl substances (PFAS) are manmade chemicals used in many everyday applications 
+with specific beneficial properties such as chemical stability.  Recently there is suggestion that members 
+of this class of compounds exhibit high environmental persistence (vP), which is combined in some 
+members with bioaccumulation (B) and toxicity (T). It is highly probable that PFAS chemicals will be 
+subject to significant regulatory restrictions in the future. At the same time, PFAS-containing materials are 
+crucial components used in semiconductor manufacturing, to the extent that the manufacture of advanced 
+semiconductor chips is currently not possible without them. 
+The Semiconductor PFAS Consortium has chosen the broadest definition found in recent proposed 
+regulations and includes in its definition of PFAS all chemistries and materials that contain molecules 
+with -CF2- and/or -CF3 groups. This definition closely aligns with the Organization for Economic 
+Cooperation and Development definition1. Despite the consortium’s broad definition of PFAS, not all 
+PFAS-containing materials within the definition are considered bioaccumulative or toxic. 
+The fluorinated organic molecule in the form of a fluoropolymer or fluoroelastomer possesses numerous 
+attributes that provide unique functionality across a wide spectrum of applications. In many situations, it 
+is not just one particular attribute (such as low surface tension) that makes a fluoropolymer or 
+fluoroelastomer effective for an application, but the combination of several attributes that enable 
+fluorinated organics to satisfy multiple, overlapping performance requirements. 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 4 
+Given the importance of fluorinated organic chemicals in semiconductor manufacturing, the 
+Semiconductor PFAS Consortium has developed seven white papers2, three case studies and a paper 
+detailing the “Impact of a Potential PFAS Restriction on the Semiconductor Sector.”3 These papers 
+identify PFAS uses in semiconductor manufacturing and assess where their use meets the concept of 
+“essential.”4 In their papers, the authors conclude that for most PFAS use cases, non-PFAS alternatives 
+providing the same performance characteristics are currently unavailable.   
+Figure 1 is a broad overview of the scope of the Semiconductor PFAS Consortium’s analysis, showing 
+both front- and back-end semiconductor processing, as well as facility support functions and device 
+assembly, test and packaging operations. The scope of the operations considered by the Semiconductor 
+PFAS Consortium starts with a bare silicon wafer entering a manufacturing facility and ends at the 
+packaging of semiconductor devices, while including semiconductor and manufacturing related 
+equipment (SMRE) and the facility infrastructure required to manufacture semiconductor devices. The 
+scope does not include the manufacturing of articles, SMRE or facility infrastructure components, which 
+can be potential sources of release in their own right. Similarly, the scope does not include potential 
+releases from the use of products generated by semiconductor manufacturing or packaging processes. 
+ 
+Figure 1: General overview of semiconductor manufacturing process steps, operations and systems 
+evaluated by the Semiconductor PFAS Consortium. 
+ 
+
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 5 
+Objective 
+The objective of this paper is to identify the principal, PFAS environmental release pathways from the use 
+of articles in semiconductor manufacturing facilities and provide a generalized template for the 
+development of specific PFAS release quantification models for semiconductor manufacturing. 
+Conceptual Release Map 
+Figure 2 shows a schematic representation of the life cycle of articles: their introduction, use, retire and 
+disposal from a semiconductor manufacturing facility. Numbers indicate various means of use (in black), 
+release pathways (in blue) or release (red). 
+Initial facility bring-up (1) may introduce an article in both the facilities infrastructure (1a) and the SMRE 
+(1b). During facility operation (2), adding a new infrastructure (2a) or SMRE (2b) may include the 
+introduction of new articles. Regular equipment and facilities use drives the consumption of replacement 
+parts (2c) and consumables (2d). Articles consumed or replaced exit the facility (3), and if contaminated 
+with process chemicals or residues, may undergo decontamination (3a). 
+Premature use or failure may cause the return of parts or consumables to the supplier (3b). If the spent 
+article is eligible for reuse, it may be refurbished (3c) or otherwise recycled (3d). If these options are not 
+viable, the manufacturer may dispose of the article through incineration or send it to a solid waste landfill 
+(3e).  Similarly, Figure 2 shows paths for the retirement of parts at end of life or shutdown (4, 4a-e).   
+Table 1 details each example illustrated in Figure 2 and includes estimates of the duration of use (lifetime) 
+of each release map variable.  Figure 2 is representative of a semiconductor fabrication facility (fab), but 
+is additionally representative of other semiconductor manufacturing facilities (such as photomask and 
+assembly test and packaging),which have analogous infrastructures, SMRE and use models, and spare 
+parts and consumables models. 
+ 
+ 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 6 
+ 
+Figure 2: Representative life of articles in semiconductor manufacturing operations and facility infrastructure. 
+ 
+
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 7 
+ 
+Figure 3: Examples of SMRE core equipment.  
+
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 8 
+Table 1: Potential PFAS-containing article time in service and release pathways. 
+Release Map 
+Variable  
+Release Map Variable 
+Description 
+Time in Service/ 
+Life Cycle 
+Comments 
+1 Initial facility construction   
+1a Installation of facilities 
+infrastructure and 
+components 
+25 plus years Generally, a factory has a greater than 25-year life span, as do 
+facility systems. Bulk chemical distribution  systems may have a 
+shorter life span because of process chemistry changes; thus, 
+construction materials have a 25-year useful life span.  
+ 
+ 
+1b Installation of SMRE 25 plus years 
+The lifetime of individual 
+pieces of equipment can 
+vary 
+A modern semiconductor manufacturing facility contains 
+hundreds of pieces of processing equipment. Fluoropolymers 
+and fluoroelastomers play a pivotal role in semiconductor 
+manufacturing equipment given their exceptional chemical 
+resistance, thermal stability and low particle generation 
+properties. Additionally, some articles are made of a non-PFAS 
+polymer that contains PFAS from processing aids or additives. 
+Manufacturers use articles within SMRE in various ways, 
+depending upon the article and its supply chain. They purchase 
+some articles for direct use, such as perfluoroalkoxy copolymer 
+(PFA) tubing cut to length from larger spools. Other articles, 
+such as a flow controller, are contained within a part purchased 
+from other suppliers for either direct use or as part of an 
+assembly. Finally, parts and assemblies may be combined into 
+additional assemblies and integrated into higher-level equipment 
+before being supplied to the facility. 
+ 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 9 
+Release Map 
+Variable  
+Release Map Variable 
+Description 
+Time in Service/ 
+Life Cycle 
+Comments 
+2 Normal facility operations  Includes routine maintenance, retooling and process 
+modifications 
+2a Installation/major 
+reconfiguration of facilities 
+infrastructure and 
+components 
+15-plus years If a factory has been repurposed for another process or function 
+(like C4 bump back end), there may be a need to rebuild some 
+facility systems to accommodate new process requirements or 
+equipment. Old facility materials may not be compatible with 
+new processes or not required, necessitating their removal or 
+replacement. This is more likely for bulk chemical delivery 
+systems and waste systems. Occasionally, facilities may have 
+entire production lines reconfigured or completely shut down. 
+During construction excess material (overage) deemed unusable 
+may be discarded. 
+2b Installation/upgrade of SMRE 15-plus years At various times during the lifetime of a semiconductor 
+manufacturing facility, existing equipment may require 
+modification or replacement because of changes in the chip 
+design or the migration of a process from another facility. 
+Occasionally, major upgrades are provided for equipment. 
+During equipment or infrastructure installation excess material 
+(overage) deemed unusable may be discarded. 
+2c Replacement parts Various, as needed Articles contained in SMRE and facilities infrastructure may 
+need replacing when failing prematurely, or when newer articles 
+become available with improved performance characteristics. 
+The equipment supplier evaluates new or changed replacement 
+parts for proper performance before using them within the 
+original equipment supplier. 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 10 
+Release Map 
+Variable  
+Release Map Variable 
+Description 
+Time in Service/ 
+Life Cycle 
+Comments 
+2d Consumables Weekly to one year Manufacturers typically replace certain articles (filters, gaskets, 
+O-rings) on a regular preventive maintenance schedule of 
+varying time periods. Consumables are a subset of replacement 
+parts are replaced per a preventive maintenance to keep 
+processing equipment operating properly and avoid unwanted 
+downtime caused by an unexpected component failure. 
+3 Spent consumables, 
+preventive maintenance, 
+component failure 
+  
+3a Removal of spent 
+consumables or components 
+from preventive maintenance 
+or component failure to 
+determine their potential 
+contamination 
+Variable  Manufacturers evaluate spent consumables or end-of life 
+components to determine whether they are contaminated from 
+process or facilities chemistries. If the article is contaminated, it 
+may be decontaminated for safe handling, storage or disposal. 
+3b Decision point for premature 
+failure/warranty claim 
+Variable Manufacturers return the article to the supplier if it fails 
+prematurely or as part of a warranty claim. Once returned, the 
+supplier typically repairs or replaces the article, with any waste 
+generated being their responsibility. 
+3c Decision point on the 
+possibility of refurbishing the 
+article 
+Variable The article may be refurbished on-site, at a supplier location or 
+at the original manufacturer, with waste generated from the 
+refurbishment process managed according to the waste 
+management hierarchy. The manufacturer would then return the 
+article to service or place it in a parts crib for future use. If it is 
+not possible to refurbish the article, it moves to the next step of 
+the life-cycle flow diagram. 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 11 
+Release Map 
+Variable  
+Release Map Variable 
+Description 
+Time in Service/ 
+Life Cycle 
+Comments 
+3d Spent consumables and end-
+of-life components sent for 
+recycling 
+Variable Articles no longer suitable for manufacturing or operations use 
+that are sent for recycling may include high-value 
+fluoropolymers such as PFA or polytetrafluoroethylene (PTFE), 
+or articles primarily made of other recyclable materials (such as 
+metals) that are coated with or contain PFAS components. 
+3e Spent consumables and end-
+of-life components sent for 
+incineration or landfill 
+disposal 
+Variable Manufacturers send articles no longer suitable for manufacturing 
+or operations use that cannot be sent for recycling (such as 
+fluoropolymers that do not have a recycling market or cannot be 
+decontaminated) for incineration or disposal in a landfill. The 
+decision for incineration vs. landfill disposal most often depends 
+on local regulations. In Europe, these articles would be burned 
+in a waste-to-energy facility. In the U.S., they are typically sent 
+to a municipal solid waste landfill unless classified as regulated 
+waste, in which case they would be sent to a permitted 
+hazardous waste landfill. 
+4 End of life, asset 
+redeployment 
+  
+4a Removal of SMRE, 
+components or facilities 
+infrastructures that are at their 
+end of life or no longer used, 
+and may be redeployed 
+Variable Manufacturers evaluate SMRE, components or facilities 
+infrastructures to determine whether they are contaminated from 
+process or facilities chemistries. If the article is contaminated, 
+they decide whether to decontaminate the article for safe 
+handling, storage or disposal. In many cases, it is possible to 
+decontaminate SMRE. In other cases, it is difficult to remove 
+certain process chemistries, or they have become embedded in 
+the article. 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 12 
+Release Map 
+Variable  
+Release Map Variable 
+Description 
+Time in Service/ 
+Life Cycle 
+Comments 
+4b SMRE, components or 
+facilities infrastructures that 
+are redeployed 
+Variable SMRE, components or facilities infrastructures that still have a 
+useful life can be deployed within the facility or at another 
+company location. There may be some waste generated during 
+redeployment if components need replacement to maintain 
+functionality or to fit a new use, with any waste generated 
+managed according to the waste management hierarchy. 
+4c SMRE, components or 
+facilities infrastructures that 
+may go into the resale market 
+Variable SMRE, components or facilities infrastructures that still have a 
+useful life can enter the resale market. There may be some waste 
+generated during resale if some components need replacement to 
+maintain functionality or to fit a new use, with any waste 
+generated managed according to the waste management 
+hierarchy. 
+4d SMRE, components or 
+facilities infrastructures that 
+may be recycled 
+Variable SMRE, components or facilities infrastructures that are no 
+longer suitable for manufacturing or operations use can be sent 
+for recycling. These may include high-value fluoropolymers 
+such as PFA or PTFE, or articles primarily made of other 
+recyclable materials (such as metals) that are coated with or 
+contain PFAS components. PFAS materials commingled with 
+other recyclable materials are not in the scope of this 
+assessment. 
+4e SMRE, components or 
+facilities infrastructures that 
+cannot be recycled and must 
+be disposed 
+Variable Manufacturers send PFAS-containing articles that do not have a 
+recycling market for incineration or disposal in a landfill. The 
+decision for incineration vs. landfill disposal most often depends 
+on local regulations. In Europe, these articles would be burned 
+in a waste-to-energy facility. In the U.S., they are typically sent 
+to a municipal solid waste landfill unless classified as regulated 
+waste, in which case they would be sent to a permitted 
+hazardous waste landfill. 
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 13 
+Release Map 
+Variable  
+Release Map Variable 
+Description 
+Time in Service/ 
+Life Cycle 
+Comments 
+4f SMRE, components or 
+facilities infrastructure 
+articles may be scavenged for 
+valuable parts that may be 
+resold 
+Variable SMRE, components or facilities infrastructures that are not 
+viable for resale may be disassembled and individual parts may 
+be resold onto the secondary market for future use.  The 
+scavenging process may generate waste, which the manufacturer 
+would then manage according to the waste management 
+hierarchy. If it is not possible to resell the scavenged part outside 
+of the enterprise, it moves to the next step of the life-cycle flow 
+diagram (4d/4e). 
+4g SMRE, components or 
+facilities infrastructure 
+articles may be scavenged for 
+valuable parts for reuse by the 
+manufacturer 
+Variable SMRE, components or facilities infrastructures that are not 
+viable for resale may be disassembled and individual parts may 
+be scavenged and retained in parts inventory for future use by 
+the enterprise.  The scavenging process may generate waste, 
+which the manufacturer would then manage according to the 
+waste management hierarchy. If it is not possible to retain the 
+article/part for future use, it moves to the next step of the life-
+cycle flow diagram (4d/4e). 
+Release factors and data sources are listed as “undetermined” if industry data has not been collected to support quantification.   
+Numeric release factors may be evaluated during Consortium quantification work  
+Rev. 0 
+ Copyright © 2023 the Semiconductor Industry Association (SIA). All rights reserved. 14 
+Conclusions and Next Steps 
+As shown in the process mapping and enumeration of the use of articles in chip manufacturing processes, 
+identifying sources of potential release is highly involved. The next step in this process is to estimate the 
+quantification of the release in order to identify the largest potential sources and mechanisms. 
+The industry, through collaborative engagements like the Semiconductor PFAS Consortium, are engaging 
+in detailed studies of the propensity for articles in the manufacturing process to release PFAS-containing 
+materials during their regular use. In parallel, the semiconductor industry continues to actively identify, 
+test and implement improved process controls that minimize releases to the environment, including 
+PFAS-containing materials. There is also an increasing focus on developing circularity for PFAS-
+containing materials, including fluoropolymers, through reuse and recycling. 
+Finally, the industry is and has been researching prospective PFAS substitutes. The identification and 
+validation of alternatives is an expensive and lengthy process that entails identifying potential substitutes, 
+evaluating their potential human and environmental risks, conducting laboratory and pilot tests, designing 
+and retooling equipment, and conducting verification tests and qualification in a high-volume 
+manufacturing environment before final implementation. 
+By taking a holistic, multifaceted approach to identify and minimize potential releases, seek circularity 
+solutions, and explore alternative materials, the semiconductor articles community is continuing to 
+demonstrate its commitment to being good stewards of this unique class of materials. 
+ 
+1 OECD, Organization for Economic Cooperation and Development. 2021. Reconciling Terminology of the Universe 
+of Per- and Polyfluoroalkyl Substances: Recommendations and Practical Guidance. OECD Series on Risk 
+Management. 
+2 Semiconductor PFAS Consortium technical white papers and case studies can be found at 
+https://semiconductors.org/pfas. 
+3 RINA. 2023. The Impact of a Potential PF AS Restriction on the Semiconductor Sector. Impact Assessment, 
+Leatherhead: RINA Tech UK Ltd. 
+4 Cousins, Ian T., Gretta Goldenman, Dorte Herzke, Rainer Lohmann, Mark Miller, Carla A. Ng, Sharyle Patton et 
+al. 2019. “The concept of essential use for determining when uses of PFASs can be phased out.” Environmental 
+Science: Processes & Impacts 1803-1815. 

@@ -4094,13 +4094,26 @@ fn format_execution_invocation(execution: &CommandExecution) -> String {
         CommandExecution::WebBrowse { url, render } => {
             let quoted = shell_command_join(std::slice::from_ref(url));
             if *render {
-                // The preview names the browser PRISM tries first. When no
-                // pane can be opened it falls back to `agent-browser` and the
-                // result says so — the preview is the intent, the envelope is
-                // the record.
+                // The pane STAYS — browsing the human can watch is the point
+                // of render mode. What changed is where the RESULT comes
+                // from: reading it back by scraping the rendered pane
+                // (`action -- read`) returns the browser's own glyph output,
+                // not the page's text.
+                //
+                // Measured on the PFAS run (2026-08-27): 48 web_browse calls,
+                // 22 failures, single stored outputs up to 2.3 MB of
+                // private-use-area glyph data — a rendered browser painted
+                // into a pane, captured back as text. It flooded the display,
+                // and the model escalated to driving Chrome's DevTools
+                // WebSocket from execute_python, which 403'd on origin. 156
+                // tool calls, zero facts stored.
+                //
+                // So: open it where a human can see it, and read the text
+                // through the text browser. Both halves do the job they are
+                // actually good at.
                 format!(
                     "{TERMINAL_BROWSER_BIN} open {quoted} --split right \
-                     && {TERMINAL_BROWSER_BIN} action -- read"
+                     && agent-browser read {quoted}"
                 )
             } else {
                 format!("agent-browser read {quoted}")
@@ -4133,6 +4146,56 @@ fn command_timeout_for_root(root: &str) -> Duration {
         "node" | "mesh" => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
+}
+
+/// Strip what is not text from a fetched page, keeping the text whole.
+///
+/// NOT a length cap. The full readable text still travels — oversized results
+/// already go to durable memory with a pointer, which is the right shape: the
+/// page is not lost, it is moved. What this removes is content that is not
+/// readable at all and can never be worth context or screen: C0 control bytes
+/// (bar tab/newline), and private-use-area codepoints, which carry no meaning
+/// outside the font that defined them.
+///
+/// Measured on the PFAS run: a single stored `web_browse` result held 2.3 MB
+/// of private-use-area glyphs with stacked combining marks — a rendered
+/// browser captured back as characters. It flooded the terminal and was worth
+/// nothing to anyone. The render path no longer produces that, but any page
+/// can serve such bytes, so the read path should not depend on the writer
+/// being well behaved.
+///
+/// Runs of combining marks are also bounded: a legitimate grapheme uses a
+/// handful, and a hundred stacked on one base is a rendering artefact or a
+/// deliberate flood, never prose.
+pub(crate) fn strip_non_text(text: &str) -> String {
+    const MAX_COMBINING_RUN: usize = 8;
+    let mut out = String::with_capacity(text.len());
+    let mut combining_run = 0usize;
+    for ch in text.chars() {
+        let is_private_use = matches!(ch as u32,
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD);
+        if is_private_use {
+            continue;
+        }
+        if ch.is_control() && ch != '\n' && ch != '\t' && ch != '\r' {
+            continue;
+        }
+        // Combining marks proper (U+0300..U+036F) plus the Hebrew/Arabic
+        // points that the observed flood stacked.
+        let is_combining = matches!(ch as u32,
+            0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A
+            | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x0730..=0x074A);
+        if is_combining {
+            combining_run += 1;
+            if combining_run > MAX_COMBINING_RUN {
+                continue;
+            }
+        } else {
+            combining_run = 0;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub(crate) fn truncate_for_ui(text: &str, max_chars: usize) -> String {
@@ -6574,8 +6637,8 @@ fn web_browse_envelope(invocation: &str, outcome: Result<AgentBrowserOutcome, St
         "success": success,
         "timed_out": timed_out,
         "exit_code": exit_code,
-        "stdout": truncate_for_ui(stdout.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
-        "stderr": truncate_for_ui(stderr.trim(), CLI_ENVELOPE_STREAM_MAX_CHARS),
+        "stdout": truncate_for_ui(&strip_non_text(stdout.trim()), CLI_ENVELOPE_STREAM_MAX_CHARS),
+        "stderr": truncate_for_ui(&strip_non_text(stderr.trim()), CLI_ENVELOPE_STREAM_MAX_CHARS),
     })
 }
 
@@ -8044,6 +8107,74 @@ mod tests {
         assert!(
             write.requires_approval,
             "a mesh write must stay approval-gated"
+        );
+    }
+
+    /// The PFAS run stored a single 2.3 MB `web_browse` result that was
+    /// private-use-area glyphs with stacked combining marks — a rendered
+    /// browser captured back as characters. It flooded the terminal and was
+    /// worth nothing. Real text must survive untouched; the noise must not.
+    #[test]
+    fn browse_output_keeps_its_text_and_drops_what_is_not_text() {
+        let prose = "PTFE has a service temperature of 260 °C — see Table 2.\nNext line\twith tab.";
+        assert_eq!(
+            strip_non_text(prose),
+            prose,
+            "ordinary prose, punctuation, accents, newlines and tabs are text"
+        );
+
+        // Private use area: meaningless outside the font that defined it.
+        let flood = "\u{F00A6}".repeat(500);
+        assert_eq!(
+            strip_non_text(&flood),
+            "",
+            "private-use glyphs carry no text"
+        );
+        assert_eq!(strip_non_text("a\u{E000}b"), "ab", "BMP private use too");
+
+        // Control bytes that are not whitespace.
+        assert_eq!(strip_non_text("a\u{0}\u{7}b"), "ab");
+
+        // A legitimate grapheme keeps its marks; a stack of a hundred does not.
+        let legit = "e\u{301}";
+        assert_eq!(strip_non_text(legit), legit, "one combining accent is text");
+        let stacked = format!("e{}", "\u{301}".repeat(100));
+        assert!(
+            strip_non_text(&stacked).chars().count() <= 9,
+            "a hundred marks on one base is a rendering artefact, not prose"
+        );
+    }
+
+    /// Length is NOT what this removes. An oversized page still travels whole
+    /// — the loop already moves anything past its threshold into durable
+    /// memory with a pointer, so the page is moved, never lost. Capping here
+    /// would make that pointer a lie.
+    #[test]
+    fn sanitising_browse_output_does_not_shorten_real_text() {
+        let long = "PTFE 260 C. ".repeat(20_000);
+        assert_eq!(
+            strip_non_text(&long).len(),
+            long.len(),
+            "a long page of real text is not truncated by sanitising"
+        );
+    }
+
+    /// A render must return TEXT, not paint a browser into a pane beside the
+    /// user. The graphical path failed 22 of 48 times on the PFAS run and the
+    /// model escalated to driving Chrome DevTools from execute_python.
+    #[test]
+    fn a_render_reads_headless_and_opens_no_terminal_pane() {
+        let preview = format_execution_invocation(&CommandExecution::WebBrowse {
+            url: "https://example.org/paper".into(),
+            render: true,
+        });
+        assert!(
+            preview.contains("agent-browser read"),
+            "the TEXT must be read through the text browser, got: {preview}"
+        );
+        assert!(
+            !preview.contains("action -- read"),
+            "never by scraping the rendered pane, got: {preview}"
         );
     }
 
@@ -12235,9 +12366,17 @@ mod artifact_view_tests {
 
     // ── web_browse: browsing the human can watch ──────────────────────
 
-    /// The preview the human approves names the browser that opens a pane.
+    /// The preview the human approves names the browser that opens a pane —
+    /// browsing the human can watch is the point of render mode — but the
+    /// TEXT is read through the text browser, not by scraping the rendered
+    /// pane.
+    ///
+    /// Scraping the pane returned the browser's own glyph output: measured on
+    /// the PFAS run, a single stored result of 2.3 MB of private-use-area
+    /// characters, which flooded the terminal and told the model nothing. The
+    /// pane is for the human's eyes; `agent-browser` is for the page's words.
     #[test]
-    fn render_preview_names_the_visible_browser() {
+    fn render_opens_a_visible_pane_but_reads_text_not_the_rendering() {
         let preview = command_tool_preview(
             "web_browse",
             &json!({"url": "https://example.org/x", "render": true}),
@@ -12246,7 +12385,11 @@ mod artifact_view_tests {
         assert_eq!(
             preview,
             "terminal-browser open https://example.org/x --split right \
-             && terminal-browser action -- read"
+             && agent-browser read https://example.org/x"
+        );
+        assert!(
+            !preview.contains("action -- read"),
+            "the result must not come from scraping the rendered pane: {preview}"
         );
     }
 

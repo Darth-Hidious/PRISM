@@ -114,6 +114,12 @@ pub const CORE_TOOL_SET: &[&str] = &[
     // Federated materials search. A weak model on a materials platform that
     // cannot reach the materials databases has nothing to answer from.
     "materials_search",
+    // ...and a model that can only READ the literature produces a transcript,
+    // not knowledge. Measured on the PFAS run of 2026-08-27: 156 tool calls
+    // (48 web_browse, 25 web, 22 prior_art_search) and ZERO calls to any
+    // ingest tool, against a brief that asked for exactly that. Searching is
+    // not researching if nothing is ever stored.
+    "papers_ingest",
     // ...but search alone means a local model can look things up and never
     // COMPUTE anything, which is backwards for this product. Observed live:
     // asked for HEA descriptors, a core-set model called `materials_search`

@@ -1,0 +1,919 @@
+Skip to Main Content
+Open Menu
+header search
+Search input auto suggest
+Search
+Advanced search
+User Tools Dropdown
+RSC Sustainability
+Toggle Menu
+Close navigation menu
+Volume 4, Issue 7
+01 July 2026
+Previous article
+Next article
+Article contents
+Introduction
+PFAS: the forever chemical problem
+The essential-use model as a framework for PFAS replacement
+Siloxanes: a potential alternative to PFAS?
+Applications of PFAS and potential siloxane alternatives
+Personal protective equipment
+Food packaging
+Medical devices
+Ice-resistant surfaces
+Aqueous film-forming foams
+Enhanced oil recovery agents
+Mould release chemicals
+Limitations of siloxanes as PFAS replacements
+High-performance lubricants and greases
+Heat transfer fluids
+Surfactants for semiconductor manufacturing
+Lithium-ion batteries
+Discussion and future outlook
+Author contributions
+Conflicts of interest
+Note added after first publication
+Data availability
+Acknowledgements
+References
+Article Navigation
+Critical Review| 01 June 2026
+Siloxanes: viable alternatives for PFAS in essential applications? 
+Open Access
+Erin M. Donahue-Boyle 
+ ; Mitchell A. Nascimento 
+ ; Melanie Kah 
+ ; Lokesh P. Padhye 
+ ; Jack L.-Y. Chen 
+ ; Erin M. Leitao
+Corresponding Author
+ 
+Author and article information
+RSC Sustainability (2026) 4 (7): 2828–2848.
+https://doi.org/10.1039/d6su00094k
+Article history
+Views Icon
+Views 
+Open Menu
+Open the
+PDF
+for Siloxanes: viable alternatives for PFAS in essential applications? in another window
+Share Icon
+Share 
+Cite Icon
+Cite
+Get permissions
+
+Per- and polyfluoroalkyl substances (PFAS) are highly valued for their thermal and chemical stability, oil and water repellency, and fire-suppression capabilities. However, they are increasingly being regulated because of their environmental persistence and bioaccumulative potential, leading to a search for alternatives across a variety of material types. Siloxanes are an under-explored class of compounds that offer many similar properties to PFAS (particularly their hydrophobicity and thermal stability) and degrade readily in the environment. Siloxane-based PFAS alternatives are commercially available for non-essential applications, such as water-repellent coatings and cosmetics, but the applicability of siloxanes in many other critical applications is not as well understood. To date, no broad comparison between siloxanes and PFAS in critical applications has been made. This critical review presents potential candidates for viable, siloxane-based PFAS replacements across materials and surfactant science applications, including omniphobic coatings, firefighting foams, mould release coatings, high-performance surfactants, and processing aids for semiconductor manufacturing. Particular emphasis is placed on compounds that are oleophobic, have low surface tension, or demonstrate high chemical stability under harsh operating conditions. In each substitution case, we discuss the properties conferred by the PFAS, analyse the current ability of state-of-the art siloxanes to satisfy the application's performance requirements, and recommend directions for future research towards the design and assessment of high-value, environmentally benign siloxane surfactants.
+
+Visual Abstract
+View large Download slide
+
+This critical review investigates the ability of siloxane-based materials to become more benign PFAS alternatives in essential applications.
+
+Sustainability spotlight
+
+A sustainable material must originate from renewable or recyclable feedstocks, be safe and effective in use, and degrade to benign products at end-of-life. Per- and polyfluoroalkyl substances resist degradation in the environment and are linked to a variety of adverse health effects. Siloxanes originate from an abundant resource (quartz), are already used safely in many consumer products, and undergo facile environmental decomposition. We acknowledge the potential for regrettable substitution and emphasize the importance of fate modelling and risk assessment before new compounds are commercialized. This work is particularly aligned with UN Sustainable Development Goal 12 (Responsible Consumption and Production) and connects with SDGs 3 (Good Health and Well-Being), 6 (Clean Water and Sanitation), and 9 (Industry, Innovation, and Infrastructure).
+
+Introduction
+PFAS: the forever chemical problem
+
+Per- and polyfluoroalkyl substances (PFAS) are a large group of chemicals1  used in a wide variety of consumer and industrial applications. Defined by the Organisation for Economic Cooperation and Development (OECD) as any compounds containing at least one fully fluorinated methyl (–CF3) or methylene (–CF2–) carbon atom,2  PFAS can be found in products ranging from non-stick coatings to firefighting foams to solvents for oil extraction and polymer processing.3  The widespread adoption of PFAS is a result of their unique properties, which give rise to unparalleled performance across a variety of applications.
+
+PFAS may broadly be grouped into two categories: polymeric and non-polymeric (Fig. 1).4  The most well-known example of a fluoropolymer is poly(tetrafluoroethylene) (PTFE, sold under the brand name Teflon®), which has a fully fluorinated carbon backbone. Other polymers, such as poly(vinylidene fluoride) (PVDF), alternate between fluorinated and non-fluorinated backbone carbon atoms; a third category of fluoropolymers comprises hydrocarbon backbones bearing fluorinated side chains, as in the case of fluorotelomer-appended polyacrylates.5  Fluoropolymers are hydro- and oleophobic, chemically inert, and remarkably insoluble. This nonreactivity makes them useful in familiar household items, such as non-stick cookware, as well as in high-value applications like O-rings for gaskets and binding agents for electrodes in rechargeable batteries.3 
+
+Fig. 1
+View large Download slide
+
+Examples of common fluoropolymer and fluorosurfactant classes. Adapted from ref. 6 with permission from American Chemical Society (ACS), Z. Wang, J. C. DeWitt, C. P. Higgins and I. T. Cousins, Environ. Sci. Technol., 2017, 51, 2508–2518, copyright 2017.
+
+Non-polymeric PFAS also find broad industrial and domestic applicability; in particular, many are used as surfactants. Common structural elements for these surfactants include a perfluorocarbon tail (often containing 4, 6, or 8C atoms5 ) and a hydrophilic head;6  some examples of frequently encountered fluorosurfactant classes are provided in Fig. 1. The presence of a hydrophilic head renders fluorosurfactants more soluble than fluoropolymers, making them ideal for use in situations where emulsification or foaming is required. Examples include fire suppression, polymer processing, and photolithography.3 
+
+The unique chemical properties of PFAS are attributed to their intra- and intermolecular interactions. The fluorine atom forms the strongest known single bond to carbon, due to its high electronegativity.7  This effect is amplified in perfluorinated molecules, where multiple C–F bonds to the same carbon atom result in reduced bond lengths and stabilising inductive effects. In these molecules, bond dissociation energies range from 405 to 551 kJ mol−1 (cf. C–C bond dissociation energy of 346 kJ mol−1).8,9  Such bond strength renders PFAS tolerant of extreme variations in pH, oxidative and dielectric conditions, and temperature, allowing them to be used in harsh environments that most other classes of chemical compounds cannot withstand.3 
+
+One of the most well-known, and difficult to replicate, properties of PFAS is their simultaneous hydro- and oleophobicity (amphiphobicity). Most PFAS used in surface coatings are perfluorinated, meaning all H atoms on the carbon backbone are substituted with F atoms. The –CF3 and –CF2- structures are responsible for the lowest known surface tensions in both solids10  and surfactants11  (Table 1), meaning that low surface energy liquids, oils, and fats are unlikely to spread across their surfaces. Furthermore, the large van der Waals radius of the fluorine atom, as compared to hydrogen, results in PFAS adopting a dense, helical conformation with little rotational flexibility and very evenly distributed electron density.12  Molecules therefore do not experience strong electrostatic interactions with one another, allowing for dense, rigid packing to present an extremely uniform, CF3-exposed surface.13,14  Liquids are very unlikely to penetrate such a regular surface, regardless of their polarity.
+
+Table 1
+
+Influence of surfactant tail structure on surface energy in water at 25 °C, illustrating the general trend CH2 > CH3 > CF2 > CF3. Adapted from ref. 11 with permission from Elsevier, A. R. Pitt, S. D. Morely, N. J. Burbidge and E. L. Quickenden, Colloids Suf., A, 1996, 114, 321–335, copyright 1996
+
+Structure	Surface energy (mN m−1)	Structure	Surface energy (mN m−1)	Structure	Surface energy (mN m−1)
+	38.5		29.5		26.0
+	24.0		21.1		16.7
+View large
+
+The properties that make PFAS so desirable in-use become problematic at end-of-life. The stability of the C–F bond means that there are no easy routes to environmental degradation at ambient temperature,6,15  and nature has not yet evolved pathways for the metabolism of perfluorinated molecules.16,17  Due to this non-degradability and resultant persistence, PFAS are often referred to as ‘forever chemicals.’
+
+Fluoropolymers mechanically degrade to microplastics both in-use and at end-of-life. They therefore pose similar challenges to analogous thermoplastic hydrocarbon polymers, such as polyethylene.18,19  Of greater concern are fluorosurfactants, in which the presence of a hydrophilic head allows for widespread environmental transport and bioaccumulation. The first replacements for problematic and regulated long-chain legacy PFAS, such as 8-carbon perfluorooctanoic acid (PFOA) and perfluorooctanesulfonic acid (PFOS), were shorter-chain fluorosurfactants such as the 6-carbon perfluorohexane sulfonic acid (PFHxS). However, these shorter-chain species presented the unintended consequence of increased aqueous solubility.20  Short-chain fluorosurfactants are more susceptible to long-range transport; PFAS have been detected in areas with very little human activity, including the high Arctic.21  Furthermore, many fluorosurfactants strongly resemble biological molecules such as fatty acids, meaning that they preferentially partition to the liver and other organs once in the body.22  Many PFAS can neither be metabolised nor excreted, resulting in bioaccumulation. Nation-scale studies in the United States,23  the Netherlands,24  and Australia25  have identified at least one PFAS at concentrations of concern in the blood of over 98% of their respective populations, demonstrating the ubiquity and persistence of these chemicals.
+
+There is an emerging link between PFAS exposure and a host of adverse health outcomes.26–29  Given these concerns, many jurisdictions are seeking to ban or restrict PFAS. The Stockholm Convention on Persistent Organic Pollutants, ratified by 185 countries and the European Union (EU), calls for the restriction of PFOS (with exceptions for certain essential uses) and the elimination of PFOA and PFHxS.30  Several long-chain PFAS have already been restricted under the European Union (EU) framework for the Registration, Evaluation, Authorization, and Restriction of Chemicals (REACH), with widespread bans on PFAS use in firefighting foams and food packaging under consideration. The New Zealand government has been the first to legislate a phase-out of the use of PFAS in cosmetics, effective as of the end of 2026.31 
+
+The implications of PFAS for human health and the environment, and ensuing regulations, make the identification of alternatives imperative. To develop PFAS replacements, we must first understand where PFAS are used, what functions they serve, and what properties are required to give rise to each function.
+
+The essential-use model as a framework for PFAS replacement
+
+PFAS are used ubiquitously, creating a significant challenge when evaluating replacements. The same compound may serve completely different functions in various applications, depending on the specific properties required for each use case.32  It is unlikely that any other class of compounds will simultaneously emulate all the properties of PFAS. Therefore, a different approach to alternatives assessment involves first identifying the ‘essential use’ of PFAS in a particular application,33  then developing a solution that meets the required performance standards for the product or process. For instance, the coating for a rain jacket needs to be durable and water-repellent, and stain resistance might be a welcome feature, but it does not need to be able to withstand caustic basic conditions.
+
+Searching for PFAS replacements is relatively straightforward when their role in a particular application is well-defined. Sometimes, however, the function the PFAS confers to the material is unclear, or a single molecule may serve multiple purposes simultaneously.32  Some key functions of PFAS include heat stabilisation, corrosion inhibition, waterproofing, grease resistance, durability, and fire retardance.32,34,35  In many materials, two or more of these features are required.
+
+Cousins and coworkers propose three categories for determining whether PFAS can be phased out or replaced.33–36  The first category addresses ‘non-essential’ applications, where the PFAS confers a property that is desirable but not strictly necessary for function. The molecule can either be readily substituted (i.e., using a hydrocarbon- or silicone-based waterproofing agent for a raincoat) or removed entirely (i.e., using a cast-iron pan in place of a non-stick one). Extensive research into alternatives for such applications is not a priority.
+
+A second class of PFAS applications is considered ‘substitutable’: the molecule fulfils an essential function, but there is an alternative technology that could be used as a drop-in replacement with minimal impact on product performance. One example of such an application is the aqueous film-forming foam (AFFF). Fluorosurfactants have historically been used in AFFFs because their low surface tension allows them to quickly spread across the surface of a fuel fire, forming a barrier to oxygen that smothers flames and is highly resistant to burnback.37,38  Clearly, the fire-extinguishing role that the PFAS plays in these foams is essential. However, military training sites where AFFFs are frequently employed have been identified as major point sources of PFAS pollution.39  The ensuing global effort to ‘clean up’ AFFFs, which has included considerable investment from the United States Department of Defence (US DoD), among other stakeholders, is leading to the development of several fluorine-free foams (FFFs) based on siloxane or hydrocarbon surfactants. The FFFs are considered to have sufficient performance for most commercial applications,40  though some military uses have stricter requirements, and viable alternatives for these situations have not yet been found.41  Alternatives assessment and identification for ‘substitutable’ PFAS uses may require the screening of known compounds to identify those with comparable properties or making minor modifications to well-established chemicals to enhance their performance. Generally, fluorine-free replacements within this category are considered well within reach and are expected to be commercially available within five to ten years.33 
+
+The final category of PFAS applications encompasses those deemed ‘essential’: the molecule plays a role integral to the application, and no suitable alternative has been identified. A good example of a use case within this category is the lithium-ion battery, where a fluoropolymer (PVDF) is used as a binding material for the cathode and a small, anionic PFAS (the bis(trifluoromethanesulfonyl)imide ion, TFSI−) is used as a counterion for the lithium ions in solution, simultaneously acting as a stabilising agent and a flame retardant.42  No commercially viable, fluorine-free compound has been identified that can perform all the functions of either substance with sufficient stability to multiple charge–recharge cycles. When looking to replace such essential PFAS, a survey of the existing library of chemicals is unlikely to be sufficient. Any alternative will require a fundamental redesign of the system from a chemical or an engineering perspective.
+
+The market poses a further challenge to the hunt for PFAS replacements. An ideal alternative, in addition to its function, should be safe (from its manufacture to its end-of-life), practical (easy to synthesise using existing industrial technologies), and affordable.32  Given the environmental concerns associated with PFAS, end-of-life fate and toxicity are also important considerations.
+
+Meeting the above requirements is a formidable task. When assessing the viability of alternatives, one strategy is to begin with a well-established class of compounds that have similar performance to PFAS in a subset of uses, then explore how structural modifications expand their applicability. Several recent reviews have surveyed existing or proposed PFAS alternatives across a variety of chemical classes, including hydrocarbon surfactants, organic and inorganic polymers, zwitterionic systems, biobased materials, and siloxanes.5,32,34,40,42–44  However, a critical review exploring the fundamental chemical design principles and procedures required to select and synthesize PFAS replacements has yet to be written. Siloxanes, in particular, are one class of compounds for which no broad comparison to PFAS has been made. Below, we discuss the fundamental properties of siloxanes and justify the rationale for their consideration as PFAS alternatives.
+
+Siloxanes: a potential alternative to PFAS?
+
+Siloxanes are a well-established class of chemical compounds that consist of a repeating Si–O–Si backbone with organic (usually methyl) substituents attached to the silicon atoms. Small-molecule siloxanes can be linear or branched (including surfactants, like PFAS), while longer-chain siloxane (or silicone) polymers are usually linear (the most well-known of these is poly(dimethylsiloxane), PDMS). Fig. 2 provides some examples of commonly used commercial siloxanes. As with PFAS, siloxanes possess desirable properties that enable their use in a wide range of products, including cookware, cosmetics, release coatings, sealants, and contact lenses.45  Some strengths of siloxanes as a chemical class include their thermal stability, gas permeability, biocompatibility, and hydrophobicity.46  Other characteristics of PFAS, such as oleophobicity and stability to acids and bases, are more difficult for siloxanes to emulate.
+
+Fig. 2
+View large Download slide
+
+Examples of commercial polymeric and amphiphilic siloxanes.
+
+Silicone rubbers are well known for their water repellency: a quick look at how water beads up on your bathroom caulking confirms their hydrophobicity. This property is attributable to the high concentration of terminal methyl groups along the PDMS backbone; other than perfluoro –CF3 and –CF2- units, the –CH3 group has the greatest ability to reduce surface tension of any organic structure (Table 1).11  Within a rubber, or when applied to a surface, the methyl groups along the backbone will orient themselves towards air interfaces.47  This results in PDMS having a relatively low surface tension of 20–22 mN m−1, depending on its molecular weight48  (cf. 34 mN m−1 for polyethylene49  and 20 mN m−1 for PTFE;50  for reference, water has a surface tension of 72 mN m−1). Static water contact angles for silicone rubbers at 25 °C usually measure around 130°,47 cf. 120° for PTFE51  (>90° is considered hydrophobic). Due to their water repellency, silicones (typically PDMS) have already been used as replacements for PFAS in applications such as the durable water-repellent coatings (DWRs) used in outerwear.5  See Table 2 for relevant examples.
+
+Table 2 
+
+Examples of successful siloxane substitutions for PFAS in selected non-essential applications. Most existing replacements are based on poly(dimethylsiloxane) (PDMS)
+
+Application	Function	Existing silicone replacements
+Durable water-repellent coatings (DWRs) for outerwear, textiles, and construction materials	• Adherence to fabric	• PDMS-based wash-in or aerosol spray-based fabric coatings71,72 
+• Excellent water repellency5 	• Organofunctionalised PDMS emulsions73 
+Cosmetics	• Liquid repellency (e.g., waterproof)	• PDMS74 
+• Spreading on skin33 	• Organofunctionalised PDMS75 
+Casings and coatings for wires and cables	• Thermal stability	• PDMS-based braided wire and fibreglass77 
+• Flame and moisture resistance76 
+View large
+
+PFAS serve many critical roles in the biomedical sector, including as breathable coatings for surgical garments and as protein- and bodily fluid-resistant coatings for devices like catheters and scalpels.41,52  Silicone rubbers are known to be non-reactive and have a long track record of biocompatibility, allowing their use in contact lenses, soft tissue implants, and soft electrodes.53,54  Siloxane surfactants have also been widely used as standalone components or as PFAS replacements in the cosmetics industry.55  If a modified siloxane exhibited oleophobic properties while retaining its biocompatibility, it would make a promising candidate for medical applications.
+
+Unlike PFAS, linear and small-molecule siloxanes undergo abiotic degradation within months upon release to the environment (PDMS is mineralised in soil to the ultimate products of sand, carbon dioxide, and water).56  The Si–O bonds in siloxanes are quite polarisable compared to the shielded fluorocarbon backbone, allowing them to be degraded by naturally occurring acids and bases.56  In crosslinked rubbers, this process is attenuated, largely due to their hydrophobicity, which limits degradation to a surface process. Even then, silicones are expected to degrade much more quickly than perfluorinated molecules.56 
+
+Although siloxanes and PFAS offer many comparable properties, the two classes have fundamentally different structures and reactivities, making the former unlikely to be a replacement for every application. The tightly wound helical conformation of perfluorinated molecules results in an electronic ‘sheathing’ effect; this renders the fluorocarbon backbone resistant to degradation by acids and bases.12  By comparison, the flexible Si–O–Si backbone in linear siloxanes is very exposed. Linear polydimethylsiloxanes readily undergo acid- and base-catalysed depolymerisation, particularly at elevated temperatures.57,58  The stability of the backbone can be increased to a certain degree via the introduction of bulkier substituents or, particularly, through chemical crosslinking, as in silicone rubbers.56  However, even hindered siloxanes are unlikely to replace PFAS in applications such as semiconductor manufacture, where prolonged and repeated exposure to etching solutions of pH < 1 is required.59 
+
+Possibly the hardest to replicate of all PFAS properties is their oleophobicity, which arises from their extremely low surface tension (13–24 mN m−1,60  see Table 1 for representative examples). Compared to fluorocarbons, siloxane chains are very flexible; the large and variable Si–O–Si bond angle (which can range between 105° and 180°)61  and lack of substitution at every second atom on the backbone allows for free chain rotation. The polarisability of the Si–O bond also allows for the formation of net dipoles within the chain, where the O atoms align along a hydrophilic surface, and the organofunctionalised Si atoms are oriented toward the air (Fig. 3a).47  Multiple orientations of the backbone, relative to the surface, are possible. Consequently, siloxane surfactants cannot rigidly pack along a surface by the same mechanism as fluorosurfactants (Fig. 3b), and the resulting lack of crystallinity reduces their effectiveness at repelling oils and low surface energy liquids.
+
+Fig. 3
+View large Download slide
+
+Packing behaviour of (a) siloxane and (b) perfluorinated surfactants at a hydrophilic surface. In siloxane surfactants, the organic R groups (typically –CH3) orient towards the air, while the polar O atoms in the flexible backbone may align along the surface or extend away from it. Conversely, the backbone of a fluorosurfactant has no polar regions and very little rotational flexibility, resulting in dense, rigid, and uniform packing across a substrate surface.
+
+Modern history provides many cautionary tales of ‘regrettable substitutions’: in the effort to replace problematic chemicals, new compounds are developed that introduce unexpected and unintended consequences.62  A careful cradle-to-grave life cycle assessment (LCA) of potential siloxane-based replacements for PFAS, with particular attention to degradation products, environmental fate, and toxicity, is essential.
+
+A comprehensive LCA comparing PFAS and siloxanes has yet to be conducted and would require extensive data for both chemical classes, much of which remains proprietary: historical, current, and projected production volumes, specific chemical structures, synthetic pathways, disposal methods, and manufacturing and disposal locations. Such an analysis is beyond the scope of this work. However, as a case study, the life cycles of the simplest linear fluorinated and siloxane polymers, PTFE and PDMS, may be compared. PTFE (Scheme 1a) is synthesised via the homo-polymerisation of tetrafluoroethylene (TFE), which can be performed in water at room temperature, though it often requires the use of PFOA as a processing aid.63  TFE must itself be synthesised using chloroform and hydrofluoric acid, both of which pose significant hazards to their handlers64,65  (alternative strategies for the synthesis of TFE exist but have not been widely adopted63 ). The greatest concern with PTFE, however, occurs at end-of-life. Its environmental half-life cannot be experimentally determined by standardized methods, such as OECD tests, because it has high molecular weight, is highly insoluble, and is not readily bioavailable or mineralised on soil.66,67  Therefore, the polymer cannot chemically degrade under environmental conditions and will persist as a microplastic.19 
+
+Scheme 1
+View large Download slide
+
+Comparison of the life cycles of (a) poly(tetrafluoroethylene), PTFE and (b) linear poly(dimethylsiloxane), PDMS. (a) PTFE is synthesised from the homopolymerisation of tetrafluoroethylene, which is synthesised from chloroform and hydrofluoric acid. To improve polymerisation, perfluorooctanoic acid (PFOA), also a PFAS, is used as a processing aid.63  At end-of-life, the PTFE is mechanically degraded to smaller plastic particles but persists in the environment. (b) In the production of PDMS, SiO2 (quartz sand) is reduced to elemental silicon at a temperature of 2000 °C.69,70  The Rochow–Müller process generates dichlorodimethylsilane, which is hydrolysed to small linear and cyclic oligomers that can be polymerised to form longer chain PDMS oils.70  In the environment, PDMS oils are readily hydrolysed in the soil within weeks, forming the ultimate products of SiO2, water, and carbon dioxide.56,70 
+
+Conversely, the greatest concern associated with the manufacture of PDMS (Scheme 1b) is the first step of its production, which requires the reduction of silica to elemental silicon at a temperature of 2000 °C.68  Worldwide, every kilogram of elemental silicon produced is estimated to emit the equivalent of 10 kilograms of CO2; electricity for heating contributes to roughly two-thirds of these emissions.69  However, once low-molecular weight cyclic and linear siloxanes are produced (Scheme 1b), polymerisation can be achieved relatively easily under mild conditions. At the end of their life, linear siloxanes are readily degraded in soil (with a half-life of weeks to months) to form the ultimate products of sand, water, and carbon dioxide.56,70  Degradation of crosslinked PDMS elastomers is less facile, but leads to the formation of the same ultimate products and is expected to be much faster than that of analogous PTFE products.70 
+
+The leading disposal methods for both PTFE and PDMS are landfilling and incineration; for the former, incineration is the only viable commercial method for depolymerisation.78,79  At lab scale, PDMS can be readily depolymerised at high or low pH via hydrolysis or alcoholysis, or through thermal decomposition at temperatures between 350 and 550 °C.79  Strategies for the chemical recycling of PTFE are more limited and complex to implement; examples include high-temperature (800 °C) decomposition in the presence of Lewis acid catalysts80  and mineralisation in molten sodium hydroxide.81  Clearly, depolymerisation of silicones is simpler to implement industrially using current technologies. A summary of key environmental parameters for PTFE and PDMS is provided in Table 3.
+
+Table 3 
+
+Summary of end-of-life behaviours of poly(tetrafluoroethylene) (PTFE) and poly(dimethylsiloxane) (PDMS)
+
+	PTFE	PDMS
+Environmental degradation products	Persistent; microplastic PTFE19 	SiO2, CO2, H2O56 
+Industrial disposal methods	Landfilling; incineration78 	Landfilling; incineration79 
+Lab-scale recycling techniques	800 °C, Lewis acid catalyst80 	Acid/base hydrolysis/alcoholysis
+Mineralisation in molten NaOH81 	Thermal depolymerisation (350–550 °C)79 
+View large
+
+While high-molecular-weight silicone polymers, including PDMS, are considered biologically inert, there is concern that some small, cyclic siloxane molecules may pose adverse health effects in living organisms. Recently, volatile cyclic siloxanes (D4, D5, and D6) have come under increasing scrutiny for their bioaccumulation potential and aquatic toxicity.82  D4 has been established as a weak endocrine disruptor in rats,83  and is linked to their reduced ovulation84  and increased liver weight.85  Cyclic siloxanes are also considered toxic to aquatic life, though their oleophilicity means that they partition to the sediment in aquatic environments and are unlikely to be bioavailable in concentrations of concern.86  D4 and D5 were found to disrupt the lipid bilayer of skin cells ex vivo, penetrating into the epidermis and dermis.87–89  They were also shown to be cytotoxic to retinal cell lines in vitro, resulting in the halted use of silicone oil in eye treatments.90  However, to date, no significant health impacts have been conclusively identified in humans.91  Nonetheless, D4, D5, and D6 have been classified ‘very persistent and very bioaccumulative’ under the EU REACH framework Annex 70.91  As of June 2026, D4-D6 will be banned in concentrations above 0.1 wt% for sale in most products across the European Union, subject to certain exemptions, including as monomers for silicone polymer production, for research and development efforts, and in healthcare products. This impending restriction must be considered when developing consumer products to ensure that potential concentrations of cyclic siloxanes fall within legislated limits.
+
+Clearly, siloxanes and silicones offer many properties that compete with those of PFAS, making them an ideal place to start when considering alternatives. Many silicone polymers and siloxane surfactants are already widely used, and a growing body of research seeks to introduce structural modifications that will enhance their ability to act as replacements for PFAS in an increasing number of applications. Currently, siloxanes/silicones can substitute PFAS where water repellency/biocompatibility matter more than oil repellency/extreme chemical resistance, but they bring their own lifecycle and regulatory constraints.
+
+Below follows a critical assessment of these replacements in applications deemed essential. In each case, the properties conferred by the PFAS are discussed, the ability of current state-of-the-art siloxanes to meet these needs is explored, and recommendations for future research are provided.
+
+Applications of PFAS and potential siloxane alternatives
+Personal protective equipment
+
+In a few critical industries, PFAS are an essential component of personal protective equipment (PPE). Examples include surgical garments (which must repel water and bodily fluids while being breathable enough to prevent sweat buildup), firefighting suits (where fuel repellence is essential and flame retardance is desirable), and fishing clothing (where the wearer is routinely exposed to torrential rain, requiring extreme water repellence).41,92  Each situation requires multiple functions currently provided by PFAS. Developing an oleophobic coating will solve part of the problem and is therefore a good place to start. This section will not address flame retardance (discussed in detail in the section on firefighting foams, below). Here, the focus is limited to adhering coatings to fabrics and imparting oil resistance.
+
+Many PFAS-containing fabric coatings have a polyacrylic backbone to which a perfluorinated side chain, often a fluorotelomer alcohol or a perfluorosulfone amidoethanol, has been appended (Fig. 4).5  Once applied to the fabric, the fluorinated tails pack together tightly; 4- and 6-carbon PFAS, in particular, adopt a highly crystalline structure.92  Because of the minimal electrostatic interactions between the side chains, these fluoropolymers remain highly breathable13  – a requirement for surgical garments that must be worn for hours on end. Employing an engineering control such as a tighter weave of fabric is ineffective because of this requirement.
+
+Fig. 4
+View large Download slide
+
+Common polyacrylate backbone modifications for durable water-repellent coatings based on PFAS: (a) n : 2 fluorotelomer alcohols; (b) perfluorosulfone amidoethanols (R = a saturated alkyl group). In both cases, m = 1–4, n = 1–9, x > 2, and y > 2.5 
+
+Silicones are gas-permeable and breathable. However, they do not readily adopt crystalline structures at interfaces, particularly if bearing methyl substituents, because of their intramolecular flexibility (Fig. 3a).47  This makes oil repellence difficult, as oils tend to quickly penetrate the pores of non-uniform surfaces.44  Siloxane-based coatings can be made more crystalline through the introduction of a long hydrocarbon substituent that will act as the outward-facing tail (hydrocarbon tails will pack with each other and, being terminated with methyl groups, are effective at reducing surface tension93 ). Dignes et al. coated 3-aminopropyltriethoxysilane-modified polyester fabric with silica nanoparticles, functionalised the particles with hexadecyltrimethoxysilane, then hydrolysed the silanes to create a hierarchical, internally crosslinked polysiloxane structure (Fig. 5).94  The long alkyl chain allowed for dense packing like that of PFAS, creating a superhydrophobic coating (contact angle > 170°), while the siloxane core created pores that allowed sweat to evaporate. Oleophobicity remained a challenge: hydrocarbons have a surface tension comparable to many organic liquids and bodily fluids.95  Furthermore, detergents tended to agglomerate on the surface of the textile, gradually lowering the coating's hydrophobicity.
+
+Fig. 5
+View large Download slide
+
+Hierarchically structured, superhydrophobic fabric coating: polyester (A) modified with 3-aminopropyltriethoxysilane (B) is coated sequentially with large (590 ± 104.5 nm) and small (144 ± 45.6 nm) silica nanoparticles (C). The silica is then functionalised with hexadecyltrimethoxysilane (D), and the silanes are hydrolysed to generate an internally crosslinked polysiloxane structure with densely packed hydrocarbon chains at the fabric surface. Reproduced from ref. 94 with permission from John Wiley and Sons, C. Dignes, N. J. Nicolas, T. B. H. Schroeder and J. Aizenberg, Adv. Eng. Mater., 2024, 27, 2401736, copyright 2024.
+
+Cheng et al. coated a 90/10 nylon-spandex blend with dimethyldichlorosilane via vapour-phase deposition, generating ‘brush-like’ PDMS structures protruding from the surface of the fabric.96  Compared to an analogous PFAS-based coating, the siloxane exhibited much greater nanoscale roughness and had a slightly higher surface tension (24.7 mN m−1vs. 22.3 mN m−1). However, it was able to repel a series of oils with comparable efficacy to a 4-carbon perfluorinated coating; only decane and octane wetted the fabric, suggesting that this method has potential for the development of fluorine-free fabric coatings.
+
+Many siloxane-based coatings are marketed as durable water repellents for clothing.71,72  However, these coatings lack repellency to oil and bodily fluids and are therefore unsuitable for most PPE applications. Key challenges faced by silicones include amphiphobicity and the difficulty of applying them to fabric surfaces. Many of the syntheses described above are optimised for coating on glass or a single fabric type, or require complicated application procedures. Developing simple and robust methodologies for coating siloxanes on various substrates will be necessary if these solutions are to be adopted on an industrial scale.
+
+Food packaging
+
+Recent efforts to transition away from single-use plastics in food packaging have given rise to widespread adoption of biobased ‘compostable’ packaging.97  While plastics are generally resistant to food oils, paper is much more prone to infiltration. The most effective solution to this problem is to coat the packaging with an oil-proofing agent.98  Unfortunately, the most effective oil-proof coatings are perfluorinated, and many compostable containers are now laced with PFAS; a Europe-wide study identified PFAS in fast food wrappers from every country surveyed except for Denmark (where their use has been banned since 2020).99  Leaching is a major concern, as PFAS have been found to migrate into foods, particularly when small molecules are used in coatings or when products are heated in their original packaging.100,101  An ideal PFAS replacement in this sector must repel water and grease, be compostable or recyclable, and avoid transfer to food when heated.
+
+Several alternatives for food packaging have already been tried. Lamination with petroleum-based polymers confers oil resistance but introduces a separation problem during product recycling.102  Modified starches (alginate, cellulose, chitin) and proteins (corn zein) are fully compostable but fail the requirement for oleophobicity.43  Siloxanes, as discussed above, are reasonably environmentally degradable and have good thermal stability. Challenges arise from grease resistance and concerns about the transfer of low-molecular weight or unpolymerised siloxanes from coatings to food.103  A few siloxane alternatives have been developed with the explicit goal of enhancing grease resistance in food packaging. Torun et al. developed a superhydrophobic spray coating using a suspension of PDMS and carnauba wax in ethanol; it was biocompatible and heat-stable, but had selective oleophilicity.104  Tang et al. pre-hydrolysed methyltrimethoxysilane in a sonicator and applied the resulting oligomers to a paper surface.103  Samples that were hydrolysed for three hours formed prepolymers that readily crosslinked with each other and with the paper upon coating. The outer layer of the coating was evenly covered with methyl groups, rendering the surface moderately resistant to both water and oil (water contact angle: 82.5 ± 3.4° and motor oil contact angle: 61.2 ± 2.5°). While the usual threshold for oleophobicity is > 90°, oils typically spread across PDMS, meaning that this coating is unusually oil-repellent. Although this coating appears promising for food packaging applications, it is unknown how many low-molecular weight chains are present in solution at the time of application, and there is some concern that these could be transferred to food.43  Nonetheless, this coating represents a significant improvement over standard materials like linear chains of PDMS appended at both ends because it is covalently bound to the paper substrate at multiple sites and is therefore more resistant to delamination at high temperatures.105 
+
+Future work on siloxane-derived food packaging is likely to focus on higher molecular weight compounds, as these appear to exhibit greater stability to heat and a lower risk of migration into food.43  Though strides have been made in improving oleophobicity, testing at scale is required to assess the viability of such alternatives.
+
+Medical devices
+
+Unsurprisingly, the standards for medical-grade materials are very stringent. Depending on the application, coatings may require one or all of the following properties: resistance to blood and bodily fluids, antifouling behaviour, self-cleaning capabilities, and stability during sterilisation procedures.41  Coatings containing PFAS, particularly those based on PTFE, are commonly used in the medical field due to their thermal stability, amphiphobicity, and biological non-reactivity, which enables their application to devices such as catheters, needles, and scalpels.52 
+
+Silicones are known to be biologically non-reactive, allowing for their use in implants. Silicone rubbers can also be impregnated or co-polymerised with molecules that confer antimicrobial properties.106  Their resistance to bodily fluids, particularly on cutting or piercing implements that experience considerable localised strain, is less well-understood.
+
+Recently, Shen et al. developed a PDMS coating for metal medical surfaces. The metal was activated with plasma and then submerged in a solution of dichlorodimethylsilane to polymerise ‘liquid-like,’ highly flexible PDMS chains on the surface of the material.52  Although the exact morphology of the coating was not characterised, it was tolerant of a range of liquids with surface tensions as low as 25.7 mN m−1 (suggesting that it will repel oils95 ), was stable to both UV- and heat-based sterilisation procedures, and resisted bacterial growth. Interestingly, the silicone had the unintended benefit of reducing friction between the scalpel and tissues, allowing for smoother cutting and less blood adhesion (Fig. 6). Unlike a PFAS-based coating, the PDMS could be removed from the surface using tetrabutylammonium fluoride (TBAF), and the metal could be cleaned off and re-coated; after five cycles, no loss of function was observed. This represents an improvement in the recyclability of medical coatings: unlike the PFAS coating, the PDMS coating can be re-applied without replacing the scalpel.
+
+Fig. 6
+View large Download slide
+
+Demonstration of reduced blood adhesion on a PDMS-coated metal scalpel; less blood remains on the scalpel surface both before and after washing. Reproduced from ref. 52 with permission from Elsevier, F. Shen, J. Liu, L. Cai, H. Shi, H. Liu, Y. Zhao, Y. Wu, X. Chen, S. Wu and D. Wang, Chem. Eng. J., 2025, 163934, copyright 2025.
+
+The above work represents the first PFAS-free silicone coating of its type, indicating potential for fine-tuning grafting techniques for fluid-resistant coatings. The relationship between silicone molecular weight and coating properties remains unexplored and warrants future investigation.
+
+Ice-resistant surfaces
+
+The worldwide green energy transition has led to the widespread adoption of solar panels and wind turbines for power generation. Both technologies are limited by the formation of ice on their surfaces, which can decrease energy efficiency and ultimately reduce the unit's lifetime; they are therefore coated with materials that are resistant to ice formation and from which ice can cleanly delaminate.107  In the case of solar panels, optical clarity is also an important consideration.
+
+The current state-of-the-art in anti- and de-icing technologies involves either the use of perfluorinated nanostructures or of slippery, liquid-infused porous nanostructures (SLIPS), in which a low-surface energy fluid (often a PFAS) is injected into the pores of a coating to confer superhydrophobicity.108  SLIPS are a non-ideal solution for the de-icing sector because the injected liquid is prone to leaching and evaporation over time, after which the architecture of the coating loses its function and is likely to collapse.
+
+Ice nucleation is most likely to occur either on hydrophilic surfaces or at defect points within hydrophobic surfaces; a smooth and extremely regular surface is therefore most resistant to ice formation.109  Emerging research has focused on the use of ‘liquid-like’ PDMS as a superhydrophobic coating. The silicone's intramolecular flexibility allows it to behave like the fluid component of SLIPS, but it is covalently attached to a surface and is therefore more stable for long-term use than its liquid counterparts.
+
+Li et al. developed a superhydrophobic, ice-resistant coating for aluminium heat-exchange fins based on PDMS.110  Laser ablation was used to create regular grooves in the metal; it was then dip-coated in an acidic solution of PDMS (Mw = 10 000 g mol−1) in isopropanol and heat-cured (coating adhesion occurred via physical interlocking with the grooves in the metal surface). Although the grooves created by the laser introduced sites for ice nucleation, the silicone infilled these grooves to yield a regular, hydrophobic surface (contact angle 131°). The siloxane coating also protected the aluminium structure during de-icing and reduced the amount of force required to scrape ice from the metal surface.
+
+As another example, Hao et al. designed a simpler approach for the grafting of PDMS to rough surfaces like glass (important for solar cells).111  A glass slide was dipped in a solution of silica gel, reducing its pore size. The slide was allowed to dry and dip-coated in a solution of alkoxysilane-terminated PDMS with a molecular weight of 60 000 g mol−1. It was then heated to 120 °C to facilitate the curing process. The resulting surface was very regular and resistant to frost (ice formation took seven times longer than on untreated glass). The ice adhesion strength to the coated surface was reduced from 1.8 MPa to 150 kPa; the de-icing behaviour was maintained over 50 freeze–melt cycles, proving the stability of the coating. The coating's coefficient of friction was also less than half that of a surface treated with 1H,1H,2H,2H-perfluorodecyltriethoxysilane, representative of PFAS used in anti-icing applications. This behaviour is attributed to the flexibility of the siloxane backbone: ice must be broken away from a highly crystalline, perfluorinated structure (regardless of its surface tension), but can be pushed along a ‘slippery’ PDMS coating (Fig. 7). Such behaviour suggests that PDMS may soon offer a viable alternative for PFAS in the de-icing field.
+
+Fig. 7
+View large Download slide
+
+De-icing behaviour of glass coated with (a) 1H,1H,2H,2H-perfluorodectyltriethoxysilane and (b) ‘loop-like’ PDMS of molecular weight 60 000 g mol−1. While the low surface tension of the terminal CF3 groups in the fluorinated coating allow for a relatively low force to be applied to break the ice away from the coating, the highly flexible siloxane backbone allows ice to slide along the surface, meaning that even less de-icing force is required. Reproduced from ref. 111 with permission from John Wiley and Sons, X. Hao, Z. Sun, S. Wu, T.-W. Wang, Y. Liu, Y. Wu, X. He, Q. Liu and F. Zhou, Adv. Mater. Interfaces, 2022, 9, 2200160, copyright 2022.
+
+Wang and McCarthy present an even simpler approach for attaching ‘slippery omniphobic covalently attached liquids’ (SOCALs) to glass surfaces.112  A glass slide was dip-coated in an acidic solution of dimethyldimethoxysilane in isopropanol; upon drying at ambient temperature and humidity, the silanes hydrolysed and polymerised to form a 3–4 nm thick coating, thought to be comprised of brush-like PDMS structures protruding from the glass surface. In addition to its ice resistance, this coating was remarkably oil repellent. A drop of hexane placed on its surface had a low static contact angle (19.4°) but immediately slid off when the surface was tilted to a 1° incline. This indicates that the surface is oleophobic, hinting at the broader applicability of siloxanes in future grease-repellent coatings. Liu et al. reduced the SOCAL synthesis to a single step – dip-coating a plasma-treated silicon wafer in dichlorodimethylsilane and drying in air – and proved that the coating was resistant to ultraviolet (UV) radiation, sonication, and mechanical wear, all of which are important for industrial applicability.113  Anti- and de-icing, as a field, represents a relatively unexplored area of research that will come into greater focus as applications for which it is needed are more widely adopted. The excellent performance of the coatings described above suggests the potential for widespread use of siloxanes in this area, ideally before the use of PFAS in coatings becomes established.
+
+Aqueous film-forming foams
+
+One of the most well-known sources of PFAS pollution is the application of aqueous film-forming foams (AFFFs), which are used to quench oil-based fires and have been identified as a major contaminant emerging from airport and military training point sources.39  AFFFs are formulations stored as a concentrated aqueous solution that are then diluted to 3–6% by volume114  in water and sprayed across the surface of a fuel fire. These formulations are complex, with various components fulfilling different functions. The PFAS (typically a sulfonamide, amido carboxylic acid, or sulfobetaine of backbone 4–10C atoms115 ) serves to reduce the surface tension of the aqueous foam, allowing it to rapidly spread across the surface of a hydrophobic fuel and create an oxygen barrier that suppresses the flames. The oleophobic tail of PFAS surfactants has the added benefit of resisting fuel transport, meaning that fuel will take longer to penetrate to the air interface, and fires are therefore less likely to re-ignite.116  Important metrics for the performance of potential fluorine-free formulations (F3s) include low surface tension, fast spreading across the fuel surface, rapid fire suppression, and the ability to resist re-ignition; it is also ideal if the chosen surfactant has a low critical micelle concentration (CMC), meaning that less material will be required to generate a stable emulsion.41,117,118 
+
+Fluorosurfactants account for only a small fraction of AFFF composition. Before dilution, foam formulations contain about 2% PFAS by weight; a further 5–10% is accounted for by other surfactants.40  These surfactants, usually hydrocarbon-based, serve as anti-foaming agents to prevent gas permeation through the film. However, their relatively high surface tension prevents them from matching the spreading performance of fluorosurfactants.117  Where hydrocarbons are used, silicone surfactants, usually with a PDMS tail and a poly(ethylene oxide) (PEO) head, are often added to reduce the total amount of material required to form an emulsion.119  The role of this surfactant in fire suppression was not previously considered, but its presence suggests that siloxanes can be easily incorporated into foam formulations.
+
+The ability of a surfactant to spread across a fuel fire is given by its spreading coefficient, S = γo − γw − γow, where γo represents the surface tension of the fuel (oil), γw represents the surface tension of the foam (water), and γow represents the surface tension at the interface between the fuel and the foam.120  When S > 0, a film will spread across the surface of the fuel. It is therefore essential that potential surfactants reduce the surface tension of water as much as possible, since its high surface tension makes it immiscible with many oils. In general, a formulation must have a total surface tension less than 25 mN m−1, although many PFAS surfactants reduce surface tension to below 20 mN m−1.121 
+
+Methyl-functionalised siloxanes have low surface tension (between 20 and 22 mN m−1, within acceptable limits for AFFFs).12,121  Rather, it is the head groups of siloxane surfactants that often prove problematic: most commercial siloxane surfactants bear PEO heads, which have significantly higher surface energy and, depending on the chain length, can exhibit surface tensions ranging from 30 to 40 mN m−1.95  Research has therefore focused on alternative, often shorter or charged, hydrophilic heads that have a less significant impact on the surfactant's surface tension.
+
+It has been demonstrated that surfactants with high concentrations of terminal methyl groups, and organofunctionalized siloxanes in particular, are highly effective at lowering the surface tension of aqueous solutions.121–123  To investigate the surface tension of silanes (characterised by their Si–C bonds, as opposed to the Si–O bonds in siloxanes), Brown et al. developed cationic and zwitterionic surfactants with triethylsilyl chains.124  These surfactants were hypothesised to be more resistant to high temperature, given the relative stability of the Si–C bond; however, their surface tensions (between 35 and 40 mN m−1) were too high to be practical in firefighting applications, despite their branched structures. The authors concluded that the flexibility of the Si–O linkage played a significant role in the surface tension reduction of siloxane surfactants.
+
+Tri- and tetrasiloxane surfactant tails have been frequently explored in firefighting foams due to their high concentration of terminal methyl groups. The structure allows for the siloxane tail to sit at air interfaces, like an ‘umbrella,’ while the head group interacts with the water in the foam formulation (Fig. 8).125  These surfactants have been shown to spread effectively across polyethylene, demonstrating their ability to reduce surface tension on low-energy surfaces.126  Snow et al. synthesised a series of umbrella-type surfactants with cationic (aminobetaine), anionic (sulfate or sulfonate), and zwitterionic (sulfo-aminobetaine) head groups and investigated their ability to reduce surface tension.125  At concentrations of 0.1 wt% in water, surfactants from all three groups reduced surface tension to below 22 mN m−1; the surfactants also increased the wetting area of water droplets on polyethylene surfaces by a factor of three, suggesting that they would readily spread across hydrophobic surfaces. A major concern with these surfactants was their long-term stability: while the solid surfactants could be stored for months without consequence, siloxane bond cleavage was observed within minutes when the surfactants were stored at pH < 5 or > 8, and some of the surfactants decomposed over several months when stored in aqueous solution.125,127  The observed hydrolysis was attributed to localised acidity generated around the sulfobetaine moiety when interacting with bulk water. Addition of buffers or cosurfactants slowed the rate of hydrolysis (to days, rather than minutes), but could not prevent it entirely.127  If these molecules are to be used in FFFs, they will need either to be stored as dry powders or under as-yet-unidentified stabilising conditions.
+
+Fig. 8
+View large Download slide
+
+‘Umbrella’-type sulfobetaine siloxane surfactants with (a) trisiloxane125  and (b) tetrasiloxane118  tails. The siloxane sits on top of the water interface like an umbrella. Increasing the hydrophobicity and CH3 content of the tail through the addition of an extra trimethylsilyl group is associated with decreases in both critical micelle concentration and surface tension. Adapted from ref. 125 with permission from American Chemical Society (ACS), S. A. Snow, W. N. Fenton, M. J. Owen, copyright 1990; with data reproduced from ref. 118 with permission from Elsevier, R. Ananth, K. M. Hinnant, M. C. Davis, A. W. Snow, C. M. Bunton, S. Karwoski and J. P. Farley, Fire Saf. J., 2024, 147, 104199, copyright 2017.
+
+Ananth et al. investigated the impact of siloxane tail structure on the performance of zwitterionic sulfobetaine surfactants.118  They found that, in comparison to the trisiloxane surfactants reported previously, increasing the hydrophobicity of the tail to a tetrasiloxane (Fig. 8) reduced both the CMC (0.27 vs. 0.59 mM) and surface tension (20.6 vs. 21.7 mN m−1) of the resulting surfactant. This phenomenon was attributed to the higher concentration of methyl groups at the surface, leading to a more effective saturation of the air interface when applied to a fuel. Foam formulations containing the tetrasiloxane surfactant were found to be more resistant to fuel permeation and were faster at suppressing both gasoline and heptane fires; however, they were less resistant to drainage over time, possibly due to reduced electrostatic interactions between the charged head groups.
+
+Several studies have investigated the effect of non-ionic head groups on tri- and tetrasiloxane surfactant performance. Blunk et al. claim a series of sugar-modified siloxane surfactants for firefighting foams; the head groups contain 1–4 sugar units and were found to spread more quickly across a fuel surface than analogous materials with head groups based on PEO (Fig. 9a).128  Improved spreading and stability was attributed to the hydrogen-bonding capabilities of the sugar units, allowing them to effectively form micelles within the water layer. Li et al. synthesised a decynediol-ethoxylate-modified trisiloxane surfactant (Fig. 9b) with a surface tension of 19.2 mN m−1,129  comparable to many PFAS (13–24 mN m−1,60  see Table 1 for examples). Unusually, this molecule has a highly branched head group, conferring additional, hydrocarbon-like hydrophobicity; this was thought to increase its spreading rate and improve its acid resistance (tolerant to pH 4, cf. 5 for comparable trisiloxane surfactants125 ). Branching may also prevent the formation of air pockets, which are vulnerable points for fuel infiltration. However, the head group used in this study (2,4,7,9-tetramethyl-5-decyne-4,7-diol ethoxylate) is too expensive to be industrially applicable. For viability, a more affordable (and likely less complex) starting material must be identified.
+
+Fig. 9
+View large Download slide
+
+Non-ionic siloxane surfactants proposed for use in fluorine-free firefighting foams: (a) representative example of sugar-modified trisiloxane surfactants;128  (b) highly branched, ethoxylate-modified trisiloxane surfactants (n = 1–4).129 
+
+AFFFs are composed of a mixture of surfactant components; these components interact with each other in ways that are not always understood. Similarly, the performance of siloxane surfactants can be improved by combining them with other, typically hydrocarbon-based, surfactants. In a 2021 patent, Ananth et al. claimed a mixture of poly(oxyethylene)-trisiloxane and poly(glucoside)-alkene surfactants that demonstrates a similar spreading rate and extinction time to commercial AFFFs when applied at a 50% higher flow rate.130  Although the film was less resistant to burnback than commercial AFFFs (due to its relatively high surface tension), it demonstrated better burnback resistance and increased foam degradation time compared to existing fluorine-free foam formulations. Additionally, it was stable on heptane, an improvement over gasoline, which is typically used for fire extinction tests. The researchers attributed the success of this formulation to the synergistic interactions between the siloxane and hydrocarbon surfactants, which enabled packing into bilayers.131  A mixture of the two surfactant components outperforms either one individually.
+
+Sheng et al. reported an F3 composed of a mixture of commercial siloxane (CoatOsil-77, a PEO-terminated tetrasiloxane) and hydrocarbon (BS-12, which bears a zwitterionic amido head group) surfactants, mixed with magnesium hydroxide nanoparticles.132  Increased nanoparticle concentration did not affect the surface tension of the films (ca. 21.5 mN m−1), likely because the nanoparticles did not interact with siloxanes and therefore would not be expected to concentrate at air interfaces. However, the nanoparticles act as thermal insulators, preventing the middle of the foam from heating as rapidly and therefore slowing its drainage. They are also thought to prevent gas transport through the film, helping to delay burnback.
+
+Due to the high-profile nature of AFFFs as sources of PFAS pollution and the widespread effort to develop alternatives, a relatively large number of siloxane-based surfactant structures have been proposed. Hinnant et al. recently compiled a database of 71 F3 surfactants and their properties; 39 of these are based on siloxanes.133  Many of the documented surfactants meet performance requirements only in combination with additives and are inadequate replacements for PFAS on their own. A better understanding of siloxane surfactants, independent of other formulation components, is required to comprehend their role in firefighting.
+
+Another problem when comparing studies is the lack of adherence to a uniform set of standards. In both academic and patent literature, reports often focus on a select few properties that are inconsistent across studies, making direct comparisons of surfactant performance difficult. Adherence to a single, well-defined standard (e.g., the US DoD's performance specifications for F3s134 ) will allow for a better understanding of the strengths and weaknesses of various surfactants.
+
+Finally, the thermal decomposition products of siloxane surfactants may represent a potential environmental concern. It is essential to identify the products released from these foams and compare their risk profile with that of a PFAS-containing AFFF. To date, no experimental work has investigated the degradation of siloxane surfactants at high temperatures. Etz et al. performed a computational study on the decomposition of a PEO-terminated trisiloxane surfactant.135  According to their model, the most likely decomposition pathway involves the formation of radicals along the PEO chain (the siloxanes are more stable than organics at high temperatures). The most likely ultimate products following radical recombination are low molecular weight PDMS (from the tail) and small molecules like formaldehyde and ethylene (from the head). These results suggest that the products of siloxane surfactant degradation could be of less environmental concern than PFAS; however, experimental validation and a survey of a wider range of surfactant structures are needed to support this conclusion.
+
+Enhanced oil recovery agents
+
+Despite ongoing efforts to transition to a renewable economy, oil remains a valuable commodity in both energy and materials production.136  The dwindling supply of oil available worldwide,137  and the environmental damage associated with its extraction (particularly during hydraulic fracturing, or ‘fracking’138 ), makes efficient extraction of known reserves a priority.
+
+There are three stages to oil recovery.136  Primary oil recovery involves pumping and using a well's existing hydraulic pressure to retrieve about 10% of its oil. Secondary oil recovery – pumping a high-pressure stream of water or a readily available gas like carbon dioxide through a reservoir – can extract another 20–40% of the reserve. Chemical flooding or gas injection is required to extract the remaining oil, a process referred to as tertiary or ‘enhanced’ oil recovery (EOR).
+
+One of the major challenges associated with oil extraction is the need to remove a hydrophobic material (oil) from one that is hydrophilic (sand), which often contains a subcomponent with a strong binding affinity for organic moieties like aromatic or long-chain aliphatic hydrocarbons (natural organic matter).139  When water is injected into a reservoir, much of the oil will remain bound to the rock. Surfactants are therefore used for two purposes: first, to coat the rock surfaces and render them both hydro-and oleophobic so that the oil will not stick to them, and second, to generate a stable aqueous foam capable of transporting the oil out of the reservoir (Fig. 10).136 
+
+Fig. 10
+View large Download slide
+
+Use of fluorosurfactants in enhanced oil recovery. In a reservoir, crude oil is most likely to sorb to carbonaceous material and will not readily detach with the injection of water. The addition of a fluorosurfactant coats the surfaces of the reservoir, rendering them hydro- and oleophobic; it also generates a stable aqueous foam so that the oil can be transported out of the reservoir.136 
+
+Fluorosurfactants have proved very useful for the above purpose because they have oleophobic tails and are effective at extremely low concentrations. Thompson demonstrated that cationic PFAS surfactants could be used at concentrations as low as 10 mg L−1 to lower the surface tension of acidic solutions (used in fracking) or brine (mimicking seawater) to between 19 and 24 mN m−1.140  The foams generated by fluorosurfactants contain air pockets in which oil can become trapped, meaning that the oil will be effectively transported out of the well when the foam is injected.141  A viable replacement for fluorosurfactants in the oil recovery sector must lower the surface tension of water to below 25 mN m−1, be hydro- and oleophobic, and maintain its structure when heated (foam formulations are often injected as gases).34,41,136  Given that surfactants are directly released to the environment,138  degradability into benign end products is also important.
+
+Alternatives development in the EOR sector has largely focused on hydrocarbons and biomolecules. Certain hydrophobins, from a class of cysteine-rich proteins, have been explored for their ability to form amphiphobic foams, but their surface tension (35 mN m−1) is too high for stable form formation.34,142  Highly branched hydrocarbon structures based on sodium sulfate salts and glycolipids93  have been proposed; these compounds are hydrophobic but lack oleophobicity. A biological approach involves growing microbial films on the surface of rocks, thereby displacing the oil; however, this approach is only thought to be applicable for a minority of reservoirs.143 
+
+Siloxane surfactants can lower surface tension to the required levels for EOR and appear to be a promising alternative. To date, few options have been explored. Zhao et al. report a trisiloxane phosphate surfactant with a room-temperature surface tension of 27.4 mN m−1; its surface tension decreased with increasing temperature, suggesting possible applicability in high-temperature injection fluid.144  Furthermore, the foam remained stable at high concentrations (>30 g L−1) of NaCl, MgCl2, and CaCl2, with minimal increase in surface tension, indicating compatibility with seawater.
+
+Gemini surfactants (those with one head or ‘spacer unit’ and two tails) are of interest in EOR because of their synergistic interactions with one another, allowing for their use in concentrations up to ten times lower than that of an analogous single-tailed surfactant.145  Tri- or tetrasiloxane-based gemini surfactants with spacers including glucosamides/PEO146,147  and aminobetaines148  have been successfully synthesised. All these molecules have surface tensions low enough for use in EOR, but their foam formation abilities and oleophobicity have not been assessed.
+
+Some of the fluorosurfactants known to work well in EOR have structural features that resemble known siloxane replacements. The addition of PFAS with sulfobetaine-containing head groups (Fig. 11a) to a mixture of hydrocarbon surfactants improved the stability of the resulting foam in crude oil by 300%;149  the tetrasiloxane surfactants developed for firefighting foams130  (discussed above, Fig. 11b) have similar head groups and are worth testing as drop-in replacements. Adibhatla et al. coated silicate-rich (mica) and carbonate-rich (calcite) rock with perfluoroalkyl triethoxysilane derivatives.150  The silicate-rich rock was rendered oleophobic, likely because of the formation of covalent bonds between the Si–OH groups on the rock surface and the hydrolysed silanes. This suggests that alkoxysilane-terminated siloxane surfactants may find widespread use in EOR.
+
+Fig. 11
+View large Download slide
+
+Structural similarity between (a) perfluorinated sulfobetaines used in enhanced oil recovery (EOR)149  and (b) tetrasiloxane-sulfobetaine surfactants proposed for use in fluorine-free firefighting foams.118,130  The low surface tension of the siloxane tail suggests that it may be useful as a drop-in replacement for EOR formulations.
+
+The above examples demonstrate the merit of assessing siloxane surfactants developed for other applications to determine their suitability in EOR, particularly where there is overlap with chemical structures known to be effective in fluorinated compounds. However, siloxanes as a class have limitations that may prevent their applicability in all oil recovery scenarios. Aqueous solutions containing hydrochloric acid are often injected into carbonate-rich sands to react with the carbonates and generate a foam.151  As the known state-of-the-art trisiloxane surfactants are unstable below pH 5,125  such surfactants may be incompatible with acidic formulations or may need to be stored separately from the rest of the solution prior to use. It is also unclear how these surfactants will behave at end-of-life; given that they are entering the environment directly, studies are required to understand their fate and potential toxicity before they are widely adopted.
+
+Mould release chemicals
+
+Moulding is an important process in the manufacture of polymeric and composite materials. A cured component must cleanly release from its mould (typically metal or ceramic) with a minimal input of force.152  Polymeric PFAS, particularly PTFE, are often used as release coatings because they exhibit thermal stability, non-reactivity, low surface energy (leading to low delamination force requirements), and low surface roughness (to prevent adhesion via mechanical interlocking).41,152  Although other release coatings based on hydrocarbon waxes or silicones are used for many applications, including the manufacture of thermoplastics,41  there remain several high-temperature applications for which no viable alternative has been identified.
+
+Few studies have directly compared the performance of fluoropolymers and silicones for mould release applications. Sánchez-Urbano et al. compared a PTFE coating to a PDMS rubber as release agents for polyurethane foams and found that, while both materials preserved the structure of the foam upon release, the rubber coating required double the input of force to induce delamination.153  Over time, this extra force was expected to result in more frequent coating failures, slowing productivity on an industrial scale and likely introducing defects to the moulded materials.
+
+Critchlow et al. compared a commercial, PDMS-containing release chemical (Frekote B15/710 NC) to commercially available fluoropolymers for the manufacture of aerospace-grade epoxy resin in a metal mould.152  They found that the PDMS lowered the release force to a level comparable to or better than the fluoropolymers, and attributed this behaviour to the ability of the silicone to infill surface irregularities in the metal, creating a smooth surface for easy delamination. However, they noted that the silicone was not covalently bound to the metal surface and needed to be replenished during the curing process. It was suggested that a more permanent solution would be preferable.
+
+Perfluoroalkyl-functionalised alkoxysilanes (Fig. 12) are used to coat some metal surfaces, suggesting that their hydrolysable silane groups could also be used to covalently tether low-surface energy siloxane surfactants to a mould. However, it was noted that the silanes assembled in very thin monolayers, meaning that any surface irregularities in the mould surface were retained and adhesion due to interlocking became a concern.152 
+
+Fig. 12
+View large Download slide
+
+General structure for perfluoroalkyl-functionalised alkoxysilanes, used to make mould release coatings for metals (n = 1–4, R = Me or Et). Low surface energy siloxanes may offer an alternative to PFAS as a surface coating for this application.152 
+
+It has been proposed that high polymeric mobility (the ability for individual chains within a polymer to slip past each other) may contribute to the effectiveness of a mould release chemical: individual chains within the coating are constantly in motion and therefore do not experience strong interactions with a polymer during the curing process.154  Polysiloxanes are very flexible, and strategies exist to covalently tether long PDMS chains to metal surfaces (see the discussion of oleophobic coatings above). A similar approach may prove useful for the development of more permanent silicone release coatings than those described above. However, even these coatings may be unsuitable for all applications. At high temperatures (>200 °C) over long periods, silicones remain susceptible to decomposition and will likely require the addition of stabilising agents to be suitable replacements for PFAS.155 
+
+Limitations of siloxanes as PFAS replacements
+
+Although recent progress has enabled the development of amphiphobic and low-surface tension siloxane materials with high potential to replace PFAS across several sectors, some limitations of siloxanes as a chemical class prevent their use in other applications. Generally, these limitations become relevant in applications where extreme chemical stability or purity is required. Key examples of applications where siloxanes are unsuitable to replace PFAS include specialised lubricants, heat transfer fluids, surfactants for semiconductor etching, and polymers and small molecules for energy storage.
+
+High-performance lubricants and greases
+
+PFAS (typically fluoropolymers such as PTFE and perfluorinated polyethers) have historically been used as additives for synthetic lubricants and greases,41  which reduce friction between moving components and prevent overheating in mechanical devices.152  These fluoropolymers have proven difficult to replace in high-temperature, high-stress devices, such as the bearings and gaskets of aerospace and military devices or greases for vacuum pumps, where extreme thermal stability and non-reactivity is required.41,155  PDMS oils offer a wide range of operating temperatures (−70 to 200 °C) and are compatible with most polymers, but are typically unstable to UV radiation and are susceptible to wear and tear, leading to more spreading and leakage than is acceptable for these applications.155  In many existing formulations, silicone is already used as the base fluid for lubricants or oils, with small amounts of fluoropolymers added to stabilise the mixture.155  It is therefore more likely that silicones will continue to serve as the base fluid for lubricants and greases, and new stabilising agents will need to be developed.
+
+Heat transfer fluids
+
+Both liquid and gaseous fluorinated molecules are widely used as heat transfer fluids (HTFs) because of their stability across a wide range of temperatures. PFAS are particularly desirable as liquid HTFs because they offer a wide range of operating temperatures, are compatible with typical containment materials (aluminium, stainless steel, PTFE, and thermoplastic polyolefins), are non-flammable, and have high thermal conductivity with a very low incidence of contamination.156,157  Siloxanes have boiling points too high to serve as viable replacements for fluorinated gases (e.g., 175 °C for D4). Liquid silicone oils are stable across a wide range of temperatures and are non-flammable, but are prone to leakage and may be contaminated with, or decompose to form, silicate particles that can damage electronic components.156  Because PFAS-based HTFs are relatively expensive compared to other technologies, they have already been phased out where possible, and new technologies will be required to address the remaining essential uses of fluorinated refrigerants.
+
+Surfactants for semiconductor manufacturing
+
+Semiconductors, printed circuit boards, and microchips are essential devices for modern life. To ensure proper function, circuit patterns must be precisely etched onto silicon wafers.41  This etching is typically performed using concentrated aqueous solutions of phosphoric or nitric acid, which have relatively high surface tensions and therefore cannot make 90° turns to precisely etch the entire surface of a desired engraving pattern. Fluorinated surfactants, such as fluoroalkyl sulfonamides, are added to etching solutions to reduce their surface tension and allow them to wet effectively around tight corners.158  They have proven difficult to replace because no other known compounds are both effective at reducing surface tension and stable to the harsh pH conditions in solution (typically <2 or >13).59  Siloxane surfactants, although effective at reducing surface tension, are unlikely to replace PFAS in etching solutions because their Si–O linkages, regardless of steric hindrance, are unlikely to survive high solution acidity.59  Furthermore, any silicon-containing decomposition products will deposit on and damage printed circuit boards, rendering them unusable.156  Replacements for these fluorosurfactants are more likely to arise from hydrocarbon surfactants, which are better able to withstand harsh pH conditions.59 
+
+Lithium-ion batteries
+
+Both fluoropolymers and non-polymeric PFAS are widely used in energy storage devices such as lithium ion (Li-ion) batteries. PVDF or PTFE are often used to coat the cathode of Li-ion batteries, as they are electrochemically stable and non-reactive with the battery's electrolyte solution, and maintain their structural integrity over multiple charge–recharge cycles.42,159  Polysiloxanes are unlikely to be suitable replacements in this context, as they are susceptible to hydrolysis and cannot contain cathode material due to their low rigidity.42  Ionically conductive inorganic polymers have recently been developed as substitutes for PTFE.160,161  The bis(trifluoromethanesulfonyl)imide ion, TFSI−, is commonly used as a stabilising ion for Li+ ions in solution at concentrations of up to 10 wt% because it has excellent ionic conductivity, thermal and oxidative stability, and flame retardance.162  As yet, no suitable alternative has been identified. Siloxanes are unsuitable to replace TFSI− as they are relatively large and comparatively unstable to oxidising conditions. Recently, E-Lyte and Nanoramic developed a proprietary, PFAS-free electrolyte solution, though its composition is undisclosed.163 
+
+Just as the essential properties of siloxanes dictate where they are likely to serve as viable PFAS replacements, the structure of siloxanes presents significant limitations. Siloxanes are susceptible to degradation by acids and bases and prone to contamination and decomposition during use, which limits their applicability in electronic applications. The development of siloxane-based PFAS alternatives is, therefore, better directed towards materials and processing applications where acidic and basic operating conditions are less likely.
+
+Discussion and future outlook
+
+Siloxanes possess several properties that make them viable alternatives to PFAS in certain applications, but lack others that would enable their broader use. Given that the properties of PFAS arise from their unique chemical and structural features, it is unlikely that a single class of compounds would be able to emulate all their desirable functions. In certain cases, however, a replacement compound could fulfil the property conferred by PFAS via a different mechanism, and these are cases that deserve particular attention when identifying suitable alternatives. A summary of the current ability of siloxanes to replace the various functions of PFAS is provided in Table 4. In situations where siloxanes fail the standard performance metric for PFAS, but offer equivalent function as measured by a different property, alternative metrics have been proposed.
+
+Table 4 
+
+Summary of current ability of siloxanes to meet PFAS performance requirements for essential uses. Where applicable, alternative metrics for assessing the performance of siloxanes have been provided
+
+Essential PFAS property	Performance requirement using conventional metric	Met by siloxanes?	Proposed alternative metric for meeting performance requirement
+Hydrophobicity	Static contact angle > 90°	Yes (130° for PDMS)47 	N/A
+Oleophobicity	Static contact angle > 90°	No	Sliding contact angle < 10° (ref. 112)
+Flame retardance (military applications)	Extinction of flame on 28 ft2 pool of gasoline in < 60 s; resistance to burnback for > 240 s (ref. 134)	No (‘umbrella-type’ sulfobetaine-siloxane have extinction time 62 s, burnback time 205 s)118 	Reassessment of standards to determine whether performance is adequate with existing materials (siloxane approaches standard)
+Low surface energy (surface coatings)	Depends on application; generally, surface energy < 20–25 mN m−1 (ref. 41)	Sometimes (PDMS has surface energy 20–22 mN m−1, depending on chain length)48 	Delamination energy < 1 MPa; coefficient of friction < 0.04 (ref. 111)
+Low surface tension (surfactants)	Surface tension < 25 mN m−1 (ref. 121)	Yes (lab-scale, ‘umbrella-type’ sulfobetaine-siloxanes have surface energies 21–22 mN m−1)118,125 	N/A
+Acid/base stability	Stable at pH < 2, pH > 13 (ref. 59)	No	None at present
+Absence of impurities	≥ 99.9% purity without likelihood of decomposition156 	No	None at present
+Oxidative stability	No decomposition while cycling between 3.0–4.3 V at 25 °C (ref. 164)	No	None at present
+View large
+
+A prime example of the incommensurability of siloxanes and PFAS concerns oleophobicity. The flexibility of the siloxane bond and the lack of crystallinity of molecules containing this motif were initially thought to be a barrier to oleophobicity.44  However, that same rotational mobility allows low-surface-tension methyl groups to preferentially migrate to air interfaces and continuously rotate, resulting in very little cohesion between liquids and the material surface.47  Oils slide off PDMS-coated surfaces with very little applied force – in some cases, less than would be required for a PFAS-coated surface.111,112  However, oils and other low-surface tension liquids wet across PDMS surfaces, meaning that siloxane oleophobicity cannot be detected by the conventional method of using static contact angles.79  This unexpected mechanism of oil repellence illustrates the importance of thorough investigation of material properties to determine whether the functions of PFAS can be substituted via different chemical architectures.
+
+Oleophobic siloxane coatings have two main features: (1) the siloxane is covalently bound to the substrate, and (2) a high concentration of methyl groups is exposed to the surface of the material.52,103,111,112  This has been achieved either by the polymerization of a methyl-terminated silane to generate a relatively rigid, crosslinked network structure103  or through the stepwise growth of brush-like, high-molecular-weight PDMS structures from a surface.96,112,113  Most syntheses proposed to date are straightforward and occur on an industrially reasonable timescale (between 1 hour and 1 day for complete curing). However, much remains unknown regarding the impact of factors such as (a) polymerisation (step-growth from silanes versus the deposition of pre-polymerised PDMS on a substrate surface); (b) molecular weight of the polymer used; and (c) the type and density of covalent linkages between the polymer and the coated surface. Furthermore, all studies to date have focused solely on polymeric, PDMS-based coatings; it is worth understanding whether small surfactant molecules can offer similar oleophobicity when coated on a surface.
+
+Siloxanes and silicones are highly effective in reducing surface tension to a value that typically meets the requirements for applications where PFAS are used (20–22 mN m−1). Typically, it is the organic head groups that increase the surface tension of siloxane-based surfactants. Many industrially relevant siloxane surfactants contain head groups based on polyethers, which have surface tensions ranging from 30 to 40 mN m−1.95  The head groups most used in fluorosurfactants (i.e., carboxylic acids and sulfonic acids in their protonated or anionic forms) are likely incompatible with acid-labile siloxane tails.3,47  Complex head group architectures remain limited in scope; the sulfobetaine head currently favoured by the US DoD was reported in 1990 (ref. 118 and 125) and renders its siloxane tails susceptible to hydrolysis in water.127  Further research is needed to expand the scope of head groups for siloxane-based surfactants.
+
+One of the major challenges identified for using siloxane surfactants as PFAS replacements is the lability associated with the siloxane structure. The umbrella-type surfactant tails, currently the gold standard for siloxane-based PFAS replacements, are only stable between pH 5 and 8,125  precluding their use in almost any application requiring an acidic or basic environment. There are a few possible approaches to mitigating this effect. If the surfactant is used only briefly and its in-use stability over long periods is non-essential (i.e., in EOR), engineering control might be used to separate the siloxane from acidic solution, with mixing occurring immediately before use. Alternatively, structural modification of the surfactant tail may improve its stability. Similarly, the careful design of head groups may alter the packing parameters of a surfactant and therefore provide greater stability. However, at extremely high or low pH, siloxanes will likely remain susceptible to decomposition.
+
+The toxicity and end-of-life fate of most siloxane compounds have not been reported, and there is little understanding of how hydrocarbon surfactant heads will degrade independently of siloxane tails. To avoid regrettable substitution, future alternatives development should consider the toxicity, bioaccumulation potential, and environmental fate of siloxane surfactants and their degradation products. Before widespread adoption of siloxane-based technologies, such analysis will support assertions that the surfactants are safe alternatives and that they will readily degrade to benign by-products. Environmental fate is of particular importance in applications like EOR, where the surfactant is directly released to the environment and containment is impossible.
+
+Clearly, siloxanes and silicones are not a silver bullet to replace every PFAS use case. They appear to be suitable for several applications (i.e., amphiphobic coatings, ice-resistant surfaces, firefighting foams, surfactants for EOR) and unsuitable for others (refrigerants, etching solutions for semiconductor manufacture, Li-ion batteries). However, where the fundamental properties of siloxanes allow their use, full substitution may be possible. Many of the alternative formulations proposed to date include co-constituents such as nanoparticles,94,111,132  hydrocarbon-based surfactants,131  or stabilising agents165  to confer additional desirable properties (such as improving the thermal stability of firefighting foams). Synergism between various chemical classes will likely allow for substitution in applications where siloxanes alone are unsuitable.
+
+One of the disadvantages of the essential-use model is the blind spot that arises from encouraging the development of alternatives to PFAS by application rather than by compound. A set of tests targeting one application may overlook other properties of a molecule that make it useful in a different context. Some examples of this, mentioned above, are surfactants developed for firefighting foams that have potential for use in EOR (Fig. 11) and SOCALs, which are currently used in anti-icing coatings but could also be applicable for mould release applications. While it is unreasonable for a single investigation to assess every possible property of a compound, thorough and consistent tests of novel siloxane molecules will make it easier for other researchers to quickly screen them for viability in a desired use case. For direct comparison of surfactants and assessment of their utility, data about solubility, critical micelle concentration, water and oil contact angles, and environmental stability, as well as application-focused information such as fire retardancy and foamability, are particularly useful.
+
+Machine learning and artificial intelligence are emerging as important tools to assist in the prediction of molecular behaviour, both in-use and at end-of-life. However, potential training datasets for siloxanes are limited by the lack of empirical data currently available, and no reliable predictive softwares are optimised for silicones. Experimental chemists will need to collect and report properties data to accelerate the development of these models.
+
+As a chemical class, siloxanes possess several desirable properties (hydrophobicity, low surface tension, thermal stability) that may allow them to replace PFAS in applications like amphiphobic coatings, oil recovery agents, and mould release agents. Their limitations, including acid lability, reactivity, and susceptibility to decomposition and contamination, prevent them from being used in harsher environments. Relatively little is known about siloxane surfactants, both in terms of structural scope and their environmental behaviour. Further research is required to address both gaps. For existing molecules, more detailed property analysis is needed to understand where they can best be used. Careful cost and environmental impact assessments are required for potential alternatives to ensure that they are safe and economically feasible. Where siloxanes offer equal or improved performance to PFAS, and their synthesis is industrially achievable, these molecules may offer a ‘temporary’ solution to the forever chemical problem.
+
+Author contributions
+
+E. M. D.-B. – conceptualisation, investigation, visualisation, writing – original draft. M. A. N. – conceptualisation, validation, writing – review & editing. M. K., L. P. P., J. L.-Y. C., E. L. – conceptualisation, validation, writing – review & editing, supervision, funding acquisition.
+
+Conflicts of interest
+
+There are no conflicts to declare.
+
+Note added after first publication
+
+This article replaces the version published on 1 Jun 2026 that contained errors in fluorinated polymer bonding in Fig. 1 and 2, Scheme 1 and the graphical abstract image. The Royal Society of Chemistry apologises for these errors.
+
+Data availability
+
+No primary research results, software, or code have been included, and no new data were generated or analysed, as part of this review.
+
+Acknowledgements
+
+This work was supported by the Royal Society Te Apārangi Marsden Grant (MFP-UOA2328).
+
+References
+1.
+CompTox Chemicals Dashboard , https://comptox.epa.gov/dashboard/chemical-lists/PFASSTRUCTV5, accessed 29 May 2025.
+2.
+Z. Wang, A. M. Buser, I. T. Cousins, S. Demattio, W. Drost, O. Johansson, K. Ohno, G. Patlewicz, A. M. Richard, G. W. Walker, G. S. White and E. Leinala, Environ. Sci. Technol., 2021, 55, 15575–15578.
+Google ScholarCrossref PubMedWeb of Science 
+3.
+J. Glüge, M. Scheringer, I. T. Cousins, J. C. DeWitt, G. Goldenman, D. Herzke, R. Lohmann, C. A. Ng, X. Trier and Z. Wang, Environ. Sci.: Processes Impacts, 2020, 22, 2345–2373.
+Google Scholar 
+4.
+R. C. Buck, J. Franklin, U. Berger, J. M. Conder, I. T. Cousins, P. de Voogt, A. A. Jensen, K. Kannan, S. A. Mabury and S. P. van Leeuwen, Integr. Environ. Assess. Manag., 2011, 7, 513–541.
+Google ScholarCrossref PubMed 
+5.
+H. Holmquist, S. Schellenberger, I. van der Veen, G. M. Peters, P. E. G. Leonards and I. T. Cousins, Environ. Int., 2016, 91, 251–264.
+Google ScholarCrossref PubMedWeb of Science 
+6.
+Z. Wang, J. C. DeWitt, C. P. Higgins and I. T. Cousins, Environ. Sci. Technol., 2017, 51, 2508–2518.
+Google ScholarCrossref PubMedWeb of Science 
+7.
+D. O'Hagan, Chem. Soc. Rev., 2008, 37, 308–319.
+Google ScholarCrossref PubMedWeb of Science 
+8.
+W. Lorpaiboon and J. Ho, J. Phys. Chem. A, 2023, 127, 7943–7953.
+Google ScholarCrossref PubMedWeb of Science 
+9.
+K. B. Wiberg and P. R. Rablen, J. Am. Chem. Soc., 1993, 115, 614–625.
+Google ScholarCrossref Web of Science 
+10.
+W. A. Zisman, in. Contact Angle, Wettability, and Adhesion, American Chemical Society, 1964, vol. 43, pp. 1–51.
+Google ScholarCrossref  
+11.
+A. R. Pitt, S. D. Morley, N. J. Burbidge and E. L. Quickenden, Colloids Surf., A, 1996, 114, 321–335.
+Google ScholarCrossref Web of Science 
+12.
+K. Esumi and M. Ueno, in. Structure-Performance Relationships in Surfactants, CRC Press, 2003.
+Google ScholarCrossref  
+13.
+J. Wang, G. Mao, C. K. Ober and E. J. Kramer, Macromolecules, 1997, 30, 1906–1914.
+Google ScholarCrossref Web of Science 
+14.
+M. K. Bernett and W. A. Zisman, J. Phys. Chem., 1960, 64, 1292–1294.
+Google ScholarCrossref Web of Science 
+15.
+I. T. Cousins, J. C. DeWitt, J. Glüge, G. Goldenman, D. Herzke, R. Lohmann, C. A. Ng, M. Scheringer and Z. Wang, Environ. Sci.: Processes Impacts, 2020, 22, 2307–2312.
+Google Scholar 
+16.
+L. P. Wackett, Microb. Biotechnol., 2024, 17, e14463.
+Google ScholarCrossref PubMedWeb of Science 
+17.
+R. B. Stockbridge and L. P. Wackett, Nat. Commun., 2024, 15, 4593.
+Google ScholarCrossref PubMedWeb of Science 
+18.
+M. Cole, A. Gomiero, A. Jaén-Gil, M. Haave and A. Lusher, Sci. Total Environ., 2024, 929, 172577.
+Google ScholarCrossref PubMedWeb of Science 
+19.
+K. Zhang, A. H. Hamidian, A. Tubić, Y. Zhang, J. K. H. Fang, C. Wu and P. K. S. Lam, Environ. Pollut., 2021, 274, 116554.
+Google ScholarCrossref PubMedWeb of Science 
+20.
+F. Li, J. Duan, S. Tian, H. Ji, Y. Zhu, Z. Wei and D. Zhao, Chem. Eng. J., 2020, 380, 122506.
+Google ScholarCrossref Web of Science 
+21.
+W. F. Hartz, M. K. Björnsdotter, L. W. Y. Yeung, A. Hodson, E. R. Thomas, J. D. Humby, C. Day, I. E. Jogsten, A. Kärrman and R. Kallenborn, Sci. Total Environ., 2023, 871, 161830.
+Google ScholarCrossref PubMedWeb of Science 
+22.
+H. Brunn, G. Arnold, W. Körner, G. Rippen, K. G. Steinhäuser and I. Valentin, Environ. Sci. Eur., 2023, 35, 20.
+Google ScholarCrossref Web of Science 
+23.
+A. M. Calafat, L.-Y. Wong, Z. Kuklenyik, J. A. Reidy and L. L. Needham, Environ. Health Perspect., 2007, 115, 1596–1602.
+Google ScholarCrossref PubMedWeb of Science 
+24.
+W. Bil, H. P. McKeon, G. Chen, M. L. S. P. Sam, I. D. Grift, F. R. M. van der Klis, E. R. A. Vos, M. Schipper, L. de Wit-Bos, M. Mengelers, B. G. H. Bokkers and R. Nederlof, PFAS in bloed van de Nederlandse bevolking, Rijksinstituut voor Volksgezondheid en Milieu, 2025.
+Google Scholar 
+25.
+Per- and polyfluoroalkyl substances , Australian Bureau of Statistics, https://www.abs.gov.au/articles/per-and-polyfluoroalkyl-substances, accessed 21 January 2026.
+26.
+B. J. Apelberg, F. R. Witter, J. B. Herbstman, A. M. Calafat, R. U. Halden, L. L. Needham and L. R. Goldman, Environ. Health Perspect., 2007, 115, 1670–1676.
+Google ScholarCrossref PubMedWeb of Science 
+27.
+R. B. Jain, Environ. Res., 2013, 126, 51–59.
+Google ScholarCrossref PubMedWeb of Science 
+28.
+H. B. Lauritzen, T. L. Larose, T. Øien, T. M. Sandanger, J. Ø. Odland, M. van de Bor and G. W. Jacobsen, Environ. Health, 2018, 17, 9.
+Google ScholarCrossref PubMedWeb of Science 
+29.
+S. J. Vagi, E. Azziz-Baumgartner, A. Sjödin, A. M. Calafat, D. Dumesic, L. Gonzalez, K. Kato, M. J. Silva, X. Ye and R. Azziz, BMC Endocr. Disord., 2014, 14, 86.
+Google ScholarCrossref PubMedWeb of Science 
+30.
+Listing of POPs in the Stockholm Convention , https://www.pops.int/TheConvention/ThePOPs/AllPOPs/tabid/2509/Default.aspx, accessed 21 January 2026.
+31.
+Updated rules for cosmetics - EPA , https://www.epa.govt.nz/hazardous-substances/rules-notices-and-how-to-comply/specific-substance-guidance/cosmetics/updated-rules-for-cosmetics/, accessed 4 June 2025.
+32.
+R. Figuière, L. T. Miaz, E. Savvidou and I. T. Cousins, Environ. Sci. Technol., 2025, 59, 2031–2042.
+Google ScholarCrossref PubMedWeb of Science 
+33.
+I. T. Cousins, G. Goldenman, D. Herzke, R. Lohmann, M. Miller, C. A. Ng, S. Patton, M. Scheringer, X. Trier, L. Vierke, Z. Wang and J. C. DeWitt, Environ. Sci.: Processes Impacts, 2019, 21, 1803–1815.
+Google Scholar 
+34.
+J. Glüge, R. London, I. T. Cousins, J. DeWitt, G. Goldenman, D. Herzke, R. Lohmann, M. Miller, C. A. Ng, S. Patton, X. Trier, Z. Wang and M. Scheringer, Environ. Sci. Technol., 2022, 56, 6232–6242.
+Google ScholarCrossref PubMedWeb of Science 
+35.
+L. P. Padhye, M. Kah, E. Leitao, K. Bowles, P. Nathanail, I. T. Cousins, R. Figuière, B. Clarke, J. M. Partington, W. S. A. Alghamdi, E. Sunderland, B. J. Ruyle, S. Endo, T. N. Brown, Z. Wang, S. Zheng, J. J. Pignatello, S. J. Smith, M. Riegel, H. P. H. Arp, J. Blotevogel, R. J. Giraud, A. K. Rappe, E. Sørmo, G. Cornelissen, M. A. Deshusses, I. V. Novosselov, P. L. Ferguson, B. R. Pinkard, T. Strathmann, K. Gobindlal, J. Sperry, E. Cuervo Lumbaque, N. Duinslaeger, J. Radjenovic and J. Hatton, Sustainability Sci. Technol., 2026, 3, 012501.
+Google ScholarCrossref  
+36.
+I. T. Cousins, J. C. D. Witt, J. Glüge, G. Goldenman, D. Herzke, R. Lohmann, M. Miller, C. A. Ng, S. Patton, M. Scheringer, X. Trier and Z. Wang, Environ. Sci.: Processes Impacts, 2021, 23, 1079–1087.
+Google Scholar 
+37.
+Aqueous Film Forming Foam - The Complete Facts , https://internationalfireandsafetyjournal.com/aqueous-film-forming-foam/, accessed 4 June 2025.
+38.
+Overview of the Mechanism of Film Formation of AFFF , New ZealandEPA.
+39.
+B. J. Ruyle, C. P. Thackray, C. M. Butt, D. R. LeBlanc, A. K. Tokranov, C. D. Vecitis and E. M. Sunderland, Environ. Sci. Technol., 2023, 57, 8096–8106.
+Google ScholarCrossref PubMedWeb of Science 
+40.
+M. Ateia, J. V. Buren, W. Barrett, T. Martin and G. G. Back, ACS Sustain. Chem. Eng., 2023, 11, 7986–7996.
+Google ScholarCrossref PubMedWeb of Science 
+41.
+United States Department of Defense , Report on Critical Per- and Polyfluoroalkyl Substance Uses, 2023.
+42.
+E. K. Savvidou, A. Rensmo, J. P. Benskin, S. Schellenberger, X. Hu, M. Weil and I. T. Cousins, Environ. Sci. Technol., 2024, 58, 21908–21917.
+Google ScholarCrossref PubMedWeb of Science 
+43.
+G. Glenn, R. Shogren, X. Jin, W. Orts, W. Hart-Cooper and L. Olson, Compr. Rev. Food Sci. Food Saf., 2021, 20, 2596–2625.
+Google ScholarCrossref PubMedWeb of Science 
+44.
+F. Cirisano and M. Ferrari, Coatings, 2021, 11, 1508.
+Google ScholarCrossref Web of Science 
+45.
+M. J. Owen, in. Advances in Silicones and Silicone-Modified Materials, American Chemical Society, 2010, vol. 1051, pp. 13–18.
+Google Scholar 
+46.
+P. Mazurek, S. Vudayagiri and A. L. Skov, Chem. Soc. Rev., 2019, 48, 1448–1464.
+Google ScholarCrossref PubMedWeb of Science 
+47.
+M. J. Owen, in. Silicon-Based Polymer Science, American Chemical Society, 1989, vol. 224, pp. 705–739.
+Google ScholarCrossref  
+48.
+Q. S. Bhatia, J.-K. Chen, J. T. Koberstein, J. E. Sohn and J. A. Emerson, J. Colloid Interface Sci., 1985, 106, 353–359.
+Google ScholarCrossref Web of Science 
+49.
+H. W. Starkweather Jr, Polym. Eng. Sci., 1965, 5, 5–6.
+Google ScholarCrossref  
+50.
+F. M. Fowkes, Ind. Eng. Chem., 1964, 56, 40–52.
+Google ScholarCrossref Web of Science 
+51.
+Y. Xiang, P. Fulmek, D. Platz and U. Schmid, Langmuir, 2022, 38, 1631–1637.
+Google ScholarCrossref PubMedWeb of Science 
+52.
+F. Shen, J. Liu, L. Cai, H. Shi, H. Liu, Y. Zhao, Y. Wu, X. Chen, S. Wu and D. Wang, Chem. Eng. J., 2025, 163934.
+Google Scholar 
+53.
+B. Arkles and P. Redinger, in. Biocompatible Polymers, Metals and Composites, Technomic Publishing, 1983, pp. 749–768.
+Google Scholar 
+54.
+A. C. Marmo and M. A. Grunlan, ACS Macro Lett., 2023, 12, 172–182.
+Google ScholarCrossref PubMedWeb of Science 
+55.
+Where Silicon Materials Can Replace PFAS - Coatings World , https://www.coatingsworld.com/buyersguide/profile/siltech-corp/view_where-silicon-materials-can-replace-pfas/, accessed 5 June 2025.
+56.
+J. C. Carpenter, J. A. Cella and S. B. Dorn, Environ. Sci. Technol., 1995, 29, 864–868.
+Google ScholarCrossref PubMedWeb of Science 
+57.
+M. J. Hunter, J. F. Hyde, E. L. Warrick and H. J. Fletcher, J. Am. Chem. Soc., 1946, 68, 667–672.
+Google ScholarCrossref PubMedWeb of Science 
+58.
+M. Cypryk and Y. Apeloig, Organometallics, 2002, 21, 2165–2175.
+Google ScholarCrossref Web of Science 
+59.
+R. Sharma, S. Shelke, M. Bagheri Kashani, G. Morose, C. Christuk and R. Nagarajan, J. Clean. Prod., 2023, 415, 137879.
+Google ScholarCrossref Web of Science 
+60.
+Typical values of surface energy for materials and adhesives , https://www.twi-global.com/technical-knowledge/faqs/faq-what-are-the-typical-values-of-surface-energy-for-materials-and-adhesives.aspx, accessed 5 June 2025.
+61.
+J. E. Mark, Acc. Chem. Res., 2004, 37, 946–953.
+Google ScholarCrossref PubMedWeb of Science 
+62.
+A. Maertens, E. Golden and T. Hartung, ACS Sustain. Chem. Eng., 2021, 9, 7749–7758.
+Google ScholarCrossref PubMedWeb of Science 
+63.
+G. J. Puts, P. Crouse and B. M. Ameduri, Chem. Rev., 2019, 119, 1763–1805.
+Google ScholarCrossref PubMedWeb of Science 
+64.
+Safety Data Sheet, Chloroform , https://www.sigmaaldrich.com/NZ/en/sds/SIAL/288306?userType=undefined, accessed 30 October 2025.
+65.
+Safety Data Sheet, Hydrofluoric Acid , https://www.sigmaaldrich.com/NZ/en/sds/sigald/339261?userType=undefined, accessed 30 October 2025.
+66.
+Test No. 302C: Inherent Biodegradability: Modified MITI Test (II) , OECD, Paris, 2009.
+67.
+Test No. 308: Aerobic and Anaerobic Transformation in Aquatic Sediment Systems , OECD, Paris, 2025.
+68.
+M. A. Brook, Silicon in Organic, Organometallic, and Polymer Chemistry, New York, 2000.
+Google Scholar 
+69.
+B. Brandt, E. Kletzer, H. Pilz, D. Hadzhiyska and P. Seizov, Silicon-Chemistry Carbon Balance: an Assessment of Greenhouse Gas Emissions and Reductions, Global Silicones Council; Centre Europeen des Silicones; Silicones Environmental, Health, and Safety Council of North America, ilicone Industry Association of Japan, 2012.
+Google Scholar 
+70.
+M. A. Brook and Y. Chen, Macromolecules, 2025, 58, 3742–3763.
+Google ScholarCrossref PubMedWeb of Science 
+71.
+Down Wash Direct , https://nikwax.com/en-us/products/waterproofing/clothing-waterproofing/down-wash-direct/, accessed 9 June 2025.
+72.
+Selleys Water Shield , https://www.selleys.co.nz/products/cleaning-and-maintenance/other/selleys-water-shield/, accessed 9 June 2025.
+73.
+How can CoatOSil Additives Replace PFAS-Containing Materials in Coatings? , https://www.specialchem.com/coatings/guide/pfas-free-coatosil-additives, accessed 30 October 2025.
+74.
+PFASs and Alternatives in Cosmetics: Report on Commercial Availability and Current Uses , Organization for Economic Co-operation and Development, 2024.
+75.
+F. Sandmeyer and B.-J. Bachmeier, US Pat., US 20230331919A1, 2023.
+76.
+D. Lay, I. Keyte, S. Tiscione and J. Kreissig, Check Your Tech: A Guide to PFAS in Electronics, ChemSec, 2023.
+Google Scholar 
+77.
+Sycor Technology , High-Temperature Wire: Silicone vs. Teflon, https://www.sycor.com/blog/post/high-temperature-wire-silicone-vs-teflon, accessed 30 October 2025.
+78.
+B. Améduri and H. Hori, Chem. Soc. Rev., 2023, 52, 4208–4247.
+Google ScholarCrossref PubMedWeb of Science 
+79.
+A. T. Wolf and A. Stammer, Polymers, 2024, 16, 2220.
+Google ScholarCrossref PubMedWeb of Science 
+80.
+G. J. Puts and P. L. Crouse, J. Fluorine Chem., 2014, 168, 260–267.
+Google ScholarCrossref Web of Science 
+81.
+N. Yanagihara and T. Katoh, Green Chem., 2022, 24, 6255–6263.
+Google ScholarCrossref Web of Science 
+82.
+A. Marrugo-Padilla, A. B. Atencio-Diaz, M. F. Barros-Domínguez, J. D. Guerra-Rivadeneira, L. V. Hernandez-Cuesta and L. M. Viloria-Gamez, J. Appl. Toxicol., 2025, 45, 902–915.
+Google ScholarCrossref PubMedWeb of Science 
+83.
+A. L. Quinn, J. M. Regan, J. M. Tobin, B. J. Marinik, J. M. McMahon, D. A. McNett, C. M. Sushynski, S. D. Crofoot, P. A. Jean and K. P. Plotzke, Toxicol. Sci., 2007, 96, 1.
+Google Scholar 
+84.
+A. L. Quinn, A. Dalu, L. S. Meeker, P. A. Jean, R. G. Meeks, J. W. Crissman, R. H. Gallavan and K. P. Plotzke, Reprod. Toxicol., 2007, 23, 532–540.
+Google ScholarCrossref PubMedWeb of Science 
+85.
+A. Franzen, T. Greene, C. Van Landingham and R. Gentry, Toxicol. Lett., 2017, 279, 2–22.
+Google ScholarCrossref PubMedWeb of Science 
+86.
+D. Mackay, D. E. Powell and K. B. Woodburn, Environ. Sci. Technol., 2015, 49, 11913–11922.
+Google ScholarCrossref PubMedWeb of Science 
+87.
+D. Krenczkowska, K. Mojsiewicz-Pieńkowska, B. Wielgomas, D. Bazar and Z. Jankowski, Pharmaceutics, 2020, 12, 586.
+Google ScholarCrossref PubMedWeb of Science 
+88.
+D. Krenczkowska, K. Mojsiewicz-Pieńkowska, B. Wielgomas, K. Cal, R. Bartoszewski, S. Bartoszewska and Z. Jankowski, Chemosphere, 2019, 231, 607–623.
+Google ScholarCrossref PubMedWeb of Science 
+89.
+K. Mojsiewicz-Pieńkowska, M. Jamrógiewicz, K. Szymkowska and D. Krenczkowska, Front. Pharmacol, 2016, 7, 132.
+Google ScholarCrossref PubMedWeb of Science 
+90.
+Y. Chen, Y. Lam Ip, L. Zhou, P. Y. Li, Y. M. Chan, W. C. Lam, K. K. W. Li, D. H. Steel and Y. K. Chan, Materials, 2022, 15, 269.
+Google ScholarCrossref Web of Science 
+91.
+Regulation - EU - 2024/1328 - EN - EUR-Lex , https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ%3AL_202401328&qid=1715919472757, accessed 5 June 2025.
+92.
+PFAS Substitution Guide for Textile Supply Chains , Rise Research Institute of Sweden, 2022.
+93.
+S. Alexander, G. N. Smith, C. James, S. E. Rogers, F. Guittard, M. Sagisaka and J. Eastoe, Langmuir, 2014, 30, 3413–3421.
+Google ScholarCrossref PubMedWeb of Science 
+94.
+C. Dignes, N. J. Nicolas, T. B. H. Schroeder and J. Aizenberg, Adv. Eng. Mater., 2024, 27, 2401736.
+Google ScholarCrossref  
+95.
+G. Korosi and E. S. Kovats, J. Chem. Eng. Data, 1981, 26, 323–332.
+Google ScholarCrossref Web of Science 
+96.
+Y. Cheng, S. Wang, Z. Xu, L. Jiang and Y. Zhao, Prog. Org. Coat., 2023, 183, 107726.
+Google ScholarCrossref Web of Science 
+97.
+Rethinking Plastics in Aotearoa New Zealand , Office of the Prime Minister’s Chief Scientific Advisor, 2019.
+98.
+S. Guzman-Puyol, npj Sci. Food, 2024, 8, 82.
+Google ScholarCrossref PubMedWeb of Science 
+99.
+J. Strakova, J. Schneider and N. Cingotti, Throwaway Packaging, Forever Chemicals: European wide survey of PFAS in disposable food packaging and tablerware, Arnika, 2021, https://www.env-health.org/wp-content/uploads/2021/05/FINAL_pfas_fcm_study_web.pdf.
+100.
+M. Lerch, R. Fengler, G.-R. Mbog, K. H. Nguyen and K. Granby, Food Packag. Shelf Life, 2023, 35, 100992.
+Google ScholarCrossref Web of Science 
+101.
+D. W. Phelps, L. V. Parkinson, J. M. Boucher, J. Muncke and B. Geueke, Environ. Sci. Technol., 2024, 58, 5670–5684.
+Google ScholarCrossref PubMedWeb of Science 
+102.
+C. Andersson, Packag. Technol. Sci., 2008, 21, 339–373.
+Google ScholarCrossref  
+103.
+Z. Tang, D. W. Hess and V. Breedveld, J. Mater. Chem. A, 2015, 3, 14651–14660.
+Google ScholarCrossref Web of Science 
+104.
+I. Torun, M. Ruzi, F. Er and M. S. Onses, Prog. Org. Coat., 2019, 136, 105279.
+Google ScholarCrossref Web of Science 
+105.
+J. Neng, Y. Yang, J. Yu, Q. Guo and K. Yang, Food Packag. Shelf Life, 2025, 49, 101509.
+Google ScholarCrossref Web of Science 
+106.
+A. Kottmann, E. Mejía, T. Hémery, J. Klein and U. Kragl, Chem.–Asian J., 2017, 12, 1168–1179.
+Google ScholarCrossref PubMedWeb of Science 
+107.
+R. M. Fillion, A. R. Riahi and A. Edrisy, Renewable Sustainable Energy Rev., 2014, 32, 797–809.
+Google ScholarCrossref Web of Science 
+108.
+T.-S. Wong, S. H. Kang, S. K. Y. Tang, E. J. Smythe, B. D. Hatton, A. Grinthal and J. Aizenberg, Nature, 2011, 477, 443–447.
+Google ScholarCrossref PubMedWeb of Science 
+109.
+N. Maeda, Molecules, 2021, 26, 392.
+Google ScholarCrossref PubMedWeb of Science 
+110.
+C. Li, S. Apelt, A. Feuer, R. Idrisov and U. Bergmann, J. Adhes., 2025, 101, 1906–1921.
+Google ScholarCrossref Web of Science 
+111.
+X. Hao, Z. Sun, S. Wu, T.-W. Wang, Y. Liu, Y. Wu, X. He, Q. Liu and F. Zhou, Adv. Mater. Interfaces, 2022, 9, 2200160.
+Google ScholarCrossref  
+112.
+L. Wang and T. J. McCarthy, Angew. Chem., Int. Ed., 2016, 55, 244–248.
+Google ScholarCrossref  
+113.
+J. Liu, Y. Sun, X. Zhou, X. Li, M. Kappl, W. Steffen and H.-J. Butt, Adv. Mater., 2021, 33, 2100237.
+Google ScholarCrossref PubMedWeb of Science 
+114.
+Performance Specification: Fire Extinguisging Agent, Aqueous Film-Forming Foam (AFFF) Liquid Concentrate, for Fresh and Sea Water, United States Department of Defense, 2020.
+115.
+B. J. Place and J. A. Field, Environ. Sci. Technol., 2012, 46, 7120–7127.
+Google ScholarCrossref PubMedWeb of Science 
+116.
+K. M. Hinnant, S. L. Giles and R. Ananth, Fire Saf. J., 2017, 91, 653–661.
+Google ScholarCrossref Web of Science 
+117.
+G. G. Back, D. Martin, N. Lieb, L. Huffert, J. Farley and S. Karwoski, Firefighting Capabilities Assessment of Commercially Available PFAS-free Foams and Agents, 2021.
+Google Scholar 
+118.
+R. Ananth, K. M. Hinnant, M. C. Davis, A. W. Snow, C. M. Bunton, S. Karwoski and J. P. Farley, Fire Saf. J., 2024, 147, 104199.
+Google ScholarCrossref Web of Science 
+119.
+R. M. Hill, Curr. Opin. Colloid Interface Sci., 2002, 7, 255–261.
+Google ScholarCrossref Web of Science 
+120.
+Y. Sheng, M. Xue, L. Ma, Y. Zhao, Q. Wang and X. Liu, Fire Technol., 2021, 57, 2079–2096.
+Google ScholarCrossref Web of Science 
+121.
+R. H. Hetzer, F. Kummerlin, K. Wirz and D. Blunk, Fire Testing a New Fluorine-free AFFF Based on a Novel Class of Environmentally Sound High Performance Siloxane Surfactants, International Association for Fire Safety Science, 2014, https://www.researchgate.net/publication/268224146_Fire_Testing_a_New_Fluorine-free_AFFF_Based_on_a_Novel_Class_of_Environmentally_Sound_High_Performance_Siloxane_Surfactants.
+122.
+G. D. Barbosa, F. W. Tavares and A. Striolo, J. Chem. Theory Comput., 2024, 20, 7300–7314.
+Google Scholar 
+123.
+S. Alexander, J. Eastoe, A. M. Lord, F. Guittard and A. R. Barron, ACS Appl. Mater. Interfaces, 2016, 8, 660–666.
+Google ScholarCrossref PubMedWeb of Science 
+124.
+J. R. Brown, M. D. Madsen, A. Ateş, R. Islam, S. Ham, B. Agbo, K. K. Nikoo, B. Y. Lattimer, R. Qiao, R. Xie and T. E. Long, Phys. Fluids, 2023, 35, 073102.
+Google ScholarCrossref Web of Science 
+125.
+S. A. Snow, W. N. Fenton and M. J. Owen, Langmuir, 1990, 6, 385–391.
+Google ScholarCrossref Web of Science 
+126.
+R. M. Hill, Curr. Opin. Colloid Interface Sci., 1998, 3, 247–254.
+Google ScholarCrossref Web of Science 
+127.
+A. W. Snow and R. Ananth, Langmuir, 2024, 40, 4831–4844.
+Google ScholarCrossref PubMedWeb of Science 
+128.
+D. Blunk, R. Helmut, A. Sager-Wiedmann and K. Wirz, US Pat., US009687686B2, 2017.
+129.
+X. Li, L. Zhang, Y. Li, L. Liu, R. Wang, H. Zhou and D. Zhang, Langmuir, 2024, 40, 21711–21718.
+Google ScholarCrossref PubMedWeb of Science 
+130.
+R. Ananth, A. W. Snow, K. Hinnant and S. L. Giles, US Pat., US11117008, 2021.
+131.
+R. Ananth, A. W. Snow, K. M. Hinnant, S. L. Giles and J. P. Farley, Colloids Surf., A, 2019, 579, 123686.
+Google ScholarCrossref Web of Science 
+132.
+Y. Sheng, D. Hu, Y. Li, S. Zhang, T. Wang and Q. Zhao, J. Mol. Liq., 2024, 415, 126328.
+Google ScholarCrossref  
+133.
+K. M. Hinnant, P. E. Sudol, J. A. Cramer, D. W. Moore, L. C. Brown, C. M. Bunton, M. C. Davis, A. W. Snow and R. Ananth, ACS Omega, 2025, 10, 42270–42281.
+Google ScholarCrossref PubMedWeb of Science 
+134.
+Performance Specification: Fire Extinguishing Agent, Fluorine-free Foam (F3) Liquid Concentrate, for Land-Based, Fresh Water Application , United States Department of Defense.
+135.
+B. D. Etz, M. Mifkovic, S. Vyas and M. K. Shukla, Chemosphere, 2022, 308, 136351.
+Google ScholarCrossref PubMedWeb of Science 
+136.
+P. M. Murphy and T. Hewat, J. Pet. Eng., 2008, 1, 58–61.
+Google ScholarCrossref  
+137.
+Years of fossil fuel reserves left , https://ourworldindata.org/grapher/years-of-fossil-fuel-reserves-left, accessed 17 June 2025.
+138.
+S. Makki, E. Maalouf and A. Yehya, Heliyon, 2025, 11, e40883.
+Google ScholarCrossref PubMedWeb of Science 
+139.
+Sediment Toxicity of Petroleum Hydrocarbon Fractions, Battelle , 2007.
+140.
+A. K. Vikingstad, M. G. Aarra and A. Skauge, Colloids Surf., A, 2006, 279, 105–112.
+Google ScholarCrossref Web of Science 
+141.
+J. L. Thompson, US Pat., US4108782, 1976.
+142.
+M. Blesic, V. Dichiarante, R. Milani, M. Linder and P. Metrangolo, Pure Appl. Chem., 2018, 90, 305–314.
+Google ScholarCrossref Web of Science 
+143.
+J. D. Desai and I. M. Banat, Microbiol. Mol. Biol. Rev., 1997, 61, 47–64.
+Google ScholarPubMedWeb of Science 
+144.
+W. Zhao, Y. Cheng, S. Lu, L. Su, N. Wang and J. Pu, J. Mol. Liq., 2023, 390, 123154.
+Google ScholarCrossref Web of Science 
+145.
+M. S. Kamal, J. Surfactants Deterg., 2016, 19, 223–236.
+Google ScholarCrossref Web of Science 
+146.
+W. Guoyong, Q. Wenshan, D. Zhiping, W. Wanxu and L. Qiuxiao, J. Phys. Chem. B, 2013, 117, 3154–3160.
+Google ScholarCrossref PubMedWeb of Science 
+147.
+F. Han and G. Zhang, Colloids Surf., A, 2004, 237, 79–85.
+Google ScholarCrossref Web of Science 
+148.
+C.-P. Chen, F. Lu and Q.-X. Tong, J. Mol. Liq., 2018, 266, 504–513.
+Google ScholarCrossref Web of Science 
+149.
+W. A. Rendall, C. Ayasse and J. Novosad, US Pat., US5074358, 1991.
+150.
+B. Adibhatla, K. K. Mohanty, P. Berger and C. Lee, J. Pet. Sci. Eng., 2006, 52, 227–236.
+Google ScholarCrossref Web of Science 
+151.
+H. Chen, Z. Li, F. Wang, A. Li, S. Wanambwa and T. Lu, Energy Sci. Eng., 2020, 8, 1092–1103.
+Google ScholarCrossref  
+152.
+G. W. Critchlow, R. E. Litchfield, I. Sutherland, D. B. Grandy and S. Wilson, Int. J. Adhes. Adhes., 2006, 26, 577–599.
+Google ScholarCrossref Web of Science 
+153.
+F. Sánchez-Urbano, G. Paz-Gómez, Ó. Rodríguez-Alabanda, P. E. Romero, M. Cabrerizo-Vílchez, M. Á. Rodríguez-Valverde and G. Guerrero-Vaca, Coatings, 2018, 8, 301.
+Google ScholarCrossref Web of Science 
+154.
+J. D. Andrade, V. Hlady and S.-I. Jeon, in Hydrophilic Polymers, American Chemical Society, 1996, vol. 248, pp. 51–59.
+Google ScholarCrossref  
+155.
+R. Whiting, J. Kreissig, F. M. Christensen, N. Pandya, T. Winther and M. T. Jensen, PFAS and Fluorine-free Alternatives in Lubricants and Construction Products, Danish Environmental Protection Agency, 2024.
+156.
+PFAS-Containing Heat Transfer Fluids Used in Semiconductor Manufacturing, Semiconductor PFAS Consortium Heat Transfer and Thermal Test Fluid Working Group, 2023.
+157.
+Factsheet ‘PFAS and Semiconductors’, Zvei, 2023.
+158.
+R. C. Buck, P. M. Murphy and M. Pabon, in. Polyfluorinated Chemicals And Transformation Products, ed. T. P. Knepper and F. T. Lange, Springer, Berlin, Heidelberg, 2012, pp. 1–24.
+Google Scholar 
+159.
+Y. Wang, X. Yang, Y. Meng, Z. Wen, R. Han, X. Hu, B. Sun, F. Kang, B. Li, D. Zhou, C. Wang and G. Wang, Chem. Rev., 2024, 124, 3494–3589.
+Google ScholarCrossref PubMedWeb of Science 
+160.
+GRST , https://alphahouseltd.co.uk/poweredby-grst/, accessed 19 June 2025.
+161.
+Lithium-ion Batteries , https://www.zsw-bw.de/en/newsroom/news/news-detail/news/detail/News/lithium-ion-batteries-new-ecofriendly-process-for-mass-manufacturing-nickel-rich-cathodes.html, accessed 19 June 2025.
+162.
+Y. Wang, Z. Wu, F. M. Azad, Y. Zhu, L. Wang, C. J. Hawker, A. K. Whittaker, M. Forsyth and C. Zhang, Nat. Rev. Mater., 2024, 9, 119–133.
+Google ScholarCrossref Web of Science 
+163.
+E. Kish, Nanoramic® Laboratories and E-Lyte Innovations Announce Strategic R&D Partnership, https://www.nanoramic.com/post/nanoramic-laboratories-and-e-lyte-innovations-announce-strategic-r-d-partnership, accessed 18 December 2024.
+164.
+J. Cha, K. Nam, J. Baek, S. Seo, K. Kwak, J.-W. Kim, W. Kim, K. H. Ryu, D.-W. Kim and E. Kwon, J. Mater. Chem. A, 2023, 11, 14180–14186.
+Google ScholarCrossref Web of Science 
+165.
+Better without , : PTFE-free silicone grease for the food industry - ELKALUB High Performance Lubricants, https://www.elkalub.com/profile/press/press-details/better-without-ptfe-free-silicone-grease-for-the-food-industry-3, accessed 18 June 2025.
+© 2026 The Author(s). Published by the Royal Society of Chemistry
+This article is licensed under a Creative Commons Attribution-Non Commercial 4.0 Unported Licence. You can use material from this article in other publications without requesting further permissions from the RSC, provided that the correct acknowledgement is given and it is not used for commercial purposes.
+View metrics
+Email alerts
+Latest issue alert
+Follow this journal:
+
+
+Citing articles via
+Google Scholar
+New and popular articles
+Latest
+Most read
+Most cited
+Promoting complete carbon utilization in Fischer–Tropsch Synthesis by tail-gas methanation
+Expansion of a paints and coatings solvent guide. Combining solvent guides and Hansen solubility parameters for greener solvent and solvent mixture selection
+Correction: Adaptation of laboratory equipment for use by students with disabilities
+Online ISSN 2753-8125
+Legal
+Privacy
+Accessibility
+Contact us
+© Royal Society of Chemistry 2026 | Registered charity number 207890.
+Your privacy is important to us
+This website uses cookies and similar technologies to store and retrieve information about your use of this website. Some cookies are necessary for our website to work properly and others are optional. This information helps us to provide, analyse and improve our services, which may include personalised content or advertising. We may share this information with Google and other third parties.
+
+
+
+We and our 1013 partner(s) store and access personal data, like browsing data or unique identifiers, on your device. Selecting Allow all enables tracking technologies to support the purposes shown under we and our partners process data to provide. If trackers are disabled, some content and ads you see may not be as relevant to you. You can resurface this menu to change your choices or withdraw consent at any time by clicking the Manage Preferences link on the bottom of the webpage. Your choices will have effect within our Website. For more details, refer to our Privacy Policy.View Privacy Policy
+
+IAB vendors can:
+
+Actively scan device characteristics for identification. Use precise geolocation data. Store and/or access information on a device. Use limited data to select advertising. Create profiles for personalised advertising. Use profiles to select personalised advertising. Create profiles to personalise content. Use profiles to select personalised content. Measure advertising performance. Measure content performance. Understand audiences through statistics or combinations of data from different sources. Develop and improve services. Use limited data to select content.
+List of IAB vendors
+
+Allow all
+Cookie settings
