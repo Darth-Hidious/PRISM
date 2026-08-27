@@ -778,6 +778,66 @@ pub struct CoverageGap {
     pub peers_measured: i64,
 }
 
+/// One paper, read and written up — a node in the research DAG.
+///
+/// Research is not a list of extracted numbers. A paper that was read and not
+/// understood is a paper that was fetched for nothing, and until this existed
+/// PRISM stored a paper's IDENTITY and discarded its abstract, so nothing in
+/// the system could say what any source had actually said.
+///
+/// `led_from` is what makes the set a DAG rather than a list: it names the
+/// paper whose write-up sent the reader here. Two lines of enquiry that arrive
+/// at the same paper collide on `source_id`, exactly as two research paths
+/// reaching the same fact collide on `assertion_id` — convergence is recorded,
+/// not duplicated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperNote {
+    /// The paper's identity: DOI, arXiv id, or URL. Content-addressed, so
+    /// reading the same paper twice updates one node.
+    pub source_id: String,
+    pub title: String,
+    /// The paper's own abstract, kept verbatim. Fetched on every search and
+    /// thrown away before this column existed.
+    pub abstract_text: String,
+    /// What this paper actually said, in the reader's words. The review the
+    /// owner asked for: "a proper review of exactly what this paper was
+    /// about".
+    pub review: String,
+    /// The task this was read FOR, verbatim. The reward signal is the
+    /// original task, so a write-up that is not anchored to it cannot be
+    /// scored: "useful" is meaningless without "useful for what".
+    pub task: String,
+    /// What it means for that task — which is not the same as what the paper
+    /// is about. This is the reward-bearing judgement: a paper can be
+    /// excellent and contribute nothing here, and saying so is a real result,
+    /// not a failure.
+    ///
+    /// Nothing is EXCLUDED on the strength of this. Sources are reached
+    /// first and judged after; a filter that refuses to fetch cannot learn
+    /// that it was wrong.
+    pub relevance: String,
+    /// How deeply it was actually read: `"abstract"` or `"fulltext"`.
+    ///
+    /// Reading is two decisions, not one — triage on the abstract, then read
+    /// the whole paper when it earns it. Recording which happened is what
+    /// separates "this paper does not help" from "we never actually looked",
+    /// and those are different claims about the same source.
+    pub depth: String,
+    /// Why it stopped at the abstract, or why it went further. The judgement
+    /// behind the depth decision, kept because it is the part worth learning
+    /// from: reading a whole paper costs a turn, and whether that was repaid
+    /// is only answerable if the reason was written down.
+    pub depth_reason: String,
+    /// Where this paper says to look next. These are the DAG's out-edges.
+    pub next_steps: String,
+    /// The paper whose write-up led here, when one did. `None` for a root.
+    pub led_from: Option<String>,
+    /// The tool call that read it, joining this node to the trajectory.
+    pub origin_action_id: Option<String>,
+    pub tenant: String,
+    pub created_at: String,
+}
+
 /// Environment variable carrying the agent action id across a process
 /// boundary.
 ///
@@ -2482,6 +2542,30 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // DAG, so "which tool call bought this fact" is a real query rather than
     // an inference from timestamps.
     crate::add_column_if_absent(conn, "prov_activity", "origin_action_id", "TEXT").await?;
+
+    // One row per paper READ, carrying its abstract and the reader's write-up.
+    // Keyed on the paper's own identity so two enquiries arriving at the same
+    // paper converge on one node instead of writing it twice.
+    conn.execute(
+        r#"CREATE TABLE IF NOT EXISTS paper_note (
+            source_id TEXT NOT NULL,
+            tenant TEXT NOT NULL,
+            title TEXT,
+            abstract_text TEXT,
+            review TEXT,
+            task TEXT,
+            relevance TEXT,
+            depth TEXT,
+            depth_reason TEXT,
+            next_steps TEXT,
+            led_from TEXT,
+            origin_action_id TEXT,
+            created_at TEXT,
+            PRIMARY KEY (tenant, source_id)
+        )"#,
+        (),
+    )
+    .await?;
 
     // `prov_assertion` is the query-optimized AGGREGATE row: `confidence`,
     // `corroborations`, and `evidence_class` are caches over
@@ -5072,6 +5156,120 @@ impl ProvenanceStore {
     /// fresh paper path produces). Ordered by id for deterministic paging.
     /// Rows with no recorded status are not returned; they predate the
     /// status axis and are reached by `assertion_by_id`.
+    /// Write up one paper. Upserts on the paper's own identity, so reading
+    /// the same source twice deepens ONE node instead of forking it.
+    ///
+    /// A later abstract-only pass must not overwrite an earlier full read:
+    /// the deeper reading is the better record, and losing it because a
+    /// search re-surfaced the same paper would silently destroy work.
+    pub async fn record_paper_note(&self, note: &PaperNote) -> Result<()> {
+        let _guard = self.write_lock.lock().await;
+        self.conn
+            .execute(
+                r#"INSERT INTO paper_note
+                   (source_id, tenant, title, abstract_text, review, task, relevance,
+                    depth, depth_reason, next_steps, led_from, origin_action_id, created_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                   ON CONFLICT(tenant, source_id) DO UPDATE SET
+                       title = excluded.title,
+                       abstract_text = excluded.abstract_text,
+                       -- Never let a shallower re-read erase a deeper one.
+                       review = CASE WHEN excluded.depth = 'fulltext'
+                                       OR paper_note.depth IS NULL
+                                       OR paper_note.depth <> 'fulltext'
+                                     THEN excluded.review ELSE paper_note.review END,
+                       task = excluded.task,
+                       relevance = CASE WHEN excluded.depth = 'fulltext'
+                                          OR paper_note.depth IS NULL
+                                          OR paper_note.depth <> 'fulltext'
+                                        THEN excluded.relevance ELSE paper_note.relevance END,
+                       depth = CASE WHEN excluded.depth = 'fulltext'
+                                    THEN 'fulltext' ELSE paper_note.depth END,
+                       depth_reason = excluded.depth_reason,
+                       next_steps = excluded.next_steps,
+                       -- The FIRST path that reached this paper is kept: a
+                       -- later arrival is convergence, not a correction.
+                       led_from = COALESCE(paper_note.led_from, excluded.led_from),
+                       origin_action_id =
+                           COALESCE(paper_note.origin_action_id, excluded.origin_action_id)"#,
+                [
+                    Value::Text(note.source_id.clone()),
+                    Value::Text(note.tenant.clone()),
+                    Value::Text(note.title.clone()),
+                    Value::Text(note.abstract_text.clone()),
+                    Value::Text(note.review.clone()),
+                    Value::Text(note.task.clone()),
+                    Value::Text(note.relevance.clone()),
+                    Value::Text(note.depth.clone()),
+                    Value::Text(note.depth_reason.clone()),
+                    Value::Text(note.next_steps.clone()),
+                    note.led_from.clone().map_or(Value::Null, Value::Text),
+                    note.origin_action_id
+                        .clone()
+                        .map_or(Value::Null, Value::Text),
+                    Value::Text(note.created_at.clone()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every paper written up for a tenant, newest first.
+    ///
+    /// This is what a person reads to see what the research actually found —
+    /// the thing that did not exist while abstracts were fetched and thrown
+    /// away.
+    pub async fn paper_notes(&self, tenant: &str, limit: usize) -> Result<Vec<PaperNote>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT source_id, tenant, title, abstract_text, review, task, relevance, \
+                        depth, depth_reason, next_steps, led_from, origin_action_id, created_at \
+                 FROM paper_note WHERE tenant = ?1 \
+                 ORDER BY created_at DESC, source_id LIMIT ?2",
+                [
+                    Value::Text(tenant.to_string()),
+                    Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+                ],
+            )
+            .await?;
+        let mut notes = Vec::new();
+        while let Some(row) = rows.next().await? {
+            notes.push(PaperNote {
+                source_id: get_str(&row, 0)?,
+                tenant: get_str(&row, 1)?,
+                title: get_str(&row, 2)?,
+                abstract_text: get_str(&row, 3)?,
+                review: get_str(&row, 4)?,
+                task: get_str(&row, 5)?,
+                relevance: get_str(&row, 6)?,
+                depth: get_str(&row, 7)?,
+                depth_reason: get_str(&row, 8)?,
+                next_steps: get_str(&row, 9)?,
+                led_from: get_opt_str(&row, 10)?,
+                origin_action_id: get_opt_str(&row, 11)?,
+                created_at: get_str(&row, 12)?,
+            });
+        }
+        Ok(notes)
+    }
+
+    /// Papers that were read only as an ABSTRACT and said to be worth more.
+    ///
+    /// The DAG's live frontier: each is a node whose own write-up argues the
+    /// full text would repay a turn, and which nobody has gone back to. This
+    /// is what the loop should expand next, and its emptiness is a real
+    /// convergence signal — nothing left that reading further would answer.
+    pub async fn unfinished_reads(&self, tenant: &str, limit: usize) -> Result<Vec<PaperNote>> {
+        Ok(self
+            .paper_notes(tenant, 1_000)
+            .await?
+            .into_iter()
+            .filter(|note| note.depth != "fulltext" && !note.next_steps.trim().is_empty())
+            .take(limit)
+            .collect())
+    }
+
     /// Holes in the knowledge manifold, worst first.
     ///
     /// A cell is (subject, quantity). Woven cells have several independent
@@ -13037,5 +13235,143 @@ mod tests {
             2,
             "two different phases are two claims"
         );
+    }
+
+    // ── Paper notes: the research DAG's nodes ────────────────────────────
+
+    fn note(source: &str, depth: &str, review: &str, led_from: Option<&str>) -> PaperNote {
+        PaperNote {
+            source_id: source.into(),
+            tenant: LOCAL_TENANT.into(),
+            title: format!("Title of {source}"),
+            abstract_text: "The abstract, kept verbatim.".into(),
+            review: review.into(),
+            task: "alternatives to PFAS in seals".into(),
+            relevance: "bears on the seals sub-question".into(),
+            depth: depth.into(),
+            depth_reason: "numbers are in the tables".into(),
+            next_steps: "read its ref [12] on FFKM service temperature".into(),
+            led_from: led_from.map(ToString::to_string),
+            origin_action_id: Some("act-1".into()),
+            created_at: "2026-08-28T00:00:00Z".into(),
+        }
+    }
+
+    /// A paper that was read must be READABLE afterwards — abstract, review
+    /// and all. Before this existed PRISM stored a paper's identity and threw
+    /// its abstract away, so nothing could say what any source had said.
+    #[tokio::test]
+    async fn a_paper_that_was_read_can_be_read_back() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store
+            .record_paper_note(&note(
+                "doi:10.1/a",
+                "abstract",
+                "says FKM tops out at 230 C",
+                None,
+            ))
+            .await
+            .unwrap();
+        let notes = store.paper_notes(LOCAL_TENANT, 10).await.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].review, "says FKM tops out at 230 C");
+        assert!(!notes[0].abstract_text.is_empty(), "the abstract is kept");
+        assert_eq!(notes[0].task, "alternatives to PFAS in seals");
+    }
+
+    /// Reading the same paper twice deepens ONE node. And a later
+    /// abstract-only pass must never overwrite an earlier full read — losing
+    /// the deeper reading because a search re-surfaced the paper would
+    /// silently destroy the work that cost the most.
+    #[tokio::test]
+    async fn a_shallow_reread_never_erases_a_deeper_reading() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store
+            .record_paper_note(&note(
+                "doi:10.1/a",
+                "fulltext",
+                "FULL: tables 3-5 carry the data",
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .record_paper_note(&note(
+                "doi:10.1/a",
+                "abstract",
+                "skimmed, looks relevant",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let notes = store.paper_notes(LOCAL_TENANT, 10).await.unwrap();
+        assert_eq!(notes.len(), 1, "one paper is one node");
+        assert_eq!(notes[0].depth, "fulltext", "depth never regresses");
+        assert_eq!(
+            notes[0].review, "FULL: tables 3-5 carry the data",
+            "the deeper reading survives the shallower re-read"
+        );
+    }
+
+    /// Two enquiries reaching one paper CONVERGE on it — that is the DAG
+    /// property. The first path that got there is kept; a later arrival is
+    /// convergence, not a correction.
+    #[tokio::test]
+    async fn two_paths_to_one_paper_converge_on_a_single_node() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store
+            .record_paper_note(&note(
+                "doi:10.1/x",
+                "abstract",
+                "r1",
+                Some("doi:10.1/seals"),
+            ))
+            .await
+            .unwrap();
+        store
+            .record_paper_note(&note(
+                "doi:10.1/x",
+                "abstract",
+                "r2",
+                Some("doi:10.1/coatings"),
+            ))
+            .await
+            .unwrap();
+        let notes = store.paper_notes(LOCAL_TENANT, 10).await.unwrap();
+        assert_eq!(notes.len(), 1, "converging paths do not duplicate the node");
+        assert_eq!(
+            notes[0].led_from.as_deref(),
+            Some("doi:10.1/seals"),
+            "the first path in is the recorded edge"
+        );
+    }
+
+    /// The frontier: papers read only as an abstract whose own write-up says
+    /// there is more worth having. An empty frontier is a real convergence
+    /// signal — nothing left that reading further would answer.
+    #[tokio::test]
+    async fn the_frontier_is_what_was_read_shallowly_and_said_to_be_worth_more() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store
+            .record_paper_note(&note(
+                "doi:10.1/shallow",
+                "abstract",
+                "worth a full read",
+                None,
+            ))
+            .await
+            .unwrap();
+        let mut done = note("doi:10.1/done", "fulltext", "read fully", None);
+        done.next_steps = "read its ref [12]".into();
+        store.record_paper_note(&done).await.unwrap();
+
+        let frontier = store.unfinished_reads(LOCAL_TENANT, 10).await.unwrap();
+        assert_eq!(frontier.len(), 1, "only the shallow one is unfinished");
+        assert_eq!(frontier[0].source_id, "doi:10.1/shallow");
     }
 }
