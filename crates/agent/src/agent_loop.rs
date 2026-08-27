@@ -208,6 +208,34 @@ pub(crate) enum CycleStep {
     Stop,
 }
 
+/// The research state, in the words a person would use to ask "how is it
+/// going".
+///
+/// Rendered for the HUMAN at every handback, because watching a stream of tool
+/// calls tells you what the agent did and never what it is finding out. A
+/// researcher keeps notes; this is those notes, and every number in it is read
+/// back from the graph or the round counters rather than written by the model,
+/// so it cannot flatter itself.
+///
+/// Deliberately short. It appears between turns, repeatedly, and a paragraph
+/// there becomes wallpaper.
+fn research_note(round: RoundYield, totals: (usize, usize, usize)) -> String {
+    let (sources_seen, facts_total, searches) = totals;
+    let bought = if round.novel_facts > 0 {
+        format!("+{} facts", round.novel_facts)
+    } else if round.novel_sources > 0 {
+        format!("+{} new sources", round.novel_sources)
+    } else if round.unknown_yield {
+        "a result it could not read".to_string()
+    } else {
+        "nothing new".to_string()
+    };
+    format!(
+        "  this round: {} call(s) -> {bought}\n           so far: {facts_total} fact(s) stored · {sources_seen} source(s) seen · {searches} search(es)",
+        round.calls
+    )
+}
+
 /// The graph's own holes, phrased as research targets.
 ///
 /// A subject whose PEERS all report a quantity, and which does not, is a cell
@@ -3812,8 +3840,15 @@ pub(crate) async fn run_turn_inner(
                         );
                         emit(AgentEvent::TextDelta {
                             text: format!(
-                                "\n\n[continuing — {continuations}/{}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n",
-                                max_continuations()
+                                "\n\n[continuing — {continuations}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n{}\n\n",
+                                research_note(
+                                    round,
+                                    (
+                                        saturation.seen.len(),
+                                        saturation.facts_written,
+                                        saturation.searches.len()
+                                    )
+                                )
                             ),
                         });
                         // The graph's own holes, when it has any. Asked for
@@ -4853,6 +4888,57 @@ mod tests {
             CycleStep::Stop,
             "a model that has stopped gathering will not start because it was \
              told to keep going; that is how a loop burns money writing essays"
+        );
+    }
+
+    /// The note a human reads between rounds must say what the round BOUGHT,
+    /// in that order of importance: facts beat sources, sources beat nothing,
+    /// and a result we could not read is reported as unreadable rather than
+    /// as zero — the same distinction the gate makes.
+    #[test]
+    fn the_research_note_says_what_the_round_actually_bought() {
+        let ingested = RoundYield {
+            calls: 3,
+            novel_sources: 2,
+            novel_facts: 38,
+            unknown_yield: false,
+        };
+        let note = research_note(ingested, (6, 38, 9));
+        assert!(note.contains("+38 facts"), "facts are the headline: {note}");
+        assert!(
+            note.contains("38 fact(s) stored"),
+            "totals travel too: {note}"
+        );
+        assert!(note.contains("6 source(s) seen"), "{note}");
+
+        let searched = RoundYield {
+            calls: 2,
+            novel_sources: 13,
+            novel_facts: 0,
+            unknown_yield: false,
+        };
+        assert!(
+            research_note(searched, (13, 0, 2)).contains("+13 new sources"),
+            "a search round reports ground reached, not facts it never writes"
+        );
+
+        let circling = RoundYield {
+            calls: 2,
+            ..RoundYield::default()
+        };
+        assert!(
+            research_note(circling, (13, 0, 5)).contains("nothing new"),
+            "circling must be visible to the person watching"
+        );
+
+        let unreadable = RoundYield {
+            calls: 1,
+            unknown_yield: true,
+            ..RoundYield::default()
+        };
+        assert!(
+            research_note(unreadable, (13, 0, 6)).contains("could not read"),
+            "unknown is reported as unknown, never as zero"
         );
     }
 
