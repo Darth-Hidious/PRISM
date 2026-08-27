@@ -232,6 +232,66 @@ pub struct SessionStore {
     index_policy: SessionIndexPolicy,
 }
 
+/// Decides what assistant prose reaches the durable record.
+///
+/// The record used to be written from `TurnComplete.text`, which carries only
+/// the LAST model message. Prose reaches the reader as a stream of
+/// `TextDelta`s across every iteration, so a turn that ended after tool calls
+/// with no final content wrote NOTHING while the reader had already read a
+/// full answer. Measured on a real session: five searches, a paragraph of
+/// reasoning on screen, zero assistant records.
+///
+/// Holding it here rather than in each event closure means the two callers —
+/// the interactive protocol and the HTTP service — cannot drift apart about
+/// what "what the assistant said" means.
+#[derive(Debug, Default)]
+pub struct AssistantRecorder {
+    block: String,
+    last: String,
+}
+
+impl AssistantRecorder {
+    /// A streamed fragment. Accumulated, never written on its own: a record
+    /// per token would bury the tool calls it sits between.
+    pub fn delta(&mut self, text: &str) {
+        self.block.push_str(text);
+    }
+
+    /// End of a prose block — the text between two tool calls, or the final
+    /// answer. Returns what to persist, if anything.
+    ///
+    /// Flushing per block rather than once per turn is what keeps the
+    /// REASONING interleaved with the tool records in the order it happened.
+    /// A tool result with no statement of why it was run explains nothing to
+    /// whoever reads the session later.
+    #[must_use]
+    pub fn flush(&mut self) -> Option<String> {
+        let block = self.block.trim().to_string();
+        self.block.clear();
+        if block.is_empty() {
+            return None;
+        }
+        self.last = block.clone();
+        Some(block)
+    }
+
+    /// The turn's terminal text. Returns what to persist, if anything.
+    ///
+    /// Paths that never stream — a refusal, a budget cutoff, a clarifying
+    /// question — carry their whole answer here and nowhere else, so this
+    /// cannot simply be ignored. It is suppressed only when it repeats the
+    /// block a flush just stored, which is the ordinary streaming case.
+    #[must_use]
+    pub fn complete(&mut self, text: Option<&str>) -> Option<String> {
+        let text = text?.trim();
+        if text.is_empty() || text == self.last {
+            return None;
+        }
+        self.last = text.to_string();
+        Some(text.to_string())
+    }
+}
+
 impl SessionStore {
     /// Create a new store. Creates the sessions directory if it doesn't exist.
     pub fn new(sessions_dir: Option<PathBuf>) -> Self {
@@ -1454,6 +1514,76 @@ fn rand_u32() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// The measured failure: a turn that streams reasoning, runs tools, and
+    /// ends with no final content. Five searches, a paragraph on screen, zero
+    /// assistant records in the store.
+    #[test]
+    fn prose_streamed_before_a_contentless_ending_is_still_recorded() {
+        let mut rec = AssistantRecorder::default();
+        rec.delta("Searches came back rich on the metallurgy side; ");
+        rec.delta("two records look like the crux.");
+
+        let block = rec.flush().expect("streamed prose must be recorded");
+        assert!(block.starts_with("Searches came back rich"));
+        assert!(block.ends_with("look like the crux."));
+
+        // The turn ends with no terminal text, which is what used to lose it.
+        assert_eq!(rec.complete(None), None);
+    }
+
+    /// Reasoning between tool calls is the audit trail. One record per turn
+    /// would collapse "why I ran this" and "what I concluded" into one blob
+    /// and lose the ordering against the tool records.
+    #[test]
+    fn each_block_between_tool_calls_is_its_own_record() {
+        let mut rec = AssistantRecorder::default();
+        rec.delta("First I need the lattice.");
+        let first = rec.flush().expect("first block");
+        rec.delta("That returned no symmetry, so I will derive it.");
+        let second = rec.flush().expect("second block");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("First I need"));
+        assert!(second.starts_with("That returned no symmetry"));
+    }
+
+    /// A refusal, a budget cutoff and a clarifying question never stream —
+    /// their whole answer arrives only as the turn's terminal text. Ignoring
+    /// it would trade one silent loss for another.
+    #[test]
+    fn a_non_streaming_answer_is_recorded_from_the_terminal_text() {
+        let mut rec = AssistantRecorder::default();
+        assert_eq!(
+            rec.complete(Some("Budget exhausted.")).as_deref(),
+            Some("Budget exhausted.")
+        );
+    }
+
+    /// The ordinary streaming case must not write the same paragraph twice:
+    /// the flush stores it, then `TurnComplete` repeats it verbatim.
+    #[test]
+    fn the_terminal_text_does_not_duplicate_the_block_just_flushed() {
+        let mut rec = AssistantRecorder::default();
+        rec.delta("Im-3m, number 229, derived from the lattice.");
+        let flushed = rec.flush().expect("block");
+        assert_eq!(rec.complete(Some(&flushed)), None, "already stored once");
+        assert_eq!(
+            rec.complete(Some("  Im-3m, number 229, derived from the lattice.  ")),
+            None,
+            "whitespace does not make it a different answer"
+        );
+    }
+
+    /// Whitespace-only streaming is not an answer and must not create a record.
+    #[test]
+    fn empty_or_blank_prose_creates_no_record() {
+        let mut rec = AssistantRecorder::default();
+        assert_eq!(rec.flush(), None);
+        rec.delta("   \n  ");
+        assert_eq!(rec.flush(), None);
+        assert_eq!(rec.complete(Some("   ")), None);
+    }
+
     use super::*;
     use tempfile::TempDir;
 

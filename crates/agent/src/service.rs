@@ -711,14 +711,25 @@ impl ChatService {
         };
 
         let tools = Arc::clone(&self.tools);
+        let mut assistant = crate::session::AssistantRecorder::default();
         let mut emit = |event: AgentEvent| match event {
             AgentEvent::ThinkingDelta { text } => {
                 let _ = events.send(ChatEvent::Thinking { text });
             }
             AgentEvent::TextDelta { text } => {
+                // Accumulate as well as forward: the durable record must match
+                // what the caller was streamed. `TurnComplete.text` alone
+                // carries only the LAST model message, so a turn ending after
+                // tool calls with no final content persisted nothing at all
+                // while the caller had already read a full answer.
+                assistant.delta(&text);
                 let _ = events.send(ChatEvent::Answer { text });
             }
-            AgentEvent::TextFlush => {}
+            AgentEvent::TextFlush => {
+                if let Some(block) = assistant.flush() {
+                    store.append_message("assistant", &block, "", "", None);
+                }
+            }
             AgentEvent::ContextPriming { iteration, status } => {
                 context_priming.push(ContextPrimingRecord {
                     iteration,
@@ -778,7 +789,12 @@ impl ChatService {
                 if let Some(text) = text
                     && !text.is_empty()
                 {
-                    store.append_message("assistant", &text, "", "", None);
+                    // Non-streaming paths (refusal, budget cutoff, clarifying
+                    // question) carry their whole answer here and nowhere
+                    // else. Skip only what the flush already stored.
+                    if let Some(final_text) = assistant.complete(Some(&text)) {
+                        store.append_message("assistant", &final_text, "", "", None);
+                    }
                     answer = text;
                 }
             }

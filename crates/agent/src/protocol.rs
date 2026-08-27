@@ -7004,6 +7004,9 @@ fn spawn_agent_turn(
             &profile,
         );
 
+        // Streamed prose, accumulated so the durable record matches the screen.
+        let mut assistant = crate::session::AssistantRecorder::default();
+
         let turn_result = command_tools::with_platform_access(
             CommandToolPlatformAccess::VerifiedNodeOwner,
             agent_loop::run_turn(
@@ -7022,12 +7025,53 @@ fn spawn_agent_turn(
                 &mut runtime.scratchpad,
                 &mut |event| {
                     match &event {
+                        // What the reader SAW is what gets written down.
+                        //
+                        // Assistant prose used to be persisted only from
+                        // `TurnComplete.text`, which carries the LAST model
+                        // message. The prose actually reaches the screen as a
+                        // stream of `TextDelta`s across every iteration of the
+                        // turn, so a turn that ended after tool calls with no
+                        // final content wrote NOTHING — measured on a real
+                        // session: five searches, a full paragraph of reasoning
+                        // on screen, and zero assistant records in the store.
+                        //
+                        // Accumulating the deltas and flushing each block keeps
+                        // the reasoning BETWEEN tool calls too, interleaved in
+                        // order with the tool records. That interleaving is the
+                        // audit trail: a tool result with no statement of why
+                        // it was run explains nothing later.
+                        AgentEvent::TextDelta { text } => {
+                            assistant.delta(text);
+                        }
+                        AgentEvent::TextFlush => {
+                            if let Some(block) = assistant.flush() {
+                                runtime.session_store.append_message(
+                                    "assistant",
+                                    &block,
+                                    "",
+                                    "",
+                                    None,
+                                );
+                            }
+                        }
                         AgentEvent::TurnComplete {
                             text: Some(text), ..
                         } if !text.is_empty() => {
-                            runtime
-                                .session_store
-                                .append_message("assistant", text, "", "", None);
+                            // Paths that never stream — a refusal, a budget
+                            // cutoff, a clarifying question — carry their whole
+                            // answer here and nowhere else. Skip only when the
+                            // flush above already stored this exact text, so
+                            // the common path does not double-write.
+                            if let Some(final_text) = assistant.complete(Some(text)) {
+                                runtime.session_store.append_message(
+                                    "assistant",
+                                    &final_text,
+                                    "",
+                                    "",
+                                    None,
+                                );
+                            }
                         }
                         AgentEvent::ToolCallResult {
                             call_id,
