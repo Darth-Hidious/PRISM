@@ -756,6 +756,9 @@ pub async fn load(
         locality: "local".into(),
         // The loader reads the artifact itself; the DOI is the origin.
         origin_source_id: None,
+        // The agent tool call that launched this loader, when one did;
+        // `None` for a direct CLI run.
+        origin_action_id: prism_provenance::action_id_from_env(),
     };
     store.record_activity(&prov).await?;
 

@@ -824,6 +824,9 @@ async fn store_claims(
         // replace it per claim with the exact cached source-text block while
         // retaining this URL as origin_source_id.
         origin_source_id: None,
+        // The agent tool call that launched this CLI run, when one did.
+        // `None` when a person ran the command directly.
+        origin_action_id: prism_provenance::action_id_from_env(),
     };
     let mut rejected: Vec<serde_json::Value> = Vec::new();
     let mut citation_warnings: Vec<serde_json::Value> = Vec::new();

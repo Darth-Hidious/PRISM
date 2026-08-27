@@ -300,6 +300,17 @@ pub static PROVENANCE_CTX: std::sync::RwLock<ProvenanceCtx> =
 pub struct ProvenanceCtx {
     pub session_id: String,
     pub llm_model: String,
+    /// Id of the tool call currently executing, minted by [`begin_action`]
+    /// before the tool runs and consumed by [`end_action`] after it returns.
+    ///
+    /// Process-global for the same reason `session_id` is: the tool that
+    /// writes facts is a CHILD PROCESS, so the id has to reach an environment
+    /// variable rather than a call argument. `fire_before` -> execute ->
+    /// `fire_after` is sequential within a turn, so at most one action is
+    /// live at a time. Two agent loops sharing one process would interleave
+    /// here — the same limitation the session id already has, and the reason
+    /// background research runs out-of-process.
+    pub action_id: Option<String>,
 }
 
 impl ProvenanceCtx {
@@ -307,6 +318,7 @@ impl ProvenanceCtx {
         Self {
             session_id: String::new(),
             llm_model: String::new(),
+            action_id: None,
         }
     }
 }
@@ -332,6 +344,45 @@ pub fn provenance_session_id() -> String {
         .map(|c| c.session_id.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Mint the id for the tool call about to run, and make it current.
+///
+/// Returned so the caller can correlate; the usual consumers read it back
+/// with [`current_action_id`]. Called from the provenance hook's BEFORE
+/// callback, so the id exists while the tool executes — the after hook is
+/// too late, because by then the tool has already written its facts.
+///
+/// Overwrites any previous value unconditionally: a tool that was denied or
+/// panicked never reaches [`end_action`], and the next call must not inherit
+/// its id.
+pub fn begin_action() -> String {
+    let id = prism_provenance::new_action_id();
+    if let Ok(mut ctx) = PROVENANCE_CTX.write() {
+        ctx.action_id = Some(id.clone());
+    }
+    id
+}
+
+/// The tool call currently executing, if one is.
+///
+/// `None` outside a tool call — attribution is never invented, and callers
+/// treat it as "not launched by an agent action".
+#[must_use]
+pub fn current_action_id() -> Option<String> {
+    PROVENANCE_CTX.read().ok().and_then(|c| c.action_id.clone())
+}
+
+/// Clear the current action and return what it was.
+///
+/// Clearing matters: without it, provenance written between turns (or by a
+/// tool whose own hooks do not fire) would be attributed to whichever call
+/// happened to run last — a wrong attribution, which is worse than none.
+pub fn end_action() -> Option<String> {
+    PROVENANCE_CTX
+        .write()
+        .ok()
+        .and_then(|mut c| c.action_id.take())
 }
 
 fn provenance_model() -> Option<String> {
@@ -603,7 +654,15 @@ fn provenance_hook() -> Hook {
 
     Hook {
         name: "provenance".to_string(),
-        before: None,
+        // Mint the action id BEFORE the tool runs. It has to exist while the
+        // tool executes: the tools that write facts are child processes that
+        // read the id from the environment, and by the after-hook they have
+        // already written. Minting here is also what makes the id and the
+        // record id the same string, which IS the join.
+        before: Some(Box::new(move |_tool_name, _inputs| {
+            begin_action();
+            HookResult::default()
+        })),
         after: Some(Box::new(move |tool_name, inputs, result, _elapsed_ms| {
             // Spawn an async task to write the provenance record.
             // This requires being inside a tokio runtime — the agent
@@ -628,6 +687,18 @@ fn provenance_hook() -> Hook {
             let (status, exit_code) = classify_for_provenance(result);
             record.status = status.clone();
             record.exit_code = exit_code;
+
+            // Adopt the id minted before the tool ran, replacing the fresh one
+            // `new_record` generated. Any activity this tool caused stored the
+            // SAME string in `prov_activity.origin_action_id`, so
+            // `assertions_from_action(record.id)` now answers "what did this
+            // call buy". `end_action` also clears it, so provenance written
+            // between turns is not misattributed to the last call. Falling
+            // back to the generated id keeps the record writable when no
+            // action was current — an unattributed record, never a lost one.
+            if let Some(action_id) = end_action() {
+                record.id = action_id;
+            }
 
             // VS2-P1c: PROV-O chaining for the verify-by-execution repair loop.
             // For code-exec tools, if the previous code-exec run was the SAME
@@ -1380,5 +1451,51 @@ mod tests {
             let result = registry.fire_before("tool", &inputs);
             assert!(result.abort, "should block '{}'", keyword);
         }
+    }
+
+    // ── Action attribution lifecycle ─────────────────────────────────────
+
+    /// `begin_action` makes an id current; `end_action` hands it back AND
+    /// clears it. The clear is the point: provenance written after a tool
+    /// returns (between turns, or by a path whose hooks do not fire) must not
+    /// inherit the last call's id and be credited to work it did not do.
+    #[test]
+    fn an_action_id_is_current_only_while_its_tool_runs() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        end_action();
+
+        assert_eq!(current_action_id(), None, "no action before one begins");
+        let id = begin_action();
+        assert_eq!(
+            current_action_id(),
+            Some(id.clone()),
+            "current while running"
+        );
+        assert_eq!(end_action(), Some(id), "end hands back what began");
+        assert_eq!(current_action_id(), None, "cleared once the tool returned");
+        assert_eq!(end_action(), None, "ending twice invents nothing");
+    }
+
+    /// A tool that was denied or panicked never reaches `end_action`, so the
+    /// next `begin_action` must overwrite rather than preserve. Otherwise the
+    /// next call's facts would be credited to the call that failed.
+    #[test]
+    fn a_new_action_replaces_one_that_never_finished() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        end_action();
+
+        let abandoned = begin_action();
+        let fresh = begin_action(); // previous call never ended
+        assert_ne!(abandoned, fresh, "each call gets its own id");
+        assert_eq!(
+            current_action_id(),
+            Some(fresh),
+            "the live call owns attribution, not the abandoned one"
+        );
+        end_action();
     }
 }

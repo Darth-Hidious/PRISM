@@ -124,6 +124,7 @@ fn repair_provenance(document: &str) -> LocalProvenance {
         ended_at: "2026-01-01T00:00:00Z".to_string(),
         locality: "local".to_string(),
         origin_source_id: None,
+        origin_action_id: None,
     }
 }
 

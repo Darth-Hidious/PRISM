@@ -902,6 +902,7 @@ mod tests {
             ended_at: now,
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
         store
@@ -967,6 +968,7 @@ mod tests {
             ended_at: now,
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         let peer = prism_provenance::LocalProvenance {
             activity_id: "act_peer".into(),

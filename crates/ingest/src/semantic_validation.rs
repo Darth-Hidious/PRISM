@@ -1835,6 +1835,7 @@ mod tests {
             ended_at: "2026-08-11T00:00:00Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         }
     }
 

@@ -732,6 +732,72 @@ pub struct LocalProvenance {
     /// `#[serde(default)]` keeps previously serialized forms deserializable.
     #[serde(default)]
     pub origin_source_id: Option<String>,
+    /// Id of the AGENT ACTION that launched this activity — the tool call,
+    /// not the session. `None` when the activity was not launched by an
+    /// agent tool call (a direct CLI ingest, a mesh sync, a test) or when
+    /// the launcher did not say; attribution is never invented.
+    ///
+    /// This is the join between the two halves of the record: the agent's
+    /// trajectory (`ProvenanceRecord`, keyed by `id`) and the fact DAG
+    /// (assertions, whose evidence rows carry `activity_id`). Without it a
+    /// fact can be traced to a session but not to the call that bought it,
+    /// so per-action credit cannot be assigned. Deliberately SEPARATE from
+    /// `activity_id`: one tool call may ingest a whole corpus, and reusing
+    /// the action id as the activity id would collapse every document in
+    /// that corpus onto a single activity.
+    ///
+    /// `#[serde(default)]` keeps previously serialized forms deserializable.
+    #[serde(default)]
+    pub origin_action_id: Option<String>,
+}
+
+/// Environment variable carrying the agent action id across a process
+/// boundary.
+///
+/// The tools that write facts run as child processes of the agent (the CLI
+/// spawner in `crates/agent/src/command_tools.rs`), so the id of the tool call
+/// that launched them cannot be passed in-process. The agent exports this; a
+/// child reads it with [`action_id_from_env`] and stores it as
+/// [`LocalProvenance::origin_action_id`].
+///
+/// It is deliberately NOT a credential and carries no authority: it is an
+/// opaque id used only for attribution, so the LocalOnly credential scrub
+/// (`strip_platform_credentials`) does not need to remove it.
+pub const ACTION_ID_ENV: &str = "PRISM_ACTION_ID";
+
+/// Mint an id for one agent action (one tool call).
+///
+/// Lives here rather than in the agent crate so the id format is owned by the
+/// crate that owns the column it lands in — the agent needs no uuid
+/// dependency of its own to produce one.
+#[must_use]
+pub fn new_action_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// The launching agent action id, if this process was started by one.
+///
+/// `None` for a direct CLI run, a test, or any launcher that did not set it.
+/// Blank is treated as absent: the credential scrub sets variables to the
+/// empty string rather than unsetting them, and an empty attribution is not
+/// an attribution.
+#[must_use]
+pub fn action_id_from_env() -> Option<String> {
+    parse_action_id(std::env::var(ACTION_ID_ENV).ok().as_deref())
+}
+
+/// The env-var reading of [`action_id_from_env`], as a pure function.
+///
+/// Split out so the rule is testable without mutating process environment —
+/// an env-mutating test has to hold the shared lock and still races anything
+/// that reads env concurrently. Blank and whitespace-only are absent, not
+/// present-and-empty: the LocalOnly credential scrub sets variables to `""`
+/// rather than unsetting them, so "" must mean no attribution.
+#[must_use]
+pub fn parse_action_id(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
 }
 
 /// The decoding/sampling record of one extraction activity, written onto
@@ -2364,6 +2430,12 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     crate::add_column_if_absent(conn, "prov_activity", "seed", "INTEGER").await?;
     crate::add_column_if_absent(conn, "prov_activity", "temperature", "REAL").await?;
     crate::add_column_if_absent(conn, "prov_activity", "decoding", "TEXT").await?;
+    // Additive attribution column (NULL on rows written before it existed and
+    // on activities no agent tool call launched): the id of the agent action
+    // that caused this activity. It joins the agent's trajectory to the fact
+    // DAG, so "which tool call bought this fact" is a real query rather than
+    // an inference from timestamps.
+    crate::add_column_if_absent(conn, "prov_activity", "origin_action_id", "TEXT").await?;
 
     // `prov_assertion` is the query-optimized AGGREGATE row: `confidence`,
     // `corroborations`, and `evidence_class` are caches over
@@ -3839,15 +3911,24 @@ impl ProvenanceStore {
         self.conn
             .execute(
                 r#"INSERT INTO prov_activity
-                   (id, agent_id, source_entity_id, tenant, started_at, ended_at, locality)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   (id, agent_id, source_entity_id, tenant, started_at, ended_at, locality,
+                    origin_action_id)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                    ON CONFLICT(id) DO UPDATE SET
                        agent_id = excluded.agent_id,
                        source_entity_id = excluded.source_entity_id,
                        tenant = excluded.tenant,
                        started_at = excluded.started_at,
                        ended_at = excluded.ended_at,
-                       locality = excluded.locality"#,
+                       locality = excluded.locality,
+                       -- Attribution is write-once: a re-recorded activity
+                       -- keeps the action that FIRST caused it. COALESCE on
+                       -- the stored value (not the incoming one) means a
+                       -- later unattributed write cannot erase a known
+                       -- launcher, while a first attribution can still fill
+                       -- a NULL left by an earlier one.
+                       origin_action_id =
+                           COALESCE(prov_activity.origin_action_id, excluded.origin_action_id)"#,
                 [
                     Value::Text(prov.activity_id.clone()),
                     Value::Text(prov.agent_id.clone()),
@@ -3856,6 +3937,9 @@ impl ProvenanceStore {
                     Value::Text(prov.started_at.clone()),
                     Value::Text(prov.ended_at.clone()),
                     Value::Text(prov.locality.clone()),
+                    prov.origin_action_id
+                        .clone()
+                        .map_or(Value::Null, Value::Text),
                 ],
             )
             .await?;
@@ -4942,6 +5026,46 @@ impl ProvenanceStore {
     /// fresh paper path produces). Ordered by id for deterministic paging.
     /// Rows with no recorded status are not returned; they predate the
     /// status axis and are reached by `assertion_by_id`.
+    /// Every assertion this AGENT ACTION is responsible for.
+    ///
+    /// Walks the join the `origin_action_id` column exists to make possible:
+    /// action -> the activities it launched -> the evidence those activities
+    /// wrote -> the assertions that evidence supports. The result is the unit
+    /// of credit for a tool call: what this specific call, with these specific
+    /// arguments, actually bought.
+    ///
+    /// DISTINCT matters and is not defensive: assertion ids are
+    /// content-addressed ([`assertion_id`]), so one action that reads the same
+    /// fact from two documents produces two evidence rows pointing at ONE
+    /// assertion. Counting rows would score that as two facts; counting
+    /// distinct assertions scores it as one fact corroborated twice, which is
+    /// what actually happened.
+    ///
+    /// Empty is a real answer, not an error: an action that launched no
+    /// activity, or whose activities produced no evidence, bought nothing.
+    /// Actions predating the column are unattributed and return empty too —
+    /// absence of attribution is never reported as absence of work, so callers
+    /// must not read empty as "this call was useless" without checking the
+    /// action was recorded after attribution existed.
+    pub async fn assertions_from_action(&self, action_id: &str) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT e.assertion_id \
+                 FROM prov_assertion_evidence e \
+                 JOIN prov_activity a ON a.id = e.activity_id \
+                 WHERE a.origin_action_id = ?1 \
+                 ORDER BY e.assertion_id",
+                [Value::Text(action_id.to_string())],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(get_str(&row, 0)?);
+        }
+        Ok(ids)
+    }
+
     pub async fn assertions_by_verification(
         &self,
         status: VerificationStatus,
@@ -6135,6 +6259,7 @@ mod tests {
             ended_at: "2026-07-13T00:00:01Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         }
     }
 
@@ -9166,6 +9291,7 @@ mod tests {
                 ended_at: "2026-01-01T00:00:00Z".into(),
                 locality: tenant.into(),
                 origin_source_id: None,
+                origin_action_id: None,
             };
             store.record_assertion(&assertion, &prov).await.unwrap();
         }
@@ -9253,6 +9379,7 @@ mod tests {
             ended_at: "2026-01-01T00:00:00Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store
             .record_assertion(
@@ -12409,5 +12536,171 @@ mod tests {
             assert_eq!(VerificationStatus::parse(status.as_str()), Some(status));
         }
         assert_eq!(VerificationStatus::parse("anything_else"), None);
+    }
+
+    // ── Action attribution: the join between trajectory and fact DAG ──────
+
+    /// Blank is absent. The LocalOnly credential scrub sets variables to `""`
+    /// rather than unsetting them, and the CLI spawner deliberately exports an
+    /// empty value when no action is current — so if `""` parsed as a real id,
+    /// every unattributed child would write an assertion attributed to an
+    /// action whose id is the empty string, silently colliding all of them
+    /// onto one node.
+    #[test]
+    fn blank_action_id_is_absent_not_empty() {
+        assert_eq!(parse_action_id(None), None);
+        assert_eq!(parse_action_id(Some("")), None);
+        assert_eq!(parse_action_id(Some("   ")), None);
+        assert_eq!(parse_action_id(Some("\t\n")), None);
+        assert_eq!(parse_action_id(Some("act-1")), Some("act-1".to_string()));
+        assert_eq!(
+            parse_action_id(Some("  act-1  ")),
+            Some("act-1".to_string())
+        );
+    }
+
+    fn action_prov(activity: &str, source: &str, action: Option<&str>) -> LocalProvenance {
+        LocalProvenance {
+            activity_id: activity.into(),
+            agent_id: "agent-x".into(),
+            agent_kind: "SoftwareAgent".into(),
+            source_entity_id: source.into(),
+            source_kind: "Document".into(),
+            tenant: LOCAL_TENANT.into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: "2026-01-01T00:00:00Z".into(),
+            locality: "local".into(),
+            origin_source_id: None,
+            origin_action_id: action.map(ToString::to_string),
+        }
+    }
+
+    fn action_fact(object: &str) -> LocalAssertion {
+        LocalAssertion {
+            subject: "Ti-6Al-4V".into(),
+            predicate: "has_phase".into(),
+            object: object.into(),
+            confidence: Some(0.8),
+        }
+    }
+
+    /// The join this whole column exists for: a fact written while a tool call
+    /// was running is retrievable FROM that tool call. Without attribution the
+    /// fact is reachable only from its session, and per-action credit cannot
+    /// be assigned at all.
+    #[tokio::test]
+    async fn assertions_are_retrievable_from_the_action_that_wrote_them() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        store
+            .record_assertion(
+                &action_fact("alpha-beta"),
+                &action_prov("act-a", "doc-1", Some("call-1")),
+            )
+            .await
+            .unwrap();
+        store
+            .record_assertion(
+                &action_fact("martensite"),
+                &action_prov("act-b", "doc-2", Some("call-2")),
+            )
+            .await
+            .unwrap();
+
+        let from_1 = store.assertions_from_action("call-1").await.unwrap();
+        let from_2 = store.assertions_from_action("call-2").await.unwrap();
+        assert_eq!(from_1.len(), 1, "call-1 bought exactly one fact");
+        assert_eq!(from_2.len(), 1, "call-2 bought exactly one fact");
+        assert_ne!(from_1, from_2, "the two calls bought DIFFERENT facts");
+
+        // An action that wrote nothing owns nothing — not everything.
+        assert!(
+            store
+                .assertions_from_action("call-never-ran")
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unrelated action must not inherit another call's facts"
+        );
+    }
+
+    /// One call that reads the SAME fact from two documents bought one fact
+    /// corroborated twice, not two facts. Assertion ids are content-addressed,
+    /// so the two evidence rows point at one assertion; counting evidence rows
+    /// instead of distinct assertions would inflate the reward for re-reading
+    /// the same claim — exactly the behaviour a diversity objective must not
+    /// pay for.
+    #[tokio::test]
+    async fn one_action_reading_a_fact_twice_owns_one_assertion() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        for (activity, source) in [("act-1", "doc-1"), ("act-2", "doc-2")] {
+            store
+                .record_assertion(
+                    &action_fact("alpha-beta"),
+                    &action_prov(activity, source, Some("call-1")),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.assertions_from_action("call-1").await.unwrap().len(),
+            1,
+            "same fact from two sources is ONE assertion, corroborated twice"
+        );
+    }
+
+    /// Attribution is write-once. Re-recording an activity without a launcher
+    /// must not erase the launcher that was recorded first — otherwise any
+    /// later unattributed touch of the same activity silently destroys the
+    /// credit trail.
+    #[tokio::test]
+    async fn a_later_unattributed_write_cannot_erase_attribution() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        store
+            .record_assertion(
+                &action_fact("alpha-beta"),
+                &action_prov("act-1", "doc-1", Some("call-1")),
+            )
+            .await
+            .unwrap();
+        // Same activity, no attribution this time.
+        store
+            .record_assertion(&action_fact("beta"), &action_prov("act-1", "doc-1", None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.assertions_from_action("call-1").await.unwrap().len(),
+            2,
+            "the activity kept its launcher, so BOTH facts stay attributed"
+        );
+    }
+
+    /// Facts written with no launching action are not attributed to anyone.
+    /// Silence must mean unattributed, never "belongs to whichever call ran
+    /// last" — a wrong attribution is worse than a missing one.
+    #[tokio::test]
+    async fn unattributed_facts_belong_to_no_action() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        store
+            .record_assertion(
+                &action_fact("alpha-beta"),
+                &action_prov("act-1", "doc-1", None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .assertions_from_action("call-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a fact no action claimed must not be claimed by one"
+        );
     }
 }

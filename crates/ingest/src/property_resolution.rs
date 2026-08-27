@@ -1170,6 +1170,7 @@ mod tests {
             ended_at: "2026-08-24T00:00:00Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store.record_activity(&prov).await.unwrap();
         store

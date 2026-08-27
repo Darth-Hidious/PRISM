@@ -486,6 +486,10 @@ pub async fn sync_dataset_from_peer(
         locality: "mesh".into(),
         // Per-row: rows that name their origin get it set below.
         origin_source_id: None,
+        // The agent tool call that launched this sync, when one did. A
+        // sync run from cron or by hand has no launching action and stays
+        // `None`; the per-row clone below inherits whichever it is.
+        origin_action_id: prism_provenance::action_id_from_env(),
     };
     store.record_activity(&prov).await?;
 

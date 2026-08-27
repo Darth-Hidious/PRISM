@@ -4221,6 +4221,7 @@ mod tests {
             ended_at: "2026-08-04T00:00:01Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store.write_fact(&facts[0], &prov).await.unwrap();
 

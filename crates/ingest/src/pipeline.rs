@@ -775,6 +775,12 @@ impl IngestPipeline {
             locality: "local".into(),
             // Local ingest reads the source itself — the locator IS the origin.
             origin_source_id: None,
+            // Which agent tool call caused this ingest, when one did. Read
+            // from the environment because the agent runs the CLI as a child
+            // process; `None` for a direct CLI run, and the ingest proceeds
+            // exactly as before — attribution is recorded when offered, never
+            // required.
+            origin_action_id: prism_provenance::action_id_from_env(),
         };
         store.record_activity(&prov).await?;
         // Reproducibility record, on the SAME activity row: the seed and

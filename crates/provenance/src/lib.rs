@@ -38,15 +38,16 @@ pub mod emmo;
 pub mod term_binding;
 pub mod units;
 pub use emmo::{
-    ActivityDecoding, AssertionClassification, ClassRegionDistance, ClassifiedFactNodes,
-    ClassifiedNode, ConditionValue, EmbeddingPartition, EntityGeometryCoverage,
-    EntityGeometryNeighbor, EntityGeometryProbe, EvidenceClass, EvidenceContribution,
-    EvidenceSource, FactGraphShape, FactNodeLabels, FactPayload, GraphEdge, GraphNode,
-    LOCAL_TENANT, LocalAssertion, LocalFact, LocalProvenance, MaterialFact, MeasurementCondition,
-    OntologyBoundFactNodes, OntologyClassification, QuantitySignDomain, QudtUnit, RecalledFact,
-    RecalledMaterialFact, SemanticEntityHit, SourceCitation, StoreBusy, StoredAssertion,
-    TraversalResult, TripleGeometryNeighbor, TripleGeometryProbe, UnitTerm, VerificationFilter,
-    VerificationStatus, assertion_id, canonical_key, conditioned_assertion_id, evidence_for_result,
+    ACTION_ID_ENV, ActivityDecoding, AssertionClassification, ClassRegionDistance,
+    ClassifiedFactNodes, ClassifiedNode, ConditionValue, EmbeddingPartition,
+    EntityGeometryCoverage, EntityGeometryNeighbor, EntityGeometryProbe, EvidenceClass,
+    EvidenceContribution, EvidenceSource, FactGraphShape, FactNodeLabels, FactPayload, GraphEdge,
+    GraphNode, LOCAL_TENANT, LocalAssertion, LocalFact, LocalProvenance, MaterialFact,
+    MeasurementCondition, OntologyBoundFactNodes, OntologyClassification, QuantitySignDomain,
+    QudtUnit, RecalledFact, RecalledMaterialFact, SemanticEntityHit, SourceCitation, StoreBusy,
+    StoredAssertion, TraversalResult, TripleGeometryNeighbor, TripleGeometryProbe, UnitTerm,
+    VerificationFilter, VerificationStatus, action_id_from_env, assertion_id, canonical_key,
+    conditioned_assertion_id, evidence_for_result, new_action_id, parse_action_id,
 };
 pub use term_binding::{
     ClassLabelEmbedding, ClassLabelNeighbor, TERM_BINDING_RUNG_EXACT, TERM_BINDING_RUNG_NORMALIZED,

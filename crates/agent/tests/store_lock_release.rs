@@ -115,6 +115,7 @@ fn run_store_child(args: &[String]) -> Result<()> {
             ended_at: now,
             locality: "local".to_string(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         let fact = prism_provenance::MaterialFact {
             subject: CHILD_SUBJECT.to_string(),

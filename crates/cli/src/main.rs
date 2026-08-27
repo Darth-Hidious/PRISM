@@ -7999,6 +7999,9 @@ async fn run_local_text_ingest_file(
         // Corroboration still keys on the original paper, not on a derived
         // text snapshot or a particular extraction run.
         origin_source_id: Some(document_id.clone()),
+        // The agent tool call that launched this CLI run, when one did.
+        // `None` when a person ran the command directly.
+        origin_action_id: prism_provenance::action_id_from_env(),
     };
     store.record_activity(&prov).await?;
 
@@ -8739,6 +8742,9 @@ async fn run_local_repair_pass(
         ended_at: now,
         locality: "local".into(),
         origin_source_id: None,
+        // The agent tool call that launched this CLI run, when one did.
+        // `None` when a person ran the command directly.
+        origin_action_id: prism_provenance::action_id_from_env(),
     };
     store.record_activity(&prov).await?;
     let classification = prism_provenance::OntologyClassification {
@@ -9770,6 +9776,9 @@ async fn record_platform_ingest_provenance(path: &Path, steps: &[(String, serde_
         locality: "platform".to_string(),
         // The platform extracted from the document itself — not a relay.
         origin_source_id: None,
+        // The agent tool call that launched this CLI run, when one did.
+        // `None` when a person ran the command directly.
+        origin_action_id: prism_provenance::action_id_from_env(),
     };
     if let Err(e) = store.record_activity(&prov).await {
         tracing::warn!(error = %e, title = %title, "platform ingest succeeded but the local provenance record failed");
@@ -19603,6 +19612,7 @@ data:\n\
             ended_at: now,
             locality: "mesh".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store
             .write_fact(
@@ -19673,6 +19683,7 @@ data:\n\
             ended_at: now,
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
 
@@ -19777,6 +19788,7 @@ data:\n\
             ended_at: now,
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         store.record_activity(&prov).await.expect("record activity");
         // CONTRACT CHANGE: `write_fact` no longer resolves typed graph shapes
@@ -19899,6 +19911,7 @@ data:\n\
             ended_at: now.clone(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         let peer = prism_provenance::LocalProvenance {
             activity_id: "act_peer".into(),
@@ -21866,6 +21879,7 @@ data:\n\
             ended_at: "2026-01-01T00:00:01Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         let ontology = prism_provenance::OntologyClassification {
             version_iri: "urn:test:ontology:v1",

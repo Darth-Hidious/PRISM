@@ -901,6 +901,7 @@ mod tests {
             ended_at: "2026-01-01T00:00:01Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         let ontology = OntologyClassification {
             version_iri: "urn:test:ontology:v1",
@@ -1036,6 +1037,7 @@ mod tests {
             ended_at: "2026-01-01T00:00:01Z".into(),
             locality: "local".into(),
             origin_source_id: None,
+            origin_action_id: None,
         };
         let ontology = OntologyClassification {
             version_iri: "urn:test:ontology:v1",

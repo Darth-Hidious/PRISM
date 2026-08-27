@@ -5952,6 +5952,26 @@ fn platform_access_refusal() -> anyhow::Error {
     anyhow::anyhow!(PLATFORM_ACCESS_REFUSAL)
 }
 
+/// Stamp the currently-executing tool call onto a child process.
+///
+/// Attribution across the process boundary: the child writes the facts, so it
+/// needs the id of the tool call that caused it. Any activity it records
+/// stores this in `prov_activity.origin_action_id`, which is what lets
+/// `assertions_from_action` answer "which call bought this fact".
+///
+/// Set UNCONDITIONALLY, blank when no action is current. This process may
+/// itself have been started by an agent (a nested run), and a stale inherited
+/// id would attribute the child's facts to a call that did not make them. A
+/// wrong attribution is worse than none, so the no-action case CLEARS rather
+/// than letting the parent's value through. Blank reads as absent —
+/// `prism_provenance::action_id_from_env` filters it.
+pub(crate) fn stamp_action_id(cmd: &mut TokioCommand) {
+    cmd.env(
+        prism_provenance::ACTION_ID_ENV,
+        crate::hooks::current_action_id().unwrap_or_default(),
+    );
+}
+
 pub(crate) fn strip_platform_credentials(cmd: &mut TokioCommand) {
     // LocalOnly is a credential boundary, not a filesystem boundary. Keep the
     // real HOME so local-only commands can read the user's provenance graph
@@ -6071,6 +6091,7 @@ async fn execute_cli_command(
     if matches!(platform_access, CommandToolPlatformAccess::LocalOnly) {
         strip_platform_credentials(&mut cmd);
     }
+    stamp_action_id(&mut cmd);
 
     let timeout_window = command_timeout_for_root(root);
     let timeout_secs = timeout_window.as_secs();
@@ -8023,6 +8044,61 @@ mod tests {
         assert!(
             write.requires_approval,
             "a mesh write must stay approval-gated"
+        );
+    }
+
+    /// The child that writes the facts learns which tool call caused it.
+    /// Without this the ingest mints an unattributed activity and the fact it
+    /// stores can be traced to a session but not to the call that bought it —
+    /// which is the whole point of the column.
+    #[test]
+    fn a_child_is_stamped_with_the_running_tool_call() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::hooks::end_action();
+
+        let id = crate::hooks::begin_action();
+        let mut cmd = TokioCommand::new("true");
+        stamp_action_id(&mut cmd);
+        let stamped = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(prism_provenance::ACTION_ID_ENV))
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_string_lossy().to_string());
+        assert_eq!(stamped, Some(id), "the child must carry the live call id");
+        crate::hooks::end_action();
+    }
+
+    /// With no call running the stamp must CLEAR, not fall through. A PRISM
+    /// started by another agent inherits that agent's id in its environment;
+    /// letting it reach the child would credit these facts to a call in a
+    /// different process that never made them. Blank reads as absent.
+    #[test]
+    fn a_child_spawned_outside_a_tool_call_inherits_no_stale_attribution() {
+        let _lock = crate::skills::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::hooks::end_action();
+
+        let mut cmd = TokioCommand::new("true");
+        stamp_action_id(&mut cmd);
+        let stamped = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(prism_provenance::ACTION_ID_ENV))
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_string_lossy().to_string());
+        assert_eq!(
+            stamped,
+            Some(String::new()),
+            "must be set-and-blank, so the parent's value cannot leak through"
+        );
+        assert_eq!(
+            prism_provenance::parse_action_id(stamped.as_deref()),
+            None,
+            "and blank must read as no attribution"
         );
     }
 
