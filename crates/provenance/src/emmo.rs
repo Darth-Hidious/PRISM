@@ -803,6 +803,22 @@ pub struct PaperNote {
     /// owner asked for: "a proper review of exactly what this paper was
     /// about".
     pub review: String,
+    /// The question the PAPER set itself. Not the same as our task, and
+    /// conflating the two is how a paper gets mis-summarised into whatever
+    /// the reader was hoping for.
+    pub question: String,
+    /// How they did it, in a sentence. A number means nothing without the
+    /// method that produced it — 260 °C from a TGA onset and from a long-term
+    /// service rating are different claims.
+    pub method: String,
+    /// The findings worth carrying, each anchored to where it was found
+    /// (table, figure, section). An anchor is what makes a claim checkable by
+    /// someone who doubts it.
+    pub key_findings: String,
+    /// What the paper says it cannot support. Recorded because a limitation
+    /// is often the reason the next paper has to be read, and dropping it
+    /// makes a hedged result look definitive.
+    pub limitations: String,
     /// The task this was read FOR, verbatim. The reward signal is the
     /// original task, so a write-up that is not anchored to it cannot be
     /// scored: "useful" is meaningless without "useful for what".
@@ -2553,6 +2569,10 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
             title TEXT,
             abstract_text TEXT,
             review TEXT,
+            question TEXT,
+            method TEXT,
+            key_findings TEXT,
+            limitations TEXT,
             task TEXT,
             relevance TEXT,
             depth TEXT,
@@ -5167,9 +5187,10 @@ impl ProvenanceStore {
         self.conn
             .execute(
                 r#"INSERT INTO paper_note
-                   (source_id, tenant, title, abstract_text, review, task, relevance,
+                   (source_id, tenant, title, abstract_text, review, question, method,
+                    key_findings, limitations, task, relevance,
                     depth, depth_reason, next_steps, led_from, origin_action_id, created_at)
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
                    ON CONFLICT(tenant, source_id) DO UPDATE SET
                        title = excluded.title,
                        abstract_text = excluded.abstract_text,
@@ -5178,6 +5199,14 @@ impl ProvenanceStore {
                                        OR paper_note.depth IS NULL
                                        OR paper_note.depth <> 'fulltext'
                                      THEN excluded.review ELSE paper_note.review END,
+                       question = excluded.question,
+                       method = excluded.method,
+                       key_findings = CASE WHEN excluded.depth = 'fulltext'
+                                             OR paper_note.depth IS NULL
+                                             OR paper_note.depth <> 'fulltext'
+                                           THEN excluded.key_findings
+                                           ELSE paper_note.key_findings END,
+                       limitations = excluded.limitations,
                        task = excluded.task,
                        relevance = CASE WHEN excluded.depth = 'fulltext'
                                           OR paper_note.depth IS NULL
@@ -5198,6 +5227,10 @@ impl ProvenanceStore {
                     Value::Text(note.title.clone()),
                     Value::Text(note.abstract_text.clone()),
                     Value::Text(note.review.clone()),
+                    Value::Text(note.question.clone()),
+                    Value::Text(note.method.clone()),
+                    Value::Text(note.key_findings.clone()),
+                    Value::Text(note.limitations.clone()),
                     Value::Text(note.task.clone()),
                     Value::Text(note.relevance.clone()),
                     Value::Text(note.depth.clone()),
@@ -5223,7 +5256,8 @@ impl ProvenanceStore {
         let mut rows = self
             .conn
             .query(
-                "SELECT source_id, tenant, title, abstract_text, review, task, relevance, \
+                "SELECT source_id, tenant, title, abstract_text, review, question, method, \
+                        key_findings, limitations, task, relevance, \
                         depth, depth_reason, next_steps, led_from, origin_action_id, created_at \
                  FROM paper_note WHERE tenant = ?1 \
                  ORDER BY created_at DESC, source_id LIMIT ?2",
@@ -5241,14 +5275,18 @@ impl ProvenanceStore {
                 title: get_str(&row, 2)?,
                 abstract_text: get_str(&row, 3)?,
                 review: get_str(&row, 4)?,
-                task: get_str(&row, 5)?,
-                relevance: get_str(&row, 6)?,
-                depth: get_str(&row, 7)?,
-                depth_reason: get_str(&row, 8)?,
-                next_steps: get_str(&row, 9)?,
-                led_from: get_opt_str(&row, 10)?,
-                origin_action_id: get_opt_str(&row, 11)?,
-                created_at: get_str(&row, 12)?,
+                question: get_str(&row, 5)?,
+                method: get_str(&row, 6)?,
+                key_findings: get_str(&row, 7)?,
+                limitations: get_str(&row, 8)?,
+                task: get_str(&row, 9)?,
+                relevance: get_str(&row, 10)?,
+                depth: get_str(&row, 11)?,
+                depth_reason: get_str(&row, 12)?,
+                next_steps: get_str(&row, 13)?,
+                led_from: get_opt_str(&row, 14)?,
+                origin_action_id: get_opt_str(&row, 15)?,
+                created_at: get_str(&row, 16)?,
             });
         }
         Ok(notes)
@@ -13246,6 +13284,10 @@ mod tests {
             title: format!("Title of {source}"),
             abstract_text: "The abstract, kept verbatim.".into(),
             review: review.into(),
+            question: "does FFKM hold above 300 C".into(),
+            method: "TGA onset plus 1000 h ageing".into(),
+            key_findings: "Table 3: 315 C onset; Fig 5: 12% mass loss at 1000 h".into(),
+            limitations: "single supplier, no thermal cycling".into(),
             task: "alternatives to PFAS in seals".into(),
             relevance: "bears on the seals sub-question".into(),
             depth: depth.into(),
