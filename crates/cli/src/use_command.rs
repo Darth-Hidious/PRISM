@@ -562,8 +562,39 @@ mod tests {
         let _h = isolated_home();
         // SAFETY: tests are single-threaded for env var mutation.
         unsafe {
-            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
         }
+        // A BUNDLED provider: the warning names the key that provider actually
+        // reads. This used to select `anthropic`, which bbd88398 deliberately
+        // stopped bundling ("added by the user or not at all") — so the test
+        // was asserting the key of a provider PRISM no longer ships, and the
+        // message it got was the unknown-provider warning instead.
+        let out = apply(
+            UseAction::Provider {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+                api_key_env: None,
+            },
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.message.contains("OPENAI_API_KEY"),
+            "expected warning about missing env var, got: {}",
+            out.message
+        );
+        assert!(out.message.contains("not set"));
+    }
+
+    /// Choosing a provider PRISM does not bundle says so, and says where to
+    /// declare it — it does not silently guess an endpoint in silence.
+    /// Anthropic is the deliberate example: `providers.rs` asserts PRISM must
+    /// not ship it, so this is the behaviour a user selecting it must get.
+    #[tokio::test]
+    async fn an_unbundled_provider_says_it_is_unknown() {
+        let _h = isolated_home();
         let out = apply(
             UseAction::Provider {
                 provider: "anthropic".into(),
@@ -576,11 +607,15 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            out.message.contains("ANTHROPIC_API_KEY"),
-            "expected warning about missing env var, got: {}",
+            out.message.contains("Unknown provider"),
+            "an unbundled provider must be named as unknown, got: {}",
             out.message
         );
-        assert!(out.message.contains("not set"));
+        assert!(
+            out.message.contains("providers.toml"),
+            "and must say where to declare it, got: {}",
+            out.message
+        );
     }
 
     #[tokio::test]
@@ -713,7 +748,6 @@ mod tests {
         for id in [
             "marc27",
             "openai",
-            "anthropic",
             "google",
             "openrouter",
             "groq",
@@ -728,6 +762,16 @@ mod tests {
         ] {
             assert!(out.message.contains(id), "{id} missing from `use list`");
         }
+        // And the converse, mirroring `providers.rs`: PRISM must NOT ship an
+        // Anthropic provider (bbd88398 — "added by the user or not at all").
+        // Without this the list could regrow it and only providers.rs would
+        // notice, which is how these two tests drifted apart in the first
+        // place.
+        assert!(
+            !out.message.contains("anthropic"),
+            "PRISM must not ship an Anthropic provider, got: {}",
+            out.message
+        );
         // Default target is the platform, so it should be marked current.
         assert_eq!(out.new_target, ChatTarget::Marc27 { model: None });
         assert!(out.message.contains("prism use provider"));

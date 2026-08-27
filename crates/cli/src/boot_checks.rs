@@ -412,7 +412,10 @@ async fn run_boot_checks_with(
                 let expired = r.status() == reqwest::StatusCode::UNAUTHORIZED;
                 let line = rejection_line(r).await;
                 if expired && creds.map(|c| !c.refresh_token.is_empty()).unwrap_or(false) {
-                    (false, format!("{line}; run `prism login`"))
+                    (
+                        false,
+                        format!("{line}; the stored refresh token can renew it"),
+                    )
                 } else {
                     (false, line)
                 }
@@ -725,9 +728,13 @@ mod tests {
                 "boot_checks no longer qualifies a public-catalog row: {needle:?}"
             );
         }
-        // An expired session must name the fix, not just the failure.
+        // An expired session must name the fix, not just the failure. The
+        // wording states the remedy rather than commanding a CLI run: the
+        // `no_exit_to_cli` guard bans the imperative form, and this assertion
+        // used to pin the exact string that guard rejects, so the two rules
+        // contradicted each other and one of them had to be red.
         assert!(
-            src.contains("run `prism login`"),
+            src.contains("the stored refresh token can renew it"),
             "the Auth row must tell the reader how to recover, not only that \
              the token expired -- a refresh token is sitting in credentials.json"
         );
