@@ -300,17 +300,6 @@ pub static PROVENANCE_CTX: std::sync::RwLock<ProvenanceCtx> =
 pub struct ProvenanceCtx {
     pub session_id: String,
     pub llm_model: String,
-    /// Id of the tool call currently executing, minted by [`begin_action`]
-    /// before the tool runs and consumed by [`end_action`] after it returns.
-    ///
-    /// Process-global for the same reason `session_id` is: the tool that
-    /// writes facts is a CHILD PROCESS, so the id has to reach an environment
-    /// variable rather than a call argument. `fire_before` -> execute ->
-    /// `fire_after` is sequential within a turn, so at most one action is
-    /// live at a time. Two agent loops sharing one process would interleave
-    /// here — the same limitation the session id already has, and the reason
-    /// background research runs out-of-process.
-    pub action_id: Option<String>,
 }
 
 impl ProvenanceCtx {
@@ -318,7 +307,6 @@ impl ProvenanceCtx {
         Self {
             session_id: String::new(),
             llm_model: String::new(),
-            action_id: None,
         }
     }
 }
@@ -346,59 +334,74 @@ pub fn provenance_session_id() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Mint the id for the tool call about to run, and make it current.
+/// The action each tokio task is currently running.
+///
+/// Keyed by TASK, not process-global. `orchestrator::fan_out` runs the
+/// research DAG's sub-questions concurrently in one process with a `JoinSet`,
+/// so a single slot would let two branches overwrite each other's action and
+/// attribute one branch's facts to the other's call. A wrong attribution is
+/// worse than none, and it would corrupt exactly the decomposed case the DAG
+/// exists to serve.
+///
+/// A task that begins an action and dies without ending it leaks one entry;
+/// the cap bounds that, and past it attribution degrades to "unattributed"
+/// rather than to "someone else's".
+static CURRENT_ACTIONS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Live actions tracked before attribution fails open.
+const MAX_LIVE_ACTIONS: usize = 1024;
+
+/// Identity of the execution context running right now.
+///
+/// A spawned task gets its own id, which is what isolates concurrent DAG
+/// branches. Everything else shares one slot: a future driven by `block_on`
+/// is NOT inside a task and has no id, and that is not an exotic case — it is
+/// how `#[tokio::test]` runs and how a caller can drive the loop. Returning
+/// `None` there looked tidy and silently dropped attribution for the whole
+/// context, which the tests caught.
+///
+/// The shared slot is exactly as safe as the process-global this replaced —
+/// one `block_on` per thread of control — while spawned work, the only place
+/// real concurrency happens, stays isolated.
+fn task_key() -> String {
+    tokio::task::try_id().map_or_else(|| "block_on".to_string(), |id| id.to_string())
+}
+
+/// Mint the id for the tool call about to run, and make it current FOR THIS
+/// TASK.
 ///
 /// Returned so the caller can correlate; the usual consumers read it back
 /// with [`current_action_id`]. Called from the provenance hook's BEFORE
-/// callback, so the id exists while the tool executes — the after hook is
-/// too late, because by then the tool has already written its facts.
+/// callback, so the id exists while the tool executes — the after hook is too
+/// late, because by then the tool has already written its facts.
 ///
-/// Overwrites any previous value unconditionally: a tool that was denied or
-/// panicked never reaches [`end_action`], and the next call must not inherit
-/// its id.
+/// Overwrites this task's previous value unconditionally: a tool that was
+/// denied or panicked never reaches [`end_action`], and the next call on that
+/// task must not inherit its id.
 pub fn begin_action() -> String {
     let id = prism_provenance::new_action_id();
-    if let Ok(mut ctx) = PROVENANCE_CTX.write() {
-        ctx.action_id = Some(id.clone());
+    if let Ok(mut live) = CURRENT_ACTIONS.write() {
+        let key = task_key();
+        if live.len() < MAX_LIVE_ACTIONS || live.contains_key(&key) {
+            live.insert(key, id.clone());
+        }
     }
     id
 }
 
-/// The tool call currently executing, if one is.
+/// The tool call this task is currently executing, if any.
 ///
 /// `None` outside a tool call — attribution is never invented, and callers
 /// treat it as "not launched by an agent action".
 #[must_use]
 pub fn current_action_id() -> Option<String> {
-    PROVENANCE_CTX.read().ok().and_then(|c| c.action_id.clone())
-}
-
-/// Action ids that have COMPLETED since the last drain.
-///
-/// The research cycle asks what a round bought, and the answer lives in the
-/// fact DAG keyed by these ids (`assertions_from_action`). The loop cannot ask
-/// without knowing which calls to ask about, and this hook is the only place
-/// that sees every one of them.
-pub static COMPLETED_ACTIONS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
-
-/// Cap on remembered action ids between drains.
-///
-/// The list is drained every handback, so it normally holds one round's calls.
-/// The cap exists only so a run with no handbacks cannot grow it without
-/// bound; dropping the OLDEST is right because a stale id contributes nothing
-/// the newer ones do not.
-const MAX_REMEMBERED_ACTIONS: usize = 512;
-
-/// Take the actions completed since the last call, leaving the list empty.
-///
-/// Draining rather than reading keeps rounds disjoint: an action counts for
-/// the round it ran in and never again, or one productive call early on would
-/// keep the loop alive forever.
-pub fn drain_completed_actions() -> Vec<String> {
-    COMPLETED_ACTIONS
-        .write()
-        .map(|mut done| std::mem::take(&mut *done))
-        .unwrap_or_default()
+    let key = task_key();
+    CURRENT_ACTIONS
+        .read()
+        .ok()
+        .and_then(|live| live.get(&key).cloned())
 }
 
 /// Clear the current action and return what it was.
@@ -407,17 +410,11 @@ pub fn drain_completed_actions() -> Vec<String> {
 /// tool whose own hooks do not fire) would be attributed to whichever call
 /// happened to run last — a wrong attribution, which is worse than none.
 pub fn end_action() -> Option<String> {
-    let finished = PROVENANCE_CTX
+    let key = task_key();
+    CURRENT_ACTIONS
         .write()
         .ok()
-        .and_then(|mut c| c.action_id.take());
-    if let (Some(id), Ok(mut done)) = (finished.as_ref(), COMPLETED_ACTIONS.write()) {
-        if done.len() >= MAX_REMEMBERED_ACTIONS {
-            done.remove(0);
-        }
-        done.push(id.clone());
-    }
-    finished
+        .and_then(|mut live| live.remove(&key))
 }
 
 fn provenance_model() -> Option<String> {
@@ -1494,8 +1491,10 @@ mod tests {
     /// clears it. The clear is the point: provenance written after a tool
     /// returns (between turns, or by a path whose hooks do not fire) must not
     /// inherit the last call's id and be credited to work it did not do.
-    #[test]
-    fn an_action_id_is_current_only_while_its_tool_runs() {
+    /// Async because attribution is keyed on the TASK: outside a runtime
+    /// there is no task, and therefore deliberately no attribution.
+    #[tokio::test]
+    async fn an_action_id_is_current_only_while_its_tool_runs() {
         let _lock = crate::skills::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1513,11 +1512,50 @@ mod tests {
         assert_eq!(end_action(), None, "ending twice invents nothing");
     }
 
+    /// The DAG case. `orchestrator::fan_out` runs sub-questions concurrently
+    /// in ONE process with a `JoinSet`, so two branches are mid-tool-call at
+    /// the same moment. Each must see only its own action: a shared slot would
+    /// attribute one branch's facts to the other branch's call, which is the
+    /// one failure worse than having no attribution at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_dag_branches_do_not_steal_each_others_attribution() {
+        use std::sync::Arc;
+        // Both branches hold an action at the same instant — without the
+        // barrier one could finish before the other starts and the test would
+        // pass even with a single shared slot.
+        let both_started = Arc::new(tokio::sync::Barrier::new(2));
+
+        let branch = |barrier: Arc<tokio::sync::Barrier>| async move {
+            let mine = begin_action();
+            barrier.wait().await;
+            let seen = current_action_id();
+            let ended = end_action();
+            (mine, seen, ended)
+        };
+
+        let (left, right) = tokio::join!(
+            tokio::spawn(branch(both_started.clone())),
+            tokio::spawn(branch(both_started.clone()))
+        );
+        let (left_mine, left_seen, left_ended) = left.expect("branch joins");
+        let (right_mine, right_seen, right_ended) = right.expect("branch joins");
+
+        assert_ne!(left_mine, right_mine, "each branch mints its own action");
+        assert_eq!(
+            left_seen,
+            Some(left_mine.clone()),
+            "a branch must see ITS action while the sibling is mid-call"
+        );
+        assert_eq!(right_seen, Some(right_mine.clone()));
+        assert_eq!(left_ended, Some(left_mine));
+        assert_eq!(right_ended, Some(right_mine));
+    }
+
     /// A tool that was denied or panicked never reaches `end_action`, so the
     /// next `begin_action` must overwrite rather than preserve. Otherwise the
     /// next call's facts would be credited to the call that failed.
-    #[test]
-    fn a_new_action_replaces_one_that_never_finished() {
+    #[tokio::test]
+    async fn a_new_action_replaces_one_that_never_finished() {
         let _lock = crate::skills::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
