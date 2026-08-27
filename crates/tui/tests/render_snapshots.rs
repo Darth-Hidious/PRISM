@@ -2717,6 +2717,372 @@ fn prose_with_no_registered_object_has_no_reference_regions() {
     }
 }
 
+/// Every column on `row` claimed by a reference with exactly `id`.
+///
+/// Exact cells, not "a region exists somewhere": the bug class this hunts is
+/// a region that exists but sits shifted by a miscounted prefix — the word
+/// looks right while hovering it resolves the neighbour, silently.
+fn reference_cols_on_row(app: &App, row: u16, width: u16, id: &str) -> Vec<u16> {
+    use prism_tui::hit_map::HitTarget;
+    let map = app.hit_map.borrow();
+    (0..width)
+        .filter(|col| {
+            matches!(map.at(*col, row),
+                Some(HitTarget::Reference { id: got }) if got.as_str() == id)
+        })
+        .collect()
+}
+
+/// Screen row and display-column span where `needle` was DRAWN, read back
+/// from the rendered buffer. Display columns, not byte offsets: the glyphs in
+/// front of a tool result (`✓`, the evidence badge) are one column but
+/// several bytes, which is exactly the confusion this helper exists to avoid.
+fn drawn_at(rendered: &str, needle: &str) -> (u16, u16, u16) {
+    use unicode_width::UnicodeWidthStr;
+    for (row, line) in rendered.lines().enumerate() {
+        if let Some(byte) = line.find(needle) {
+            let start = line[..byte].width() as u16;
+            return (row as u16, start, start + needle.width() as u16);
+        }
+    }
+    panic!("{needle:?} is not drawn anywhere:\n{rendered}");
+}
+
+/// A tool name on its own result line is pointable, at exactly its own cells.
+///
+/// Tool names live overwhelmingly on tool-result lines, and those lines were
+/// never annotated — `tool://` references resolved in tests and were
+/// unreachable on a live screen. The assertion compares the hit region
+/// against where the buffer actually drew the word, so it also pins the
+/// prefix arithmetic: the indent, the `✓` (one column, three bytes) and the
+/// evidence badge all sit in front, and any of them counted in bytes — or
+/// not counted at all — shifts every mark onto the wrong word with no panic.
+#[test]
+fn the_tool_name_on_a_result_line_claims_exactly_its_own_cells() {
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "lookup_structure".into(),
+        content: "found 1 match".into(),
+        card_type: "result".into(),
+        elapsed_ms: Some(120),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    // 90 columns: the sidebar is dropped, so the only "lookup_structure" on
+    // screen is the result line's own.
+    let rendered = render_app_to_string(&app, 90, 30);
+
+    let (row, start, end) = drawn_at(&rendered, "lookup_structure");
+    assert_eq!(
+        reference_cols_on_row(&app, row, 90, "tool://lookup_structure"),
+        (start..end).collect::<Vec<u16>>(),
+        "the mark must cover the drawn word exactly; row {row} reads: {:?}",
+        rendered.lines().nth(row as usize)
+    );
+}
+
+/// An identity in a tool-result BODY is pointable, at exactly its own cells.
+///
+/// Identities are born in tool results — a structure's label and id appear
+/// there before any reply paraphrases them — so the body rows behind the
+/// 4-column indent are where a reader points first. Same exact-cells bar as
+/// the head line: an indent added to the text but not to the region (or vice
+/// versa) drifts every mark four columns.
+#[test]
+fn a_reference_in_a_tool_result_body_claims_exactly_its_own_cells() {
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://e129a2e9d3".into(),
+        kind: "structure".into(),
+        label: "MoNbTaW".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "structure".into(),
+        content: "stored 1 structure\nMoNbTaW relaxed cleanly".into(),
+        card_type: "result".into(),
+        elapsed_ms: Some(80),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let rendered = render_app_to_string(&app, 90, 30);
+
+    let (row, start, end) = drawn_at(&rendered, "MoNbTaW");
+    assert_eq!(
+        reference_cols_on_row(&app, row, 90, "cache://e129a2e9d3"),
+        (start..end).collect::<Vec<u16>>(),
+        "the mark must cover the drawn word exactly; row {row} reads: {:?}",
+        rendered.lines().nth(row as usize)
+    );
+}
+
+/// The identity as the MODEL abbreviates it is pointable — the live bug.
+///
+/// Measured live: the model wrote "Import succeeded (1 atom, stored as
+/// cache://9a13e307…/structure.cif)" for a structure registered under the
+/// full 64-hex id, and no cell on the rendered screen resolved to a
+/// Reference. The '…' stopped the machine-id scanner at `cache://9a13e307`
+/// (never registered), and no registered token was a substring of the
+/// abbreviation. A swappable model abbreviates however it likes, so the
+/// written form must RESOLVE to the registered id when it unambiguously
+/// identifies it — this exercises the exact live string, and the ASCII
+/// `...` spelling the same model also produces.
+#[test]
+fn the_live_measured_abbreviated_id_resolves_to_the_registered_structure() {
+    // The real id shape: cache://<64 hex>/structure.cif.
+    let full_id = format!("cache://9a13e307{}/structure.cif", "f".repeat(56));
+    for written in [
+        // Verbatim from the live transcript (U+2026).
+        "Import succeeded (1 atom, stored as cache://9a13e307…/structure.cif)",
+        // The ASCII spelling of the same abbreviation. '.' is an id
+        // character, so this one used to be captured WHOLE and unregistered.
+        "Import succeeded (1 atom, stored as cache://9a13e307.../structure.cif)",
+    ] {
+        let mut app = app_with_welcome();
+        app.apply_agent_msg(AgentMsg::ObjectUpdate {
+            id: full_id.clone(),
+            kind: "structure".into(),
+            label: "W-refractory".into(),
+            status: "completed".into(),
+            progress_current: None,
+            progress_total: None,
+            detail: None,
+        });
+        app.apply_agent_msg(AgentMsg::TextDelta(format!("{written}\n")));
+        app.apply_agent_msg(AgentMsg::TextFlush);
+        let rendered = render_app_to_string(&app, 90, 30);
+
+        // The abbreviation collapses to the sigil and the sigil's cells
+        // resolve to the FULL registered id — the whole point of the change.
+        let (row, start, end) = drawn_at(&rendered, "cache:9a13e307…");
+        assert_eq!(
+            reference_cols_on_row(&app, row, 90, &full_id),
+            (start..end).collect::<Vec<u16>>(),
+            "{written:?}: the written abbreviation must resolve to the \
+             registered id and claim exactly the drawn cells"
+        );
+        // The swallowed elision leaves no debris after the sigil.
+        assert!(
+            !rendered.contains("……") && !rendered.contains("…/structure.cif"),
+            "{written:?}: the elided tail must be part of the written id, \
+             not leftover prose:\n{rendered}"
+        );
+    }
+}
+
+/// The renderer's own short form and a raw DOI are pointable as tokens.
+///
+/// Two more forms the transcript writes beyond the label: the sigil
+/// ("cache:c1d48df2…") circulates once anything quotes the screen, and a DOI
+/// has no `cache://`-style scheme so the machine-id scanner never sees it.
+/// Both are registered as tokens and must claim their own cells. (The
+/// abbreviated `cache://…` form the model itself writes is a different bug
+/// with its own test above.)
+#[test]
+fn the_sigil_form_and_a_raw_doi_are_pointable_as_tokens() {
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://c1d48df2abc/structure.cif".into(),
+        kind: "structure".into(),
+        label: "W-refractory".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "10.1038/s41586-024-1234-5".into(),
+        kind: "paper".into(),
+        label: "Senkov 2019".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    // Neither label appears — only the sigil form and the raw DOI, the two
+    // forms that used to match nothing.
+    app.apply_agent_msg(AgentMsg::TextDelta(
+        "See cache:c1d48df2… and 10.1038/s41586-024-1234-5 here.\n".into(),
+    ));
+    app.apply_agent_msg(AgentMsg::TextFlush);
+    let rendered = render_app_to_string(&app, 90, 30);
+
+    let (row, start, end) = drawn_at(&rendered, "cache:c1d48df2…");
+    assert_eq!(
+        reference_cols_on_row(&app, row, 90, "cache://c1d48df2abc/structure.cif"),
+        (start..end).collect::<Vec<u16>>(),
+        "the sigil form must resolve to the full id it abbreviates"
+    );
+    let (row, start, end) = drawn_at(&rendered, "10.1038/s41586-024-1234-5");
+    assert_eq!(
+        reference_cols_on_row(&app, row, 90, "10.1038/s41586-024-1234-5"),
+        (start..end).collect::<Vec<u16>>(),
+        "a raw id outside the machine-id schemes must match as a token"
+    );
+}
+
+/// A reference past the WRAP point claims the cells where it is drawn.
+///
+/// Marks are recorded in pre-wrap columns, and `rows_for()` only says where a
+/// logical line BEGINS. A tool-result head line longer than the terminal
+/// wraps, so a word past the wrap point is drawn on a later row — and the
+/// mark used to be recorded one row up, on the pre-wrap column, where the
+/// cells are blank (or, past `area.width`, dropped entirely). Clicking the
+/// visible word did nothing. The assertion compares the hit map against the
+/// buffer the word was actually drawn into, at a width that forces the wrap.
+#[test]
+fn a_reference_past_the_wrap_point_claims_the_cells_where_it_is_drawn() {
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://e129a2e9d3".into(),
+        kind: "structure".into(),
+        label: "MoNbTaW".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    // The head line = indent + glyph + badge + "structure: AAAA…" — far past
+    // 44 columns, so "MoNbTaW" lands on a continuation row.
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "structure".into(),
+        content: format!("{} MoNbTaW relaxed", "A".repeat(32)),
+        card_type: "result".into(),
+        elapsed_ms: Some(80),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let rendered = render_app_to_string(&app, 44, 30);
+
+    let (row, start, end) = drawn_at(&rendered, "MoNbTaW");
+    assert!(
+        row > 0,
+        "the word must sit on a wrapped continuation row for this test to \
+         mean anything; rendered:\n{rendered}"
+    );
+    assert_eq!(
+        reference_cols_on_row(&app, row, 44, "cache://e129a2e9d3"),
+        (start..end).collect::<Vec<u16>>(),
+        "the mark must cover the drawn word on its WRAPPED row; row {row} \
+         reads: {:?}",
+        rendered.lines().nth(row as usize)
+    );
+    // And nothing one row up: the old failure recorded the mark on the row
+    // where the logical line begins, over blank cells.
+    assert_eq!(
+        reference_cols_on_row(&app, row - 1, 44, "cache://e129a2e9d3"),
+        Vec::<u16>::new(),
+        "no reference cells may sit on the pre-wrap row"
+    );
+}
+
+/// A tool that has only ever FAILED is still reachable by its name.
+///
+/// `register_tool_references` collects names from every `ToolResult`
+/// including failures, but error bodies stay unannotated — so a tool with no
+/// successful line had a `tool://` entry with zero clickable cells anywhere,
+/// and the tool a reader most wants to interrogate was the one they could
+/// not. The name on the failed head line is the pointer; the error message
+/// itself stays red and unmarked.
+#[test]
+fn a_tool_that_only_ever_failed_is_still_reachable_by_its_name() {
+    use prism_tui::app::{ChatLine, LineKind, Role};
+
+    let mut app = app_with_welcome();
+    // A failure for a tool that never succeeds anywhere in the session.
+    app.messages.push(ChatLine {
+        role: Role::Tool,
+        text: "flaky_tool: connection refused".into(),
+        kind: LineKind::ToolResult {
+            tool_name: "flaky_tool".into(),
+            content: "connection refused".into(),
+            elapsed_ms: 50,
+            success: false,
+            evidence_class: None,
+            image_paths: Vec::new(),
+        },
+    });
+    // Any later result runs the same registration pass a live session runs,
+    // which scans ALL ToolResult lines — including the failure above.
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "lookup_structure".into(),
+        content: "found 1 match".into(),
+        card_type: "result".into(),
+        elapsed_ms: Some(120),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let rendered = render_app_to_string(&app, 90, 30);
+
+    let (row, start, end) = drawn_at(&rendered, "flaky_tool");
+    assert_eq!(
+        reference_cols_on_row(&app, row, 90, "tool://flaky_tool"),
+        (start..end).collect::<Vec<u16>>(),
+        "the failed tool's NAME must be pointable — it is the only place its \
+         tool:// entry can be reached; row {row} reads: {:?}",
+        rendered.lines().nth(row as usize)
+    );
+}
+
+/// An error card's MESSAGE takes no reference marks — deliberately.
+///
+/// The whole error card is painted red so a failure reads as one; a mark
+/// would repaint words of that message in the accent colour, trading the one
+/// signal the colour carries there for a pointer. This pins the decision so
+/// a future "annotate everything" sweep has to argue with a red test. What
+/// this covers: an error card whose text mentions a registered structure —
+/// no cell of it may be a reference. The one exception lives elsewhere: a
+/// failed ToolResult's own NAME is marked on its head line
+/// (`a_tool_that_only_ever_failed_is_still_reachable_by_its_name`), and this
+/// card registers no `tool://` entry, so no name mark applies here.
+#[test]
+fn an_error_result_takes_no_reference_marks() {
+    use prism_tui::hit_map::HitTarget;
+
+    let mut app = app_with_welcome();
+    app.apply_agent_msg(AgentMsg::ObjectUpdate {
+        id: "cache://e129a2e9d3".into(),
+        kind: "structure".into(),
+        label: "MoNbTaW".into(),
+        status: "completed".into(),
+        progress_current: None,
+        progress_total: None,
+        detail: None,
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "structure".into(),
+        content: "MoNbTaW import failed\nMoNbTaW was unreachable".into(),
+        card_type: "error".into(),
+        elapsed_ms: Some(80),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let rendered = render_app_to_string(&app, 90, 30);
+    assert!(
+        rendered.contains("MoNbTaW"),
+        "the registered word must be on screen for this test to mean anything"
+    );
+
+    let map = app.hit_map.borrow();
+    for row in 0..30u16 {
+        for col in 0..90u16 {
+            assert!(
+                !matches!(map.at(col, row), Some(HitTarget::Reference { .. })),
+                "an error line must not carry reference marks — its colour is \
+                 the signal (cell {col},{row})"
+            );
+        }
+    }
+}
+
 /// B5: pointing at a reference opens a panel, and nothing is fetched before
 /// the pointer arrives.
 ///

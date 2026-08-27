@@ -62,12 +62,37 @@ pub struct ReferenceEntry {
 #[derive(Debug, Default)]
 pub struct ReferenceRegistry {
     entries: Vec<ReferenceEntry>,
+    /// Tokens that two entries with DIFFERENT ids have both claimed.
+    ///
+    /// Such a word identifies neither thing, so the matcher skips it: a mark
+    /// that resolves to the wrong identity is worse than plain text. The
+    /// measured case is the sigil — `id_sigil` keeps eight characters of the
+    /// body, so two `file://` ids in one directory tree collide, and the
+    /// earliest-insertion tie-break silently handed the first file every
+    /// later file's clicks. Basenames collide the same way (`mod.rs`).
+    ///
+    /// Contested is PERMANENT for the session, not recomputed from current
+    /// claims: entries are replaced wholesale on re-insertion, and if the ban
+    /// lapsed the moment one claimant was re-registered, the other id would
+    /// still abbreviate to the same word — the re-registered entry would
+    /// steal it back.
+    contested: std::collections::BTreeSet<String>,
 }
 
 impl ReferenceRegistry {
     /// Add or replace an entry. Re-inserting the same id replaces it, because
     /// a re-run of the same tool describes the same thing more recently.
     pub fn insert(&mut self, entry: ReferenceEntry) {
+        for token in &entry.tokens {
+            if !token.is_empty()
+                && self
+                    .entries
+                    .iter()
+                    .any(|e| e.id != entry.id && e.tokens.contains(token))
+            {
+                self.contested.insert(token.clone());
+            }
+        }
         if let Some(slot) = self.entries.iter_mut().find(|e| e.id == entry.id) {
             *slot = entry;
         } else {
@@ -103,39 +128,106 @@ pub struct RefRegion {
 
 /// Find the next machine identifier in `hay` at or after `from`.
 ///
-/// Returns `(start, end, canonical_id)`. Models paste these into prose
-/// whatever the system prompt says — and the prompt cannot be relied on,
-/// because the model is swappable. So the TUI recognises them itself.
+/// Returns `(start, end, written_id)` — the id AS WRITTEN, which may be an
+/// abbreviation. Models paste these into prose whatever the system prompt
+/// says — and the prompt cannot be relied on, because the model is swappable.
+/// So the TUI recognises them itself, elisions included: the live transcript
+/// wrote "cache://9a13e307…/structure.cif" for a 64-hex id, and an ellipsis
+/// that stopped the scan left the head captured, unregistered, and the tail
+/// as debris. [`resolve_written_id`] decides what an abbreviation stands for.
 fn next_machine_id(hay: &str, from: usize) -> Option<(usize, usize, String)> {
     const PREFIXES: &[&str] = &["cache://", "file://"];
+    /// Bytes of the run of id characters at the start of `s`.
+    fn id_run(s: &str) -> usize {
+        s.char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+            .map(|(i, c)| i + c.len_utf8())
+            .last()
+            .unwrap_or(0)
+    }
+    /// Trim trailing sentence punctuation so "…cif." keeps its full stop in
+    /// the prose — but keep a trailing run of three or more dots: that is an
+    /// ELISION the model wrote ("cache://9a13e307..."), part of the id as
+    /// written, not a full stop.
+    fn trim_sentence_punct(hay: &str, start: usize, mut end: usize) -> usize {
+        let dots = hay[start..end]
+            .bytes()
+            .rev()
+            .take_while(|b| *b == b'.')
+            .count();
+        if dots >= 3 {
+            return end;
+        }
+        while end > start && matches!(hay.as_bytes()[end - 1], b'.' | b'-') {
+            end -= 1;
+        }
+        end
+    }
     let mut best: Option<(usize, usize, String)> = None;
     for prefix in PREFIXES {
         let Some(rel) = hay[from..].find(prefix) else {
             continue;
         };
         let start = from + rel;
-        // Runs to the first character that cannot be part of an id. Trailing
-        // sentence punctuation is deliberately excluded so "…cif." keeps its
-        // full stop in the prose.
-        let rest = &hay[start + prefix.len()..];
-        let len: usize = rest
-            .char_indices()
-            .take_while(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-            .map(|(i, c)| i + c.len_utf8())
-            .last()
-            .unwrap_or(0);
-        let mut end = start + prefix.len() + len;
-        while end > start && matches!(hay.as_bytes()[end - 1], b'.' | b'-') {
-            end -= 1;
-        }
-        if end <= start + prefix.len() {
+        let body = start + prefix.len();
+        let mut end = body + id_run(&hay[body..]);
+        if end <= body {
             continue;
         }
+        // An ellipsis immediately after the run belongs to the id AS WRITTEN,
+        // and so does the path tail after it: "cache://9a13e307…/structure.cif"
+        // is one abbreviated id, not an id that stops at the ellipsis with
+        // debris behind it. The ASCII "..." spelling needs no handling here —
+        // '.' is an id character, so it is already inside the run.
+        if hay[end..].starts_with('…') {
+            end += '…'.len_utf8();
+            end += id_run(&hay[end..]);
+        }
+        end = trim_sentence_punct(hay, start, end);
         if best.as_ref().is_none_or(|(bs, _, _)| start < *bs) {
             best = Some((start, end, hay[start..end].to_string()));
         }
     }
     best
+}
+
+/// The registered id a WRITTEN machine id stands for, if it identifies
+/// exactly one.
+///
+/// Models abbreviate ids in their own prose — "cache://9a13e307…" for a
+/// 64-hex id — and a swappable model abbreviates however it likes, so the
+/// abbreviation habits are not ours to choose. A written id resolves when it
+/// unambiguously identifies one registered entry:
+///
+/// 1. verbatim — it IS a registered id;
+/// 2. elided — the text before the first `…`/`...` is a prefix of exactly
+///    one registered id whose end also matches the text after it (an 8-hex
+///    head disambiguates in practice);
+/// 3. bare — the whole written id is a prefix of exactly one registered id.
+///
+/// Two candidates resolve to NOTHING: guessing between identities is worse
+/// than leaving the text plain — the same rule that keeps unregistered ids
+/// uncoloured and contested tokens unmatched.
+fn resolve_written_id(written: &str, reg: &ReferenceRegistry) -> Option<String> {
+    if reg.get(written).is_some() {
+        return Some(written.to_string());
+    }
+    let (head, tail) = match written.find('…') {
+        Some(i) => (&written[..i], &written[i + '…'.len_utf8()..]),
+        None => match written.find("...") {
+            Some(i) => (&written[..i], &written[i + 3..]),
+            None => (written, ""),
+        },
+    };
+    let mut candidates = reg.entries().filter(|e| {
+        // The length guard keeps head and tail from overlapping inside a
+        // short id: "cache://abc…bc" must not resolve to "cache://abc".
+        e.id.len() >= head.len() + tail.len() && e.id.starts_with(head) && e.id.ends_with(tail)
+    });
+    match (candidates.next(), candidates.next()) {
+        (Some(only), None) => Some(only.id.clone()),
+        _ => None,
+    }
 }
 
 /// The short form shown in prose for an id PRISM knows.
@@ -149,6 +241,43 @@ pub fn id_sigil(id: &str) -> String {
     let head: String = body.chars().take(8).collect();
     let scheme = id.split_once("://").map(|(s, _)| s).unwrap_or("id");
     format!("{scheme}:{head}…")
+}
+
+/// The earliest standalone token match in `hay` at or after `from`, with the
+/// id of the entry the token stands for. Earliest wins, then longest, so an
+/// entry whose token contains another's wins the span.
+fn next_token_match<'r>(
+    hay: &str,
+    from: usize,
+    reg: &'r ReferenceRegistry,
+) -> Option<(usize, usize, &'r str)> {
+    let mut best: Option<(usize, usize, &str)> = None;
+    for entry in reg.entries() {
+        for token in &entry.tokens {
+            // A contested token — one that two different ids have claimed —
+            // identifies neither and matches nothing. See
+            // `ReferenceRegistry::contested`.
+            if token.is_empty() || reg.contested.contains(token) {
+                continue;
+            }
+            let Some(rel) = hay[from..].find(token.as_str()) else {
+                continue;
+            };
+            let start = from + rel;
+            let end = start + token.len();
+            if !is_standalone(hay, start, end) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((bs, be, _)) => start < bs || (start == bs && end > be),
+            };
+            if better {
+                best = Some((start, end, entry.id.as_str()));
+            }
+        }
+    }
+    best
 }
 
 /// Whether a match at `start..end` inside `hay` stands alone rather than
@@ -167,6 +296,20 @@ fn is_standalone(hay: &str, start: usize, end: usize) -> bool {
     boundary(before) && boundary(after)
 }
 
+/// The style every pointable mark wears.
+///
+/// One place, not a per-call-site copy: the convention the reader learns is
+/// "this colour means I can open it", and two hand-kept styles would drift
+/// into teaching two rules. A dedicated colour, not `warn` — `warn` also
+/// paints loading messages, approval prompts and tagged rows, so sharing it
+/// taught the rule and then broke it on the same screen.
+#[must_use]
+pub fn mark_style(t: Theme) -> Style {
+    Style::default()
+        .fg(t.reference)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
 /// Paint every known reference in `lines` and say where each one landed.
 ///
 /// Operates on the ALREADY-RENDERED lines, so the coordinates it returns
@@ -183,13 +326,7 @@ pub fn annotate_references(
     if reg.is_empty() {
         return (lines, Vec::new());
     }
-    // A dedicated colour, not `warn`. The convention the reader learns is
-    // "this colour means I can open it"; `warn` also paints loading messages,
-    // approval prompts and tagged rows, so sharing it taught the rule and then
-    // broke it on the same screen.
-    let style = Style::default()
-        .fg(t.reference)
-        .add_modifier(Modifier::UNDERLINED);
+    let style = mark_style(t);
     let mut regions = Vec::new();
     let mut out = Vec::with_capacity(lines.len());
 
@@ -204,27 +341,49 @@ pub fn annotate_references(
             let mut cursor = 0usize;
             let mut emitted_any = false;
             loop {
-                // A raw machine id in the prose wins over token matching: it
-                // IS the identity, not a word that stands for one. Known ids
-                // collapse to a sigil and stay pointable; unknown ids are left
-                // exactly as written, and deliberately NOT given the reference
-                // colour — that colour promises a resolvable identity, and
-                // painting an unregistered token with it would be a lie.
-                if let Some((ms, me, id)) = next_machine_id(&text, cursor) {
-                    let known = reg.get(&id).is_some();
+                // A raw machine id wins over token matching AT THE SAME
+                // POSITION: it IS the identity, not a word that stands for
+                // one — and when a registered token is itself the raw id,
+                // both matchers find the same characters and only this path
+                // collapses a known id to its sigil. But it must not eat the
+                // words BEFORE it. An early `continue` here used to emit the
+                // head of "MoNbTaW stored at cache://x" unexamined, so a
+                // label was only matchable in sentences that mentioned no id
+                // after it. Both candidates are found first; the earlier one
+                // is processed; the loop comes back for the other.
+                //
+                // Written ids that RESOLVE — verbatim, elided, or by unique
+                // prefix, see `resolve_written_id` — collapse to a sigil and
+                // stay pointable, carrying the FULL registered id. Ids that
+                // resolve to nothing (unregistered, or ambiguous between two
+                // registrations) are left exactly as written, and deliberately
+                // NOT given the reference colour — that colour promises a
+                // resolvable identity, and painting a token PRISM cannot
+                // resolve with it would be a lie.
+                let machine = next_machine_id(&text, cursor);
+                let token = next_token_match(&text, cursor, reg);
+                let machine_first = match (&machine, &token) {
+                    (Some((ms, ..)), Some((ts, ..))) => ms <= ts,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if machine_first {
+                    let Some((ms, me, written)) = machine else {
+                        unreachable!("machine_first implies a machine id")
+                    };
                     if ms > cursor {
                         let head = text[cursor..ms].to_string();
                         col += width_of(&head);
                         spans.push(Span::styled(head, span.style));
                     }
-                    if known {
-                        let sigil = id_sigil(&id);
+                    if let Some(full) = resolve_written_id(&written, reg) {
+                        let sigil = id_sigil(&full);
                         let w = width_of(&sigil);
                         regions.push(RefRegion {
                             row,
                             col_start: col,
                             col_end: col + w,
-                            id: id.clone(),
+                            id: full,
                         });
                         col += w;
                         spans.push(Span::styled(sigil, style));
@@ -237,32 +396,7 @@ pub fn annotate_references(
                     emitted_any = true;
                     continue;
                 }
-                let mut best: Option<(usize, usize, &str)> = None;
-                for entry in reg.entries() {
-                    for token in &entry.tokens {
-                        if token.is_empty() {
-                            continue;
-                        }
-                        let Some(rel) = text[cursor..].find(token.as_str()) else {
-                            continue;
-                        };
-                        let start = cursor + rel;
-                        let end = start + token.len();
-                        if !is_standalone(&text, start, end) {
-                            continue;
-                        }
-                        // Prefer the earliest match, then the longest, so an
-                        // entry whose token contains another's wins the span.
-                        let better = match best {
-                            None => true,
-                            Some((bs, be, _)) => start < bs || (start == bs && end > be),
-                        };
-                        if better {
-                            best = Some((start, end, entry.id.as_str()));
-                        }
-                    }
-                }
-                let Some((start, end, id)) = best else { break };
+                let Some((start, end, id)) = token else { break };
                 if start > cursor {
                     let head = text[cursor..start].to_string();
                     col += width_of(&head);
@@ -471,6 +605,64 @@ mod tests {
         assert_eq!(regions.len(), 1, "the standalone token must still match");
     }
 
+    /// A token BEFORE a machine id in the same span still marks.
+    ///
+    /// The machine-id branch used to `continue` past the head unexamined, so
+    /// a label was only matchable in sentences that mentioned no id after it
+    /// — and the sentence a tool result actually writes is "<label> stored at
+    /// <id>". Both the word and the id must come back pointable.
+    #[test]
+    fn a_token_before_a_machine_id_in_the_same_span_still_marks() {
+        let t = crate::theme::get(0);
+        let reg = reg_with("cache://x", "MoNbTaW");
+        let lines = crate::markdown::markdown_lines("MoNbTaW stored at cache://x today.", t, 200);
+        let (out, regions) = annotate_references(lines, &reg, t);
+
+        assert_eq!(
+            regions.len(),
+            2,
+            "the label and the id must both mark: {regions:?}"
+        );
+        assert_eq!(regions[0].id, "cache://x");
+        assert_eq!(
+            extract(&out, &regions[0]),
+            "MoNbTaW",
+            "the head before the id must still be token-matched"
+        );
+        assert_eq!(
+            extract(&out, &regions[1]),
+            "cache:x…",
+            "the id after the token must still collapse to its sigil"
+        );
+    }
+
+    /// An id registered as its own token marks ONCE, as a sigil.
+    ///
+    /// Registration now lists the raw id among the tokens, so both matchers
+    /// find the same characters. The machine path must win the tie: it is the
+    /// one that collapses a known id, and letting the token path take it
+    /// would leave the full forty-character id eating the line, marked but
+    /// never shortened.
+    #[test]
+    fn a_raw_id_registered_as_its_own_token_still_collapses_once() {
+        let t = crate::theme::get(0);
+        let mut reg = ReferenceRegistry::default();
+        reg.insert(ReferenceEntry {
+            id: "cache://deadbeef".into(),
+            kind: RefKind::Structure,
+            tokens: vec!["W".into(), "cache://deadbeef".into()],
+        });
+        let lines = crate::markdown::markdown_lines("Stored at cache://deadbeef now.", t, 200);
+        let (out, regions) = annotate_references(lines, &reg, t);
+
+        assert_eq!(regions.len(), 1, "one id, one region: {regions:?}");
+        assert_eq!(
+            extract(&out, &regions[0]),
+            "cache:deadbeef…",
+            "the machine path must win the tie and collapse the id"
+        );
+    }
+
     /// With nothing registered, the lines come back untouched — no allocation
     /// churn and no styling, so a session that never ran a tool pays nothing.
     #[test]
@@ -619,6 +811,101 @@ mod tests {
             "an unregistered id must not be given a reference region — the \
              colour promises an identity PRISM can resolve"
         );
+    }
+
+    /// An abbreviation that matches TWO registrations marks nothing.
+    ///
+    /// Guards the resolver against guessing: with two structures sharing an
+    /// 8-hex head, "cache://9a13e307…/structure.cif" identifies neither, and
+    /// a mark that resolves to the wrong one is worse than plain text — the
+    /// same rule that keeps unregistered ids uncoloured. The written form
+    /// stays verbatim so the reader sees exactly what the model said.
+    #[test]
+    fn an_ambiguous_abbreviation_marks_nothing_and_stays_verbatim() {
+        let t = crate::theme::get(0);
+        let mut reg = ReferenceRegistry::default();
+        for tail in ["aaaa", "bbbb"] {
+            reg.insert(ReferenceEntry {
+                id: format!("cache://9a13e307{tail}/structure.cif"),
+                kind: RefKind::Structure,
+                tokens: Vec::new(),
+            });
+        }
+        for prose in [
+            "stored as cache://9a13e307…/structure.cif today.",
+            "stored as cache://9a13e307.../structure.cif today.",
+        ] {
+            let lines = crate::markdown::markdown_lines(prose, t, 200);
+            let (out, regions) = annotate_references(lines, &reg, t);
+            assert!(
+                regions.is_empty(),
+                "{prose:?}: an ambiguous abbreviation must not mark; got \
+                 {regions:?}"
+            );
+            let rendered: String = out
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|sp| sp.content.to_string()))
+                .collect();
+            assert!(
+                rendered.contains("cache://9a13e307"),
+                "{prose:?}: the written id must survive verbatim: {rendered}"
+            );
+        }
+    }
+
+    /// A token that two different ids both claim identifies neither, so it
+    /// marks nothing — permanently.
+    ///
+    /// The measured case is the sigil: `id_sigil` keeps 8 characters of the
+    /// body, so two `file://` ids in one directory tree collide, and the
+    /// earliest-insertion tie-break in `next_token_match` handed the first
+    /// file every later file's clicks. Silently the wrong identity — worse
+    /// than no mark. The ban must survive re-insertion: both ids still
+    /// abbreviate to the same word, so a re-registered entry must not steal
+    /// it back.
+    #[test]
+    fn a_token_two_ids_both_claim_marks_neither() {
+        let t = crate::theme::get(0);
+        let entry = |name: &str| {
+            let id = format!("file:///home/user/project/src/{name}");
+            ReferenceEntry {
+                tokens: vec![name.to_string(), id.clone(), id_sigil(&id)],
+                id,
+                kind: RefKind::FileLine,
+            }
+        };
+        // The collision is real: same tree, same sigil.
+        assert_eq!(
+            id_sigil("file:///home/user/project/src/foo.rs"),
+            id_sigil("file:///home/user/project/src/bar.rs"),
+        );
+        let mut reg = ReferenceRegistry::default();
+        reg.insert(entry("foo.rs"));
+        reg.insert(entry("bar.rs"));
+
+        // The shared sigil marks NOTHING — resolving it to either file would
+        // be a guess.
+        let lines = crate::markdown::markdown_lines("See file:/home/us… here.", t, 200);
+        let (_, regions) = annotate_references(lines, &reg, t);
+        assert!(
+            regions.is_empty(),
+            "a token both ids claim must mark neither; got {regions:?}"
+        );
+
+        // ...and re-inserting one claimant must not let it steal the word.
+        reg.insert(entry("bar.rs"));
+        let lines = crate::markdown::markdown_lines("See file:/home/us… here.", t, 200);
+        let (_, regions) = annotate_references(lines, &reg, t);
+        assert!(
+            regions.is_empty(),
+            "the ban must survive re-insertion; got {regions:?}"
+        );
+
+        // Uncontested tokens still work: each basename is one file's alone.
+        let lines = crate::markdown::markdown_lines("Open bar.rs now.", t, 200);
+        let (_, regions) = annotate_references(lines, &reg, t);
+        assert_eq!(regions.len(), 1, "unique tokens must still mark");
+        assert_eq!(regions[0].id, "file:///home/user/project/src/bar.rs");
     }
 
     /// The sigil is short, deterministic, and keeps the scheme.

@@ -19,10 +19,13 @@ use crate::theme::Theme;
 use crate::toast::ToastKind;
 use prism_provenance::EvidenceClass;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, Widget, Wrap,
+};
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
@@ -314,6 +317,78 @@ fn draw_toasts(f: &mut Frame, app: &App) {
 /// Rows reserved for one inline figure in the transcript.
 const FIGURE_ROWS: u16 = 12;
 
+/// One transcript line that carries reference marks, prepared for resolving
+/// those marks to WRAPPED screen cells.
+///
+/// A mark is recorded in pre-wrap columns of its logical line, but the
+/// transcript is one wrapped `Paragraph`: a long line spills onto
+/// continuation rows, and `rows_for()` only says where the line BEGINS. A
+/// mark past the wrap point used to be recorded one row up on blank cells —
+/// the word looked right, clicking it did nothing. Instead of re-deriving
+/// ratatui's word-wrap (which would drift the day their algorithm changes),
+/// the probe re-renders THIS line with ratatui's own wrapper and reads back
+/// where each mark's cells actually landed.
+struct RefProbe {
+    /// Index into the transcript's logical `lines`.
+    line: usize,
+    /// The line with the k-th mark's cells — and only those — styled with
+    /// [`probe_sentinel`]`(k)`. Content is byte-identical to the real line,
+    /// and wrapping depends only on content, so it wraps exactly the same.
+    probe: Line<'static>,
+    /// Reference id per mark, indexed by sentinel `k`.
+    ids: Vec<String>,
+    /// Wrapped rows this line occupies at the transcript width.
+    rows: u16,
+}
+
+/// Colour that encodes mark index `k`, worn only inside a probe buffer that
+/// is scanned and thrown away — it is never drawn to the terminal.
+fn probe_sentinel(k: usize) -> Color {
+    // Two bytes of index reach 65,536 marks on ONE logical line; a line
+    // cannot physically carry that many words. The 0xE1 head byte only
+    // matters within the probe, where every non-mark span wears
+    // `Style::default()`, so nothing else can collide with it.
+    Color::Rgb(0xE1, (k >> 8) as u8, k as u8)
+}
+
+/// The mark index a probe cell's foreground encodes, if any.
+fn probe_sentinel_index(fg: Option<Color>) -> Option<usize> {
+    match fg {
+        Some(Color::Rgb(0xE1, hi, lo)) => Some((usize::from(hi) << 8) | usize::from(lo)),
+        _ => None,
+    }
+}
+
+/// Re-style `line` so each mark's cells carry its sentinel and nothing else
+/// carries any colour at all. `marks` are `(col_start, col_end)` in display
+/// columns, ascending and non-overlapping — the order the annotator emits.
+fn probe_line(line: &Line<'_>, marks: &[(u16, u16)]) -> Line<'static> {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let style_for = |owner: Option<usize>| match owner {
+        Some(k) => Style::default().fg(probe_sentinel(k)),
+        None => Style::default(),
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current = String::new();
+    let mut owner: Option<usize> = None;
+    let mut col: u16 = 0;
+    for ch in text.chars() {
+        let ch_owner = marks
+            .iter()
+            .position(|(start, end)| col >= *start && col < *end);
+        if ch_owner != owner && !current.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut current), style_for(owner)));
+        }
+        owner = ch_owner;
+        current.push(ch);
+        col = col.saturating_add(u16::try_from(ch.to_string().width()).unwrap_or(0));
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(current, style_for(owner)));
+    }
+    Line::from(spans)
+}
+
 fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let mut lines: Vec<Line> = Vec::new();
@@ -467,7 +542,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                         Span::raw("  "),
                         Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
                     ];
-                    if let Some(evidence_class) = evidence_class {
+                    let remainder = if let Some(evidence_class) = evidence_class {
                         let token = evidence_token(evidence_class);
                         spans.push(Span::styled(
                             token.clone(),
@@ -475,15 +550,95 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                                 .fg(evidence_color(evidence_class, t))
                                 .add_modifier(Modifier::BOLD),
                         ));
-                        spans.push(Span::styled(
-                            line_text
-                                .strip_prefix(&token)
-                                .unwrap_or(line_text)
-                                .to_string(),
-                            style,
-                        ));
+                        line_text
+                            .strip_prefix(&token)
+                            .unwrap_or(line_text)
+                            .to_string()
                     } else {
-                        spans.push(Span::styled(line_text.to_string(), style));
+                        line_text.to_string()
+                    };
+                    if render_body_as_markdown {
+                        // This line carries the tool's own name — the most
+                        // pointed-at word on screen — so it gets the same
+                        // annotation as assistant prose. The regions come back
+                        // in the coordinates of the remainder alone, and shift
+                        // right by the width of the prefix spans ALREADY
+                        // pushed. That width is measured from those spans, not
+                        // counted from a format string: the glyph is one
+                        // column but three bytes, and the evidence badge
+                        // varies per class — a hand-kept count would drift the
+                        // day either changes and every mark would land on the
+                        // wrong word, silently.
+                        let prefix_cols =
+                            u16::try_from(spans.iter().map(Span::width).sum::<usize>())
+                                .unwrap_or(u16::MAX);
+                        let (annotated, refs) = crate::refs::annotate_references(
+                            vec![Line::from(Span::styled(remainder, style))],
+                            &app.references,
+                            t,
+                        );
+                        for r in &refs {
+                            reference_marks.push((
+                                lines.len(),
+                                r.col_start.saturating_add(prefix_cols),
+                                r.col_end.saturating_add(prefix_cols),
+                                r.id.clone(),
+                            ));
+                        }
+                        for annotated_line in annotated {
+                            spans.extend(annotated_line.spans);
+                        }
+                    } else {
+                        // A FAILED result stays red and its body stays
+                        // unannotated — the colour is the signal — but the
+                        // tool's NAME on this head line is still marked. The
+                        // name is not part of the error message: it is the
+                        // identity of the thing that failed, and a tool that
+                        // has ONLY ever failed is exactly the one a reader
+                        // most wants to interrogate. Without this, its
+                        // `tool://` entry (registered from every ToolResult,
+                        // failures included) had zero clickable cells
+                        // anywhere on screen.
+                        let failed_tool_mark = match kind {
+                            LineKind::ToolResult {
+                                success: false,
+                                tool_name,
+                                ..
+                            } => {
+                                let id = format!("tool://{tool_name}");
+                                (app.references.get(&id).is_some())
+                                    .then(|| remainder.find(tool_name.as_str()))
+                                    .flatten()
+                                    .map(|at| (at, tool_name.len(), id))
+                            }
+                            _ => None,
+                        };
+                        if let Some((at, len, id)) = failed_tool_mark {
+                            // Same rule as the successful head line above:
+                            // the region shifts by the width of what is
+                            // actually drawn in front of it, measured from
+                            // the spans, never counted from a format string.
+                            let prefix_cols =
+                                u16::try_from(spans.iter().map(Span::width).sum::<usize>())
+                                    .unwrap_or(u16::MAX);
+                            let head = remainder[..at].to_string();
+                            let name = remainder[at..at + len].to_string();
+                            let tail = remainder[at + len..].to_string();
+                            let head_w = u16::try_from(head.width()).unwrap_or(u16::MAX);
+                            let name_w = u16::try_from(name.width()).unwrap_or(u16::MAX);
+                            let col = prefix_cols.saturating_add(head_w);
+                            reference_marks.push((
+                                lines.len(),
+                                col,
+                                col.saturating_add(name_w),
+                                id,
+                            ));
+                            spans.push(Span::styled(head, style));
+                            spans.push(Span::styled(name, crate::refs::mark_style(t)));
+                            spans.push(Span::styled(tail, style));
+                        } else {
+                            spans.push(Span::styled(remainder, style));
+                        }
                     }
                     lines.push(Line::from(spans));
                 }
@@ -491,14 +646,47 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 if render_body_as_markdown && !rest.join("").trim().is_empty() {
                     // Width is reduced by the 4-column indent so a table sizes
                     // its columns to the room it will actually occupy.
-                    for md in
-                        markdown::markdown_lines(&rest.join("\n"), t, area.width.saturating_sub(4))
-                    {
-                        let mut spans = vec![Span::raw("    ")];
+                    //
+                    // Annotated like assistant prose, and for a stronger
+                    // reason: identities are BORN here. A structure's
+                    // `cache://…` appears in the result that stored it long
+                    // before any reply paraphrases it, so a result body that
+                    // is not annotated leaves the reference system reachable
+                    // only through prose that happens to repeat the id.
+                    let (annotated, refs) = crate::refs::annotate_references(
+                        markdown::markdown_lines(&rest.join("\n"), t, area.width.saturating_sub(4)),
+                        &app.references,
+                        t,
+                    );
+                    for (n, md) in annotated.into_iter().enumerate() {
+                        let indent = Span::raw("    ");
+                        // Measured from the span itself, same rule as the head
+                        // line above: the region shifts by what is actually
+                        // drawn in front of it, nothing else.
+                        let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
+                        let mut spans = vec![indent];
                         spans.extend(md.spans);
+                        for r in refs.iter().filter(|r| r.row == n) {
+                            reference_marks.push((
+                                lines.len(),
+                                r.col_start.saturating_add(indent_cols),
+                                r.col_end.saturating_add(indent_cols),
+                                r.id.clone(),
+                            ));
+                        }
                         lines.push(Line::from(spans));
                     }
                 } else {
+                    // Error BODIES are deliberately NOT annotated, for the
+                    // same reason they are not markdown-rendered: the whole
+                    // card is painted red so a failure reads as one, and a
+                    // reference mark would repaint words of that message in
+                    // the accent colour — trading the one signal the colour
+                    // carries there (this failed) for a pointer. The tool's
+                    // NAME is the exception, and it is marked on the HEAD
+                    // line above, not here — so a tool that has only ever
+                    // failed is still reachable without repainting a word of
+                    // its error message.
                     for line_text in rest {
                         lines.push(Line::from(vec![
                             Span::raw("    "),
@@ -695,6 +883,41 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     // the paragraph measures itself below without cloning anything.
     let tail_rows = (prev > 0).then(|| acc.saturating_add(measure(&lines[prev..])));
 
+    // Prepare each marked line for wrap-aware hit-region resolution, while
+    // `lines` is still ours to borrow — the paragraph takes ownership below.
+    // Marks arrive grouped: lines are emitted in order and each line's marks
+    // are pushed left to right, so consecutive equal indices are one line.
+    let ref_probes: Vec<RefProbe> = {
+        let mut probes: Vec<RefProbe> = Vec::new();
+        let mut cols: Vec<(u16, u16)> = Vec::new();
+        let mut ids: Vec<String> = Vec::new();
+        let mut flush = |line: usize, cols: &mut Vec<(u16, u16)>, ids: &mut Vec<String>| {
+            if ids.is_empty() {
+                return;
+            }
+            probes.push(RefProbe {
+                line,
+                probe: probe_line(&lines[line], cols),
+                ids: std::mem::take(ids),
+                rows: measure(&lines[line..line + 1]).min(u32::from(u16::MAX)) as u16,
+            });
+            cols.clear();
+        };
+        let mut current: Option<usize> = None;
+        for (line, col_start, col_end, id) in &reference_marks {
+            if current.is_some_and(|c| c != *line) {
+                flush(current.unwrap(), &mut cols, &mut ids);
+            }
+            current = Some(*line);
+            cols.push((*col_start, *col_end));
+            ids.push(id.clone());
+        }
+        if let Some(line) = current {
+            flush(line, &mut cols, &mut ids);
+        }
+        probes
+    };
+
     // A clicked line is MARKED, not merely remembered. Selection was stored
     // and never drawn, so pointing at a line looked like nothing happened —
     // the reader had no way to know the app had heard them.
@@ -787,24 +1010,67 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         // own cells while the rest of the reply still answers as a message —
         // pointing at the word gets the reference, pointing beside it gets the
         // message.
-        for (line, col_start, col_end, id) in &reference_marks {
-            let row = rows_for(*line);
-            if row < effective_scroll || row >= effective_scroll.saturating_add(area.height) {
+        //
+        // A mark's pre-wrap column is NOT its screen column: the transcript
+        // wraps, and a word past the wrap point is drawn rows below where its
+        // logical line begins. So each marked line is re-rendered through
+        // ratatui's own wrapper (see `RefProbe`) and the mark's cells are
+        // read back from where they actually landed — only the rows visible
+        // this frame, so the cost per marked line is one render of at most a
+        // viewport's worth of it. A mark that itself straddles the wrap
+        // yields one region per row, which is where its cells really are.
+        for probe in &ref_probes {
+            let start = rows_for(probe.line);
+            let vis_top = start.max(effective_scroll);
+            let vis_bottom = start
+                .saturating_add(probe.rows)
+                .min(effective_scroll.saturating_add(area.height));
+            if vis_bottom <= vis_top {
                 continue;
             }
-            let width = col_end.saturating_sub(*col_start);
-            if width == 0 || *col_start >= area.width {
-                continue;
-            }
-            map.push(
-                Rect::new(
-                    area.x + col_start,
-                    area.y + (row - effective_scroll),
-                    width.min(area.width - col_start),
-                    1,
-                ),
-                HitTarget::Reference { id: id.clone() },
+            let skip = vis_top - start;
+            let show = vis_bottom - vis_top;
+            let mut buf = Buffer::empty(Rect::new(0, 0, area.width, show));
+            Widget::render(
+                Paragraph::new(vec![probe.probe.clone()])
+                    .wrap(Wrap { trim: false })
+                    .scroll((skip, 0)),
+                buf.area,
+                &mut buf,
             );
+            for r in 0..show {
+                // Bounding column range per mark on this row. A wide glyph's
+                // continuation cell carries no style, so min/max over the
+                // sentinel cells — a mark's cells are consecutive — rather
+                // than requiring an unbroken styled run.
+                let mut ranges: Vec<Option<(u16, u16)>> = vec![None; probe.ids.len()];
+                for c in 0..area.width {
+                    let cell = &buf[(c, r)];
+                    let Some(k) = probe_sentinel_index(cell.style().fg) else {
+                        continue;
+                    };
+                    let w = u16::try_from(cell.symbol().width()).unwrap_or(1).max(1);
+                    let range = ranges[k].get_or_insert((c, c));
+                    range.0 = range.0.min(c);
+                    range.1 = range.1.max(c.saturating_add(w));
+                }
+                for (k, range) in ranges.iter().enumerate() {
+                    let Some((col_start, col_end)) = range else {
+                        continue;
+                    };
+                    map.push(
+                        Rect::new(
+                            area.x + col_start,
+                            area.y + (vis_top + r - effective_scroll),
+                            (col_end - col_start).min(area.width - col_start),
+                            1,
+                        ),
+                        HitTarget::Reference {
+                            id: probe.ids[k].clone(),
+                        },
+                    );
+                }
+            }
         }
     }
 

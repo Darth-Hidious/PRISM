@@ -5440,10 +5440,18 @@ impl App {
                         "paper" | "doi" => crate::refs::RefKind::Doi,
                         _ => crate::refs::RefKind::FileLine,
                     };
+                    // The label is NOT the only form the transcript writes.
+                    // Tool results and the prose quoting them say the identity
+                    // itself — "stored as cache://9a13e307…" — and the
+                    // renderer's short form (`cache:9a13e307…`) circulates
+                    // once anything quotes the screen. With only the label
+                    // registered, the one string that IS the thing matched
+                    // nothing and pointing at it did nothing. All three forms
+                    // are tokens now; a reader may point at any of them.
                     self.references.insert(crate::refs::ReferenceEntry {
                         id: id.clone(),
                         kind: ref_kind,
-                        tokens: vec![label.clone()],
+                        tokens: vec![label.clone(), id.clone(), crate::refs::id_sigil(&id)],
                     });
                 }
                 if id.trim().is_empty() {
