@@ -169,6 +169,43 @@ const MAX_CONTRACT_GATE_FIRINGS: usize = 2;
 /// going, and someone who turns it on has said so.
 const MAX_CONTINUATIONS: usize = 24;
 
+/// Whether a handback should happen, and what to demand of it.
+///
+/// Pure so the cycle can be reasoned about without driving a model: research is
+/// search → read → let what you read say where to look next, and the only
+/// mechanical question is whether the last round actually gathered anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CycleStep {
+    /// Gathered something; ask it to analyse and then chase what that exposed.
+    ContinueAfterResearch,
+    /// Produced only prose; ask for evidence, and count it against the budget.
+    ContinueAfterStall,
+    /// Stopped gathering. Telling it to keep going only produces more prose.
+    Stop,
+}
+
+#[must_use]
+pub(crate) fn cycle_step(researched: bool, stalled_so_far: usize) -> CycleStep {
+    if researched {
+        return CycleStep::ContinueAfterResearch;
+    }
+    if stalled_so_far + 1 > MAX_STALLED_CONTINUATIONS {
+        CycleStep::Stop
+    } else {
+        CycleStep::ContinueAfterStall
+    }
+}
+
+/// Handbacks that may produce analysis without gathering anything new before
+/// the loop gives up.
+///
+/// Research is search → read → let what you read say where to look next. A
+/// round that adds no evidence has left the cycle, and telling such a model to
+/// "keep going" only produces more prose. One recovery round is allowed,
+/// because a model can legitimately spend a turn reasoning about what it just
+/// read before acting on it.
+const MAX_STALLED_CONTINUATIONS: usize = 1;
+
 /// Whether the operator asked for research that continues past the model's
 /// first attempt to stop.
 ///
@@ -3007,6 +3044,10 @@ pub(crate) async fn run_turn_inner(
     let mut tools_used_this_turn: Vec<String> = Vec::new();
     let mut contract_gate_firings: usize = 0;
     let mut continuations: usize = 0;
+    // How many tools had run when the turn was last handed back — the marker
+    // that says whether the next round actually gathered anything.
+    let mut tools_at_last_continuation: usize = 0;
+    let mut stalled_continuations: usize = 0;
     // Tool-definition token budget for THIS model's real context window,
     // resolved once per turn (the catalog and the model do not change mid-turn).
     let tool_token_budget =
@@ -3562,33 +3603,73 @@ pub(crate) async fn run_turn_inner(
                     && !transcript.budget_exhausted()
                     && !claims_research_complete(response.message.content.as_deref().unwrap_or(""))
                 {
-                    continuations += 1;
-                    tracing::info!(
-                        continuation = continuations,
-                        "continuation gate: turn handed back, work not declared complete"
-                    );
-                    emit(AgentEvent::TextDelta {
-                        text: format!(
-                            "\n\n[continuing — {continuations}/{MAX_CONTINUATIONS}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n"
-                        ),
-                    });
-                    history.push(ChatMessage {
-                        role: "system".to_string(),
-                        content: Some(format!(
-                            "You have not finished. Do not summarise and stop — carry out the \
-                             next step you just named, then the one after it. Prefer acting \
-                             over reporting: if you wrote that something remains to be \
-                             ingested, verified, computed or defined, do it now with a tool.\n\n\
-                             When the work is genuinely complete — not merely reported on — \
-                             end your message with `{RESEARCH_COMPLETE_MARKER}`. If you are \
-                             blocked and no tool can move you forward, say what blocks you \
-                             and end with `{RESEARCH_COMPLETE_MARKER}` as well; continuing to \
-                             restate a blocker is not progress."
-                        )),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    continue;
+                    // Did the model actually RESEARCH since the last handback,
+                    // or only write more prose? Analysis is the middle of the
+                    // cycle, not the end of it: what you just read is what
+                    // tells you where to look next. A continuation that
+                    // produces no tool call is the loop spinning, and saying
+                    // "keep going" to a model that is already only talking
+                    // produces more talking.
+                    let researched = tools_used_this_turn.len() > tools_at_last_continuation;
+                    let step = cycle_step(researched, stalled_continuations);
+                    stalled_continuations = if researched {
+                        0
+                    } else {
+                        stalled_continuations + 1
+                    };
+                    if step == CycleStep::Stop {
+                        tracing::info!(
+                            continuation = continuations,
+                            "continuation gate: stopping — analysis without research"
+                        );
+                        emit(AgentEvent::TextDelta {
+                            text: format!(
+                                "\n\n[stopping — {MAX_STALLED_CONTINUATIONS} handbacks produced \
+                                 analysis but no new evidence]\n\n"
+                            ),
+                        });
+                    } else {
+                        continuations += 1;
+                        tools_at_last_continuation = tools_used_this_turn.len();
+                        tracing::info!(
+                            continuation = continuations,
+                            researched,
+                            "continuation gate: turn handed back, work not declared complete"
+                        );
+                        emit(AgentEvent::TextDelta {
+                            text: format!(
+                                "\n\n[continuing — {continuations}/{MAX_CONTINUATIONS}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n"
+                            ),
+                        });
+                        let demand = if researched {
+                            "You have just analysed what you gathered. That analysis is not the \
+                             end of the cycle — it is what tells you where to look next. Name \
+                             the specific gap, contradiction or unverified number it exposed, \
+                             then GO GET IT with a tool. Read a source you have only listed, \
+                             compute what you assumed, or search for what you now know is \
+                             missing."
+                        } else {
+                            "Your last turn produced no new evidence — only more prose about \
+                             what you already had. Restating a plan is not research. Call a \
+                             tool now: read one of the sources you listed, compute one of the \
+                             numbers you assumed, or search for the specific thing your own \
+                             analysis said was missing."
+                        };
+                        history.push(ChatMessage {
+                            role: "system".to_string(),
+                            content: Some(format!(
+                                "{demand}\n\n\
+                                 When the work is genuinely complete — not merely reported on — \
+                                 end your message with `{RESEARCH_COMPLETE_MARKER}`. If you are \
+                                 blocked and no tool can move you forward, say what blocks you \
+                                 and end with `{RESEARCH_COMPLETE_MARKER}` as well; continuing \
+                                 to restate a blocker is not progress."
+                            )),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        continue;
+                    }
                 }
 
                 // ── Capability-gap re-retrieval ───────────────────
@@ -4526,6 +4607,32 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 
 #[cfg(test)]
 mod tests {
+    /// The cycle the owner asked for: analyse, then go back and research what
+    /// the analysis exposed, and repeat. A round that gathered evidence always
+    /// earns another round.
+    #[test]
+    fn a_round_that_gathered_evidence_continues_the_cycle() {
+        assert_eq!(cycle_step(true, 0), CycleStep::ContinueAfterResearch);
+        assert_eq!(
+            cycle_step(true, MAX_STALLED_CONTINUATIONS + 5),
+            CycleStep::ContinueAfterResearch,
+            "gathering evidence clears the stall, however long it had stalled"
+        );
+    }
+
+    /// One barren round is allowed — a model may legitimately spend a turn
+    /// reasoning about what it just read before acting on it.
+    #[test]
+    fn one_barren_round_is_forgiven_then_the_loop_stops() {
+        assert_eq!(cycle_step(false, 0), CycleStep::ContinueAfterStall);
+        assert_eq!(
+            cycle_step(false, MAX_STALLED_CONTINUATIONS),
+            CycleStep::Stop,
+            "a model that has stopped gathering will not start because it was \
+             told to keep going; that is how a loop burns money writing essays"
+        );
+    }
+
     /// Continuation is the operator's decision, never PRISM's. Off, the turn
     /// ends exactly as it does today; a default that kept spending because the
     /// model had more ideas would be the harness deciding to spend money.
