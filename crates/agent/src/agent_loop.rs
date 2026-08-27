@@ -180,14 +180,125 @@ pub(crate) enum CycleStep {
     ContinueAfterResearch,
     /// Produced only prose; ask for evidence, and count it against the budget.
     ContinueAfterStall,
+    /// Worked, but reached only ground the session already held. Keep going and
+    /// SAY so: repeated near-synonym queries returning the same papers is a
+    /// diversity failure, and the fix is a different direction, not more of the
+    /// same or an early finish.
+    ContinueAndDiversify,
     /// Stopped gathering. Telling it to keep going only produces more prose.
     Stop,
 }
 
+/// The graph's own holes, phrased as research targets.
+///
+/// A subject whose PEERS all report a quantity, and which does not, is a cell
+/// where the answer has to be predicted rather than looked up — and therefore
+/// the cell research should go after next. Handing these to a circling model
+/// turns "try something else" into "these specific things are missing", which
+/// is the difference between a nudge and a direction.
+///
+/// Best-effort by construction: a coverage query that fails degrades to the
+/// generic nudge. A reporting aid must never be able to stop research.
+async fn coverage_targets(limit: usize) -> Option<String> {
+    let path = crate::hooks::provenance_db_path();
+    let store = prism_provenance::ProvenanceStore::open(&path).await.ok()?;
+    let gaps = store
+        .coverage_gaps(prism_provenance::LOCAL_TENANT, limit)
+        .await
+        .ok()?;
+    if gaps.is_empty() {
+        return None;
+    }
+    let lines = gaps
+        .iter()
+        .map(|gap| {
+            format!(
+                "  - {} has no value in {} — {} comparable subject(s) do",
+                gap.subject, gap.quantity, gap.peers_measured
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(lines)
+}
+
+/// What one round of research actually bought.
+///
+/// Counted in ground reached, not in activity. `calls` says the model did
+/// something; the other two say whether that something moved the research DAG.
+/// Both novelty counts are exact rather than fuzzy because both identities are
+/// content-addressed: a source is its DOI/URL and an assertion is
+/// `assertion_id(tenant, subject, predicate, object)`, so two paths arriving at
+/// the same place collide instead of double-counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RoundYield {
+    /// Tool calls completed since the last handback.
+    pub calls: usize,
+    /// Sources reached this round the session had not seen, summed from
+    /// `SaturationTracker`'s per-search `fresh`. This is the signal for
+    /// SEARCH, which writes no facts at all.
+    pub novel_sources: usize,
+    /// Facts stored this round. The signal for INGEST.
+    pub novel_facts: usize,
+    /// A search this round could not be read, so its yield is UNKNOWN.
+    ///
+    /// Kept separate from "zero" on purpose: the tracker already records that
+    /// counting an unreadable result as zero-new is how a big successful
+    /// search gets mistaken for a dry well. Unknown must never be evidence of
+    /// exhaustion.
+    pub unknown_yield: bool,
+}
+
+impl RoundYield {
+    /// Whether the round reached new ground — or whether we cannot say it
+    /// did not, which is treated the same way.
+    #[must_use]
+    pub fn found_new_ground(&self) -> bool {
+        self.novel_sources > 0 || self.novel_facts > 0 || self.unknown_yield
+    }
+}
+
+/// Rounds of real work that reach no new ground before the loop tells the
+/// model it is going in circles.
+///
+/// Not a stop: saturation is a DIVERSITY failure, not a completion signal.
+/// Re-reading what you already have is what a search does when its queries are
+/// near-synonyms of each other, and the useful response is "look somewhere
+/// else", never "you are finished". Three rounds is enough to distinguish a
+/// genuine re-read (checking a number, following a citation) from a loop.
+const SATURATED_ROUNDS_BEFORE_NUDGE: usize = 3;
+
+/// Holes named in one diversify nudge.
+///
+/// Enough to choose from, few enough to act on. A long list reads as a backlog
+/// and gets skimmed; the point is that the model picks ONE and goes after it.
+const COVERAGE_TARGETS_SHOWN: usize = 6;
+
+/// Decide what happens after a handback.
+///
+/// Ordered by how strong the evidence of progress is. The rule that matters:
+/// this can never stop a turn that the previous, activity-only gate would have
+/// continued. Novelty only ever ADDS a reason to keep going, because search —
+/// the bulk of research — writes no facts at all, so a fact-gated loop would
+/// cut off exactly the work it exists to protect.
 #[must_use]
-pub(crate) fn cycle_step(researched: bool, stalled_so_far: usize) -> CycleStep {
-    if researched {
+pub(crate) fn cycle_step(
+    round: RoundYield,
+    stalled_so_far: usize,
+    saturated_so_far: usize,
+) -> CycleStep {
+    if round.found_new_ground() {
         return CycleStep::ContinueAfterResearch;
+    }
+    if round.calls > 0 {
+        // Worked, but landed on ground the session already held. Keep going —
+        // this is the case the old gate continued — but say so, so the model
+        // can change approach instead of rephrasing the same query again.
+        return if saturated_so_far + 1 >= SATURATED_ROUNDS_BEFORE_NUDGE {
+            CycleStep::ContinueAndDiversify
+        } else {
+            CycleStep::ContinueAfterResearch
+        };
     }
     if stalled_so_far + 1 > MAX_STALLED_CONTINUATIONS {
         CycleStep::Stop
@@ -3047,6 +3158,12 @@ pub(crate) async fn run_turn_inner(
     // How many tools had run when the turn was last handed back — the marker
     // that says whether the next round actually gathered anything.
     let mut tools_at_last_continuation: usize = 0;
+    // Where the saturation tracker stood at the last handback, so a round's
+    // yield is the DELTA rather than the session total.
+    let mut searches_at_last_continuation: usize = 0;
+    let mut facts_at_last_continuation: usize = 0;
+    // Consecutive rounds that worked but reached no new ground.
+    let mut saturated_continuations: usize = 0;
     let mut stalled_continuations: usize = 0;
     // Tool-definition token budget for THIS model's real context window,
     // resolved once per turn (the catalog and the model do not change mid-turn).
@@ -3610,12 +3727,36 @@ pub(crate) async fn run_turn_inner(
                     // produces no tool call is the loop spinning, and saying
                     // "keep going" to a model that is already only talking
                     // produces more talking.
-                    let researched = tools_used_this_turn.len() > tools_at_last_continuation;
-                    let step = cycle_step(researched, stalled_continuations);
+                    // What the round BOUGHT, not merely that it acted. The
+                    // per-search `fresh` counts and `facts_written` already
+                    // live on the saturation tracker, so this reads the
+                    // measurement PRISM already takes rather than making a
+                    // second one that could disagree with it.
+                    let round_searches = &saturation.searches[searches_at_last_continuation..];
+                    let round = RoundYield {
+                        calls: tools_used_this_turn
+                            .len()
+                            .saturating_sub(tools_at_last_continuation),
+                        novel_sources: round_searches.iter().map(|call| call.fresh).sum(),
+                        novel_facts: saturation
+                            .facts_written
+                            .saturating_sub(facts_at_last_continuation),
+                        unknown_yield: round_searches.iter().any(|call| call.unreadable),
+                    };
+                    let researched = round.calls > 0;
+                    let step = cycle_step(round, stalled_continuations, saturated_continuations);
                     stalled_continuations = if researched {
                         0
                     } else {
                         stalled_continuations + 1
+                    };
+                    // Counts rounds of real work that reached no new ground.
+                    // Reset the moment any is reached, so this measures a
+                    // RUN of circling, not a lifetime total.
+                    saturated_continuations = if round.found_new_ground() || !researched {
+                        0
+                    } else {
+                        saturated_continuations + 1
                     };
                     if step == CycleStep::Stop {
                         tracing::info!(
@@ -3631,6 +3772,8 @@ pub(crate) async fn run_turn_inner(
                     } else {
                         continuations += 1;
                         tools_at_last_continuation = tools_used_this_turn.len();
+                        searches_at_last_continuation = saturation.searches.len();
+                        facts_at_last_continuation = saturation.facts_written;
                         tracing::info!(
                             continuation = continuations,
                             researched,
@@ -3641,7 +3784,33 @@ pub(crate) async fn run_turn_inner(
                                 "\n\n[continuing — {continuations}/{MAX_CONTINUATIONS}; say \"{RESEARCH_COMPLETE_MARKER}\" when the work is actually done]\n\n"
                             ),
                         });
-                        let demand = if researched {
+                        // The graph's own holes, when it has any. Asked for
+                        // only on the diversify path: it is one query per
+                        // nudge, not per turn, and a circling model is exactly
+                        // when a concrete target is worth the round trip.
+                        let targets = if step == CycleStep::ContinueAndDiversify {
+                            coverage_targets(COVERAGE_TARGETS_SHOWN).await
+                        } else {
+                            None
+                        };
+                        let demand = if step == CycleStep::ContinueAndDiversify {
+                            // Circling, not finished. Saying "keep going" here
+                            // produces another near-synonym of the query that
+                            // already returned these papers. The useful
+                            // instruction names the failure and asks for a
+                            // different DIRECTION — a different sub-question,
+                            // a different source class, a different level of
+                            // the problem — which is what a diversity failure
+                            // actually needs.
+                            "Your last rounds called tools but reached nothing the session did \
+                             not already have — the same sources coming back means the queries \
+                             are near-synonyms of each other, not that the literature is \
+                             exhausted. Do NOT rephrase the same search again. Change \
+                             direction: ask a different sub-question, go after a source class \
+                             you have not touched (patents, non-English, standards, a cited \
+                             reference inside a paper you already have), or stop searching and \
+                             READ or COMPUTE something you have only listed so far."
+                        } else if researched {
                             "You have just analysed what you gathered. That analysis is not the \
                              end of the cycle — it is what tells you where to look next. Name \
                              the specific gap, contradiction or unverified number it exposed, \
@@ -3654,6 +3823,16 @@ pub(crate) async fn run_turn_inner(
                              tool now: read one of the sources you listed, compute one of the \
                              numbers you assumed, or search for the specific thing your own \
                              analysis said was missing."
+                        };
+                        let demand = match &targets {
+                            Some(holes) => format!(
+                                "{demand}\n\nThe graph already knows where it is thin. These \
+                                 subjects have no value for a quantity their comparable \
+                                 subjects DO have — each line is a specific thing to go and \
+                                 find, and filling one is worth more than another paper on \
+                                 something already covered:\n{holes}"
+                            ),
+                            None => demand.to_string(),
                         };
                         history.push(ChatMessage {
                             role: "system".to_string(),
@@ -4607,16 +4786,28 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 
 #[cfg(test)]
 mod tests {
+    fn worked(calls: usize) -> RoundYield {
+        RoundYield {
+            calls,
+            ..RoundYield::default()
+        }
+    }
+
     /// The cycle the owner asked for: analyse, then go back and research what
-    /// the analysis exposed, and repeat. A round that gathered evidence always
+    /// the analysis exposed, and repeat. A round that reached new ground always
     /// earns another round.
     #[test]
     fn a_round_that_gathered_evidence_continues_the_cycle() {
-        assert_eq!(cycle_step(true, 0), CycleStep::ContinueAfterResearch);
+        let found = RoundYield {
+            calls: 1,
+            novel_sources: 3,
+            ..RoundYield::default()
+        };
+        assert_eq!(cycle_step(found, 0, 0), CycleStep::ContinueAfterResearch);
         assert_eq!(
-            cycle_step(true, MAX_STALLED_CONTINUATIONS + 5),
+            cycle_step(found, MAX_STALLED_CONTINUATIONS + 5, 99),
             CycleStep::ContinueAfterResearch,
-            "gathering evidence clears the stall, however long it had stalled"
+            "reaching new ground clears both counters, however long it had circled"
         );
     }
 
@@ -4624,12 +4815,81 @@ mod tests {
     /// reasoning about what it just read before acting on it.
     #[test]
     fn one_barren_round_is_forgiven_then_the_loop_stops() {
-        assert_eq!(cycle_step(false, 0), CycleStep::ContinueAfterStall);
+        assert_eq!(cycle_step(worked(0), 0, 0), CycleStep::ContinueAfterStall);
         assert_eq!(
-            cycle_step(false, MAX_STALLED_CONTINUATIONS),
+            cycle_step(worked(0), MAX_STALLED_CONTINUATIONS, 0),
             CycleStep::Stop,
             "a model that has stopped gathering will not start because it was \
              told to keep going; that is how a loop burns money writing essays"
+        );
+    }
+
+    /// SEARCH WRITES NO FACTS. Measured in this repo: nothing under
+    /// `crates/retrieval` records an assertion; only ingest does. So a gate
+    /// that demanded facts would cut off the ordinary case — search, read,
+    /// search again — which is the whole activity being protected. Novelty may
+    /// only ever ADD a reason to continue, never remove one.
+    #[test]
+    fn a_working_round_never_stops_earlier_than_the_activity_gate_did() {
+        for saturated in 0..=SATURATED_ROUNDS_BEFORE_NUDGE + 3 {
+            let step = cycle_step(worked(2), 0, saturated);
+            assert_ne!(
+                step,
+                CycleStep::Stop,
+                "a round that called tools must never stop the loop (saturated={saturated})"
+            );
+        }
+    }
+
+    /// Circling is a DIVERSITY failure, not completion. After a run of rounds
+    /// that worked and found nothing new, the loop keeps going but says so, so
+    /// the model changes direction instead of rephrasing the same query.
+    #[test]
+    fn sustained_circling_redirects_rather_than_stopping() {
+        assert_eq!(
+            cycle_step(worked(2), 0, SATURATED_ROUNDS_BEFORE_NUDGE - 2),
+            CycleStep::ContinueAfterResearch,
+            "an occasional re-read is normal and must not trigger the nudge"
+        );
+        assert_eq!(
+            cycle_step(worked(2), 0, SATURATED_ROUNDS_BEFORE_NUDGE - 1),
+            CycleStep::ContinueAndDiversify,
+            "a sustained run of no-new-ground rounds must change the direction"
+        );
+    }
+
+    /// An unreadable search result has UNKNOWN yield, and unknown must never
+    /// be evidence of exhaustion — the tracker records that counting it as
+    /// zero-new is how a big successful search gets mistaken for a dry well.
+    #[test]
+    fn an_unreadable_result_is_never_treated_as_a_dry_well() {
+        let unknown = RoundYield {
+            calls: 1,
+            novel_sources: 0,
+            novel_facts: 0,
+            unknown_yield: true,
+        };
+        assert!(unknown.found_new_ground(), "unknown is not zero");
+        assert_eq!(
+            cycle_step(unknown, 0, SATURATED_ROUNDS_BEFORE_NUDGE + 5),
+            CycleStep::ContinueAfterResearch,
+            "a round we could not read must not be scored as circling"
+        );
+    }
+
+    /// Ingest reaches new ground without touching a source list, so facts
+    /// alone must keep the cycle alive.
+    #[test]
+    fn stored_facts_alone_count_as_new_ground() {
+        let ingested = RoundYield {
+            calls: 1,
+            novel_sources: 0,
+            novel_facts: 12,
+            unknown_yield: false,
+        };
+        assert_eq!(
+            cycle_step(ingested, 0, SATURATED_ROUNDS_BEFORE_NUDGE + 5),
+            CycleStep::ContinueAfterResearch
         );
     }
 

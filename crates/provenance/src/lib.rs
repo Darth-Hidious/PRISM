@@ -39,7 +39,7 @@ pub mod term_binding;
 pub mod units;
 pub use emmo::{
     ACTION_ID_ENV, ActivityDecoding, AssertionClassification, ClassRegionDistance,
-    ClassifiedFactNodes, ClassifiedNode, ConditionValue, EmbeddingPartition,
+    ClassifiedFactNodes, ClassifiedNode, ConditionValue, CoverageGap, EmbeddingPartition,
     EntityGeometryCoverage, EntityGeometryNeighbor, EntityGeometryProbe, EvidenceClass,
     EvidenceContribution, EvidenceSource, FactGraphShape, FactNodeLabels, FactPayload, GraphEdge,
     GraphNode, LOCAL_TENANT, LocalAssertion, LocalFact, LocalProvenance, MaterialFact,

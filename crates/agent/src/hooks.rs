@@ -373,16 +373,51 @@ pub fn current_action_id() -> Option<String> {
     PROVENANCE_CTX.read().ok().and_then(|c| c.action_id.clone())
 }
 
+/// Action ids that have COMPLETED since the last drain.
+///
+/// The research cycle asks what a round bought, and the answer lives in the
+/// fact DAG keyed by these ids (`assertions_from_action`). The loop cannot ask
+/// without knowing which calls to ask about, and this hook is the only place
+/// that sees every one of them.
+pub static COMPLETED_ACTIONS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Cap on remembered action ids between drains.
+///
+/// The list is drained every handback, so it normally holds one round's calls.
+/// The cap exists only so a run with no handbacks cannot grow it without
+/// bound; dropping the OLDEST is right because a stale id contributes nothing
+/// the newer ones do not.
+const MAX_REMEMBERED_ACTIONS: usize = 512;
+
+/// Take the actions completed since the last call, leaving the list empty.
+///
+/// Draining rather than reading keeps rounds disjoint: an action counts for
+/// the round it ran in and never again, or one productive call early on would
+/// keep the loop alive forever.
+pub fn drain_completed_actions() -> Vec<String> {
+    COMPLETED_ACTIONS
+        .write()
+        .map(|mut done| std::mem::take(&mut *done))
+        .unwrap_or_default()
+}
+
 /// Clear the current action and return what it was.
 ///
 /// Clearing matters: without it, provenance written between turns (or by a
 /// tool whose own hooks do not fire) would be attributed to whichever call
 /// happened to run last — a wrong attribution, which is worse than none.
 pub fn end_action() -> Option<String> {
-    PROVENANCE_CTX
+    let finished = PROVENANCE_CTX
         .write()
         .ok()
-        .and_then(|mut c| c.action_id.take())
+        .and_then(|mut c| c.action_id.take());
+    if let (Some(id), Ok(mut done)) = (finished.as_ref(), COMPLETED_ACTIONS.write()) {
+        if done.len() >= MAX_REMEMBERED_ACTIONS {
+            done.remove(0);
+        }
+        done.push(id.clone());
+    }
+    finished
 }
 
 fn provenance_model() -> Option<String> {

@@ -751,6 +751,33 @@ pub struct LocalProvenance {
     pub origin_action_id: Option<String>,
 }
 
+/// One hole in the knowledge manifold: a quantity the peers of a subject
+/// have been measured for, and this subject has not.
+///
+/// The graph is a surface over (subject x quantity). Where independent
+/// sources agree the fabric is woven; where nothing has been measured
+/// there is a hole, and a hole is BOTH the place an answer has to be
+/// predicted rather than looked up AND the place research should go next.
+/// Reporting holes is what turns research from "chase whatever the last
+/// paper mentioned" into "cover the surface".
+///
+/// `peers_measured` is the evidence that the gap is real: a quantity no
+/// subject has is not a hole, it is a quantity nobody in this corpus
+/// measures, and sending an agent after it wastes the turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageGap {
+    pub subject: String,
+    /// The physical quantity, identified by its UNIT.
+    ///
+    /// Unit rather than predicate on purpose: measured in this store,
+    /// 252 of 320 assertions share ONE catch-all EMMO predicate, so the
+    /// predicate does not identify what was measured and the unit does
+    /// (MPa = a strength, GPa = a modulus, K = a temperature).
+    pub quantity: String,
+    /// How many OTHER subjects have this quantity measured.
+    pub peers_measured: i64,
+}
+
 /// Environment variable carrying the agent action id across a process
 /// boundary.
 ///
@@ -1331,7 +1358,26 @@ pub fn conditioned_assertion_id(
     hash_field(&mut h, tenant.as_bytes());
     hash_field(&mut h, canonical_key(subject).as_bytes());
     hash_field(&mut h, predicate.as_bytes());
-    hash_field(&mut h, canonical_key(object).as_bytes());
+    // A MEASURED fact is identified by what was measured and the number, not
+    // by the sentence a paper wrote it in. When value AND unit are both parsed
+    // the object string is a rendering of them, so including it splits one
+    // claim into as many assertions as there are ways to phrase it — and a
+    // split claim can never corroborate itself.
+    //
+    // Measured in the live store before this change: `229 GPa` and `229 GPa at
+    // 293 K (235 GPa at 198 K, 241 GPa at 77 K)` were two assertions with the
+    // same predicate, the same value and the same unit, and the parenthetical
+    // duplicated what `conditions` already carries structurally. Across the
+    // whole store only 2 of 763 valued facts had more than one source.
+    //
+    // Safe because the PREDICATE names the property here — `yield strength`,
+    // `ultimate tensile strength`, `fracture toughness K_JIc` — so dropping
+    // the object cannot merge two different quantities that happen to share a
+    // magnitude. Unvalued facts are untouched: for them the object IS the
+    // content, which is why `assertion_id` still hashes it.
+    if value.is_none() || unit.is_none() {
+        hash_field(&mut h, canonical_key(object).as_bytes());
+    }
     let value_bytes = value.map(|v| v.to_bits().to_le_bytes());
     hash_optional_field(&mut h, value_bytes.as_ref().map(|b| &b[..]));
     hash_optional_field(&mut h, unit.map(str::as_bytes));
@@ -5026,6 +5072,66 @@ impl ProvenanceStore {
     /// fresh paper path produces). Ordered by id for deterministic paging.
     /// Rows with no recorded status are not returned; they predate the
     /// status axis and are reached by `assertion_by_id`.
+    /// Holes in the knowledge manifold, worst first.
+    ///
+    /// A cell is (subject, quantity). Woven cells have several independent
+    /// sources, thin cells have one, and a hole has none. This returns the
+    /// holes that MATTER: a quantity several peer subjects have been measured
+    /// for, which this subject lacks. Ordered by how many peers have it,
+    /// because a quantity everything else in the corpus reports is the most
+    /// conspicuous thing to be missing.
+    ///
+    /// Two honest limits, both visible in the data this was built against:
+    /// subjects are raw strings, so one material written two ways is two rows
+    /// and its holes are overstated until entity resolution merges them; and
+    /// corroboration is keyed on the object string, so "woven" undercounts
+    /// until identity stops splitting equal values. Both make this report
+    /// PESSIMISTIC — it never invents a hole, it can only miss that one is
+    /// already filled.
+    pub async fn coverage_gaps(&self, tenant: &str, limit: usize) -> Result<Vec<CoverageGap>> {
+        let mut rows = self
+            .conn
+            .query(
+                "WITH cell AS ( \
+                     SELECT subject AS subject, unit AS quantity \
+                     FROM prov_assertion \
+                     WHERE value IS NOT NULL AND unit IS NOT NULL \
+                       AND TRIM(unit) <> '' AND tenant = ?1 \
+                     GROUP BY subject, unit \
+                 ), \
+                 quant AS ( \
+                     SELECT quantity, COUNT(DISTINCT subject) AS peers \
+                     FROM cell GROUP BY quantity \
+                 ) \
+                 SELECT s.subject, q.quantity, q.peers \
+                 FROM (SELECT DISTINCT subject FROM cell) s \
+                 CROSS JOIN quant q \
+                 LEFT JOIN cell c \
+                     ON c.subject = s.subject AND c.quantity = q.quantity \
+                 WHERE c.subject IS NULL AND q.peers >= 2 \
+                 ORDER BY q.peers DESC, s.subject, q.quantity \
+                 LIMIT ?2",
+                [
+                    Value::Text(tenant.to_string()),
+                    Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+                ],
+            )
+            .await?;
+        let mut gaps = Vec::new();
+        while let Some(row) = rows.next().await? {
+            gaps.push(CoverageGap {
+                subject: get_str(&row, 0)?,
+                quantity: get_str(&row, 1)?,
+                peers_measured: row
+                    .get_value(2)
+                    .ok()
+                    .and_then(|v| v.as_integer().copied())
+                    .unwrap_or(0),
+            });
+        }
+        Ok(gaps)
+    }
+
     /// Every assertion this AGENT ACTION is responsible for.
     ///
     /// Walks the join the `origin_action_id` column exists to make possible:
@@ -12701,6 +12807,235 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a fact no action claimed must not be claimed by one"
+        );
+    }
+
+    // ── Coverage manifold: where the fabric has holes ────────────────────
+
+    async fn measured(
+        store: &ProvenanceStore,
+        subject: &str,
+        unit: &str,
+        value: f64,
+        source: &str,
+    ) {
+        let fact = LocalFact {
+            subject: subject.into(),
+            predicate: "has_property".into(),
+            object: format!("{value} {unit}"),
+            value: Some(value),
+            unit: Some(unit.into()),
+            confidence: Some(0.9),
+            kind: Some("measurement".into()),
+        };
+        store
+            .write_fact(&fact, &action_prov(source, source, None))
+            .await
+            .unwrap();
+    }
+
+    /// A hole is a quantity this subject's PEERS have and it does not. That is
+    /// the cell where an answer has to be predicted rather than looked up, and
+    /// therefore the cell research should go after next.
+    #[tokio::test]
+    async fn a_quantity_the_peers_have_and_this_subject_lacks_is_a_hole() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // Two peers carry MPa and GPa; the third carries only MPa.
+        for subject in ["alloy-a", "alloy-b"] {
+            measured(&store, subject, "MPa", 900.0, &format!("doc-{subject}-1")).await;
+            measured(&store, subject, "GPa", 210.0, &format!("doc-{subject}-2")).await;
+        }
+        measured(&store, "alloy-c", "MPa", 850.0, "doc-c-1").await;
+
+        let gaps = store.coverage_gaps(LOCAL_TENANT, 20).await.unwrap();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.subject == "alloy-c" && gap.quantity == "GPa"),
+            "the GPa hole in alloy-c must be reported, got {gaps:?}"
+        );
+        let gpa = gaps
+            .iter()
+            .find(|gap| gap.subject == "alloy-c" && gap.quantity == "GPa")
+            .expect("hole present");
+        assert_eq!(gpa.peers_measured, 2, "two peers carry GPa");
+        assert!(
+            !gaps.iter().any(|gap| gap.quantity == "MPa"),
+            "MPa is measured for every subject and is not a hole anywhere"
+        );
+    }
+
+    /// A quantity only ONE subject has is not a hole in the others — it is a
+    /// quantity this corpus barely measures. Reporting it would send research
+    /// after something no peer establishes as expected, which is how a
+    /// coverage report turns into noise.
+    #[tokio::test]
+    async fn a_quantity_only_one_subject_has_is_not_a_hole() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        measured(&store, "alloy-a", "MPa", 900.0, "doc-1").await;
+        measured(&store, "alloy-b", "MPa", 850.0, "doc-2").await;
+        // Exotic: only alloy-a has it.
+        measured(&store, "alloy-a", "S/m", 1.2, "doc-3").await;
+
+        let gaps = store.coverage_gaps(LOCAL_TENANT, 20).await.unwrap();
+        assert!(
+            !gaps.iter().any(|gap| gap.quantity == "S/m"),
+            "a quantity with a single owner is not a peer expectation, got {gaps:?}"
+        );
+    }
+
+    /// The report is ordered by how many peers hold the quantity, so the most
+    /// conspicuous absence is the first thing research is pointed at.
+    #[tokio::test]
+    async fn holes_are_ordered_by_how_many_peers_have_the_quantity() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        for subject in ["a", "b", "c"] {
+            measured(&store, subject, "MPa", 900.0, &format!("d-{subject}-1")).await;
+        }
+        for subject in ["a", "b"] {
+            measured(&store, subject, "GPa", 210.0, &format!("d-{subject}-2")).await;
+        }
+        // `d` has nothing but a third quantity, so it is missing both.
+        measured(&store, "d", "K", 300.0, "d-d-1").await;
+        measured(&store, "a", "K", 300.0, "d-a-3").await;
+
+        let gaps = store.coverage_gaps(LOCAL_TENANT, 20).await.unwrap();
+        let for_d: Vec<_> = gaps.iter().filter(|gap| gap.subject == "d").collect();
+        assert!(for_d.len() >= 2, "d is missing both MPa and GPa: {gaps:?}");
+        assert!(
+            for_d[0].peers_measured >= for_d[1].peers_measured,
+            "the more widely held quantity must come first: {for_d:?}"
+        );
+    }
+
+    // ── Valued-fact identity: three papers, one claim ────────────────────
+
+    /// THE corroboration test. Three independent papers report the same
+    /// measured value, each phrasing it differently — which is what papers do.
+    /// They must land on ONE assertion corroborated three times, not three
+    /// assertions corroborated once.
+    ///
+    /// Measured in the live store before this fix: 763 valued facts, 2 with
+    /// more than one source. `229 GPa` and `229 GPa at 293 K (235 GPa at 198
+    /// K, 241 GPa at 77 K)` were separate assertions despite identical
+    /// predicate, value and unit. With corroboration unable to fire, the
+    /// evidence ladder, noisy-OR confidence and provenance-weighted trust all
+    /// sit on an identity that can never match two sources.
+    #[tokio::test]
+    async fn three_papers_phrasing_one_measurement_differently_corroborate() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        for (phrasing, source) in [
+            ("229 GPa", "doi:10.1/a"),
+            (
+                "229 GPa at 293 K (235 GPa at 198 K, 241 GPa at 77 K)",
+                "doi:10.1/b",
+            ),
+            ("approximately 229 GPa", "doi:10.1/c"),
+        ] {
+            let fact = LocalFact {
+                subject: "CrCoNi".into(),
+                predicate: "youngs modulus".into(),
+                object: phrasing.into(),
+                value: Some(229.0),
+                unit: Some("GPa".into()),
+                confidence: Some(0.8),
+                kind: Some("measurement".into()),
+            };
+            store
+                .write_fact(&fact, &action_prov("act", source, None))
+                .await
+                .unwrap();
+        }
+
+        let stored = count(
+            &store,
+            "SELECT COUNT(*) FROM prov_assertion WHERE value IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            stored, 1,
+            "three phrasings of one measurement are ONE claim, not three"
+        );
+        let corroborations = count(
+            &store,
+            "SELECT corroborations FROM prov_assertion WHERE value IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            corroborations, 3,
+            "and that claim is corroborated by all three independent sources"
+        );
+    }
+
+    /// The converse, so the fix cannot become a merge-everything bug: two
+    /// DIFFERENT properties of one material stay separate even when their
+    /// numbers coincide. The predicate is what keeps them apart, which is why
+    /// dropping the object string is safe.
+    #[tokio::test]
+    async fn two_properties_that_share_a_number_stay_separate() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        for predicate in ["yield strength", "ultimate tensile strength"] {
+            let fact = LocalFact {
+                subject: "CrCoNi".into(),
+                predicate: predicate.into(),
+                object: "657 MPa".into(),
+                value: Some(657.0),
+                unit: Some("MPa".into()),
+                confidence: Some(0.8),
+                kind: Some("measurement".into()),
+            };
+            store
+                .write_fact(&fact, &action_prov("act", "doi:10.1/x", None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion WHERE value IS NOT NULL"
+            )
+            .await,
+            2,
+            "yield strength and UTS are different claims even at the same number"
+        );
+    }
+
+    /// An UNVALUED fact is still identified by its object — for a claim like
+    /// "phase = fcc solid solution" the object IS the content, and merging on
+    /// subject+predicate alone would destroy it.
+    #[tokio::test]
+    async fn unvalued_facts_are_still_identified_by_their_object() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        for object in ["fcc solid solution", "hcp martensite"] {
+            let fact = LocalFact {
+                subject: "CrCoNi".into(),
+                predicate: "phase".into(),
+                object: object.into(),
+                value: None,
+                unit: None,
+                confidence: Some(0.8),
+                kind: None,
+            };
+            store
+                .write_fact(&fact, &action_prov("act", "doi:10.1/y", None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion WHERE value IS NULL"
+            )
+            .await,
+            2,
+            "two different phases are two claims"
         );
     }
 }
