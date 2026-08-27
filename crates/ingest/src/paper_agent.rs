@@ -1094,6 +1094,14 @@ fn elide_stale_tool_results(messages: &mut [ChatMessage], budget: usize) -> (usi
     (elided_results, elided_chars)
 }
 
+/// Declared measurement relations named in the prompt.
+///
+/// A closed set to land a predicate in, never a vocabulary to browse. The cap
+/// is what keeps it the former: an ontology declaring dozens of measurement
+/// relations would turn this back into the label inventory that collapses
+/// extraction accuracy, and the tools remain the way to reach the rest.
+const MAX_DECLARED_RELATIONS_SHOWN: usize = 12;
+
 fn initial_messages(
     ontologies: &OntologySet,
     title: &str,
@@ -1153,8 +1161,14 @@ order a fact is actually established in:\n\
 - reasoning: one sentence on why this is a fact about the world, not about \
 the document.\n\
 - fact.subject: the real thing the statement is about.\n\
-- fact.predicate: the property or relation stated — a loaded ontology's \
-term where one fits.\n\
+- fact.predicate: the property or relation stated. BIND IT to a loaded \
+ontology term. The metadata lists each ontology's declared measurement \
+relations; a measured property belongs under one of them, and \
+search_ontology finds the rest. Inventing a predicate is the last resort, \
+not the default: a name only this paper uses can never agree with a second \
+paper reporting the same thing, so an unbound predicate stores a fact that \
+can never be corroborated. If nothing in any loaded ontology fits, propose \
+the extension rather than quietly minting a private name.\n\
 - fact.object: what is asserted of the subject.\n\
 - fact.value and fact.unit: the number and its unit exactly as the paper \
 states them, whenever it states them.\n\
@@ -1187,9 +1201,30 @@ when done."
         "title": title,
         "raw_line_count": raw_line_count,
         "source_revision_id": source_revision_id,
-        // Fingerprints only — identity, not vocabulary. Every loaded
-        // ontology is named so the model knows what it may bind against;
-        // the terms themselves are reached through the ontology tools.
+        // Identity, plus the DECLARED relation vocabulary. The terms
+        // themselves are still reached through the ontology tools; what
+        // travels here is only the small closed set each ontology declares
+        // as its measurement surface — for EMMO, `["HAS_PROPERTY"]` and
+        // `["Property"]`, both derived from the declaration.
+        //
+        // This used to be fingerprints only, on the reasoning that vocabulary
+        // belongs in the tools. Measured on a live run 2026-08-27: 23 facts
+        // stored from one paper and ZERO predicates bound to any ontology
+        // IRI — `pfasLayerReductionFactor`, `maskCount`, a private vocabulary
+        // invented per paper, which no two papers can ever corroborate
+        // across. Binding cost a `search_ontology` call against a turn
+        // budget, so the incentive ran the wrong way.
+        //
+        // Naming the admissible set in context is the "ontology-aware
+        // retrieval" mechanism (see docs/RESEARCH_AGENT_PRIOR_ART.md): it
+        // reframes the predicate choice as ALIGNMENT to a listed term rather
+        // than free generation, and costs no turn. It does not replace the
+        // tools — an ontology declaring nothing here sends nothing, and the
+        // model still searches.
+        //
+        // RELATIONS ONLY, and capped. The class inventory stays behind the
+        // tools: that is a different quantity of text and the reason is
+        // measured, not stylistic.
         "primary_ontology": ontologies.primary().id(),
         "loaded_ontologies": ontologies
             .all()
@@ -1199,6 +1234,22 @@ when done."
                     "id": ontology.id(),
                     "version_iri": ontology.version_iri().as_str(),
                     "artifact_sha256": ontology.artifact_sha256(),
+                    // The declared measurement RELATIONS only — for EMMO
+                    // that is `["HAS_PROPERTY"]`. Capped, and deliberately
+                    // NOT the class inventory: `quantitative_labels()`
+                    // returns the extraction labels of every subclass of
+                    // Property, which for a rich ontology is hundreds, and
+                    // `initial_prompt_names_every_loaded_ontology_...`
+                    // records the measurement that hundred-plus label
+                    // inventories COLLAPSE extraction accuracy
+                    // (LongICLBench). A handful of relation names is the
+                    // opposite of that inventory: it is the closed set a
+                    // predicate must land in, not a vocabulary to search.
+                    "measurement_relations": ontology
+                        .measurement_relations()
+                        .into_iter()
+                        .take(MAX_DECLARED_RELATIONS_SHOWN)
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect::<Vec<_>>(),
@@ -3290,6 +3341,82 @@ mod tests {
         );
         assert!(!prompt.contains("legierung.invalid/klasse"));
         assert!(!prompt.contains("beispiel.invalid/klasse"));
+    }
+
+    /// The declared measurement RELATIONS travel in context, so binding a
+    /// predicate costs no turn.
+    ///
+    /// Measured on a live run 2026-08-27: 23 facts stored from one paper and
+    /// ZERO predicates bound to any ontology IRI — `pfasLayerReductionFactor`,
+    /// `maskCount`, a private vocabulary invented per paper. Binding required
+    /// a `search_ontology` call against a turn budget while the instruction
+    /// only asked for a term "where one fits", so the incentive ran against
+    /// the thing the graph needs most: two papers cannot corroborate through
+    /// names only one of them uses.
+    #[test]
+    fn the_declared_measurement_relations_reach_the_reader() {
+        let ontologies = crate::ontologies::loaded(None).expect("default ontologies load");
+        let messages = initial_messages(
+            &ontologies,
+            "Titel",
+            1,
+            "rev",
+            MIN_TURN_BUDGET,
+            PaperAgentPolicy::default(),
+        );
+        let prompt = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let declared = ontologies.primary().measurement_relations();
+        assert!(
+            !declared.is_empty(),
+            "the default ontology must declare a measurement relation, or this \
+             guard passes while guarding nothing"
+        );
+        for relation in declared {
+            assert!(
+                prompt.contains(relation),
+                "declared measurement relation {relation:?} never reached the reader"
+            );
+        }
+    }
+
+    /// Binding is the DEFAULT, and the prompt says why — an unbound predicate
+    /// stores a fact no second paper can ever agree with. The old wording
+    /// ("a loaded ontology's term where one fits") left the judgement to the
+    /// model, which judged that none fit 23 times out of 23.
+    #[test]
+    fn the_prompt_requires_binding_rather_than_suggesting_it() {
+        let ontologies = crate::ontologies::loaded(None).expect("default ontologies load");
+        let messages = initial_messages(
+            &ontologies,
+            "Titel",
+            1,
+            "rev",
+            MIN_TURN_BUDGET,
+            PaperAgentPolicy::default(),
+        );
+        let prompt = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prompt.contains("BIND IT"),
+            "binding must be stated as the requirement, not an option"
+        );
+        assert!(
+            !prompt.contains("term where one fits"),
+            "the optional phrasing that produced 0 bound predicates must be gone"
+        );
+        assert!(
+            prompt.contains("propose the extension"),
+            "and the escape hatch must stay: nothing fitting is a real answer, \
+             but it is a PROPOSAL, not a private name"
+        );
     }
 
     #[test]
