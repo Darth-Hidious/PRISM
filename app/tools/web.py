@@ -176,31 +176,56 @@ def _web_read(**kwargs) -> dict:
         # The tool's own description warns that repositories 403 this
         # User-Agent — that is exactly the case that must not read as success.
         if r.status_code >= 400:
-            return {
+            # A publisher refusing a bot is not the work being unavailable.
+            # See `_open_access_location`: this exact 403 lost the two most
+            # relevant papers of a live run, both of them open access.
+            error = {
                 "error": f"HTTP {r.status_code} reading {url}",
                 "url": url,
                 "status_code": r.status_code,
                 "source": "basic_fetch",
             }
+            open_copy = _open_access_location(url)
+            if not open_copy:
+                return error
+            if open_copy["is_pdf"]:
+                # Not parsed here — `papers_ingest` is the tool that reads PDFs
+                # properly and records provenance. Name it so the refusal is
+                # actionable instead of terminal.
+                error["open_access_url"] = open_copy["url"]
+                error["recovery"] = (
+                    "the publisher refused this request, but the work is open "
+                    "access: read the PDF above with papers_ingest"
+                )
+                return error
+            try:
+                oa_response = httpx.get(
+                    open_copy["url"],
+                    timeout=15,
+                    follow_redirects=True,
+                    headers={
+                        "User-Agent": "PRISM/2.7 (materials science research; "
+                        "+https://marc27.com)"
+                    },
+                )
+                if oa_response.status_code >= 400:
+                    error["open_access_url"] = open_copy["url"]
+                    return error
+            except Exception:
+                error["open_access_url"] = open_copy["url"]
+                return error
+            title, text = _html_to_text(oa_response.text)
+            # Honest about what was actually read: this is the open copy of the
+            # same work, NOT the URL that was asked for.
+            return {
+                "url": open_copy["url"],
+                "requested_url": url,
+                "title": title or open_copy["title"],
+                "source": "open_access_fallback",
+                **_window(text, offset, max_chars),
+            }
 
-        try:
-            from bs4 import BeautifulSoup
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            # Remove script/style
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            title = soup.title.string if soup.title else ""
-            text = soup.get_text(separator="\n", strip=True)
-        except ImportError:
-            # bs4 not available — basic regex fallback
-            import re
-
-            title = ""
-            text = re.sub(r"<script[^>]*>.*?</script>", "", r.text, flags=re.DOTALL)
-            text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
-            text = re.sub(r"<[^>]+>", " ", text)
-            text = re.sub(r"\s+", " ", text).strip()
+        title, text = _html_to_text(r.text)
 
         return {
             "url": url,
@@ -210,6 +235,93 @@ def _web_read(**kwargs) -> dict:
         }
     except Exception as e:
         return {"error": f"Failed to read URL: {e}"}
+
+
+def _html_to_text(html: str) -> tuple[str, str]:
+    """Title and readable text from an HTML page."""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        # Remove script/style
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        title = soup.title.string if soup.title else ""
+        return title, soup.get_text(separator="\n", strip=True)
+    except ImportError:
+        # bs4 not available — basic regex fallback
+        import re
+
+        text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
+        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return "", re.sub(r"\s+", " ", text).strip()
+
+
+_DOI_PATTERN = r"10\.\d{4,9}/[^\s\"'<>&?#]+"
+
+
+def _open_access_location(url: str) -> dict | None:
+    """Where the same work is legally readable, when the publisher refuses us.
+
+    Measured 2026-08-28 during a live PFAS run. PRISM asked for two DOIs, took
+    the publisher's 403, and stopped:
+
+        HTTP 403 reading https://doi.org/10.1039/d6su00094k
+        HTTP 403 reading https://doi.org/10.1039/d5ra08575f
+
+    They were "Siloxanes: viable alternatives for PFAS in essential
+    applications?" and "Non-stick performance of polymethylsilsesquioxane thin
+    films" — the two most on-topic papers of the entire run. **Both are open
+    access**, with a direct PDF one metadata call away. The run instead read a
+    paper on sorghum root architecture.
+
+    A 403 at doi.org is the publisher's landing page refusing a bot, not the
+    work being unavailable, and PRISM already talks to OpenAlex as a search
+    source. So on refusal, ask where the open copy is. Returns `None` — never
+    a guess — when the URL carries no DOI, when the lookup fails, when the work
+    is not open, or when the open copy is the URL that just refused us.
+    """
+    import re
+
+    match = re.search(_DOI_PATTERN, url)
+    if not match:
+        return None
+    doi = match.group(0).rstrip(".")
+    try:
+        import httpx
+
+        # OpenAlex asks for a contact for its polite pool. Sent only when the
+        # operator has configured one; never invented from the local user.
+        params = {}
+        mailto = os.environ.get("PRISM_MAILTO", "").strip()
+        if mailto:
+            params["mailto"] = mailto
+        response = httpx.get(
+            f"https://api.openalex.org/works/doi:{doi}",
+            params=params,
+            timeout=15,
+            follow_redirects=True,
+        )
+        if response.status_code >= 400:
+            return None
+        work = response.json()
+        if not isinstance(work, dict):
+            return None
+    except Exception as error:  # network, JSON, or a stubbed client in tests
+        logger.warning(f"open-access lookup failed for {doi}: {error}")
+        return None
+
+    best = work.get("best_oa_location") or {}
+    open_access = work.get("open_access") or {}
+    location = best.get("pdf_url") or open_access.get("oa_url") or best.get("landing_page_url")
+    if not isinstance(location, str) or not location or location == url:
+        return None
+    return {
+        "url": location,
+        "title": work.get("title") or "",
+        "is_pdf": location.lower().endswith(".pdf") or "articlepdf" in location.lower(),
+    }
 
 
 def _web_search(**kwargs) -> dict:
