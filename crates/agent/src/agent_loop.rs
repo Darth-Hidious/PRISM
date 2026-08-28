@@ -208,6 +208,45 @@ pub(crate) enum CycleStep {
     Stop,
 }
 
+/// What a round was worth, on PaSa's published scale.
+///
+/// PaSa (ACL 2025) trains its Crawler with a reward that counts a paper only
+/// when it is relevant AND not already in the queue, priced from their own
+/// training config: `search_select_score` / `expand_select_score` 1.5 against
+/// `search_cost` / `expand_cost` 0.1. So: +1.5 for ground newly reached, −0.1
+/// for the act of reaching. Novelty sits INSIDE the reward — a paper already
+/// held is worth nothing — which is the same thing PRISM's saturation tracker
+/// already measures.
+///
+/// COMPUTED, NOT TRAINED. Nothing here learns; this is arithmetic over
+/// counters the loop already keeps, so the loop's decisions become measurable
+/// before any question of training arises. That ordering is deliberate: the
+/// number is what tells us whether a policy would be worth paying for.
+///
+/// ⚠ An UPPER BOUND, and the gap has a name. PaSa's count is of newly found
+/// RELEVANT papers, judged by a trained Selector. PRISM has no judge, so this
+/// counts newly reached SOURCES — every one of which PaSa would first ask
+/// "does this answer the query?" and discard some. A prompted judge is the
+/// stand-in when one exists; until then a high score means "reached a lot",
+/// not "found a lot worth having", and it must not be read as the latter.
+///
+/// `None` when a result could not be read: that round's yield is UNKNOWN, and
+/// scoring it as zero is the same error as treating an unreadable search as a
+/// dry well.
+#[must_use]
+pub(crate) fn round_reward(round: RoundYield) -> Option<f64> {
+    /// Ground newly reached — one source, or one stored fact.
+    const REACHED: f64 = 1.5;
+    /// Charged per action, so circling costs something even when it is busy.
+    const ACTED: f64 = 0.1;
+    if round.unknown_yield {
+        return None;
+    }
+    let reached = round.novel_sources + round.novel_facts;
+    #[allow(clippy::cast_precision_loss)]
+    Some(REACHED * reached as f64 - ACTED * round.calls as f64)
+}
+
 /// The research state, in the words a person would use to ask "how is it
 /// going".
 ///
@@ -230,8 +269,16 @@ fn research_note(round: RoundYield, totals: (usize, usize, usize)) -> String {
     } else {
         "nothing new".to_string()
     };
+    // The reward beside the counts, so a round has a number and not only a
+    // description. "unscored" when a result could not be read — an unknown
+    // yield is not a zero one, and scoring it zero would punish the loop for
+    // our own failure to parse.
+    let score = round_reward(round).map_or_else(
+        || "unscored — a result could not be read".to_string(),
+        |reward| format!("{reward:+.1}"),
+    );
     format!(
-        "  this round: {} call(s) -> {bought}\n           so far: {facts_total} fact(s) stored · {sources_seen} source(s) seen · {searches} search(es)",
+        "  this round: {} call(s) -> {bought}  [{score}]\n           so far: {facts_total} fact(s) stored · {sources_seen} source(s) seen · {searches} search(es)",
         round.calls
     )
 }
@@ -4888,6 +4935,59 @@ mod tests {
             CycleStep::Stop,
             "a model that has stopped gathering will not start because it was \
              told to keep going; that is how a loop burns money writing essays"
+        );
+    }
+
+    /// PaSa's arithmetic, on our counters: +1.5 for ground newly reached,
+    /// −0.1 for the act of reaching. Novelty is inside the reward, so a round
+    /// that worked hard and reached nothing scores NEGATIVE — which is the
+    /// point, because that is exactly what circling is.
+    #[test]
+    fn a_round_is_scored_by_what_it_reached_minus_what_it_cost() {
+        let found = RoundYield {
+            calls: 3,
+            novel_sources: 2,
+            novel_facts: 0,
+            unknown_yield: false,
+        };
+        // 2 x 1.5 - 3 x 0.1
+        assert!((round_reward(found).expect("scored") - 2.7).abs() < 1e-9);
+
+        let circling = RoundYield {
+            calls: 4,
+            ..RoundYield::default()
+        };
+        assert!(
+            round_reward(circling).expect("scored") < 0.0,
+            "working hard and reaching nothing must cost, not merely fail to pay"
+        );
+
+        let ingested = RoundYield {
+            calls: 1,
+            novel_sources: 0,
+            novel_facts: 10,
+            unknown_yield: false,
+        };
+        assert!(
+            round_reward(ingested).expect("scored") > round_reward(found).expect("scored"),
+            "stored facts are ground reached too"
+        );
+    }
+
+    /// An unreadable result is UNSCORED, never zero. Scoring it zero is the
+    /// same error as treating a search we could not parse as a dry well, and
+    /// it would quietly punish the loop for our own failure to read.
+    #[test]
+    fn a_round_we_could_not_read_is_unscored_not_zero() {
+        let unknown = RoundYield {
+            calls: 2,
+            unknown_yield: true,
+            ..RoundYield::default()
+        };
+        assert!(round_reward(unknown).is_none());
+        assert!(
+            research_note(unknown, (0, 0, 1)).contains("unscored"),
+            "and the person watching is told it could not be scored"
         );
     }
 
