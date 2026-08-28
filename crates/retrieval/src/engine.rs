@@ -102,6 +102,50 @@ pub struct RetrievalEngine {
     selector: Option<Arc<dyn Selector>>,
 }
 
+/// A shorter version of an over-specified query, or `None` when there is
+/// nothing safe to shorten.
+///
+/// Measured 2026-08-28 against PubMed, same source, nothing else varied:
+///
+/// | query | results |
+/// |---|---|
+/// | `elastomer seal chemical resistance` | 3 |
+/// | `PFAS elastomer seals` | 1 |
+/// | `PFAS-free elastomer seals gaskets` | 0 |
+/// | `PFAS-free elastomer seals gaskets O-ring chemical resistance service temperature` | 0 |
+///
+/// E-utilities ANDs its terms, so every added term can only SHRINK the set and
+/// on a niche subject three or four is already enough to reach zero. Four of
+/// nine sources returned `cache (0 results)` for the live run's queries —
+/// pubmed, doaj, ntrs, preprints_europepmc — none of them broken, all of them
+/// asked a question they cannot answer. Meanwhile the semantic backends answer
+/// the same long query with fractal geometry, so one query was simultaneously
+/// too specific for half the fan-out and too loose for the other half.
+///
+/// Two hypotheses were tested and killed before this one: it is NOT the query
+/// length alone (the four-term prefix also returns zero) and it is NOT the
+/// hyphenated compound (splitting `PFAS-free` changes nothing). It is plain
+/// boolean AND, and no term-level trick fixes that — only asking less.
+///
+/// So: keep the leading half, never fewer than [`MIN_RELAXED_TERMS`], and only
+/// when that is actually shorter. Leading, because a researcher writes the
+/// subject first and the qualifiers after. This recovers some queries and not
+/// all — `PFAS-free` survives its own relaxation and still matches nothing —
+/// which is why the shortened query is REPORTED rather than quietly
+/// substituted.
+fn relax_query(query: &str) -> Option<String> {
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    if terms.len() <= MIN_RELAXED_TERMS {
+        return None;
+    }
+    let keep = (terms.len() / 2).max(MIN_RELAXED_TERMS);
+    (keep < terms.len()).then(|| terms[..keep].join(" "))
+}
+
+/// Below this a query is already as broad as it is going to get, and cutting
+/// further would ask a different question rather than a looser one.
+const MIN_RELAXED_TERMS: usize = 3;
+
 impl RetrievalEngine {
     pub fn new(cfg: EngineConfig) -> Self {
         Self::with_registry(cfg, SourceRegistry::builtin())
@@ -376,7 +420,22 @@ impl RetrievalEngine {
             async move {
                 let source_start = Instant::now();
                 let result = tokio::time::timeout(timeout, source.fetch(ctx, query)).await;
-                (source, source_start.elapsed(), result)
+                // A source that found NOTHING may simply have been asked an
+                // over-specified question — see `relax_query`. Ask once more,
+                // shorter. Only an empty success is retried: an error or a
+                // timeout is a source problem, and hammering it with a second
+                // request would not fix it.
+                let empty_success = matches!(&result, Ok(Ok(page)) if page.papers.is_empty());
+                if empty_success && let Some(relaxed) = relax_query(query) {
+                    let retry = tokio::time::timeout(timeout, source.fetch(ctx, &relaxed)).await;
+                    // Keep the retry only if it actually found something.
+                    // Otherwise the original stands, and the caller is not
+                    // told about a relaxation that bought nothing.
+                    if matches!(&retry, Ok(Ok(page)) if !page.papers.is_empty()) {
+                        return (source, source_start.elapsed(), retry, Some(relaxed));
+                    }
+                }
+                (source, source_start.elapsed(), result, None)
             }
         });
         let outcomes = join_all(futures).await;
@@ -386,7 +445,7 @@ impl RetrievalEngine {
         let mut duplicates_merged = 0usize;
         let mut source_status: Vec<SourceStatus> = Vec::new();
 
-        for (source, elapsed, result) in outcomes {
+        for (source, elapsed, result, retried_with) in outcomes {
             let latency_ms = elapsed.as_secs_f64() * 1000.0;
             let source_id = source.id();
             match result {
@@ -422,6 +481,7 @@ impl RetrievalEngine {
                             .unwrap_or(false),
                         error: None,
                         failure_kind: None,
+                        retried_with,
                     });
                 }
                 Ok(Err(e)) => source_status.push(SourceStatus {
@@ -433,6 +493,9 @@ impl RetrievalEngine {
                     cache_hit: false,
                     error: Some(format!("{e:#}")),
                     failure_kind: Some(e.kind()),
+                    // An error is a source problem, not an over-specified
+                    // question, so it is never retried shorter.
+                    retried_with: None,
                 }),
                 Err(_) => source_status.push(SourceStatus {
                     source: source_id.to_string(),
@@ -448,6 +511,8 @@ impl RetrievalEngine {
                     // Our deadline ended the fetch; the source neither
                     // answered nor failed on its own.
                     failure_kind: Some(FailureKind::Cancelled),
+                    // Not an over-specified question, so never retried shorter.
+                    retried_with: None,
                 }),
             }
         }
@@ -466,6 +531,8 @@ impl RetrievalEngine {
                 // A configuration failure, not a source failure — the
                 // taxonomy describes what SOURCES do.
                 failure_kind: None,
+                // Not an over-specified question, so never retried shorter.
+                retried_with: None,
             });
         }
 
@@ -738,6 +805,197 @@ mod tests {
     // ── Test-only adapters ───────────────────────────────────────────────
     // No network, no cache, no SourceId variant: pure trait objects proving
     // the registry is the dispatch path.
+
+    /// Models a boolean-AND backend: it answers a SHORT query and returns
+    /// nothing for a long one, exactly as PubMed did in the 2026-08-28
+    /// measurements. It also records every query it was asked, so a test can
+    /// assert what was actually sent rather than infer it from the result.
+    struct AndSource {
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+        max_terms: usize,
+        fail: bool,
+    }
+
+    impl AndSource {
+        fn new(max_terms: usize) -> Self {
+            Self {
+                asked: Arc::new(std::sync::Mutex::new(Vec::new())),
+                max_terms,
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            Self {
+                asked: Arc::new(std::sync::Mutex::new(Vec::new())),
+                max_terms: 0,
+                fail: true,
+            }
+        }
+        fn queries(&self) -> Vec<String> {
+            self.asked.lock().expect("asked poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Source for AndSource {
+        fn id(&self) -> &'static str {
+            "andsource"
+        }
+        fn min_interval(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn initial_cursor(&self) -> &'static str {
+            "0"
+        }
+        fn capabilities(&self) -> SourceCaps {
+            SourceCaps {
+                max_page_size: 10,
+                max_offset: None,
+            }
+        }
+        async fn fetch(&self, _ctx: &FetchCtx, query: &str) -> Result<SourcePage, SourceError> {
+            self.asked
+                .lock()
+                .expect("asked poisoned")
+                .push(query.to_string());
+            if self.fail {
+                return Err(SourceError::msg(FailureKind::Transport, "backend down"));
+            }
+            let papers = if query.split_whitespace().count() <= self.max_terms {
+                vec![Paper {
+                    source: "andsource".to_string(),
+                    source_id: "and-1".to_string(),
+                    title: "Elastomer seals".to_string(),
+                    authors: Vec::new(),
+                    year: None,
+                    published: None,
+                    doi: None,
+                    external_ids: Default::default(),
+                    abstract_text: None,
+                    url: "urn:and:1".to_string(),
+                    fulltext_url: None,
+                    fulltext_format: None,
+                    journal: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(SourcePage {
+                raw_count: papers.len(),
+                papers,
+                available: None,
+            })
+        }
+
+        async fn fetch_page(
+            &self,
+            ctx: &FetchCtx,
+            query: &str,
+            _cursor: &str,
+        ) -> Result<(SourcePage, Option<String>), SourceError> {
+            self.fetch(ctx, query).await.map(|p| (p, None))
+        }
+    }
+
+    /// Keep the leading half, never below the floor, and only when that is
+    /// actually shorter.
+    #[test]
+    fn relaxation_shortens_from_the_tail_and_stops_at_the_floor() {
+        assert_eq!(
+            relax_query("PFAS-free elastomer seals gaskets O-ring chemical resistance service"),
+            Some("PFAS-free elastomer seals gaskets".to_string()),
+        );
+        // The subject leads and the qualifiers trail, so the head is kept.
+        // Four terms: half is two, but the floor holds it at three.
+        assert_eq!(
+            relax_query("elastomer seal chemical resistance"),
+            Some("elastomer seal chemical".to_string()),
+        );
+        // Already broad: nothing to give up without asking a different
+        // question instead of a looser one.
+        for already_short in [
+            "elastomer seal chemical",
+            "PFAS elastomer seals",
+            "seals",
+            "",
+        ] {
+            assert_eq!(relax_query(already_short), None, "{already_short:?}");
+        }
+    }
+
+    /// The measured defect end to end: a boolean backend answers the short
+    /// query and returns nothing for the long one, and PRISM must not report
+    /// that emptiness as the last word.
+    #[tokio::test]
+    async fn a_source_that_found_nothing_is_asked_again_more_briefly() {
+        let source = Arc::new(AndSource::new(4));
+        let mut engine = isolated_engine();
+        engine
+            .register_source(source.clone())
+            .expect("a free id must register");
+
+        let outcome = engine
+            .search(
+                "PFAS-free elastomer seals gaskets O-ring chemical resistance service",
+                5,
+            )
+            .await;
+
+        assert_eq!(
+            source.queries(),
+            vec![
+                "PFAS-free elastomer seals gaskets O-ring chemical resistance service".to_string(),
+                "PFAS-free elastomer seals gaskets".to_string(),
+            ],
+            "the full query first, then once more shorter"
+        );
+        assert_eq!(outcome.papers.len(), 1, "the retry's papers are kept");
+        let status = &outcome.source_status[0];
+        assert_eq!(status.count, 1);
+        // The caller is told the question changed. Without this an honest
+        // "0 results" and "3 results, to a question you did not ask" look the
+        // same on the wire.
+        assert_eq!(
+            status.retried_with.as_deref(),
+            Some("PFAS-free elastomer seals gaskets"),
+        );
+    }
+
+    /// A relaxation that buys nothing is not reported: the original emptiness
+    /// stands, and no one is told about a question whose answer was also
+    /// nothing.
+    #[tokio::test]
+    async fn a_relaxation_that_finds_nothing_is_not_reported() {
+        let source = Arc::new(AndSource::new(1));
+        let mut engine = isolated_engine();
+        engine.register_source(source.clone()).expect("registers");
+
+        let outcome = engine
+            .search("alpha beta gamma delta epsilon zeta", 5)
+            .await;
+
+        assert_eq!(source.queries().len(), 2, "it did try once more");
+        assert_eq!(outcome.source_status[0].count, 0);
+        assert_eq!(outcome.source_status[0].retried_with, None);
+    }
+
+    /// An ERROR is a source problem, not an over-specified question. Retrying
+    /// it shorter would hammer a backend that is already failing and could not
+    /// fix anything.
+    #[tokio::test]
+    async fn a_failing_source_is_not_retried() {
+        let source = Arc::new(AndSource::failing());
+        let mut engine = isolated_engine();
+        engine.register_source(source.clone()).expect("registers");
+
+        let outcome = engine
+            .search("alpha beta gamma delta epsilon zeta", 5)
+            .await;
+
+        assert_eq!(source.queries().len(), 1, "asked once, not twice");
+        assert_eq!(outcome.source_status[0].status, "error");
+        assert_eq!(outcome.source_status[0].retried_with, None);
+    }
 
     struct EchoSource;
     #[async_trait]

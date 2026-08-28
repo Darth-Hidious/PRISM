@@ -186,6 +186,8 @@ impl RetrievalEngine {
                     error: Some(format!("no adapter registered for source '{id}'")),
                     // A configuration failure, not a source failure.
                     failure_kind: None,
+                    // Sweep paginates one fixed query; it does not relax.
+                    retried_with: None,
                 });
                 completes.push(false);
                 continue;
@@ -425,6 +427,8 @@ impl RetrievalEngine {
                 cache_hit: pages_this_source > 0 && cached_pages_this_source == pages_this_source,
                 error: error_this_source,
                 failure_kind: failure_kind_this_source,
+                // Sweep paginates one fixed query; it does not relax.
+                retried_with: None,
             });
         }
 
