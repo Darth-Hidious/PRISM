@@ -135,15 +135,15 @@ pub struct SourceStatus {
     /// unchanged; this field only adds information.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_kind: Option<crate::sources::source::FailureKind>,
-    /// The SHORTER query this source was actually asked, after the caller's
-    /// query returned nothing. `None` means it was asked the caller's query
-    /// and only that.
+    /// Why this source may have returned nothing, when its emptiness is
+    /// plausibly the query's fault rather than the corpus's.
     ///
-    /// Without this an `ok (0 results)` and an `ok (3 results, but only after
-    /// we changed the question)` are indistinguishable, and the second is not
-    /// an answer to what was asked.
+    /// A statement, not an action. PRISM briefly shortened such queries and
+    /// re-asked them automatically; that answered a question nobody put, and
+    /// the caller — which writes the queries in the first place — chooses
+    /// better than a fixed rule can.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retried_with: Option<String>,
+    pub empty_note: Option<String>,
 }
 
 /// Result of one federated search.

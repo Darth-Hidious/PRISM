@@ -102,10 +102,9 @@ pub struct RetrievalEngine {
     selector: Option<Arc<dyn Selector>>,
 }
 
-/// A shorter version of an over-specified query, or `None` when there is
-/// nothing safe to shorten.
+/// What to say about a source that found NOTHING, when the query may be why.
 ///
-/// Measured 2026-08-28 against PubMed, same source, nothing else varied:
+/// Measured 2026-08-28 against PubMed, one source, nothing else varied:
 ///
 /// | query | results |
 /// |---|---|
@@ -114,37 +113,38 @@ pub struct RetrievalEngine {
 /// | `PFAS-free elastomer seals gaskets` | 0 |
 /// | `PFAS-free elastomer seals gaskets O-ring chemical resistance service temperature` | 0 |
 ///
-/// E-utilities ANDs its terms, so every added term can only SHRINK the set and
-/// on a niche subject three or four is already enough to reach zero. Four of
-/// nine sources returned `cache (0 results)` for the live run's queries —
-/// pubmed, doaj, ntrs, preprints_europepmc — none of them broken, all of them
-/// asked a question they cannot answer. Meanwhile the semantic backends answer
-/// the same long query with fractal geometry, so one query was simultaneously
-/// too specific for half the fan-out and too loose for the other half.
+/// E-utilities ANDs its terms, so every added term can only SHRINK the set,
+/// and on a niche subject three or four is already enough to reach zero. Four
+/// of nine sources returned `cache (0 results)` for the live run's queries —
+/// pubmed, doaj, ntrs, preprints_europepmc — none broken, all asked a question
+/// they cannot answer.
 ///
-/// Two hypotheses were tested and killed before this one: it is NOT the query
-/// length alone (the four-term prefix also returns zero) and it is NOT the
-/// hyphenated compound (splitting `PFAS-free` changes nothing). It is plain
-/// boolean AND, and no term-level trick fixes that — only asking less.
+/// This USED to shorten the query and re-ask it automatically, keeping the
+/// leading half. Wrong shape twice over. It hard-coded a judgement the caller
+/// makes better — the agent's own decomposition of "PFAS alternatives" into
+/// firefighting foam / coatings / textiles / semiconductor / seals was
+/// expert-grade, and term-slicing is not — and it answered a question nobody
+/// asked. It was also measurably weak exactly where it mattered: the original
+/// PFAS query still returned zero after relaxation, because halving from the
+/// head keeps `PFAS-free`, the term a person would have dropped first.
 ///
-/// So: keep the leading half, never fewer than [`MIN_RELAXED_TERMS`], and only
-/// when that is actually shorter. Leading, because a researcher writes the
-/// subject first and the qualifiers after. This recovers some queries and not
-/// all — `PFAS-free` survives its own relaxation and still matches nothing —
-/// which is why the shortened query is REPORTED rather than quietly
-/// substituted.
-fn relax_query(query: &str) -> Option<String> {
-    let terms: Vec<&str> = query.split_whitespace().collect();
-    if terms.len() <= MIN_RELAXED_TERMS {
-        return None;
-    }
-    let keep = (terms.len() / 2).max(MIN_RELAXED_TERMS);
-    (keep < terms.len()).then(|| terms[..keep].join(" "))
-}
+/// So state the fact and leave the decision where it belongs. `None` when the
+/// query is short enough that its length is not a plausible explanation — a
+/// note on every empty result is noise, and noise is how a real signal gets
+/// ignored.
+fn empty_result_note(query: &str, count: usize) -> Option<String> {
+    /// Below this, brevity is not the explanation, and saying otherwise would
+    /// be guessing at someone else's empty shelf.
+    const TERSE_ENOUGH: usize = 3;
 
-/// Below this a query is already as broad as it is going to get, and cutting
-/// further would ask a different question rather than a looser one.
-const MIN_RELAXED_TERMS: usize = 3;
+    let terms = query.split_whitespace().count();
+    (count == 0 && terms > TERSE_ENOUGH).then(|| {
+        format!(
+            "no results for a {terms}-term query; a source that requires EVERY term to \
+             match returns nothing once a query is this specific — a shorter one may find more"
+        )
+    })
+}
 
 impl RetrievalEngine {
     pub fn new(cfg: EngineConfig) -> Self {
@@ -420,22 +420,7 @@ impl RetrievalEngine {
             async move {
                 let source_start = Instant::now();
                 let result = tokio::time::timeout(timeout, source.fetch(ctx, query)).await;
-                // A source that found NOTHING may simply have been asked an
-                // over-specified question — see `relax_query`. Ask once more,
-                // shorter. Only an empty success is retried: an error or a
-                // timeout is a source problem, and hammering it with a second
-                // request would not fix it.
-                let empty_success = matches!(&result, Ok(Ok(page)) if page.papers.is_empty());
-                if empty_success && let Some(relaxed) = relax_query(query) {
-                    let retry = tokio::time::timeout(timeout, source.fetch(ctx, &relaxed)).await;
-                    // Keep the retry only if it actually found something.
-                    // Otherwise the original stands, and the caller is not
-                    // told about a relaxation that bought nothing.
-                    if matches!(&retry, Ok(Ok(page)) if !page.papers.is_empty()) {
-                        return (source, source_start.elapsed(), retry, Some(relaxed));
-                    }
-                }
-                (source, source_start.elapsed(), result, None)
+                (source, source_start.elapsed(), result)
             }
         });
         let outcomes = join_all(futures).await;
@@ -445,7 +430,7 @@ impl RetrievalEngine {
         let mut duplicates_merged = 0usize;
         let mut source_status: Vec<SourceStatus> = Vec::new();
 
-        for (source, elapsed, result, retried_with) in outcomes {
+        for (source, elapsed, result) in outcomes {
             let latency_ms = elapsed.as_secs_f64() * 1000.0;
             let source_id = source.id();
             match result {
@@ -481,7 +466,8 @@ impl RetrievalEngine {
                             .unwrap_or(false),
                         error: None,
                         failure_kind: None,
-                        retried_with,
+                        // Why it may be empty — stated, never acted on.
+                        empty_note: empty_result_note(query, count),
                     });
                 }
                 Ok(Err(e)) => source_status.push(SourceStatus {
@@ -494,8 +480,8 @@ impl RetrievalEngine {
                     error: Some(format!("{e:#}")),
                     failure_kind: Some(e.kind()),
                     // An error is a source problem, not an over-specified
-                    // question, so it is never retried shorter.
-                    retried_with: None,
+                    // question; brevity has nothing to do with it.
+                    empty_note: None,
                 }),
                 Err(_) => source_status.push(SourceStatus {
                     source: source_id.to_string(),
@@ -511,8 +497,8 @@ impl RetrievalEngine {
                     // Our deadline ended the fetch; the source neither
                     // answered nor failed on its own.
                     failure_kind: Some(FailureKind::Cancelled),
-                    // Not an over-specified question, so never retried shorter.
-                    retried_with: None,
+                    // Not an over-specified question.
+                    empty_note: None,
                 }),
             }
         }
@@ -532,7 +518,7 @@ impl RetrievalEngine {
                 // taxonomy describes what SOURCES do.
                 failure_kind: None,
                 // Not an over-specified question, so never retried shorter.
-                retried_with: None,
+                empty_note: None,
             });
         }
 
@@ -897,76 +883,77 @@ mod tests {
         }
     }
 
-    /// Keep the leading half, never below the floor, and only when that is
-    /// actually shorter.
+    /// The note states a FACT about what happened — how many terms, no
+    /// results — and nothing about what to do next beyond a hint the caller
+    /// may ignore. Short queries get no note, because on a short query the
+    /// length is not the explanation and a note on every empty result is
+    /// noise.
     #[test]
-    fn relaxation_shortens_from_the_tail_and_stops_at_the_floor() {
-        assert_eq!(
-            relax_query("PFAS-free elastomer seals gaskets O-ring chemical resistance service"),
-            Some("PFAS-free elastomer seals gaskets".to_string()),
+    fn an_empty_result_explains_itself_only_when_length_is_a_plausible_cause() {
+        let note = empty_result_note(
+            "PFAS-free elastomer seals gaskets O-ring chemical resistance service",
+            0,
+        )
+        .expect("eight terms and nothing found");
+        assert!(
+            note.contains("8-term"),
+            "states what was actually sent: {note}"
         );
-        // The subject leads and the qualifiers trail, so the head is kept.
-        // Four terms: half is two, but the floor holds it at three.
+
+        // Found something: nothing to explain.
         assert_eq!(
-            relax_query("elastomer seal chemical resistance"),
-            Some("elastomer seal chemical".to_string()),
+            empty_result_note("PFAS-free elastomer seals gaskets O-ring", 3),
+            None
         );
-        // Already broad: nothing to give up without asking a different
-        // question instead of a looser one.
-        for already_short in [
+        // Short and empty: the shelf is bare, not the question too narrow.
+        for terse in [
             "elastomer seal chemical",
             "PFAS elastomer seals",
             "seals",
             "",
         ] {
-            assert_eq!(relax_query(already_short), None, "{already_short:?}");
+            assert_eq!(empty_result_note(terse, 0), None, "{terse:?}");
         }
     }
 
-    /// The measured defect end to end: a boolean backend answers the short
-    /// query and returns nothing for the long one, and PRISM must not report
-    /// that emptiness as the last word.
+    /// A source is asked ONCE — the question it was given, and no other.
+    ///
+    /// PRISM briefly shortened an empty query and re-asked it automatically,
+    /// keeping the leading half. That answered a question nobody put, and it
+    /// was measurably weak where it mattered: the PFAS query still returned
+    /// zero after relaxation, because halving from the head keeps `PFAS-free`,
+    /// the term a person would drop first. The caller writes the queries and
+    /// chooses better; PRISM's job is to tell it what happened.
     #[tokio::test]
-    async fn a_source_that_found_nothing_is_asked_again_more_briefly() {
+    async fn a_source_that_finds_nothing_is_asked_once_and_says_why() {
         let source = Arc::new(AndSource::new(4));
         let mut engine = isolated_engine();
         engine
             .register_source(source.clone())
             .expect("a free id must register");
 
-        let outcome = engine
-            .search(
-                "PFAS-free elastomer seals gaskets O-ring chemical resistance service",
-                5,
-            )
-            .await;
+        let query = "PFAS-free elastomer seals gaskets O-ring chemical resistance service";
+        let outcome = engine.search(query, 5).await;
 
         assert_eq!(
             source.queries(),
-            vec![
-                "PFAS-free elastomer seals gaskets O-ring chemical resistance service".to_string(),
-                "PFAS-free elastomer seals gaskets".to_string(),
-            ],
-            "the full query first, then once more shorter"
+            vec![query.to_string()],
+            "asked exactly what the caller asked, once"
         );
-        assert_eq!(outcome.papers.len(), 1, "the retry's papers are kept");
         let status = &outcome.source_status[0];
-        assert_eq!(status.count, 1);
-        // The caller is told the question changed. Without this an honest
-        // "0 results" and "3 results, to a question you did not ask" look the
-        // same on the wire.
-        assert_eq!(
-            status.retried_with.as_deref(),
-            Some("PFAS-free elastomer seals gaskets"),
-        );
+        assert_eq!(status.count, 0);
+        let note = status
+            .empty_note
+            .as_deref()
+            .expect("a long query that found nothing explains itself");
+        assert!(note.contains("8-term"), "{note}");
     }
 
-    /// A relaxation that buys nothing is not reported: the original emptiness
-    /// stands, and no one is told about a question whose answer was also
-    /// nothing.
+    /// A source that DID find something carries no note: there is nothing to
+    /// explain, and an explanation attached to a success reads as a warning.
     #[tokio::test]
-    async fn a_relaxation_that_finds_nothing_is_not_reported() {
-        let source = Arc::new(AndSource::new(1));
+    async fn a_source_that_found_something_says_nothing_extra() {
+        let source = Arc::new(AndSource::new(10));
         let mut engine = isolated_engine();
         engine.register_source(source.clone()).expect("registers");
 
@@ -974,16 +961,15 @@ mod tests {
             .search("alpha beta gamma delta epsilon zeta", 5)
             .await;
 
-        assert_eq!(source.queries().len(), 2, "it did try once more");
-        assert_eq!(outcome.source_status[0].count, 0);
-        assert_eq!(outcome.source_status[0].retried_with, None);
+        assert_eq!(outcome.source_status[0].count, 1);
+        assert_eq!(outcome.source_status[0].empty_note, None);
     }
 
-    /// An ERROR is a source problem, not an over-specified question. Retrying
-    /// it shorter would hammer a backend that is already failing and could not
-    /// fix anything.
+    /// An ERROR is a source problem. Its emptiness has nothing to do with the
+    /// query's length, so it must not be handed an explanation that points at
+    /// the query.
     #[tokio::test]
-    async fn a_failing_source_is_not_retried() {
+    async fn a_failing_source_is_not_blamed_on_the_query() {
         let source = Arc::new(AndSource::failing());
         let mut engine = isolated_engine();
         engine.register_source(source.clone()).expect("registers");
@@ -992,9 +978,9 @@ mod tests {
             .search("alpha beta gamma delta epsilon zeta", 5)
             .await;
 
-        assert_eq!(source.queries().len(), 1, "asked once, not twice");
+        assert_eq!(source.queries().len(), 1, "asked once");
         assert_eq!(outcome.source_status[0].status, "error");
-        assert_eq!(outcome.source_status[0].retried_with, None);
+        assert_eq!(outcome.source_status[0].empty_note, None);
     }
 
     struct EchoSource;
