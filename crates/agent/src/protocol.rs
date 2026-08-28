@@ -5882,8 +5882,13 @@ fn emit_agent_event(event: AgentEvent) {
             is_error,
         } => {
             // Frontend expects "ui.card" with UiCard schema. Evidence fields
-            // are additive for older clients and always present for receivers
-            // that must treat missing/unknown producer metadata as RED.
+            // are additive: present only when the tool declared a class.
+            // "Always present" was the bug — the indeterminate default it
+            // required painted every unclassified SUCCESS "✓ [RED
+            // indeterminate]" in the live TUI (find_tools, prior_art_search),
+            // because the receiver rightly trusts a declared class over its
+            // own silence handling. Missing fields do not render as success:
+            // the TUI draws `[unclassified]` for them and RED for failures.
             let payload = build_ui_card_payload(
                 &call_id,
                 &tool_name,
@@ -6161,7 +6166,6 @@ fn build_ui_card_payload(
 ) -> Value {
     let (display_content, extra_data) =
         build_tool_card_payload(tool_name, content, preview, summary);
-    let evidence = crate::tool_result::tool_result_evidence(content);
     let mut data = serde_json::Map::new();
     data.insert("call_id".to_string(), serde_json::json!(call_id));
     if let Some(summary) = summary {
@@ -6176,15 +6180,26 @@ fn build_ui_card_payload(
         }
     }
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "card_type": if is_error { "error" } else { "results" },
         "tool_name": tool_name,
         "elapsed_ms": elapsed_ms,
         "content": display_content,
-        "evidence_class": evidence.as_str(),
-        "evidence_color": evidence.color(),
         "data": data,
-    })
+    });
+    // Only a class the tool DECLARED goes on the wire. Stamping the old
+    // indeterminate default here overrode the TUI's own silence handling
+    // (`crates/tui/src/app.rs::tool_result_evidence` reads `data` first and
+    // must trust a declared class), so every unclassified success rendered
+    // "✓ [RED indeterminate]" live — find_tools, prior_art_search. An absent
+    // field is not an absent badge: the renderer always draws one, muted
+    // `[unclassified]`, and failures still arrive RED via `card_type:
+    // "error"`.
+    if let Some(evidence) = crate::tool_result::tool_result_evidence(content) {
+        payload["evidence_class"] = serde_json::json!(evidence.as_str());
+        payload["evidence_color"] = serde_json::json!(evidence.color());
+    }
+    payload
 }
 
 fn build_tool_card_payload(
@@ -6194,18 +6209,23 @@ fn build_tool_card_payload(
     summary: Option<&str>,
 ) -> (String, Value) {
     let (display_content, mut data) = build_tool_card_content(tool_name, content, preview, summary);
-    let evidence = crate::tool_result::tool_result_evidence(content);
     let data = data
         .as_object_mut()
         .expect("tool card formatter data must be an object");
-    data.insert(
-        "evidence_class".to_string(),
-        serde_json::json!(evidence.as_str()),
-    );
-    data.insert(
-        "evidence_color".to_string(),
-        serde_json::json!(evidence.color()),
-    );
+    // Same rule as the ui.card top level: lift a DECLARED class, never invent
+    // one. `data.evidence_class` is the field the TUI consults first, so a
+    // stamped default here was the exact byte that painted successful
+    // unclassified results RED in the live transcript.
+    if let Some(evidence) = crate::tool_result::tool_result_evidence(content) {
+        data.insert(
+            "evidence_class".to_string(),
+            serde_json::json!(evidence.as_str()),
+        );
+        data.insert(
+            "evidence_color".to_string(),
+            serde_json::json!(evidence.color()),
+        );
+    }
     (display_content, Value::Object(data.clone()))
 }
 
@@ -10554,8 +10574,16 @@ mod tests {
         assert_eq!(data["evidence_color"], "yellow");
     }
 
+    /// Converted from `..._defaults_missing_evidence_to_indeterminate`, whose
+    /// stamped default the TUI could not tell from a tool DECLARING itself
+    /// ungrounded — observed live as "✓ [RED indeterminate] find_tools:
+    /// find_tools: 5 results" on a successful call. The original intent
+    /// stands: silence must never render as success. It is honoured by the
+    /// receiver, which always draws a badge and shows an absent class as the
+    /// muted `[unclassified]`; the producer's job is to not forge a
+    /// declaration.
     #[test]
-    fn build_tool_card_payload_defaults_missing_evidence_to_indeterminate() {
+    fn build_tool_card_payload_leaves_undeclared_evidence_unstamped() {
         let (_, data) = build_tool_card_payload(
             "legacy_evaluator",
             r#"{"composition":"W0.7 Mo0.3","reward":3455.3}"#,
@@ -10563,8 +10591,40 @@ mod tests {
             None,
         );
 
-        assert_eq!(data["evidence_class"], "indeterminate");
-        assert_eq!(data["evidence_color"], "red");
+        assert!(
+            data.get("evidence_class").is_none(),
+            "an undeclared class must not be stamped as one: {data}"
+        );
+        assert!(
+            data.get("evidence_color").is_none(),
+            "no class, no derived color: {data}"
+        );
+    }
+
+    /// The ui.card top level obeys the same rule as `data` — both fields the
+    /// TUI consults must agree in silence, or the stamped one wins and paints
+    /// the badge RED (the live defect).
+    #[test]
+    fn ui_card_notification_omits_undeclared_evidence() {
+        let params = build_ui_card_payload(
+            "call-2",
+            "find_tools",
+            r#"{"tools":["a","b","c","d","e"]}"#,
+            Some("find_tools: 5 results"),
+            None,
+            8,
+            false,
+        );
+
+        assert_eq!(params["card_type"], "results");
+        assert!(
+            params.get("evidence_class").is_none() && params.get("evidence_color").is_none(),
+            "undeclared evidence must not reach the wire: {params}"
+        );
+        assert!(
+            params["data"].get("evidence_class").is_none(),
+            "nor hide inside data, the field the TUI reads first: {params}"
+        );
     }
 
     #[test]

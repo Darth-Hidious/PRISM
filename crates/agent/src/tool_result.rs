@@ -37,32 +37,42 @@ fn evidence_class_from_value(value: &Value) -> Option<EvidenceClass> {
         })
 }
 
-/// Extract the evidence class from a tool-result content string.
+/// Extract the evidence class the tool itself declared, or `None` when it
+/// declared none.
 ///
 /// Tool results normally carry evidence at the top level. CLI-backed command
-/// tools are transport envelopes, so their JSON stdout is also checked. Any
-/// missing, malformed, or unknown class is indeterminate; `evidence_color` is
-/// deliberately not trusted because color is derived from the class.
-pub fn tool_result_evidence(content: &str) -> EvidenceClass {
-    let Ok(value) = serde_json::from_str::<Value>(content) else {
-        return EvidenceClass::Indeterminate;
-    };
+/// tools are transport envelopes, so their JSON stdout is also checked;
+/// `evidence_class: "garbage"` is `Some(Indeterminate)` — the tool asserted a
+/// grounding PRISM cannot read, which is worse than silence — and
+/// `evidence_color` is deliberately not trusted because color is derived from
+/// the class.
+///
+/// `None` is NOT `Indeterminate`. This used to collapse every undeclared
+/// result to `Indeterminate`, and the card builders stamped that default into
+/// every `ui.card`, so the TUI — whose renderer already distinguishes "tool
+/// said nothing" (muted `[unclassified]`) from "tool said indeterminate"
+/// (RED) — was fed a declared class it had no way to doubt. Observed live on
+/// SUCCESSFUL calls: "✓ [RED indeterminate] find_tools: find_tools: 5
+/// results" and "✓ [RED indeterminate] prior_art_search: 13 result(s), 13 not
+/// seen before in this session." The fail-safe ("silence must never render as
+/// success") lives in the renderer, which always draws a badge; it does not
+/// need the classifier to invent a declaration.
+pub fn tool_result_evidence(content: &str) -> Option<EvidenceClass> {
+    let value = serde_json::from_str::<Value>(content).ok()?;
     if let Some(evidence_class) = evidence_class_from_value(&value) {
-        return evidence_class;
+        return Some(evidence_class);
     }
 
-    let Some(object) = value.as_object() else {
-        return EvidenceClass::Indeterminate;
-    };
+    let object = value.as_object()?;
     if object.contains_key("root")
         && let Some(stdout) = object.get("stdout").and_then(Value::as_str)
         && let Ok(stdout_value) = serde_json::from_str::<Value>(stdout.trim())
         && let Some(evidence_class) = evidence_class_from_value(&stdout_value)
     {
-        return evidence_class;
+        return Some(evidence_class);
     }
 
-    EvidenceClass::Indeterminate
+    None
 }
 
 /// Inspect a tool result and decide whether it represents a failure.
@@ -398,23 +408,41 @@ mod tests {
     fn evidence_uses_authoritative_class_and_derives_color() {
         let evidence = tool_result_evidence(
             r#"{"value":1.5,"evidence_class":"screening","evidence_color":"green"}"#,
-        );
+        )
+        .expect("a declared class must be read");
         assert_eq!(evidence, EvidenceClass::Screening);
         assert_eq!(evidence.color(), "yellow");
     }
 
+    /// A class the tool DECLARED but PRISM cannot read stays Indeterminate:
+    /// the tool asserted a grounding we cannot check, which is worse than
+    /// silence. Split from the silence cases below when the two stopped
+    /// meaning the same thing.
     #[test]
-    fn evidence_missing_unknown_or_malformed_is_indeterminate() {
+    fn evidence_declared_but_unreadable_is_indeterminate() {
+        assert_eq!(
+            tool_result_evidence(r#"{"value":1.5,"evidence_class":"confirmed"}"#),
+            Some(EvidenceClass::Indeterminate),
+        );
+    }
+
+    /// Silence is `None`, not a class — and still not an optimistic default:
+    /// the renderer always draws a badge, and `None` renders as the muted
+    /// `[unclassified]`, never as verified. Collapsing these to Indeterminate
+    /// is what painted successful, unclassified results "✓ [RED
+    /// indeterminate]" in the live TUI (find_tools, prior_art_search).
+    /// `evidence_color` alone stays silence: color is derived, not trusted.
+    #[test]
+    fn evidence_undeclared_is_none_not_indeterminate() {
         for content in [
             r#"{"value":1.5}"#,
-            r#"{"value":1.5,"evidence_class":"confirmed"}"#,
             r#"{"value":1.5,"evidence_color":"green"}"#,
             "not json",
         ] {
             assert_eq!(
                 tool_result_evidence(content),
-                EvidenceClass::Indeterminate,
-                "content must not receive an optimistic default: {content}"
+                None,
+                "silence must stay distinguishable from a declared class: {content}"
             );
         }
     }
@@ -432,6 +460,9 @@ mod tests {
         })
         .to_string();
 
-        assert_eq!(tool_result_evidence(&content), EvidenceClass::Research);
+        assert_eq!(
+            tool_result_evidence(&content),
+            Some(EvidenceClass::Research)
+        );
     }
 }

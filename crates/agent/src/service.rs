@@ -150,7 +150,16 @@ fn tool_result_event(
     elapsed_ms: u64,
     is_error: bool,
 ) -> ChatEvent {
-    let evidence = crate::tool_result::tool_result_evidence(&content);
+    // This SSE surface's `evidence_class`/`evidence_color` are non-optional
+    // strings — external headless consumers key on their presence — so an
+    // undeclared class still collapses to indeterminate HERE, deliberately
+    // and only here. The interactive path (`build_ui_card_payload`) omits the
+    // fields instead, because its receiver renders silence as a muted
+    // `[unclassified]`; this wire has no such renderer to hand the
+    // distinction to. Widening this contract is an API decision, not a badge
+    // fix.
+    let evidence = crate::tool_result::tool_result_evidence(&content)
+        .unwrap_or(prism_provenance::EvidenceClass::Indeterminate);
     ChatEvent::ToolResult {
         tool_name,
         call_id,
