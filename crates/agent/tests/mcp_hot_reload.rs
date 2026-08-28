@@ -108,6 +108,24 @@ async fn a_server_added_to_the_config_becomes_callable_without_a_restart() {
         "namespaced under the server that supplied them: {after_add:?}"
     );
 
+    // Listing it is not using it. CALL one, through the manager that was
+    // published by the reload, and require a real answer back — a catalog
+    // entry proves the name is known, not that anything is on the other end.
+    let called = prism_agent::mcp::global()
+        .expect("the reload published a manager")
+        .call_tool("mcp__pty__list_sessions", &json!({}))
+        .await
+        .expect("a hot-added server must actually answer");
+    eprintln!("called mcp__pty__list_sessions -> {called}");
+    // A round trip is not a successful call. The first version of this test
+    // asserted only that the Result was Ok, and passed while the server was
+    // replying "Invalid input: expected object, received undefined" — PRISM
+    // was dropping `{}` instead of sending it, so the tool never ran.
+    assert!(
+        called.get("error").is_none(),
+        "the tool itself must accept and answer the call: {called}"
+    );
+
     // Now the operator removes it again. Reload is the undo — nothing
     // accumulates, and no second mechanism is needed to take a server away.
     write_config(home.path(), json!([]));

@@ -251,10 +251,20 @@ impl McpManager {
 
         let mut request = rmcp::model::CallToolRequestParams::new(remote.clone());
         match args {
-            Value::Object(map) if !map.is_empty() => {
+            // An EMPTY object still gets sent. Omitting `arguments` for `{}`
+            // is not the same as sending `{}`: a server whose input schema is
+            // an object with no required properties then receives `undefined`
+            // and rejects the call. Measured against a real server —
+            // `list_sessions` takes no arguments and answered
+            // "Invalid input: expected object, received undefined" — which is
+            // a call that never reached the tool at all, reported as if the
+            // tool had refused it.
+            Value::Object(map) => {
                 request = request.with_arguments(map.clone());
             }
-            Value::Object(_) | Value::Null => {}
+            // Null means genuinely no arguments, which is the caller saying
+            // something different from "an empty set of them".
+            Value::Null => {}
             other => bail!("MCP tool arguments must be a JSON object, got: {other}"),
         }
 
