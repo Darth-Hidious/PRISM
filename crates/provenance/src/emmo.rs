@@ -1993,7 +1993,7 @@ async fn rekey_assertions_by_tenant(conn: &turso::Connection) -> Result<()> {
 async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     // Cheap unlocked pre-check: almost every open is of an already-stamped
     // database and must not pay for a write transaction.
-    if read_user_version(conn).await? >= MATKG_NAMESPACE_VERSION {
+    if read_user_version(conn).await? >= LATEST_MIGRATION_VERSION {
         return Ok(());
     }
 
@@ -2006,7 +2006,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
     let txn = begin_immediate(conn).await?;
     let result = async {
         let version = read_user_version(conn).await?;
-        if version >= MATKG_NAMESPACE_VERSION {
+        if version >= LATEST_MIGRATION_VERSION {
             return Ok(());
         }
 
@@ -2030,6 +2030,9 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         if version < MATKG_NAMESPACE_VERSION {
             migrate_matkg_namespace(conn).await?;
         }
+        if version < CORROBORATION_KEY_VERSION {
+            migrate_backfill_corroboration_keys(conn).await?;
+        }
 
         // Stamp even when nothing needed changing — a fresh store has empty
         // tables, and returning without stamping would make every subsequent
@@ -2037,7 +2040,7 @@ async fn run_key_migrations(conn: &turso::Connection) -> Result<()> {
         // all generations, so a crash between them re-runs from the last
         // committed generation rather than skipping one.
         conn.execute(
-            &format!("PRAGMA user_version = {MATKG_NAMESPACE_VERSION}"),
+            &format!("PRAGMA user_version = {LATEST_MIGRATION_VERSION}"),
             (),
         )
         .await?;
@@ -2367,6 +2370,23 @@ const SAMPLE_DISAGREEMENT_RETIRED_VERSION: i64 = 6;
 /// assertion digest — no identity is recomputed and no fact changes meaning.
 const MATKG_NAMESPACE_VERSION: i64 = 7;
 
+/// Generation at which stored assertions carry a `corroboration_key`.
+///
+/// Below this, every valued fact in the store has a NULL key and therefore
+/// pools with nothing: measured on the live store, 1,580 of 1,582 valued
+/// facts sat at one source, because the key that lets two spellings of one
+/// measurement agree was computed nowhere and stored on no row.
+const CORROBORATION_KEY_VERSION: i64 = 8;
+
+/// The generation an opened store is stamped with — always the newest.
+///
+/// Named rather than spelled as whichever constant happens to be last: the
+/// tests that guard "the stamp must be the LATEST generation" were pinned to
+/// `MATKG_NAMESPACE_VERSION` and broke the moment a generation was added,
+/// which makes a bump look like a regression. Point this at the newest
+/// generation and both the runner and its guards follow.
+const LATEST_MIGRATION_VERSION: i64 = CORROBORATION_KEY_VERSION;
+
 const MATKG_NAMESPACE_BEFORE: &str = "https://marc27.com/ontology/matkg";
 const MATKG_NAMESPACE_AFTER: &str = "https://mirdyne.com/ontology/matkg";
 
@@ -2405,6 +2425,69 @@ const MATKG_NAMESPACE_SITES: &[(&str, &str)] = &[
 /// `nearest_*` columns were added later still, so a store opened before either
 /// existed is normal, not corrupt. Those two cases are skipped; anything else
 /// propagates.
+/// Backfill `corroboration_key` on stored assertions, then recount.
+///
+/// Identity is NOT touched. Two spellings of one measurement stay two
+/// assertion rows — that is what identity is for, keeping what each paper
+/// actually wrote — and the key is what lets them AGREE. Rewriting ids would
+/// merge the rows and lose the wording; this only computes the missing
+/// grouping and recounts over it, so the migration cannot destroy a fact.
+///
+/// Without it the fix is prospective only: every fact already in the store
+/// keeps a NULL key and pools with nothing, so a store built over months
+/// stays at one source per fact while new writes corroborate correctly. On
+/// the live store that is 1,580 of 1,582 valued facts.
+///
+/// Unvalued facts are skipped deliberately: they have no measurement to agree
+/// about, and `corroboration_key` returns None for them.
+async fn migrate_backfill_corroboration_keys(conn: &turso::Connection) -> Result<()> {
+    let mut rows = conn
+        .query(
+            "SELECT id, tenant, subject, predicate, value, unit FROM prov_assertion \
+             WHERE corroboration_key IS NULL AND value IS NOT NULL",
+            (),
+        )
+        .await?;
+    let mut backfill: Vec<(String, String)> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let id = get_str(&row, 0)?;
+        let tenant = get_str(&row, 1)?;
+        let subject = get_str(&row, 2)?;
+        let predicate = get_str(&row, 3)?;
+        let value = row.get_value(4).ok().and_then(|v| v.as_real().copied());
+        let unit = get_opt_str(&row, 5)?;
+        if let Some(key) = corroboration_key(&tenant, &subject, &predicate, value, unit.as_deref())
+        {
+            backfill.push((id, key));
+        }
+    }
+    for (id, key) in backfill {
+        conn.execute(
+            "UPDATE prov_assertion SET corroboration_key = ?2 WHERE id = ?1",
+            [Value::Text(id), Value::Text(key)],
+        )
+        .await?;
+    }
+
+    // Recount every group in one pass. Counting DISTINCT source keys means a
+    // paper that appears under two spellings is still one source — the same
+    // rule the live path uses, so migrated and fresh rows cannot disagree
+    // about what a corroboration is.
+    conn.execute(
+        "UPDATE prov_assertion \
+         SET corroborations = ( \
+             SELECT COUNT(DISTINCT peer_e.source_key) \
+             FROM prov_assertion peer \
+             JOIN prov_assertion_evidence peer_e ON peer_e.assertion_id = peer.id \
+             WHERE peer.corroboration_key = prov_assertion.corroboration_key \
+         ) \
+         WHERE corroboration_key IS NOT NULL",
+        (),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn migrate_matkg_namespace(conn: &turso::Connection) -> Result<()> {
     for (table, column) in MATKG_NAMESPACE_SITES {
         let sql = format!(
@@ -9844,7 +9927,7 @@ mod tests {
         let conn = database.connect().unwrap();
         assert_eq!(
             read_user_version(&conn).await.unwrap(),
-            MATKG_NAMESPACE_VERSION,
+            LATEST_MIGRATION_VERSION,
             "the stamp must be the LATEST generation, not the assertion one — \
              stamping the assertion version would leave the key migration \
              re-running on every open",
@@ -10024,7 +10107,7 @@ mod tests {
         );
         assert_eq!(
             read_user_version(&store.conn).await.unwrap(),
-            MATKG_NAMESPACE_VERSION,
+            LATEST_MIGRATION_VERSION,
         );
     }
 
@@ -12531,7 +12614,7 @@ mod tests {
 
         assert_eq!(
             count("PRAGMA user_version".to_string()).await,
-            MATKG_NAMESPACE_VERSION,
+            LATEST_MIGRATION_VERSION,
             "the store was not stamped at the new generation",
         );
     }
@@ -13597,5 +13680,58 @@ mod tests {
         )
         .await;
         assert_eq!(highest, 1, "one paper agreeing with itself is one source");
+    }
+
+    /// A store built BEFORE the key existed is repaired on open.
+    ///
+    /// Without this the corroboration fix is prospective only: months of
+    /// stored facts keep a NULL key, pool with nothing, and sit at one source
+    /// each while new writes agree correctly. On the live store that is 1,580
+    /// of 1,582 valued facts.
+    ///
+    /// Identity is deliberately untouched — the two spellings stay two rows,
+    /// keeping what each paper wrote. Only the grouping is computed.
+    #[tokio::test]
+    async fn a_store_written_before_the_key_is_repaired_on_open() {
+        let db = TempDb::new();
+        {
+            let store = ProvenanceStore::open(&db.path).await.unwrap();
+            measured(&store, "Ti-6Al-4V", "MPa", 950.0, "doi:10.1/a").await;
+            measured(&store, "Ti6Al4V", "MPa", 950.0, "doi:10.1/b").await;
+            // Rewind to the pre-key world: no keys, counts as they were.
+            store
+                .conn
+                .execute(
+                    "UPDATE prov_assertion SET corroboration_key = NULL, corroborations = 1",
+                    (),
+                )
+                .await
+                .unwrap();
+            store
+                .conn
+                .execute("PRAGMA user_version = 7", ())
+                .await
+                .unwrap();
+        }
+
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        assert_eq!(
+            count(
+                &store,
+                "SELECT MIN(corroborations) FROM prov_assertion WHERE value IS NOT NULL"
+            )
+            .await,
+            2,
+            "both spellings must now report the two independent sources"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM prov_assertion WHERE value IS NOT NULL"
+            )
+            .await,
+            2,
+            "identity is untouched: the rows are NOT merged, only grouped"
+        );
     }
 }
