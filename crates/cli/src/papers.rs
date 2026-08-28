@@ -632,7 +632,16 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         ReadPaper {
                             url: &fulltext.source_url,
                             title: &title,
-                            abstract_text: paper.abstract_text.as_deref().unwrap_or_default(),
+                            // The search record's abstract when there is one;
+                            // otherwise the document's own, because
+                            // papers_ingest is given a URL and has no search
+                            // record to read from. Absent in both is stored
+                            // as absent.
+                            abstract_text: &paper
+                                .abstract_text
+                                .clone()
+                                .or_else(|| abstract_from_document(&fulltext.plain_text))
+                                .unwrap_or_default(),
                             write_up: prism_ingest::text_extract::best_write_up(&write_ups),
                         },
                         &extractor_model,
@@ -776,6 +785,53 @@ fn semantic_entities_for_claims<'a>(
         }
     }
     entities
+}
+
+/// The paper's own abstract, taken from the document when it declares one.
+///
+/// A search result carries an abstract; a bare URL does not, and
+/// `papers_ingest` takes a URL. Measured on the run of 2026-08-28: the
+/// write-up stored and `abstract kept: 0 chars` — the note landed, the
+/// paper's own summary did not, because the field was read from a search
+/// record that path never has.
+///
+/// So it is read from the document, and ONLY where the document says so. The
+/// tempting alternative — take the first N characters — would file a title
+/// block, an author list and a footer under the name "abstract", which is
+/// inventing a summary rather than keeping one. A paper that declares no
+/// abstract gets `None`, and absence is stored as absence.
+#[must_use]
+fn abstract_from_document(plain_text: &str) -> Option<String> {
+    /// Long enough for a dense abstract, short enough that a missed section
+    /// boundary cannot swallow the introduction.
+    const MAX_ABSTRACT_CHARS: usize = 4_000;
+
+    let lower = plain_text.to_lowercase();
+    let start = lower.find("abstract")?;
+    // Skip the heading word itself plus any punctuation or dash that follows
+    // it, so the stored text begins at the prose.
+    let after = plain_text[start + "abstract".len()..]
+        .trim_start_matches([':', '.', '-', '—', '–', ' ', '\t', '\r', '\n']);
+
+    // An abstract ends where the next section begins. Match the headings
+    // papers actually use, lowercased; whichever comes first wins.
+    let body_lower = after.to_lowercase();
+    let end = [
+        "introduction",
+        "1. introduction",
+        "1 introduction",
+        "keywords",
+        "index terms",
+    ]
+    .iter()
+    .filter_map(|marker| body_lower.find(marker))
+    .min()
+    .unwrap_or(after.len())
+    .min(MAX_ABSTRACT_CHARS);
+
+    let text = after[..end].trim();
+    // A heading with nothing under it is not an abstract.
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// One paper as it was actually read: its identity, what it says about
@@ -1789,6 +1845,48 @@ mod store_tests {
             "an invented predicate must be counted, not passed over: {out}"
         );
         assert_eq!(binding["bound"], 0);
+    }
+
+    /// The paper's own abstract is kept when the document declares one, and
+    /// NOT invented when it does not.
+    ///
+    /// Measured 2026-08-28: a run stored its write-up with `abstract kept: 0
+    /// chars`, because the field was read from a search record and
+    /// `papers_ingest` is given a bare URL.
+    #[test]
+    fn the_abstract_is_taken_from_the_paper_or_left_absent() {
+        let paper = "Some Title\nA. Author\n\nAbstract\nWe measured the service \
+                     temperature of FFKM seals.\n\n1. Introduction\nSeals matter.";
+        let found = abstract_from_document(paper).expect("the paper declares one");
+        assert!(
+            found.starts_with("We measured"),
+            "starts at the prose: {found:?}"
+        );
+        assert!(
+            !found.contains("Introduction"),
+            "stops where the next section begins: {found:?}"
+        );
+        assert!(
+            !found.contains("A. Author"),
+            "and never reaches back into the front matter"
+        );
+
+        // No abstract declared: absence, not the first paragraph relabelled.
+        assert_eq!(
+            abstract_from_document("Title\n\n1. Introduction\nStraight in."),
+            None
+        );
+        // A heading with nothing under it is not an abstract.
+        assert_eq!(abstract_from_document("Abstract\n\n"), None);
+    }
+
+    /// Keywords end an abstract too — some papers put them before the
+    /// introduction, and swallowing them would file a keyword list as prose.
+    #[test]
+    fn a_keyword_block_ends_the_abstract() {
+        let paper = "Abstract: We measured FFKM.\nKeywords: PFAS, seals, FFKM\n\n                     1. Introduction";
+        let found = abstract_from_document(paper).expect("declared");
+        assert_eq!(found, "We measured FFKM.");
     }
 
     fn claim(object: &str, unit: Option<&str>, cond_unit: Option<&str>) -> ExtractedClaim {
