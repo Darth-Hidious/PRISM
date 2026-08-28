@@ -735,14 +735,14 @@ pub async fn reset() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::OnceLock;
 
     /// These tests drive the process-global kernel singleton, so they must not
     /// run concurrently. This async mutex serializes them regardless of the
     /// harness thread count (an await-safe alternative to `--test-threads=1`).
-    fn test_serial() -> &'static tokio::sync::Mutex<()> {
+    pub(crate) fn test_serial() -> &'static tokio::sync::Mutex<()> {
         static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
     }
@@ -762,7 +762,7 @@ mod tests {
         None
     }
 
-    fn reset_global() {
+    pub(crate) fn reset_global() {
         *lock() = None;
     }
 

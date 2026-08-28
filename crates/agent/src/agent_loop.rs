@@ -1053,6 +1053,52 @@ pub(crate) fn prune_stale_tool_results(history: &mut [ChatMessage]) -> PruneOutc
     }
 }
 
+/// Put an oversized result in the REPL as a variable, and return its name.
+///
+/// The RLM move (arXiv 2512.24601), which names PRISM's measured failure in
+/// its own words: retrieval agents "can only fill up the underlying LLM's
+/// context window with snippets before breaking down". Measured here on
+/// 2026-08-27 — a 2,346,631-character browse result of which 8k reached the
+/// model, the rest stranded in durable memory behind a `recall` that costs
+/// the turn's remaining budget.
+///
+/// So the whole text goes where code can reach it instead: the SAME notebook
+/// kernel the human's notebook drives, so the model can slice, grep and count
+/// over the document with `execute_python` rather than reading it through a
+/// keyhole — and the human can inspect the same variable.
+///
+/// Staged through a file rather than interpolated into Python source: a
+/// megabyte of arbitrary document text inside a string literal is an escaping
+/// accident waiting to happen, and a paper containing triple quotes or a
+/// backslash would corrupt the cell.
+///
+/// Best-effort. A kernel that is not running, or a write that fails, returns
+/// `None` and the caller falls back to the preview-and-pointer it already
+/// had; being unable to offer the REPL must never cost the result.
+async fn offload_to_repl(content: &str, handle: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join("prism-repl-offload");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{handle}.txt"));
+    std::fs::write(&path, content).ok()?;
+    // Built line by line, NOT with a `\n\` continuation: rustfmt collapses
+    // the continuation and bakes the source indentation into the string, so
+    // the second line arrives with nine leading spaces and Python raises
+    // IndentationError. That is exactly how this failed the first time, and
+    // the failure is invisible in the Rust source.
+    let code = [
+        format!(
+            "{handle} = open({:?}, encoding='utf-8', errors='replace').read()",
+            path.display().to_string()
+        ),
+        format!("print(f'{handle}: {{len({handle})}} chars')"),
+    ]
+    .join("\n");
+    let cell = crate::notebook::execute(&code, Some(30), "agent")
+        .await
+        .ok()?;
+    cell.success.then(|| handle.to_string())
+}
+
 fn process_large_result(content: &str) -> String {
     if content.len() <= MAX_TOOL_RESULT_CHARS {
         return content.to_string();
@@ -3262,6 +3308,8 @@ pub(crate) async fn run_turn_inner(
     let mut continuations: usize = 0;
     // How many tools had run when the turn was last handed back — the marker
     // that says whether the next round actually gathered anything.
+    // Names the REPL variables handed to the model this turn: doc_1, doc_2…
+    let mut repl_offloads: usize = 0;
     let mut tools_at_last_continuation: usize = 0;
     // Where the saturation tracker stood at the last handback, so a round's
     // yield is the DELTA rather than the session total.
@@ -4774,7 +4822,33 @@ pub(crate) async fn run_turn_inner(
             // ended the last two runs of this exact question on their budget.
             let content = match search_digest(tool_name, &result_value, last_search_fresh) {
                 Some(digest) => digest,
-                None => process_large_result(&content_after_hooks),
+                None => {
+                    // Oversized results also go into the REPL as a variable,
+                    // so the model can compute over the WHOLE document rather
+                    // than read a prefix of it. See `offload_to_repl`: the
+                    // measured case is a 2.3 MB page of which 8k reached the
+                    // model.
+                    let trimmed = process_large_result(&content_after_hooks);
+                    if content_after_hooks.len() > MAX_TOOL_RESULT_CHARS {
+                        repl_offloads += 1;
+                        let handle = format!("doc_{repl_offloads}");
+                        match offload_to_repl(&content_after_hooks, &handle).await {
+                            Some(name) => format!(
+                                "{trimmed}\n\n[The FULL text is also in the notebook kernel as \
+                                 `{name}` ({} chars). It is a plain Python string in the same \
+                                 kernel execute_python uses, so slice it, search it, or count \
+                                 over it in code instead of asking for more of it as text.]",
+                                content_after_hooks.len()
+                            ),
+                            // Offering the REPL is a bonus, never a cost: if
+                            // the kernel is not up, the pointer the caller
+                            // already had still stands.
+                            None => trimmed,
+                        }
+                    } else {
+                        trimmed
+                    }
+                }
             };
 
             // ── h9. Log to scratchpad ─────────────────────────────
@@ -4939,6 +5013,62 @@ mod tests {
             CycleStep::Stop,
             "a model that has stopped gathering will not start because it was \
              told to keep going; that is how a loop burns money writing essays"
+        );
+    }
+
+    /// An oversized document reaches the REPL whole, and the model is told
+    /// the handle.
+    ///
+    /// RLM (arXiv 2512.24601) names the failure this answers: retrieval
+    /// agents "can only fill up the underlying LLM's context window with
+    /// snippets before breaking down". Measured here — a 2,346,631-char
+    /// browse result of which 8k reached the model.
+    ///
+    /// Staged through a file on purpose: a megabyte of arbitrary document
+    /// text interpolated into Python source is an escaping accident, and a
+    /// paper containing a triple quote would corrupt the cell.
+    #[tokio::test]
+    async fn a_document_too_big_for_context_is_reachable_as_code() {
+        // THE kernel lock, not a second one: the notebook kernel is process
+        // global, so a test that drives it must serialize against every other
+        // test that drives it. Aliasing the existing guard is the rule here —
+        // a private copy would serialize nothing.
+        let _serial = crate::notebook::tests::test_serial().lock().await;
+        // A kernel left running by an earlier test is configured for ITS
+        // workdir; configure does not adopt a live one, so start clean.
+        crate::notebook::tests::reset_global();
+        crate::notebook::configure(std::path::PathBuf::from("python3"), std::env::temp_dir());
+        // Contains exactly the characters that break naive interpolation.
+        let awkward = format!(
+            "{}\n\"\"\"triple quoted\"\"\" and a backslash \\ and a newline",
+            "x".repeat(MAX_TOOL_RESULT_CHARS + 10)
+        );
+        let offloaded = offload_to_repl(&awkward, "doc_test").await;
+        // Non-vacuous: where python EXISTS the offload must work. Skipping on
+        // `None` alone would let this test pass green on a machine where the
+        // feature is simply broken.
+        let python_available = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !python_available {
+            assert!(
+                offloaded.is_none(),
+                "no python, so the documented fallback is the only honest outcome"
+            );
+            return;
+        }
+        let handle = offloaded.expect("python is present, so the document must reach the REPL");
+        assert_eq!(handle, "doc_test");
+        let cell = crate::notebook::execute("print(len(doc_test))", Some(30), "test")
+            .await
+            .expect("the kernel answers");
+        assert!(cell.success, "the variable must be usable: {cell:?}");
+        assert!(
+            cell.stdout.trim().parse::<usize>().unwrap_or(0) == awkward.chars().count(),
+            "the WHOLE document is there, not a prefix: {}",
+            cell.stdout.trim()
         );
     }
 
