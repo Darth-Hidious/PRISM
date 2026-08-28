@@ -1233,6 +1233,34 @@ async fn store_claims(
         }
     }
 
+    // How many predicates landed in a loaded ontology, and how many did not.
+    //
+    // ANNOTATE, NEVER REFUSE. The tabular pipeline flags an unknown relation
+    // through `validate_graph`'s `unknown_rel`; this path writes facts one at
+    // a time and never ran that check, so a paper could contribute a whole
+    // private vocabulary in silence. Measured 2026-08-27: 23 facts stored from
+    // one paper, ZERO predicates ontology-bound, and nothing in the run said
+    // so — it took a SQL query afterwards to find out.
+    //
+    // Refusing them would be the wrong cure, and this file already records
+    // why: refuse-at-the-door lost the fact entirely, and quietly normalising
+    // it stored the number as if it were clean. So the facts are stored and
+    // the run SAYS what it did — a number a reader can act on, at the point of
+    // use, instead of a silence that reads like success.
+    let bound_predicates = claims
+        .iter()
+        .filter(|claim| {
+            let predicate = claim.predicate.trim();
+            predicate.starts_with("http://")
+                || predicate.starts_with("https://")
+                || ontologies
+                    .all()
+                    .iter()
+                    .any(|ontology| ontology.relation_for_label(predicate).is_some())
+        })
+        .count();
+    let unbound_predicates = claims.len().saturating_sub(bound_predicates);
+
     Ok(json!({
         "written": written,
         "rejected": rejected.len(),
@@ -1243,6 +1271,13 @@ async fn store_claims(
             "suppressed": proposals_suppressed,
         },
         "property_resolution": property_resolution,
+        // Visible in the result, so "nothing bound" cannot look like success.
+        "predicate_binding": {
+            "bound": bound_predicates,
+            "unbound": unbound_predicates,
+            "note": "unbound predicates are STORED, not dropped — a name only \
+                     this paper uses cannot corroborate with any other paper",
+        },
         "store": db_path.display().to_string(),
         "tenant": base_prov.tenant,
         "semantic_validation": semantic.report,
@@ -1709,6 +1744,51 @@ mod store_tests {
             q.push(suffix);
             let _ = std::fs::remove_file(q);
         }
+    }
+
+    /// A run that stores a private vocabulary must SAY so. Measured
+    /// 2026-08-27: 23 facts from one paper, zero predicates ontology-bound,
+    /// and nothing in the run's own output mentioned it — the defect was only
+    /// findable by querying SQL afterwards, so the run read like a success.
+    ///
+    /// Reported, never refused. This file already records why refusing is the
+    /// wrong cure: refuse-at-the-door lost the fact, and quietly normalising
+    /// stored the number as if it were clean.
+    #[tokio::test]
+    async fn a_run_reports_how_many_predicates_landed_in_an_ontology() {
+        let db = scratch_db();
+        let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
+
+        let mut invented = claim("UTS", Some("QUDT:MegaPA"), None);
+        invented.predicate = "pfasLayerReductionFactor".into();
+        invented.provenance.source_revision_id = Some("a".repeat(64));
+        invented.provenance.line_start = Some(1);
+        invented.provenance.line_end = Some(2);
+        invented.provenance.quote = Some("UTS was 1140 MPa".into());
+
+        let out = store_claims(
+            &[invented],
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
+            "test-model",
+            &db,
+            &ontologies,
+            &[],
+            &[],
+        )
+        .await
+        .expect("store");
+
+        let binding = &out["predicate_binding"];
+        assert_eq!(
+            binding["unbound"], 1,
+            "an invented predicate must be counted, not passed over: {out}"
+        );
+        assert_eq!(binding["bound"], 0);
     }
 
     fn claim(object: &str, unit: Option<&str>, cond_unit: Option<&str>) -> ExtractedClaim {
