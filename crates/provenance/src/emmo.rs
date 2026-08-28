@@ -1226,6 +1226,42 @@ pub fn canonical_key(name: &str) -> String {
         .to_lowercase()
 }
 
+/// The thing a SUBJECT names, folded only where folding is safe.
+///
+/// `canonical_key` trims and lowercases, which leaves `Ti-6Al-4V` and
+/// `Ti6Al4V` as different strings that can never corroborate each other.
+/// Measured on the live store 2026-08-27, that tear is real and visible:
+/// `CrCoNi medium-entropy alloy` carried three sources while
+/// `CrCoNi equiatomic medium-entropy alloy` sat beside it at one, the same
+/// material with its evidence split; likewise `Ti-6Al-4V` / `Ti6Al4V` /
+/// `Ti6Al4V alloy` and `IN718` / `IN718 (Inconel 718)`.
+///
+/// Deliberately far more conservative than [`predicate_concept`], because the
+/// two failure modes are not symmetric. Merging `hasSolidusTemperature` with
+/// `solidus temperature` recovers a fact; merging two MATERIALS invents one.
+/// So this only drops separators and case — it does NOT strip words, expand
+/// abbreviations, or touch parentheticals:
+///
+/// | folded together | kept apart |
+/// |---|---|
+/// | `Ti-6Al-4V` ≡ `Ti6Al4V` ≡ `ti 6al 4v` | `SS 316` ≠ `SS 316L` |
+/// | `IN-718` ≡ `IN718` | `Ti-6Al-4V` ≠ `Ti-6Al-4V ELI` |
+/// | `CrCoNi` ≡ `Cr-Co-Ni` | `IN718` ≠ `IN718 (Inconel 718)` |
+///
+/// The right-hand column is the point. `SS 316` and `SS 316L` differ by one
+/// character and are different alloys; a fold aggressive enough to join the
+/// left column's third row would join them too. Under-merging leaves
+/// corroboration unclaimed, which is a gap. Over-merging pools the evidence
+/// of two different materials, which is a fabrication.
+#[must_use]
+pub fn subject_concept(subject: &str) -> String {
+    subject
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// The concept a predicate names, stripped of how it was written.
 ///
 /// `assertion_id` hashes the predicate RAW, which is correct for identity —
@@ -1303,7 +1339,7 @@ pub fn corroboration_key(
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     hash_field(&mut h, tenant.as_bytes());
-    hash_field(&mut h, canonical_key(subject).as_bytes());
+    hash_field(&mut h, subject_concept(subject).as_bytes());
     hash_field(&mut h, predicate_concept(predicate).as_bytes());
     // Normalise the number itself so 1658 and 1658.0 meet, without pretending
     // 1658 and 1659 are the same measurement.
@@ -2646,6 +2682,14 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // conservatively RED; no old value is rewritten or dropped.
     crate::add_column_if_absent(conn, "prov_assertion", "value", "REAL").await?;
     crate::add_column_if_absent(conn, "prov_assertion", "unit", "TEXT").await?;
+    // The AGREEMENT key, beside the identity. `corroboration_key` folds the
+    // spellings that identity must keep apart — `Ti-6Al-4V` vs `Ti6Al4V`,
+    // `hasSolidusTemperature` vs `solidus temperature`, `1658` vs `1658.0` —
+    // so facts that are the same measurement can pool their sources without
+    // their ids being merged. NULL on rows written before it existed, and on
+    // unvalued facts, which have no measurement to agree about.
+    crate::add_column_if_absent(conn, "prov_assertion", "corroboration_key", "TEXT").await?;
+
     crate::add_column_if_absent(
         conn,
         "prov_assertion",
@@ -4250,10 +4294,10 @@ impl ProvenanceStore {
                 r#"INSERT INTO prov_assertion
                    (id, subject, subject_canonical, predicate, object, object_canonical, value, unit,
                     conditions_json, evidence_class, confidence, corroborations,
-                    confidence_basis, activity_id, source, agent, tenant)
+                    confidence_basis, activity_id, source, agent, tenant, corroboration_key)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                            0.0, 0, 'native',
-                           ?11, ?12, ?13, ?14)
+                           ?11, ?12, ?13, ?14, ?15)
                    ON CONFLICT(id) DO NOTHING"#,
                 [
                     Value::Text(id.clone()),
@@ -4270,6 +4314,8 @@ impl ProvenanceStore {
                     Value::Text(prov.source_entity_id.clone()),
                     Value::Text(prov.agent_id.clone()),
                     Value::Text(prov.tenant.clone()),
+                    corroboration_key(&prov.tenant, &a.subject, &a.predicate, value, unit)
+                        .map_or(Value::Null, Value::Text),
                 ],
             )
             .await?;
@@ -4562,6 +4608,40 @@ impl ProvenanceStore {
                            corroborations = COALESCE(corroborations, 0) + 1
                        WHERE id = ?1"#,
                     [Value::Text(id.clone()), Value::Real(confidence_evidence)],
+                )
+                .await?;
+            // Then pool the group. Two spellings of one measurement are two
+            // assertion ids by design — identity keeps what was written — but
+            // they are ONE claim, and counting their sources separately is
+            // what left 1,580 of 1,582 valued facts at a single source on the
+            // live store.
+            //
+            // Every member of the group is set to the group's DISTINCT source
+            // count, so the number means "independent sources behind this
+            // measurement" however the paper spelled it. Recomputed rather
+            // than incremented: an increment would have to know whether this
+            // source was already counted under a sibling spelling, and a
+            // recompute simply cannot double-count.
+            //
+            // Scoped to rows that HAVE a key: unvalued facts have no
+            // measurement to agree about and keep the per-id count above.
+            self.conn
+                .execute(
+                    r#"UPDATE prov_assertion
+                       SET corroborations = (
+                               SELECT COUNT(DISTINCT peer_e.source_key)
+                               FROM prov_assertion peer
+                               JOIN prov_assertion_evidence peer_e
+                                 ON peer_e.assertion_id = peer.id
+                               WHERE peer.corroboration_key =
+                                     prov_assertion.corroboration_key
+                           )
+                       WHERE corroboration_key IS NOT NULL
+                         AND corroboration_key = (
+                               SELECT corroboration_key FROM prov_assertion
+                               WHERE id = ?1
+                           )"#,
+                    [Value::Text(id.clone())],
                 )
                 .await?;
             // Derived in a second statement so it reads the statistics just
@@ -13415,5 +13495,107 @@ mod tests {
         let frontier = store.unfinished_reads(LOCAL_TENANT, 10).await.unwrap();
         assert_eq!(frontier.len(), 1, "only the shallow one is unfinished");
         assert_eq!(frontier[0].source_id, "doi:10.1/shallow");
+    }
+
+    // ── Subject folding: the tear that split one material in two ─────────
+
+    /// Folds the separators, and NOTHING else. The right-hand assertions are
+    /// the point: a fold aggressive enough to join `IN718` with
+    /// `IN718 (Inconel 718)` would also join `SS 316` with `SS 316L`, which
+    /// are different alloys one character apart. Under-merging leaves
+    /// corroboration unclaimed; over-merging pools two materials' evidence
+    /// and invents a fact.
+    #[test]
+    fn subject_folding_joins_spellings_but_never_two_materials() {
+        assert_eq!(subject_concept("Ti-6Al-4V"), subject_concept("Ti6Al4V"));
+        assert_eq!(subject_concept("Ti-6Al-4V"), subject_concept("ti 6al 4v"));
+        assert_eq!(subject_concept("IN-718"), subject_concept("IN718"));
+        assert_eq!(subject_concept("CrCoNi"), subject_concept("Cr-Co-Ni"));
+
+        assert_ne!(
+            subject_concept("SS 316"),
+            subject_concept("SS 316L"),
+            "one character apart and a different alloy"
+        );
+        assert_ne!(
+            subject_concept("Ti-6Al-4V"),
+            subject_concept("Ti-6Al-4V ELI"),
+            "ELI is a different grade, not a spelling"
+        );
+        assert_ne!(
+            subject_concept("IN718"),
+            subject_concept("IN718 (Inconel 718)"),
+            "deliberately NOT folded — parenthetical stripping is the step \
+             that would start merging materials"
+        );
+    }
+
+    /// THE corroboration test for subjects. Two papers report the same
+    /// measurement of the same material, spelling it differently — which is
+    /// what papers do. They must pool into one measurement backed by two
+    /// independent sources.
+    ///
+    /// Measured on the live store before this: `CrCoNi medium-entropy alloy`
+    /// carried three sources while `CrCoNi equiatomic medium-entropy alloy`
+    /// sat beside it at one, and 1,580 of 1,582 valued facts were stuck at a
+    /// single source. `corroboration_key` existed and folded the predicate,
+    /// value and unit correctly — but nothing in production called it, and
+    /// the subject was never folded at all.
+    #[tokio::test]
+    async fn two_spellings_of_one_material_pool_their_sources() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        measured(&store, "Ti-6Al-4V", "MPa", 950.0, "doi:10.1/a").await;
+        measured(&store, "Ti6Al4V", "MPa", 950.0, "doi:10.1/b").await;
+
+        let rows = count(
+            &store,
+            "SELECT MIN(corroborations) FROM prov_assertion WHERE value IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            rows, 2,
+            "both spellings must report the two independent sources behind \
+             the measurement, not one each"
+        );
+    }
+
+    /// The converse, so the fold cannot become a merge-everything bug: two
+    /// genuinely different alloys keep their own evidence.
+    #[tokio::test]
+    async fn two_different_alloys_never_pool_their_sources() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        measured(&store, "SS 316", "MPa", 950.0, "doi:10.1/a").await;
+        measured(&store, "SS 316L", "MPa", 950.0, "doi:10.1/b").await;
+
+        let highest = count(
+            &store,
+            "SELECT MAX(corroborations) FROM prov_assertion WHERE value IS NOT NULL",
+        )
+        .await;
+        assert_eq!(
+            highest, 1,
+            "316 and 316L are different alloys; sharing a number is not agreement"
+        );
+    }
+
+    /// Re-reading the SAME source under both spellings is not corroboration.
+    /// Corroboration counts INDEPENDENT sources, and the group recompute
+    /// counts distinct source keys precisely so a second spelling of the same
+    /// paper cannot inflate the number.
+    #[tokio::test]
+    async fn one_source_spelled_twice_is_still_one_source() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        measured(&store, "Ti-6Al-4V", "MPa", 950.0, "doi:10.1/same").await;
+        measured(&store, "Ti6Al4V", "MPa", 950.0, "doi:10.1/same").await;
+
+        let highest = count(
+            &store,
+            "SELECT MAX(corroborations) FROM prov_assertion WHERE value IS NOT NULL",
+        )
+        .await;
+        assert_eq!(highest, 1, "one paper agreeing with itself is one source");
     }
 }
