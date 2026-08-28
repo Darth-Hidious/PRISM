@@ -8838,27 +8838,34 @@ pub async fn build_agent_seed(
     // always-offered model surface. Approval prompts and mode policy must see
     // `apply_patch` as the workspace-writing, approval-required tool it is.
     tool_catalog.extend(crate::meta_tools::definitions());
+    // In the catalog so `find_tools` can surface it, off the always-on surface
+    // so it costs nothing until wanted.
+    tool_catalog.extend(crate::meta_tools::discoverable_definitions());
 
     // External MCP servers (~/.prism/mcp.json): connect, list their tools, and
     // fold them into the catalog as UNTRUSTED (namespaced mcp__<server>__<tool>,
     // anti-spoof gated by extend_untrusted). Missing config = zero servers.
     let mcp_manager = crate::mcp::McpManager::connect_from_default_config().await;
     if !mcp_manager.is_empty() {
-        let rejected = tool_catalog.extend_untrusted(mcp_manager.loaded_tools());
-        for name in rejected {
-            tracing::warn!(
-                tool = %name,
-                "rejected MCP tool: name collides with an existing tool — rename the server",
-            );
-        }
         tracing::info!(
             servers = mcp_manager.server_count(),
             "connected external MCP servers"
         );
     }
+    let mcp_tools = mcp_manager.loaded_tools();
     crate::mcp::init_global(mcp_manager);
 
-    let tools = Arc::new(tool_catalog);
+    // The catalog is published as base + MCP, with the base kept aside so a
+    // later `mcp::reload_global()` can rebuild from it. Rebuilding beats
+    // extending in place: a server DELETED from the config then actually
+    // disappears, instead of lingering because nothing removed it.
+    let (tools, rejected) = crate::tool_catalog::install_live(tool_catalog, mcp_tools);
+    for name in rejected {
+        tracing::warn!(
+            tool = %name,
+            "rejected MCP tool: name collides with an existing tool — rename the server",
+        );
+    }
     tracing::info!(tool_count = tools.len(), "loaded tool catalog");
 
     // Runtime instruction discovery: fold any per-project `AGENTS.md`
@@ -9107,7 +9114,7 @@ async fn run_server_core(
                             pending_turn = Some(spawn_agent_turn(
                                 rt,
                                 queued_text,
-                                Arc::clone(&tools),
+                                crate::tool_catalog::live_or(&tools),
                                 Arc::clone(&config),
                                 auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                                 Arc::clone(&hooks),
@@ -9292,7 +9299,7 @@ async fn run_server_core(
                 pending_turn = Some(spawn_agent_turn(
                     bundle,
                     text.to_string(),
-                    Arc::clone(&tools),
+                    crate::tool_catalog::live_or(&tools),
                     Arc::clone(&config),
                     auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                     Arc::clone(&hooks),
@@ -9397,7 +9404,7 @@ async fn run_server_core(
                 pending_turn = Some(spawn_agent_turn(
                     bundle,
                     text,
-                    Arc::clone(&tools),
+                    crate::tool_catalog::live_or(&tools),
                     Arc::clone(&config),
                     auto_approve_flag.load(std::sync::atomic::Ordering::Relaxed),
                     Arc::clone(&hooks),

@@ -719,7 +719,9 @@ impl ChatService {
             }
         };
 
-        let tools = Arc::clone(&self.tools);
+        // Live catalog if the agent has published one, so a `reload_mcp`
+        // in an earlier turn is visible in this one.
+        let tools = crate::tool_catalog::live_or(&self.tools);
         let mut assistant = crate::session::AssistantRecorder::default();
         let mut emit = |event: AgentEvent| match event {
             AgentEvent::ThinkingDelta { text } => {

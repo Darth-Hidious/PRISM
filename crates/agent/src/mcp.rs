@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -400,17 +400,101 @@ fn sanitize_segment(segment: &str) -> String {
 // nested subagent turns) without threading another parameter through every
 // `run_turn` call site.
 
-static GLOBAL: OnceLock<Arc<McpManager>> = OnceLock::new();
+/// The live manager. Replaceable, deliberately.
+///
+/// This was a `OnceLock` — set once, first caller wins — and the comment above
+/// the struct said "built once at agent startup; sessions live for the process
+/// lifetime". That made adding an MCP server require restarting PRISM, which
+/// is a choice, not a law: the agent already has `file` and `execute_bash` in
+/// its always-present core set and can write `~/.prism/mcp.json` itself. The
+/// surface was already open; only the reload was frozen.
+///
+/// Old sessions are dropped when the manager is replaced, which closes their
+/// child processes — the effect carries its undo. A server deleted from the
+/// config is gone after a reload; nothing accumulates.
+static GLOBAL: RwLock<Option<Arc<McpManager>>> = RwLock::new(None);
 
-/// Install the process-global manager. First caller wins (both transports
-/// build from the same config file, so a second seed would be identical).
+/// Publish `manager` as the live one, replacing (and shutting down) whatever
+/// was there.
 pub fn init_global(manager: McpManager) {
-    let _ = GLOBAL.set(Arc::new(manager));
+    *GLOBAL.write().expect("MCP global poisoned") = Some(Arc::new(manager));
 }
 
 #[must_use]
 pub fn global() -> Option<Arc<McpManager>> {
-    GLOBAL.get().cloned()
+    GLOBAL.read().expect("MCP global poisoned").clone()
+}
+
+/// What a reload did, in terms a caller can act on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpReloadReport {
+    /// Servers connected after the reload.
+    pub servers: Vec<String>,
+    /// Namespaced tool names now callable.
+    pub tools: Vec<String>,
+    /// Servers that are configured and did NOT connect, with the reason.
+    pub failed: Vec<(String, String)>,
+    /// Tools refused because their namespaced name collides with an existing
+    /// tool. The anti-spoof gate is unchanged by hot reloading.
+    pub rejected: Vec<String>,
+    /// Server names that appeared since the previous manager.
+    pub added: Vec<String>,
+    /// Server names that are gone since the previous manager.
+    pub removed: Vec<String>,
+}
+
+/// Re-read `~/.prism/mcp.json`, reconnect, and publish the result — without
+/// restarting the process.
+///
+/// Connect FIRST, publish second: a config that fails to connect leaves the
+/// previous manager serving, so a bad edit degrades to "nothing changed and
+/// here is why" rather than to a session with no tools. Per-server failures
+/// are still recorded and reported, exactly as at startup.
+///
+/// Takes effect for the NEXT turn, not the running one: swapping the tool
+/// catalog under a turn already in flight would let the model call against a
+/// list it was never shown.
+pub async fn reload_global() -> McpReloadReport {
+    let before: Vec<String> = global().map(|m| m.server_names()).unwrap_or_default();
+    let manager = McpManager::connect_from_default_config().await;
+
+    let servers = manager.server_names();
+    let failed = manager.failed_servers().to_vec();
+    let loaded = manager.loaded_tools();
+    init_global(manager);
+
+    // `None` = the agent never published a catalog, so nothing was rebuilt.
+    // Said out loud rather than reported as an empty rejection list, which
+    // would read exactly like a clean reload.
+    let rejected = crate::tool_catalog::rebuild_live(loaded).unwrap_or_else(|| {
+        vec!["(tool catalog not published — reload changed nothing)".to_string()]
+    });
+    let tools = crate::tool_catalog::live()
+        .map(|catalog| {
+            catalog
+                .tool_names()
+                .into_iter()
+                .filter(|name| name.starts_with(MCP_TOOL_PREFIX))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    McpReloadReport {
+        added: servers
+            .iter()
+            .filter(|name| !before.contains(name))
+            .cloned()
+            .collect(),
+        removed: before
+            .iter()
+            .filter(|name| !servers.contains(name))
+            .cloned()
+            .collect(),
+        servers,
+        tools,
+        failed,
+        rejected,
+    }
 }
 
 /// Dispatch entry used by the agent loop for catalog tools with

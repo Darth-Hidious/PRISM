@@ -1,5 +1,6 @@
 use prism_ingest::llm::{FunctionDef, ToolDefinition};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 use crate::permissions::{PermissionMode, get_tool_permission};
 
@@ -185,6 +186,66 @@ impl LoadedTool {
 
 /// Catalog of tools loaded from the Python registry. The LLM still receives
 /// plain `ToolDefinition`s, but the runtime keeps the richer metadata here.
+/// The catalog WITHOUT any MCP tools — the fixed half, captured once.
+static BASE: std::sync::OnceLock<ToolCatalog> = std::sync::OnceLock::new();
+/// Base + whichever MCP tools are currently connected. Replaced by
+/// [`rebuild_live`]; read by each turn as it starts.
+static LIVE: std::sync::RwLock<Option<Arc<ToolCatalog>>> = std::sync::RwLock::new(None);
+
+/// Publish the startup catalog and fold in the MCP tools connected so far.
+///
+/// The base is kept separately so a later reload can rebuild from it. Without
+/// that, repeated reloads would either accumulate stale MCP tools or need the
+/// whole catalog rebuilt from the tool server again.
+pub fn install_live(
+    base: ToolCatalog,
+    mcp_tools: Vec<LoadedTool>,
+) -> (Arc<ToolCatalog>, Vec<String>) {
+    let _ = BASE.set(base);
+    let rejected = rebuild_live(mcp_tools)
+        .expect("the base was just installed, so a rebuild cannot be a no-op");
+    (
+        live().expect("the live catalog exists once the base is installed"),
+        rejected,
+    )
+}
+
+/// Rebuild the live catalog as base + `mcp_tools`, returning the names refused
+/// for colliding with an existing tool.
+///
+/// Rebuilt from the BASE every time, never extended in place, so a server
+/// removed from the config actually disappears instead of lingering because
+/// nothing removed it.
+///
+/// `None` means no base has been published yet — nothing was rebuilt. It is
+/// returned rather than swallowed because a reload that quietly changed
+/// nothing while reporting success is the failure this whole change exists to
+/// remove.
+pub fn rebuild_live(mcp_tools: Vec<LoadedTool>) -> Option<Vec<String>> {
+    let base = BASE.get()?;
+    let mut catalog = base.clone();
+    let rejected = catalog.extend_untrusted(mcp_tools);
+    *LIVE.write().expect("live catalog poisoned") = Some(Arc::new(catalog));
+    Some(rejected)
+}
+
+/// The catalog for a turn about to start: the live one when the agent has
+/// published it, else the caller's own.
+///
+/// Called as each turn begins, which is what makes a reload take effect on the
+/// NEXT turn and not the running one. Swapping the catalog mid-turn would let
+/// the model call against a list it was never shown.
+#[must_use]
+pub fn live_or(fallback: &Arc<ToolCatalog>) -> Arc<ToolCatalog> {
+    live().unwrap_or_else(|| Arc::clone(fallback))
+}
+
+/// The catalog a turn should use. `None` before the agent has started.
+#[must_use]
+pub fn live() -> Option<Arc<ToolCatalog>> {
+    LIVE.read().expect("live catalog poisoned").clone()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ToolCatalog {
     tools: Vec<LoadedTool>,
@@ -379,6 +440,12 @@ impl ToolCatalog {
         }
         self.definitions = self.tools.iter().map(LoadedTool::to_definition).collect();
         rejected
+    }
+
+    /// Every tool name currently in the catalog, in catalog order.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.iter().map(|tool| tool.name.clone()).collect()
     }
 
     /// Rank the WHOLE catalog by keyword relevance to `query`, most relevant
@@ -971,6 +1038,96 @@ mod tests {
         assert!(
             catalog.find("recall").is_none(),
             "reserved name must not be injected by an untrusted source"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_catalog_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mcp_tool(name: &str) -> LoadedTool {
+        LoadedTool {
+            name: name.to_string(),
+            description: "a tool from an external server".to_string(),
+            input_schema: json!({"type": "object", "properties": {}}),
+            requires_approval: false,
+            declared_free: false,
+            permission_mode: crate::permissions::PermissionMode::ReadOnly,
+            source: Some("mcp".to_string()),
+            source_detail: Some("weather".to_string()),
+        }
+    }
+
+    /// Adding an MCP server must change what the NEXT turn sees, without the
+    /// process restarting.
+    ///
+    /// Before this, the manager was a `OnceLock` and the catalog an `Arc`
+    /// built once at startup, so a server added to `~/.prism/mcp.json` stayed
+    /// invisible until relaunch — even though the agent can WRITE that file
+    /// itself with the `file` and `execute_bash` tools that are always in its
+    /// core set. The surface was already open; only the reload was frozen.
+    ///
+    /// ONE test, not four: `BASE` and `LIVE` are process-globals, and cargo
+    /// runs tests in parallel threads. Split across tests these raced — one
+    /// clearing the catalog while another asserted on it — which is a real
+    /// property of the design (a single live catalog per process), not
+    /// something to paper over with retries.
+    #[test]
+    fn reloading_adds_removes_and_still_refuses_collisions() {
+        let base = ToolCatalog::from_tool_server_json(&json!({"tools": []}));
+        let (installed, rejected) = install_live(base, vec![mcp_tool("mcp__weather__forecast")]);
+        assert!(
+            rejected.is_empty(),
+            "a free name is not refused: {rejected:?}"
+        );
+        assert!(
+            installed
+                .tool_names()
+                .contains(&"mcp__weather__forecast".to_string()),
+            "the server's tool is callable without a restart"
+        );
+
+        // A second server arrives — the agent wrote the config and reloaded.
+        rebuild_live(vec![
+            mcp_tool("mcp__weather__forecast"),
+            mcp_tool("mcp__tickets__search"),
+        ])
+        .expect("a base is installed");
+        let names = live().expect("published").tool_names();
+        assert!(names.contains(&"mcp__tickets__search".to_string()));
+        assert!(names.contains(&"mcp__weather__forecast".to_string()));
+
+        // The anti-spoof gate is not weakened by reloading: a namespaced name
+        // that collides is still refused, BY NAME, and refusing it does not
+        // take the rest of the server down.
+        let rejected = rebuild_live(vec![
+            mcp_tool("mcp__weather__forecast"),
+            mcp_tool("mcp__weather__forecast"),
+        ])
+        .expect("a base is installed");
+        assert_eq!(
+            rejected,
+            vec!["mcp__weather__forecast".to_string()],
+            "the duplicate is named, not silently dropped"
+        );
+        assert!(
+            live()
+                .expect("published")
+                .tool_names()
+                .contains(&"mcp__weather__forecast".to_string()),
+            "the first one still loaded"
+        );
+
+        // ...and the config is edited to drop everything. Rebuilding from the
+        // BASE is what makes removal work at all; extending in place would
+        // leave stale tools behind forever, because nothing ever removes one.
+        rebuild_live(Vec::new()).expect("a base is installed");
+        let names = live().expect("published").tool_names();
+        assert!(
+            !names.iter().any(|name| name.starts_with("mcp__")),
+            "a server deleted from the config is gone after a reload: {names:?}"
         );
     }
 }

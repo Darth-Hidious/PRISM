@@ -60,13 +60,14 @@ pub enum MetaTool {
     SpawnSubagent,
     OrchestrateAgents,
     ListFailures,
+    ReloadMcp,
 }
 
 impl MetaTool {
     /// Every meta-tool. A variant missing from this array still cannot skip
     /// classification (the wildcard-free matches force it), but it would skip
     /// the registry-parity test — the array makes that a compile-time count.
-    pub const ALL: [MetaTool; 9] = [
+    pub const ALL: [MetaTool; 10] = [
         MetaTool::ApplyPatch,
         MetaTool::Recall,
         MetaTool::FindTools,
@@ -76,6 +77,7 @@ impl MetaTool {
         MetaTool::SpawnSubagent,
         MetaTool::OrchestrateAgents,
         MetaTool::ListFailures,
+        MetaTool::ReloadMcp,
     ];
 
     /// Parse the wire name. Strings are an open set so the `_` arm is
@@ -94,6 +96,7 @@ impl MetaTool {
             "spawn_subagent" => Some(MetaTool::SpawnSubagent),
             "orchestrate_agents" => Some(MetaTool::OrchestrateAgents),
             "list_failures" => Some(MetaTool::ListFailures),
+            "reload_mcp" => Some(MetaTool::ReloadMcp),
             _ => None,
         }
     }
@@ -112,6 +115,7 @@ impl MetaTool {
             MetaTool::SpawnSubagent => "spawn_subagent",
             MetaTool::OrchestrateAgents => "orchestrate_agents",
             MetaTool::ListFailures => "list_failures",
+            MetaTool::ReloadMcp => "reload_mcp",
         }
     }
 
@@ -129,10 +133,18 @@ impl MetaTool {
             // re-executes stored code; spawn_subagent and orchestrate_agents
             // drive nested turns over the same code-running tool surface.
             // All four are node-owner only.
+            // reload_mcp launches every server named in ~/.prism/mcp.json as a
+            // CHILD PROCESS. That the config is a local file does not make it
+            // less than code execution — an entry can name any binary — so it
+            // is owner-gated like the rest of this group. It is also why the
+            // agent may not reach it on the strength of something it READ: a
+            // server name arriving from a paper or a web page is untrusted
+            // content, and the gate is what keeps that from becoming a spawn.
             MetaTool::WriteSkill
             | MetaTool::RunSkill
             | MetaTool::SpawnSubagent
-            | MetaTool::OrchestrateAgents => MetaToolEffect::ExecutesCode,
+            | MetaTool::OrchestrateAgents
+            | MetaTool::ReloadMcp => MetaToolEffect::ExecutesCode,
         }
     }
 }
@@ -262,6 +274,40 @@ pub fn is_meta_tool(tool_name: &str) -> bool {
 #[must_use]
 pub fn is_reserved_tool_name(tool_name: &str) -> bool {
     is_meta_tool(tool_name) || crate::command_tools::is_command_tool(tool_name)
+}
+
+/// Meta-tools that live in the catalog but are NOT on the always-offered
+/// surface — reachable through `find_tools`, and free once found because
+/// `is_meta_tool` exempts them from slot competition.
+///
+/// `reload_mcp` is here rather than in [`definitions`] because the always-on
+/// surface is FULL: the nine mandatory meta-tools charge almost exactly the
+/// headroom `always_on_meta_tools_leave_room_in_the_minimum_tool_budget`
+/// allows, and a tenth pushed it over. That guard is right and the answer is
+/// not to raise its limit. Reloading MCP servers is a deliberate, occasional
+/// act — the agent looks for it when it wants it, and the smallest supported
+/// context keeps its room to work.
+#[must_use]
+pub fn discoverable_definitions() -> Vec<LoadedTool> {
+    vec![LoadedTool {
+        name: "reload_mcp".to_string(),
+        description: "Reconnect the MCP servers in ~/.prism/mcp.json without restarting \
+                PRISM. Edit that file with your file/bash tools, then call this. Reports the \
+                servers connected, tools now callable, failures, and refused names. Callable \
+                from your next turn."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {}
+        }),
+        requires_approval: true,
+        declared_free: false,
+        // Spawning child processes named by a config file sits with the
+        // other code-execution surfaces, not with the read-only ones.
+        permission_mode: PermissionMode::WorkspaceWrite,
+        source: Some("builtin".to_string()),
+        source_detail: Some("mcp".to_string()),
+    }]
 }
 
 /// Catalog entries for the meta-tools, so the model is offered them and
@@ -550,6 +596,10 @@ pub async fn execute_meta_tool_with_project_root(
         MetaTool::RunSkill => run_skill(args).await,
         MetaTool::ListSkills => Ok(list_skills()),
         MetaTool::ListFailures => list_failures(args, store, session_id).await,
+        MetaTool::ReloadMcp => {
+            let report = crate::mcp::reload_global().await;
+            Ok(serde_json::to_value(report)?)
+        }
         // Needs the live turn machinery (LLM client, tool server, approval
         // channel), which this signature cannot carry — the agent loop
         // intercepts it BEFORE this dispatcher (see agent_loop.rs). Reaching
@@ -1275,14 +1325,33 @@ mod tests {
                 tool.name()
             );
         }
-        // Registry parity with the definitions offered to the model: neither
-        // side may grow without the other.
-        let mut def_names: Vec<String> = definitions().iter().map(|t| t.name.clone()).collect();
+        // Registry parity with the definitions the model can reach: neither
+        // side may grow without the other. Now spread over TWO lists — the
+        // always-offered surface and the find_tools-discoverable one — because
+        // the always-on surface is full (see `discoverable_definitions`). A
+        // variant must appear in exactly one of them: absent from both it is
+        // undispatchable, present in both it would be offered twice.
+        let mut def_names: Vec<String> = definitions()
+            .iter()
+            .chain(discoverable_definitions().iter())
+            .map(|t| t.name.clone())
+            .collect();
         let mut all_names: Vec<String> =
             MetaTool::ALL.iter().map(|t| t.name().to_string()).collect();
         def_names.sort();
         all_names.sort();
         assert_eq!(def_names, all_names);
+
+        // ...and the two lists are disjoint.
+        let always: std::collections::HashSet<String> =
+            definitions().iter().map(|t| t.name.clone()).collect();
+        for tool in discoverable_definitions() {
+            assert!(
+                !always.contains(&tool.name),
+                "{} is both always-on and discoverable",
+                tool.name
+            );
+        }
     }
 
     /// The gate is INSIDE the executor (mirrors `execute_command_tool`), so
