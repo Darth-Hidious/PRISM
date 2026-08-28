@@ -146,11 +146,16 @@ pub async fn apply(
             // rather than letting the next chat turn 401 mysteriously.
             let mut notes = Vec::new();
             if known.is_none() {
+                // "or run `prism use list`" straddled a string continuation
+                // exactly at "run \ `prism", so the no_exit_to_cli guard's
+                // physical-line scan never saw it; the splice-aware scan does.
+                // The mention stays (it names this command's own subcommand),
+                // the imperative goes.
                 notes.push(format!(
                     "\x1b[33mUnknown provider\x1b[0m \x1b[1m{provider}\x1b[0m — PRISM will \
                      guess \x1b[2mhttps://api.{provider}.com/v1\x1b[0m, which is probably \
-                     wrong. Declare it in {override_path} to fix the endpoint, or run \
-                     `prism use list` to see the providers PRISM ships with.",
+                     wrong. Declare it in {override_path} to fix the endpoint; \
+                     `prism use list` shows the providers PRISM ships with.",
                     override_path = crate::providers::user_path()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "~/.prism/providers.toml".to_string()),

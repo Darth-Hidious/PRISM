@@ -4769,10 +4769,16 @@ async fn main() -> Result<()> {
                         Err(error) => {
                             consecutive_failures += 1;
                             if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                                // "check with: prism agent" was an exit-to-CLI
+                                // instruction (no_exit_to_cli.rs) — this error
+                                // reaches TUI/agent surfaces that have their
+                                // own background-research view. Same for the
+                                // two sibling bails below.
                                 anyhow::bail!(
                                     "lost contact with the platform while polling run {run_id} \
                                      ({consecutive_failures} consecutive failures, last: {error}). \
-                                     The run may still be going — check with: prism agent"
+                                     The run may still be going — check the background-research \
+                                     status once the platform is reachable again."
                                 );
                             }
                             continue;
@@ -4792,7 +4798,8 @@ async fn main() -> Result<()> {
                             anyhow::bail!(
                                 "lost contact with the platform while polling run {run_id} \
                                  ({consecutive_failures} consecutive failures, last: {error:#}). \
-                                 The run may still be going — check with: prism agent"
+                                 The run may still be going — check the background-research \
+                                 status once the platform is reachable again."
                             );
                         }
                         continue;
@@ -4803,7 +4810,8 @@ async fn main() -> Result<()> {
                             anyhow::bail!(
                                 "lost contact with the platform while polling run {run_id} \
                                  ({consecutive_failures} consecutive failures, last: {error}). \
-                                 The run may still be going — check with: prism agent"
+                                 The run may still be going — check the background-research \
+                                 status once the platform is reachable again."
                             );
                         }
                         continue;
@@ -4842,8 +4850,9 @@ async fn main() -> Result<()> {
                     _ => {
                         if std::time::Instant::now() >= deadline {
                             anyhow::bail!(
-                                "research run {run_id} still '{state}' after 10 min; \
-                                 check later with: prism agent (check_background_research)"
+                                "research run {run_id} still '{state}' after 10 min; it \
+                                 continues in the background — check its status later \
+                                 (check_background_research)"
                             );
                         }
                         eprint!(".");
@@ -14163,10 +14172,15 @@ async fn handle_query(
             }
         }
         if results.is_empty() {
-            println!(
-                "  (the local semantic index is empty — ingest data first with: \
-                 prism ingest <path>)"
-            );
+            // Observed live in a TUI transcript: "(the local semantic index is
+            // empty — ingest data first with: prism ingest <path>)". This
+            // stdout is piped verbatim into whatever surface invoked the CLI,
+            // so "ingest data first with: prism ingest" told a TUI user to
+            // exit and type a command — the exact defect no_exit_to_cli.rs
+            // exists to ban (it escaped because the literal's continuation
+            // split "with:" from "prism"). State the fact; each surface owns
+            // its own ingest remedy.
+            println!("  (the local semantic index is empty — nothing has been ingested yet)");
         }
     } else {
         // Graph traversal over the bundled Turso provenance store
