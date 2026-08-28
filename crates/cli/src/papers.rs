@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use prism_retrieval::{
-    EngineConfig, Paper, RelevancePolicy, RetrievalEngine, SourceId, SweepPlan, sweep,
+    EngineConfig, Paper, RelevancePolicy, RetrievalEngine, SourceId, SweepPlan,
+    fulltext::BlockKind, sweep,
 };
 use serde_json::json;
 
@@ -479,7 +480,13 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             // consults every loaded vocabulary, and a term from any of them
             // binds.
             let ontologies = prism_ingest::ontologies::loaded(Some(&ontology_id))?;
-            let title = paper.title.clone();
+            // The search record's title when there is one; otherwise the
+            // document's own. `papers_ingest` takes a URL, so on that path
+            // `paper.title` is always empty.
+            let title = Some(paper.title.clone())
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| title_from_document(&fulltext))
+                .unwrap_or_default();
             let document_id = paper
                 .doi
                 .clone()
@@ -640,6 +647,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                             abstract_text: &paper
                                 .abstract_text
                                 .clone()
+                                .or_else(|| labelled_block(&fulltext, BlockKind::Abstract))
                                 .or_else(|| abstract_from_document(&fulltext.plain_text))
                                 .unwrap_or_default(),
                             write_up: prism_ingest::text_extract::best_write_up(&write_ups),
@@ -785,6 +793,46 @@ fn semantic_entities_for_claims<'a>(
         }
     }
     entities
+}
+
+/// The text of the first block the parser labelled `kind`.
+///
+/// JATS declares the title and the abstract STRUCTURALLY — `<article-title>`
+/// and `<abstract>` — so neither the title nor the word "Abstract" appears as
+/// a heading in `plain_text`. Scanning the text therefore finds nothing on the
+/// JATS path, which is the path six of the seven papers in the 2026-08-28 run
+/// took. The label is the paper's own declaration and is exact; prefer it, and
+/// keep the text scan for PDFs, where there are no labels and the heading
+/// really is in the prose.
+#[must_use]
+fn labelled_block(fulltext: &prism_retrieval::Fulltext, kind: BlockKind) -> Option<String> {
+    let text = fulltext
+        .blocks
+        .iter()
+        .find(|block| block.locator.kind == kind)?
+        .text
+        .trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The paper's own title, taken from the document when it declares one.
+///
+/// Same hole as the abstract below, same cause: `papers_ingest` is given a
+/// bare URL or PMC id, so there is no search record and `Paper::title` is
+/// `String::new()`. Measured 2026-08-28: all seven notes of a live run stored
+/// an empty title, which leaves a reader unable to tell one write-up from
+/// another.
+///
+/// An over-long block is REFUSED rather than truncated. A truncated abstract
+/// is still the abstract's opening and useful; a truncated title is simply a
+/// different, wrong title, and a wrong title is worse than an honest absence.
+#[must_use]
+fn title_from_document(fulltext: &prism_retrieval::Fulltext) -> Option<String> {
+    /// Generous for a real title, short enough that a mis-parsed block that
+    /// swallowed the body is recognisable as one.
+    const MAX_TITLE_CHARS: usize = 500;
+
+    labelled_block(fulltext, BlockKind::Title).filter(|t| t.chars().count() <= MAX_TITLE_CHARS)
 }
 
 /// The paper's own abstract, taken from the document when it declares one.
@@ -1579,6 +1627,60 @@ mod tests {
     /// its five tables lives in `<floats-group>`/`<app-group>`, the shape
     /// that used to reach the reader with NO tables at all.
     const REAL_JATS: &str = include_str!("../../retrieval/tests/fixtures/PMC13302085.nxml");
+
+    /// JATS declares the title and abstract as TAGS, so neither word appears
+    /// in the prose — the text scan alone finds nothing on this path, and this
+    /// is the path six of the seven papers in the 2026-08-28 run took, every
+    /// one of them storing an empty title.
+    ///
+    /// Driven through the real parser on the real JATS fixture rather than a
+    /// `Fulltext` assembled here: a struct built by the test proves only that
+    /// the test can build a struct.
+    #[test]
+    fn title_and_abstract_come_from_the_labelled_blocks_on_the_jats_path() {
+        let fulltext = prism_retrieval::fulltext::parse_jats(REAL_JATS.as_bytes()).unwrap();
+
+        let title = title_from_document(&fulltext).expect("JATS declares <article-title>");
+        assert!(!title.trim().is_empty());
+        assert!(
+            !title.contains('<'),
+            "the block text is parsed, not raw markup: {title:?}"
+        );
+
+        let abstract_text =
+            labelled_block(&fulltext, BlockKind::Abstract).expect("JATS declares <abstract>");
+        assert!(!abstract_text.trim().is_empty());
+        assert_ne!(abstract_text, title, "these are different blocks");
+
+        // The text scan is the PDF fallback and cannot serve this path: the
+        // word "Abstract" is a tag here, never prose.
+        assert!(
+            !fulltext.plain_text.to_lowercase().starts_with("abstract"),
+            "if the heading were in the prose this fix would be unnecessary"
+        );
+    }
+
+    /// A block that swallowed the body is not a title. Refused, not truncated:
+    /// a truncated title is a different, wrong title, and a wrong title is
+    /// worse than an honest absence.
+    #[test]
+    fn an_implausibly_long_title_block_is_refused_not_truncated() {
+        let long = "word ".repeat(200);
+        let jats = format!(
+            "<article><front><article-meta><title-group><article-title>{long}\
+             </article-title></title-group></article-meta></front></article>"
+        );
+        let fulltext = prism_retrieval::fulltext::parse_jats(jats.as_bytes()).unwrap();
+        assert!(
+            labelled_block(&fulltext, BlockKind::Title).is_some(),
+            "the block is there"
+        );
+        assert_eq!(
+            title_from_document(&fulltext),
+            None,
+            "but it is not a title, and half of it is not one either"
+        );
+    }
 
     /// End to end from real JATS to the reader's workspace: the exact text
     /// `search_paper`/`read_paper` serve must contain the table BY NAME and
