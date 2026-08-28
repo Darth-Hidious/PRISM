@@ -3923,7 +3923,11 @@ pub(crate) async fn run_turn_inner(
                              direction: ask a different sub-question, go after a source class \
                              you have not touched (patents, non-English, standards, a cited \
                              reference inside a paper you already have), or stop searching and \
-                             READ or COMPUTE something you have only listed so far."
+                             READ or COMPUTE something you have only listed so far. If the \
+                             question has separable parts — different applications, materials \
+                             or sub-questions — orchestrate_agents runs them as a DAG, each a \
+                             full nested turn, instead of you working through them one after \
+                             another in this one."
                         } else if researched {
                             "You have just analysed what you gathered. That analysis is not the \
                              end of the cycle — it is what tells you where to look next. Name \
@@ -4935,6 +4939,39 @@ mod tests {
             CycleStep::Stop,
             "a model that has stopped gathering will not start because it was \
              told to keep going; that is how a loop burns money writing essays"
+        );
+    }
+
+    /// A circling model is told that decomposition exists.
+    ///
+    /// Measured: `orchestrate_agents` was called ZERO times across 467 tool
+    /// calls on the PFAS runs, while the brief named five separable
+    /// application areas — a textbook decomposition, worked through
+    /// sequentially instead. The tool was offered the whole time (meta-tools
+    /// bypass the slot competition), its description already says DECOMPOSE,
+    /// and its schema already takes `depends_on`. Nothing was missing except
+    /// the model choosing it.
+    ///
+    /// So the reminder goes exactly where sequential searching has already
+    /// stopped paying, and nowhere else — a blanket instruction to fan out
+    /// would spend money on every question, including the ones one agent
+    /// answers fine.
+    #[test]
+    fn a_circling_model_is_reminded_that_the_question_can_be_split() {
+        // The diversify text is what a circling round hands back; it must
+        // name the DAG tool by the name the model can actually call.
+        let source = include_str!("agent_loop.rs");
+        let demand_start = source
+            .find("Your last rounds called tools but reached nothing")
+            .expect("the diversify demand exists");
+        let demand = &source[demand_start..demand_start + 1400];
+        assert!(
+            demand.contains("orchestrate_agents"),
+            "the circling handback must name the tool that splits the question"
+        );
+        assert!(
+            demand.contains("separable parts"),
+            "and say WHEN it applies, so it is a direction and not an advert"
         );
     }
 
