@@ -239,6 +239,22 @@ async fn the_pass_through_path_is_byte_identical_with_and_without_the_reprompter
     };
     let project = tempfile::tempdir().expect("tempdir");
     write_stub_project(project.path());
+
+    // Own the HOME this test runs under. `build_agent_seed` connects the MCP
+    // servers listed in `~/.prism/mcp.json`, and their tools go into the same
+    // catalog whose ranking decides which tools fit the request budget. Read
+    // from the DEVELOPER's home, that made the assertion depend on whether
+    // whoever ran it happened to have an MCP server configured: adding one
+    // turned this red, and the failure — a tool missing from one side's list —
+    // said nothing about the cause. Measured: passes with no `mcp.json`, fails
+    // with one, same commit.
+    //
+    // SAFETY: this file contains exactly one test, and it already owns the
+    // process env for `PRISM_REPROMPT` for the same reason.
+    let home = tempfile::tempdir().expect("home tempdir");
+    unsafe {
+        std::env::set_var("HOME", home.path());
+    }
     let chars = |reqs: &[serde_json::Value]| -> usize {
         reqs.iter().map(|r| r["messages"].to_string().len()).sum()
     };
