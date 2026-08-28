@@ -485,9 +485,11 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                 .clone()
                 .or_else(|| paper.external_ids.get("pmc").cloned())
                 .unwrap_or_else(|| paper.source_id.clone());
-            let document_url = paper.url.clone();
             let source = paper.source.clone();
 
+            // One per chunk and per agreement sample; `best_write_up` picks
+            // the one that stands for the paper.
+            let mut write_ups: Vec<prism_ingest::paper_agent::PaperWriteUp> = Vec::new();
             let mut claims = Vec::new();
             // Retained in the response schema for compatibility. Agentic
             // population records failed checks on each claim instead of
@@ -559,6 +561,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     .map(|turn| turn.tool_calls.len())
                     .sum::<usize>();
                 agent_traces.extend(extraction.agent_traces);
+                write_ups.extend(extraction.write_ups);
                 proposed_classes.extend(extraction.proposed_classes);
                 proposed_relations.extend(extraction.proposed_relations);
                 if extraction.facts.len() != extraction.citations.len()
@@ -603,7 +606,7 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         let mut claim = claim_from_fact(
                             fact,
                             &document_id,
-                            &document_url,
+                            &paper.url,
                             &source,
                             locator,
                             source_text_path.as_deref(),
@@ -626,7 +629,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     let db_path = prism_provenance::store_path();
                     store_claims(
                         &claims,
-                        &fulltext.source_url,
+                        ReadPaper {
+                            url: &fulltext.source_url,
+                            title: &title,
+                            abstract_text: paper.abstract_text.as_deref().unwrap_or_default(),
+                            write_up: prism_ingest::text_extract::best_write_up(&write_ups),
+                        },
                         &extractor_model,
                         &db_path,
                         &ontologies,
@@ -770,9 +778,28 @@ fn semantic_entities_for_claims<'a>(
     entities
 }
 
+/// One paper as it was actually read: its identity, what it says about
+/// itself, and the reader's write-up.
+///
+/// Grouped because these four travel together and mean nothing apart — a
+/// write-up with no url cannot be filed, and a url with no reading is the
+/// state that made a run's sources unaccountable.
+#[derive(Clone, Copy)]
+struct ReadPaper<'a> {
+    /// DOI, arXiv id or URL — the paper's own identity, and the key its node
+    /// is stored under.
+    url: &'a str,
+    title: &'a str,
+    /// Kept verbatim. Fetched on every search and discarded before the note
+    /// existed.
+    abstract_text: &'a str,
+    /// `None` when the reader produced none, which is reported as absence.
+    write_up: Option<&'a prism_ingest::paper_agent::PaperWriteUp>,
+}
+
 async fn store_claims(
     claims: &[prism_retrieval::claims::ExtractedClaim],
-    document_url: &str,
+    paper: ReadPaper<'_>,
     model: &str,
     db_path: &std::path::Path,
     ontologies: &prism_ingest::ontologies::OntologySet,
@@ -801,6 +828,43 @@ async fn store_claims(
 
     let store = ProvenanceStore::open(db_path).await?;
     let now = chrono::Utc::now().to_rfc3339();
+
+    // The paper's own node: what it WAS, beside the facts taken from it.
+    // Written here because this is the layer that has the whole paper — its
+    // url, title and abstract — and the store; the chunk reader has neither,
+    // which is why the write-up is collected there and persisted here.
+    //
+    // The abstract is kept verbatim. It was fetched on every search and
+    // discarded, so after a run nothing could say what any source argued.
+    if let Some(write_up) = paper.write_up {
+        store
+            .record_paper_note(&prism_provenance::PaperNote {
+                source_id: paper.url.to_string(),
+                tenant: prism_provenance::LOCAL_TENANT.to_string(),
+                title: paper.title.to_string(),
+                abstract_text: paper.abstract_text.to_string(),
+                review: write_up.key_findings.clone(),
+                question: write_up.question.clone(),
+                method: write_up.method.clone(),
+                key_findings: write_up.key_findings.clone(),
+                limitations: write_up.limitations.clone(),
+                // Empty until the caller that HAS a task passes one down: the
+                // CLI reads a url, not a research question. Recorded as absent
+                // rather than filled with the paper's own question, which
+                // would quietly answer "useful for what?" with the wrong
+                // thing.
+                task: String::new(),
+                relevance: write_up.relevance.clone(),
+                depth: write_up.depth.clone(),
+                depth_reason: write_up.depth_reason.clone(),
+                next_steps: write_up.next_steps.clone(),
+                // Set by the caller that knows which paper sent it here.
+                led_from: None,
+                origin_action_id: prism_provenance::action_id_from_env(),
+                created_at: now.clone(),
+            })
+            .await?;
+    }
     let base_prov = LocalProvenance {
         activity_id: uuid::Uuid::new_v4().to_string(),
         agent_id: if model.is_empty() {
@@ -809,7 +873,7 @@ async fn store_claims(
             model.to_string()
         },
         agent_kind: "SoftwareAgent".into(),
-        source_entity_id: document_url.to_string(),
+        source_entity_id: paper.url.to_string(),
         source_kind: "Document".into(),
         // Same composed tenancy as every other ingest path — a promoted
         // ontology's claims must not blend into EMMO's keyspace.
@@ -955,7 +1019,7 @@ async fn store_claims(
         claim_prov.activity_id = uuid::Uuid::new_v4().to_string();
         if let Some(source_text_path) = claim.provenance.source_text_path.as_deref() {
             claim_prov.source_entity_id = source_text_path.to_string();
-            claim_prov.origin_source_id = Some(document_url.to_string());
+            claim_prov.origin_source_id = Some(paper.url.to_string());
         }
         prepared.push((claim, fact, citation, claim_prov));
     }
@@ -1104,7 +1168,7 @@ async fn store_claims(
             ontologies,
             backend.as_deref(),
             &base_prov.tenant,
-            document_url,
+            paper.url,
             &property_terms,
             prism_ingest::property_resolution::DEFAULT_SEMANTIC_BIND_THRESHOLD,
         )
@@ -1136,7 +1200,7 @@ async fn store_claims(
         for proposal in proposed_classes {
             queued.push(class_proposal_queue_item(
                 proposal,
-                document_url,
+                paper.url,
                 &base_prov.tenant,
                 now_secs,
             ));
@@ -1144,7 +1208,7 @@ async fn store_claims(
         for proposal in proposed_relations {
             queued.push(relation_proposal_queue_item(
                 proposal,
-                document_url,
+                paper.url,
                 &base_prov.tenant,
                 now_secs,
             ));
@@ -1765,7 +1829,12 @@ mod store_tests {
 
         let out = store_claims(
             &[cited],
-            "https://example.org/paper",
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "test-model",
             &db,
             &ontologies,
@@ -1875,7 +1944,12 @@ mod store_tests {
 
         let out = store_claims(
             &[cited, unmeasured, free_text],
-            "https://example.org/paper",
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "test-model",
             &db,
             &ontologies,
@@ -1991,7 +2065,12 @@ mod store_tests {
 
         let out = store_claims(
             &[claim("UTS", Some("QUDT:MegaPA"), None)],
-            "https://example.org/legacy-paper",
+            ReadPaper {
+                url: "https://example.org/legacy-paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "test-model",
             &db,
             &ontologies,
@@ -2031,7 +2110,12 @@ mod store_tests {
                 Some(selected_unit),
                 Some(selected_condition_unit),
             )],
-            "https://example.org/paper",
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "test-model",
             &db,
             &ontologies,
@@ -2091,7 +2175,12 @@ mod store_tests {
                 claim("blank unit", Some("   "), None),
                 missing_condition,
             ],
-            "https://example.org/paper",
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "test-model",
             &db,
             &ontologies,
@@ -2161,7 +2250,12 @@ mod store_tests {
 
         let out = store_claims(
             &[c],
-            "https://example.org/paper",
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "m",
             &db,
             &ontologies,
@@ -2191,7 +2285,12 @@ mod store_tests {
         let ontologies = prism_ingest::ontologies::loaded(None).expect("default ontology");
         let out = store_claims(
             &[],
-            "https://example.org/paper",
+            ReadPaper {
+                url: "https://example.org/paper",
+                title: "A title",
+                abstract_text: "An abstract kept verbatim.",
+                write_up: None,
+            },
             "m",
             &db,
             &ontologies,

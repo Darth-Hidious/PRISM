@@ -8106,6 +8106,7 @@ async fn run_local_text_ingest_file(
             }
         };
         let prism_ingest::text_extract::TextExtraction {
+            write_ups: _,
             facts,
             citations,
             ontology_bindings,

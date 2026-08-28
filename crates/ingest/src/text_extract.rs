@@ -262,6 +262,38 @@ pub struct RejectedFact {
     pub detail: String,
 }
 
+/// Choose the one write-up that stands for a paper.
+///
+/// The agent runs per chunk and several times per chunk for agreement, so a
+/// paper arrives with several readings, each from a reader that saw a slice.
+/// Exactly one belongs on the paper's node.
+///
+/// A `fulltext` reading beats an `abstract` one, always: it cost more and saw
+/// more, and letting a triage note displace it would throw away the expensive
+/// half. Among equals, the one that says the most — a reader who filled in
+/// method, findings and limitations understood more of the paper than one who
+/// filled in none, and length here is a proxy for having looked rather than
+/// for verbosity, because every field is a distinct question.
+///
+/// `None` when nobody wrote anything, which is a fact about the run and is
+/// reported as absence rather than replaced by an invented summary.
+#[must_use]
+pub fn best_write_up(
+    write_ups: &[crate::paper_agent::PaperWriteUp],
+) -> Option<&crate::paper_agent::PaperWriteUp> {
+    write_ups.iter().max_by_key(|write_up| {
+        let read_fully = usize::from(write_up.depth == "fulltext");
+        let substance = write_up.question.len()
+            + write_up.method.len()
+            + write_up.key_findings.len()
+            + write_up.limitations.len()
+            + write_up.relevance.len()
+            + write_up.next_steps.len();
+        // Depth dominates: no amount of prose about an abstract outranks
+        // somebody who actually read the paper.
+        (read_fully, substance)
+    })
+}
 /// What one extraction call produced.
 #[derive(Debug, Clone)]
 pub struct TextExtraction {
@@ -280,6 +312,13 @@ pub struct TextExtraction {
     /// as [`Self::facts`]. These are carried separately from the source
     /// witness so population and later source re-verification remain distinct.
     pub ontology_bindings: Vec<FactOntologyBinding>,
+    /// Every write-up the readers produced, in the order they arrived.
+    ///
+    /// A VECTOR because this agent runs per chunk and several times per chunk
+    /// for agreement, so one paper yields several — each from a reader that
+    /// saw a slice. Choosing between them is [`best_write_up`], and it is the
+    /// caller's job because only the caller knows it is looking at one paper.
+    pub write_ups: Vec<crate::paper_agent::PaperWriteUp>,
     /// Legacy compatibility field. Agent tool arguments are validated per
     /// call and their failures live in [`Self::agent_traces`], so the agentic
     /// path does not have a document-wide response parse failure.
@@ -836,6 +875,7 @@ pub async fn extract_facts_from_chunk_sampled(
     let mut usage: Option<prism_llm::UsageInfo> = None;
     let mut per_sample: Vec<Vec<CitedFact>> = Vec::with_capacity(sampling.samples.get());
     let mut rejections = Vec::new();
+    let mut write_ups: Vec<crate::paper_agent::PaperWriteUp> = Vec::new();
     let mut agent_traces = Vec::with_capacity(sampling.samples.get());
     let mut proposed_classes = Vec::new();
     let mut proposed_relations = Vec::new();
@@ -854,6 +894,9 @@ pub async fn extract_facts_from_chunk_sampled(
         .await?;
         usage = merge_usage(usage, Some(output.usage));
         agent_traces.push(output.trace);
+        if let Some(write_up) = output.write_up {
+            write_ups.push(write_up);
+        }
         proposed_classes.extend(output.proposed_classes);
         proposed_relations.extend(output.proposed_relations);
 
@@ -949,6 +992,7 @@ pub async fn extract_facts_from_chunk_sampled(
         .map(|rejection| rejection.detail.clone())
         .collect();
     Ok(TextExtraction {
+        write_ups,
         facts,
         citations,
         ontology_bindings,
@@ -2987,6 +3031,56 @@ mod tests {
     /// CONTRACT CHANGE (agentic paper reading): tool arguments fail per call
     /// and live in the trace. There is no document-wide JSON envelope parse
     /// and therefore no legacy parse error for a valid tool proposal.
+    fn a_reading(depth: &str, findings: &str) -> crate::paper_agent::PaperWriteUp {
+        crate::paper_agent::PaperWriteUp {
+            question: String::new(),
+            method: String::new(),
+            key_findings: findings.to_string(),
+            limitations: String::new(),
+            relevance: "bears on the task".into(),
+            depth: depth.to_string(),
+            depth_reason: String::new(),
+            next_steps: String::new(),
+        }
+    }
+
+    /// A paper arrives with several readings — one per chunk, several per
+    /// chunk for agreement — and exactly one belongs on its node. A reading
+    /// of the FULL text always wins: it cost more and saw more, and letting a
+    /// triage note displace it throws away the expensive half.
+    #[test]
+    fn a_triage_note_never_displaces_a_full_reading() {
+        let readings = vec![
+            a_reading("fulltext", "Table 3: 315 C onset"),
+            a_reading("abstract", &"skimmed; ".repeat(40)),
+        ];
+        let best = best_write_up(&readings).expect("a reading was chosen");
+        assert_eq!(best.depth, "fulltext");
+        assert_eq!(best.key_findings, "Table 3: 315 C onset");
+    }
+
+    /// Among equal depth, the fuller reading stands for the paper: every
+    /// field is a distinct question, so filling them in is evidence of
+    /// having looked.
+    #[test]
+    fn among_equal_readings_the_fuller_one_stands_for_the_paper() {
+        let readings = vec![
+            a_reading("abstract", ""),
+            a_reading("abstract", "onset near 315 C, single supplier"),
+        ];
+        assert_eq!(
+            best_write_up(&readings).expect("chosen").key_findings,
+            "onset near 315 C, single supplier"
+        );
+    }
+
+    /// Nobody wrote anything is a fact about the run, reported as absence
+    /// rather than replaced by an invented summary.
+    #[test]
+    fn no_reading_is_reported_as_none() {
+        assert!(best_write_up(&[]).is_none());
+    }
+
     #[tokio::test]
     async fn agentic_extraction_has_no_document_wide_parse_error() {
         // CONTRACT CHANGE: the extraction protocol is a sequence of typed
