@@ -94,12 +94,20 @@ pub struct RelevanceReport {
     pub threshold: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// True means `papers` were returned in their original, unfiltered order.
+    /// True means `papers` were returned in their original, unfiltered
+    /// order. When the selector stage drops papers afterwards, the engine
+    /// clears this flag so it stays a statement about the returned set, not
+    /// about this stage alone.
     pub returned_unfiltered: bool,
     #[serde(default)]
     pub off_topic_examples: Vec<OffTopicExample>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// What the optional LLM selector stage did after this embedding stage.
+    /// `None` means the selector was not configured for this engine; every
+    /// other state (unavailable, applied, failed) is a present report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<crate::selector::SelectorReport>,
 }
 
 impl Default for RelevanceReport {
@@ -122,6 +130,7 @@ impl RelevanceReport {
             message: Some(
                 "relevance filtering was disabled; papers were returned unfiltered".to_string(),
             ),
+            selector: None,
         }
     }
 
@@ -138,6 +147,7 @@ impl RelevanceReport {
             message: Some(
                 "no embedding backend was available; papers were returned unfiltered".to_string(),
             ),
+            selector: None,
         }
     }
 
@@ -159,6 +169,7 @@ impl RelevanceReport {
             message: Some(format!(
                 "relevance filtering failed ({reason}); papers were returned unfiltered"
             )),
+            selector: None,
         }
     }
 
@@ -179,6 +190,7 @@ impl RelevanceReport {
             returned_unfiltered: false,
             off_topic_examples,
             message: None,
+            selector: None,
         }
     }
 }

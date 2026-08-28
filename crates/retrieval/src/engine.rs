@@ -13,6 +13,7 @@ use crate::cache::DiskCache;
 use crate::model::{Paper, SearchOutcome, SourceStatus};
 use crate::ratelimit::RateLimiter;
 use crate::relevance::{RelevancePolicy, RelevanceReport, filter_papers};
+use crate::selector::{Selector, SelectorPolicy, SelectorReport, select_papers};
 use crate::sources::source::FailureKind;
 use crate::sources::{self, FetchCtx, Source, SourceRegistry, all_sources};
 
@@ -44,6 +45,13 @@ pub struct EngineConfig {
     /// semantic relevance after deduplication.
     #[serde(default)]
     pub relevance: Option<RelevancePolicy>,
+    /// `None` leaves the result set as the embedding stage returned it.
+    /// `Some` runs the batched LLM selector after the embedding filter —
+    /// precision after recall. The judge itself is supplied with
+    /// [`RetrievalEngine::with_selector`]; a policy without a judge is
+    /// reported honestly as unavailable and drops nothing.
+    #[serde(default)]
+    pub selector: Option<SelectorPolicy>,
 }
 
 impl Default for EngineConfig {
@@ -61,6 +69,7 @@ impl Default for EngineConfig {
             max_attempts: 3,
             base_overrides: HashMap::new(),
             relevance: None,
+            selector: None,
         }
     }
 }
@@ -87,6 +96,10 @@ pub struct RetrievalEngine {
     /// first use. The cell also caches honest unavailability and init failure.
     relevance_backend:
         tokio::sync::OnceCell<Result<Option<Arc<dyn prism_embed::EmbedBackend>>, String>>,
+    /// The optional precision judge for the selector stage. `None` (the
+    /// default) models "no LLM configured": with a selector policy enabled
+    /// the stage keeps every paper and says so in its report.
+    selector: Option<Arc<dyn Selector>>,
 }
 
 impl RetrievalEngine {
@@ -134,6 +147,7 @@ impl RetrievalEngine {
             selected,
             missing,
             relevance_backend: tokio::sync::OnceCell::new(),
+            selector: None,
         }
     }
 
@@ -157,6 +171,23 @@ impl RetrievalEngine {
             self.relevance_backend.set(Ok(backend)).is_ok(),
             "relevance backend was already initialized"
         );
+        self
+    }
+
+    /// Enable the LLM selector stage for this engine with a caller-overridable
+    /// policy. The judge itself comes from [`RetrievalEngine::with_selector`];
+    /// enabling the policy without one is reported honestly as unavailable
+    /// and drops nothing.
+    pub fn with_selector_policy(mut self, policy: SelectorPolicy) -> Self {
+        self.cfg.selector = Some(policy);
+        self
+    }
+
+    /// Supply the precision judge, including explicit `None` to model a
+    /// deployment with no LLM configured. This is also the deterministic
+    /// seam for tests and callers with their own LLM lifecycle.
+    pub fn with_selector(mut self, selector: Option<Arc<dyn Selector>>) -> Self {
+        self.selector = selector;
         self
     }
 
@@ -237,7 +268,30 @@ impl RetrievalEngine {
             .clone()
     }
 
+    /// Both relevance stages in order: cheap embedding RECALL, then the
+    /// optional LLM selector for PRECISION. Each stage fails open on its own,
+    /// so a failed embedding pass hands the selector every paper and a failed
+    /// selector drops nothing. When the selector removed papers, the
+    /// embedding report's `returned_unfiltered` is cleared so the flag stays
+    /// a true statement about the returned set.
     async fn apply_relevance(&self, query: &str, papers: &mut Vec<Paper>) -> RelevanceReport {
+        let mut report = self.apply_embedding_relevance(query, papers).await;
+        report.selector = self.apply_selector(query, papers).await;
+        if report
+            .selector
+            .as_ref()
+            .is_some_and(|selector| selector.dropped > 0)
+        {
+            report.returned_unfiltered = false;
+        }
+        report
+    }
+
+    async fn apply_embedding_relevance(
+        &self,
+        query: &str,
+        papers: &mut Vec<Paper>,
+    ) -> RelevanceReport {
         let Some(policy) = &self.cfg.relevance else {
             return RelevanceReport::disabled(papers.len());
         };
@@ -254,6 +308,26 @@ impl RetrievalEngine {
         match filter_papers(query, papers, policy, backend.as_ref()).await {
             Ok(report) => report,
             Err(reason) => RelevanceReport::failed(papers.len(), policy, Some(backend_id), reason),
+        }
+    }
+
+    /// The precision stage. `None` means the stage was not configured; every
+    /// failure path keeps every paper and reports why.
+    async fn apply_selector(&self, query: &str, papers: &mut Vec<Paper>) -> Option<SelectorReport> {
+        let policy = self.cfg.selector.as_ref()?;
+        if let Err(reason) = policy.validate() {
+            return Some(SelectorReport::failed(papers.len(), None, reason));
+        }
+        let Some(selector) = &self.selector else {
+            return Some(SelectorReport::unavailable(papers.len()));
+        };
+        match select_papers(query, papers, policy, selector.as_ref()).await {
+            Ok(report) => Some(report),
+            Err(reason) => Some(SelectorReport::failed(
+                papers.len(),
+                Some(selector.id()),
+                reason,
+            )),
         }
     }
 

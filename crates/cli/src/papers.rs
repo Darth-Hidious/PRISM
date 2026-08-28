@@ -201,6 +201,46 @@ fn build_engine(sources: Vec<String>, mailto: &Option<String>, no_cache: bool) -
     RetrievalEngine::new(cfg)
 }
 
+/// The precision judge for the selector stage, when an LLM is configured.
+///
+/// `None` is the honest answer for a deployment with no LLM: the stage then
+/// reports itself unavailable and keeps every paper. It is never a silent
+/// pass-through — a search that COULD NOT be judged must not read like one
+/// that was judged and found everything relevant.
+fn literature_judge(
+    project_root: &std::path::Path,
+) -> Option<std::sync::Arc<dyn prism_retrieval::Selector>> {
+    let cfg = crate::build_llm_config(project_root, None, None, None).ok()?;
+    if cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() {
+        return None;
+    }
+    Some(std::sync::Arc::new(prism_retrieval::LlmSelector::new(
+        prism_llm::LlmClient::new(cfg),
+    )))
+}
+
+/// Both relevance stages, in order, for every path that returns papers to a
+/// caller — `search` and `corpus` alike, because a corpus written to disk
+/// carries its mistakes further than a search result does.
+///
+/// They answer different questions. The embedding filter scores SIMILARITY,
+/// which buys recall: measured 2026-08-28 it kept "Completely Symmetric
+/// Resistance Forms on the Stretched Sierpinski Gasket" for a query about
+/// sealing gaskets, because the words match though the subjects share
+/// nothing. No threshold separates those two — the genuinely relevant
+/// PFAS-free-seals paper scored no higher, and papers dropped at 0.5937 were
+/// no worse. The selector asks a QUESTION instead — would reading this help —
+/// which is the judgement a cosine cannot make at any threshold.
+fn with_relevance_stages(
+    engine: RetrievalEngine,
+    project_root: &std::path::Path,
+) -> RetrievalEngine {
+    engine
+        .with_relevance_policy(RelevancePolicy::default())
+        .with_selector_policy(prism_retrieval::SelectorPolicy::default())
+        .with_selector(literature_judge(project_root))
+}
+
 /// Paper descriptor for full-text/claims: identified by PMC id or a direct
 /// URL. No other identifiers are guessed.
 fn paper_for_fulltext(
@@ -267,8 +307,8 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             no_cache,
         } => {
             let source_ids = parse_sources(&sources)?;
-            let engine = build_engine(source_ids, &mailto, no_cache)
-                .with_relevance_policy(RelevancePolicy::default());
+            let engine =
+                with_relevance_stages(build_engine(source_ids, &mailto, no_cache), project_root);
             let outcome = engine.search(&query, limit).await;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
@@ -337,8 +377,8 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             no_cache,
         } => {
             let source_ids = parse_sources(&sources)?;
-            let engine = build_engine(source_ids, &mailto, no_cache)
-                .with_relevance_policy(RelevancePolicy::default());
+            let engine =
+                with_relevance_stages(build_engine(source_ids, &mailto, no_cache), project_root);
             let outcome = engine.search(&query, limit).await;
             std::fs::create_dir_all(&out)
                 .with_context(|| format!("cannot create corpus directory {out:?}"))?;
@@ -620,9 +660,29 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                             &citation,
                             ontology_binding,
                         );
+                        // Measured 2026-08-28: all 218 facts of a live run
+                        // stored `indeterminate` — which `EvidenceClass`
+                        // itself defines as "model assertion with NO
+                        // grounding". Every one had a source revision hash,
+                        // an exact line range and a citation span. By the
+                        // enum's own definition that is `research`,
+                        // "extracted from literature".
+                        //
+                        // The cause was a ceiling with no floor.
+                        // `cap_at_literature` can only LOWER a class, the
+                        // model is never asked for one (paper_agent asserts
+                        // it does not supply it), so the serde default —
+                        // `Indeterminate` — survived every time.
+                        //
+                        // A claim reaching this line came from a cited read
+                        // of a fetched document. That provenance is the
+                        // pipeline's own, and it is stronger evidence than
+                        // any class a model could self-report, so it is not
+                        // capped DOWN from here either: literature evidence
+                        // is exactly research, never verified higher by the
+                        // act of reading, never lower than what was cited.
                         claim.evidence_class =
-                            prism_retrieval::claims::cap_at_literature(&claim.evidence_class)
-                                .to_string();
+                            prism_retrieval::claims::EVIDENCE_RESEARCH.to_string();
                         claims.push(claim);
                     }
                 }
@@ -1627,6 +1687,65 @@ mod tests {
     /// its five tables lives in `<floats-group>`/`<app-group>`, the shape
     /// that used to reach the reader with NO tables at all.
     const REAL_JATS: &str = include_str!("../../retrieval/tests/fixtures/PMC13302085.nxml");
+
+    /// The selector must be REACHED by the path that serves papers, not
+    /// merely exist.
+    ///
+    /// Built-and-unwired is this codebase's most common defect and it was this
+    /// feature's first state: `selector.rs` was complete and tested while
+    /// `papers search` — the path `prior_art_search` actually invokes — never
+    /// constructed it, so every search would have run the embedding filter
+    /// alone and reported nothing about a judge at all.
+    ///
+    /// Driven through the production constructor over an engine with no
+    /// sources, so there is no network and nothing the test built itself
+    /// stands in for the thing under test. Which status comes back depends on
+    /// whether THIS machine has an LLM configured — `build_llm_config` reads
+    /// the global `~/.prism` config, not only the project — so the assertion
+    /// is on what must hold either way: the stage ran and reported.
+    #[tokio::test]
+    async fn the_search_path_reaches_the_selector_stage() {
+        let engine = with_relevance_stages(
+            build_engine(Vec::new(), &None, true),
+            std::path::Path::new("/nonexistent-project-root"),
+        );
+
+        let outcome = engine.search("pfas free elastomer seals", 1).await;
+
+        let selector =
+            outcome.relevance.selector.as_ref().expect(
+                "the search path must reach the selector stage; None means it was never wired",
+            );
+        assert_eq!(
+            selector.dropped, 0,
+            "nothing was retrieved, so nothing can be dropped"
+        );
+    }
+
+    /// With no judge the stage is honestly UNAVAILABLE and keeps everything.
+    /// A search that could not be judged must never read like one that was
+    /// judged and found everything relevant — that is the difference between
+    /// an empty result and an unasked question.
+    #[tokio::test]
+    async fn a_search_without_a_judge_says_so_rather_than_passing_silently() {
+        let engine = build_engine(Vec::new(), &None, true)
+            .with_relevance_policy(RelevancePolicy::default())
+            .with_selector_policy(prism_retrieval::SelectorPolicy::default())
+            .with_selector(None);
+
+        let outcome = engine.search("pfas free elastomer seals", 1).await;
+
+        let selector = outcome
+            .relevance
+            .selector
+            .as_ref()
+            .expect("an unavailable judge still reports");
+        assert_eq!(
+            selector.status,
+            prism_retrieval::SelectorStatus::Unavailable
+        );
+        assert_eq!(selector.dropped, 0, "an unavailable judge drops nothing");
+    }
 
     /// JATS declares the title and abstract as TAGS, so neither word appears
     /// in the prose — the text scan alone finds nothing on this path, and this

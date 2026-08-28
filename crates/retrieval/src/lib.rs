@@ -24,6 +24,7 @@ pub mod model;
 pub mod ratelimit;
 pub mod relevance;
 pub mod reverify;
+pub mod selector;
 pub mod sources;
 pub mod sweep;
 
@@ -37,6 +38,10 @@ pub use reverify::{
     RereadTarget, SourceUnavailableReason, affirm_reread_context, load_reread_targets,
     reread_from_text, reread_local_source, reverify_and_record, reverify_local_assertion,
     text_revision_id,
+};
+pub use selector::{
+    LlmSelector, Selector, SelectorCandidate, SelectorDroppedExample, SelectorPolicy,
+    SelectorReport, SelectorStatus, SelectorVerdict,
 };
 pub use sources::{
     FailureKind, FetchCtx, Source, SourceCaps, SourceError, SourceId, SourceRegistry, all_sources,
