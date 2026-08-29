@@ -5833,7 +5833,26 @@ fn humanize_tool_verb(tool_name: &str, preview: Option<&str>) -> String {
 /// frontend expects.  Event names and schemas MUST match
 /// `frontend/src/bridge/types.ts` → `UI_EVENT_MAP`.
 fn emit_agent_event(event: AgentEvent) {
+    // Peel the attribution off first so every arm below matches exactly as it
+    // did before. The INNERMOST name wins: a grandchild's activity is forwarded
+    // untouched by its parent, so the agent named on the wire is the one that
+    // actually did the work.
+    let mut agent = None;
+    let mut event = event;
+    loop {
+        let (tag, inner) = event.split_agent();
+        event = inner;
+        match tag {
+            Some(name) => agent = Some(name),
+            None => break,
+        }
+    }
+    let agent = agent;
     match event {
+        // Unreachable: the loop above peels every layer. An empty arm rather
+        // than `unreachable!()` because panicking in the UI emitter would take
+        // a session down over a rendering detail.
+        AgentEvent::AgentActivity { .. } => {}
         AgentEvent::TextDelta { text } => {
             emit_notification("ui.text.delta", serde_json::json!({ "text": text }));
         }
@@ -5859,15 +5878,19 @@ fn emit_agent_event(event: AgentEvent) {
         } => {
             // Flush any buffered text before a tool starts
             emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
-            emit_notification(
-                "ui.tool.start",
-                serde_json::json!({
-                    "tool_name": tool_name,
-                    "call_id": call_id,
-                    "verb": humanize_tool_verb(&tool_name, preview.as_deref()),
-                    "preview": preview,
-                }),
-            );
+            let mut start = serde_json::json!({
+                "tool_name": tool_name,
+                "call_id": call_id,
+                "verb": humanize_tool_verb(&tool_name, preview.as_deref()),
+                "preview": preview,
+            });
+            // WHICH agent is doing this. Absent for the parent's own work, so
+            // a single-agent session is byte-identical to before and an
+            // interface can treat presence as "this belongs to a lane".
+            if let Some(agent) = &agent {
+                start["agent"] = serde_json::json!(agent);
+            }
+            emit_notification("ui.tool.start", start);
         }
         AgentEvent::ToolCallResult {
             call_id,
@@ -5889,7 +5912,7 @@ fn emit_agent_event(event: AgentEvent) {
             // because the receiver rightly trusts a declared class over its
             // own silence handling. Missing fields do not render as success:
             // the TUI draws `[unclassified]` for them and RED for failures.
-            let payload = build_ui_card_payload(
+            let mut payload = build_ui_card_payload(
                 &call_id,
                 &tool_name,
                 &content,
@@ -5898,6 +5921,11 @@ fn emit_agent_event(event: AgentEvent) {
                 elapsed_ms,
                 is_error,
             );
+            // Same rule as the start notification: named only when a
+            // delegated agent did the work.
+            if let Some(agent) = &agent {
+                payload["agent"] = serde_json::json!(agent);
+            }
             emit_notification("ui.card", payload);
             for object in object_updates_from_result(&tool_name, &content, is_error) {
                 emit_notification("ui.object.update", object);

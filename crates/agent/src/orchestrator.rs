@@ -1412,6 +1412,12 @@ impl ItemAgent for OrchestratedAgent {
             let nested_result;
             {
                 let events = ctx.events.clone();
+                // WHICH agent this activity belongs to. Without it every
+                // parallel item pushes onto one sink and the streams interleave
+                // with no way to tell them apart — the identity has to be on
+                // the wire, because the parent pumps these events from its own
+                // task and cannot infer the sender.
+                let agent = self.spec.id.clone();
                 // Item event routing: text is CAPTURED (it becomes the item
                 // result); tool activity is FORWARDED so the parent's sink
                 // sees what every item is doing; approval requests are
@@ -1442,8 +1448,21 @@ impl ItemAgent for OrchestratedAgent {
                             }
                         }
                         AgentEvent::ContextPriming { .. } | AgentEvent::ToolCallStart { .. } => {}
+                        // Already tagged by a deeper agent: forwarded untouched.
+                        // Re-tagging here would claim a grandchild's work for its
+                        // parent.
+                        AgentEvent::AgentActivity { .. } => {}
                     }
-                    let _ = events.send(event);
+                    let _ = events.send(match event {
+                        // Already tagged deeper down: forwarded untouched, so
+                        // the name on the wire stays the agent that did the
+                        // work rather than the one relaying it.
+                        tagged @ AgentEvent::AgentActivity { .. } => tagged,
+                        own => AgentEvent::AgentActivity {
+                            agent: agent.clone(),
+                            event: Box::new(own),
+                        },
+                    });
                 };
 
                 let nested: Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> =

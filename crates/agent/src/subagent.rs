@@ -473,6 +473,10 @@ async fn execute_spawn_subagent_inner(
                 AgentEvent::ContextPriming { .. }
                 | AgentEvent::ToolCallStart { .. }
                 | AgentEvent::ToolApprovalRequest { .. } => {}
+                // Already tagged by a deeper agent: forwarded untouched.
+                // Re-tagging here would claim a grandchild's work for its
+                // parent.
+                AgentEvent::AgentActivity { .. } => {}
             }
             emit(event);
         };

@@ -270,13 +270,43 @@ async fn run_parent_turn(
     (answer, events)
 }
 
+/// The content of a tool result, whoever ran it.
+///
+/// Looks THROUGH `AgentActivity`: a delegated agent's activity is now tagged
+/// with which agent produced it, and a helper asking "what did tool X answer"
+/// should not care who ran it. `agent_of_tool_result` is the one that does.
 fn tool_result_content<'a>(events: &'a [AgentEvent], tool: &str) -> Option<&'a str> {
-    events.iter().find_map(|e| match e {
+    events.iter().find_map(|e| match untagged(e) {
         AgentEvent::ToolCallResult {
             tool_name, content, ..
         } if tool_name == tool => Some(content.as_str()),
         _ => None,
     })
+}
+
+/// Peel every attribution layer, returning the event underneath.
+fn untagged(event: &AgentEvent) -> &AgentEvent {
+    let mut current = event;
+    while let AgentEvent::AgentActivity { event, .. } = current {
+        current = event;
+    }
+    current
+}
+
+/// Which agents were seen running `tool`, in the order their results arrived.
+fn agents_running(events: &[AgentEvent], tool: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AgentActivity { agent, event } => match untagged(event) {
+                AgentEvent::ToolCallResult { tool_name, .. } if tool_name == tool => {
+                    Some(agent.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// The session's root run row (`role == "agent"`).
@@ -340,6 +370,28 @@ async fn orchestrate_agents_fans_out_and_records_descendants() {
 
     // Parent finished ON TOP of the fan-out's report.
     assert_eq!(answer, "PARENT_DONE");
+
+    // Every forwarded event NAMES the agent that produced it. Three items run
+    // the same tool concurrently onto one sink; without the tag their activity
+    // is a single interleaved stream and no interface can group a lane,
+    // because the identity was never on the wire.
+    let mut runners = agents_running(&events, "stub_echo");
+    runners.sort();
+    assert_eq!(
+        runners,
+        vec!["one".to_string(), "three".to_string(), "two".to_string()],
+        "each item's tool activity is attributed to that item"
+    );
+
+    // The PARENT's own work stays untagged, so a single-agent session looks
+    // exactly as it did before attribution existed.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallResult { tool_name, .. } if tool_name == "orchestrate_agents"
+        )),
+        "the parent's own tool result is not wrapped in an agent tag"
+    );
 
     // The per-item report reached the parent: every id, individually, with
     // its own outcome — never an aggregate "ok".

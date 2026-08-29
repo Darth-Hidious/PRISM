@@ -102,6 +102,20 @@ pub enum AgentEvent {
         iteration: usize,
         status: crate::influence::ContextPrimingStatus,
     },
+    /// An event produced by a DELEGATED agent, tagged with which one.
+    ///
+    /// Parallel agents all push onto one sink. Without this their tool
+    /// activity interleaves into a single undifferentiated stream, and no
+    /// interface can group a lane because the identity was never on the wire —
+    /// the same defect as facts that did not name the call that bought them.
+    ///
+    /// `agent` is the orchestrator's task id, which for an unnamed task is a
+    /// scientist's surname (see `agent_names`), so the tag is something a
+    /// person can read and not just correlate.
+    AgentActivity {
+        agent: String,
+        event: Box<AgentEvent>,
+    },
     ToolCallStart {
         tool_name: String,
         call_id: String,
@@ -139,6 +153,24 @@ pub enum AgentEvent {
         total_usage: Option<UsageInfo>,
         estimated_cost: Option<f64>,
     },
+}
+
+impl AgentEvent {
+    /// Peel one layer of agent attribution off an event.
+    ///
+    /// Returns `(Some(agent), inner)` for a delegated agent's event and
+    /// `(None, self)` for the parent's own, so a consumer can `match` exactly
+    /// as it did before and use the name only if it has somewhere to put it.
+    /// One layer only: an agent that delegates further arrives already tagged
+    /// by its own child, and re-tagging it here would claim the grandchild's
+    /// work for the parent.
+    #[must_use]
+    pub fn split_agent(self) -> (Option<String>, AgentEvent) {
+        match self {
+            AgentEvent::AgentActivity { agent, event } => (Some(agent), *event),
+            other => (None, other),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

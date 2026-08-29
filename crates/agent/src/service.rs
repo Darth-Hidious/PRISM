@@ -724,6 +724,10 @@ impl ChatService {
         let tools = crate::tool_catalog::live_or(&self.tools);
         let mut assistant = crate::session::AssistantRecorder::default();
         let mut emit = |event: AgentEvent| match event {
+            // This SSE surface carries no per-agent field yet, so a delegated
+            // agent's activity is not reported on it. Widening that wire is an
+            // API decision; inventing a field here would not be one.
+            AgentEvent::AgentActivity { .. } => {}
             AgentEvent::ThinkingDelta { text } => {
                 let _ = events.send(ChatEvent::Thinking { text });
             }
