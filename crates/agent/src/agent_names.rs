@@ -183,6 +183,19 @@ pub static SCIENTISTS: &[Scientist] = &[
     s("Lomonosov", Origin::Russian, Field::Chemistry),
 ];
 
+/// Who goes first, in order, before anything is hashed.
+///
+/// Sarabhai founded the Indian space programme and Bhabha its nuclear one;
+/// both built the institutions rather than only the results. The owner's call,
+/// and a defensible one: the first two lanes of any fan-out are the ones a
+/// watcher looks at first, so they get the names worth reading first.
+///
+/// This deliberately OUTRANKS field matching — a chemistry task can draw
+/// Bhabha, a physicist. The cost is one less apt name on the first two lanes;
+/// what is bought is a stable, recognisable opening to every run, which is
+/// worth more than a marginally better topical fit.
+pub static FOUNDERS: &[&str] = &["Sarabhai", "Bhabha"];
+
 /// The field a task is about, from words the task itself uses.
 ///
 /// Keyword matching, not classification: a wrong guess costs a less apt name
@@ -265,6 +278,11 @@ fn hash(text: &str) -> u64 {
 /// label is exactly the confusion the naming exists to prevent.
 #[must_use]
 pub fn name_for(task: &str, index: usize, taken: &HashSet<String>) -> String {
+    // The openers, in order, while any remain.
+    if let Some(founder) = FOUNDERS.iter().find(|name| !taken.contains(**name)) {
+        return (*founder).to_string();
+    }
+
     let field = field_of(task);
     let seed = hash(task);
 
@@ -308,6 +326,29 @@ pub fn name_for(task: &str, index: usize, taken: &HashSet<String>) -> String {
 mod tests {
     use super::*;
 
+    /// Sarabhai then Bhabha open every run, whatever the first tasks are
+    /// about — the owner's call, and the first two lanes are the ones anyone
+    /// looks at first.
+    #[test]
+    fn sarabhai_and_bhabha_are_the_first_two_agents() {
+        let mut taken: HashSet<String> = HashSet::new();
+        let first = name_for("compare alloy microstructure after sintering", 0, &taken);
+        assert_eq!(first, "Sarabhai");
+        taken.insert(first);
+
+        let second = name_for("optimise the fluorination catalyst", 1, &taken);
+        assert_eq!(second, "Bhabha", "even for a chemistry task");
+        taken.insert(second);
+
+        // Third onwards is the ordinary field-matched draw again.
+        let third = name_for("compare alloy microstructure after sintering", 2, &taken);
+        let picked = SCIENTISTS
+            .iter()
+            .find(|sc| sc.surname == third)
+            .expect("from the pool");
+        assert_eq!(picked.field, Field::Materials, "back to the field: {third}");
+    }
+
     #[test]
     fn the_same_task_always_draws_the_same_name() {
         let taken = HashSet::new();
@@ -331,10 +372,13 @@ mod tests {
         }
     }
 
-    /// A materials question is narrated by people who worked on materials.
+    /// A materials question is narrated by people who worked on materials —
+    /// once the openers are past. `taken` starts with the founders because
+    /// they outrank field matching by design (see `FOUNDERS`), so testing the
+    /// field rule means testing the draw that happens after them.
     #[test]
     fn a_task_is_named_from_its_own_field() {
-        let taken = HashSet::new();
+        let taken: HashSet<String> = FOUNDERS.iter().map(|name| (*name).to_string()).collect();
         for task in [
             "compare alloy microstructure after sintering",
             "which ceramic coating resists this elastomer solvent",

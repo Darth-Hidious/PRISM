@@ -1141,13 +1141,18 @@ fn parse_args(
         if task.is_empty() {
             anyhow::bail!("tasks[{index}] is missing a non-empty `task` instruction");
         }
+        // A caller-supplied id wins; otherwise the agent is named after a
+        // scientist whose field matches the task. `task-0` is unique and
+        // unreadable, and this id is the only handle anything downstream — a
+        // report, a log line, an interface grouping a lane — has for saying
+        // WHICH agent did something.
         let id = entry
             .get("id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(|id| clip(id, 64))
-            .unwrap_or_else(|| format!("task-{index}"));
+            .unwrap_or_else(|| crate::agent_names::name_for(task, index, &seen_ids));
         if !seen_ids.insert(id.clone()) {
             anyhow::bail!("duplicate task id \"{id}\" — per-item outcomes need unique ids");
         }
@@ -2449,6 +2454,45 @@ mod tests {
         assert_eq!(def.input_schema["required"], json!(["tasks"]));
     }
 
+    /// A real fan-out is named through the REAL parse path, not by calling
+    /// the name pool directly — the pool having good names proves nothing
+    /// about whether the orchestrator ever asks it for one.
+    #[test]
+    fn an_unnamed_fan_out_is_named_after_scientists_and_never_repeats() {
+        let (specs, _) = parse_args(
+            &json!({"tasks": [
+                {"task": "survey fluorine-free firefighting foam burnback performance"},
+                {"task": "compare PTFE-free non-stick ceramic sol-gel coating friction"},
+                {"task": "PFAS-free elastomer seal chemical resistance and service temperature"},
+                {"task": "review the polymer synthesis route for the replacement monomer"},
+                {"task": "fluorine-free durable water repellent textile finish"},
+            ]}),
+            "glm-5.3",
+        )
+        .expect("valid args");
+
+        let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
+        assert_eq!(
+            &ids[..2],
+            &["Sarabhai", "Bhabha"],
+            "the openers lead every fan-out: {ids:?}"
+        );
+        for id in &ids {
+            assert!(
+                crate::agent_names::SCIENTISTS
+                    .iter()
+                    .any(|sc| sc.surname == *id),
+                "every lane is named, none fell back to a number: {ids:?}"
+            );
+        }
+        let unique: std::collections::HashSet<&&str> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "no two lanes share a name: {ids:?}"
+        );
+    }
+
     #[test]
     fn parse_args_applies_defaults_and_limits() {
         let (specs, policy) = parse_args(&json!({
@@ -2456,7 +2500,13 @@ mod tests {
         }), "glm-5.3")
         .expect("valid args");
         assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].id, "task-0");
+        // CONTRACT CHANGE: an unnamed task is named after a scientist, not
+        // `task-0`. The id is the only handle a report or an interface has for
+        // saying WHICH agent did something, and `task-0` is unique without
+        // being readable. `Sarabhai` opens every fan-out by design — see
+        // `agent_names::FOUNDERS`.
+        assert_eq!(specs[0].id, "Sarabhai");
+        // A caller-supplied id still wins outright.
         assert_eq!(specs[1].id, "ni");
         // CONTRACT CHANGE: an unnamed model INHERITS the parent's route rather
         // than defaulting to the constant. The constant asked whatever endpoint
