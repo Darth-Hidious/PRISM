@@ -159,6 +159,9 @@ pub enum AgentMsg {
         call_id: Option<String>,
         preview: Option<String>,
         approval_required: Option<bool>,
+        /// Which DELEGATED agent started the call. `None` means the parent
+        /// did it itself — never invent a name for that case.
+        agent: Option<String>,
     },
     /// `ui.card` — a tool call finished and produced a result card.
     ///
@@ -173,6 +176,9 @@ pub enum AgentMsg {
         call_id: Option<String>,
         provenance_id: Option<String>,
         data: Option<Value>,
+        /// Which DELEGATED agent produced the result. `None` means the
+        /// parent did it itself — never invent a name for that case.
+        agent: Option<String>,
     },
 
     // ── Approval lifecycle ───────────────────────────────────────────
@@ -651,6 +657,10 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .and_then(|p| p.as_str())
                 .map(str::to_string),
             approval_required: params.get("approval_required").and_then(|a| a.as_bool()),
+            agent: params
+                .get("agent")
+                .and_then(|a| a.as_str())
+                .map(str::to_string),
         },
         "ui.card" => AgentMsg::ToolCard {
             tool_name: params
@@ -678,6 +688,10 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .and_then(|p| p.as_str())
                 .map(str::to_string),
             data: params.get("data").cloned(),
+            agent: params
+                .get("agent")
+                .and_then(|a| a.as_str())
+                .map(str::to_string),
         },
 
         // ── Approval ─────────────────────────────────────────────────

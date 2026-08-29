@@ -337,6 +337,7 @@ fn snapshot_tool_success_100x30() {
     });
     app.push_user("sample alloy");
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "sample_material".into(),
         verb: "Running".into(),
         call_id: Some("call-1".into()),
@@ -344,6 +345,7 @@ fn snapshot_tool_success_100x30() {
         approval_required: Some(false),
     });
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "sample_material".into(),
         call_id: Some("call-1".into()),
         content: "W0.3 Mo0.2 Ta0.3 Nb0.2".into(),
@@ -379,6 +381,7 @@ fn snapshot_tool_error_100x30() {
     });
     app.push_user("submit job");
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "compute_submit".into(),
         verb: "Running".into(),
         call_id: Some("call-2".into()),
@@ -386,6 +389,7 @@ fn snapshot_tool_error_100x30() {
         approval_required: Some(true),
     });
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "compute_submit".into(),
         call_id: Some("call-2".into()),
         content: "Error: budget exceeded ($50.00 limit)".into(),
@@ -795,6 +799,7 @@ fn snapshot_approval_after_y_100x30() {
     app.focus = prism_tui::app::Focus::Input;
     // Apply a tool success card as the backend response
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "compute_submit".into(),
         call_id: Some("call-3".into()),
         content: "Job submitted successfully (job_id: fake-123)".into(),
@@ -872,6 +877,7 @@ fn snapshot_approval_after_a_100x30() {
         raw: serde_json::json!({}),
     });
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "compute_submit".into(),
         call_id: Some("call-3".into()),
         content: "Job submitted (auto-approved for session)".into(),
@@ -1339,6 +1345,7 @@ fn snapshot_workspace_activity_detail_100x30() {
     let mut app = app_with_welcome();
     app.push_user("sample alloy");
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "sample_material".into(),
         content: "W0.3 Mo0.2 Ta0.3 Nb0.2".into(),
         card_type: "results".into(),
@@ -2058,6 +2065,7 @@ fn the_notebook_draws_its_newest_figure_and_names_what_it_cannot_draw() {
 fn a_table_from_a_tool_renders_as_a_table_not_as_pipes() {
     let mut app = app_with_welcome();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "compare_materials".into(),
         content: "comparison complete\n\n| alloy | density |\n|---|---|\n| Ti64 | 4.43 |\n| NbMoTaW | 13.7 |".into(),
         card_type: "results".into(),
@@ -2098,6 +2106,7 @@ fn a_table_from_a_tool_renders_as_a_table_not_as_pipes() {
 fn a_figure_from_any_tool_reaches_the_transcript() {
     let mut app = app_with_welcome();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "plot".into(),
         content: "wrote the parity plot".into(),
         card_type: "results".into(),
@@ -2481,6 +2490,7 @@ fn a_real_frame_records_what_it_drew() {
     app.apply_agent_msg(AgentMsg::TextDelta("about 1878 K\n".into()));
     app.apply_agent_msg(AgentMsg::TextFlush);
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "materials_search".into(),
         verb: "Running".into(),
         call_id: Some("call-1".into()),
@@ -2761,6 +2771,7 @@ fn drawn_at(rendered: &str, needle: &str) -> (u16, u16, u16) {
 fn the_tool_name_on_a_result_line_claims_exactly_its_own_cells() {
     let mut app = app_with_welcome();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "lookup_structure".into(),
         content: "found 1 match".into(),
         card_type: "result".into(),
@@ -2802,6 +2813,7 @@ fn a_reference_in_a_tool_result_body_claims_exactly_its_own_cells() {
         detail: None,
     });
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "structure".into(),
         content: "stored 1 structure\nMoNbTaW relaxed cleanly".into(),
         card_type: "result".into(),
@@ -2950,6 +2962,7 @@ fn a_reference_past_the_wrap_point_claims_the_cells_where_it_is_drawn() {
     // The head line = indent + glyph + badge + "structure: AAAA…" — far past
     // 44 columns, so "MoNbTaW" lands on a continuation row.
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "structure".into(),
         content: format!("{} MoNbTaW relaxed", "A".repeat(32)),
         card_type: "result".into(),
@@ -3006,11 +3019,13 @@ fn a_tool_that_only_ever_failed_is_still_reachable_by_its_name() {
             success: false,
             evidence_class: None,
             image_paths: Vec::new(),
+            agent: None,
         },
     });
     // Any later result runs the same registration pass a live session runs,
     // which scans ALL ToolResult lines — including the failure above.
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "lookup_structure".into(),
         content: "found 1 match".into(),
         card_type: "result".into(),
@@ -3057,6 +3072,7 @@ fn an_error_result_takes_no_reference_marks() {
         detail: None,
     });
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "structure".into(),
         content: "MoNbTaW import failed\nMoNbTaW was unreachable".into(),
         card_type: "error".into(),
@@ -3528,6 +3544,7 @@ fn a_file_a_tool_touched_opens_its_real_source() {
     // The shape a real file write produces: `extract_path` reads the path off
     // the first line of the tool result.
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "file".into(),
         content: format!("Wrote {path_str}"),
         card_type: "file".into(),
@@ -3570,4 +3587,252 @@ fn a_file_a_tool_touched_opens_its_real_source() {
         other => panic!("the file should have resolved from disk; got {other:?}"),
     }
     let _ = std::fs::remove_file(&path);
+}
+
+// ── Delegated-agent attribution ─────────────────────────────────────
+//
+// Parallel delegated agents all push onto one transcript. The wire names
+// which agent did what (`agent` on `ui.tool.start` / `ui.card`); these
+// tests pin the two promises that make it usable: absence renders exactly
+// as it always did, and concurrent lanes get state for all, detail for
+// one.
+
+/// The chat pane's share of a rendered row: everything left of the
+/// sidebar border (when the sidebar is up), right-trimmed. Lets tests
+/// read transcript and summary lines without the workspace column.
+fn chat_part(line: &str) -> &str {
+    let cut = line.rfind('│').map_or(line, |i| &line[..i]);
+    cut.trim_end()
+}
+
+/// The committed `tool_success` snapshot is the PRE-ATTRIBUTION render
+/// of a single-agent tool scene. A session where the wire never sends an
+/// `agent` must still produce those exact bytes — a single-agent session
+/// must look byte-identical to before.
+#[test]
+fn no_agent_on_the_wire_renders_exactly_as_before() {
+    let mut app = app_with_welcome();
+    app.push_user("sample alloy");
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "sample_material".into(),
+        verb: "Running".into(),
+        call_id: Some("call-1".into()),
+        preview: Some("{\"n\": 10}".into()),
+        approval_required: Some(false),
+        agent: None,
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "sample_material".into(),
+        call_id: Some("call-1".into()),
+        content: "W0.3 Mo0.2 Ta0.3 Nb0.2".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(292),
+        provenance_id: Some("prov_001".into()),
+        data: Some(serde_json::json!({"evidence_class": "screening"})),
+        agent: None,
+    });
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    app.tokens_per_sec = 0.0;
+    let rendered = render_app_to_string(&app, 100, 30);
+
+    // Body of the committed snapshot = the render before attribution
+    // existed. insta format: `---` header block, `---`, then the value.
+    let snap = include_str!("snapshots/render_snapshots__tool_success_100x30.snap");
+    let expected = snap
+        .splitn(3, "---\n")
+        .nth(2)
+        .expect("snapshot must have a body");
+    let expected = expected.strip_suffix('\n').unwrap_or(expected);
+    assert_eq!(
+        rendered, expected,
+        "an agent-less session changed its bytes"
+    );
+}
+
+/// Two delegated agents in one turn: the transcript lines name their
+/// lane, and a compact summary shows ONE row per agent with its most
+/// recent tool and status — state for all, detail for one.
+#[test]
+fn concurrent_agents_get_one_summary_row_each() {
+    let mut app = app_with_welcome();
+    app.push_user("screen HEAs");
+    // Sarabhai finishes a recall…
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "recall".into(),
+        verb: "Recalling earlier results".into(),
+        call_id: Some("c1".into()),
+        preview: None,
+        approval_required: Some(false),
+        agent: Some("Sarabhai".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "recall".into(),
+        content: "3 prior runs".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(120),
+        call_id: Some("c1".into()),
+        provenance_id: None,
+        data: None,
+        agent: Some("Sarabhai".into()),
+    });
+    // …while Bhabha is still browsing.
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "web_browse".into(),
+        verb: "Searching the web — HEA papers".into(),
+        call_id: Some("c2".into()),
+        preview: None,
+        approval_required: Some(false),
+        agent: Some("Bhabha".into()),
+    });
+
+    let rendered = render_app_to_string(&app, 100, 30);
+
+    // The transcript lines carry their lane's name.
+    assert!(
+        rendered.contains("Sarabhai ⚙ Recalling earlier results"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Sarabhai ✓"),
+        "the finished card names its lane: {rendered}"
+    );
+    assert!(
+        rendered.contains("Bhabha ⚙ Searching the web"),
+        "{rendered}"
+    );
+
+    // The summary block: exactly one row per agent, carrying the most
+    // recent tool and its status — not N transcripts.
+    let summary: Vec<&str> = rendered
+        .lines()
+        .map(chat_part)
+        .filter(|l| l.ends_with(" running") || l.ends_with(" done") || l.ends_with(" failed"))
+        .collect();
+    assert_eq!(summary.len(), 2, "one row per agent: {rendered}");
+    assert!(
+        rendered
+            .lines()
+            .map(chat_part)
+            .any(|l| l == "  Sarabhai ✓ recall done"),
+        "most recent tool + status for a finished lane: {rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .map(chat_part)
+            .any(|l| l == "  Bhabha   ⚙ web_browse running"),
+        "most recent tool + status for a live lane: {rendered}"
+    );
+}
+
+/// One delegated agent is not concurrency. Its transcript lines are
+/// still named, but no summary block spends screen space announcing a
+/// single-agent session.
+#[test]
+fn a_single_agent_gets_named_lines_but_no_summary_block() {
+    let mut app = app_with_welcome();
+    app.push_user("screen HEAs");
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "recall".into(),
+        verb: "Recalling earlier results".into(),
+        call_id: Some("c1".into()),
+        preview: None,
+        approval_required: Some(false),
+        agent: Some("Sarabhai".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "recall".into(),
+        content: "3 prior runs".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(120),
+        call_id: Some("c1".into()),
+        provenance_id: None,
+        data: None,
+        agent: Some("Sarabhai".into()),
+    });
+
+    let rendered = render_app_to_string(&app, 100, 30);
+
+    // The lane prefix appears on BOTH tool lines and nowhere else: no
+    // summary row repeats the name.
+    assert_eq!(
+        rendered.matches("Sarabhai").count(),
+        2,
+        "start line + result line only: {rendered}"
+    );
+    // No summary statuses anywhere on screen.
+    assert!(
+        !rendered
+            .lines()
+            .map(chat_part)
+            .any(|l| { l.ends_with(" running") || l.ends_with(" done") || l.ends_with(" failed") }),
+        "{rendered}"
+    );
+}
+
+/// A lane whose tool FAILED must not linger as "running": the failed
+/// card names its agent on its transcript line, and the summary marks
+/// the lane failed, keeping the tool it was running when it went down.
+#[test]
+fn a_lane_whose_tool_failed_is_marked_failed_not_running() {
+    let mut app = app_with_welcome();
+    app.push_user("screen HEAs");
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "compute_submit".into(),
+        verb: "Submitting — VASP relax".into(),
+        call_id: Some("c1".into()),
+        preview: None,
+        approval_required: Some(false),
+        agent: Some("Wagner".into()),
+    });
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: "compute_submit".into(),
+        content: "budget exceeded".into(),
+        card_type: "error".into(),
+        elapsed_ms: Some(40),
+        call_id: Some("c1".into()),
+        provenance_id: None,
+        data: None,
+        agent: Some("Wagner".into()),
+    });
+    // A second lane keeps running, so the summary block exists at all.
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        tool_name: "web_browse".into(),
+        verb: "Searching the web — HEA papers".into(),
+        call_id: Some("c2".into()),
+        preview: None,
+        approval_required: Some(false),
+        agent: Some("Bhabha".into()),
+    });
+
+    let rendered = render_app_to_string(&app, 100, 30);
+
+    // The failed card's transcript line names its lane.
+    assert!(
+        rendered
+            .lines()
+            .map(chat_part)
+            .any(|l| l.starts_with("  Wagner ✗")),
+        "the failed card names its lane: {rendered}"
+    );
+    // Summary: Wagner failed (not running), Bhabha still running — one
+    // row each.
+    let summary: Vec<&str> = rendered
+        .lines()
+        .map(chat_part)
+        .filter(|l| l.ends_with(" running") || l.ends_with(" done") || l.ends_with(" failed"))
+        .collect();
+    assert_eq!(summary.len(), 2, "one row per agent: {rendered}");
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with("  Wagner") && l.ends_with("compute_submit failed")),
+        "the failed lane says failed, with the tool it ran: {rendered}"
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|l| l.starts_with("  Bhabha") && l.ends_with(" running")),
+        "the live lane says running: {rendered}"
+    );
 }

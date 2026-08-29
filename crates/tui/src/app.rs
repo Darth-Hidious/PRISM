@@ -45,6 +45,9 @@ pub enum LineKind {
     ToolStart {
         tool_name: String,
         elapsed_ms: Option<u64>,
+        /// Which DELEGATED agent started the call. `None` is the parent's
+        /// own work and renders exactly as it always did — unnamed.
+        agent: Option<String>,
     },
     ToolResult {
         tool_name: String,
@@ -69,13 +72,20 @@ pub enum LineKind {
         /// outside the notebook was invisible, not because the information was
         /// missing but because nobody looked at it.
         image_paths: Vec<String>,
+        /// Which DELEGATED agent produced this result, when any did.
+        /// `None` is the parent's own work — never a guessed label.
+        agent: Option<String>,
     },
     Approval {
         tool_name: String,
         message: String,
     },
     Status(String),
-    Error(String),
+    /// An error line. The second slot is WHICH delegated agent it belongs
+    /// to — only a FAILED tool card ever sets it; `None` is everything
+    /// else (backend errors, the parent's own failures) and renders
+    /// exactly as it always did.
+    Error(String, Option<String>),
     View {
         title: String,
         body: String,
@@ -5103,7 +5113,10 @@ impl App {
                 self.status_text = "Ready".to_string();
             }
             AgentMsg::ToolStart {
-                tool_name, verb, ..
+                tool_name,
+                verb,
+                agent,
+                ..
             } => {
                 // `..` ignores call_id, preview, approval_required —
                 // current behavior only pushes a tool-start line.
@@ -5112,6 +5125,8 @@ impl App {
                 // control sequences.
                 let clean_verb = sanitize_for_render(&verb);
                 let clean_name = sanitize_for_render(&tool_name);
+                // The agent name is backend-supplied text too — same rule.
+                let clean_agent = agent.map(|a| sanitize_for_render(&a));
                 // The backend sends a full humanized verb ("Searching the
                 // web — …") which is displayed verbatim. Only a bare/legacy
                 // "Running" verb gets the tool name appended — appending it
@@ -5127,6 +5142,7 @@ impl App {
                     kind: LineKind::ToolStart {
                         tool_name: clean_name,
                         elapsed_ms: None,
+                        agent: clean_agent,
                     },
                 });
                 self.is_waiting = false;
@@ -5137,6 +5153,7 @@ impl App {
                 card_type,
                 elapsed_ms,
                 data,
+                agent,
                 ..
             } => {
                 // Every result card receives an explicit class token. The
@@ -5172,12 +5189,14 @@ impl App {
                     })
                     .unwrap_or_default();
                 let elapsed = elapsed_ms.unwrap_or(0);
+                // The agent name is backend-supplied text too — same rule.
+                let clean_agent = agent.map(|a| sanitize_for_render(&a));
                 let text = format!("{token} {clean_name}: {clean_content}");
                 if !success {
                     self.push_message(ChatLine {
                         role: Role::Tool,
                         text: text.clone(),
-                        kind: LineKind::Error(text),
+                        kind: LineKind::Error(text, clean_agent),
                     });
                 } else {
                     self.push_message(ChatLine {
@@ -5190,6 +5209,7 @@ impl App {
                             success,
                             evidence_class,
                             image_paths,
+                            agent: clean_agent,
                         },
                     });
                 }
@@ -5593,7 +5613,7 @@ impl App {
         self.push_message(ChatLine {
             role: Role::System,
             text: clean.clone(),
-            kind: LineKind::Error(clean),
+            kind: LineKind::Error(clean, None),
         });
     }
 
@@ -5735,18 +5755,28 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
         LineKind::Text => v["event"] = "text".into(),
         LineKind::Thinking => v["event"] = "thinking".into(),
         LineKind::Status(_) => v["event"] = "status".into(),
-        LineKind::Error(e) => {
+        LineKind::Error(e, agent) => {
             v["event"] = "error".into();
             v["error"] = e.clone().into();
+            // Absent stays absent: only a failed card from a delegated
+            // agent names one.
+            if let Some(agent) = agent {
+                v["agent"] = agent.clone().into();
+            }
         }
         LineKind::ToolStart {
             tool_name,
             elapsed_ms,
+            agent,
         } => {
             v["event"] = "tool_start".into();
             v["tool_name"] = tool_name.clone().into();
             if let Some(ms) = elapsed_ms {
                 v["elapsed_ms"] = (*ms).into();
+            }
+            // Absent stays absent: no name for the parent's own work.
+            if let Some(agent) = agent {
+                v["agent"] = agent.clone().into();
             }
         }
         LineKind::ToolResult {
@@ -5755,6 +5785,7 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
             elapsed_ms,
             success,
             evidence_class,
+            agent,
             ..
         } => {
             v["event"] = "tool_result".into();
@@ -5768,6 +5799,10 @@ fn chatline_detail_json(m: &ChatLine) -> Value {
                 Some(class) => class.as_str().into(),
                 None => serde_json::Value::Null,
             };
+            // Absent stays absent: no name for the parent's own work.
+            if let Some(agent) = agent {
+                v["agent"] = agent.clone().into();
+            }
         }
         LineKind::Approval { tool_name, message } => {
             v["event"] = "approval".into();
@@ -6175,6 +6210,7 @@ mod tests {
                     success: ok,
                     evidence_class: None,
                     image_paths: Vec::new(),
+                    agent: None,
                 },
             });
         }

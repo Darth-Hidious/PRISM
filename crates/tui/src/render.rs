@@ -497,7 +497,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             // ── Tool activity: indented + grouped under the turn ────
             (Role::Tool, kind) => {
                 let (glyph, gcolor, style) = match kind {
-                    LineKind::ToolResult { success: false, .. } | LineKind::Error(_) => {
+                    LineKind::ToolResult { success: false, .. } | LineKind::Error(..) => {
                         ("✗", t.err, Style::default().fg(t.err))
                     }
                     // Tool RESULTS are content the user reads, not chrome:
@@ -518,7 +518,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 // reads as a verified one.
                 let evidence_class: Option<Option<EvidenceClass>> = match kind {
                     LineKind::ToolResult { evidence_class, .. } => Some(*evidence_class),
-                    LineKind::Error(_) => Some(Some(EvidenceClass::Indeterminate)),
+                    LineKind::Error(..) => Some(Some(EvidenceClass::Indeterminate)),
                     _ => None,
                 };
                 // A finished RESULT is prose the reader studies, so its body
@@ -538,10 +538,21 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     matches!(kind, LineKind::ToolResult { success: true, .. });
                 let mut body = msg.text.lines();
                 if let Some(line_text) = body.next() {
-                    let mut spans = vec![
-                        Span::raw("  "),
-                        Span::styled(format!("{glyph} "), Style::default().fg(gcolor)),
-                    ];
+                    let mut spans = vec![Span::raw("  ")];
+                    // WHICH agent did this. Only delegated work carries a
+                    // name; the parent's own lines render byte-identical to
+                    // before. The reference-mark math below measures the
+                    // prefix width from these spans, so marks stay correct.
+                    if let Some(agent) = tool_line_agent(kind) {
+                        spans.push(Span::styled(
+                            format!("{agent} "),
+                            Style::default().fg(t.dim),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        format!("{glyph} "),
+                        Style::default().fg(gcolor),
+                    ));
                     let remainder = if let Some(evidence_class) = evidence_class {
                         let token = evidence_token(evidence_class);
                         spans.push(Span::styled(
@@ -710,7 +721,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             // ── System: status lines, errors, approval records ──────
             _ => {
                 let style = match &msg.kind {
-                    LineKind::Error(_) => Style::default().fg(t.err),
+                    LineKind::Error(..) => Style::default().fg(t.err),
                     LineKind::Approval { .. } => {
                         Style::default().fg(t.approval).add_modifier(Modifier::BOLD)
                     }
@@ -771,6 +782,33 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::SLOW_BLINK),
             ),
         ]));
+    }
+
+    // Live summary of concurrent delegated agents — one row per agent with
+    // its most recent tool and status. Absent unless MORE THAN ONE agent
+    // has been seen this turn: a single-agent session must not pay screen
+    // space to be told it is single-agent.
+    let lanes = agent_lanes(app);
+    if lanes.len() > 1 {
+        let name_cols = lanes.iter().map(|l| l.name.width()).max().unwrap_or(0);
+        lines.push(Line::raw(""));
+        for lane in &lanes {
+            let (glyph, status_word, color) = match lane.status {
+                LaneStatus::Running => ("⚙", "running", t.warn),
+                LaneStatus::Done => ("✓", "done", t.ok),
+                LaneStatus::Failed => ("✗", "failed", t.err),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    pad_right_display(&lane.name, name_cols + 1),
+                    Style::default().fg(t.dim),
+                ),
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(format!("{} ", lane.tool), Style::default().fg(t.dim)),
+                Span::styled(status_word, Style::default().fg(color)),
+            ]));
+        }
     }
 
     let title = if app.model.is_empty() {
@@ -1677,6 +1715,101 @@ fn derive_tools(app: &App) -> Vec<ToolEntry> {
         }
     }
     out
+}
+
+/// The delegated agent that produced a tool line, when one did. `None` is
+/// the parent's own work, which renders exactly as it did before — unnamed.
+fn tool_line_agent(kind: &LineKind) -> Option<&str> {
+    match kind {
+        LineKind::ToolStart { agent, .. } | LineKind::ToolResult { agent, .. } => agent.as_deref(),
+        // A FAILED card is exactly the line where lane attribution matters
+        // most, so it names its agent too.
+        LineKind::Error(_, agent) => agent.as_deref(),
+        _ => None,
+    }
+}
+
+/// Status of one delegated agent's most recent activity this turn.
+#[derive(Debug, Clone, Copy)]
+enum LaneStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// One row of the concurrent-agents summary: a delegated agent with its
+/// most recent tool and status.
+#[derive(Debug, Clone)]
+struct AgentLane {
+    name: String,
+    tool: String,
+    status: LaneStatus,
+}
+
+/// Live per-lane state for the CURRENT turn — everything since the most
+/// recent user prompt. Derived from the transcript (like `derive_tools`),
+/// so the render path stays pure and there is no second state to desync.
+///
+/// The design rule is state for all, detail for one: the transcript keeps
+/// every line, this keeps one row per agent.
+fn agent_lanes(app: &App) -> Vec<AgentLane> {
+    let start = app
+        .messages
+        .iter()
+        .rposition(|m| matches!(m.role, Role::User))
+        .map_or(0, |i| i + 1);
+    let mut lanes: Vec<AgentLane> = Vec::new();
+    for m in &app.messages[start..] {
+        // A FAILED card arrives as a plain error line with no tool name of
+        // its own, but it still says WHICH lane it failed in: keep the tool
+        // that lane was last seen running and mark the lane failed. Without
+        // this, a lane whose tool errored would show "running" forever.
+        if let LineKind::Error(_, Some(agent)) = &m.kind {
+            if let Some(lane) = lanes.iter_mut().find(|l| l.name == *agent) {
+                lane.status = LaneStatus::Failed;
+            } else {
+                lanes.push(AgentLane {
+                    name: agent.clone(),
+                    tool: String::new(),
+                    status: LaneStatus::Failed,
+                });
+            }
+            continue;
+        }
+        let (agent, tool, status) = match &m.kind {
+            LineKind::ToolStart {
+                agent: Some(agent),
+                tool_name,
+                ..
+            } => (agent, tool_name, LaneStatus::Running),
+            LineKind::ToolResult {
+                agent: Some(agent),
+                tool_name,
+                success,
+                ..
+            } => (
+                agent,
+                tool_name,
+                if *success {
+                    LaneStatus::Done
+                } else {
+                    LaneStatus::Failed
+                },
+            ),
+            _ => continue,
+        };
+        if let Some(lane) = lanes.iter_mut().find(|l| l.name == *agent) {
+            lane.tool = tool.clone();
+            lane.status = status;
+        } else {
+            lanes.push(AgentLane {
+                name: agent.clone(),
+                tool: tool.clone(),
+                status,
+            });
+        }
+    }
+    lanes
 }
 
 fn build_tools_lines(

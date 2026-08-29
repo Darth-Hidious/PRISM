@@ -133,13 +133,14 @@ fn parse_tool_start() {
             call_id,
             preview,
             approval_required,
-            ..
+            agent,
         } => {
             assert_eq!(tool_name, "sample_material");
             assert_eq!(verb, "Running");
             assert_eq!(call_id.as_deref(), Some("c1"));
             assert!(preview.is_none());
             assert!(approval_required.is_none());
+            assert!(agent.is_none(), "the parent's own work carries no name");
         }
         other => panic!("expected ToolStart, got {other:?}"),
     }
@@ -165,7 +166,7 @@ fn parse_tool_card() {
             call_id,
             provenance_id,
             data,
-            ..
+            agent,
         } => {
             assert_eq!(tool_name, "evaluate_material");
             assert_eq!(content, "Fe: 0.3, Ni: 0.3");
@@ -174,6 +175,45 @@ fn parse_tool_card() {
             assert!(call_id.is_none());
             assert!(provenance_id.is_none());
             assert!(data.is_none());
+            assert!(agent.is_none(), "the parent's own work carries no name");
+        }
+        other => panic!("expected ToolCard, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tool_start_with_agent_names_the_delegated_lane() {
+    let msg = json!({
+        "method": "ui.tool.start",
+        "params": {
+            "tool_name": "dft_relax",
+            "verb": "Relaxing — TiO2",
+            "call_id": "c1",
+            "agent": "Bhabha"
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolStart { agent, .. } => {
+            assert_eq!(agent.as_deref(), Some("Bhabha"));
+        }
+        other => panic!("expected ToolStart, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_tool_card_with_agent_names_the_delegated_lane() {
+    let msg = json!({
+        "method": "ui.card",
+        "params": {
+            "tool_name": "band_structure",
+            "content": "gap 1.2 eV",
+            "card_type": "results",
+            "agent": "Sarabhai"
+        }
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolCard { agent, .. } => {
+            assert_eq!(agent.as_deref(), Some("Sarabhai"));
         }
         other => panic!("expected ToolCard, got {other:?}"),
     }
@@ -342,6 +382,7 @@ fn text_delta_starts_new_message_after_non_text() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::TextDelta("first".into()));
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "t".into(),
         verb: "Running".into(),
         call_id: Some("c".into()),
@@ -392,6 +433,7 @@ fn text_flush_clears_waiting_state() {
 fn tool_start_pushes_tool_message() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "sample_material".into(),
         verb: "Running".into(),
         call_id: Some("c1".into()),
@@ -408,6 +450,7 @@ fn tool_start_pushes_tool_message() {
 fn tool_card_success_pushes_result_with_text_evidence_token() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "evaluate_material".into(),
         content: "density=7.8".into(),
         card_type: "results".into(),
@@ -435,6 +478,7 @@ fn tool_card_success_pushes_result_with_text_evidence_token() {
 fn a_tool_that_declared_nothing_is_unclassified_not_ungrounded() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "evaluate_material".into(),
         content: "reward=0.75".into(),
         card_type: "results".into(),
@@ -459,6 +503,7 @@ fn a_tool_that_declared_nothing_is_unclassified_not_ungrounded() {
 fn an_unreadable_evidence_class_stays_indeterminate() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "evaluate_material".into(),
         content: "reward=0.75".into(),
         card_type: "results".into(),
@@ -479,6 +524,7 @@ fn an_unreadable_evidence_class_stays_indeterminate() {
 fn tool_card_error_pushes_error_line() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "bash".into(),
         content: "exit 1".into(),
         card_type: "error".into(),
@@ -488,7 +534,94 @@ fn tool_card_error_pushes_error_line() {
         data: None,
     });
     let last = app.messages.last().unwrap();
-    assert!(matches!(last.kind, LineKind::Error(_)));
+    assert!(matches!(last.kind, LineKind::Error(..)));
+}
+
+#[test]
+fn tool_start_with_agent_stores_the_name_on_the_line() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: Some("Sarabhai".into()),
+        tool_name: "dft_relax".into(),
+        verb: "Relaxing — TiO2".into(),
+        call_id: None,
+        preview: None,
+        approval_required: None,
+    });
+    let last = app.messages.last().unwrap();
+    match &last.kind {
+        LineKind::ToolStart { agent, .. } => {
+            assert_eq!(agent.as_deref(), Some("Sarabhai"));
+        }
+        other => panic!("expected ToolStart, got {other:?}"),
+    }
+}
+
+#[test]
+fn tool_card_with_agent_stores_the_name_on_the_result() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: Some("Bhabha".into()),
+        tool_name: "band_structure".into(),
+        content: "gap 1.2 eV".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(10),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let last = app.messages.last().unwrap();
+    match &last.kind {
+        LineKind::ToolResult { agent, .. } => {
+            assert_eq!(agent.as_deref(), Some("Bhabha"));
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_parent_tool_card_stays_unnamed() {
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
+        tool_name: "band_structure".into(),
+        content: "gap 1.2 eV".into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(10),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let last = app.messages.last().unwrap();
+    match &last.kind {
+        LineKind::ToolResult { agent, .. } => {
+            assert!(agent.is_none(), "absence on the wire must stay absence");
+        }
+        other => panic!("expected ToolResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_failed_tool_card_keeps_its_agent() {
+    // A failure is exactly when lane attribution matters most, so the
+    // error line carries the name even though it is not a ToolResult.
+    let mut app = test_app();
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: Some("Wagner".into()),
+        tool_name: "compute_submit".into(),
+        content: "budget exceeded".into(),
+        card_type: "error".into(),
+        elapsed_ms: Some(5),
+        call_id: None,
+        provenance_id: None,
+        data: None,
+    });
+    let last = app.messages.last().unwrap();
+    assert!(
+        matches!(&last.kind, LineKind::Error(_, agent) if agent.as_deref() == Some("Wagner")),
+        "expected an Error line attributed to Wagner, got {:?}",
+        last.kind
+    );
 }
 
 #[test]
@@ -555,7 +688,7 @@ fn error_pushes_error_message() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::Error("bad thing".into()));
     let last = app.messages.last().unwrap();
-    assert!(matches!(last.kind, LineKind::Error(_)));
+    assert!(matches!(last.kind, LineKind::Error(..)));
     assert!(last.text.contains("bad thing"));
 }
 
@@ -745,7 +878,7 @@ fn push_system_adds_system_message() {
 fn push_error_adds_error_line() {
     let mut app = test_app();
     app.push_error("oops");
-    assert!(matches!(app.messages[0].kind, LineKind::Error(_)));
+    assert!(matches!(app.messages[0].kind, LineKind::Error(..)));
 }
 
 /// The transcript is KEPT, not windowed.
@@ -828,6 +961,7 @@ fn handle_backend_message_text_delta() {
 fn tool_card_empty_card_type_is_success() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "t".into(),
         content: "ok".into(),
         card_type: "".into(), // empty != "error" → success
@@ -867,12 +1001,14 @@ fn parse_tool_start_captures_preview_and_approval() {
             call_id,
             preview,
             approval_required,
+            agent,
         } => {
             assert_eq!(tool_name, "compute_submit");
             assert_eq!(verb, "Running");
             assert_eq!(call_id.as_deref(), Some("call-42"));
             assert_eq!(preview.as_deref(), Some("{\"image\":\"vasp:6.5\"}"));
             assert_eq!(approval_required, Some(true));
+            assert!(agent.is_none(), "no agent field on the wire stays None");
         }
         other => panic!("expected ToolStart, got {other:?}"),
     }
@@ -953,6 +1089,42 @@ fn parse_tool_card_missing_optional_fields_are_none() {
             assert!(data.is_none());
         }
         other => panic!("expected ToolCard, got {other:?}"),
+    }
+}
+
+// ── Agent attribution: the wire names WHICH delegated agent ─────────
+//
+// The WITH-agent direction is covered by
+// `parse_tool_start_with_agent_names_the_delegated_lane` and
+// `parse_tool_card_with_agent_names_the_delegated_lane` above; these pin
+// the other half of the contract.
+
+/// No `agent` on the wire means the PARENT did the work. That must parse
+/// as `None` — a defaulted name would attribute the parent's work to a
+/// lane that never existed.
+#[test]
+fn parse_tool_card_without_agent_is_none_not_a_guess() {
+    let msg = json!({
+        "method": "ui.card",
+        "params": {"tool_name": "prior_art_search", "content": "3 hits"}
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolCard { agent, .. } => assert!(agent.is_none()),
+        other => panic!("expected ToolCard, got {other:?}"),
+    }
+}
+
+/// Same rule on the start notification: the parent's own work stays
+/// unnamed — absence on the wire is absence in the model.
+#[test]
+fn parse_tool_start_without_agent_is_none_not_a_guess() {
+    let msg = json!({
+        "method": "ui.tool.start",
+        "params": {"tool_name": "web_browse", "verb": "Searching the web"}
+    });
+    match parse_notification(&msg) {
+        AgentMsg::ToolStart { agent, .. } => assert!(agent.is_none()),
+        other => panic!("expected ToolStart, got {other:?}"),
     }
 }
 
@@ -1425,6 +1597,7 @@ fn backend_error_no_code_still_pushes() {
 fn tool_start_still_pushes_same_visible_behavior() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "sample_material".into(),
         verb: "Running".into(),
         call_id: Some("c1".into()),
@@ -1480,6 +1653,7 @@ fn workspace_enter_on_activity_shows_event_json() {
     let mut app = test_app();
     app.push_user("sample alloy");
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "sample_material".into(),
         content: "W0.3 Mo0.2".into(),
         card_type: "results".into(),
@@ -1510,6 +1684,7 @@ fn workspace_enter_on_files_shows_file_content() {
 
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "write_file".into(),
         content: format!("Wrote {}", path.display()),
         card_type: "results".into(),
@@ -1854,6 +2029,7 @@ fn tool_start_humanized_verb_is_shown_verbatim() {
     // the tool name again (that produced lines like "Running web web").
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "web".into(),
         verb: "Searching the web — \"NiTi damping\"".into(),
         call_id: Some("c1".into()),
@@ -1873,6 +2049,7 @@ fn tool_start_humanized_verb_is_shown_verbatim() {
 fn tool_card_result_without_class_is_visibly_unclassified() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "evaluate_material".into(),
         content: "density=7.8".into(),
         card_type: "results".into(),
@@ -2083,6 +2260,7 @@ fn thinking_delta_with_ansi_stores_sanitized_text() {
 fn tool_card_content_with_ansi_stores_sanitized_text() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "evaluate_material".into(),
         content: "\x1b[32mdensity=7.8\x1b[0m".into(),
         card_type: "results".into(),
@@ -2100,6 +2278,7 @@ fn tool_card_content_with_ansi_stores_sanitized_text() {
 fn tool_card_error_with_ansi_stores_sanitized_text() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolCard {
+        agent: None,
         tool_name: "\x1b[31mbash\x1b[0m".into(),
         content: "exit \x1b[1m1\x1b[0m".into(),
         card_type: "error".into(),
@@ -2117,6 +2296,7 @@ fn tool_card_error_with_ansi_stores_sanitized_text() {
 fn tool_start_with_ansi_stores_sanitized_text() {
     let mut app = test_app();
     app.apply_agent_msg(AgentMsg::ToolStart {
+        agent: None,
         tool_name: "\x1b[36msample_material\x1b[0m".into(),
         verb: "\x1b[1mRunning\x1b[0m".into(),
         call_id: None,
@@ -3742,7 +3922,7 @@ fn backend_method_not_found_becomes_unavailable_not_chat_noise() {
     assert!(
         !app.messages
             .iter()
-            .any(|m| matches!(m.kind, LineKind::Error(_))),
+            .any(|m| matches!(m.kind, LineKind::Error(..))),
         "an attributed protocol error must not land in the chat transcript"
     );
 
