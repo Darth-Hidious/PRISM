@@ -275,7 +275,17 @@ fn research_note(round: RoundYield, totals: (usize, usize, usize)) -> String {
     // our own failure to parse.
     let score = round_reward(round).map_or_else(
         || "unscored — a result could not be read".to_string(),
-        |reward| format!("{reward:+.1}"),
+        |reward| {
+            // An unjudged round still scores — the arithmetic is unchanged —
+            // but "reached" has quietly stopped meaning "worth having", so the
+            // number is marked as the upper bound it is rather than presented
+            // as the judged count it looks like.
+            if round.unjudged {
+                format!("{reward:+.1} upper bound — sources not judged")
+            } else {
+                format!("{reward:+.1}")
+            }
+        },
     );
     format!(
         "  this round: {} call(s) -> {bought}  [{score}]\n           so far: {facts_total} fact(s) stored · {sources_seen} source(s) seen · {searches} search(es)",
@@ -341,6 +351,16 @@ pub(crate) struct RoundYield {
     /// search gets mistaken for a dry well. Unknown must never be evidence of
     /// exhaustion.
     pub unknown_yield: bool,
+    /// A judge was configured for one of this round's searches and did NOT
+    /// rule, so those sources are counted but unvouched.
+    ///
+    /// The Selector filters papers in place BEFORE a search tool returns, so
+    /// when it runs, `novel_sources` is already PaSa's "newly found RELEVANT
+    /// paper" count. When it fails open — no LLM, an HTTP 401, a malformed
+    /// answer — the papers come back whole and the same number silently means
+    /// the older, weaker "newly reached". The score is then an upper bound,
+    /// and saying so is the difference between a number and one you can trust.
+    pub unjudged: bool,
 }
 
 impl RoundYield {
@@ -1258,6 +1278,13 @@ struct SearchCall {
     /// UNKNOWN. Counting it as zero-new is how a big successful search gets
     /// mistaken for a dry well.
     unreadable: bool,
+    /// Whether a relevance JUDGE actually ruled on these sources.
+    ///
+    /// `None` when the result reported no selector at all — a non-paper tool,
+    /// or a backend predating the stage. `Some(false)` is the case worth
+    /// naming: a judge was configured and did not rule, so the papers came
+    /// back unfiltered.
+    judged: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -1408,6 +1435,8 @@ impl SaturationTracker {
                 returned: 0,
                 fresh: 0,
                 unreadable: true,
+                // Unreadable: nothing to judge, and nothing judged.
+                judged: None,
             });
             return;
         };
@@ -1451,7 +1480,25 @@ impl SaturationTracker {
             returned,
             fresh,
             unreadable: false,
+            judged: Self::selector_ruled(&payload),
         });
+    }
+
+    /// Did a relevance judge actually rule on this search's papers?
+    ///
+    /// Reads the search tool's OWN honest report — `papers_relevance.selector`
+    /// names its status precisely because the stage fails open. `applied` is
+    /// the only status meaning the papers were judged; `unavailable` and
+    /// `failed` both mean they came back whole. `None` when no selector was
+    /// reported, which is a different thing from one that did not rule.
+    fn selector_ruled(payload: &Value) -> Option<bool> {
+        let status = payload
+            .get("papers_relevance")
+            .or_else(|| payload.get("relevance"))?
+            .get("selector")?
+            .get("status")?
+            .as_str()?;
+        Some(status == "applied")
     }
 
     /// Share of the recent window that was new. `None` when the window holds no
@@ -3895,6 +3942,7 @@ pub(crate) async fn run_turn_inner(
                             .facts_written
                             .saturating_sub(facts_at_last_continuation),
                         unknown_yield: round_searches.iter().any(|call| call.unreadable),
+                        unjudged: round_searches.iter().any(|call| call.judged == Some(false)),
                     };
                     let researched = round.calls > 0;
                     let step = cycle_step(round, stalled_continuations, saturated_continuations);
@@ -4985,6 +5033,61 @@ mod tests {
         }
     }
 
+    /// A search whose papers a judge actually ruled on is scored as judged;
+    /// one where the judge failed OPEN is scored the same but marked, because
+    /// the papers came back whole and "reached" stopped meaning "worth having".
+    #[test]
+    fn an_unjudged_round_is_scored_as_an_upper_bound() {
+        let judged = RoundYield {
+            calls: 2,
+            novel_sources: 3,
+            ..RoundYield::default()
+        };
+        let note = research_note(judged, (10, 4, 2));
+        assert!(note.contains("+4.3"), "scored: {note}");
+        assert!(
+            !note.contains("upper bound"),
+            "a judged round is not hedged: {note}"
+        );
+
+        let unjudged = RoundYield {
+            unjudged: true,
+            ..judged
+        };
+        let note = research_note(unjudged, (10, 4, 2));
+        assert!(note.contains("+4.3"), "same arithmetic: {note}");
+        assert!(
+            note.contains("upper bound") && note.contains("not judged"),
+            "an unjudged round says so: {note}"
+        );
+    }
+
+    /// The flag is read from the search tool's OWN report, and only `applied`
+    /// counts. `unavailable` and `failed` both mean the papers came back
+    /// unfiltered — that is the whole point of the stage failing open.
+    #[test]
+    fn only_an_applied_selector_counts_as_judged() {
+        let with = |status: &str| serde_json::json!({"papers_relevance": {"selector": {"status": status}}});
+        assert_eq!(
+            SaturationTracker::selector_ruled(&with("applied")),
+            Some(true)
+        );
+        assert_eq!(
+            SaturationTracker::selector_ruled(&with("failed")),
+            Some(false)
+        );
+        assert_eq!(
+            SaturationTracker::selector_ruled(&with("unavailable")),
+            Some(false)
+        );
+        // No selector reported at all is NOT the same as one that did not
+        // rule: a non-paper tool has nothing to judge.
+        assert_eq!(
+            SaturationTracker::selector_ruled(&serde_json::json!({"papers": []})),
+            None
+        );
+    }
+
     /// The cycle the owner asked for: analyse, then go back and research what
     /// the analysis exposed, and repeat. A round that reached new ground always
     /// earns another round.
@@ -5116,6 +5219,7 @@ mod tests {
             novel_sources: 2,
             novel_facts: 0,
             unknown_yield: false,
+            unjudged: false,
         };
         // 2 x 1.5 - 3 x 0.1
         assert!((round_reward(found).expect("scored") - 2.7).abs() < 1e-9);
@@ -5134,6 +5238,7 @@ mod tests {
             novel_sources: 0,
             novel_facts: 10,
             unknown_yield: false,
+            unjudged: false,
         };
         assert!(
             round_reward(ingested).expect("scored") > round_reward(found).expect("scored"),
@@ -5169,6 +5274,7 @@ mod tests {
             novel_sources: 2,
             novel_facts: 38,
             unknown_yield: false,
+            unjudged: false,
         };
         let note = research_note(ingested, (6, 38, 9));
         assert!(note.contains("+38 facts"), "facts are the headline: {note}");
@@ -5183,6 +5289,7 @@ mod tests {
             novel_sources: 13,
             novel_facts: 0,
             unknown_yield: false,
+            unjudged: false,
         };
         assert!(
             research_note(searched, (13, 0, 2)).contains("+13 new sources"),
@@ -5253,6 +5360,7 @@ mod tests {
             novel_sources: 0,
             novel_facts: 0,
             unknown_yield: true,
+            unjudged: false,
         };
         assert!(unknown.found_new_ground(), "unknown is not zero");
         assert_eq!(
@@ -5271,6 +5379,7 @@ mod tests {
             novel_sources: 0,
             novel_facts: 12,
             unknown_yield: false,
+            unjudged: false,
         };
         assert_eq!(
             cycle_step(ingested, 0, SATURATED_ROUNDS_BEFORE_NUDGE + 5),
