@@ -417,6 +417,51 @@ pub fn end_action() -> Option<String> {
         .and_then(|mut live| live.remove(&key))
 }
 
+/// Which delegated agent is running on THIS task, if any.
+///
+/// The same task-keyed shape as [`CURRENT_ACTIONS`], for the same reason: a
+/// spawned task gets its own id, and that is exactly what isolates concurrent
+/// DAG branches from one another. The orchestrator spawns one task per item,
+/// so an item's tool calls carry its name and the parent's carry none.
+static CURRENT_AGENTS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+/// Name the agent running on this task, for as long as it runs.
+///
+/// Bounded by the same cap as live actions: past it, attribution degrades to
+/// "unattributed" rather than to somebody else's branch.
+pub fn begin_agent(name: &str) {
+    if let Ok(mut live) = CURRENT_AGENTS.write() {
+        let key = task_key();
+        if live.len() < MAX_LIVE_ACTIONS || live.contains_key(&key) {
+            live.insert(key, name.to_string());
+        }
+    }
+}
+
+/// The delegated agent this task belongs to. `None` is the parent's own work —
+/// never invented, so a single-agent session records what it always did.
+#[must_use]
+pub fn current_agent() -> Option<String> {
+    let key = task_key();
+    CURRENT_AGENTS
+        .read()
+        .ok()
+        .and_then(|live| live.get(&key).cloned())
+}
+
+/// Stop attributing this task to an agent.
+///
+/// Clearing matters for the same reason it does for actions: a task reused
+/// after an item finishes would otherwise keep charging that item for work it
+/// did not do, and a wrong branch is worse than no branch.
+pub fn end_agent() {
+    if let Ok(mut live) = CURRENT_AGENTS.write() {
+        live.remove(&task_key());
+    }
+}
+
 fn provenance_model() -> Option<String> {
     PROVENANCE_CTX
         .read()
@@ -709,6 +754,11 @@ fn provenance_hook() -> Hook {
                 model.as_deref(),
                 inputs.clone(),
             );
+            // WHICH branch made this call. Read HERE, on the task that is
+            // running the tool — the durable write is spawned below, and a
+            // spawned task has its own id, so reading it there would find
+            // nothing. `None` is the parent's own work.
+            record.agent = current_agent();
             // Record the output too so `recall` can pull the full result
             // back later (by id or keyword), not just the tool's inputs.
             record.output_json = Some(result.clone());

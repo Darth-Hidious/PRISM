@@ -393,6 +393,30 @@ async fn orchestrate_agents_fans_out_and_records_descendants() {
         "the parent's own tool result is not wrapped in an agent tag"
     );
 
+    // Every branch is DISTINGUISHABLE IN THE STORE. Facts already name the
+    // call that bought them; calls now name the agent that made them, so
+    // "what did this branch buy" is a query. Without it a fan-out's branches
+    // are indistinguishable in provenance, and a DAG that cannot score its own
+    // branches cannot decide which to expand — which is the whole point of
+    // running them separately.
+    let store = prism_provenance::ProvenanceStore::open(&prism_agent::hooks::provenance_db_path())
+        .await
+        .expect("open the ledger");
+    let yields = store
+        .branch_yields(session_id)
+        .await
+        .expect("branch yields");
+    let mut named: Vec<&str> = yields.iter().map(|y| y.agent.as_str()).collect();
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        vec!["one", "three", "two"],
+        "each item's tool calls are attributed to it in the store: {yields:?}"
+    );
+    for y in &yields {
+        assert!(y.calls > 0, "a branch that ran made calls: {y:?}");
+    }
+
     // The per-item report reached the parent: every id, individually, with
     // its own outcome — never an aggregate "ok".
     let report =

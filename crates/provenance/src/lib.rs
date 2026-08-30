@@ -70,6 +70,19 @@ pub struct ProvenanceRecord {
     pub material_ref: Option<String>,
     pub confidence: f64,
     pub tags: Vec<String>,
+    /// WHICH delegated agent made this call, when one did.
+    ///
+    /// `None` for the parent's own work — attribution is never invented, and a
+    /// single-agent session records exactly what it did before.
+    ///
+    /// This is the branch key. Facts already name the call that bought them
+    /// (`prov_activity.origin_action_id`); this names the agent that made the
+    /// call, so "what did Sarabhai's branch actually buy" becomes a query
+    /// instead of a guess. Without it a fan-out's branches are
+    /// indistinguishable in the store, and a DAG that cannot score its own
+    /// branches cannot decide which to expand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// VS1/F5: structured outcome flag — "ok" | "error" | None.
     /// None means "unknown" (a legacy row written before this field existed,
     /// or a non-tool record where the notion does not apply). Honest
@@ -935,7 +948,8 @@ impl ProvenanceStore {
                 confidence REAL DEFAULT 0,
                 tags TEXT,
                 status TEXT,
-                exit_code INTEGER
+                exit_code INTEGER,
+                agent TEXT
             )"#,
             (),
         )
@@ -950,6 +964,9 @@ impl ProvenanceStore {
         // DBs converge on the same 15-column shape.
         add_column_if_absent(conn, "provenance_records", "status", "TEXT").await?;
         add_column_if_absent(conn, "provenance_records", "exit_code", "INTEGER").await?;
+        // Same guard for the branch key: an existing ~/.prism/provenance.db
+        // has no `agent` column, and the INSERT below names it.
+        add_column_if_absent(conn, "provenance_records", "agent", "TEXT").await?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_prov_session ON provenance_records(session_id)",
@@ -1314,8 +1331,10 @@ impl ProvenanceStore {
                 r#"INSERT INTO provenance_records
                    (id, timestamp, session_id, action_type, actor,
                     tool_name, llm_model, input_json, output_json,
-                    parent_id, material_ref, confidence, tags, status, exit_code)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+                    parent_id, material_ref, confidence, tags, status, exit_code,
+                    agent)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                           ?16)"#,
                 [
                     Value::Text(rec.id.clone()),
                     Value::Text(rec.timestamp.clone()),
@@ -1338,6 +1357,7 @@ impl ProvenanceStore {
                         Some(c) => Value::Integer(c),
                         None => Value::Null,
                     },
+                    opt_to_value(&rec.agent),
                 ],
             )
             .await?;
@@ -2943,6 +2963,66 @@ fn row_to_agent_run(row: &turso::Row) -> Result<AgentRun> {
     })
 }
 
+/// What one fan-out branch bought: calls made, and facts those calls produced.
+///
+/// The join the DAG needs to score itself. Facts already name the call that
+/// bought them (`prov_activity.origin_action_id`) and calls now name the agent
+/// that made them (`provenance_records.agent`), so one query answers "was this
+/// branch worth expanding" — which is the question a decomposition has to
+/// answer before the next one is written.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BranchYield {
+    pub agent: String,
+    pub calls: usize,
+    pub facts: usize,
+}
+
+impl ProvenanceStore {
+    /// Per-branch yield for one session, richest first.
+    ///
+    /// The parent's own calls (`agent IS NULL`) are excluded: it is not a
+    /// branch, and folding it in would make every fan-out look like it had one
+    /// enormous winner.
+    pub async fn branch_yields(&self, session_id: &str) -> Result<Vec<BranchYield>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"SELECT r.agent,
+                          COUNT(DISTINCT r.id)          AS calls,
+                          COUNT(DISTINCT e.assertion_id) AS facts
+                   FROM provenance_records r
+                   LEFT JOIN prov_activity a ON a.origin_action_id = r.id
+                   LEFT JOIN prov_assertion_evidence e ON e.activity_id = a.id
+                   WHERE r.session_id = ?1 AND r.agent IS NOT NULL AND r.agent <> ''
+                   GROUP BY r.agent
+                   ORDER BY facts DESC, calls ASC"#,
+                [Value::Text(session_id.to_string())],
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let agent = get_str(&row, 0)?;
+            let calls = row
+                .get_value(1)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            let facts = row
+                .get_value(2)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            out.push(BranchYield {
+                agent,
+                calls: usize::try_from(calls).unwrap_or(0),
+                facts: usize::try_from(facts).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+}
+
 fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
     let action_type = match get_str(row, 3)?.as_str() {
         "tool_call" => ActionType::ToolCall,
@@ -2989,6 +3069,12 @@ fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
     // semantic_search path, RECORD_COLS lists them in the same order.
     let status = get_opt_str(row, 13)?.filter(|s| !s.is_empty());
     let exit_code = row.get_value(14).ok().and_then(|v| v.as_integer().copied());
+    // Index 15 in BOTH shapes: the CREATE lists status, exit_code, agent in
+    // that order, and the guarded ALTERs append them in the same order, so a
+    // fresh database and a migrated one agree. That invariant is what makes
+    // positional reads safe here — break the order and this reads the wrong
+    // column silently.
+    let agent = get_opt_str(row, 15)?.filter(|a| !a.is_empty());
 
     Ok(ProvenanceRecord {
         id: get_str(row, 0)?,
@@ -3006,6 +3092,7 @@ fn row_to_record(row: &turso::Row) -> Result<ProvenanceRecord> {
         tags,
         status,
         exit_code,
+        agent,
     })
 }
 
@@ -3055,6 +3142,7 @@ pub fn new_record(
         tags: Vec::new(),
         status: None,
         exit_code: None,
+        agent: None,
     }
 }
 

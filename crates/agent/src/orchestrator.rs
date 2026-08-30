@@ -1418,6 +1418,12 @@ impl ItemAgent for OrchestratedAgent {
                 // the wire, because the parent pumps these events from its own
                 // task and cannot infer the sender.
                 let agent = self.spec.id.clone();
+                // Name this branch for the provenance hook too, not only for
+                // the event stream. Set on THIS task — the orchestrator spawns
+                // one per item, which is what keeps concurrent branches apart —
+                // so every tool call the item makes is recorded against it, and
+                // "what did this branch actually buy" becomes a query.
+                crate::hooks::begin_agent(&agent);
                 // Item event routing: text is CAPTURED (it becomes the item
                 // result); tool activity is FORWARDED so the parent's sink
                 // sees what every item is doing; approval requests are
@@ -1465,6 +1471,8 @@ impl ItemAgent for OrchestratedAgent {
                     });
                 };
 
+                // Cleared as soon as the turn returns, below: a task reused
+                // after this item finishes must not keep charging it.
                 let nested: Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> =
                     Box::pin(crate::agent_loop::run_turn_inner(
                         &live.llm,
@@ -1495,6 +1503,11 @@ impl ItemAgent for OrchestratedAgent {
                 nested_result =
                     crate::command_tools::with_platform_access(ctx.access, nested).await;
             }
+            // The item's turn is over — including the error path, which is why
+            // this sits before the `?` below. A task that kept an item's name
+            // after it finished would charge the next piece of work to the
+            // wrong branch, and a wrong branch is worse than no branch.
+            crate::hooks::end_agent();
             // Charge from the INCREMENTAL metrics, BEFORE propagating the
             // error.
             //
