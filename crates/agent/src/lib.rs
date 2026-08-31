@@ -2,6 +2,7 @@
 pub mod agent_loop;
 pub mod agent_names;
 mod apply_patch;
+pub mod branch_policy;
 pub mod capability;
 pub mod command_tools;
 pub mod commands;

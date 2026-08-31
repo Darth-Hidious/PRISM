@@ -135,6 +135,94 @@ pub struct MeasurementCondition {
 
 /// The shared four-level evidence vocabulary, aligned with RHEA-JAX
 /// `ClaimStatus`. Colors are presentation labels; these serialized values are
+/// WHY a fact is unreliable — not how unreliable it is.
+///
+/// PROV-K models these as distinct classes because they call for opposite
+/// actions. A single low confidence number cannot distinguish them, and
+/// averaging them together is how a contradiction gets filed as a weak
+/// measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unreliability {
+    /// One source, uncorroborated. The corpus has not been looked at hard
+    /// enough yet — the remedy is MORE evidence.
+    InsufficientEvidence,
+    /// Independent sources disagree. More evidence will not settle it by
+    /// itself; something has to be adjudicated. Never average this away —
+    /// surfacing the disagreement IS the result.
+    ContrastingEvidence,
+}
+
+impl Unreliability {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unreliability::InsufficientEvidence => "insufficient_evidence",
+            Unreliability::ContrastingEvidence => "contrasting_evidence",
+        }
+    }
+
+    /// Classify from what the graph already knows: how many INDEPENDENT
+    /// sources back the fact, and whether any of them disagree.
+    ///
+    /// `None` means reliable — corroborated and consistent. Disagreement wins
+    /// over scarcity when both hold: two sources that contradict each other is
+    /// a contradiction, not a shortage.
+    #[must_use]
+    pub fn classify(corroborations: i64, has_disagreement: bool) -> Option<Self> {
+        if has_disagreement {
+            return Some(Unreliability::ContrastingEvidence);
+        }
+        (corroborations < 2).then_some(Unreliability::InsufficientEvidence)
+    }
+}
+
+#[cfg(test)]
+mod unreliability_tests {
+    use super::Unreliability;
+
+    /// The two causes call for opposite actions, so they must never collapse
+    /// into one low score: scarcity says gather more, disagreement says
+    /// adjudicate. Disagreement wins when both hold — two sources that
+    /// contradict each other is a contradiction, not a shortage.
+    #[test]
+    fn scarcity_and_contradiction_are_told_apart() {
+        assert_eq!(
+            Unreliability::classify(1, false),
+            Some(Unreliability::InsufficientEvidence)
+        );
+        assert_eq!(
+            Unreliability::classify(4, true),
+            Some(Unreliability::ContrastingEvidence),
+            "corroborated but contradicted is still a contradiction"
+        );
+        assert_eq!(
+            Unreliability::classify(1, true),
+            Some(Unreliability::ContrastingEvidence),
+            "disagreement outranks scarcity"
+        );
+        assert_eq!(
+            Unreliability::classify(3, false),
+            None,
+            "corroborated and consistent is reliable, and says nothing"
+        );
+    }
+
+    /// The wire strings are the PROV-K class names in snake_case; they are
+    /// stored, so changing one silently reclassifies history.
+    #[test]
+    fn the_stored_names_are_stable() {
+        assert_eq!(
+            Unreliability::InsufficientEvidence.as_str(),
+            "insufficient_evidence"
+        );
+        assert_eq!(
+            Unreliability::ContrastingEvidence.as_str(),
+            "contrasting_evidence"
+        );
+    }
+}
+
 /// the stable machine contract used by facts and computed results.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2772,6 +2860,19 @@ pub(crate) async fn init_schema(conn: &turso::Connection) -> Result<()> {
     // their ids being merged. NULL on rows written before it existed, and on
     // unvalued facts, which have no measurement to agree about.
     crate::add_column_if_absent(conn, "prov_assertion", "corroboration_key", "TEXT").await?;
+    // PROV-K (Springer IJDL 2025, doi 10.1007/s00799-025-00431-x) separates
+    // two certainties that PRISM had collapsed into one number:
+    //   assigned  — what the CREATOR of the claim asserted (our extraction)
+    //   trusted   — what an EXTERNAL agent concluded on review
+    // Keeping them apart is what lets "the extractor was sure and the reviewer
+    // disagreed" be a query rather than an averaged-away nothing.
+    crate::add_column_if_absent(conn, "prov_assertion", "trusted_confidence", "REAL").await?;
+    // And the CAUSE of unreliability, not merely its degree. PROV-K models
+    // `InsufficientEvidence` and `ContrastingEvidence` as distinct classes
+    // because they mean opposite things: one says look harder, the other says
+    // something is wrong. A single low score cannot tell them apart, and the
+    // action they call for is different.
+    crate::add_column_if_absent(conn, "prov_assertion", "unreliability", "TEXT").await?;
 
     crate::add_column_if_absent(
         conn,

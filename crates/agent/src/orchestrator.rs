@@ -1801,8 +1801,47 @@ pub(crate) fn execute_orchestrate_agents<'a>(
                 .lock()
                 .expect("orchestration usage roll-up is never held across a panic"),
         );
+        // What each branch BOUGHT, and which to expand next. This is the
+        // feedback edge: the fan-out scores its own branches so the NEXT
+        // decomposition is written against measured yield instead of a guess.
+        // Best-effort — a store that cannot be read costs the recommendation,
+        // never the run, and an absent block is honest about that.
+        let branch_feedback = match prism_provenance::ProvenanceStore::open(
+            &crate::hooks::provenance_db_path(),
+        )
+        .await
+        {
+            Ok(store) => {
+                let yields = store
+                    .branch_yields(&ctx.session_id)
+                    .await
+                    .unwrap_or_default();
+                let expansions = store
+                    .branch_expansions(&ctx.session_id)
+                    .await
+                    .unwrap_or_default();
+                let ranked = crate::branch_policy::rank(&yields, &expansions);
+                crate::branch_policy::feedback_block(&ranked).map(|block| {
+                    json!({
+                        "ranked": ranked.iter().map(|c| json!({
+                            "agent": c.agent,
+                            "facts_per_call": c.yield_per_call,
+                            "expansions": c.expansions,
+                            "weight": c.weight,
+                        })).collect::<Vec<_>>(),
+                        "for_the_next_decomposition": block,
+                    })
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "branch feedback unavailable for this fan-out");
+                None
+            }
+        };
+
         Ok(json!({
             "items": run.items,
+            "branch_feedback": branch_feedback,
             "succeeded": run.succeeded(),
             "failed": run.failed(),
             "skipped": run.skipped(),

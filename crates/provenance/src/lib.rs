@@ -2970,7 +2970,7 @@ fn row_to_agent_run(row: &turso::Row) -> Result<AgentRun> {
 /// that made them (`provenance_records.agent`), so one query answers "was this
 /// branch worth expanding" — which is the question a decomposition has to
 /// answer before the next one is written.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BranchYield {
     pub agent: String,
     pub calls: usize,
@@ -2978,6 +2978,40 @@ pub struct BranchYield {
 }
 
 impl ProvenanceStore {
+    /// How many separate fan-outs each branch name has appeared in.
+    ///
+    /// The exploration term of the selection policy: a branch expanded three
+    /// times has had three chances, and the next decomposition should weigh
+    /// that against one that has had none. Counted as DISTINCT actions that
+    /// launched work under the name, not raw calls — a branch that made forty
+    /// calls in one expansion has still only been tried once.
+    pub async fn branch_expansions(
+        &self,
+        session_id: &str,
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"SELECT agent, COUNT(DISTINCT DATE(timestamp) || '|' || substr(id, 1, 8))
+                   FROM provenance_records
+                   WHERE session_id = ?1 AND agent IS NOT NULL AND agent <> ''
+                   GROUP BY agent"#,
+                [Value::Text(session_id.to_string())],
+            )
+            .await?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let agent = get_str(&row, 0)?;
+            let n = row
+                .get_value(1)
+                .ok()
+                .and_then(|v| v.as_integer().copied())
+                .unwrap_or(0);
+            out.insert(agent, usize::try_from(n).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
     /// Per-branch yield for one session, richest first.
     ///
     /// The parent's own calls (`agent IS NULL`) are excluded: it is not a
