@@ -10068,7 +10068,14 @@ async fn handle_ingest(
     let mut summaries = Vec::new();
     // Held, not `?`'d: a per-file error must still reach the seam
     // retirement below before it leaves this function.
-    let mut run_error: Option<anyhow::Error> = None;
+    // One file's failure is that file's failure. This was `break` on the first
+    // `Err`, and the run then returned before printing a single summary: file 7
+    // of 400 unreadable meant files 8-400 never attempted AND files 1-6 —
+    // already written to the graph — never reported, never counted, absent
+    // from `--json`. The only production `Err => break` over a collection in
+    // the workspace, and `prism ingest` is an agent tool, so it was the
+    // model's path too.
+    let mut file_errors: Vec<(PathBuf, anyhow::Error)> = Vec::new();
     for target in ingest_targets {
         let summary = match ingest_backend(&target) {
             Some(IngestBackend::LocalTabular) => {
@@ -10118,10 +10125,7 @@ async fn handle_ingest(
         };
         match summary {
             Ok(summary) => summaries.push(summary),
-            Err(error) => {
-                run_error = Some(error);
-                break;
-            }
+            Err(error) => file_errors.push((target.clone(), error)),
         }
     }
 
@@ -10133,10 +10137,7 @@ async fn handle_ingest(
     if let Some(seam) = vision_seam.take() {
         seam.retire().await;
     }
-    if let Some(error) = run_error {
-        return Err(error);
-    }
-
+    let ingested = summaries.len();
     let total_step_errors: usize = summaries.iter().map(ingest_summary_errors).sum();
     let deferred_documents = ingest_summary_deferrals(&summaries);
     let deferred_nothing_stored = if schema_only {
@@ -10148,7 +10149,26 @@ async fn handle_ingest(
     };
 
     if json_output {
-        let payload = ingest_json_payload(summaries, deferred_documents);
+        let mut payload = ingest_json_payload(summaries, deferred_documents);
+        if let Some(object) = payload.as_object_mut() {
+            // Every failed file, by name and reason — a script must be able
+            // to tell "12 documents" from "12 of 40, 28 failed".
+            object.insert("ingested".to_string(), serde_json::json!(ingested));
+            object.insert(
+                "file_errors".to_string(),
+                serde_json::json!(
+                    file_errors
+                        .iter()
+                        .map(|(path, error)| {
+                            serde_json::json!({
+                                "path": path.display().to_string(),
+                                "error": format!("{error:#}"),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         for (index, summary) in summaries.iter().enumerate() {
@@ -10156,6 +10176,9 @@ async fn handle_ingest(
                 println!();
             }
             print_ingest_summary(summary);
+        }
+        for (path, error) in &file_errors {
+            eprintln!("Failed: {} — {error:#}", path.display());
         }
         // A visible run-level count (audit F9): a partial deferral is NOT an
         // error — the sound pages' facts are stored — but it must never be
@@ -10168,6 +10191,17 @@ async fn handle_ingest(
         }
     }
 
+    // A failed file exits non-zero AFTER every sound file has been reported
+    // and stored — the exit code says "not everything", the output says what.
+    if !file_errors.is_empty() {
+        let (first_path, first_error) = &file_errors[0];
+        bail!(
+            "{} of {} file(s) failed ({ingested} ingested) — first: {}: {first_error:#}",
+            file_errors.len(),
+            file_errors.len() + ingested,
+            first_path.display()
+        );
+    }
     // Exit non-zero when configured steps failed — agents and scripts key
     // off the exit code, and the old exit-0-having-stored-nothing was the
     // audit's #2 critical.
@@ -20968,8 +21002,9 @@ data:\n\
     ///    tombstone, never a stale live reader;
     /// and the watch loop's bookkeeping, driven by that same real error,
     /// must keep the file retry-eligible (F8).
-    #[allow(clippy::await_holding_lock)]
+
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn handle_ingest_fails_loudly_when_every_pdf_starves_behind_vision() {
         let _guard = boot_checks::ENV_LOCK
             .lock()
@@ -21055,6 +21090,63 @@ data:\n\
         assert!(
             deferred.contains(&pdf),
             "a fully-starved file must keep its retry eligibility",
+        );
+    }
+
+    /// One unreadable file must not end the corpus, and must not erase the
+    /// files already ingested. This loop was `Err => break`, then returned
+    /// before printing a summary: file 2 of 3 bad meant file 3 never
+    /// attempted and file 1 — already in the graph — never reported. The run
+    /// still exits non-zero, AFTER every sound file is reported, with a
+    /// message that says what was lost and what was kept.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn one_bad_file_does_not_end_the_corpus_or_hide_the_good_ones() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).unwrap();
+        let _restore_home = HomeGuard::isolated(home.path());
+
+        let corpus = tempfile::tempdir().expect("corpus tempdir");
+        let csv = "material,uts_mpa\nTi-6Al-4V,950\nInconel 718,1240\n";
+        std::fs::write(corpus.path().join("a-good.csv"), csv).unwrap();
+        std::fs::write(
+            corpus.path().join("b-bad.pdf"),
+            b"%PDF-1.4 garbage not a pdf",
+        )
+        .unwrap();
+        std::fs::write(corpus.path().join("c-good.csv"), csv).unwrap();
+
+        // An explicit model + unroutable URL: resolution must not probe this
+        // machine's live ports (it lists them in its refusal otherwise), and
+        // schema-only never calls the model for a CSV.
+        let err = handle_ingest(
+            corpus.path(),
+            corpus.path(),
+            Some("test-extractor"),
+            Some("http://127.0.0.1:1"),
+            None,
+            true, // schema_only: the sound files produce a summary with no LLM
+            "http://192.0.2.1:1",
+            None,
+            false,
+            None,
+            prism_ingest::text_extract::SamplingPolicy::default(),
+            VisionModelChoice::default(),
+        )
+        .await
+        .expect_err("a run with a failed file must still exit non-zero");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("1 of 3 file(s) failed"), "{msg}");
+        assert!(
+            msg.contains("2 ingested"),
+            "the sound files must be counted, not lost: {msg}"
+        );
+        assert!(
+            msg.contains("b-bad.pdf"),
+            "the failed file must be named: {msg}"
         );
     }
 
