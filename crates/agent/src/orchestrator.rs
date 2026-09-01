@@ -702,8 +702,26 @@ pub async fn fan_out<F>(
 where
     F: Fn(usize, &OrchestratorTaskSpec) -> Box<dyn ItemAgent> + Send + Sync + 'static,
 {
-    let effective = effective_concurrency(policy, lane_bound);
     let budget = Arc::new(AgentCallBudget::new(policy.max_agent_calls));
+    fan_out_with_budget(specs, policy, lane_bound, cancel, factory, budget).await
+}
+
+/// `fan_out` against a budget the caller owns. The budget is a property of
+/// ONE approval: a DAG run that minted a fresh budget per wave could make
+/// `waves × max_agent_calls` calls on a single approval while reporting the
+/// largest wave as its spend.
+pub async fn fan_out_with_budget<F>(
+    specs: Vec<OrchestratorTaskSpec>,
+    policy: &OrchestratorPolicy,
+    lane_bound: Option<NonZeroUsize>,
+    cancel: CancelSignal,
+    factory: F,
+    budget: Arc<AgentCallBudget>,
+) -> OrchestratedRun
+where
+    F: Fn(usize, &OrchestratorTaskSpec) -> Box<dyn ItemAgent> + Send + Sync + 'static,
+{
+    let effective = effective_concurrency(policy, lane_bound);
     let factory = Arc::new(factory);
 
     let semaphore_capacity = effective
@@ -973,6 +991,7 @@ where
     F: Fn(usize, &OrchestratorTaskSpec) -> Box<dyn ItemAgent> + Send + Sync + Clone + 'static,
 {
     let waves = dependency_waves(&specs)?;
+    let budget = Arc::new(AgentCallBudget::new(policy.max_agent_calls));
     // No edges at all: this is a plain fan-out, so do exactly that. One wave
     // also means the DAG path costs nothing when nobody uses it.
     let mut reports: HashMap<String, ItemReport> = HashMap::new();
@@ -999,12 +1018,13 @@ where
             wave_specs.push(spec);
         }
 
-        let run = fan_out(
+        let run = fan_out_with_budget(
             wave_specs,
             policy,
             lane_bound,
             cancel.clone(),
             factory.clone(),
+            Arc::clone(&budget),
         )
         .await;
         for report in &run.items {
@@ -1019,7 +1039,9 @@ where
             None => run,
             Some(previous) => OrchestratedRun {
                 items: Vec::new(),
-                budget_used: previous.budget_used.max(run.budget_used),
+                // One budget for the whole run: the counter is shared, so the
+                // latest wave's figure is the cumulative spend.
+                budget_used: run.budget_used,
                 budget_exhausted: previous.budget_exhausted || run.budget_exhausted,
                 ..run
             },
@@ -2710,6 +2732,44 @@ mod tests {
             message.contains('a') && message.contains('b'),
             "names the stuck tasks: {message}"
         );
+    }
+
+    /// One approval, one budget. Two investigations run in wave one and a
+    /// synthesis waits for them in wave two, all on a budget of TWO calls.
+    /// Before this, every wave minted a fresh budget: three calls were made on
+    /// an approval for two, the run reported a spend of two, and exhaustion
+    /// was never raised — the real bill was `waves × max_agent_calls`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dag_run_spends_one_budget_across_its_waves() {
+        let probe = Probe::default();
+        let factory_probe = probe.clone();
+        let (_handle, cancel) = never_cancelled();
+        let specs = vec![
+            dag_spec("compare", &["coatings", "seals"]),
+            dag_spec("coatings", &[]),
+            dag_spec("seals", &[]),
+        ];
+        let run = fan_out_dag(specs, &policy(2, 2), None, cancel, move |index, _| {
+            Box::new(FakeAgent::new(
+                index,
+                factory_probe.clone(),
+                Duration::from_millis(10),
+                vec![Step::Answer("done")],
+            )) as Box<dyn ItemAgent>
+        })
+        .await
+        .expect("a valid plan");
+        assert_eq!(
+            probe.attempts.load(Ordering::Acquire),
+            2,
+            "two calls were approved; the synthesis must not be a third"
+        );
+        assert_eq!(run.budget_used, 2, "{run:?}");
+        assert!(
+            run.budget_exhausted,
+            "the skipped synthesis is exhaustion, not silence"
+        );
+        assert_eq!(run.skipped(), 1, "{run:?}");
     }
 
     #[test]
