@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use super::{InducedClass, InducedRelation, normalize_label};
+use super::{InducedClass, InducedFactKind, InducedRelation, normalize_label};
 use crate::ontologies::Ontology;
 
 /// What one run inherited from one base ontology.
@@ -118,6 +118,10 @@ fn display_name(pref_label: Option<&str>, extraction_labels: &[String], iri: &st
 /// Measured before this rule existed: folding eight shards of one corpus
 /// produced eight parallel taxonomies — 3738 of 6893 classes were
 /// qualification duplicates whose shards all pointed at the same EMMO IRI.
+fn owned(tokens: Vec<&str>) -> Vec<String> {
+    tokens.into_iter().map(str::to_string).collect()
+}
+
 pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
     let mut seed = Seed::default();
     // normalised label -> (base id, surface form), for collision detection and
@@ -138,6 +142,23 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
         let base_id = base.id().to_string();
         let mut classes = 0usize;
         let mut relations = 0usize;
+        // The base serves WHICH of its relations fill each typed fact shape;
+        // a seed that re-derives nothing and copies nothing left every fold
+        // untyped, so a folded ontology could store no measurement at all —
+        // `fact_graph_shape` answered `None` for every kind. Same rescue as
+        // `class_exact_match`: read what the base states, carry it across.
+        let typed: [(InducedFactKind, Vec<String>); 4] = [
+            (
+                InducedFactKind::Measurement,
+                owned(base.measurement_relations()),
+            ),
+            (InducedFactKind::Phase, owned(base.phase_relations())),
+            (
+                InducedFactKind::Processing,
+                owned(base.processing_relations()),
+            ),
+            (InducedFactKind::Contains, owned(base.contains_relations())),
+        ];
 
         for decl in base.ontology_classes() {
             let iri = decl.iri.as_str().to_string();
@@ -189,6 +210,7 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
             claimed.insert(key, (base_id.clone(), label.clone()));
             iri_to_label.insert(iri, label.clone());
             identity_to_label.insert(identity.clone(), label.clone());
+            let label_for_sign = label.clone();
             seed.classes.push(InducedClass {
                 label,
                 definition: String::new(),
@@ -201,7 +223,10 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
                 // again at the next fold.
                 aligned_iri: Some(identity),
                 declared_by_reference: false,
-                sign_domain: None,
+                // The base answers by any name a reader may bind; the seeded
+                // label is one of them. Dropped silently before this, so a
+                // fold lost every `prism:signDomain` its shards declared.
+                sign_domain: base.quantity_sign_domain(&label_for_sign),
             });
             classes += 1;
         }
@@ -262,13 +287,22 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
                 None => label,
             };
             claimed_relations.insert(normalize_label(&label), base_id.clone());
+            // A relation is typed by the base's own statement, matched on the
+            // extraction token the base serves it under. Untyped stays
+            // untyped — an honest generic edge, never a guessed shape.
+            let fact_kind = typed.iter().find_map(|(kind, tokens)| {
+                decl.extraction_labels
+                    .iter()
+                    .any(|t| tokens.iter().any(|k| k == t))
+                    .then_some(*kind)
+            });
             seed.relations.push(InducedRelation {
                 label,
                 definition: String::new(),
                 domain,
                 range,
                 aligned_iri: Some(iri),
-                fact_kind: None,
+                fact_kind,
             });
             relations += 1;
         }

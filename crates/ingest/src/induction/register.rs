@@ -1147,6 +1147,53 @@ mod tests {
         );
     }
 
+    /// A base's typed fact shapes and sign domains must survive being seeded
+    /// from. The `Ontology` trait serves both (`measurement_relations`,
+    /// `quantity_sign_domain`); `seed_from` built every relation `fact_kind:
+    /// None` and every class `sign_domain: None` without asking. A folded
+    /// ontology therefore declared no measurement shape, `fact_graph_shape`
+    /// answered `None` for every kind, and every numeric claim against it was
+    /// reported unstorable. Same shape as the `domains: Vec::new()` loss, one
+    /// layer up. Drives the real adapter and the real seeder.
+    #[test]
+    fn seeding_from_a_base_carries_its_fact_kinds_and_sign_domains() {
+        let mut o = ontology("indtest-typedseed");
+        o.status = OntologyStatus::Accepted;
+        o.relations[0].fact_kind = Some(InducedFactKind::Measurement);
+        o.classes[2].sign_domain = Some(QuantitySignDomain::Signed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.ttl");
+        write_artifact(&path, &o).unwrap();
+        let base = load_induced_seed_from_path(&path).expect("loads as a seed");
+        assert!(
+            !base.measurement_relations().is_empty(),
+            "precondition: the base itself must serve the typed relation"
+        );
+
+        let seed = super::super::seed::seed_from(&[base]).expect("seeding succeeds");
+
+        let rel = seed
+            .relations
+            .iter()
+            .find(|r| r.label == "has property")
+            .unwrap();
+        assert_eq!(
+            rel.fact_kind,
+            Some(InducedFactKind::Measurement),
+            "the base states this relation fills the measurement shape; the seed must carry it"
+        );
+        let gtt = seed
+            .classes
+            .iter()
+            .find(|c| c.label == "Glass Transition Temperature")
+            .unwrap();
+        assert_eq!(
+            gtt.sign_domain,
+            Some(QuantitySignDomain::Signed),
+            "the base states this quantity is signed; the seed must carry it"
+        );
+    }
+
     /// Two bases that state the same `skos:exactMatch` have declared their
     /// classes identical; the fold must MERGE them, and only qualify apart the
     /// classes that share a word without a stated identity.
