@@ -29,12 +29,25 @@ impl ExternalConnector {
         Self { external }
     }
 
-    fn parse_port(uri: &str, default_port: u16) -> u16 {
-        // Try to extract port from URI like "kafka://host:9092" or "host:9092"
-        uri.rsplit(':')
-            .next()
-            .and_then(|p| p.trim_end_matches('/').parse().ok())
-            .unwrap_or(default_port)
+    /// Host and port of a service URI — `kafka://host:9092`, `host:9092`,
+    /// `host`, or a bare `9092` (host omitted means this machine). The host
+    /// is what gets probed: it is the one thing the URI is for.
+    fn parse_host_port(uri: &str, default_port: u16) -> (String, u16) {
+        let rest = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+        let rest = rest.trim_end_matches('/');
+        match rest.rsplit_once(':') {
+            Some((host, port)) => match port.parse() {
+                Ok(port) => (
+                    if host.is_empty() { "127.0.0.1" } else { host }.to_string(),
+                    port,
+                ),
+                Err(_) => (rest.to_string(), default_port),
+            },
+            None => match rest.parse() {
+                Ok(port) => ("127.0.0.1".to_string(), port),
+                Err(_) => (rest.to_string(), default_port),
+            },
+        }
     }
 }
 
@@ -45,9 +58,9 @@ impl ServiceOrchestrator for ExternalConnector {
         let mut services = Vec::new();
 
         if let Some(ref uri) = self.external.kafka_uri {
-            let port = Self::parse_port(uri, 9092);
-            let healthy = checker.check_port(port).await;
-            info!(uri, port, healthy, "external Kafka");
+            let (host, port) = Self::parse_host_port(uri, 9092);
+            let healthy = checker.check_addr(&host, port).await;
+            info!(uri, host, port, healthy, "external Kafka");
             if !healthy {
                 anyhow::bail!("Cannot connect to external Kafka at {uri}");
             }
@@ -87,14 +100,56 @@ impl ServiceOrchestrator for ExternalConnector {
 mod tests {
     use super::*;
 
+    /// The bug this pins: something listening on loopback made a broker on
+    /// another host look healthy, and a broker that was up looked down.
+    #[tokio::test]
+    async fn a_remote_broker_is_probed_where_it_lives() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = ServiceConfig::default();
+        let remote = ExternalConnector::new(ExternalServices {
+            kafka_uri: Some(format!("kafka://192.0.2.1:{port}")),
+        });
+        assert!(
+            remote.start_all(&config).await.is_err(),
+            "a loopback listener must not vouch for kafka://192.0.2.1"
+        );
+        let local = ExternalConnector::new(ExternalServices {
+            kafka_uri: Some(format!("127.0.0.1:{port}")),
+        });
+        let handles = local.start_all(&config).await.unwrap();
+        assert!(
+            handles
+                .services
+                .iter()
+                .any(|h| h.name == "kafka" && h.healthy)
+        );
+    }
+
+    #[test]
+    fn the_host_in_the_uri_is_the_host_that_gets_probed() {
+        let p = ExternalConnector::parse_host_port;
+        assert_eq!(
+            p("kafka://broker.example:9093/", 9092),
+            ("broker.example".into(), 9093)
+        );
+        assert_eq!(
+            p("broker.example:9093", 9092),
+            ("broker.example".into(), 9093)
+        );
+        assert_eq!(p("broker.example", 9092), ("broker.example".into(), 9092));
+        assert_eq!(p("9093", 9092), ("127.0.0.1".into(), 9093));
+        assert_eq!(p(":9093", 9092), ("127.0.0.1".into(), 9093));
+    }
+
     #[test]
     fn parse_port_from_scheme_uri() {
         assert_eq!(
-            ExternalConnector::parse_port("kafka://localhost:9092", 9092),
+            ExternalConnector::parse_host_port("kafka://localhost:9092", 9092).1,
             9092
         );
         assert_eq!(
-            ExternalConnector::parse_port("kafka://broker.internal:9100", 9092),
+            ExternalConnector::parse_host_port("kafka://broker.internal:9100", 9092).1,
             9100
         );
     }
@@ -102,11 +157,11 @@ mod tests {
     #[test]
     fn parse_port_from_http_uri() {
         assert_eq!(
-            ExternalConnector::parse_port("http://10.0.0.5:3002", 3002),
+            ExternalConnector::parse_host_port("http://10.0.0.5:3002", 3002).1,
             3002
         );
         assert_eq!(
-            ExternalConnector::parse_port("http://scraper:3010/", 3002),
+            ExternalConnector::parse_host_port("http://scraper:3010/", 3002).1,
             3010
         );
     }
@@ -114,13 +169,16 @@ mod tests {
     #[test]
     fn parse_port_bare_host() {
         assert_eq!(
-            ExternalConnector::parse_port("kafka-broker:9092", 9092),
+            ExternalConnector::parse_host_port("kafka-broker:9092", 9092).1,
             9092
         );
     }
 
     #[test]
     fn parse_port_falls_back_to_default() {
-        assert_eq!(ExternalConnector::parse_port("just-a-hostname", 9092), 9092);
+        assert_eq!(
+            ExternalConnector::parse_host_port("just-a-hostname", 9092).1,
+            9092
+        );
     }
 }

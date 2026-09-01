@@ -21,9 +21,18 @@ impl HealthChecker {
         }
     }
 
-    /// Check if a TCP port is accepting connections.
+    /// Check if a TCP port on THIS machine is accepting connections — the
+    /// readiness signal for services the orchestrator itself started.
     pub async fn check_port(&self, port: u16) -> bool {
-        let addr = format!("127.0.0.1:{port}");
+        self.check_addr("127.0.0.1", port).await
+    }
+
+    /// Check if `host:port` is accepting connections. An external service
+    /// lives wherever its URI says; probing loopback in its place made a
+    /// remote broker's health depend on what happened to be listening on
+    /// the developer's own machine.
+    pub async fn check_addr(&self, host: &str, port: u16) -> bool {
+        let addr = format!("{host}:{port}");
         timeout(Duration::from_secs(2), TcpStream::connect(&addr))
             .await
             .is_ok_and(|r| r.is_ok())
@@ -147,5 +156,32 @@ impl HealthMonitor {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listener on loopback must not vouch for a host that is somewhere
+    /// else: the probe goes to the address it was asked about.
+    #[tokio::test]
+    async fn a_loopback_listener_does_not_vouch_for_a_remote_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let checker = HealthChecker::new();
+        assert!(
+            checker.check_addr("127.0.0.1", port).await,
+            "the local listener is up"
+        );
+        assert!(
+            checker.check_port(port).await,
+            "check_port is the loopback case"
+        );
+        // 192.0.2.0/24 is TEST-NET-1: never routed, so the probe times out.
+        assert!(
+            !checker.check_addr("192.0.2.1", port).await,
+            "a remote host must be probed where it lives, not on loopback"
+        );
     }
 }
