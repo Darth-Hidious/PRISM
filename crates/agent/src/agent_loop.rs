@@ -4448,10 +4448,7 @@ pub(crate) async fn run_turn_inner(
                             // meta-tool that can pull an arbitrarily large
                             // payload back into the conversation, so it sizes
                             // itself against what the turn actually has left.
-                            Some(crate::meta_tools::TurnRemaining::new(
-                                transcript.cost.total_input,
-                                transcript.budget.max_input_tokens,
-                            )),
+                            crate::meta_tools::recall_budget(&transcript.cost, &transcript.budget),
                         )
                         .await
                         .map(|value| serde_json::json!({ "result": value }))

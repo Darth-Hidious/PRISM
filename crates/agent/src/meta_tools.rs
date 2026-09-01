@@ -220,6 +220,31 @@ pub struct TurnRemaining {
     pub total: u64,
 }
 
+/// What `recall` may size itself against: the LAST request measured against
+/// the model's usable window — never cumulative spend against a fixed number.
+///
+/// It was `TurnRemaining::new(cost.total_input, budget.max_input_tokens)`:
+/// the sum of every prompt in the turn, divided by 200_000 regardless of
+/// model. `exhausted()` retired exactly that comparison after every research
+/// run on 2026-08-20 died of it, and left this copy behind. On a 1M-context
+/// model, thirty modest tool calls put the cumulative sum past 180k while
+/// each request sat at a few percent of the window, and `recall` refused —
+/// "only 10% of this turn's budget is left" — with nine hundred thousand
+/// tokens free.
+///
+/// An unknown window (local llama.cpp with no `/props`) returns `None`:
+/// `recall` keeps its flat ceiling and refuses nothing, because there is no
+/// number to refuse against.
+#[must_use]
+pub fn recall_budget(
+    cost: &crate::transcript::CostTracker,
+    budget: &crate::transcript::TurnBudget,
+) -> Option<TurnRemaining> {
+    budget
+        .usable_context()
+        .map(|usable| TurnRemaining::new(cost.last_input, usable))
+}
+
 impl TurnRemaining {
     #[must_use]
     pub fn new(used: u64, total: u64) -> Self {
@@ -1619,6 +1644,31 @@ mod tests {
     /// many fetches a turn makes. Measured on a live run: nine consecutive
     /// recalls took a 200k-token turn from 87% to 100%, because nine × 64k
     /// chars is ~144k tokens — 86% of everything left after the tool block.
+    /// A 1M-context model with 180k of cumulative spend and a 20k last request
+    /// has nine hundred thousand tokens free; recall must not refuse. And an
+    /// unknown window refuses nothing.
+    #[test]
+    fn recall_sizes_against_the_last_request_and_the_models_window() {
+        use crate::transcript::{CostTracker, TurnBudget};
+        let cost = CostTracker {
+            total_input: 180_000,
+            last_input: 20_000,
+            ..CostTracker::default()
+        };
+        let big = TurnBudget::for_model(Some(1_000_000), None);
+        let rem = recall_budget(&cost, &big).expect("a known window yields a budget");
+        assert_eq!(rem.total, big.usable_context().unwrap());
+        assert!(
+            recall_cap_for_budget(Some(rem)).is_ok(),
+            "180k cumulative on a 1M model is not 'budget exhausted'"
+        );
+        let unknown = TurnBudget::for_model(None, None);
+        assert!(
+            recall_budget(&cost, &unknown).is_none(),
+            "no window, no number to refuse against"
+        );
+    }
+
     #[test]
     fn a_recall_is_sized_by_what_the_turn_has_left() {
         // No budget context (slash command, test): unchanged behaviour.
