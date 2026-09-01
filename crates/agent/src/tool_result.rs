@@ -95,8 +95,19 @@ pub fn tool_result_is_error(value: &Value) -> bool {
         None => return false,
     };
 
-    // (1) Top-level string error — the legacy/outer-wrap signal.
-    if obj.get("error").and_then(Value::as_str).is_some() {
+    // (1) Top-level error — a string, OR an object (`{"error": {"code":
+    //     …}}` is how structured tools report). Only a string counted, so an
+    //     error object read as success: the TUI showed ✓, provenance stored
+    //     "ok", and the saturation counter credited the call.
+    if obj.get("error").is_some_and(|e| !e.is_null()) {
+        return true;
+    }
+    // A tool that says `status: "error"|"failed"` has said it failed.
+    if obj
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| matches!(s, "error" | "failed"))
+    {
         return true;
     }
 
@@ -104,7 +115,7 @@ pub fn tool_result_is_error(value: &Value) -> bool {
     //     notebook_exec's "result" is a string (the last-expression value);
     //     descending into it would misread the payload.
     if let Some(inner) = obj.get("result").and_then(Value::as_object) {
-        if inner.get("error").and_then(Value::as_str).is_some() {
+        if inner.get("error").is_some_and(|e| !e.is_null()) {
             return true;
         }
         if let Some(false) = inner.get("success").and_then(Value::as_bool) {
@@ -464,5 +475,33 @@ mod tests {
             tool_result_evidence(&content),
             Some(EvidenceClass::Research)
         );
+    }
+
+    /// An error OBJECT and a `status: "error"` are errors. Only a string
+    /// `error` counted, so `{"error": {"code": 429}}` and `{"status":
+    /// "error"}` read as successes to the TUI badge, provenance status and
+    /// the saturation counter.
+    #[test]
+    fn an_error_object_or_error_status_is_an_error() {
+        assert!(tool_result_is_error(
+            &serde_json::json!({"error": {"code": 429, "message": "rate limited"}})
+        ));
+        assert!(tool_result_is_error(
+            &serde_json::json!({"result": {"error": {"kind": "timeout"}}})
+        ));
+        assert!(tool_result_is_error(
+            &serde_json::json!({"status": "error", "detail": "x"})
+        ));
+        assert!(tool_result_is_error(
+            &serde_json::json!({"status": "failed"})
+        ));
+        // and the honest non-errors stay non-errors
+        assert!(!tool_result_is_error(
+            &serde_json::json!({"error": null, "rows": 3})
+        ));
+        assert!(!tool_result_is_error(&serde_json::json!({"status": "ok"})));
+        assert!(!tool_result_is_error(
+            &serde_json::json!({"result": "a string result"})
+        ));
     }
 }
