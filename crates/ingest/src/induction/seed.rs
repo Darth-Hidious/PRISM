@@ -251,9 +251,18 @@ pub fn seed_from(bases: &[Arc<dyn Ontology>]) -> Result<Seed> {
             // `undeclared_domain`/`undeclared_range`. Report it rather than
             // emitting an artifact that cannot validate.
             let (Some(domain), Some(range)) = (domain, range) else {
+                // Two different facts wore one message. The shipped EMMO subset
+                // declares no domain or range for any of its properties, so its
+                // relations were reported as "not among the seeded classes" —
+                // sending a reader to look for a seeding gap that does not exist.
+                let reason = if decl.domains.is_empty() || decl.ranges.is_empty() {
+                    "the base declares no domain or range for it, and a PRISM relation \
+                     needs typed endpoints"
+                } else {
+                    "its domain or range is not among the seeded classes"
+                };
                 seed.notes.push(format!(
-                    "base {base_id}: relation {label:?} skipped — its domain or range is \
-                     not among the seeded classes"
+                    "base {base_id}: relation {label:?} skipped — {reason}"
                 ));
                 continue;
             };
@@ -430,6 +439,7 @@ mod tests {
     struct Fake {
         id: &'static str,
         classes: Vec<ClassDecl>,
+        relations: Vec<crate::ontologies::RelationDecl>,
     }
 
     impl Ontology for Fake {
@@ -449,7 +459,7 @@ mod tests {
             &self.classes
         }
         fn relations(&self) -> &[crate::ontologies::RelationDecl] {
-            &[]
+            &self.relations
         }
         fn is_a(&self, _sub: &Iri, _sup: &Iri) -> bool {
             false
@@ -468,6 +478,79 @@ mod tests {
         }
     }
 
+    fn relation(
+        iri: &str,
+        label: &str,
+        domains: Vec<&str>,
+        ranges: Vec<&str>,
+    ) -> crate::ontologies::RelationDecl {
+        crate::ontologies::RelationDecl {
+            iri: Iri::new(iri.to_string()).unwrap(),
+            pref_label: Some(label.to_string()),
+            parents: vec![],
+            domains: domains
+                .into_iter()
+                .map(|d| Iri::new(d.to_string()).unwrap())
+                .collect(),
+            ranges: ranges
+                .into_iter()
+                .map(|r| Iri::new(r.to_string()).unwrap())
+                .collect(),
+            extraction_labels: vec![label.to_string()],
+        }
+    }
+
+    /// The shipped EMMO subset declares no domain or range for any property,
+    /// so its relations cannot be seeded — a true limit, which the note used
+    /// to misreport as "not among the seeded classes", sending a reader to
+    /// hunt for a seeding gap that does not exist.
+    #[test]
+    fn a_relation_the_base_never_typed_is_reported_as_such_not_as_a_seeding_gap() {
+        let base: Arc<dyn Ontology> = Arc::new(Fake {
+            id: "fake",
+            classes: vec![class("https://example.org#Material", "Material", vec![])],
+            relations: vec![
+                relation(
+                    "https://example.org#hasProperty",
+                    "hasProperty",
+                    vec![],
+                    vec![],
+                ),
+                relation(
+                    "https://example.org#madeIn",
+                    "madeIn",
+                    vec!["https://example.org#Material"],
+                    vec!["https://example.org#Factory"],
+                ),
+            ],
+        });
+        let seed = seed_from(&[base]).expect("seeds");
+        assert!(
+            seed.relations.is_empty(),
+            "neither relation can be typed: {:?}",
+            seed.relations
+        );
+        let untyped = seed
+            .notes
+            .iter()
+            .find(|n| n.contains("\"hasProperty\""))
+            .expect("a note for the untyped relation");
+        assert!(untyped.contains("declares no domain or range"), "{untyped}");
+        assert!(
+            !untyped.contains("not among the seeded classes"),
+            "{untyped}"
+        );
+        let unseeded = seed
+            .notes
+            .iter()
+            .find(|n| n.contains("\"madeIn\""))
+            .expect("a note for the relation whose range is not seeded");
+        assert!(
+            unseeded.contains("not among the seeded classes"),
+            "{unseeded}"
+        );
+    }
+
     #[test]
     fn a_seeded_class_keeps_its_base_identity_and_its_parent() {
         let base: Arc<dyn Ontology> = Arc::new(Fake {
@@ -480,6 +563,7 @@ mod tests {
                     vec!["https://example.org#Material"],
                 ),
             ],
+            relations: vec![],
         });
         let seed = seed_from(&[base]).expect("seeds");
 
@@ -507,10 +591,12 @@ mod tests {
         let a: Arc<dyn Ontology> = Arc::new(Fake {
             id: "materials",
             classes: vec![class("https://a#Cell", "Cell", vec![])],
+            relations: vec![],
         });
         let b: Arc<dyn Ontology> = Arc::new(Fake {
             id: "biology",
             classes: vec![class("https://b#Cell", "Cell", vec![])],
+            relations: vec![],
         });
         let seed = seed_from(&[a, b]).expect("two domains may be grown together");
 
@@ -551,6 +637,7 @@ mod tests {
                     vec!["https://example.org#A", "https://example.org#B"],
                 ),
             ],
+            relations: vec![],
         });
         let seed = seed_from(&[base]).expect("seeds");
         let c = seed.classes.iter().find(|x| x.label == "C").unwrap();
