@@ -186,10 +186,30 @@ impl DocumentUnderstanding for VisionUnderstanding {
             );
         };
 
+        // One page's failure is that page's failure. This was `?` inside the
+        // loop: page 3 of 30 failing threw away pages 1-2 — already rendered,
+        // tiled, and billed — and never attempted 4-30, and `escalate` then
+        // recorded one adapter-level note with no page recovered. The pages
+        // that read are returned; the pages that did not stay damaged under
+        // their own note, and each is named here. Only when NO page read is
+        // the adapter itself the failure — returned as `Err` carrying the
+        // first error, so its origin (local render fault vs. an answer from
+        // the endpoint) still reaches the breaker.
         let mut pages = Vec::new();
+        let mut first_error = None;
         for &number in wanted {
-            let text = self.read_page(doc.bytes, number).await?;
-            pages.push(PageText { number, text });
+            match self.read_page(doc.bytes, number).await {
+                Ok(text) => pages.push(PageText { number, text }),
+                Err(error) => {
+                    tracing::warn!(page = number, error = %format!("{error:#}"), "vision read of one page failed; the others are kept");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if pages.is_empty()
+            && let Some(error) = first_error
+        {
+            return Err(error);
         }
         Ok(Understanding {
             adapter_id: self.id().into(),
@@ -271,6 +291,85 @@ mod tests {
     /// Reading a whole paper by sight is a large billable cost, so it must be
     /// a deliberate request. An audit made `pages: None` default to reading
     /// pages 1-3 and nothing failed.
+    /// One page's failure is that page's failure. This was `?` inside the page
+    /// loop: page 2 of 3 failing threw away page 1 — already rendered, tiled
+    /// and billed — and never attempted page 3. The pages that read are
+    /// returned; only when NO page read is the adapter the failure.
+    #[tokio::test]
+    async fn one_pages_failure_keeps_the_pages_that_read() {
+        /// Renders every page except `broken`.
+        struct FailsOn {
+            broken: u32,
+        }
+        impl PageRasteriser for FailsOn {
+            fn id(&self) -> &'static str {
+                "fails-on"
+            }
+            fn readiness(&self) -> Readiness {
+                Readiness::Ready
+            }
+            fn render(&self, _pdf: &[u8], page: u32, _dpi: u32) -> Result<Vec<u8>> {
+                if page == self.broken {
+                    anyhow::bail!("pdftoppm exited with status 7 on page {page}")
+                }
+                Ok(page_png(400, 300))
+            }
+        }
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "UTS 1140 MPa at 298 K"}}]
+            })))
+            .mount(&server)
+            .await;
+        let llm = prism_llm::LlmClient::new(prism_llm::LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "stub-vlm".into(),
+            ..Default::default()
+        });
+        let doc = SourceDocument {
+            bytes: b"%PDF",
+            media_type: "pdf",
+            label: "x.pdf",
+            pages: Some(&[1, 2, 3]),
+        };
+
+        let reader = VisionUnderstanding::new(Arc::new(FailsOn { broken: 2 }), Arc::new(llm));
+        let read = reader
+            .understand(&doc)
+            .await
+            .expect("two of three pages read");
+        let numbers: Vec<u32> = read.pages.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![1, 3], "pages 1 and 3 read and must be kept");
+
+        // Every page failing is the adapter failing, and the caller must hear it.
+        let llm2 = prism_llm::LlmClient::new(prism_llm::LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "stub-vlm".into(),
+            ..Default::default()
+        });
+        struct FailsAll;
+        impl PageRasteriser for FailsAll {
+            fn id(&self) -> &'static str {
+                "fails-all"
+            }
+            fn readiness(&self) -> Readiness {
+                Readiness::Ready
+            }
+            fn render(&self, _pdf: &[u8], page: u32, _dpi: u32) -> Result<Vec<u8>> {
+                anyhow::bail!("no renderer for page {page}")
+            }
+        }
+        let reader = VisionUnderstanding::new(Arc::new(FailsAll), Arc::new(llm2));
+        let err = reader
+            .understand(&doc)
+            .await
+            .expect_err("no page read: the adapter failed");
+        assert!(format!("{err:#}").contains("no renderer"), "{err:#}");
+    }
+
     #[tokio::test]
     async fn reading_a_whole_document_by_sight_is_refused() {
         let (reader, _server) = vision_against("some text").await;
