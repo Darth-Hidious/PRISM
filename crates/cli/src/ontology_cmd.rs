@@ -1895,26 +1895,6 @@ async fn accept_proposals(
         }
     };
 
-    let mut provenance = prism_ingest::induction::InductionProvenance {
-        model: "ontology-proposal-governance".to_string(),
-        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ..Default::default()
-    };
-    // Attributable identity: the artifact differs with the proposal set.
-    // Hash the sorted ids so the value is a real digest, matching the
-    // `sha256:<hex>` contract the field documents.
-    let mut ids = item_ids.to_vec();
-    ids.sort();
-    let ids_joined = ids.join("\n");
-    provenance.corpus_hash = format!(
-        "sha256:{}",
-        sha2::Sha256::digest(ids_joined.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
-    provenance.merge_notes.extend(extra_parent_notes);
-
     let mut ontology = if output_path.exists() {
         let mut existing = induction::load_validated(&output_path)?;
         if let Some(domain) = domain
@@ -1941,6 +1921,35 @@ async fn accept_proposals(
             provenance: Default::default(),
         }
     };
+    // Governance EXTENDS an artifact; it does not re-derive it. This block
+    // used to be built from `Default` with only `model` and `created_at`
+    // set, then assigned over the loaded artifact's provenance wholesale:
+    // `seeds` went empty (the field's own doc: "without this a grown artifact
+    // silently takes credit for every class it inherited"), `documents_total`
+    // went to 0 (the artifact claimed no document was ever read), every
+    // original merge note — including thousands of recorded conflicts — was
+    // wiped, and `version_iri`, derived from `corpus_hash` and `seeds`,
+    // silently changed identity. Start from what the artifact already knows.
+    let mut provenance = ontology.provenance.clone();
+    provenance.model = "ontology-proposal-governance".to_string();
+    provenance.created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    // Attributable identity: the artifact differs with the proposal set.
+    // Hash the sorted ids so the value is a real digest, matching the
+    // `sha256:<hex>` contract the field documents.
+    let mut ids = item_ids.to_vec();
+    ids.sort();
+    // Chained, not replaced: the artifact's identity changes with the
+    // proposal set — but its lineage to the corpus it was induced from
+    // survives in the hash rather than being overwritten by it.
+    let ids_joined = format!("{}\n{}", ontology.provenance.corpus_hash, ids.join("\n"));
+    provenance.corpus_hash = format!(
+        "sha256:{}",
+        sha2::Sha256::digest(ids_joined.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    provenance.merge_notes.extend(extra_parent_notes);
 
     // Absorb through the SAME builder machinery induction uses, so
     // duplicate merging, referential closure and cycle-breaking behave
@@ -2857,8 +2866,8 @@ mod tests {
     /// re-queued. Nothing here builds its own registry or store — the
     /// handlers derive everything from `$HOME` and the project root, which
     /// is exactly what a real invocation does.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn proposal_governance_roundtrip_through_the_cli_surface() {
         let _guard = crate::boot_checks::ENV_LOCK
             .lock()
@@ -3050,5 +3059,122 @@ mod tests {
                 .unwrap(),
             prism_provenance::OntologyProposalEnqueue::SupersededByDisposition
         );
+    }
+
+    /// Accepting one proposal onto a grown artifact must EXTEND its
+    /// provenance, not replace it. The governance block was built from
+    /// `Default` and assigned wholesale: `seeds` went empty, so the artifact
+    /// took credit for every inherited class; `documents_total` went to 0;
+    /// every original merge note was wiped; and `version_iri` — derived from
+    /// `corpus_hash` and `seeds` — silently changed identity.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn accepting_a_proposal_extends_provenance_rather_than_replacing_it() {
+        let _guard = crate::boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let project = tempfile::tempdir().expect("project tempdir");
+        let neutral = InducedClass {
+            label: "NeutralEntity".to_string(),
+            definition: "A neutral test concept.".to_string(),
+            parent: None,
+            aligned_iri: None,
+            declared_by_reference: false,
+            sign_domain: None,
+        };
+        let mut active = draft_ontology("gov-active2");
+        active.classes = vec![neutral.clone()];
+        let source = project.path().join("gov-active2-candidate.ttl");
+        ttl::write_artifact(&source, &active).expect("write draft");
+        let promoted = ttl::promote_artifact(&source).expect("promote");
+        install_promoted_artifact(project.path(), &promoted).expect("install");
+        std::fs::create_dir_all(project.path().join(".prism")).expect("project .prism");
+        std::fs::write(
+            project.path().join(".prism/prism.toml"),
+            "[ontology]\nid = \"gov-active2\"\n",
+        )
+        .expect("project config");
+        let root = project.path().to_path_buf();
+        let home = tempfile::tempdir().expect("home tempdir");
+        std::fs::create_dir_all(home.path().join(".prism")).expect("home .prism");
+        let _restore_home = HomeRestore::isolated(home.path());
+        let store = prism_provenance::ProvenanceStore::open(&proposal_store_path().unwrap())
+            .await
+            .expect("open governance store");
+
+        // The artifact being extended: grown from a seed, seven documents read,
+        // two merge notes recorded, a known corpus hash.
+        let mut grown = draft_ontology("gov-grown");
+        grown.classes = vec![neutral];
+        grown.provenance.seeds = vec![prism_ingest::induction::seed::SeedRef {
+            id: "emmo".to_string(),
+            version_iri: "https://w3id.org/emmo/1.0.3".to_string(),
+            artifact_sha256: "0".repeat(64),
+            classes: 50,
+            relations: 5,
+        }];
+        grown.provenance.documents_total = 7;
+        grown.provenance.merge_notes = vec!["note one".to_string(), "note two".to_string()];
+        grown.provenance.corpus_hash = "sha256:original-corpus".to_string();
+        let output = project.path().join("gov-grown.ttl");
+        ttl::write_artifact(&output, &grown).expect("write grown artifact");
+
+        let parent_iri = "https://prism.mirdyne.com/ontology/gov-active2#NeutralEntity".to_string();
+        let class_proposal = prism_ingest::paper_agent::OntologyClassProposal {
+            label: "Sieved Powder".to_string(),
+            proposed_iri: None,
+            parent_iris: vec![parent_iri],
+            description: Some("Powder passed through a sieve.".to_string()),
+            citation: prism_ingest::paper_agent::PaperCitation {
+                source_revision_id: "ab".repeat(32),
+                from_line: 2,
+                to_line: 2,
+                quoted_text: "powders were sieved before use".to_string(),
+            },
+        };
+        let (class_item, class_citation) = prism_ingest::paper_agent::class_proposal_queue_item(
+            &class_proposal,
+            "paper.pdf",
+            "local",
+            1.0,
+        );
+        store
+            .enqueue_ontology_proposal(&class_item, &class_citation, 1.0)
+            .await
+            .unwrap();
+
+        accept_proposals(
+            &store,
+            std::slice::from_ref(&class_item.item_id),
+            Some("gov-grown"),
+            Some(output.clone()),
+            &root,
+        )
+        .await
+        .expect("accept onto the grown artifact");
+
+        let extended = induction::load_validated(&output).expect("extended artifact parses");
+        let prov = &extended.provenance;
+        assert_eq!(
+            prov.seeds.len(),
+            1,
+            "the seed the artifact grew from must survive"
+        );
+        assert_eq!(
+            prov.documents_total, 7,
+            "the documents it read must survive"
+        );
+        assert!(
+            prov.merge_notes.iter().any(|n| n == "note one")
+                && prov.merge_notes.iter().any(|n| n == "note two"),
+            "the original merge notes must survive: {:?}",
+            prov.merge_notes
+        );
+        assert_eq!(prov.model, "ontology-proposal-governance");
+        assert_ne!(
+            prov.corpus_hash, "sha256:original-corpus",
+            "identity changes with the proposal set"
+        );
+        assert!(prov.corpus_hash.starts_with("sha256:"));
     }
 }
