@@ -298,9 +298,111 @@ pub fn strip_markup(input: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The named entities scientific text actually uses, beyond XML's five.
+/// Deleting one of these silently corrupted numbers: `950 &plusmn; 30 MPa`
+/// became `950 30 MPa`, the `Uncertainty` guard in `claims.rs` could no
+/// longer see a `±`, and 30 stamped as a measured value — with a stored quote
+/// that verified against the corrupted text, so provenance certified it.
+/// `&deg;C` became `C`; `&mu;m` became `m`.
+const NAMED_ENTITIES: &[(&str, &str)] = &[
+    ("nbsp", " "),
+    ("plusmn", "±"),
+    ("deg", "°"),
+    ("micro", "µ"),
+    ("times", "×"),
+    ("divide", "÷"),
+    ("minus", "−"),
+    ("middot", "·"),
+    ("sdot", "⋅"),
+    ("le", "≤"),
+    ("ge", "≥"),
+    ("ne", "≠"),
+    ("asymp", "≈"),
+    ("approx", "≈"),
+    ("equiv", "≡"),
+    ("sim", "∼"),
+    ("cong", "≅"),
+    ("prop", "∝"),
+    ("infin", "∞"),
+    ("sup2", "²"),
+    ("sup3", "³"),
+    ("frac12", "½"),
+    ("frac14", "¼"),
+    ("frac34", "¾"),
+    ("prime", "′"),
+    ("Prime", "″"),
+    ("permil", "‰"),
+    ("ndash", "–"),
+    ("mdash", "—"),
+    ("hellip", "…"),
+    ("lsquo", "‘"),
+    ("rsquo", "’"),
+    ("ldquo", "“"),
+    ("rdquo", "”"),
+    ("larr", "←"),
+    ("rarr", "→"),
+    ("harr", "↔"),
+    ("uarr", "↑"),
+    ("darr", "↓"),
+    ("rArr", "⇒"),
+    ("hArr", "⇔"),
+    ("part", "∂"),
+    ("nabla", "∇"),
+    ("sum", "∑"),
+    ("prod", "∏"),
+    ("int", "∫"),
+    ("radic", "√"),
+    ("ang", "∠"),
+    ("perp", "⊥"),
+    ("oplus", "⊕"),
+    ("otimes", "⊗"),
+    ("Aring", "Å"),
+    ("aring", "å"),
+    ("alpha", "α"),
+    ("beta", "β"),
+    ("gamma", "γ"),
+    ("delta", "δ"),
+    ("epsilon", "ε"),
+    ("zeta", "ζ"),
+    ("eta", "η"),
+    ("theta", "θ"),
+    ("iota", "ι"),
+    ("kappa", "κ"),
+    ("lambda", "λ"),
+    ("mu", "μ"),
+    ("nu", "ν"),
+    ("xi", "ξ"),
+    ("pi", "π"),
+    ("rho", "ρ"),
+    ("sigma", "σ"),
+    ("tau", "τ"),
+    ("upsilon", "υ"),
+    ("phi", "φ"),
+    ("chi", "χ"),
+    ("psi", "ψ"),
+    ("omega", "ω"),
+    ("Gamma", "Γ"),
+    ("Delta", "Δ"),
+    ("Theta", "Θ"),
+    ("Lambda", "Λ"),
+    ("Xi", "Ξ"),
+    ("Pi", "Π"),
+    ("Sigma", "Σ"),
+    ("Phi", "Φ"),
+    ("Psi", "Ψ"),
+    ("Omega", "Ω"),
+    ("copy", "©"),
+    ("reg", "®"),
+    ("trade", "™"),
+    ("euro", "€"),
+    ("pound", "£"),
+];
+
 /// Resolve one entity/character reference name (quick-xml 0.41 emits
-/// `GeneralRef` events for them inside text). Unknown named entities
-/// resolve to nothing — no text is invented.
+/// `GeneralRef` events for them inside text). No text is invented — and none
+/// is deleted: a name this table does not know comes back as the literal
+/// `&name;` it was, so a reader sees an unresolved reference rather than a
+/// silently shorter sentence with a different number in it.
 pub fn resolve_reference(name: &str) -> String {
     match name {
         "amp" => "&".to_string(),
@@ -322,7 +424,10 @@ pub fn resolve_reference(name: &str) -> String {
                     .map(|c| c.to_string())
                     .unwrap_or_default()
             } else {
-                String::new()
+                NAMED_ENTITIES
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map_or_else(|| format!("&{name};"), |(_, c)| (*c).to_string())
             }
         }
     }
@@ -351,6 +456,17 @@ mod tests {
         );
     }
 
+    /// `&plusmn;` deleted turned `950 ± 30 MPa` into `950 30 MPa`, and 30
+    /// was stored as a measured value with a quote that verified against the
+    /// corrupted text. Driven through the real markup path.
+    #[test]
+    fn an_uncertainty_survives_the_markup_path() {
+        assert_eq!(
+            strip_markup("<p>UTS of 950 &plusmn; 30 MPa at 25 &deg;C, grains 50 &mu;m</p>"),
+            "UTS of 950 ± 30 MPa at 25 °C, grains 50 μm"
+        );
+    }
+
     #[test]
     fn strip_markup_keeps_text_drops_tags() {
         assert_eq!(
@@ -367,6 +483,14 @@ mod tests {
         assert_eq!(resolve_reference("amp"), "&");
         assert_eq!(resolve_reference("#65"), "A");
         assert_eq!(resolve_reference("#x41"), "A");
-        assert_eq!(resolve_reference("nbsp"), "");
+        assert_eq!(resolve_reference("nbsp"), " ");
+        assert_eq!(resolve_reference("plusmn"), "±");
+        assert_eq!(resolve_reference("deg"), "°");
+        assert_eq!(resolve_reference("mu"), "μ");
+        assert_eq!(
+            resolve_reference("zzzunknown"),
+            "&zzzunknown;",
+            "an unknown entity is kept literal, never deleted"
+        );
     }
 }
