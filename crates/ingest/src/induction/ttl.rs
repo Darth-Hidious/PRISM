@@ -253,6 +253,15 @@ fn literal_of(graph: &FastGraph, s: &impl Term, p: &impl Term) -> Option<String>
         .find_map(|t| t.o().lexical_form().map(|lex| lex.to_string()))
 }
 
+/// Whether any predicate in `graph` lives under `ns`. Decides which meta
+/// namespace an artifact was written under, once, before any lookup.
+fn graph_uses_namespace(graph: &FastGraph, ns: &str) -> bool {
+    graph
+        .triples()
+        .filter_map(|t| t.ok())
+        .any(|t| t.p().iri().is_some_and(|iri| iri.as_str().starts_with(ns)))
+}
+
 /// One IRI object of (s, p) in `graph`, if present.
 fn iri_of(graph: &FastGraph, s: &impl Term, p: &impl Term) -> Option<String> {
     graph
@@ -298,7 +307,16 @@ pub fn parse_turtle(ttl: &str) -> Result<InducedOntology> {
     let rdfs = Namespace::new_unchecked(RDFS_NS);
     let prov = Namespace::new_unchecked(PROV_NS);
     let dcterms = Namespace::new_unchecked(DCTERMS_NS);
-    let prism = Namespace::new_unchecked(PRISM_META_NS);
+    // Read under whichever meta namespace THIS artifact speaks. Artifacts
+    // written before the rename carry the legacy IRI on every prism: term;
+    // reading them under the new one found nothing and rejected them as
+    // "not a PRISM induction artifact". The writer emits only the current
+    // namespace, so this is read-compat, not a second dialect.
+    let prism = if graph_uses_namespace(&graph, super::LEGACY_PRISM_META_NS) {
+        Namespace::new_unchecked(super::LEGACY_PRISM_META_NS)
+    } else {
+        Namespace::new_unchecked(PRISM_META_NS)
+    };
 
     let owl_ontology = owl.get_unchecked("Ontology");
     let owl_class = owl.get_unchecked("Class");
@@ -545,6 +563,35 @@ mod tests {
         OntologyLabelProposal, SemanticCheckReport, SemanticValidationStatus,
     };
     use prism_provenance::QuantitySignDomain;
+
+    /// An artifact written under the pre-rename meta namespace must still
+    /// read as the same artifact. 93c14e70 renamed `PRISM_META_NS`; every
+    /// shard induced before it then failed with "artifact carries no
+    /// prism:domain — not a PRISM induction artifact", which blamed the
+    /// file for the parser having moved. The writer emits only the current
+    /// namespace; this pins that the reader accepts both.
+    #[test]
+    fn an_artifact_under_the_legacy_meta_namespace_still_parses() {
+        let o = sample();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.ttl");
+        write_artifact(&path, &o).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            current.contains(PRISM_META_NS),
+            "precondition: written under the current ns"
+        );
+        let legacy = current.replace(PRISM_META_NS, super::super::LEGACY_PRISM_META_NS);
+        assert!(!legacy.contains(PRISM_META_NS));
+
+        let from_current = parse_turtle(&current).expect("current namespace parses");
+        let from_legacy = parse_turtle(&legacy)
+            .expect("an artifact under the legacy namespace is still a PRISM artifact");
+        assert_eq!(from_legacy.domain, from_current.domain);
+        assert_eq!(from_legacy.status, from_current.status);
+        assert_eq!(from_legacy.classes.len(), from_current.classes.len());
+        assert_eq!(from_legacy.relations.len(), from_current.relations.len());
+    }
 
     fn sample() -> InducedOntology {
         InducedOntology {

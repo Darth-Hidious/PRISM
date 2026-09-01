@@ -70,6 +70,12 @@ pub const PROMPT_VERSION: &str = "4";
 /// re-induction rather than rewritten in place, so no stored fact is
 /// silently re-pointed at a class it was never bound to.
 pub const PRISM_META_NS: &str = "https://prism.mirdyne.com/ontology/meta#";
+/// The meta namespace every artifact carried before 93c14e70 renamed it.
+/// Written by nothing; READ so that those artifacts stay artifacts. The
+/// rename alone turned eight induced shards (fourteen hours of compute) into
+/// "not a PRISM induction artifact" — a message that blamed the files for
+/// the parser having moved. An IRI rename without read-compat is data loss.
+pub const LEGACY_PRISM_META_NS: &str = "https://prism.marc27.com/ontology/meta#";
 
 /// The artifact literal for a quantity sign-domain declaration.
 ///
