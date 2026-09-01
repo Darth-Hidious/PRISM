@@ -61,3 +61,39 @@ def test_the_capability_groups_are_separable(sidecar_venv):
     assert calphad and pyiron
     assert not calphad & pyiron
     assert set(_sidecar.SIDECAR_PACKAGES) == calphad | pyiron
+
+
+# ── A crashing sidecar is reported as a crash, with its traceback ───────────
+#
+# Its stderr went to DEVNULL, so a sidecar that died on its first request
+# (a TypeError in the handler, a missing import) came back as "timed out":
+# the one diagnosis that sends a person looking in the wrong place.
+
+
+def _popen_that_crashes(argv, **kwargs):
+    """Stand in for the sidecar: write a traceback to stderr and exit 3."""
+    import subprocess as _sp
+    import sys as _sys
+
+    kwargs.pop("cwd", None)
+    return _sp.Popen(
+        [
+            _sys.executable,
+            "-c",
+            "import sys; sys.stdin.readline(); "
+            "sys.stderr.write('Traceback (most recent call last):\\n  File x\\n"
+            "TypeError: ToolRegistry object is not subscriptable\\n'); sys.exit(3)",
+        ],
+        **kwargs,
+    )
+
+
+def test_a_sidecar_that_crashes_is_reported_with_its_traceback_not_as_a_timeout(monkeypatch):
+    monkeypatch.setattr(_sidecar, "ensure_sidecar", lambda: None)
+    monkeypatch.setattr(_sidecar.spawn, "popen", _popen_that_crashes)
+    proc = _sidecar._SidecarProcess()
+    response = proc.call("calphad_compute", {"x": 1})
+    error = response.get("error", "")
+    assert "exited (code 3)" in error, error
+    assert "TypeError: ToolRegistry object is not subscriptable" in error, error
+    assert "timed out" not in error, error

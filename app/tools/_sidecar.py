@@ -17,6 +17,7 @@ materials search, and any fork() after that SIGSEGVs. See app/tools/spawn.py.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import shutil
@@ -190,6 +191,10 @@ class _SidecarProcess:
     def __init__(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        # Last lines the sidecar wrote to stderr. A sidecar that crashes on
+        # its first request used to be reported as "timed out" because its
+        # stderr went to DEVNULL; the traceback is the diagnosis.
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=40)
 
     def _spawn(self) -> Optional[str]:
         repo_root = Path(__file__).resolve().parents[2]
@@ -199,13 +204,33 @@ class _SidecarProcess:
                 cwd=str(repo_root),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
             )
+            self._stderr_tail.clear()
+            threading.Thread(
+                target=self._drain_stderr, args=(self._proc,), daemon=True
+            ).start()
             return None
         except Exception as exc:
             self._proc = None
             return f"failed to start science sidecar: {exc}"
+
+    def _drain_stderr(self, proc: subprocess.Popen) -> None:
+        assert proc.stderr
+        for line in proc.stderr:
+            self._stderr_tail.append(line.rstrip("\n"))
+
+    def _failure(self, tool: str) -> str:
+        """What actually happened: an exit with its code and stderr, or a hang."""
+        assert self._proc
+        code = self._proc.poll()
+        tail = "\n".join(self._stderr_tail).strip()
+        if code is not None:
+            head = f"science sidecar exited (code {code}) during {tool}"
+        else:
+            head = f"science sidecar timed out on {tool}"
+        return f"{head}: {tail}" if tail else head
 
     def call(self, tool: str, args: dict) -> dict[str, Any]:
         with self._lock:
@@ -232,9 +257,17 @@ class _SidecarProcess:
                 reader.start()
                 reader.join(timeout=_CALL_TIMEOUT_SECS)
                 if reader.is_alive() or not line or not line[0]:
+                    # EOF on stdout means the process is gone (or going): give
+                    # it a moment to finish dying so the exit code is known.
+                    if not reader.is_alive():
+                        try:
+                            self._proc.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    message = self._failure(tool)
                     self._proc.kill()
                     self._proc = None
-                    return {"error": f"science sidecar timed out on {tool}"}
+                    return {"error": message}
                 response = json.loads(line[0])
             except Exception as exc:
                 self._proc = None
