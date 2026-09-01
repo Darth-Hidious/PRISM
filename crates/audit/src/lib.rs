@@ -500,7 +500,13 @@ impl AuditEmitter {
         };
         let _guard = self.write_lock.lock().await;
         if let Err(e) = self.log.append(&envelope).await {
+            // The doc above promises `None` when the append failed, and the
+            // code returned the envelope anyway — a caller held a signed record
+            // that the log did not contain, and with no sequence number or
+            // previous-hash in the format, the gap was undetectable by any
+            // compliance reader. An unrecorded event must not look recorded.
             tracing::warn!(error = %e, "failed to append audit envelope");
+            return None;
         }
         Some(envelope)
     }
@@ -757,6 +763,29 @@ mod tests {
         assert_eq!(back.len(), 1);
         back[0].verify_signature().unwrap();
         assert_eq!(back[0], env);
+    }
+
+    /// An event the log could not append must not come back as recorded.
+    /// The doc promised `None` on append failure; the code warned and
+    /// returned the signed envelope anyway, so a caller held a record the
+    /// log did not contain — and with no sequence number or previous-hash in
+    /// the format, no reader could ever detect the gap.
+    #[tokio::test]
+    async fn an_event_the_log_could_not_append_is_not_reported_as_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let not_a_file = tmp.path().join("is-a-directory");
+        std::fs::create_dir(&not_a_file).unwrap();
+        let em = AuditEmitter::new(
+            "node-tokyo-01",
+            "org-tokyo",
+            SigningKey::generate(&mut OsRng),
+            not_a_file,
+            true,
+        );
+        assert!(
+            em.emit(sample_spec()).await.is_none(),
+            "an append that failed must not hand back an envelope as if recorded"
+        );
     }
 
     #[tokio::test]
