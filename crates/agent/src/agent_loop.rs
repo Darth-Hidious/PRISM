@@ -3702,6 +3702,15 @@ pub(crate) async fn run_turn_inner(
             transcript.record_cost("llm_turn", usage.prompt_tokens, usage.completion_tokens);
             run_metrics.record_usage(&billed_usage, &billing_model);
             total_usage += billed_usage;
+        } else {
+            // Nothing distinguishes "the provider reported no usage" from
+            // "usage was zero" downstream: compaction pressure, the budget
+            // warning and cost all read zero and stay silent. Say it once,
+            // where it happened.
+            tracing::warn!(
+                "the provider reported no token usage for this turn; token-pressure \
+                 compaction and the budget warning cannot measure it"
+            );
         }
 
         // ── 2d-bis. Record the LLM turn in the provenance ledger ──

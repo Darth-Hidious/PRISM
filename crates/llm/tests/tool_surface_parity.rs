@@ -526,3 +526,61 @@ async fn marc27_still_parses_text_fenced_tool_calls_as_a_fallback() {
         .expect("text fallback stopped working");
     assert_eq!(calls[0].function.name, "compute_gpus");
 }
+
+/// Without `stream_options.include_usage`, an OpenAI-shaped server streams
+/// `"usage": null` on every chunk, and every context mechanism downstream —
+/// token-pressure compaction, the budget warning, cost — reads a number that
+/// is structurally zero. This asserts on the bytes that leave the process.
+#[tokio::test]
+async fn the_openai_stream_request_asks_for_usage() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(serve_once(
+        listener,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+    ));
+    let client = LlmClient::new(config(format!("http://127.0.0.1:{port}/v1")));
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_with_tools_streaming(&user("hello"), &[], |_, _| {}),
+    )
+    .await
+    .expect("turn timed out");
+    let body = server.await.unwrap();
+    assert_eq!(
+        body.pointer("/stream_options/include_usage"),
+        Some(&serde_json::json!(true)),
+        "the stream must ask the server to report usage: {body}"
+    );
+}
+
+/// A usage an earlier chunk reported must survive a trailing chunk whose
+/// `usage` is null. The old `.ok()` assignment overwrote it, so a real count
+/// became `None` and compaction never fired.
+#[tokio::test]
+async fn a_reported_usage_survives_a_trailing_null_chunk() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":null}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"total_tokens\":107}}\n\n",
+        "data: {\"choices\":[{\"delta\":{}}],\"usage\":null}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_string();
+    let server = tokio::spawn(serve_once(listener, sse));
+    let client = LlmClient::new(config(format!("http://127.0.0.1:{port}/v1")));
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_with_tools_streaming(&user("hello"), &[], |_, _| {}),
+    )
+    .await
+    .expect("turn timed out")
+    .expect("stream parses");
+    let _ = server.await.unwrap();
+    let usage = response
+        .usage
+        .expect("a usage the server reported must reach the caller");
+    assert_eq!(usage.prompt_tokens, 100);
+    assert_eq!(usage.completion_tokens, 7);
+}

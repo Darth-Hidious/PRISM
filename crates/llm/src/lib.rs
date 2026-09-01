@@ -2203,6 +2203,13 @@ impl LlmClient {
             "messages": messages,
             "temperature": 0.1,
             "stream": true,
+            // Without this an OpenAI-shaped server streams `"usage": null` on
+            // every chunk, and every context mechanism downstream — token
+            // pressure compaction, the budget warning, cost — reads a number
+            // that is structurally zero. That is what the 2026-08-19/20 budget
+            // deaths were measured against. Servers that predate the field
+            // ignore it.
+            "stream_options": { "include_usage": true },
         });
         let mut body = self.with_operator_output_cap(body, est);
 
@@ -2271,9 +2278,16 @@ impl LlmClient {
                         native_calls.push_deltas(tcs);
                     }
 
-                    // Extract usage from final chunk
-                    if let Some(u) = chunk.get("usage") {
-                        usage_info = serde_json::from_value::<UsageInfo>(u.clone()).ok();
+                    // Extract usage from the chunk that carries it. A chunk
+                    // whose `usage` is null or empty says nothing and must not
+                    // erase a usage an earlier chunk reported — the old
+                    // `.ok()` assignment did exactly that, turning a real count
+                    // into `None` whenever a trailing chunk carried null.
+                    if let Some(u) = chunk.get("usage")
+                        && let Ok(parsed) = serde_json::from_value::<UsageInfo>(u.clone())
+                        && (parsed.prompt_tokens > 0 || parsed.completion_tokens > 0)
+                    {
+                        usage_info = Some(parsed);
                     }
                 }
             }
