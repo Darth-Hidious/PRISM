@@ -322,6 +322,37 @@ pub fn task_turn_message(goal: &prism_campaign::ResearchCampaignGoal, iteration:
     msg
 }
 
+/// Whether `phrase` occurs in `low` somewhere it is not negated: not within a
+/// few words of a preceding "not", "no", "never", "isn't", "hasn't", "wasn't",
+/// "cannot" or "can't". A colon-terminated phrase ("done: ") must also open
+/// its sentence, so "not done: …" and "undone: …" do not count.
+fn contains_unnegated(low: &str, phrase: &str) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "not ", "no ", "never ", "isn't ", "hasn't ", "wasn't ", "cannot ", "can't ", "un",
+    ];
+    let mut from = 0;
+    while let Some(at) = low[from..].find(phrase) {
+        let start = from + at;
+        let window = &low[start.saturating_sub(24)..start];
+        let negated = NEGATIONS.iter().any(|n| {
+            if *n == "un" {
+                window.ends_with("un")
+            } else {
+                window.contains(n)
+                    && !window[window.rfind(n).unwrap() + n.len()..].contains(['.', ';'])
+            }
+        });
+        let anchored = !phrase.ends_with(": ")
+            || window.trim_end().is_empty()
+            || window.trim_end().ends_with(['.', '!', '?', '\n']);
+        if !negated && anchored {
+            return true;
+        }
+        from = start + phrase.len();
+    }
+    false
+}
+
 /// Assess whether the success criteria appear met, from the model's text output
 /// of a turn. Heuristic: the model is expected to state progress; this looks
 /// for explicit completion signals. Conservative (defaults to "not done").
@@ -336,14 +367,17 @@ pub fn assess_research_progress(
         return 0.1_f64.min(turn_text.len().min(2000) as f64 / 20_000.0);
     }
     let low = turn_text.to_ascii_lowercase();
-    // Strong completion signals.
+    // Strong completion signals — but only where they are not negated. This
+    // is a heuristic over prose, and it decides a durable checkpoint: a
+    // campaign writes `completion_reason = "success_criteria_met"` on 1.0.
+    // "Not done: three criteria remain" contains "done: " and scored 1.0.
     for phrase in [
         "task complete",
         "research complete",
         "all criteria met",
         "done: ",
     ] {
-        if low.contains(phrase) {
+        if contains_unnegated(&low, phrase) {
             return 1.0;
         }
     }
@@ -742,6 +776,32 @@ mod tests {
         assert!(msg.contains(&goal.objective));
         assert!(msg.contains("Success criteria"));
         assert!(msg.contains("progress"));
+    }
+
+    /// "Not done: …" contains "done: " and scored 1.0, which the campaign
+    /// wrote to its checkpoint as `success_criteria_met`. A negated or
+    /// mid-sentence completion phrase is not a completion signal. This stays
+    /// a heuristic over prose: "task complete would need two more runs" is
+    /// beyond any substring rule, and no test here pretends otherwise.
+    #[test]
+    fn a_negated_completion_phrase_is_not_completion() {
+        let goal = research_goal();
+        for text in [
+            "Not done: three criteria remain unmet.",
+            "We have no research complete yet.",
+            "Undone: the second criterion.",
+        ] {
+            let p = assess_research_progress(&goal, text);
+            assert!(p < 1.0, "{text:?} scored {p}");
+        }
+        assert_eq!(
+            assess_research_progress(&goal, "Done: all criteria met."),
+            1.0
+        );
+        assert_eq!(
+            assess_research_progress(&goal, "Task complete. Report attached."),
+            1.0
+        );
     }
 
     #[test]
