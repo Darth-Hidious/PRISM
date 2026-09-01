@@ -1,47 +1,31 @@
 # CONTEXT — resume here
 
-**Current Task**: Measure PRISM's extraction against LitXBench gold data. The
-harness is built and BLOCKED on one bug (below). Fix that first tomorrow, then
-run it — the number is the goal.
+**Current Task**: Systematic find-and-fix across the crates for six recurring
+defect classes (muzzles, lying signals, silent data loss, gates at the wrong
+seam, tests that prove nothing, measurement hygiene). Four Opus hunters
+produced ranked findings with file:line; fixes land one at a time with a
+mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca`.
 
-## The blocker, found last thing, fix this first
-
-`crates/cli/src/papers.rs:310` and `:417` — `full-text` and `claims` build their
-fetch engine with **arXiv only**:
-
-```rust
-let engine = build_engine(vec![SourceId::Arxiv.as_str().to_string()], &None, false);
-```
-
-The other four `build_engine` call sites pass the user's resolved `source_ids`.
-So SEARCH can use every source and EXTRACTION can only fetch arXiv. Any other URL
-returns `None` and PRISM reports **`no_fulltext_available`** — which is a lie: the
-paper has full text, PRISM has no adapter wired for that host.
-
-**This probably accounts for part of the "464 papers, no fetchable full text"
-number.** Fix = pass the resolved source list like the other four sites, and make
-the refusal name the real reason ("no adapter for host X").
-
-It is also why the benchmark cannot run: gold papers served over localhost are
-refused as having no full text.
+## Already fixed — do NOT re-fix
+- arXiv-only fetch in `papers.rs`: GONE. `full-text`/`claims` now build the
+  engine with `parse_sources(&None)` = all sources (`papers.rs:367`, `:479`).
+- `--base` refusing DRAFT shards (`5b10e6b6`); relations dropped at the fold
+  (`238c8fd9`); exactMatch merge (`44a373e0`, pinned `14b12a35`); fold dropping
+  `fact_kind`/`sign_domain` (`6523eae3`). The Aug 24 promoted
+  `~/Downloads/prism-ontology-shards/ontology-polymers.ttl` PREDATES all of
+  these — 8 copies of every EMMO upper class, zero typed relations. Re-fold with
+  `~/Downloads/prism-ontology-shards/fold.sh`; review; only then promote.
 
 ## Key Decisions
-- Ontology binds AFTER extraction, never in the prompt (controlled ablation:
-  in-prompt costs 41% of triples; post-hoc gets same conformance, 1.7x recall).
-- NEVER make `value`/`unit` required fields — required fields drive fabrication
-  to 100% in 10 of 13 models. Filter after; never compel a number.
-- Destructive-intent gates key on registered write capability, never on English
-  words in user text.
+- Park only what a missing capability actually blocks; never discard sound work.
+- No synthetic health probes: the real read is the health signal (K=3 remote failures).
+- Ontology binds AFTER extraction; `value`/`unit` are never required fields.
 
 ## Next Steps
-1. Fix the arXiv-only fetch (above), then run the LitXBench eval —
-   `~/Downloads/prism-gold-eval/harness/` has `convert_claims.py`, `score.py`,
-   `md_to_jats.py`, and 5 papers already converted to JATS in `harness/jats/`.
-   Serve over localhost; `papers claims --url ... --format jats`. Use
-   `PRISM_PROVENANCE_DB` pointed at a scratch db — never the live store.
-2. Read the Gemini CLI recon result (agent was still running at cutoff) — how a
-   general agent scores 0.80 where purpose-built pipelines lose by up to 0.37 F1.
-3. Then merge to main (563 commits ahead) and only then tag. Release workflow
-   fires on a `v*` tag push; CHANGELOG is already written.
-
-Full detail: `~/Downloads/PRISM_HARNESS_PLAYBOOK.md` §10-§12.
+1. Finish the hunter findings (playbook §13): arXiv parser text-buffer bleed
+   (`arxiv.rs:87`, corrupts `published` and the dedup key on every record);
+   usage always None on OpenAI streaming (`llm/lib.rs:2201`, so compaction never
+   fires); `EndpointCall` at `vision.rs:139` untested; live-store guard disarmed
+   under `cargo test -p prism-cli` (H3).
+2. Then the LitXBench eval (`~/Downloads/prism-gold-eval/harness/`), scratch DB.
+3. Merge to main; tag only after.
