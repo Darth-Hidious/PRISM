@@ -84,10 +84,20 @@ pub fn parse(body: &[u8]) -> Result<SourcePage> {
 
     loop {
         match reader.read_event_into(&mut buf)? {
-            Event::Text(e) => text_buf.push_str(&e.decode().unwrap_or_default()),
-            Event::GeneralRef(e) => {
+            // Only text INSIDE an element this parser reads is data. Without
+            // the gate, text from every unmatched element accumulated and was
+            // prepended to the next matched value: `<updated>` bled into
+            // `published` on every live record, and the last author's
+            // `<arxiv:affiliation>` bled into `doi` — which is the dedup key,
+            // so the arXiv copy of a paper never merged with Crossref's. The
+            // fixture hid it by omitting every element the parser skips.
+            Event::Text(e) if field.is_some() || in_total_results => {
+                text_buf.push_str(&e.decode().unwrap_or_default())
+            }
+            Event::GeneralRef(e) if field.is_some() || in_total_results => {
                 text_buf.push_str(&super::resolve_reference(&e.decode().unwrap_or_default()))
             }
+            Event::Text(_) | Event::GeneralRef(_) => {}
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"entry" => draft = Some(EntryDraft::default()),
                 b"totalResults" if draft.is_none() => {
@@ -224,6 +234,63 @@ pub fn collapse_whitespace(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry in the order the live arXiv API serves it, INCLUDING the
+    /// elements this parser does not read. `FIXTURE` above omits every one of
+    /// them, which is exactly why the buffer bleed stayed green: `<updated>`
+    /// precedes `<published>`, `<arxiv:affiliation>` follows each `<name>`,
+    /// and `<arxiv:comment>` precedes `<arxiv:journal_ref>`. Each is placed to
+    /// land in a specific field if text leaks across elements.
+    const LIVE_SHAPED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <entry>
+    <id>http://arxiv.org/abs/2103.00001v2</id>
+    <updated>2021-04-15T09:00:00Z</updated>
+    <published>2021-03-01T10:30:00Z</published>
+    <title>Sliding wear of filled PTFE seals</title>
+    <summary>Abstract text.</summary>
+    <author>
+      <name>M. Nolan</name>
+      <arxiv:affiliation>Department of Physics</arxiv:affiliation>
+    </author>
+    <author>
+      <name>R. Patel</name>
+      <arxiv:affiliation>Tribology Lab</arxiv:affiliation>
+    </author>
+    <arxiv:doi>10.1063/1.1383585</arxiv:doi>
+    <arxiv:comment>11 pages, 6 figures</arxiv:comment>
+    <arxiv:journal_ref>J. Chem. Phys. 115, 1626</arxiv:journal_ref>
+    <arxiv:primary_category term="cond-mat.mtrl-sci"/>
+    <category term="cond-mat.mtrl-sci"/>
+    <link href="http://arxiv.org/abs/2103.00001v2" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2103.00001v2" rel="related" type="application/pdf"/>
+  </entry>
+</feed>"#;
+
+    #[test]
+    fn unread_elements_never_bleed_into_the_next_field() {
+        let page = parse(LIVE_SHAPED.as_bytes()).expect("live-shaped feed parses");
+        assert_eq!(page.papers.len(), 1);
+        let p = &page.papers[0];
+        assert_eq!(p.year, Some(2021));
+        assert_eq!(
+            p.authors,
+            vec!["M. Nolan", "R. Patel"],
+            "an affiliation must not be prepended to the next author"
+        );
+        assert_eq!(
+            p.doi.as_deref(),
+            Some("10.1063/1.1383585"),
+            "an affiliation must not be prepended to the DOI — this is the dedup key"
+        );
+        assert_eq!(
+            p.journal.as_deref(),
+            Some("J. Chem. Phys. 115, 1626"),
+            "the arxiv:comment must not be prepended to the journal reference"
+        );
+        assert_eq!(p.title, "Sliding wear of filled PTFE seals");
+    }
 
     const FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
