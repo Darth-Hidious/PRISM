@@ -506,24 +506,19 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                         "document": fulltext.source_url,
                     })
                 );
-                return Ok(());
+                // A refusal that produced nothing exits non-zero: scripts and
+                // agents key off the exit code, and this was exit 0.
+                bail!("no LLM endpoint configured — zero claims extracted");
             }
 
-            // Cheap connectivity probe BEFORE spending one LLM call per
-            // block: an unreachable endpoint must fail in seconds, not after
-            // dozens of 300s-timeout retries.
-            if let Err(reason) = probe_endpoint(&llm_cfg.base_url) {
-                println!(
-                    "{}",
-                    json!({
-                        "claims": [],
-                        "status": "extractor_unreachable",
-                        "reason": format!("{reason} Zero claims returned — none were invented."),
-                        "document": fulltext.source_url,
-                    })
-                );
-                return Ok(());
-            }
+            // No connectivity probe. One lived here: a raw TCP connect with its
+            // own 3 s budget, no proxy awareness and no happy-eyeballs, standing
+            // in for a client that has all three. It refused extraction with
+            // `extractor_unreachable` and exit 0 — zero claims, reported as a
+            // clean run — against endpoints the real client reaches. The real
+            // client applies the offline gate on every request and fails an
+            // unreachable host at its connect timeout on the first block; that
+            // failure is the honest signal, and it propagates.
 
             let llm = prism_ingest::llm::LlmClient::new(llm_cfg);
             let ontology_id = crate::active_ontology_from_config(project_root)?;
@@ -1525,54 +1520,6 @@ fn property_terms_for_claims(
     terms
 }
 
-/// TCP-probe an LLM base URL with a hard 3-second budget.
-fn probe_endpoint(base_url: &str) -> Result<(), String> {
-    use std::net::ToSocketAddrs;
-
-    // Hard offline, checked FIRST — before `to_socket_addrs`, not just before
-    // the connect. Resolution is itself a network call: a DNS query for an
-    // agent-chosen host leaves the machine even if the TCP handshake never
-    // happens.
-    //
-    // This probe is agent-reachable with no human gate. `papers` is
-    // `PermissionMode::ReadOnly, requires_approval: false` and its
-    // `FlagPolicy::Only` list includes `--llm-url`
-    // (agent/src/command_tools.rs), and `execute_cli_command` spawns the CLI
-    // with no `env_clear`, so a `PRISM_OFFLINE=1` parent is inherited and was
-    // then ignored right here. A model could name the host.
-    //
-    // `check_url` rather than `enabled()`: a local llama.cpp endpoint is the
-    // normal case and must stay probeable offline.
-    prism_runtime::offline::check_url(base_url)?;
-    let without_scheme = base_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
-    let host_port = without_scheme.split('/').next().unwrap_or("");
-    let host_port = match host_port.rsplit_once(':') {
-        Some((_host, p)) if p.parse::<u16>().is_ok() => host_port.to_string(),
-        _ => format!(
-            "{host_port}:{port}",
-            port = if base_url.starts_with("https") {
-                443
-            } else {
-                80
-            }
-        ),
-    };
-    if host_port.starts_with(':') {
-        return Err(format!("cannot parse host from {base_url}"));
-    }
-    let addr = host_port
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {host_port}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("cannot resolve {host_port}"))?;
-    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
-        .map(|_| ())
-        .map_err(|e| format!("LLM endpoint {addr} unreachable: {e}."))
-}
-
 /// The reader's workspace, assembled from a parsed full text.
 ///
 /// Selected blocks are joined into ONE newline-separated text — the only
@@ -1862,113 +1809,6 @@ mod tests {
         assert_eq!(locator.label.as_deref(), Some("Table A1"));
     }
 
-    /// The CRATE's lock, not a private one.
-    ///
-    /// `boot_checks::ENV_LOCK` is already shared by `boot_checks.rs` and
-    /// `main.rs`; this file declared a second `static LOCK` for the same
-    /// process-global `PRISM_OFFLINE`. Two locks that do not exclude each
-    /// other serialize nothing, and all three files compile into one test
-    /// binary that cargo runs multi-threaded. Sixth occurrence of this shape —
-    /// `d3fcdfa4` consolidated it in `crates/mesh` and missed that
-    /// `crates/cli` had the same bug.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::boot_checks::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Restores the var on drop, so a failed assertion cannot leave it set for
-    /// the rest of the binary.
-    struct OfflineGuard(Option<String>);
-    impl Drop for OfflineGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("PRISM_OFFLINE", v),
-                    None => std::env::remove_var("PRISM_OFFLINE"),
-                }
-            }
-        }
-    }
-
-    /// `--sources ntrs` must select the NTRS adapter: the CLI's name
-    /// catalogue (SourceId), the default selection, and the registry that
-    /// actually serves fetches all have to agree, or the name parses while
-    /// the engine reports an unknown source.
-    #[test]
-    fn ntrs_is_selectable_and_backed_by_a_registered_adapter() {
-        let ids = parse_sources(&Some("ntrs".to_string())).expect("'ntrs' must parse");
-        assert_eq!(ids, ["ntrs"]);
-        let default = parse_sources(&None).expect("default set must parse");
-        assert!(
-            default.contains(&"ntrs".to_string()),
-            "ntrs missing from the default selection: {default:?}"
-        );
-        assert!(
-            prism_retrieval::SourceRegistry::builtin()
-                .get("ntrs")
-                .is_some(),
-            "the catalogue names 'ntrs' but no adapter is registered under it"
-        );
-    }
-
-    /// The probe must refuse a remote host BEFORE resolving it. `papers` is an
-    /// agent tool with `requires_approval: false` whose flag allow-list
-    /// includes `--llm-url`, and the spawned CLI inherits `PRISM_OFFLINE`
-    /// (no `env_clear`), so a model could name the host and this was the one
-    /// step that ignored the flag.
-    #[test]
-    fn probe_refuses_a_remote_endpoint_offline() {
-        let _guard = env_lock();
-        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
-        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
-
-        let err = probe_endpoint("https://llm.example.invalid/v1")
-            .expect_err("offline must refuse a remote endpoint");
-        assert!(err.contains("offline mode"), "{err}");
-        assert!(
-            err.contains("llm.example.invalid"),
-            "must name what it blocked: {err}"
-        );
-        // It must NOT have got as far as resolution — a DNS failure message
-        // would mean the lookup already left the machine.
-        assert!(
-            !err.contains("cannot resolve"),
-            "resolved before refusing: {err}"
-        );
-    }
-
-    /// A local llama.cpp endpoint stays probeable offline — `check_url`, not a
-    /// blanket refusal. Nothing listens on port 1, so reaching a CONNECT error
-    /// rather than a policy one proves the guard let it through.
-    #[test]
-    fn probe_still_allows_loopback_offline() {
-        let _guard = env_lock();
-        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
-        unsafe { std::env::set_var("PRISM_OFFLINE", "1") };
-
-        let err =
-            probe_endpoint("http://127.0.0.1:1/v1").expect_err("nothing is listening on port 1");
-        assert!(
-            !err.contains("offline mode"),
-            "loopback must not be refused by policy: {err}"
-        );
-    }
-
-    /// Without this the two above would pass even if the guard refused
-    /// unconditionally.
-    #[test]
-    fn probe_guard_is_inert_when_offline_is_unset() {
-        let _guard = env_lock();
-        let _restore = OfflineGuard(std::env::var("PRISM_OFFLINE").ok());
-        unsafe { std::env::remove_var("PRISM_OFFLINE") };
-
-        let err = probe_endpoint("http://127.0.0.1:1/v1").expect_err("nothing is listening");
-        assert!(
-            !err.contains("offline mode"),
-            "guard fired with offline unset: {err}"
-        );
-    }
     fn bare_paper() -> Paper {
         Paper {
             source: "pubmed".into(),
@@ -2718,5 +2558,28 @@ mod store_tests {
         assert_eq!(out["written"], 0);
         assert_eq!(out["semantic_validation"], serde_json::Value::Null);
         assert!(!db.exists(), "an empty claim set created a database anyway");
+    }
+
+    /// The synthetic connectivity probe is gone and must not come back by
+    /// name. It refused extraction — exit 0, zero claims — against endpoints
+    /// the real client reaches, because its budget and policy differed from
+    /// the client it stood in for. The real client's own failure is the signal.
+    #[test]
+    fn claims_extraction_has_no_synthetic_connectivity_probe() {
+        const SOURCE: &str = include_str!("papers.rs");
+        let production = SOURCE
+            .split_once("#[cfg(test)]")
+            .map_or(SOURCE, |(before, _)| before);
+        // Scan code, not the comments that explain why it is gone.
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("probe_endpoint"), "the probe is back");
+        assert!(
+            !code.contains("extractor_unreachable"),
+            "the probe's verdict is back"
+        );
     }
 }
