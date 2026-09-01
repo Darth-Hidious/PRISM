@@ -189,9 +189,12 @@ def test_s1_failed_provider_marked_not_ok_in_status():
     result = asyncio.run(engine.search(q))
     statuses = {log.provider_id: log.status for log in result.query_log}
     assert statuses["alive"] == "success"
-    # dead provider must be an honest failure status, never "success"
+    # dead provider must be an honest non-success status, never "success".
+    # It sleeps past the fan-out deadline, so the ENGINE ends it: that is
+    # "skipped" (our decision), not "timeout" (its answer). The old tuple
+    # encoded the misattribution this file has fixed four times over.
     assert statuses["dead"] != "success"
-    assert statuses["dead"] in ("timeout", "http_error")
+    assert statuses["dead"] in ("timeout", "http_error", "skipped")
 
 
 def test_s1_tool_output_surfaces_ok_status_warnings_summary():
@@ -336,6 +339,111 @@ def test_s3_early_cancellation_is_never_charged_to_the_provider():
         "a healthy provider must not be locked out by the engine's own "
         "early-termination"
     )
+
+
+def test_global_deadline_is_never_charged_to_the_providers_it_cancels():
+    """The fan-out deadline cancelling in-flight providers is OUR decision.
+
+    Same rule as the early canceller — and the same bug, on the fourth path.
+    Before the fix the deadline cancelled tasks without naming them, so each
+    CancelledError fell into the failure branch and struck the provider.
+    Measured on this machine's provider_health.json: 35 of 53 providers at
+    34-36 consecutive failures in lockstep, including hosts with 650+ successes
+    at ~200 ms. Independent hosts do not fail together; one deadline struck
+    every in-flight task at once, ~34 times, and persisted it.
+
+    Two searches, because two strikes open a circuit for 300 s.
+    """
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.engine import SearchEngine
+
+    from types import SimpleNamespace
+
+    reg = ProviderRegistry()
+    for i in range(4):
+        p = _slow_fail_provider(f"slow{i}", delay=20.0)
+        # A per-provider timeout ABOVE the global, so it is the fan-out
+        # deadline — not the provider's own — that ends these tasks.
+        p._endpoint = SimpleNamespace(behavior=SimpleNamespace(timeout_ms=20_000))
+        reg.register(p)
+    health = HealthManager(persist_path=None)
+    engine = SearchEngine(
+        registry=reg,
+        cache=SearchCache(disk_dir=None),
+        health_manager=health,
+        global_timeout=0.5,
+    )
+    for elements in (["Fe"], ["Ni"]):
+        result = asyncio.run(
+            engine.search(MaterialSearchQuery(elements=elements, limit=5))
+        )
+        statuses = {log.provider_id: log.status for log in result.query_log}
+        messages = {log.provider_id: log.error_message for log in result.query_log}
+        for i in range(4):
+            assert statuses[f"slow{i}"] == "skipped", (
+                f"cancelled by our deadline, reported as {statuses[f'slow{i}']!r}"
+            )
+            assert "deadline" in (messages[f"slow{i}"] or ""), (
+                "the log must say it was our deadline, not 'enough results': "
+                f"{messages[f'slow{i}']!r}"
+            )
+    for i in range(4):
+        h = health.get(f"slow{i}")
+        assert h.failure_count == 0, "our own deadline must not count as a failure"
+        assert h.consecutive_failures == 0
+        assert h.circuit_state == "closed"
+        assert h.should_query() is True
+
+
+def test_per_provider_timeout_is_never_charged_to_the_provider():
+    """A provider's own timeout expiring is our deadline, not its answer.
+
+    Before the fix this path called record_failure(): OQMD, whose recorded
+    mean SUCCESS latency is 3.5 s, was struck whenever its tail crossed the
+    8 s default, and two searches opened its circuit. A slow host is not a
+    dead one; only a failure that reached the endpoint and came back may
+    strike it. A genuinely hung host still costs at most the global deadline,
+    in parallel with everyone else.
+    """
+    from app.tools.search_engine.providers.base import Provider, ProviderCapabilities
+    from app.tools.search_engine.providers.registry import ProviderRegistry
+    from app.tools.search_engine.engine import SearchEngine
+
+    from types import SimpleNamespace
+
+    class Tail(Provider):
+        id = "tail"
+        name = "tail"
+        capabilities = ProviderCapabilities(filterable_fields={"elements"})
+
+        async def search(self, query):
+            await asyncio.sleep(5.0)
+            return []
+
+    tail = Tail()
+    # The provider's OWN timeout, well below the global, so its deadline —
+    # not the fan-out's — is the one that expires.
+    tail._endpoint = SimpleNamespace(behavior=SimpleNamespace(timeout_ms=200))
+    reg = ProviderRegistry()
+    reg.register(tail)
+    health = HealthManager(persist_path=None)
+    engine = SearchEngine(
+        registry=reg,
+        cache=SearchCache(disk_dir=None),
+        health_manager=health,
+        global_timeout=3.0,
+    )
+    for elements in (["Fe"], ["Ni"]):
+        result = asyncio.run(
+            engine.search(MaterialSearchQuery(elements=elements, limit=5))
+        )
+        statuses = {log.provider_id: log.status for log in result.query_log}
+        assert statuses["tail"] == "timeout"
+    h = health.get("tail")
+    assert h.failure_count == 0, "a timeout is our deadline, not the provider's answer"
+    assert h.consecutive_failures == 0
+    assert h.circuit_state == "closed"
+    assert h.should_query() is True
 
 
 def test_engine_records_providers_own_query_description():

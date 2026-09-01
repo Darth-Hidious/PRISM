@@ -315,6 +315,11 @@ class SearchEngine:
         # CancelledError says nothing about them, so it must not be read as
         # one (see the failure loop below).
         early_cancelled: set[str] = set()
+        # Providers the whole-fan-out DEADLINE ended. Kept apart from the
+        # early set only so the log can say which decision of ours it was —
+        # "enough results" and "out of time" are different facts, and the
+        # first message was being written for the second event.
+        deadline_cancelled: set[str] = set()
 
         async def _early_canceller():
             await early_event.wait()
@@ -340,9 +345,27 @@ class SearchEngine:
             # The whole fan-out exceeded the deadline. Cancel anything still in
             # flight so it doesn't keep running after we return, then collect
             # whatever each task had produced so far (None for not-started ones).
-            for t in tasks.values():
+            #
+            # These cancellations are OUR decision, exactly like the early
+            # canceller's, and must be named so: unnamed, each one fell into the
+            # failure branch below as a CancelledError and struck the provider.
+            # Measured on this machine's provider_health.json: 35 of 53
+            # providers at 34-36 consecutive failures in lockstep, including
+            # ones with 650+ successes at 200 ms — independent hosts do not fail
+            # together; one deadline struck every in-flight task at once, ~34
+            # times. Fixed three times before for other paths (b6db7301,
+            # 48c47c6f, 91836e31); this was the fourth path.
+            #
+            # `wait_for` has ALREADY cancelled the gather, and the gather its
+            # children, before this except runs — so `if not t.done()` was
+            # never true here and nothing was ever named. The task our deadline
+            # ended is the one that is done-and-cancelled.
+            for pid, t in tasks.items():
                 if not t.done():
                     t.cancel()
+                    deadline_cancelled.add(pid)
+                elif t.cancelled():
+                    deadline_cancelled.add(pid)
             # Gather again (no wait_for) to surface CancelledError as values and
             # preserve partial results already completed.
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -362,7 +385,9 @@ class SearchEngine:
         # `warnings` may already carry the whole-fan-out deadline notice set above.
         for pid, result in provider_results.items():
             provider = next(p for p in providers if p.id == pid)
-            if pid in early_cancelled and isinstance(result, asyncio.CancelledError):
+            if (pid in early_cancelled or pid in deadline_cancelled) and isinstance(
+                result, asyncio.CancelledError
+            ):
                 # THE ENGINE cancelled this provider because the fast ones had
                 # already returned 2x the requested limit. That is a decision
                 # of ours, not evidence about the provider — the same rule the
@@ -397,7 +422,10 @@ class SearchEngine:
                     status="skipped",
                     pages_fetched=0,
                     error_message=(
-                        "Early termination — enough results from fast providers"
+                        f"Whole-fan-out deadline ({self._global_timeout:.0f}s) reached — "
+                        "cancelled by the engine, not a provider failure"
+                        if pid in deadline_cancelled
+                        else "Early termination — enough results from fast providers"
                     ),
                 ))
                 continue
@@ -634,10 +662,15 @@ class SearchEngine:
             # site was missed by the first fix, so offline still poisoned
             # health through any provider that timed out rather than raising
             # the socket guard's error immediately.
-            if _offline_policy_enabled():
-                self._health.get(provider.id).release_probe_claim()
-            else:
-                self._health.get(provider.id).record_failure()
+            # A timeout is OUR deadline expiring, not an answer from the
+            # provider — it says nothing about whether the host is up, and it
+            # said "down" about OQMD, whose recorded mean success latency is
+            # 3.5 s against an 8 s default. Only a failure that reached the
+            # endpoint and came back may strike it (the Local/Remote rule in
+            # crates/ingest/src/document/mod.rs). A genuinely hung host still
+            # costs at most the global deadline, in parallel with everyone
+            # else, so nothing waits on it that wasn't already bounded.
+            self._health.get(provider.id).release_probe_claim()
             log = ProviderQueryLog(
                 provider_id=provider.id,
                 provider_name=provider.name,
