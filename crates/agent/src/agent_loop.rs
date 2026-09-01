@@ -812,13 +812,30 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
     }
     let payload = cli_payload(result)?;
     let records = paper_records(&payload);
-    if records.is_empty() {
+    // `prior_art_search` answers `{papers, patents}`. The digest read only
+    // `papers`, so a result of 5 papers and 40 patents reached the model as
+    // "5 result(s)" — the patents deleted, uncounted, with no marker, and the
+    // model reporting a prior-art search that had found five things.
+    let patents: Vec<&Value> = payload
+        .get("patents")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if records.is_empty() && patents.is_empty() {
         return None;
     }
-    let mut out = format!(
-        "{} result(s), {fresh} not seen before in this session.\n",
-        records.len()
-    );
+    let mut out = if patents.is_empty() {
+        format!(
+            "{} result(s), {fresh} not seen before in this session.\n",
+            records.len()
+        )
+    } else {
+        format!(
+            "{} paper(s) ({fresh} not seen before in this session) and {} patent(s).\n",
+            records.len(),
+            patents.len()
+        )
+    };
     // Carry the handle INGESTION needs, not just the one citation needs.
     //
     // The digest used to emit title + dedup key and nothing else, while
@@ -874,6 +891,27 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
             "  … and {} more\n",
             records.len() - SEARCH_DIGEST_TITLES
         ));
+    }
+    if !patents.is_empty() {
+        out.push_str("  patents:\n");
+        for patent in patents.iter().take(SEARCH_DIGEST_TITLES) {
+            let title = patent
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or("(untitled)");
+            let number = patent
+                .get("number")
+                .and_then(Value::as_str)
+                .unwrap_or("unnumbered");
+            out.push_str(&format!("  - {title} [{number}]\n"));
+        }
+        if patents.len() > SEARCH_DIGEST_TITLES {
+            out.push_str(&format!(
+                "  … and {} more patent(s)\n",
+                patents.len() - SEARCH_DIGEST_TITLES
+            ));
+        }
     }
     for status in payload
         .get("source_status")
@@ -7243,6 +7281,48 @@ mod tests {
     /// route to a URL was `recall`, the budget sink that killed the run in the
     /// first place. A directive the model cannot follow is worse than none: it
     /// burns the turn proving it cannot comply.
+    /// `prior_art_search` answers `{papers, patents}`; the digest read only
+    /// `papers`, so forty patents vanished with no count and no marker.
+    #[test]
+    fn a_prior_art_digest_carries_its_patents_and_counts_them() {
+        let papers: Vec<Value> = (0..5)
+            .map(|i| paper(Some(&format!("10.1/{i}")), "s2", "x"))
+            .collect();
+        let patents: Vec<Value> = (0..40)
+            .map(|i| serde_json::json!({"title": format!("Seal ring {i}"), "number": format!("US-{i}-B2")}))
+            .collect();
+        let digest = search_digest(
+            "prior_art_search",
+            &cli_envelope(serde_json::json!({"papers": papers, "patents": patents})),
+            5,
+        )
+        .expect("a prior-art search with results must produce a digest");
+        assert!(
+            digest.contains("40 patent(s)"),
+            "patents must be COUNTED: {digest}"
+        );
+        assert!(
+            digest.contains("Seal ring 0 [US-0-B2]"),
+            "patents must be LISTED: {digest}"
+        );
+        assert!(
+            digest.contains("and 32 more patent(s)"),
+            "the elision must be stated: {digest}"
+        );
+
+        // Patents alone are still a result, not a None that hides them.
+        let only: Vec<Value> = (0..3)
+            .map(|i| serde_json::json!({"title": format!("P{i}"), "number": format!("EP-{i}")}))
+            .collect();
+        let digest = search_digest(
+            "prior_art_search",
+            &cli_envelope(serde_json::json!({"papers": [], "patents": only})),
+            0,
+        )
+        .expect("a patents-only result is a result");
+        assert!(digest.contains("3 patent(s)"), "{digest}");
+    }
+
     #[test]
     fn the_digest_carries_what_ingestion_needs() {
         let mut with_text = paper(Some("10.1/a"), "openalex", "W1");
