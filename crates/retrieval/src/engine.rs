@@ -319,8 +319,17 @@ impl RetrievalEngine {
     /// embedding report's `returned_unfiltered` is cleared so the flag stays
     /// a true statement about the returned set.
     async fn apply_relevance(&self, query: &str, papers: &mut Vec<Paper>) -> RelevanceReport {
+        let embedding_start = Instant::now();
         let mut report = self.apply_embedding_relevance(query, papers).await;
+        let embedding_ms = embedding_start.elapsed().as_secs_f64() * 1000.0;
+        let selector_start = Instant::now();
         report.selector = self.apply_selector(query, papers).await;
+        tracing::debug!(
+            embedding_ms,
+            selector_ms = selector_start.elapsed().as_secs_f64() * 1000.0,
+            candidates = papers.len(),
+            "relevance stage timing"
+        );
         if report
             .selector
             .as_ref()
@@ -394,6 +403,7 @@ impl RetrievalEngine {
             network_fetches: std::sync::atomic::AtomicUsize::new(0),
             cache_fetches: std::sync::atomic::AtomicUsize::new(0),
             fulltext_limiter: Arc::new(RateLimiter::new(Duration::from_millis(1000))),
+            extra_headers: sources::auth_headers_from_env(),
         }
     }
 
@@ -424,6 +434,10 @@ impl RetrievalEngine {
             }
         });
         let outcomes = join_all(futures).await;
+        tracing::debug!(
+            fanout_ms = start.elapsed().as_secs_f64() * 1000.0,
+            "source fan-out complete"
+        );
 
         let mut papers: Vec<Paper> = Vec::new();
         let mut seen: HashMap<String, usize> = HashMap::new();

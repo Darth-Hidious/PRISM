@@ -125,6 +125,16 @@ pub struct PropertyBinding {
     /// How many graph entities the bind stamped (`class_iri` filled where it
     /// was NULL — never overwriting a declared classification).
     pub entities_stamped: u64,
+    /// Where the stamp landed, per ENTITY tenant, ordered by tenant; empty
+    /// when nothing was stamped. Under
+    /// [`resolve_property_terms_stamping_across_tenants`] this is how an
+    /// operator sees the effect crossing the tenant boundary.
+    pub entities_stamped_by_tenant: Vec<(String, u64)>,
+    /// Entities matching the term that already carry a DIFFERENT class IRI.
+    /// Never overwritten — counted so the refusal is visible, not silent.
+    /// Only the cross-tenant stamp measures this; the tenant-fenced stamp
+    /// leaves it 0.
+    pub stamp_conflicts: u64,
     /// Whether the store's binding row now reflects this outcome (`false`
     /// when an equal-or-stronger binding already held; that binding stands).
     pub recorded: bool,
@@ -241,6 +251,14 @@ fn same_number(left: f64, right: f64) -> bool {
 #[must_use]
 pub fn binding_report(bindings: &[PropertyBinding]) -> serde_json::Value {
     let count = |rung: BindingRung| bindings.iter().filter(|b| b.rung == rung).count();
+    // Per-tenant rollup of where stamps landed, so an operator sees a
+    // cross-tenant stamp cross — not just a total.
+    let mut stamped_by_tenant = std::collections::BTreeMap::<&str, u64>::new();
+    for binding in bindings {
+        for (tenant, stamped) in &binding.entities_stamped_by_tenant {
+            *stamped_by_tenant.entry(tenant).or_default() += stamped;
+        }
+    }
     serde_json::json!({
         "terms": bindings.len(),
         "exact": count(BindingRung::Exact),
@@ -252,6 +270,8 @@ pub fn binding_report(bindings: &[PropertyBinding]) -> serde_json::Value {
             .filter(|b| b.proposal_item_id.is_some())
             .count(),
         "entities_stamped": bindings.iter().map(|b| b.entities_stamped).sum::<u64>(),
+        "entities_stamped_by_tenant": stamped_by_tenant,
+        "stamp_conflicts": bindings.iter().map(|b| b.stamp_conflicts).sum::<u64>(),
         "threshold": DEFAULT_SEMANTIC_BIND_THRESHOLD,
         "bindings": bindings
             .iter()
@@ -483,6 +503,12 @@ async fn nearest_for(
 /// `backend = None` (no embedding model configured) degrades honestly: the
 /// lexical rungs still bind, and everything else is recorded unbound with no
 /// score.
+///
+/// Entity stamping stays fenced to `tenant` here. When the binding tenant is
+/// ontology-qualified (`local@alloyprops`) and the entities live under the
+/// base tenant, that fence is why a rebind can bind hundreds of terms and
+/// stamp zero entities — the caller opts out of it EXPLICITLY via
+/// [`resolve_property_terms_stamping_across_tenants`].
 pub async fn resolve_property_terms(
     store: &ProvenanceStore,
     ontologies: &OntologySet,
@@ -491,6 +517,56 @@ pub async fn resolve_property_terms(
     document: &str,
     terms: &[PropertyTerm],
     threshold: f64,
+) -> Result<Vec<PropertyBinding>> {
+    resolve_property_terms_scoped(
+        store, ontologies, backend, tenant, document, terms, threshold, false,
+    )
+    .await
+}
+
+/// [`resolve_property_terms`], with entity stamping allowed to CROSS the
+/// tenant boundary — the resolver-level mirror of
+/// `prism ontology rebind --adopt-orphans` (which reaches another tenant's
+/// unbound BACKLOG the same way: by explicit, named opt-in, never
+/// implicitly).
+///
+/// The tenant split exists to keep BINDING rows from colliding, not to stop
+/// a fact learning its type: a class IRI is fully qualified, so it is
+/// unambiguous wherever it lands. Binding RECORDS keep their isolation —
+/// every row this writes still lands under `tenant`; only
+/// `emmo_entity.class_iri` is filled wherever the term's entities live, and
+/// each binding reports per tenant where its stamp landed
+/// ([`PropertyBinding::entities_stamped_by_tenant`]) plus how many entities
+/// were refused for already carrying a different class
+/// ([`PropertyBinding::stamp_conflicts`]).
+pub async fn resolve_property_terms_stamping_across_tenants(
+    store: &ProvenanceStore,
+    ontologies: &OntologySet,
+    backend: Option<&dyn prism_embed::EmbedBackend>,
+    tenant: &str,
+    document: &str,
+    terms: &[PropertyTerm],
+    threshold: f64,
+) -> Result<Vec<PropertyBinding>> {
+    resolve_property_terms_scoped(
+        store, ontologies, backend, tenant, document, terms, threshold, true,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private core behind the two named public entry points"
+)]
+async fn resolve_property_terms_scoped(
+    store: &ProvenanceStore,
+    ontologies: &OntologySet,
+    backend: Option<&dyn prism_embed::EmbedBackend>,
+    tenant: &str,
+    document: &str,
+    terms: &[PropertyTerm],
+    threshold: f64,
+    stamp_across_tenants: bool,
 ) -> Result<Vec<PropertyBinding>> {
     ensure!(
         threshold.is_finite() && (0.0..=1.0).contains(&threshold),
@@ -559,6 +635,8 @@ pub async fn resolve_property_terms(
                 model: None,
                 proposal_item_id: None,
                 entities_stamped: 0,
+                entities_stamped_by_tenant: Vec::new(),
+                stamp_conflicts: 0,
                 recorded: false,
             }),
             None => misses.push(Pending {
@@ -620,6 +698,8 @@ pub async fn resolve_property_terms(
                 model: model_id.clone(),
                 proposal_item_id: None,
                 entities_stamped: 0,
+                entities_stamped_by_tenant: Vec::new(),
+                stamp_conflicts: 0,
                 recorded: false,
             }),
             None => {
@@ -680,6 +760,8 @@ pub async fn resolve_property_terms(
                     model: score.and(model_id.clone()),
                     proposal_item_id,
                     entities_stamped: 0,
+                    entities_stamped_by_tenant: Vec::new(),
+                    stamp_conflicts: 0,
                     recorded: false,
                 });
             }
@@ -711,9 +793,22 @@ pub async fn resolve_property_terms(
         if outcome.recorded
             && let Some(class_iri) = &outcome.class_iri
         {
-            outcome.entities_stamped = store
-                .apply_term_binding_to_entities(tenant, &outcome.canonical, class_iri)
-                .await?;
+            if stamp_across_tenants {
+                let stamp = store
+                    .apply_term_binding_to_entities_across_tenants(&outcome.canonical, class_iri)
+                    .await?;
+                outcome.entities_stamped = stamp.total_stamped();
+                outcome.entities_stamped_by_tenant = stamp.stamped_by_tenant;
+                outcome.stamp_conflicts = stamp.conflicts;
+            } else {
+                outcome.entities_stamped = store
+                    .apply_term_binding_to_entities(tenant, &outcome.canonical, class_iri)
+                    .await?;
+                if outcome.entities_stamped > 0 {
+                    outcome.entities_stamped_by_tenant =
+                        vec![(tenant.to_string(), outcome.entities_stamped)];
+                }
+            }
         }
     }
     Ok(outcomes)
@@ -1336,6 +1431,108 @@ mod tests {
         assert!(is_property_name_shaped("0.2% proof stress"));
         assert!(is_property_name_shaped("yield strength"));
         assert!(is_property_name_shaped("almost 950 kJ m^-2 of resistance"));
+    }
+
+    /// The measured failure and its fix, end to end through the resolver.
+    ///
+    /// Bindings written under an ontology-qualified tenant
+    /// (`local@alloyprops`) cannot see the entities under `local`
+    /// (measured 2026-08-21: 203 bound terms, `entities stamped: 0` on
+    /// every one), so the plain resolver reproduces the zero. The
+    /// explicitly named cross-tenant variant — the resolver-level mirror of
+    /// `rebind --adopt-orphans` — stamps the base tenant's entity, reports
+    /// per tenant where the stamp landed, refuses (and counts) an entity
+    /// already carrying a different class, and copies NO binding rows
+    /// between tenants.
+    #[tokio::test]
+    async fn cross_tenant_opt_in_stamps_the_base_tenants_entities() {
+        let (_db, store) = store().await;
+        let set = loaded_set();
+
+        // What a paper wrote under the DEFAULT tenant: one entity with its
+        // class unknown, one already classified differently.
+        store
+            .write_extracted_entity("MetallicMaterial", "Entity", None, "local")
+            .await
+            .unwrap();
+        store
+            .write_classified_entity(
+                "MetallicMaterial",
+                prism_provenance::ClassifiedNode {
+                    entity_type: "Property",
+                    storage_label: "Property",
+                    class_iri: "https://example.test/AlreadyDeclared",
+                },
+                None,
+                "local",
+            )
+            .await
+            .unwrap();
+
+        // Rebinding under the promoted vocabulary's namespace: the term
+        // BINDS, and the tenant fence stamps nothing — the measured state.
+        let plain = resolve_property_terms(
+            &store,
+            &set,
+            None,
+            "local@alloyprops",
+            "doc-1",
+            &[term("MetallicMaterial")],
+            DEFAULT_SEMANTIC_BIND_THRESHOLD,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain[0].rung, BindingRung::Exact, "{:?}", plain[0]);
+        assert_eq!(
+            plain[0].entities_stamped, 0,
+            "the fence hides the base tenant's entities — the bug being fixed"
+        );
+
+        // The explicit opt-in reaches them and says where the stamp landed.
+        let adopted = resolve_property_terms_stamping_across_tenants(
+            &store,
+            &set,
+            None,
+            "local@alloyprops",
+            "doc-1",
+            &[term("MetallicMaterial")],
+            DEFAULT_SEMANTIC_BIND_THRESHOLD,
+        )
+        .await
+        .unwrap();
+        assert_eq!(adopted[0].entities_stamped, 1);
+        assert_eq!(
+            adopted[0].entities_stamped_by_tenant,
+            vec![("local".to_string(), 1)],
+            "the operator sees the effect landing in the OTHER tenant"
+        );
+        assert_eq!(
+            adopted[0].stamp_conflicts, 1,
+            "the declared classification was refused, visibly — not overwritten"
+        );
+
+        // Isolation of binding RECORDS still holds: the binding row lives
+        // only under the caller's tenant.
+        assert!(
+            store
+                .term_binding("local", "metallicmaterial")
+                .await
+                .unwrap()
+                .is_none(),
+            "no binding row was copied into the base tenant"
+        );
+        assert!(
+            store
+                .term_binding("local@alloyprops", "metallicmaterial")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // And the operator-facing report rolls the same facts up.
+        let report = binding_report(&adopted);
+        assert_eq!(report["entities_stamped_by_tenant"]["local"], 1);
+        assert_eq!(report["stamp_conflicts"], 1);
     }
 
     #[test]

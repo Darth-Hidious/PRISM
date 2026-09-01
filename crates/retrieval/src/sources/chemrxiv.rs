@@ -35,7 +35,27 @@ pub async fn fetch_page(
         "{base}/items?term={q}&limit={limit}&skip={skip}",
         q = url_encode(query)
     );
-    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
+    let (body, _cached) = ctx.fetch_cached(ID, &url).await.map_err(|err| {
+        // Measured 2026-08-31: chemrxiv.org answers every non-browser
+        // request with a Cloudflare JS challenge (`cf-mitigated: challenge`,
+        // HTTP 403) regardless of headers, and this design deliberately
+        // runs no headless browser. State the real reason and where the
+        // same preprints still arrive from, instead of a bare 403.
+        let forbidden = err.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::http::HttpStatusFailure>()
+                .is_some_and(|http| http.status.as_u16() == 403)
+        });
+        if forbidden {
+            err.context(
+                "chemrxiv.org fronts its public API with a browser-only Cloudflare \
+                 challenge that a non-browser client cannot pass; ChemRxiv preprints \
+                 still arrive via the preprints_europepmc source",
+            )
+        } else {
+            err
+        }
+    })?;
     let page = parse(&body)?;
     let next = (page.raw_count >= limit).then(|| (skip + page.raw_count).to_string());
     Ok((page, next))

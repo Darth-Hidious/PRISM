@@ -187,6 +187,7 @@ fn bare_ctx(id: &str, base: String, limit: usize) -> FetchCtx {
         network_fetches: std::sync::atomic::AtomicUsize::new(0),
         cache_fetches: std::sync::atomic::AtomicUsize::new(0),
         fulltext_limiter: Arc::new(RateLimiter::new(Duration::ZERO)),
+        extra_headers: HashMap::new(),
     }
 }
 

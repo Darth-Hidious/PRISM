@@ -584,11 +584,15 @@ enum Commands {
         #[command(subcommand)]
         command: MarketplaceCommands,
     },
-    /// Start a hosted research loop for a materials-science goal.
+    /// Research a materials-science goal with the local agent, its tools and
+    /// its DAG. Runs entirely on this machine — same session the TUI drives.
     Research {
         /// Research goal or question that can trigger iterative search and synthesis.
         query: String,
-        /// Research depth. Use `0` for the cheapest smoke-test path.
+        /// How hard to decompose. `0` answers directly; above it the goal is
+        /// split into sub-questions run with `orchestrate_agents` up to this
+        /// depth. The DAG is always available, so this shapes the ask rather
+        /// than switching a backend.
         #[arg(long, default_value_t = 0)]
         depth: u32,
         /// Output as JSON (for piping to other tools / agents).
@@ -2366,6 +2370,36 @@ async fn main() -> Result<()> {
                     println!();
 
                     let mut campaign = Campaign::new(campaign_goal, config, campaign_id.clone());
+
+                    // No --reward-weight and no --target-property: derive the
+                    // objective (one LLM call, validated against the domain's
+                    // reward registry) and SHOW it before any compute is
+                    // spent, so the operator can argue with it. Explicit
+                    // flags always win; a failed derivation falls back to the
+                    // domain's documented default policy — an objective is
+                    // never fabricated.
+                    match campaign.derive_reward_spec().await {
+                        Ok(Some(spec)) => {
+                            println!(
+                                "Objective (derived by {} — no --reward-weight/--target-property given):",
+                                spec.derived_by.as_deref().unwrap_or("the configured model")
+                            );
+                            for line in spec.describe() {
+                                println!("  {line}");
+                            }
+                            println!(
+                                "  Not what you want? Restart with --reward-weight PROPERTY=WEIGHT or --target-property PROPERTY."
+                            );
+                            println!();
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            println!(
+                                "  note: could not derive a reward objective ({error:#}); \
+                                 falling back to the domain's default reward policy"
+                            );
+                        }
+                    }
 
                     if detach {
                         // Long-research mode: the goal id must exist on disk
@@ -4705,185 +4739,247 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Research { query, depth, json } => {
-            let (api_base, auth) = resolve_agent_auth()?;
-            // Target /agent-runs — the durable research orchestrator that IS
-            // deployed and goes through marc27_core::research::engine (all
-            // safety gates included). The `/research` verb-shim this command
-            // originally targeted was PR #50, which was CLOSED unmerged —
-            // the endpoint never existed in prod (every call 404'd). The
-            // Python tool layer (app/tools/agent_runs.py) already uses
-            // /agent-runs; this mirrors it: create run, poll until terminal.
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()?;
-            let created: serde_json::Value = auth
-                .apply(client.post(format!("{api_base}/agent-runs")))
-                // Keep smoke tests cheap by always making depth explicit.
-                .json(&serde_json::json!({ "question": query, "depth": depth }))
-                .send()
-                .await?
-                .platform_error_for_status()
-                .await?
-                .json()
-                .await?;
-            let run_id = created
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("platform did not return a run id: {created}"))?;
-            eprintln!("research run {run_id} started; waiting for completion…");
-
-            // Poll until terminal ("completed" | "failed" | "canceled").
-            // Dots to stderr so stdout stays a single clean JSON/answer document.
+            // LOCAL. Research is not a separate system: it is this agent,
+            // given a goal, with the DAG (`orchestrate_agents`), the whole
+            // tool surface, and the notebook it always has.
             //
-            // The ceiling is deliberately well past the server's run budget
-            // (RESEARCH_MAX_WALL_SECS, 600s by default but raised in
-            // deployments): if the client gives up first it reports a hang on a
-            // run that is still working, and the user loses an answer they have
-            // already paid for.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2100);
+            // This command used to POST to `/agent-runs` and poll, so every
+            // answer came from `marc27_core::research::engine` — a vendor the
+            // project no longer uses. Nothing local was ever exercised, which
+            // is why an expired token made research unavailable outright
+            // rather than degraded. It now drives `prism backend`, the same
+            // JSON-RPC session the TUI and PRISM Desktop already drive.
+            let exe = std::env::current_exe()?;
+            let mut child = tokio::process::Command::new(exe)
+                .arg("backend")
+                .arg("--project-root")
+                .arg(&project_root)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                // Kept, not discarded: a backend that panics says why HERE,
+                // and a research run that dies silently is indistinguishable
+                // from one that found nothing.
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut child_stdin = child.stdin.take().expect("stdin was piped");
+            let child_stdout = child.stdout.take().expect("stdout was piped");
+            let child_stderr = child.stderr.take().expect("stderr was piped");
 
-            // A poll failure is NOT a run failure. The run lives server-side;
-            // this loop only reads it. Aborting on one bad response threw away
-            // ten to twenty minutes of billable work every time the API
-            // restarted underneath it — observed three times in one afternoon,
-            // as a 502 mid-poll and as a truncated stream. Transient errors are
-            // therefore tolerated until they stop looking transient.
-            const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 12; // ~1 min at 5s
-            let mut consecutive_failures: u32 = 0;
+            // FAN-OUT IS WIDTH, NOT DEPTH. An agent spawned by
+            // `orchestrate_agents` carries `orchestration_forbidden`, so a
+            // second level is refused by design — "a caller who wants more
+            // parallel work asks for a WIDER batch". Asking for levels spends
+            // turns on something the harness will not do.
+            let prompt = if depth == 0 {
+                query.clone()
+            } else {
+                format!(
+                    "Research goal: {query}\n\nDecompose this into independent \
+                     sub-questions and run them as ONE batch with \
+                     orchestrate_agents, then synthesise a single answer. \
+                     Cite the sources you actually read."
+                )
+            };
 
-            let resp = loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            use tokio::io::AsyncWriteExt as _;
+            for request in [
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "init", "params": {}}),
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "input.message",
+                    "params": {"text": prompt}
+                }),
+            ] {
+                child_stdin
+                    .write_all(format!("{request}\n").as_bytes())
+                    .await?;
+            }
+            child_stdin.flush().await?;
 
-                let polled = auth
-                    .apply(client.get(format!("{api_base}/agent-runs/{run_id}")))
-                    .send()
-                    .await;
-
-                let run: serde_json::Value = match polled {
-                    Ok(response) if response.status().is_success() => match response.json().await {
-                        Ok(value) => {
-                            consecutive_failures = 0;
-                            value
-                        }
-                        Err(error) => {
-                            consecutive_failures += 1;
-                            if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
-                                // "check with: prism agent" was an exit-to-CLI
-                                // instruction (no_exit_to_cli.rs) — this error
-                                // reaches TUI/agent surfaces that have their
-                                // own background-research view. Same for the
-                                // two sibling bails below.
-                                anyhow::bail!(
-                                    "lost contact with the platform while polling run {run_id} \
-                                     ({consecutive_failures} consecutive failures, last: {error}). \
-                                     The run may still be going — check the background-research \
-                                     status once the platform is reachable again."
-                                );
-                            }
-                            continue;
-                        }
-                    },
-                    Ok(response) => {
-                        let transient = response.status().is_server_error();
-                        let error = response
-                            .platform_error_for_status()
-                            .await
-                            .expect_err("non-success response must produce a platform error");
-                        if !transient {
-                            return Err(error);
-                        }
-                        consecutive_failures += 1;
-                        if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
-                            anyhow::bail!(
-                                "lost contact with the platform while polling run {run_id} \
-                                 ({consecutive_failures} consecutive failures, last: {error:#}). \
-                                 The run may still be going — check the background-research \
-                                 status once the platform is reachable again."
-                            );
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        consecutive_failures += 1;
-                        if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
-                            anyhow::bail!(
-                                "lost contact with the platform while polling run {run_id} \
-                                 ({consecutive_failures} consecutive failures, last: {error}). \
-                                 The run may still be going — check the background-research \
-                                 status once the platform is reachable again."
-                            );
-                        }
-                        continue;
-                    }
-                };
-                // Read the terminal state from `state` (primary) or `status`
-                // (fallback), and accept the full success/failure vocabulary the
-                // platform uses. This mirrors the sibling `run_ingest_job` poll
-                // loop and the verified Python client (`app/tools/agent_runs.py`,
-                // shape verified 2026-07-02): the `/agent-runs` orchestrator may
-                // report success as "succeeded"/"done" (not only "completed"),
-                // and cancel as "cancelled". Matching only "completed" here would
-                // hang the research leg until the 10-min deadline on a run that
-                // actually finished.
-                let state = run
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .or_else(|| run.get("status").and_then(|s| s.as_str()))
-                    .unwrap_or("");
-                match state {
-                    "completed" | "succeeded" | "done" => {
-                        break serde_json::json!({
-                            "run_id": run_id,
-                            "answer": run.get("answer").cloned().unwrap_or(serde_json::Value::Null),
-                            "sources": run.get("params").and_then(|p| p.get("sources")).cloned()
-                                .unwrap_or_else(|| serde_json::json!([])),
-                        });
-                    }
-                    "failed" | "canceled" | "cancelled" => {
-                        let err = run
-                            .get("error")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("(no error detail)");
-                        anyhow::bail!("research run {run_id} {state}: {err}");
-                    }
-                    _ => {
-                        if std::time::Instant::now() >= deadline {
-                            anyhow::bail!(
-                                "research run {run_id} still '{state}' after 10 min; it \
-                                 continues in the background — check its status later \
-                                 (check_background_research)"
-                            );
-                        }
-                        eprint!(".");
-                        use std::io::Write as _;
-                        let _ = std::io::stderr().flush();
+            use tokio::io::AsyncBufReadExt as _;
+            // Drained on its own task: a full stderr pipe blocks the child,
+            // and a blocked child never reaches `ui.turn.complete`.
+            let stderr_task = tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(child_stderr).lines();
+                let mut kept = Vec::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if kept.len() < 200 {
+                        kept.push(line);
                     }
                 }
-            };
-            eprintln!();
+                kept
+            });
+
+            let mut reader = tokio::io::BufReader::new(child_stdout).lines();
+            let mut answer = String::new();
+            let mut cost = serde_json::Value::Null;
+            let mut backend_error: Option<String> = None;
+            let mut turn_completed = false;
+            let mut prompt_id = 100i64;
+            while let Some(line) = reader.next_line().await? {
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                let params = event.get("params");
+                let text_of = |key: &str| {
+                    params
+                        .and_then(|p| p.get(key))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                };
+                match event.get("method").and_then(serde_json::Value::as_str) {
+                    Some("ui.text.delta") => {
+                        if let Some(text) = text_of("text") {
+                            answer.push_str(&text);
+                            // Stream it: a research turn runs for minutes, and
+                            // a silent pipe is indistinguishable from a hang.
+                            if !json {
+                                print!("{text}");
+                                io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                    // Progress goes to STDERR so stdout stays one clean
+                    // document — the same contract the hosted version kept.
+                    //
+                    // `agent` is present only when the call belongs to a DAG
+                    // lane, so printing it makes the decomposition visible:
+                    // without it a fan-out looks identical to one agent
+                    // working sequentially.
+                    Some("ui.tool.start") => {
+                        if let Some(tool) = text_of("tool_name") {
+                            match text_of("agent") {
+                                Some(agent) => eprintln!("  [{agent}] {tool}"),
+                                None => eprintln!("  · {tool}"),
+                            }
+                        }
+                    }
+                    // AN UNANSWERED PROMPT IS A DEADLOCK. The backend emits
+                    // `ui.prompt` for a tool that needs approval and then
+                    // WAITS for `input.prompt_response`; a driver that only
+                    // listens hangs forever. Measured: a `--depth 2` run sat
+                    // for 85 minutes at 0.0% CPU with no network connection
+                    // open, having printed its plan and nothing else.
+                    //
+                    // What to answer is NOT uniform. `orchestrate_agents` and
+                    // `spawn_subagent` are `requires_approval: true`, and this
+                    // command's own prompt ORDERS the model to decompose — so
+                    // a blanket "n" denies the one tool the operator asked
+                    // for by typing `--depth`, and the run silently collapses
+                    // to a flat answer. That consent is given at invocation;
+                    // it is granted here and SAID OUT LOUD, never assumed.
+                    //
+                    // Everything else is declined: this command is
+                    // non-interactive, and granting `execute_bash` or `file`
+                    // on an absent human's behalf is not a default anyone
+                    // chose. Research's own tools (`prior_art_search`,
+                    // `materials_search`) declare no approval, so they are
+                    // never affected either way.
+                    Some("ui.prompt") => {
+                        let tool = text_of("tool_name").unwrap_or_else(|| "?".to_string());
+                        let orchestration =
+                            matches!(tool.as_str(), "orchestrate_agents" | "spawn_subagent");
+                        let allow = orchestration && depth > 0;
+                        if allow {
+                            eprintln!("  approved (you asked for decomposition): {tool}");
+                        } else {
+                            eprintln!("  declined (needs approval, nobody is here): {tool}");
+                        }
+                        prompt_id += 1;
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": prompt_id,
+                            "method": "input.prompt_response",
+                            "params": {
+                                // "y" approves THIS CALL. Never "a".
+                                //
+                                // "a" is `allow-session`, and it does what it
+                                // says: the backend maps it to
+                                // `ApprovalResponse::AllowAll`, which calls
+                                // `PermissionOverrides::allow_all()` and
+                                // inserts the `"*"` wildcard. Every later
+                                // tool — `execute_bash`, `file`,
+                                // `knowledge_write` — is then auto-approved
+                                // and NO further prompt is ever emitted, so
+                                // the decline branch below can never fire
+                                // again. This code shipped for part of a day
+                                // granting unrestricted autonomy while the
+                                // comment above claimed it declined
+                                // everything but orchestration.
+                                "response": if allow { "y" } else { "n" },
+                                "tool_name": tool
+                            }
+                        });
+                        child_stdin
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await?;
+                        child_stdin.flush().await?;
+                    }
+                    // A backend failure is a FAILURE. Left unhandled it
+                    // arrives as an empty answer and exit 0, which is the
+                    // expired-token case this rewrite exists to remove
+                    // reappearing in a quieter form.
+                    Some("ui.backend.error") => {
+                        backend_error = Some(
+                            text_of("message")
+                                .or_else(|| text_of("error"))
+                                .unwrap_or_else(|| line.clone()),
+                        );
+                    }
+                    Some("ui.cost") => {
+                        cost = params.cloned().unwrap_or(serde_json::Value::Null);
+                    }
+                    Some("ui.turn.complete") => {
+                        turn_completed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Closing stdin is the backend's own shutdown signal — it drains
+            // a pending turn and reaps the Python tool server through
+            // `kill_on_drop`. SIGKILL would forfeit both and can strand that
+            // grandchild. `kill_on_drop` on our own child remains the
+            // backstop if we leave early.
+            drop(child_stdin);
+            let status = child.wait().await.ok();
+            let stderr_lines = stderr_task.await.unwrap_or_default();
+
+            // Say what went wrong, loudly, rather than presenting an empty
+            // document as a finished answer.
+            if let Some(error) = backend_error {
+                for line in stderr_lines.iter().rev().take(10).rev() {
+                    eprintln!("  {line}");
+                }
+                anyhow::bail!("research failed: {error}");
+            }
+            if !turn_completed {
+                for line in stderr_lines.iter().rev().take(10).rev() {
+                    eprintln!("  {line}");
+                }
+                let how = status
+                    .map(|s| format!("backend exited with {s}"))
+                    .unwrap_or_else(|| "backend exited".to_string());
+                anyhow::bail!("research ended before the turn completed: {how}");
+            }
+            if answer.trim().is_empty() {
+                anyhow::bail!("research produced no answer");
+            }
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "query": query,
+                        "depth": depth,
+                        "answer": answer,
+                        "cost": cost,
+                    }))?
+                );
             } else {
-                if let Some(answer) = resp.get("answer").and_then(|a| a.as_str()) {
-                    println!("{answer}");
-                }
-                if let Some(sources) = resp.get("sources").and_then(|s| s.as_array())
-                    && !sources.is_empty()
-                {
-                    println!("\nSources:");
-                    for src in sources {
-                        if let Some(title) = src.get("title").and_then(|t| t.as_str()) {
-                            let url = src.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                            println!("  - {title} {url}");
-                        }
-                    }
-                }
-                if resp.get("answer").is_none() {
-                    // Raw response if no structured answer
-                    println!("{}", serde_json::to_string_pretty(&resp)?);
-                }
+                println!();
             }
         }
         Commands::Deploy { command } => {
@@ -7286,6 +7382,7 @@ pub(crate) fn paper_agent_policy(
     let config = prism_core::config::NodeConfig::load(Some(project_root));
     prism_ingest::paper_agent::PaperAgentPolicy {
         finish_coverage_floor: config.ingest.finish_coverage_floor,
+        finish_quantity_floor: config.ingest.finish_quantity_floor,
         model_acceptance_floor: config.ingest.model_acceptance_floor,
         model_degenerate_ceiling: config.ingest.model_degenerate_ceiling,
     }

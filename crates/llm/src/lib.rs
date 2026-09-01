@@ -187,6 +187,18 @@ pub struct LlmConfig {
     /// `0` (default) = never; only an operator may bound a thinking model.
     #[serde(default = "default_read_idle_timeout_secs")]
     pub read_idle_timeout_secs: u64,
+    /// Ask this endpoint NOT to deliberate, for callers whose answer is a
+    /// short verdict rather than a derivation.
+    ///
+    /// Set per CLIENT, never globally: the literature judge returns a few
+    /// booleans and paid 56-123s for hidden `reasoning_content` to produce
+    /// them (measured 2026-08-31 against z.ai — 3,357-7,213 completion
+    /// tokens, all but ~700 invisible, at ~55 tok/s), while the paper reader
+    /// on the same endpoint wants every bit of that deliberation. One global
+    /// switch cannot serve both, which is why `LLM_NO_THINK` — an env var —
+    /// is the wrong shape for this and stays what it is.
+    #[serde(default)]
+    pub no_think: bool,
     /// The model's context window in tokens. Hosted values come from the
     /// platform catalog; an embedded GGUF client replaces them with the
     /// active context derived from model metadata. `None` means unknown.
@@ -343,6 +355,9 @@ impl Default for LlmConfig {
             api_key: None,
             credential_kind: None,
             embedding_model: None,
+            // Deliberation stays ON by default: the reader wants it, and a
+            // caller that does not must say so.
+            no_think: false,
             max_sample_rows: 10,
             // MUST agree with the serde default. They disagreed — serde said 0
             // ("PRISM does not impose one on them"), this said 300 — and every
@@ -1444,11 +1459,47 @@ impl LlmClient {
         // Opt-in via env because the kwarg is a llama-server/vLLM extension
         // OpenAI rejects with 400 (same contract as the schema path's
         // caller-opt-in `no_think`).
-        if no_think_requested() {
+        if no_think_requested() || self.config.no_think {
             body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+            // The SAME request, spelled the way GLM's own API spells it.
+            // `chat_template_kwargs` is a llama-server/vLLM extension that
+            // z.ai ignores outright: measured 2026-08-31, a selector-sized
+            // judging call returned 3,357-7,213 completion tokens of which
+            // all but ~700 were hidden `reasoning_content` at ~55 tok/s —
+            // 56 to 123 SECONDS of invisible deliberation on a call whose
+            // visible verdicts take 13. `thinking: {"type": "disabled"}`
+            // takes reasoning_content to exactly zero on that endpoint.
+            body["thinking"] = serde_json::json!({"type": "disabled"});
         }
         let body = self.with_operator_output_cap(body, prompt.len() as u64 / 4);
-        let resp = self.post(&url, &body).await?;
+        let sent_no_think = body.get("thinking").is_some();
+        let resp = match self.post(&url, &body).await {
+            Ok(resp) => resp,
+            // A provider that REFUSES the kill-switch must still answer.
+            // `chat_template_kwargs` and `thinking` are both non-standard, and
+            // a strict OpenAI-shaped endpoint 400s on either — which, once
+            // the literature judge began setting `no_think` unconditionally,
+            // turned every judging call on such a provider into a hard
+            // failure and killed the whole selector stage.
+            //
+            // Recovering by RETRY, not by a provider allowlist: no list of
+            // who-accepts-what stays true, and the endpoint already told us.
+            // The cost of being wrong is one extra call on a request that had
+            // failed anyway.
+            Err(error) if sent_no_think => {
+                debug!(
+                    %url,
+                    "endpoint refused the no-think fields; retrying once without them: {error:#}"
+                );
+                let mut plain = body.clone();
+                if let Some(map) = plain.as_object_mut() {
+                    map.remove("thinking");
+                    map.remove("chat_template_kwargs");
+                }
+                self.post(&url, &plain).await.map_err(|_| error)?
+            }
+            Err(error) => return Err(error),
+        };
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
 
         // Self-heal for thinking-mode budget burn (measured live with Gemma 4
@@ -1464,6 +1515,9 @@ impl LlmClient {
         if Self::burned_budget_on_reasoning(&data["choices"][0]) {
             let mut retry_body = body.clone();
             retry_body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+            // Both dialects: a backend that ignores the kwarg would otherwise
+            // burn its budget on the retry exactly as it did on the original.
+            retry_body["thinking"] = serde_json::json!({"type": "disabled"});
             match self.post(&url, &retry_body).await {
                 Ok(retry_resp) => {
                     if let Ok(retry_data) = retry_resp.json::<serde_json::Value>().await
@@ -4442,6 +4496,61 @@ mod tests {
         assert_eq!(out, "{\"facts\": []}");
         first.assert_async().await;
         retry.assert_async().await;
+    }
+
+    /// A provider that REFUSES the no-think fields must still answer.
+    ///
+    /// Both `chat_template_kwargs` and `thinking` are non-standard; a strict
+    /// OpenAI-shaped endpoint 400s on either. The literature judge sets
+    /// `no_think` unconditionally, so without recovery every judging call
+    /// against such a provider was a hard failure — the whole selector stage
+    /// died and every candidate came back unjudged. Recovery is by RETRY, not
+    /// by a provider allowlist: no list of who-accepts-what stays true.
+    #[tokio::test]
+    async fn a_provider_that_rejects_the_no_think_fields_still_gets_an_answer() {
+        let mut server = mockito::Server::new_async().await;
+        // Mockito serves the FIRST created mock that still has expected hits
+        // left, so the rejecting mock is created first to take the initial
+        // request; the catch-all then answers the retry.
+        let refuses = server
+            .mock("POST", "/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "thinking": {"type": "disabled"}
+            })))
+            .with_status(400)
+            .with_body(r#"{"error":{"message":"Unrecognized request argument: thinking"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let plain = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "{\"verdicts\": []}"}
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = LlmClient::new(LlmConfig {
+            base_url: server.url(),
+            model: "test-model".to_string(),
+            no_think: true,
+            ..LlmConfig::default()
+        });
+        let (out, _usage) = client
+            .generate_json_with_usage("judge these")
+            .await
+            .expect("a 400 on the kill-switch must not kill the call");
+        assert_eq!(out, "{\"verdicts\": []}");
+        refuses.assert_async().await;
+        plain.assert_async().await;
     }
 
     /// When the retry ALSO burns its budget on reasoning, the caller gets

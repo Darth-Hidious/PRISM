@@ -194,3 +194,191 @@ async fn the_kind_serializes_snake_case_and_only_on_failures() {
         "an ok status must serialize exactly as before the field existed: {json}"
     );
 }
+
+// ── Live-measured source failures (2026-08-31) and their remedies ─────────
+
+/// Serialize env mutation with the workspace lock, restoring on drop so a
+/// failed assertion cannot leak state into other tests.
+struct KeyGuard {
+    saved: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl KeyGuard {
+    fn with(value: Option<&str>) -> Self {
+        let lock = prism_runtime::offline::test_support::env_lock();
+        let saved = std::env::var("SEMANTIC_SCHOLAR_API_KEY").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("SEMANTIC_SCHOLAR_API_KEY", v),
+                None => std::env::remove_var("SEMANTIC_SCHOLAR_API_KEY"),
+            }
+        }
+        Self { saved, _lock: lock }
+    }
+}
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("SEMANTIC_SCHOLAR_API_KEY", v),
+                None => std::env::remove_var("SEMANTIC_SCHOLAR_API_KEY"),
+            }
+        }
+    }
+}
+
+/// The unauthenticated Semantic Scholar pool 429s on effectively every call.
+/// The status must not stop at "HTTP 429" — it names the remedy, so the
+/// operator learns about the key path from the failure itself.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn semantic_scholar_429_names_the_api_key_remedy() {
+    let _env = KeyGuard::with(None);
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/paper/search")
+        .match_query(mockito::Matcher::Any)
+        .with_status(429)
+        .with_body(r#"{"message": "Too Many Requests"}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let engine = engine_for("semantic_scholar", server.url(), 10);
+    let outcome = engine.search("q", 5).await;
+
+    assert_eq!(outcome.source_status.len(), 1);
+    let status = &outcome.source_status[0];
+    assert_eq!(status.status, "error");
+    assert_eq!(status.failure_kind, Some(FailureKind::RateLimited));
+    let msg = status.error.as_deref().unwrap();
+    assert!(
+        msg.contains("SEMANTIC_SCHOLAR_API_KEY"),
+        "the failure must name the remedy: {msg}"
+    );
+    assert!(msg.contains("HTTP 429"), "the raw status survives: {msg}");
+}
+
+/// With a key configured the request carries `x-api-key` — and ONLY the
+/// Semantic Scholar request does; the mock refuses unkeyed requests, so a
+/// pass proves the header went on the wire.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn semantic_scholar_sends_the_configured_api_key() {
+    let _env = KeyGuard::with(Some("test-key-123"));
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/paper/search")
+        .match_query(mockito::Matcher::Any)
+        .match_header("x-api-key", "test-key-123")
+        .with_status(200)
+        .with_body(r#"{"total": 0, "data": []}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let engine = engine_for("semantic_scholar", server.url(), 10);
+    let outcome = engine.search("q", 5).await;
+
+    assert_eq!(outcome.source_status.len(), 1);
+    let status = &outcome.source_status[0];
+    assert_eq!(
+        status.status, "ok",
+        "the keyed request must match the mock's x-api-key expectation: {:?}",
+        status.error
+    );
+}
+
+/// chemrxiv.org now fronts its public API with a browser-only Cloudflare
+/// challenge (HTTP 403, `cf-mitigated: challenge`). The status must state
+/// that reason — and where ChemRxiv preprints still arrive from — instead
+/// of a bare 403 that reads like a transient fault.
+#[tokio::test]
+async fn chemrxiv_403_names_the_cloudflare_challenge_and_the_alternative() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/items")
+        .match_query(mockito::Matcher::Any)
+        .with_status(403)
+        .with_body("<!DOCTYPE html><title>Just a moment...</title>")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let engine = engine_for("chemrxiv", server.url(), 10);
+    let outcome = engine.search("q", 5).await;
+
+    assert_eq!(outcome.source_status.len(), 1);
+    let status = &outcome.source_status[0];
+    assert_eq!(status.status, "error");
+    assert_eq!(status.failure_kind, Some(FailureKind::Auth));
+    let msg = status.error.as_deref().unwrap();
+    assert!(
+        msg.contains("Cloudflare") && msg.contains("preprints_europepmc"),
+        "the failure must state the real reason and the alternative: {msg}"
+    );
+    assert!(msg.contains("HTTP 403"), "the raw status survives: {msg}");
+}
+
+/// Unauthenticated, the shared pool's 429 is deterministic within the retry
+/// horizon: the in-band retries burned ~3.7 s per search and never once
+/// succeeded. One attempt gets the honest answer fast — the mock counts.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn semantic_scholar_unauthenticated_429_is_not_retried_in_band() {
+    let _env = KeyGuard::with(None);
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/paper/search")
+        .match_query(mockito::Matcher::Any)
+        .with_status(429)
+        .with_body(r#"{"message": "Too Many Requests"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let engine = RetrievalEngine::new(EngineConfig {
+        sources: vec!["semantic_scholar".to_string()],
+        base_overrides: HashMap::from([("semantic_scholar".to_string(), server.url())]),
+        cache_dir: None,
+        per_source_timeout_secs: 10,
+        max_attempts: 3,
+        ..EngineConfig::default()
+    });
+    let outcome = engine.search("q", 5).await;
+
+    mock.assert_async().await;
+    let status = &outcome.source_status[0];
+    assert_eq!(status.status, "error");
+    assert_eq!(status.failure_kind, Some(FailureKind::RateLimited));
+}
+
+/// With a key configured the engine's FULL retry budget applies — a keyed
+/// 429 is a genuine, transient rate limit, not the exhausted shared pool.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn semantic_scholar_keyed_429_keeps_the_engine_retry_budget() {
+    let _env = KeyGuard::with(Some("test-key-123"));
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/paper/search")
+        .match_query(mockito::Matcher::Any)
+        .match_header("x-api-key", "test-key-123")
+        .with_status(429)
+        .with_body(r#"{"message": "Too Many Requests"}"#)
+        .expect(3)
+        .create_async()
+        .await;
+    let engine = RetrievalEngine::new(EngineConfig {
+        sources: vec!["semantic_scholar".to_string()],
+        base_overrides: HashMap::from([("semantic_scholar".to_string(), server.url())]),
+        cache_dir: None,
+        per_source_timeout_secs: 30,
+        max_attempts: 3,
+        ..EngineConfig::default()
+    });
+    let outcome = engine.search("q", 5).await;
+
+    mock.assert_async().await;
+    let status = &outcome.source_status[0];
+    assert_eq!(status.status, "error");
+    assert_eq!(status.failure_kind, Some(FailureKind::RateLimited));
+}

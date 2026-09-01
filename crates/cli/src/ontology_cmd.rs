@@ -109,8 +109,27 @@ pub enum OntologyCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Import a plain list of terms as an ontology a customer can bind
-    /// against — one term per line, from anywhere.
+    /// What relations touch a class in the LOADED ontologies, and what is
+    /// on the other end.
+    ///
+    /// The traversal read surface: given a class a fact just bound to,
+    /// this answers "what does the vocabulary connect it to" — which is
+    /// what a research step consults to decide what to look for next.
+    /// Edges come from declared `rdfs:domain` (outgoing) and `rdfs:range`
+    /// (incoming), subclasses included, across EVERY loaded ontology,
+    /// primary first. A relation that declares no endpoints honestly
+    /// touches nothing — the bundled EMMO declares none; promoted and
+    /// imported artifacts declare theirs.
+    Relations {
+        /// The class to look around: a full IRI, an extraction label, or a
+        /// prefLabel declared by any loaded ontology.
+        class: String,
+        /// Machine-readable result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a plain list of terms — and, optionally, relations between
+    /// them — as an ontology a customer can bind against, from anywhere.
     ///
     /// A target schema is USUALLY just a list of names: an enum, a column
     /// header row, a data dictionary, a controlled vocabulary. This turns
@@ -119,12 +138,21 @@ pub enum OntologyCommands {
     /// the list is the whole input, which is what makes bringing your own
     /// schema a file rather than a code change.
     ///
+    /// A schema is not only names: how its concepts CONNECT is what tells a
+    /// consumer what to look for next. A line of the form
+    /// `Domain -> relation label -> Range` declares one relation (an
+    /// `owl:ObjectProperty`) whose domain and range name classes — term
+    /// lines elsewhere in the file, or classes declared by reference when
+    /// the endpoint is not a term (recorded in the artifact, never silent).
+    ///
     /// Importing a vocabulary is OPTIONAL. Extraction never requires one:
     /// terms are read in the source's own words and bound afterwards, so
     /// with no vocabulary loaded everything is simply recorded unbound.
     Import {
-        /// File with one term per line. `-` reads standard input. Blank
-        /// lines and `#` comments are skipped.
+        /// File with one entry per line: a bare term declares a class; a
+        /// `Domain -> relation label -> Range` triple declares a relation
+        /// between two classes. `-` reads standard input. Blank lines and
+        /// `#` comments are skipped.
         terms: PathBuf,
         /// Domain id for the imported vocabulary (its registry id).
         #[arg(long)]
@@ -154,6 +182,20 @@ pub enum OntologyCommands {
         /// recorded either way, so this can be tuned from measured data.
         #[arg(long)]
         threshold: Option<f64>,
+        /// Also re-resolve terms recorded under OTHER ontologies' tenants.
+        ///
+        /// Bindings are namespaced per ontology (`local`, `local@alloyprops`),
+        /// so a vocabulary promoted today starts an empty namespace and can
+        /// never reach the backlog that accumulated before it existed.
+        /// Measured: 207 terms sat unbound under `local` while a rebind
+        /// against a vocabulary that binds them reported "no unbound terms"
+        /// and exited.
+        ///
+        /// Isolation is kept — every result is written under the CURRENT
+        /// tenant, and only the WORK LIST is shared. A term is a piece of
+        /// text; re-resolving it is not copying a binding.
+        #[arg(long)]
+        adopt_orphans: bool,
         /// Machine-readable result.
         #[arg(long)]
         json: bool,
@@ -355,6 +397,7 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
             threshold,
             json,
         } => bind_names(project_root, &names, onto.as_deref(), threshold, json).await,
+        OntologyCommands::Relations { class, json } => relations_around(project_root, &class, json),
         OntologyCommands::Import {
             terms,
             domain,
@@ -364,8 +407,9 @@ pub async fn handle(command: OntologyCommands, project_root: &Path) -> Result<()
         OntologyCommands::Rebind {
             dry_run,
             threshold,
+            adopt_orphans,
             json,
-        } => rebind(project_root, dry_run, threshold, json).await,
+        } => rebind(project_root, dry_run, threshold, adopt_orphans, json).await,
     }
 }
 
@@ -469,7 +513,189 @@ async fn bind_names(
     Ok(())
 }
 
+// ── Traversal read surface ─────────────────────────────────────────────
+
+/// One printable row of `prism ontology relations`: the edge, resolved to
+/// labels a human (or a JSON consumer) can act on.
+struct ClassEdgeRow {
+    /// True for a domain hit (edge points OUT of the class), false for a
+    /// range hit (edge points IN).
+    outgoing: bool,
+    relation_iri: String,
+    relation_label: String,
+    /// Registry id of the loaded ontology declaring the relation.
+    declared_by: &'static str,
+    /// `(IRI, resolved prefLabel)` of each class on the other end — the
+    /// relation's declared ranges for an outgoing edge, domains for an
+    /// incoming one. Labels resolve through the WHOLE loaded set.
+    other_end: Vec<(String, Option<String>)>,
+}
+
+/// Resolve the operator's class argument against the loaded set: a full
+/// IRI, an exact extraction label, then a prefLabel (ASCII
+/// case-insensitive), in that order — primary first, like every set
+/// lookup. Nothing resolving is a loud error naming what is loaded.
+fn resolve_class_argument(
+    ontologies: &prism_ingest::ontologies::OntologySet,
+    input: &str,
+) -> Result<prism_ingest::ontologies::Iri> {
+    if let Ok(iri) = prism_ingest::ontologies::Iri::new(input.to_string())
+        && ontologies.declaring_class(&iri).is_some()
+    {
+        return Ok(iri);
+    }
+    if let Some((_, decl)) = ontologies.class_for_label(input) {
+        return Ok(decl.iri.clone());
+    }
+    for ontology in ontologies.all() {
+        for decl in ontology.ontology_classes() {
+            if decl
+                .pref_label
+                .as_deref()
+                .is_some_and(|label| label.eq_ignore_ascii_case(input))
+            {
+                return Ok(decl.iri.clone());
+            }
+        }
+    }
+    bail!(
+        "no loaded ontology declares a class {input:?} (loaded: {}) — pass a class IRI, \
+         an extraction label, or a prefLabel",
+        ontologies
+            .all()
+            .iter()
+            .map(|ontology| ontology.id())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The rows for one class, from
+/// [`prism_ingest::ontologies::OntologySet::relations_touching`] —
+/// factored out of [`relations_around`] so the read surface is testable
+/// without capturing stdout.
+fn class_edge_rows(
+    ontologies: &prism_ingest::ontologies::OntologySet,
+    class: &prism_ingest::ontologies::Iri,
+) -> Vec<ClassEdgeRow> {
+    ontologies
+        .relations_touching(class)
+        .into_iter()
+        .map(|edge| {
+            let relation_label = edge
+                .relation
+                .pref_label
+                .clone()
+                .or_else(|| edge.relation.extraction_labels.first().cloned())
+                .unwrap_or_else(|| edge.relation.iri.as_str().to_string());
+            let other = if edge.outgoing {
+                &edge.relation.ranges
+            } else {
+                &edge.relation.domains
+            };
+            let other_end = other
+                .iter()
+                .map(|iri| {
+                    (
+                        iri.as_str().to_string(),
+                        ontologies
+                            .declaring_class(iri)
+                            .and_then(|(_, decl)| decl.pref_label.clone()),
+                    )
+                })
+                .collect();
+            ClassEdgeRow {
+                outgoing: edge.outgoing,
+                relation_iri: edge.relation.iri.as_str().to_string(),
+                relation_label,
+                declared_by: edge.ontology.id(),
+                other_end,
+            }
+        })
+        .collect()
+}
+
+/// `prism ontology relations <class>` — what the loaded vocabularies
+/// connect a class to. Same load order as `bind`/`rebind`: the project's
+/// catalog artifact registers BEFORE the loaded set is asked for, so the
+/// promoted ontology the operator is asking about is actually loaded.
+fn relations_around(project_root: &Path, class: &str, json: bool) -> Result<()> {
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    prism_ingest::ontologies::active_from_project(Some(&config.ontology.id), project_root)?;
+    let ontologies = prism_ingest::ontologies::loaded(Some(&config.ontology.id))?;
+    let iri = resolve_class_argument(&ontologies, class)?;
+    let label = ontologies
+        .declaring_class(&iri)
+        .and_then(|(_, decl)| decl.pref_label.clone());
+    let rows = class_edge_rows(&ontologies, &iri);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "class": { "iri": iri.as_str(), "label": label },
+                "edges": rows.iter().map(|row| serde_json::json!({
+                    "direction": if row.outgoing { "outgoing" } else { "incoming" },
+                    "relation_iri": row.relation_iri,
+                    "relation_label": row.relation_label,
+                    "declared_by": row.declared_by,
+                    "other_end": row.other_end.iter().map(|(iri, label)| {
+                        serde_json::json!({ "iri": iri, "label": label })
+                    }).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "class {}{}",
+        iri.as_str(),
+        label
+            .as_deref()
+            .map(|label| format!(" ({label:?})"))
+            .unwrap_or_default()
+    );
+    if rows.is_empty() {
+        println!(
+            "  no loaded relation declares this class in its rdfs:domain or rdfs:range. \
+             Relations enter the loaded set through a promoted artifact — `prism ontology \
+             import` accepts `Domain -> relation label -> Range` lines, and accepted \
+             relation proposals carry endpoints too."
+        );
+        return Ok(());
+    }
+    for row in &rows {
+        let ends = if row.other_end.is_empty() {
+            "(no declared other end)".to_string()
+        } else {
+            row.other_end
+                .iter()
+                .map(|(iri, label)| label.clone().unwrap_or_else(|| iri.clone()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (tag, arrow) = if row.outgoing {
+            ("OUT", "->")
+        } else {
+            ("IN ", "<-")
+        };
+        println!(
+            "  {tag}  {} {arrow} {ends}   [{}] {}",
+            row.relation_label, row.declared_by, row.relation_iri
+        );
+    }
+    Ok(())
+}
+
 // ── Vocabulary import ──────────────────────────────────────────────────
+
+/// One relation line, as parsed from the import file.
+struct ImportedRelation {
+    label: String,
+    domain: String,
+    range: String,
+}
 
 /// Turn a plain list of terms into a DRAFT ontology artifact.
 ///
@@ -480,6 +706,14 @@ async fn bind_names(
 /// promote gate, the loaded union, and the resolution ladder that binds
 /// free-text property names onto whatever is loaded. No schema is known to
 /// PRISM and none is compiled in.
+///
+/// Relations ride in the SAME file: `Domain -> relation label -> Range`
+/// declares one object property, because a schema's connectivity — which
+/// relations touch which classes — is what lets a consumer traverse it
+/// (`prism ontology relations` is the read side). An endpoint that
+/// is not a term line is declared by reference, the same referential
+/// closure the induction builder gives model proposals — recorded on the
+/// class, never silent.
 fn import_vocabulary(
     terms_path: &Path,
     domain: &str,
@@ -500,16 +734,51 @@ fn import_vocabulary(
 
     let mut seen = std::collections::HashSet::new();
     let mut terms: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let term = line.trim();
-        if term.is_empty() || term.starts_with('#') {
+    let mut seen_relations = std::collections::HashSet::new();
+    let mut imported_relations: Vec<ImportedRelation> = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        let entry = line.trim();
+        if entry.is_empty() || entry.starts_with('#') {
             continue;
         }
-        if seen.insert(term.to_lowercase()) {
-            terms.push(term.to_string());
+        if entry.contains("->") {
+            let fields: Vec<&str> = entry.split("->").map(str::trim).collect();
+            let [domain_label, label, range_label] = fields[..] else {
+                bail!(
+                    "line {}: a relation line is exactly `Domain -> relation label -> Range`, \
+                     got {entry:?}",
+                    index + 1
+                );
+            };
+            if domain_label.is_empty() || label.is_empty() || range_label.is_empty() {
+                bail!(
+                    "line {}: a relation needs all three of domain, label and range \
+                     non-empty, got {entry:?}",
+                    index + 1
+                );
+            }
+            // Only an IDENTICAL triple is a duplicate to skip; the same
+            // label with different endpoints flows on to the validation
+            // gate, which refuses it loudly — never a silent first-wins.
+            let key = (
+                induction::normalize_label(label),
+                induction::normalize_label(domain_label),
+                induction::normalize_label(range_label),
+            );
+            if seen_relations.insert(key) {
+                imported_relations.push(ImportedRelation {
+                    label: label.to_string(),
+                    domain: domain_label.to_string(),
+                    range: range_label.to_string(),
+                });
+            }
+            continue;
+        }
+        if seen.insert(entry.to_lowercase()) {
+            terms.push(entry.to_string());
         }
     }
-    if terms.is_empty() {
+    if terms.is_empty() && imported_relations.is_empty() {
         bail!(
             "no terms found in {} — a vocabulary import needs at least one \
              non-empty, non-comment line",
@@ -539,14 +808,74 @@ fn import_vocabulary(
         });
     }
 
-    // The corpus hash is over the TERMS as imported: re-importing the same
-    // list claims the same version, and a changed list does not.
+    // Referential closure for relation endpoints, with the induction
+    // builder's guarantees: an endpoint that names a term binds to the
+    // term's spelling (one class, not two spellings of one concept), and an
+    // endpoint nothing declares becomes a class declared by reference —
+    // recorded on the class itself, never silent.
+    fn endpoint_label(
+        surface: &str,
+        classes: &mut Vec<induction::InducedClass>,
+        canonical: &mut std::collections::BTreeMap<String, String>,
+    ) -> String {
+        let key = induction::normalize_label(surface);
+        if let Some(label) = canonical.get(&key) {
+            return label.clone();
+        }
+        classes.push(induction::InducedClass {
+            label: surface.to_string(),
+            definition: String::new(),
+            parent: None,
+            aligned_iri: None,
+            declared_by_reference: true,
+            sign_domain: None,
+        });
+        canonical.insert(key, surface.to_string());
+        surface.to_string()
+    }
+    let mut canonical: std::collections::BTreeMap<String, String> = classes
+        .iter()
+        .map(|class| {
+            (
+                induction::normalize_label(&class.label),
+                class.label.clone(),
+            )
+        })
+        .collect();
+    let mut relations: Vec<induction::InducedRelation> = Vec::new();
+    for imported in &imported_relations {
+        let domain_label = endpoint_label(&imported.domain, &mut classes, &mut canonical);
+        let range_label = endpoint_label(&imported.range, &mut classes, &mut canonical);
+        relations.push(induction::InducedRelation {
+            label: imported.label.clone(),
+            definition: String::new(),
+            domain: domain_label,
+            range: range_label,
+            aligned_iri: None,
+            fact_kind: None,
+        });
+    }
+
+    // The corpus hash is over the TERMS and RELATIONS as imported:
+    // re-importing the same list claims the same version, and a changed
+    // list — a relation added or re-pointed included — does not. Terms
+    // hash first and exactly as they always did, so a pure term list keeps
+    // the version it claimed before relations existed.
     let digest = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         for term in &terms {
             hasher.update(term.as_bytes());
             hasher.update(b"\n");
+        }
+        for relation in &relations {
+            hasher.update(
+                format!(
+                    "{} -> {} -> {}\n",
+                    relation.domain, relation.label, relation.range
+                )
+                .as_bytes(),
+            );
         }
         let digest = hasher.finalize();
         let mut hex = String::with_capacity(digest.len() * 2);
@@ -561,7 +890,7 @@ fn import_vocabulary(
         domain: domain.to_string(),
         status: induction::OntologyStatus::Draft,
         classes,
-        relations: Vec::new(),
+        relations,
         provenance: induction::InductionProvenance {
             // No model read anything: this vocabulary was DECLARED, not
             // induced, and the artifact must not imply otherwise.
@@ -577,16 +906,34 @@ fn import_vocabulary(
         },
     };
 
+    // The strict gate, identical to induce and accept: an import that would
+    // produce an invalid artifact (one relation label with two conflicting
+    // endpoint declarations, two terms normalising to one label) is refused
+    // loudly with the specific violations, and nothing is written.
+    let violations = validate::validate(&ontology);
+    if !violations.is_empty() {
+        let mut msg = format!(
+            "import of {} REJECTED: {} violation(s) — no artifact written:",
+            terms_path.display(),
+            violations.len()
+        );
+        for violation in &violations {
+            msg.push_str(&format!("\n  [{}] {}", violation.rule, violation.message));
+        }
+        bail!(msg);
+    }
+
     let path = output.map_or_else(
         || PathBuf::from(format!("./ontology-{domain}.ttl")),
         Path::to_path_buf,
     );
     ttl::write_artifact(&path, &ontology)?;
     println!(
-        "IMPORTED: {} — {} term(s) as DRAFT ontology '{}'. Promote it with \
+        "IMPORTED: {} — {} term(s), {} relation(s) as DRAFT ontology '{}'. Promote it with \
          `prism ontology promote {}`.",
         path.display(),
         terms.len(),
+        ontology.relations.len(),
         domain,
         path.display(),
     );
@@ -630,6 +977,7 @@ async fn rebind(
     project_root: &Path,
     dry_run: bool,
     threshold: Option<f64>,
+    adopt_orphans: bool,
     json: bool,
 ) -> Result<()> {
     let threshold =
@@ -651,7 +999,14 @@ async fn rebind(
     );
 
     let store = prism_provenance::ProvenanceStore::open(&proposal_store_path()?).await?;
-    let unbound = store.unbound_term_bindings(&tenant).await?;
+    // A vocabulary promoted after the fact must be able to reach the backlog
+    // it was promoted FOR; without this the work list is empty and the
+    // command reports success while 207 terms stay unbound.
+    let unbound = if adopt_orphans {
+        store.unbound_term_bindings_across_tenants(&tenant).await?
+    } else {
+        store.unbound_term_bindings(&tenant).await?
+    };
     if unbound.is_empty() {
         if json {
             println!(
@@ -664,10 +1019,32 @@ async fn rebind(
                 })
             );
         } else {
-            println!(
-                "no unbound terms for tenant {tenant:?} — nothing to re-resolve (ingest a \
-                 paper, or the backlog is already fully bound)"
-            );
+            // A full backlog must never read as an empty one. The terms
+            // exist; they are in another ontology's namespace, and saying
+            // "nothing to re-resolve" is how 207 unbound terms looked like a
+            // finished job.
+            // A FAILED query must not read as "no orphans". Swallowing the
+            // error here recreates the exact silent success this branch
+            // exists to remove: the operator is told nothing needs
+            // re-resolving while the backlog is intact and unqueried.
+            let orphans = match store.unbound_term_bindings_across_tenants(&tenant).await {
+                Ok(found) => found.len(),
+                Err(error) => {
+                    bail!("could not check other tenants for unbound terms: {error:#}");
+                }
+            };
+            if adopt_orphans || orphans == 0 {
+                println!(
+                    "no unbound terms for tenant {tenant:?} — nothing to re-resolve (ingest a \
+                     paper, or the backlog is already fully bound)"
+                );
+            } else {
+                println!(
+                    "no unbound terms for tenant {tenant:?}, but {orphans} term(s) are unbound \
+                     under OTHER ontologies' tenants — re-run with --adopt-orphans to resolve \
+                     them against the vocabulary loaded now"
+                );
+            }
         }
         return Ok(());
     }
@@ -734,18 +1111,39 @@ async fn rebind(
         );
     }
 
-    let bindings = prism_ingest::property_resolution::resolve_property_terms(
-        &store,
-        &ontologies,
-        backend.as_deref(),
-        &tenant,
-        // Re-resolution is not a document reading; it is named as itself so
-        // provenance never claims a paper was consulted when none was.
-        "prism://rebind",
-        &terms,
-        threshold,
-    )
-    .await?;
+    // Stamping follows the WORK LIST. With --adopt-orphans the terms came
+    // from another ontology's namespace and the entities that use them live
+    // there too, so the stamp must reach them — without it the rebind binds
+    // terms and reports `entities stamped: 0`, the ontology filling up while
+    // no fact points at it. A PLAIN rebind stays tenant-fenced: it only asked
+    // about its own namespace, so it may only write there.
+    let bindings = if adopt_orphans {
+        prism_ingest::property_resolution::resolve_property_terms_stamping_across_tenants(
+            &store,
+            &ontologies,
+            backend.as_deref(),
+            &tenant,
+            // Re-resolution is not a document reading; it is named as itself so
+            // provenance never claims a paper was consulted when none was.
+            "prism://rebind",
+            &terms,
+            threshold,
+        )
+        .await?
+    } else {
+        prism_ingest::property_resolution::resolve_property_terms(
+            &store,
+            &ontologies,
+            backend.as_deref(),
+            &tenant,
+            // Re-resolution is not a document reading; it is named as itself so
+            // provenance never claims a paper was consulted when none was.
+            "prism://rebind",
+            &terms,
+            threshold,
+        )
+        .await?
+    };
 
     let bound_now = bindings.iter().filter(|b| b.class_iri.is_some()).count();
     let stamped: u64 = bindings.iter().map(|b| b.entities_stamped).sum();
@@ -1377,16 +1775,25 @@ async fn accept_proposals(
     }
 
     // The proposals reference classes of the ontology they were read
-    // against. Resolve those IRIs to labels through the ACTIVE project
-    // ontology — if the active ontology changed since the proposal was
-    // made, the unresolvable IRIs are named loudly rather than dropped.
-    let active = prism_ingest::ontologies::active_for_project_config(project_root)?;
+    // against. Resolve those IRIs to labels through the LOADED SET — if no
+    // loaded ontology declares an IRI, it is named loudly rather than dropped.
+    //
+    // The set, not the primary. The reader proposes against every loaded
+    // ontology, so a parent may legitimately come from any of them: measured
+    // 2026-09-01, 41 proposals parented on `matkg#Property` — a class the
+    // bundled matkg artifact really does declare — were refused as
+    // "no longer declared" because resolution consulted only the primary
+    // (`emmo`). Real concepts (`apparent elastic modulus`, `crack initiation
+    // coefficient`) were permanently unacceptable for a reason that had
+    // nothing to do with them.
+    let config = prism_core::config::NodeConfig::load(Some(project_root));
+    prism_ingest::ontologies::active_from_project(Some(&config.ontology.id), project_root)?;
+    let active = prism_ingest::ontologies::loaded(Some(&config.ontology.id))?;
     let label_of = |iri: &str| -> Option<String> {
+        let parsed = prism_ingest::ontologies::Iri::new(iri.to_string()).ok()?;
         active
-            .ontology_classes()
-            .iter()
-            .find(|class| class.iri.as_str() == iri)
-            .and_then(|class| class.pref_label.clone())
+            .declaring_class(&parsed)
+            .and_then(|(_, decl)| decl.pref_label.clone())
     };
 
     let mut unresolved = Vec::new();
@@ -2131,6 +2538,182 @@ mod tests {
     use prism_ingest::ontologies::OntologyRegistry;
 
     use super::*;
+
+    // ── relation import + the traversal read surface ──
+
+    /// `import` turns `Domain -> relation label -> Range` lines into
+    /// declared object properties: endpoints that are term lines bind to
+    /// those classes, an endpoint nothing declares is declared by
+    /// reference (recorded, never silent), and the ordinary promote gate
+    /// accepts the artifact unchanged. Without relation parsing each such
+    /// line would silently become a CLASS named `"A -> b -> C"` — a
+    /// vocabulary with connectivity would import as disconnected names.
+    #[test]
+    fn import_parses_relation_lines_and_closes_endpoints_by_reference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terms = dir.path().join("schema.txt");
+        std::fs::write(
+            &terms,
+            "# a schema with connectivity\n\
+             Material\n\
+             Property\n\
+             Material -> has property -> Property\n\
+             Material -> made of -> Element\n\
+             Material -> made of -> Element\n",
+        )
+        .expect("write terms file");
+        let output = dir.path().join("ontology-relimport.ttl");
+        import_vocabulary(&terms, "relimport", Some(&output), None).expect("import succeeds");
+
+        let ontology = induction::load_validated(&output).expect("artifact parses");
+        assert_eq!(
+            ontology.relations.len(),
+            2,
+            "two distinct relations (the identical duplicate line collapses): {:?}",
+            ontology.relations
+        );
+        let has_property = ontology
+            .relations
+            .iter()
+            .find(|relation| relation.label == "has property")
+            .expect("'has property' imported as a relation, not a class");
+        assert_eq!(has_property.domain, "Material");
+        assert_eq!(has_property.range, "Property");
+        let made_of = ontology
+            .relations
+            .iter()
+            .find(|relation| relation.label == "made of")
+            .expect("'made of' imported");
+        assert_eq!(made_of.range, "Element");
+
+        // The endpoint no term line declared was closed by reference —
+        // and says so; the term classes stay real declarations.
+        let class = |label: &str| {
+            ontology
+                .classes
+                .iter()
+                .find(|class| class.label == label)
+                .unwrap_or_else(|| panic!("class {label:?} missing: {:?}", ontology.classes))
+        };
+        assert!(class("Element").declared_by_reference);
+        assert!(!class("Material").declared_by_reference);
+        assert!(!class("Property").declared_by_reference);
+        // No arrow line leaked through as a class label.
+        assert!(
+            ontology
+                .classes
+                .iter()
+                .all(|class| !class.label.contains("->")),
+            "{:?}",
+            ontology.classes
+        );
+
+        ttl::promote_artifact(&output).expect("the existing promote gate accepts the artifact");
+    }
+
+    /// A relation line that is not exactly three fields is a loud error
+    /// naming the line — never a silently imported garbage class.
+    #[test]
+    fn a_malformed_relation_line_is_refused_naming_the_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bad in ["Material -> has property", "A -> b -> C -> d", "-> x -> Y"] {
+            let terms = dir.path().join("bad.txt");
+            std::fs::write(&terms, format!("Material\n{bad}\n")).expect("write terms file");
+            let err = import_vocabulary(&terms, "badrel", Some(&dir.path().join("out.ttl")), None)
+                .expect_err("a malformed relation line must be refused");
+            assert!(
+                format!("{err:#}").contains("line 2"),
+                "the error must name the line for {bad:?}: {err:#}"
+            );
+        }
+    }
+
+    /// One relation label declared twice with CONFLICTING endpoints is a
+    /// refusal through the validation gate, not a silent first-wins —
+    /// and nothing is written.
+    #[test]
+    fn conflicting_relation_declarations_are_refused_not_first_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terms = dir.path().join("conflict.txt");
+        std::fs::write(
+            &terms,
+            "Material -> has property -> Property\nProcess -> has property -> Material\n",
+        )
+        .expect("write terms file");
+        let output = dir.path().join("out.ttl");
+        let err = import_vocabulary(&terms, "confrel", Some(&output), None)
+            .expect_err("conflicting endpoint declarations must be refused");
+        assert!(
+            format!("{err:#}").contains("duplicate_relation_label"),
+            "{err:#}"
+        );
+        assert!(!output.exists(), "a refused import must write nothing");
+    }
+
+    /// The read surface end to end on a promoted relation import: the
+    /// operator's spelling resolves (prefLabel, case-insensitive), the
+    /// domain side lists an outgoing edge with the range class on the
+    /// other end resolved to its label, and the range side lists the same
+    /// relation incoming. This is the query a DAG step asks to decide
+    /// what to look for next.
+    #[test]
+    fn relation_rows_answer_direction_and_other_end_from_a_promoted_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let terms = dir.path().join("schema.txt");
+        std::fs::write(
+            &terms,
+            "Material\nProperty\nMaterial -> has property -> Property\n",
+        )
+        .expect("write terms file");
+        let artifact = dir.path().join("ontology-relquery.ttl");
+        import_vocabulary(&terms, "relquery", Some(&artifact), None).expect("import");
+        ttl::promote_artifact(&artifact).expect("promote");
+
+        let induced = induction::register::load_induced_from_path(&artifact)
+            .expect("accepted artifact loads as an adapter");
+        let set = prism_ingest::ontologies::OntologySet::new(vec![
+            induced,
+            std::sync::Arc::new(prism_ingest::ontologies::EmmoOntology),
+        ])
+        .expect("distinct ids");
+
+        // prefLabel resolution is case-insensitive, primary first.
+        let material = resolve_class_argument(&set, "material").expect("prefLabel resolves");
+        let rows = class_edge_rows(&set, &material);
+        assert_eq!(rows.len(), 1, "one edge touches Material");
+        assert!(rows[0].outgoing, "the domain side is outgoing");
+        assert_eq!(rows[0].relation_label, "has property");
+        assert_eq!(rows[0].declared_by, "relquery");
+        assert_eq!(
+            rows[0]
+                .other_end
+                .iter()
+                .map(|(_, label)| label.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("Property")],
+            "the other end resolves to its declared label"
+        );
+
+        // The range side sees the same relation incoming.
+        let property = resolve_class_argument(&set, "Property").expect("label resolves");
+        let rows = class_edge_rows(&set, &property);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].outgoing, "the range side is incoming");
+        assert_eq!(
+            rows[0]
+                .other_end
+                .iter()
+                .map(|(_, label)| label.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("Material")]
+        );
+
+        // Nothing resolving is a loud error naming what is loaded.
+        let err = resolve_class_argument(&set, "no such class anywhere")
+            .expect_err("an undeclared class must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("relquery") && msg.contains("emmo"), "{msg}");
+    }
 
     fn draft_ontology(domain: &str) -> InducedOntology {
         InducedOntology {

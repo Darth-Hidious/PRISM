@@ -464,17 +464,19 @@ pub fn parse_jats(body: &[u8]) -> Result<Fulltext> {
                         // both, so <row> is a row boundary exactly like <tr>.
                         text.push('\n');
                     }
-                    b"td" | b"th" | b"entry" if sink == Some(Sink::Wrap) => {
-                        // Preserve CELL structure: cells joined with bare
-                        // spaces destroyed column identity — "Inconel 718
-                        // 1375" cannot be split back into alloy and value,
-                        // and a multi-word cell swallows its neighbours.
-                        // ~85% of reported compositions/properties live in
-                        // tables (DiSCoMaT, ACL 2023); the delimiter is what
-                        // lets a reader bind a value to its column header.
-                        if !text.is_empty() && !text.ends_with('\n') {
-                            text.push_str(" |");
-                        }
+                    // Preserve CELL structure: cells joined with bare
+                    // spaces destroyed column identity — "Inconel 718
+                    // 1375" cannot be split back into alloy and value,
+                    // and a multi-word cell swallows its neighbours.
+                    // ~85% of reported compositions/properties live in
+                    // tables (DiSCoMaT, ACL 2023); the delimiter is what
+                    // lets a reader bind a value to its column header.
+                    b"td" | b"th" | b"entry"
+                        if sink == Some(Sink::Wrap)
+                            && !text.is_empty()
+                            && !text.ends_with('\n') =>
+                    {
+                        text.push_str(" |");
                     }
                     b"p" if (depth_body > 0 || depth_app > 0) && sink.is_none() => {
                         // <app> paragraphs are document content (appendix

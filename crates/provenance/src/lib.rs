@@ -51,8 +51,9 @@ pub use emmo::{
     parse_action_id,
 };
 pub use term_binding::{
-    ClassLabelEmbedding, ClassLabelNeighbor, TERM_BINDING_RUNG_EXACT, TERM_BINDING_RUNG_NORMALIZED,
-    TERM_BINDING_RUNG_PROPOSED, TERM_BINDING_RUNG_SEMANTIC, TermBinding,
+    ClassLabelEmbedding, ClassLabelNeighbor, CrossTenantStamp, TERM_BINDING_RUNG_EXACT,
+    TERM_BINDING_RUNG_NORMALIZED, TERM_BINDING_RUNG_PROPOSED, TERM_BINDING_RUNG_SEMANTIC,
+    TermBinding,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

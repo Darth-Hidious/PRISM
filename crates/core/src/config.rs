@@ -253,6 +253,14 @@ pub struct IngestSection {
     /// reading, never what the lines say. `0` disables the gate.
     #[serde(default = "default_finish_coverage_floor")]
     pub finish_coverage_floor: f64,
+    /// The paper loop's EXTRACTION STANDARD: the fraction of the
+    /// quantity-bearing lines the reader has SEEN that may remain uncited by
+    /// any proposal before a FIRST `finish` is refused once, with those line
+    /// numbers handed back. It shows, it never demands — no target count is
+    /// stated anywhere, because a model told to produce more facts produces
+    /// false ones. `1` disables the gate.
+    #[serde(default = "default_finish_quantity_floor")]
+    pub finish_quantity_floor: f64,
     /// Capability verdict (§D.5): when EVERY sample's proposal acceptance
     /// rate stays below this floor — together with a degenerate-rate or
     /// coverage failure — the extraction is reported `model_insufficient`
@@ -271,6 +279,7 @@ impl Default for IngestSection {
             batch_rows: None,
             chunk_bytes: None,
             finish_coverage_floor: default_finish_coverage_floor(),
+            finish_quantity_floor: default_finish_quantity_floor(),
             model_acceptance_floor: default_model_acceptance_floor(),
             model_degenerate_ceiling: default_model_degenerate_ceiling(),
         }
@@ -281,6 +290,24 @@ impl Default for IngestSection {
 /// measured-safe default; `0` turns the gate off entirely.
 fn default_finish_coverage_floor() -> f64 {
     0.25
+}
+
+/// OFF by default (`1.0`), and that is a measured decision.
+///
+/// The diagnosis holds: across 20 LitXAlloy papers the reader reached 100%
+/// coverage on every one, stopped on `finish` (never `budget`) on every one
+/// with turns to spare, and recorded about a third of the quantities present.
+/// Reading was never the constraint; stopping was, and nothing measured it.
+///
+/// But the gate does not fix it. Four papers, same binary, on vs off: mean F1
+/// 0.4329 vs 0.4381 — 0.005 apart, indistinguishable — while per paper it
+/// swung BOTH ways by more than the benchmark's noise floor (+0.108 on one,
+/// -0.145 on the one where it fired and claims went 24 to 42). No measured
+/// accuracy, added variance, against a design note warning that a model told
+/// it must produce more facts will produce false ones. An operator may set a
+/// fraction to turn it on.
+fn default_finish_quantity_floor() -> f64 {
+    1.0
 }
 
 /// A healthy frontier model lands far above one third of its proposals; a

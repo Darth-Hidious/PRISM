@@ -210,10 +210,21 @@ fn build_engine(sources: Vec<String>, mailto: &Option<String>, no_cache: bool) -
 fn literature_judge(
     project_root: &std::path::Path,
 ) -> Option<std::sync::Arc<dyn prism_retrieval::Selector>> {
-    let cfg = crate::build_llm_config(project_root, None, None, None).ok()?;
+    let mut cfg = crate::build_llm_config(project_root, None, None, None).ok()?;
     if cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() {
         return None;
     }
+    // The judge answers "would reading this help" with a handful of booleans.
+    // Measured 2026-08-31 against z.ai: it spent 56-123 SECONDS producing
+    // 3,357-7,213 completion tokens for that, all but ~700 of them hidden
+    // `reasoning_content` at ~55 tok/s — while the visible verdicts take
+    // ~13s. It was the whole reason a literature search overran the 60s tool
+    // ceiling and every in-agent search timed out.
+    //
+    // Set on THIS client only. The paper reader runs on the same endpoint and
+    // wants every bit of that deliberation, which is exactly why the existing
+    // `LLM_NO_THINK` env switch is the wrong instrument here.
+    cfg.no_think = true;
     Some(std::sync::Arc::new(prism_retrieval::LlmSelector::new(
         prism_llm::LlmClient::new(cfg),
     )))
@@ -733,6 +744,12 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
                     "document": fulltext.source_url,
                     "blocks_extracted": blocks_extracted,
                     "max_blocks": max_blocks,
+                    // An extraction that cannot name the model that produced
+                    // it is unreproducible: a flash model and a frontier one
+                    // yield very different claim counts from identical input,
+                    // and without this field a scored corpus cannot say which
+                    // it measured.
+                    "model": extractor_model,
                     "stored": stored,
                     "ontology": ontology_id,
                     "paper_agent": {

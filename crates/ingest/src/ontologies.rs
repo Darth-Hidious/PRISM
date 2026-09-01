@@ -1392,6 +1392,83 @@ impl OntologySet {
                 .map(|decl| (ontology.as_ref(), decl))
         })
     }
+
+    /// The class plus every strict named ancestor reachable through the
+    /// UNION of loaded ontologies.
+    ///
+    /// A worklist, not one pass per ontology: an induced class may parent on
+    /// a class another loaded ontology declares (the paper reader proposes
+    /// against the whole set), so each discovered ancestor is re-asked of
+    /// EVERY ontology. Cycle-safe by the visited set.
+    fn class_and_ancestors(&self, iri: &Iri) -> BTreeSet<Iri> {
+        let mut closure = BTreeSet::new();
+        let mut pending = vec![iri.clone()];
+        while let Some(current) = pending.pop() {
+            if !closure.insert(current.clone()) {
+                continue;
+            }
+            for ontology in &self.ontologies {
+                pending.extend(ontology.ancestors(&current));
+            }
+        }
+        closure
+    }
+
+    /// Every declared object property that touches `class`: the relation
+    /// names the class — or one of its ancestors, so an edge declared on a
+    /// general class covers its subclasses — in its `rdfs:domain`
+    /// (outgoing) or `rdfs:range` (incoming).
+    ///
+    /// This is the traversal read surface: given a class a fact just bound
+    /// to, it answers "what does the vocabulary connect this to", which is
+    /// what a DAG step consults to decide what to look for next. The other
+    /// end of each edge is the relation declaration's own
+    /// [`RelationDecl::ranges`] (outgoing) / [`RelationDecl::domains`]
+    /// (incoming).
+    ///
+    /// The WHOLE loaded set answers, primary first — the same contract as
+    /// [`OntologySet::declaring_class`]: consulting only the primary
+    /// silently loses edges declared by other loaded ontologies. A relation
+    /// that declares no endpoints (the bundled EMMO artifact carries no
+    /// `rdfs:domain`/`rdfs:range`) honestly touches nothing — silence,
+    /// never a guess.
+    pub fn relations_touching(&self, class: &Iri) -> Vec<ClassRelationEdge<'_>> {
+        let closure = self.class_and_ancestors(class);
+        let mut edges = Vec::new();
+        for ontology in &self.ontologies {
+            for relation in ontology.ontology_properties() {
+                if relation.domains.iter().any(|iri| closure.contains(iri)) {
+                    edges.push(ClassRelationEdge {
+                        ontology: ontology.as_ref(),
+                        relation,
+                        outgoing: true,
+                    });
+                }
+                if relation.ranges.iter().any(|iri| closure.contains(iri)) {
+                    edges.push(ClassRelationEdge {
+                        ontology: ontology.as_ref(),
+                        relation,
+                        outgoing: false,
+                    });
+                }
+            }
+        }
+        edges
+    }
+}
+
+/// One declared relation touching a class, from
+/// [`OntologySet::relations_touching`]. A self-relation (the class covered
+/// by domain AND range) yields two edges, one per direction.
+pub struct ClassRelationEdge<'a> {
+    /// The loaded ontology that declares the relation — so a consumer can
+    /// name the edge's source, exactly like the `declaring_*` lookups.
+    pub ontology: &'a dyn Ontology,
+    pub relation: &'a RelationDecl,
+    /// True when the class (or an ancestor) is in the relation's domain —
+    /// the edge points OUT of the class toward [`RelationDecl::ranges`];
+    /// false when in its range, pointing IN from [`RelationDecl::domains`].
+    pub outgoing: bool,
 }
 
 /// Resolve the UNION of loaded ontologies for one extraction run: the active
@@ -1727,6 +1804,144 @@ mod tests {
             .expect_err("a declaration its own resolver cannot find must be refused");
         assert!(format!("{error:#}").contains("resolver cannot find"));
         assert!(reg.all().is_empty(), "every invalid adapter was refused");
+    }
+
+    /// A parent IRI may come from ANY loaded ontology, not just the primary.
+    ///
+    /// The paper reader proposes against the whole loaded set, so a class it
+    /// parents on `matkg#Property` is legitimate even when `emmo` is primary.
+    /// Measured 2026-09-01: acceptance resolved parent IRIs through the
+    /// PRIMARY ontology alone, so 41 proposals parented on a class the
+    /// bundled matkg artifact really does declare were refused as "no longer
+    /// declared" — `apparent elastic modulus`, `crack initiation
+    /// coefficient` and others were permanently unacceptable for a reason
+    /// that had nothing to do with them.
+    #[test]
+    fn a_parent_from_a_non_primary_ontology_still_resolves() {
+        let set = loaded(Some(DEFAULT_ONTOLOGY_ID)).expect("bundled ontologies load");
+        assert!(
+            set.all().len() > 1,
+            "this test is meaningless with one ontology loaded: {:?}",
+            set.all().iter().map(|o| o.id()).collect::<Vec<_>>()
+        );
+        assert_eq!(set.primary().id(), DEFAULT_ONTOLOGY_ID);
+
+        let matkg_property =
+            Iri::new("https://mirdyne.com/ontology/matkg#Property".to_string()).expect("valid iri");
+
+        // The primary does NOT declare it — this is what made the bug silent.
+        assert!(
+            set.primary().class(&matkg_property).is_none(),
+            "emmo must not declare a matkg class, or this pins nothing"
+        );
+        // The SET does, which is what acceptance must consult.
+        let (owner, decl) = set
+            .declaring_class(&matkg_property)
+            .expect("a loaded ontology declares matkg#Property");
+        assert_eq!(owner.id(), "matkg");
+        assert_eq!(decl.pref_label.as_deref(), Some("Property"));
+    }
+
+    /// The traversal read surface answers from the WHOLE loaded set with
+    /// subsumption: an edge declared by a NON-primary ontology on a general
+    /// class is found for that class, for its subclass declared by ANOTHER
+    /// ontology, and for a sub-subclass whose ancestry crosses ontology
+    /// boundaries twice — the case a single `ancestors` pass per ontology
+    /// would miss. Direction is domain=outgoing, range=incoming.
+    #[test]
+    fn relations_touching_answers_from_the_whole_set_with_cross_ontology_subsumption() {
+        let iri = |s: &str| Iri::new(s.to_string()).expect("test IRI is valid");
+        let class = |i: &Iri, label: &str, parents: Vec<Iri>| ClassDecl {
+            iri: i.clone(),
+            pref_label: Some(label.to_string()),
+            parents,
+            extraction_labels: vec![label.to_string()],
+        };
+
+        let material = iri("https://example.test/alpha#Material");
+        let alloy = iri("https://example.test/alpha#Alloy");
+        let property = iri("https://example.test/beta#Property");
+        let has_property = iri("https://example.test/beta#hasProperty");
+        let superalloy = iri("https://example.test/gamma#Superalloy");
+
+        // alpha (primary): the class hierarchy, no relations.
+        let mut alpha = Fake::new("alpha", &["Material"], &[]);
+        alpha.classes = vec![
+            class(&material, "Material", Vec::new()),
+            class(&alloy, "Alloy", vec![material.clone()]),
+        ];
+        // beta: declares the ONE relation, on the general class.
+        let mut beta = Fake::new("beta", &["Property"], &["HAS_PROPERTY"]);
+        beta.classes = vec![class(&property, "Property", Vec::new())];
+        beta.relations = vec![RelationDecl {
+            iri: has_property.clone(),
+            pref_label: Some("hasProperty".to_string()),
+            parents: Vec::new(),
+            domains: vec![material.clone()],
+            ranges: vec![property.clone()],
+            extraction_labels: vec!["HAS_PROPERTY".to_string()],
+        }];
+        // gamma: a subclass whose parent lives in alpha — ancestry crosses
+        // ontology boundaries twice (gamma -> alpha -> alpha).
+        let mut gamma = Fake::new("gamma", &["Superalloy"], &[]);
+        gamma.classes = vec![class(&superalloy, "Superalloy", vec![alloy.clone()])];
+
+        let set = OntologySet::new(vec![Arc::new(alpha), Arc::new(beta), Arc::new(gamma)])
+            .expect("distinct ids");
+
+        // Direct domain hit, declared by a NON-primary ontology.
+        let edges = set.relations_touching(&material);
+        assert_eq!(edges.len(), 1, "one edge touches Material");
+        assert!(edges[0].outgoing, "domain side is outgoing");
+        assert_eq!(edges[0].ontology.id(), "beta");
+        assert_eq!(edges[0].relation.iri, has_property);
+        assert_eq!(edges[0].relation.ranges, vec![property.clone()]);
+
+        // Subsumption: the subclass inherits the edge …
+        let edges = set.relations_touching(&alloy);
+        assert_eq!(edges.len(), 1, "Alloy inherits Material's edge");
+        assert!(edges[0].outgoing);
+        // … and so does the sub-subclass whose closure needs the worklist:
+        // gamma answers Superalloy -> Alloy, only alpha answers Alloy ->
+        // Material, so a one-pass union would stop short of the domain.
+        let edges = set.relations_touching(&superalloy);
+        assert_eq!(
+            edges.len(),
+            1,
+            "cross-ontology transitive ancestry must reach the declared domain"
+        );
+
+        // Range side is incoming.
+        let edges = set.relations_touching(&property);
+        assert_eq!(edges.len(), 1);
+        assert!(!edges[0].outgoing, "range side is incoming");
+        assert_eq!(edges[0].relation.domains, vec![material.clone()]);
+    }
+
+    /// A relation that declares no `rdfs:domain`/`rdfs:range` touches
+    /// NOTHING — pinned on the real bundled EMMO, whose artifact carries no
+    /// endpoint declarations at all. Silence, never a guessed edge: the
+    /// read surface must not invent connectivity the ontology never stated.
+    #[test]
+    fn relations_without_declared_endpoints_touch_nothing() {
+        let emmo = EmmoOntology;
+        assert!(
+            emmo.ontology_properties()
+                .iter()
+                .all(|relation| relation.domains.is_empty() && relation.ranges.is_empty()),
+            "this pin assumes the bundled EMMO declares no endpoints; if it \
+             gained some, assert the new edges instead of deleting this test"
+        );
+        let material = emmo
+            .class_for_label("Material")
+            .expect("Material is declared")
+            .iri
+            .clone();
+        let set = OntologySet::single(Arc::new(emmo));
+        assert!(
+            set.relations_touching(&material).is_empty(),
+            "no declared endpoints must mean no edges — never a guess"
+        );
     }
 
     /// Facts of the default ontology keep the bare base tenant (every

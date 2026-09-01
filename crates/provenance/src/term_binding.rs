@@ -93,6 +93,27 @@ pub struct ClassLabelNeighbor {
     pub similarity: f64,
 }
 
+/// Where a cross-tenant stamp landed, and what it refused to touch.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CrossTenantStamp {
+    /// Entities stamped, grouped by the ENTITY's tenant and ordered by
+    /// tenant. Tenants where nothing was stamped are omitted, so an
+    /// operator reads exactly where the effect landed.
+    pub stamped_by_tenant: Vec<(String, u64)>,
+    /// Entities whose canonical name matches the term but which already
+    /// carry a DIFFERENT class IRI, across all tenants. They are never
+    /// overwritten — counted so the refusal is visible instead of silent.
+    pub conflicts: u64,
+}
+
+impl CrossTenantStamp {
+    /// Total entities stamped across every tenant.
+    #[must_use]
+    pub fn total_stamped(&self) -> u64 {
+        self.stamped_by_tenant.iter().map(|(_, count)| count).sum()
+    }
+}
+
 /// Schema for the ladder's two durable surfaces. Called from the store's
 /// `init_schema`, same `CREATE TABLE IF NOT EXISTS` idempotency as every
 /// other table there.
@@ -295,6 +316,45 @@ impl ProvenanceStore {
         .await
     }
 
+    /// Terms still unbound ANYWHERE, for a vocabulary that did not exist when
+    /// they were first read.
+    ///
+    /// Bindings are namespaced per ontology (`local`, `local@alloyprops`), so
+    /// a newly promoted vocabulary starts an empty namespace and can never
+    /// reach the backlog that accumulated under the old one — measured: 207
+    /// terms sat unbound under `local` while `rebind` against a vocabulary
+    /// that binds them reported "no unbound terms" and exited.
+    ///
+    /// Isolation is preserved by the CALLER, which re-resolves each term
+    /// against the ontologies loaded now and writes the result under its OWN
+    /// tenant. Nothing is copied across namespaces; only the work list is
+    /// shared, and a term is only ever a piece of text.
+    ///
+    /// `DISTINCT` on the term because the same word may be unbound under
+    /// several tenants and needs re-resolving once.
+    pub async fn unbound_term_bindings_across_tenants(
+        &self,
+        current_tenant: &str,
+    ) -> Result<Vec<TermBinding>> {
+        self.query_bindings(
+            "SELECT tenant, term, verbatim, class_iri, ontology_id, rung, \
+             score, threshold, model, proposal_item_id, resolved_at, \
+                  nearest_class_iri, nearest_label \
+             FROM ontology_term_binding b \
+             WHERE class_iri IS NULL \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM ontology_term_binding bound \
+                     WHERE bound.tenant = ?1 AND bound.term = b.term \
+                       AND bound.class_iri IS NOT NULL) \
+               AND b.rowid = ( \
+                     SELECT MIN(o.rowid) FROM ontology_term_binding o \
+                     WHERE o.term = b.term AND o.class_iri IS NULL) \
+             ORDER BY term",
+            vec![Value::Text(current_tenant.to_string())],
+        )
+        .await
+    }
+
     async fn query_bindings(&self, sql: &str, params: Vec<Value>) -> Result<Vec<TermBinding>> {
         let mut rows = self.conn.query(sql, params).await?;
         let mut bindings = Vec::new();
@@ -489,6 +549,102 @@ impl ProvenanceStore {
             .await?;
         Ok(stamped)
     }
+
+    /// [`Self::apply_term_binding_to_entities`] without the tenant fence:
+    /// stamp the class onto every still-unclassed entity whose canonical
+    /// name is the term, in WHATEVER tenant it lives.
+    ///
+    /// Bindings are namespaced per ontology (`local`, `local@alloyprops`),
+    /// entities are not re-homed when a vocabulary is promoted — measured
+    /// 2026-08-21: 5,136 entities under `local`, every new binding under
+    /// `local@<ontology>`, and `entities stamped: 0` on all 203 bound
+    /// terms. The tenant split exists to keep BINDING rows from colliding;
+    /// it was never meant to stop a fact learning its type, and a class IRI
+    /// is fully qualified — unambiguous wherever it lands. So crossing is
+    /// allowed HERE, in a separately named method a caller opts into
+    /// deliberately (the `rebind --adopt-orphans` precedent: the effect is
+    /// named, never implicit). Binding RECORDS keep their isolation — this
+    /// copies no rows between binding namespaces, it only writes
+    /// `emmo_entity.class_iri`.
+    ///
+    /// The same `class_iri IS NULL` guard applies: an entity that already
+    /// carries a DIFFERENT class is never overwritten, and is counted in
+    /// [`CrossTenantStamp::conflicts`] so the refusal is never silent.
+    pub async fn apply_term_binding_to_entities_across_tenants(
+        &self,
+        term: &str,
+        class_iri: &str,
+    ) -> Result<CrossTenantStamp> {
+        if class_iri.trim().is_empty() {
+            bail!("refusing to stamp an empty class IRI");
+        }
+        let _same_handle_guard = self.write_lock.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM emmo_entity \
+                 WHERE canonical_name = ?1 AND class_iri IS NOT NULL AND class_iri <> ?2",
+                [
+                    Value::Text(term.to_string()),
+                    Value::Text(class_iri.to_string()),
+                ],
+            )
+            .await?;
+        let conflicts = match rows.next().await? {
+            Some(row) => count_column(&row, 0)?,
+            None => 0,
+        };
+        // Finalize the read before writing on the same connection.
+        drop(rows);
+        // Counted BEFORE the update, under the same write lock on the same
+        // connection, so the per-tenant counts are exactly the rows the
+        // UPDATE then stamps.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COALESCE(tenant, ''), COUNT(*) FROM emmo_entity \
+                 WHERE canonical_name = ?1 AND class_iri IS NULL \
+                 GROUP BY COALESCE(tenant, '') ORDER BY 1",
+                [Value::Text(term.to_string())],
+            )
+            .await?;
+        let mut stamped_by_tenant = Vec::new();
+        while let Some(row) = rows.next().await? {
+            stamped_by_tenant.push((get_str(&row, 0)?, count_column(&row, 1)?));
+        }
+        drop(rows);
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE emmo_entity SET class_iri = ?2 \
+                 WHERE canonical_name = ?1 AND class_iri IS NULL",
+                [
+                    Value::Text(term.to_string()),
+                    Value::Text(class_iri.to_string()),
+                ],
+            )
+            .await?;
+        let counted: u64 = stamped_by_tenant.iter().map(|(_, count)| count).sum();
+        if updated != counted {
+            bail!(
+                "cross-tenant stamp updated {updated} entity rows but counted {counted} — \
+                 the per-tenant report would lie; refusing to return it"
+            );
+        }
+        Ok(CrossTenantStamp {
+            stamped_by_tenant,
+            conflicts,
+        })
+    }
+}
+
+/// A `COUNT(*)` column, refusing to read a malformed answer as zero.
+fn count_column(row: &turso::Row, index: usize) -> Result<u64> {
+    let value = row.get_value(index)?;
+    value
+        .as_integer()
+        .map(|count| *count as u64)
+        .ok_or_else(|| anyhow::anyhow!("COUNT(*) column {index} is not an integer: {value:?}"))
 }
 
 fn opt_text(value: &Option<String>) -> Value {
@@ -745,6 +901,76 @@ mod tests {
         );
     }
 
+    /// A vocabulary promoted AFTER the terms were read must be able to reach
+    /// them.
+    ///
+    /// Bindings are namespaced per ontology (`local`, `local@alloyprops`), so
+    /// a newly promoted vocabulary starts an empty namespace. Measured on the
+    /// real store: 241 terms sat unbound under `local` while a rebind against
+    /// a vocabulary that binds them reported "no unbound terms" and exited
+    /// successfully — a full backlog reading as a finished job.
+    #[tokio::test]
+    async fn the_cross_tenant_work_list_reaches_another_tenants_backlog() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // Read under the default tenant, before the new vocabulary existed.
+        let mut orphan = unbound(Some(0.62), None);
+        orphan.term = "vickers hardness".into();
+        orphan.verbatim = "Vickers hardness".into();
+        store.record_term_binding(&orphan).await.unwrap();
+
+        // The new vocabulary's namespace is empty, so the same-tenant work
+        // list is empty and the old behaviour reports nothing to do.
+        assert!(
+            store
+                .unbound_term_bindings("local@alloyprops")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the new tenant starts empty — this is what made the bug silent"
+        );
+
+        // Across tenants, the backlog is visible.
+        let reachable = store
+            .unbound_term_bindings_across_tenants("local@alloyprops")
+            .await
+            .unwrap();
+        assert_eq!(reachable.len(), 1, "{reachable:?}");
+        assert_eq!(reachable[0].term, "vickers hardness");
+        assert_eq!(
+            reachable[0].tenant, "local",
+            "the work list keeps its origin tenant; the CALLER writes results under its own"
+        );
+    }
+
+    /// Work already done is not re-offered: a term the current tenant has
+    /// bound must not come back through the cross-tenant list because some
+    /// other tenant still has it unbound.
+    #[tokio::test]
+    async fn the_cross_tenant_work_list_skips_what_this_tenant_already_bound() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        let mut orphan = unbound(Some(0.62), None);
+        orphan.term = "yield strength".into();
+        store.record_term_binding(&orphan).await.unwrap();
+
+        let mut already = bound(TERM_BINDING_RUNG_EXACT, "https://example.test/YS", None);
+        already.tenant = "local@alloyprops".into();
+        already.term = "yield strength".into();
+        store.record_term_binding(&already).await.unwrap();
+
+        assert!(
+            store
+                .unbound_term_bindings_across_tenants("local@alloyprops")
+                .await
+                .unwrap()
+                .is_empty(),
+            "an already-bound term must not be re-resolved on every run"
+        );
+    }
+
     /// Nearest-neighbour scoping: only the requested ontology ids and the
     /// requested model partition may answer, whatever else is stored — the
     /// SQL-level half of "the union of LOADED ontologies is consulted".
@@ -896,5 +1122,111 @@ mod tests {
             untouched, 0,
             "a declared classification is never overwritten"
         );
+    }
+
+    /// The cross-tenant stamp: bindings live under ontology-qualified
+    /// tenants (`local@alloyprops`) while the entities they describe stay
+    /// under `local`, so the tenant-fenced stamp found NOTHING — measured
+    /// 2026-08-21 as `entities stamped: 0` on all 203 bound terms. The
+    /// unfenced sibling reaches every tenant, reports per tenant where the
+    /// stamp landed, and counts (never overwrites) entities that already
+    /// carry a different class.
+    #[tokio::test]
+    async fn cross_tenant_stamp_reaches_every_tenant_and_reports_where_it_landed() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+
+        // The backlog's entities live under the BASE tenant and one other.
+        store
+            .write_extracted_entity("Yield Strength", "Entity", None, "local")
+            .await
+            .unwrap();
+        store
+            .write_extracted_entity("yield strength", "Entity", None, "mesh-b")
+            .await
+            .unwrap();
+        // A declared classification with a DIFFERENT class must survive and
+        // be counted as a conflict, not silently overwritten.
+        store
+            .write_classified_entity(
+                "yield strength",
+                crate::ClassifiedNode {
+                    entity_type: "Property",
+                    storage_label: "Property",
+                    class_iri: "https://example.test/Declared",
+                },
+                None,
+                "local",
+            )
+            .await
+            .unwrap();
+
+        // The binding's own tenant holds no entities: the measured zero.
+        assert_eq!(
+            store
+                .apply_term_binding_to_entities(
+                    "local@alloyprops",
+                    "yield strength",
+                    "https://example.test/YS",
+                )
+                .await
+                .unwrap(),
+            0,
+            "the tenant fence is why nothing was ever stamped"
+        );
+
+        let stamp = store
+            .apply_term_binding_to_entities_across_tenants(
+                "yield strength",
+                "https://example.test/YS",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stamp.stamped_by_tenant,
+            vec![("local".to_string(), 1), ("mesh-b".to_string(), 1)],
+            "the operator sees exactly where the effect landed"
+        );
+        assert_eq!(stamp.total_stamped(), 2);
+        assert_eq!(
+            stamp.conflicts, 1,
+            "the declared class was refused, visibly"
+        );
+
+        // The declared classification is untouched; the stamped row carries
+        // the binding's class.
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT class_iri FROM emmo_entity \
+                 WHERE tenant = 'local' AND canonical_name = 'yield strength' \
+                 ORDER BY class_iri",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut classes = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            classes.push(get_str(&row, 0).unwrap());
+        }
+        assert_eq!(
+            classes,
+            vec![
+                "https://example.test/Declared".to_string(),
+                "https://example.test/YS".to_string(),
+            ]
+        );
+
+        // A repeat run finds nothing left to stamp: rows now carrying the
+        // SAME class are done, not conflicts.
+        let again = store
+            .apply_term_binding_to_entities_across_tenants(
+                "yield strength",
+                "https://example.test/YS",
+            )
+            .await
+            .unwrap();
+        assert!(again.stamped_by_tenant.is_empty(), "{again:?}");
+        assert_eq!(again.conflicts, 1, "only the genuinely different class");
     }
 }

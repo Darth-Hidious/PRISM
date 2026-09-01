@@ -18,11 +18,24 @@ pub(crate) const POLYMER_DOMAIN: PolymerDomain = PolymerDomain;
 pub(crate) const EVALUATION_TOOL: &str = "polymer_insulation_properties";
 pub const RDKIT_INSTALL_HINT: &str = "Install RDKit in the PRISM Python environment with `python -m pip install rdkit`, then restart the PRISM node; the polymer evaluator is not registered without RDKit.";
 
+/// The reward vocabulary — the electrical-insulation target set, keyed
+/// exactly as `polymer_insulation_properties` reports it. This is the ONLY
+/// set a reward spec, reward weight, or declared target property may name on
+/// a polymer campaign, and the set reward derivation offers.
+const POLYMER_REWARD_REGISTRY: [(&str, &str); 4] = [
+    ("glass_transition_temperature_k", "K"),
+    ("dielectric_constant", "dimensionless"),
+    ("dielectric_breakdown_strength_kv_per_mm", "kV/mm"),
+    ("thermal_conductivity_w_per_m_k", "W/(m·K)"),
+];
+
+/// Target-property names, derived from the registry so the two lists cannot
+/// drift apart.
 const TARGET_PROPERTIES: [&str; 4] = [
-    "glass_transition_temperature_k",
-    "dielectric_constant",
-    "dielectric_breakdown_strength_kv_per_mm",
-    "thermal_conductivity_w_per_m_k",
+    POLYMER_REWARD_REGISTRY[0].0,
+    POLYMER_REWARD_REGISTRY[1].0,
+    POLYMER_REWARD_REGISTRY[2].0,
+    POLYMER_REWARD_REGISTRY[3].0,
 ];
 
 const POLYMER_EVALUATOR_TIERS: [EvaluatorTier; 1] = [EvaluatorTier {
@@ -223,6 +236,37 @@ impl Domain for PolymerDomain {
         &POLYMER_EVALUATOR_TIERS
     }
 
+    fn reward_registry(&self) -> &'static [(&'static str, &'static str)] {
+        &POLYMER_REWARD_REGISTRY
+    }
+
+    fn validate_config(&self, config: &CampaignConfig, goal: &CampaignGoal) -> Result<()> {
+        // "I'm not gonna put tungsten in polymers": HEA compositional
+        // thresholds are alloy vocabulary. A polymer campaign configured
+        // with one is refused, never run with the threshold silently
+        // unenforced — an operator who set a minimum entropy believes it is
+        // being enforced.
+        for (field, configured) in [
+            ("hea_definition", config.hea_definition.is_some()),
+            (
+                "min_configurational_entropy_j_per_mol_k",
+                config.min_configurational_entropy_j_per_mol_k.is_some(),
+            ),
+            (
+                "min_principal_elements",
+                config.min_principal_elements.is_some(),
+            ),
+        ] {
+            if configured {
+                bail!(
+                    "'{field}' is an alloy-domain HEA constraint; the polymer domain does not \
+                     evaluate it and refuses to run a campaign that would silently ignore it"
+                );
+            }
+        }
+        super::validate_reward_vocabulary(self.name(), self.reward_registry(), config, goal)
+    }
+
     fn evaluator_inputs(&self, parsed: &ParsedCandidate) -> serde_json::Value {
         serde_json::json!({ "candidate_identity": parsed.canonical, "tier": 0 })
     }
@@ -264,6 +308,22 @@ impl Domain for PolymerDomain {
         config: &CampaignConfig,
         properties: &serde_json::Value,
     ) -> Result<f64> {
+        // A declared, normalised objective wins here exactly as it does on
+        // the alloy domain — a spec set on a polymer campaign used to be
+        // silently IGNORED, which ran an objective nobody asked for. Its
+        // terms are checked against THIS domain's registry first, so an
+        // alloy descriptor is refused by name, never scored on a
+        // coincidence.
+        if let Some(spec) = &config.reward_spec {
+            super::validate_spec_vocabulary(self.name(), self.reward_registry(), spec)?;
+            // A spec can also arrive by deserialization, which skips every
+            // check `parse_derived_spec` performs.
+            spec.validate()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            return spec
+                .score(properties)
+                .map_err(|error| anyhow::anyhow!("{error}"));
+        }
         if !config.reward_weights.is_empty() {
             return weighted_reward(config, properties, EVALUATION_TOOL);
         }
@@ -385,6 +445,97 @@ mod tests {
                 .unwrap();
             assert!(parsed.canonical.contains("representation"));
         }
+    }
+
+    fn bare_goal() -> CampaignGoal {
+        CampaignGoal {
+            description: String::new(),
+            elements: Vec::new(),
+            objective: String::new(),
+            target_property: None,
+            constraints: Vec::new(),
+            seeds: Vec::new(),
+        }
+    }
+
+    /// THE LEAKAGE. A reward spec set on a polymer campaign was silently
+    /// ignored — `compute_reward` consulted only `reward_weights` and
+    /// `goal.target_property`, so the declared objective never scored a
+    /// single candidate. The spec must govern the polymer reward exactly as
+    /// it governs the alloy reward.
+    #[test]
+    fn a_reward_spec_governs_the_polymer_reward() {
+        let config = CampaignConfig {
+            reward_spec: Some(crate::reward::RewardSpec {
+                terms: vec![crate::reward::RewardTerm {
+                    property: "glass_transition_temperature_k".into(),
+                    aim: crate::reward::Aim::Target {
+                        value: 450.0,
+                        tolerance: 50.0,
+                    },
+                    importance: 1.0,
+                    rationale: None,
+                }],
+                derived_by: None,
+            }),
+            ..Default::default()
+        };
+        let on_target = POLYMER_DOMAIN
+            .compute_reward(
+                &bare_goal(),
+                &config,
+                &serde_json::json!({"glass_transition_temperature_k": 450.0}),
+            )
+            .expect("a declared objective must score the polymer candidate");
+        assert!(
+            (on_target - 1.0).abs() < 1e-9,
+            "on target scores 1: {on_target}"
+        );
+        let off_target = POLYMER_DOMAIN
+            .compute_reward(
+                &bare_goal(),
+                &config,
+                &serde_json::json!({"glass_transition_temperature_k": 425.0}),
+            )
+            .unwrap();
+        assert!(on_target > off_target, "the spec, not a fallback, ranks");
+    }
+
+    /// An ALLOY descriptor in a spec must be refused by name on a polymer
+    /// campaign — even when the payload carries a numeric value under that
+    /// key, which is exactly when silent acceptance would rank candidates on
+    /// a coincidence. Tungsten stays out of the polymers.
+    #[test]
+    fn an_alloy_descriptor_in_a_spec_is_refused_by_name() {
+        let config = CampaignConfig {
+            reward_spec: Some(crate::reward::RewardSpec {
+                terms: vec![crate::reward::RewardTerm {
+                    property: "Tm_estimate_K".into(),
+                    aim: crate::reward::Aim::Maximize {
+                        poor: 2000.0,
+                        good: 3500.0,
+                    },
+                    importance: 1.0,
+                    rationale: None,
+                }],
+                derived_by: None,
+            }),
+            ..Default::default()
+        };
+        let error = POLYMER_DOMAIN
+            .compute_reward(
+                &bare_goal(),
+                &config,
+                &serde_json::json!({"Tm_estimate_K": 3200.0}),
+            )
+            .expect_err("an alloy property must not score a polymer campaign");
+        let message = format!("{error:#}");
+        assert!(message.contains("Tm_estimate_K"), "{message}");
+        assert!(message.contains("'polymer'"), "{message}");
+        assert!(
+            message.contains("glass_transition_temperature_k"),
+            "the polymer vocabulary is listed: {message}"
+        );
     }
 
     #[test]

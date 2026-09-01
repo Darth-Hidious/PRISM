@@ -126,6 +126,11 @@ pub struct FetchCtx {
     pub cache_fetches: std::sync::atomic::AtomicUsize,
     /// Shared politeness limiter for full-text downloads across all hosts.
     pub fulltext_limiter: Arc<RateLimiter>,
+    /// Per-source auth headers, keyed by source id — e.g. Semantic Scholar's
+    /// `x-api-key`. Merged over the shared identification headers for that
+    /// source's requests ONLY; other sources never see another source's
+    /// credentials. Populated by [`auth_headers_from_env`].
+    pub extra_headers: HashMap<String, HeaderMap>,
 }
 
 impl FetchCtx {
@@ -152,6 +157,24 @@ impl FetchCtx {
     /// GET with cache-first semantics: a fresh cache hit is parsed without
     /// touching the network. Returns (body, cache_hit).
     pub async fn fetch_cached(&self, id: &str, url: &str) -> Result<(Vec<u8>, bool)> {
+        self.fetch_cached_with_attempts(id, url, self.max_attempts)
+            .await
+    }
+
+    /// [`FetchCtx::fetch_cached`] with an adapter-chosen retry budget.
+    ///
+    /// For a source whose failure is measured DETERMINISTIC within the
+    /// backoff horizon — Semantic Scholar's unauthenticated shared pool
+    /// 429s instantly and stays exhausted for minutes, so the 1 s + 2 s
+    /// in-band retries burned ~3.7 s per search and never once succeeded —
+    /// retrying only delays the honest answer. The adapter states its own
+    /// budget; everything else keeps the engine's.
+    pub async fn fetch_cached_with_attempts(
+        &self,
+        id: &str,
+        url: &str,
+        max_attempts: u32,
+    ) -> Result<(Vec<u8>, bool)> {
         if let Some(cache) = &self.cache
             && let Some(body) = cache.get(id, url)
         {
@@ -170,15 +193,19 @@ impl FetchCtx {
         self.network_fetches
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let limiter = self.limiter(id);
-        let body = get_with_retry(
-            &self.client,
-            &limiter,
-            url,
-            &self.headers,
-            self.max_attempts,
-        )
-        .await?
-        .to_vec();
+        let headers = match self.extra_headers.get(id) {
+            Some(extra) => {
+                let mut merged = self.headers.clone();
+                for (name, value) in extra {
+                    merged.insert(name.clone(), value.clone());
+                }
+                merged
+            }
+            None => self.headers.clone(),
+        };
+        let body = get_with_retry(&self.client, &limiter, url, &headers, max_attempts)
+            .await?
+            .to_vec();
         if let Some(cache) = &self.cache
             && let Err(e) = cache.put(id, url, &body)
         {
@@ -191,6 +218,30 @@ impl FetchCtx {
 /// Build default identification headers for the engine.
 pub fn default_headers(user_agent: &str) -> Result<HeaderMap> {
     identification_headers(user_agent)
+}
+
+/// Per-source auth headers from the environment, keyed by source id.
+///
+/// Semantic Scholar's unauthenticated pool is shared by every anonymous
+/// caller worldwide and 429s on effectively every request (measured
+/// 2026-08-31: instant `Too Many Requests` pointing at the API-key form).
+/// `SEMANTIC_SCHOLAR_API_KEY` moves requests onto the operator's own pool
+/// via the `x-api-key` header. A key that is not a valid header value is
+/// ignored rather than poisoning every request.
+pub fn auth_headers_from_env() -> HashMap<String, HeaderMap> {
+    let mut map = HashMap::new();
+    if let Ok(key) = std::env::var("SEMANTIC_SCHOLAR_API_KEY") {
+        let key = key.trim();
+        if !key.is_empty()
+            && let Ok(mut value) = reqwest::header::HeaderValue::from_str(key)
+        {
+            value.set_sensitive(true);
+            let mut headers = HeaderMap::new();
+            headers.insert("x-api-key", value);
+            map.insert(semantic_scholar::ID.to_string(), headers);
+        }
+    }
+    map
 }
 
 /// Percent-encode for query components (RFC 3986 unreserved set kept).

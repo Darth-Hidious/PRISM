@@ -333,6 +333,20 @@ pub(crate) fn goal_explicitly_requests_hea(goal: &CampaignGoal) -> bool {
         })
 }
 
+/// The reward vocabulary — exactly the tier-0 empirical descriptor set that
+/// `hea_descriptors` reports (`_TIER0_UNITS` on the Python side). This is the
+/// ONLY set a reward spec, reward weight, or declared target property may
+/// name on an alloy campaign, and the set reward derivation offers.
+const ALLOY_REWARD_REGISTRY: [(&str, &str); 7] = [
+    ("delta_H_mix_kJ_per_mol", "kJ/mol"),
+    ("delta_S_mix_J_per_molK", "J/(mol·K)"),
+    ("omega", "dimensionless"),
+    ("VEC", "valence electrons/atom"),
+    ("delta_radius_pct", "%"),
+    ("delta_chi", "Pauling"),
+    ("Tm_estimate_K", "K"),
+];
+
 const ALLOY_EVALUATOR_TIERS: [EvaluatorTier; 1] = [EvaluatorTier {
     tier: 0,
     name: "empirical_hea_descriptors",
@@ -522,6 +536,10 @@ impl Domain for AlloyDomain {
         &ALLOY_EVALUATOR_TIERS
     }
 
+    fn reward_registry(&self) -> &'static [(&'static str, &'static str)] {
+        &ALLOY_REWARD_REGISTRY
+    }
+
     fn evaluator_inputs(&self, parsed: &ParsedCandidate) -> serde_json::Value {
         serde_json::json!({ "composition": parsed.canonical })
     }
@@ -555,6 +573,20 @@ impl Domain for AlloyDomain {
         config: &CampaignConfig,
         props: &serde_json::Value,
     ) -> Result<f64> {
+        // A declared, normalised objective wins over everything else: it is
+        // the only form in which an importance means importance. Its terms
+        // are checked against THIS domain's registry first — a foreign
+        // property is refused by name, never scored on a coincidence.
+        if let Some(spec) = &config.reward_spec {
+            super::validate_spec_vocabulary(self.name(), self.reward_registry(), spec)?;
+            // A spec can also arrive by deserialization, which skips every
+            // check `parse_derived_spec` performs.
+            spec.validate()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            return spec
+                .score(props)
+                .map_err(|error| anyhow::anyhow!("{error}"));
+        }
         if config.reward_weights.is_empty() {
             // CONTRACT CHANGE: reward-property selection reads the goal's
             // DECLARED `target_property` — never English substring matching
@@ -564,6 +596,16 @@ impl Domain for AlloyDomain {
             // direction word ("minimize") is the objective field's
             // documented wire format, not domain vocabulary.
             if let Some(property) = &goal.target_property {
+                // Validated against the registry exactly as the polymer
+                // domain validates its target set: a property outside the
+                // alloy vocabulary must not rank candidates even when the
+                // payload happens to carry a number under that key.
+                super::ensure_in_registry(
+                    self.name(),
+                    self.reward_registry(),
+                    property,
+                    "goal.target_property",
+                )?;
                 let value = props
                     .get(property)
                     .and_then(serde_json::Value::as_f64)
@@ -737,6 +779,66 @@ mod reward_specification {
             near_pure_w["Tm_estimate_K"].as_f64() > real_hea["Tm_estimate_K"].as_f64(),
             "Tm alone genuinely favours the pure element; that was never a bug in the loop"
         );
+    }
+
+    fn bare_goal() -> CampaignGoal {
+        CampaignGoal {
+            description: String::new(),
+            elements: Vec::new(),
+            objective: String::new(),
+            target_property: None,
+            constraints: Vec::new(),
+            seeds: Vec::new(),
+        }
+    }
+
+    /// A reward spec naming a POLYMER descriptor must be refused by name on
+    /// an alloy campaign — even when the payload happens to carry a numeric
+    /// value under that key, which is exactly when silent acceptance would
+    /// rank candidates on a coincidence.
+    #[test]
+    fn a_polymer_descriptor_in_a_reward_spec_is_refused_by_name() {
+        let config = CampaignConfig {
+            reward_spec: Some(crate::reward::RewardSpec {
+                terms: vec![crate::reward::RewardTerm {
+                    property: "dielectric_constant".into(),
+                    aim: crate::reward::Aim::Maximize {
+                        poor: 1.0,
+                        good: 10.0,
+                    },
+                    importance: 1.0,
+                    rationale: None,
+                }],
+                derived_by: None,
+            }),
+            ..Default::default()
+        };
+        let props = serde_json::json!({"dielectric_constant": 4.2, "Tm_estimate_K": 3200.0});
+        let error = ALLOY_DOMAIN
+            .compute_reward(&bare_goal(), &config, &props)
+            .expect_err("a polymer property must not score an alloy campaign");
+        let message = format!("{error:#}");
+        assert!(message.contains("dielectric_constant"), "{message}");
+        assert!(message.contains("'alloy'"), "{message}");
+    }
+
+    /// The declared target property is validated against the alloy registry
+    /// the same way the polymer domain validates its target set. A payload
+    /// carrying a numeric value under a foreign key must not rank on it.
+    #[test]
+    fn a_target_property_outside_the_alloy_registry_is_refused() {
+        let mut goal = bare_goal();
+        goal.target_property = Some("glass_transition_temperature_k".into());
+        let props = serde_json::json!({"glass_transition_temperature_k": 450.0});
+        let error = ALLOY_DOMAIN
+            .compute_reward(&goal, &CampaignConfig::default(), &props)
+            .expect_err("a foreign target property must be refused, not ranked on");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("glass_transition_temperature_k"),
+            "{message}"
+        );
+        assert!(message.contains("'alloy'"), "{message}");
     }
 
     /// A weight naming a property the evaluator does not report must fail

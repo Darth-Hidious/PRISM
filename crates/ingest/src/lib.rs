@@ -234,6 +234,8 @@ mod tests {
             max_output_tokens: None,
             credential_kind: None,
             streaming: true,
+            // Deliberation on: the reader wants it. Only a judge turns it off.
+            no_think: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let parsed: LlmConfig = serde_json::from_str(&json).unwrap();

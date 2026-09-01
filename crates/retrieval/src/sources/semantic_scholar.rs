@@ -1,6 +1,10 @@
 //! Semantic Scholar — Graph API v1 paper search, JSON. Unauthenticated
-//! callers share a strict pool (1 rps, frequent 429s); the limiter + retry
-//! with Retry-After is what makes this source usable at all.
+//! callers share one worldwide pool that 429s on effectively every request
+//! (measured 2026-08-31: instant refusal, no Retry-After, pointing at the
+//! API-key form), so an unkeyed fetch makes ONE attempt and names the
+//! remedy. `SEMANTIC_SCHOLAR_API_KEY` moves requests onto a dedicated pool
+//! (`x-api-key`, wired through `FetchCtx::extra_headers`) with the engine's
+//! full retry budget.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -41,7 +45,39 @@ pub async fn fetch_page(
         "{base}/paper/search?query={q}&limit={limit}&offset={offset}&fields={FIELDS}",
         q = url_encode(query)
     );
-    let (body, _cached) = ctx.fetch_cached(ID, &url).await?;
+    // Unauthenticated, the shared pool's 429 is deterministic within the
+    // retry horizon (measured: the 1 s + 2 s in-band retries burned ~3.7 s
+    // per search, never once succeeding), so one attempt gets the honest
+    // answer fast. A configured key restores the engine's full budget —
+    // a keyed 429 is a genuine, transient rate limit.
+    let attempts = if ctx.extra_headers.contains_key(ID) {
+        ctx.max_attempts
+    } else {
+        1
+    };
+    let (body, _cached) = ctx
+        .fetch_cached_with_attempts(ID, &url, attempts)
+        .await
+        .map_err(|err| {
+            // The shared unauthenticated pool 429s on effectively every call
+            // (measured 2026-08-31: instant refusal pointing at the key form).
+            // Name the remedy in the status a caller actually sees, but only
+            // when no key was sent — a keyed 429 is a genuine rate limit.
+            let rate_limited = err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::http::HttpStatusFailure>()
+                    .is_some_and(|http| http.status.as_u16() == 429)
+            });
+            if rate_limited && !ctx.extra_headers.contains_key(ID) {
+                err.context(
+                    "Semantic Scholar's shared unauthenticated pool is exhausted; set \
+                 SEMANTIC_SCHOLAR_API_KEY for a dedicated pool \
+                 (https://www.semanticscholar.org/product/api#api-key-form)",
+                )
+            } else {
+                err
+            }
+        })?;
     let page = parse(&body)?;
     let next = (page.raw_count >= limit && (offset + limit) as u64 <= MAX_OFFSET)
         .then(|| (offset + limit).to_string());

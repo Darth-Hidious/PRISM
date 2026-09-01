@@ -9631,7 +9631,29 @@ async fn run_server_core(
                     }
                     _ => agent_loop::ApprovalResponse::Deny,
                 };
-                let _ = approval_tx.try_send(approval);
+                // A DROPPED approval is a hang, so it must never be silent.
+                //
+                // The channel holds one response and carries no prompt id, so
+                // two lanes prompting close together can collide: the second
+                // `try_send` finds the buffer full, the reply is discarded,
+                // and that lane waits for an answer that will never come —
+                // `ui.turn.complete` never arrives and the caller blocks
+                // forever, because this loop deliberately sets no deadline.
+                //
+                // `send().await` is NOT the fix: with capacity 1 and no
+                // waiter yet registered for the second prompt it would stall
+                // this whole request loop, which is worse. The real fix is to
+                // correlate a response with the call it answers; until then
+                // the failure is at least reported instead of swallowed, so a
+                // hang is diagnosable rather than mysterious.
+                if let Err(error) = approval_tx.try_send(approval) {
+                    tracing::warn!(
+                        tool = tool_name.unwrap_or("<unknown>"),
+                        "approval response could not be delivered ({error}); the tool call \
+                         that asked for it will wait indefinitely — responses are not \
+                         correlated to prompts, so two near-simultaneous approvals collide"
+                    );
+                }
                 emit_response(id, serde_json::json!({ "status": "ok" }));
             }
 

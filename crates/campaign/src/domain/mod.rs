@@ -122,6 +122,21 @@ pub trait Domain: Send + Sync {
         config: &CampaignConfig,
         properties: &serde_json::Value,
     ) -> Result<f64>;
+
+    /// The reward vocabulary: `(property, unit)` pairs keyed exactly as this
+    /// domain's evaluator reports them. Reward validation and derivation both
+    /// read THIS list, so an objective can never name a property the active
+    /// domain's evaluator will not report — an alloy descriptor offered to a
+    /// polymer campaign is refused by name, never silently dropped.
+    fn reward_registry(&self) -> &'static [(&'static str, &'static str)];
+
+    /// Refuse, by name and before compute is spent, campaign configuration
+    /// this domain cannot honour. A configured objective that is silently
+    /// ignored runs a campaign nobody asked for.
+    fn validate_config(&self, config: &CampaignConfig, goal: &CampaignGoal) -> Result<()> {
+        validate_reward_vocabulary(self.name(), self.reward_registry(), config, goal)
+    }
+
     fn summarize_properties(&self, properties: &serde_json::Value) -> String;
 
     fn proposal_system_prompt(&self) -> &'static str;
@@ -282,6 +297,63 @@ pub fn resolve_domain(id: &str) -> Result<&'static dyn Domain> {
     })
 }
 
+/// Everything the reward path ranks on — spec terms, weighted properties,
+/// the declared target property — must be in the domain's reward registry.
+/// Refusal is BY NAME: a silently dropped term is an objective nobody agreed
+/// to, and a foreign property (an alloy descriptor on a polymer campaign)
+/// would rank nothing or, worse, rank on a coincidence.
+pub(crate) fn validate_reward_vocabulary(
+    domain_id: &str,
+    registry: &[(&'static str, &'static str)],
+    config: &CampaignConfig,
+    goal: &CampaignGoal,
+) -> Result<()> {
+    if let Some(spec) = &config.reward_spec {
+        validate_spec_vocabulary(domain_id, registry, spec)?;
+    }
+    for property in config.reward_weights.keys() {
+        ensure_in_registry(domain_id, registry, property, "reward weight")?;
+    }
+    if let Some(property) = &goal.target_property {
+        ensure_in_registry(domain_id, registry, property, "goal.target_property")?;
+    }
+    Ok(())
+}
+
+/// Refuse a reward spec whose terms name properties outside the domain's
+/// registry. Called both when a stored spec is about to score and when a
+/// campaign starts, so the refusal happens before compute is spent.
+pub(crate) fn validate_spec_vocabulary(
+    domain_id: &str,
+    registry: &[(&'static str, &'static str)],
+    spec: &crate::reward::RewardSpec,
+) -> Result<()> {
+    for term in &spec.terms {
+        ensure_in_registry(domain_id, registry, &term.property, "reward objective term")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_in_registry(
+    domain_id: &str,
+    registry: &[(&'static str, &'static str)],
+    property: &str,
+    role: &str,
+) -> Result<()> {
+    if registry.iter().any(|(name, _)| *name == property) {
+        return Ok(());
+    }
+    let allowed = registry
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "{role} '{property}' is not a property the '{domain_id}' domain's evaluator reports, \
+         so it cannot be optimised here. Allowed properties: [{allowed}]"
+    )
+}
+
 pub(crate) fn structured_constraint_descriptions(
     constraints: &[PropertyConstraint],
 ) -> Vec<String> {
@@ -430,6 +502,9 @@ mod tests {
             ) -> Result<f64> {
                 Ok(0.0)
             }
+            fn reward_registry(&self) -> &'static [(&'static str, &'static str)] {
+                &[]
+            }
             fn summarize_properties(&self, _properties: &serde_json::Value) -> String {
                 String::new()
             }
@@ -475,5 +550,104 @@ mod tests {
             registry.get("dehardcode-test-legal").unwrap().name(),
             "dehardcode-test-legal"
         );
+    }
+
+    fn bare_goal() -> crate::CampaignGoal {
+        crate::CampaignGoal {
+            description: String::new(),
+            elements: Vec::new(),
+            objective: String::new(),
+            target_property: None,
+            constraints: Vec::new(),
+            seeds: Vec::new(),
+        }
+    }
+
+    /// A reward property is valid only in ITS domain's vocabulary: a polymer
+    /// key weighted on an alloy campaign (and the reverse, a target property
+    /// from the alloy set on a polymer campaign) is refused BY NAME, with the
+    /// domain's own vocabulary listed — never silently ignored.
+    #[test]
+    fn reward_properties_outside_the_domain_registry_are_refused_by_name() {
+        let alloy = resolve_domain(ALLOY_DOMAIN_ID).unwrap();
+        let polymer = resolve_domain(POLYMER_DOMAIN_ID).unwrap();
+
+        let mut config = crate::CampaignConfig::default();
+        config
+            .reward_weights
+            .insert("glass_transition_temperature_k".into(), 1.0);
+        let error = alloy
+            .validate_config(&config, &bare_goal())
+            .expect_err("a polymer key must not pass alloy validation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("glass_transition_temperature_k"),
+            "{message}"
+        );
+        assert!(message.contains("'alloy'"), "{message}");
+        assert!(
+            message.contains("Tm_estimate_K"),
+            "vocabulary listed: {message}"
+        );
+
+        let mut goal = bare_goal();
+        goal.target_property = Some("Tm_estimate_K".into());
+        let error = polymer
+            .validate_config(&crate::CampaignConfig::default(), &goal)
+            .expect_err("an alloy key must not pass polymer validation");
+        let message = format!("{error:#}");
+        assert!(message.contains("Tm_estimate_K"), "{message}");
+        assert!(message.contains("'polymer'"), "{message}");
+
+        // Each domain still accepts its OWN vocabulary.
+        let mut alloy_config = crate::CampaignConfig::default();
+        alloy_config
+            .reward_weights
+            .insert("Tm_estimate_K".into(), 1.0);
+        alloy
+            .validate_config(&alloy_config, &bare_goal())
+            .expect("alloy vocabulary passes on the alloy domain");
+        let mut polymer_goal = bare_goal();
+        polymer_goal.target_property = Some("glass_transition_temperature_k".into());
+        polymer
+            .validate_config(&crate::CampaignConfig::default(), &polymer_goal)
+            .expect("polymer vocabulary passes on the polymer domain");
+    }
+
+    /// "I'm not gonna put tungsten in polymers": HEA compositional thresholds
+    /// are alloy vocabulary. A polymer campaign configured with one is
+    /// refused, never run with the threshold silently unenforced.
+    #[test]
+    fn hea_constraints_on_a_polymer_campaign_are_refused_not_ignored() {
+        let polymer = resolve_domain(POLYMER_DOMAIN_ID).unwrap();
+        let alloy = resolve_domain(ALLOY_DOMAIN_ID).unwrap();
+
+        let config = crate::CampaignConfig {
+            min_configurational_entropy_j_per_mol_k: Some(8.314),
+            ..Default::default()
+        };
+        let error = polymer
+            .validate_config(&config, &bare_goal())
+            .expect_err("an HEA entropy floor is meaningless for polymers");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("min_configurational_entropy_j_per_mol_k"),
+            "{message}"
+        );
+        // The same config is legitimate on the alloy domain.
+        alloy
+            .validate_config(&config, &bare_goal())
+            .expect("HEA thresholds are alloy vocabulary");
+
+        let config = crate::CampaignConfig {
+            min_principal_elements: Some(4),
+            ..Default::default()
+        };
+        assert!(polymer.validate_config(&config, &bare_goal()).is_err());
+        let config = crate::CampaignConfig {
+            hea_definition: Some(crate::HeaDefinition::PermissiveRhea),
+            ..Default::default()
+        };
+        assert!(polymer.validate_config(&config, &bare_goal()).is_err());
     }
 }

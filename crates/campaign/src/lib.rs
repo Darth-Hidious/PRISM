@@ -60,6 +60,7 @@ use prism_provenance::{
 use prism_runtime::platform_env::PlatformVar;
 
 mod domain;
+pub mod reward;
 
 pub use domain::alloy::{
     COMPOSITION_SUM_TOLERANCE, DEFAULT_HEA_MIN_CONFIG_ENTROPY_J_PER_MOL_K,
@@ -216,6 +217,16 @@ pub struct CampaignConfig {
     /// Negative = minimize, positive = maximize.
     #[serde(default)]
     pub reward_weights: BTreeMap<String, f64>,
+    /// The objective, stated so nobody has to guess a scale factor.
+    ///
+    /// Supersedes `reward_weights` when present. `reward_weights` multiplies
+    /// RAW magnitudes, so `Tm_estimate_K=1` with `delta_S_mix_J_per_molK=100`
+    /// reads as "entropy matters 100x" and means the opposite — 3200 against
+    /// 12 makes melting point 72% of the reward. A `RewardSpec` normalises
+    /// every term to 0-1 first, so an importance is an importance, and it can
+    /// state a TARGET rather than only a direction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reward_spec: Option<crate::reward::RewardSpec>,
     /// Scientific domain plugin id, resolved through the process-wide domain
     /// registry (`prism_campaign::domain::resolve_domain`). Omitted legacy
     /// checkpoints default to the alloy domain; the wire form is unchanged
@@ -287,6 +298,7 @@ impl Default for CampaignConfig {
             llm_model: String::new(),
             llm_temperature: 0.7,
             reward_weights: BTreeMap::new(),
+            reward_spec: None,
             domain: ALLOY_DOMAIN_ID.to_string(),
             evaluation_tier: None,
             property_constraints: Vec::new(),
@@ -1335,6 +1347,14 @@ impl Campaign {
             );
         }
 
+        // Refuse, before any compute is spent, configuration the active
+        // domain cannot honour: a reward property outside the domain's
+        // vocabulary, or an alloy-only HEA threshold on a domain that never
+        // evaluates it. Silently ignoring either runs a campaign nobody
+        // asked for.
+        domain_for(&self.state.config.domain)
+            .validate_config(&self.state.config, &self.state.goal)?;
+
         info!(
             campaign = %self.state.campaign_id,
             goal = %self.state.goal.description,
@@ -1975,10 +1995,73 @@ impl Campaign {
         // Build the LLM prompt for proposal.
         let prompt = self.build_proposal_prompt(batch);
 
-        // Use the shared chat-target resolver for the proposal LLM. An
-        // explicit endpoint override remains an escape hatch, but the
-        // resolver is still attempted first so it supplies the selected
-        // target's model and credentials when available.
+        let (client, _model) = self.resolve_chat_client()?;
+
+        let domain = domain_for(&self.state.config.domain);
+        let system = domain.proposal_system_prompt();
+
+        // Counted BEFORE the await: a call that errors mid-flight may still
+        // have been billed, and a ceiling that only counts successes
+        // under-reports in exactly the case worth reporting.
+        //
+        // `LlmClient::chat` returns `Result<String>` — no usage, no cost — so
+        // this spend cannot be added to `total_cost_usd`. It is not an
+        // estimate withheld; there is nothing to estimate from that would not
+        // be invented. `budget_status` reports the gap instead.
+        self.state.uncosted_llm_calls += 1;
+        let response = client
+            .chat(system, &prompt)
+            .await
+            .context("LLM proposal call failed")?;
+
+        self.record_event(
+            "campaign.propose",
+            serde_json::json!({
+                "iteration": iter,
+                "prompt": prompt,
+                "response": &response,
+                "uncosted_llm_calls": self.state.uncosted_llm_calls,
+            }),
+        )
+        .await;
+
+        // Parse the response as a JSON array of domain candidate strings.
+        let proposals = self.parse_compositions(&response);
+
+        if proposals.is_empty() {
+            // No synthetic proposals, ever: a campaign that cannot get
+            // parseable identities from the model HALTS instead of fabricating
+            // candidates.
+            let candidate_plural = domain.candidate_plural();
+            warn!(
+                campaign = %self.state.campaign_id,
+                iteration = iter,
+                raw = %response,
+                "LLM returned no parseable {candidate_plural}; halting proposal step"
+            );
+            if self.state.config.domain == ALLOY_DOMAIN_ID {
+                anyhow::bail!(
+                    "proposal step failed: LLM returned no parseable compositions                  (campaign halted rather than proposing synthetic candidates)"
+                );
+            }
+            anyhow::bail!(
+                "proposal step failed: LLM returned no parseable {candidate_plural} (campaign halted rather than fabricating candidates)"
+            );
+        }
+
+        Ok(proposals.into_iter().take(batch).collect())
+    }
+
+    /// Resolve the campaign's chat endpoint ONCE, for both the proposal loop
+    /// and reward derivation — the same resolver, overrides, and no-deadline
+    /// policy apply to every campaign LLM call. Returns the ready client and
+    /// the model id it will bill against.
+    ///
+    /// Uses the shared chat-target resolver. An explicit endpoint override
+    /// remains an escape hatch, but the resolver is still attempted first so
+    /// it supplies the selected target's model and credentials when
+    /// available.
+    fn resolve_chat_client(&self) -> Result<(prism_llm::LlmClient, String)> {
         let explicit_base_url = std::env::var("LLM_API_BASE")
             .ok()
             .or_else(|| self.state.config.llm_base_url.clone())
@@ -2055,61 +2138,77 @@ impl Campaign {
             embedding_model: resolved.and_then(|llm| llm.embedding_model),
             ..Default::default()
         };
-        let client = prism_llm::LlmClient::new(config);
+        Ok((prism_llm::LlmClient::new(config), model))
+    }
 
+    /// Derive the reward objective from the goal when the operator declared
+    /// none — no reward weights, no target property, no explicit spec.
+    ///
+    /// One LLM call: the prompt offers exactly the active domain's
+    /// [`Domain::reward_registry`] vocabulary, and the reply is validated by
+    /// [`reward::parse_derived_spec`] against that same registry — unknown
+    /// properties, reversed anchors, and empty objectives are refused rather
+    /// than repaired. On success the spec is stored on the config, so every
+    /// later `compute_reward` and checkpoint carries it.
+    ///
+    /// Returns `Ok(None)` without touching the LLM when an explicit
+    /// objective already exists (explicit always wins), when this is not a
+    /// materials campaign, or when candidates were already scored — an
+    /// objective must not change mid-run, because rewards are compared
+    /// ACROSS iterations.
+    ///
+    /// On failure the campaign is untouched: the caller says why and the
+    /// domain's documented default policy applies. An objective is never
+    /// fabricated from a failed derivation.
+    pub async fn derive_reward_spec(&mut self) -> Result<Option<crate::reward::RewardSpec>> {
+        if self.state.kind != CampaignGoalKind::Materials
+            || self.state.config.reward_spec.is_some()
+            || !self.state.config.reward_weights.is_empty()
+            || self.state.goal.target_property.is_some()
+            || self.state.current_iteration > 0
+        {
+            return Ok(None);
+        }
         let domain = domain_for(&self.state.config.domain);
-        let system = domain.proposal_system_prompt();
-
-        // Counted BEFORE the await: a call that errors mid-flight may still
-        // have been billed, and a ceiling that only counts successes
-        // under-reports in exactly the case worth reporting.
-        //
-        // `LlmClient::chat` returns `Result<String>` — no usage, no cost — so
-        // this spend cannot be added to `total_cost_usd`. It is not an
-        // estimate withheld; there is nothing to estimate from that would not
-        // be invented. `budget_status` reports the gap instead.
+        let registry = domain.reward_registry();
+        if registry.is_empty() {
+            bail!(
+                "domain '{}' declares no reward properties to derive an objective from",
+                domain.name()
+            );
+        }
+        let prompt = crate::reward::derivation_prompt(
+            &self.state.goal.description,
+            &self.state.goal.objective,
+            registry,
+        );
+        let (client, model) = self.resolve_chat_client()?;
+        // Counted BEFORE the await — the same disclosure rule as the
+        // proposal call: an errored call may still have been billed.
         self.state.uncosted_llm_calls += 1;
         let response = client
-            .chat(system, &prompt)
+            .chat(
+                "You state what \"better\" means for a materials-discovery campaign. \
+                 Reply with ONLY the requested JSON object, no prose.",
+                &prompt,
+            )
             .await
-            .context("LLM proposal call failed")?;
-
+            .context("reward-derivation LLM call failed")?;
+        let allowed = registry.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        let spec = crate::reward::parse_derived_spec(&response, &allowed, &model)
+            .map_err(|reason| anyhow::anyhow!("the derived objective was rejected: {reason}"))?;
         self.record_event(
-            "campaign.propose",
+            "campaign.reward_derived",
             serde_json::json!({
-                "iteration": iter,
-                "prompt": prompt,
-                "response": &response,
+                "derived_by": model,
+                "spec": spec,
+                "described": spec.describe(),
                 "uncosted_llm_calls": self.state.uncosted_llm_calls,
             }),
         )
         .await;
-
-        // Parse the response as a JSON array of domain candidate strings.
-        let proposals = self.parse_compositions(&response);
-
-        if proposals.is_empty() {
-            // No synthetic proposals, ever: a campaign that cannot get
-            // parseable identities from the model HALTS instead of fabricating
-            // candidates.
-            let candidate_plural = domain.candidate_plural();
-            warn!(
-                campaign = %self.state.campaign_id,
-                iteration = iter,
-                raw = %response,
-                "LLM returned no parseable {candidate_plural}; halting proposal step"
-            );
-            if self.state.config.domain == ALLOY_DOMAIN_ID {
-                anyhow::bail!(
-                    "proposal step failed: LLM returned no parseable compositions                  (campaign halted rather than proposing synthetic candidates)"
-                );
-            }
-            anyhow::bail!(
-                "proposal step failed: LLM returned no parseable {candidate_plural} (campaign halted rather than fabricating candidates)"
-            );
-        }
-
-        Ok(proposals.into_iter().take(batch).collect())
+        self.state.config.reward_spec = Some(spec.clone());
+        Ok(Some(spec))
     }
 
     /// Build the LLM prompt for the proposal step.
@@ -3422,6 +3521,182 @@ mod tests {
             Some("target-model")
         );
         server.abort();
+    }
+
+    /// Serve one canned chat completion and count how often it is asked.
+    async fn derivation_chat(
+        State(state): State<Arc<(AtomicUsize, String)>>,
+        Json(_body): Json<Value>,
+    ) -> Json<Value> {
+        state.0.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "choices": [{ "message": { "content": state.1 } }]
+        }))
+    }
+
+    /// Spawn a chat target serving `content` and point the configured chat
+    /// target at it. Returns the call counter and the env guards that keep
+    /// the configuration alive for the test's scope.
+    async fn spawn_derivation_target(
+        tmp: &tempfile::TempDir,
+        content: &str,
+    ) -> (Arc<(AtomicUsize, String)>, [EnvGuard; 3]) {
+        let state = Arc::new((AtomicUsize::new(0), content.to_string()));
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(derivation_chat))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[chat]\nmode = \"local\"\nurl = \"{base_url}/v1\"\nmodel = \"target-model\"\n"
+            ),
+        )
+        .unwrap();
+        let guards = [
+            EnvGuard::set("PRISM_CONFIG_PATH", config_path.into_os_string()),
+            EnvGuard::remove("LLM_API_BASE"),
+            EnvGuard::remove("LLM_BASE_URL"),
+        ];
+        (state, guards)
+    }
+
+    const DERIVED_SPEC_REPLY: &str = r#"{"terms": [
+        {"property": "Tm_estimate_K", "goal": "target", "value": 3000, "tolerance": 400,
+         "importance": 2, "rationale": "service temperature, not a maximum"},
+        {"property": "delta_S_mix_J_per_molK", "goal": "maximize", "poor": 8.314, "good": 14,
+         "importance": 3, "rationale": "stay a real HEA"}
+    ]}"#;
+
+    /// THE WIRING. `derivation_prompt`/`parse_derived_spec` existed with
+    /// nothing calling them; a user still had to guess weights. When the
+    /// operator declares no objective, ONE chat call against the configured
+    /// target derives the spec, validated against the active domain's
+    /// registry, and stores it on the config so the whole campaign (and its
+    /// checkpoint) ranks on it.
+    #[tokio::test]
+    async fn derives_the_reward_spec_when_no_objective_is_declared() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (chat, _guards) = spawn_derivation_target(&tmp, DERIVED_SPEC_REPLY).await;
+
+        let mut campaign = Campaign::new(test_goal(), CampaignConfig::default(), "derive".into());
+        let spec = campaign
+            .derive_reward_spec()
+            .await
+            .expect("derivation against the configured target succeeds")
+            .expect("an undeclared objective must be derived");
+
+        assert_eq!(chat.0.load(Ordering::SeqCst), 1, "exactly one LLM call");
+        assert_eq!(spec.derived_by.as_deref(), Some("target-model"));
+        assert_eq!(spec.terms.len(), 2);
+        assert_eq!(spec.terms[0].property, "Tm_estimate_K");
+        // Stored on the config: compute_reward and the checkpoint carry it.
+        assert_eq!(campaign.state().config.reward_spec.as_ref(), Some(&spec));
+        assert_eq!(campaign.state().uncosted_llm_calls, 1);
+        let reward = campaign
+            .compute_reward(&json!({"Tm_estimate_K": 3000.0, "delta_S_mix_J_per_molK": 14.0}))
+            .unwrap();
+        assert!(
+            (reward - 1.0).abs() < 1e-9,
+            "the derived spec scores: {reward}"
+        );
+    }
+
+    /// Explicit `--reward-weight` / `--target-property` (or an existing spec)
+    /// always wins: derivation is skipped WITHOUT an LLM call.
+    #[tokio::test]
+    async fn an_explicit_objective_suppresses_derivation() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (chat, _guards) = spawn_derivation_target(&tmp, DERIVED_SPEC_REPLY).await;
+
+        let mut goal = test_goal();
+        goal.target_property = Some("Tm_estimate_K".into());
+        let mut campaign = Campaign::new(goal, CampaignConfig::default(), "no-derive-1".into());
+        assert!(campaign.derive_reward_spec().await.unwrap().is_none());
+
+        let mut config = CampaignConfig::default();
+        config.reward_weights.insert("Tm_estimate_K".into(), 1.0);
+        let mut campaign = Campaign::new(test_goal(), config, "no-derive-2".into());
+        assert!(campaign.derive_reward_spec().await.unwrap().is_none());
+
+        assert_eq!(
+            chat.0.load(Ordering::SeqCst),
+            0,
+            "an explicit objective must not spend an LLM call"
+        );
+    }
+
+    /// A derived objective naming a property outside the active domain's
+    /// registry is refused BY NAME and nothing is stored — a fabricated or
+    /// foreign-domain objective must never rank candidates.
+    #[tokio::test]
+    async fn a_derived_objective_outside_the_registry_is_refused() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let polymer_reply = r#"{"terms": [
+            {"property": "glass_transition_temperature_k", "goal": "maximize",
+             "poor": 300, "good": 500, "importance": 1}
+        ]}"#;
+        let (_chat, _guards) = spawn_derivation_target(&tmp, polymer_reply).await;
+
+        let mut campaign = Campaign::new(
+            test_goal(),
+            CampaignConfig::default(),
+            "derive-refused".into(),
+        );
+        let error = campaign
+            .derive_reward_spec()
+            .await
+            .expect_err("a foreign-domain property must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("glass_transition_temperature_k"),
+            "{message}"
+        );
+        assert!(
+            campaign.state().config.reward_spec.is_none(),
+            "a refused derivation must store nothing"
+        );
+    }
+
+    /// Config the domain cannot honour is refused when the campaign RUNS,
+    /// before any proposal or evaluation spend — here an HEA entropy floor
+    /// on a polymer campaign.
+    #[tokio::test]
+    async fn run_refuses_config_the_domain_cannot_honour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let goal = CampaignGoal {
+            description: "Polymer insulation screen".into(),
+            elements: Vec::new(),
+            objective: String::new(),
+            target_property: Some("glass_transition_temperature_k".into()),
+            constraints: Vec::new(),
+            seeds: vec![r#"{"representation":"monomer","monomer":"ethylene"}"#.into()],
+        };
+        let config = CampaignConfig {
+            domain: crate::POLYMER_DOMAIN_ID.into(),
+            min_configurational_entropy_j_per_mol_k: Some(8.314),
+            checkpoint_dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut campaign = Campaign::new(goal, config, "polymer-hea-refused".into());
+        let error = campaign
+            .run()
+            .await
+            .expect_err("an alloy-only threshold must refuse the polymer campaign");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("min_configurational_entropy_j_per_mol_k"),
+            "{message}"
+        );
+        assert!(message.contains("polymer"), "{message}");
     }
 
     #[test]
