@@ -1147,6 +1147,75 @@ mod tests {
         );
     }
 
+    /// Two bases that state the same `skos:exactMatch` have declared their
+    /// classes identical; the fold must MERGE them, and only qualify apart the
+    /// classes that share a word without a stated identity.
+    ///
+    /// Measured on the promoted polymers ontology before this was pinned:
+    /// eight shards seeded from one EMMO base produced `Property (poly1)`
+    /// through `Property (poly8)` — eight parallel upper hierarchies, 4128 of
+    /// 6893 classes qualification duplicates whose `exactMatch` IRIs were
+    /// identical. The merge rule existed in `seed_from` but nothing proved it
+    /// ran. This drives two real artifacts through the real adapter and the
+    /// real seeder; a hand-built `ClassDecl` could not have caught an adapter
+    /// that never populated `exact_matches`.
+    #[test]
+    fn bases_sharing_an_exact_match_merge_and_the_rest_qualify_apart() {
+        const EMMO_PROPERTY: &str =
+            "https://w3id.org/emmo#EMMO_b7bcff25_ffc3_474e_9ab5_01b1664bd4ba";
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for domain in ["indtest-mergea", "indtest-mergeb"] {
+            let mut o = ontology(domain);
+            // "Material" carries a stated identity in BOTH bases; "Polymer" and
+            // "Glass Transition Temperature" share only a word.
+            o.classes[0].aligned_iri = Some(EMMO_PROPERTY.into());
+            let path = dir.path().join(format!("{domain}.ttl"));
+            write_artifact(&path, &o).unwrap();
+            paths.push(path);
+        }
+        let bases: Vec<_> = paths
+            .iter()
+            .map(|p| load_induced_seed_from_path(p).expect("a draft loads as a seed"))
+            .collect();
+
+        let seed = super::super::seed::seed_from(&bases).expect("seeding succeeds");
+
+        let labels: Vec<&str> = seed.classes.iter().map(|c| c.label.as_str()).collect();
+        let material_count = labels.iter().filter(|l| l.starts_with("Material")).count();
+        assert_eq!(
+            material_count, 1,
+            "a shared exactMatch is the bases stating identity; it must merge, not \
+             qualify — got {labels:?}"
+        );
+        // The classes with no stated identity still keep the existing rule.
+        assert!(
+            labels.contains(&"Polymer (indtest-mergeb)"),
+            "same word, no stated identity: must be qualified apart — got {labels:?}"
+        );
+        assert_eq!(
+            seed.classes.len(),
+            5,
+            "3 from the first base, 2 qualified from the second"
+        );
+        assert!(
+            !seed
+                .notes
+                .iter()
+                .any(|n| n.contains("Material") && n.contains("NOT asserted")),
+            "the merged class must not be reported as un-asserted: {:?}",
+            seed.notes
+        );
+        // The second base's qualified Polymer must hang under the MERGED
+        // Material, not under a dropped or dangling parent.
+        let polymer_b = seed
+            .classes
+            .iter()
+            .find(|c| c.label == "Polymer (indtest-mergeb)")
+            .unwrap();
+        assert_eq!(polymer_b.parent.as_deref(), Some("Material"));
+    }
+
     /// Sharded induction produces DRAFTS, and folding shards means handing
     /// them straight back as bases. Refusing a draft on the seed path made that
     /// impossible: merging N shards would have required promoting N unreviewed
