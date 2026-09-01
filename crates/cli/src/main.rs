@@ -1816,6 +1816,16 @@ fn command_needs_python(command: Option<&Commands>) -> bool {
         // Ontology induction is Rust + the configured LLM HTTP endpoint;
         // no handler takes the interpreter path.
         Some(Commands::Ontology { .. }) => false,
+        // The paper pipeline — search, sweep, full-text, claims — is the Rust
+        // retrieval engine, the configured LLM endpoint over HTTP, and the
+        // local provenance store; `papers::handle` takes no interpreter path
+        // and papers.rs never names Python. Measured before this arm: a
+        // `papers claims` run against loopback endpoints spent 63.5 s of its
+        // 65 s building a venv (pip reaching PyPI) and 2.1 s doing the work.
+        Some(Commands::Papers { .. }) => false,
+        // Re-verification re-reads stored facts against their sources over
+        // HTTP; `reverify_cmd::run` takes no interpreter path either.
+        Some(Commands::Reverify { .. }) => false,
         // Reports on the venv — including its absence — rather than using it.
         Some(Commands::Doctor { .. }) => false,
         // Pure platform HTTP: these talk to the API over reqwest and print
@@ -20252,6 +20262,33 @@ data:\n\
             &["prism", "use", "list"],
         ] {
             assert!(!needs_python(argv), "{argv:?} must not build a venv");
+        }
+    }
+
+    /// The paper pipeline is Rust end to end — retrieval engine, LLM over
+    /// HTTP, provenance store. Measured before the exemption: `papers claims`
+    /// against loopback endpoints spent 63.5 s of 65 s building a venv it never
+    /// used (pip reaching PyPI from inside `cargo test`), then 2.1 s working.
+    #[test]
+    fn papers_commands_do_not_provision_a_venv() {
+        for argv in [
+            ["prism", "papers", "search", "--query", "pfas"].as_slice(),
+            &["prism", "papers", "sweep", "--query", "pfas"],
+            &["prism", "papers", "full-text", "--pmc", "PMC1"],
+            &[
+                "prism",
+                "papers",
+                "claims",
+                "--url",
+                "http://127.0.0.1:1/p.xml",
+            ],
+            &[
+                "prism", "papers", "corpus", "--query", "pfas", "--out", "corpus",
+            ],
+            &["prism", "reverify", "list", "--status", "stale"],
+            &["prism", "reverify", "history", "--assertion", "a1"],
+        ] {
+            assert!(!needs_python(argv), "{argv:?} is Rust end to end; no venv");
         }
     }
 
