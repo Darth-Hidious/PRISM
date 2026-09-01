@@ -5,7 +5,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use prism_node::daemon::DaemonOptions;
 use prism_runtime::PlatformEndpoints;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "prism-node")]
@@ -77,7 +76,7 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(prism_runtime::log_filter())
         .init();
 
     let cli = Cli::parse();

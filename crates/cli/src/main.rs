@@ -58,7 +58,6 @@ use prism_workflows::{
     execute_workflow_with_policy_and_options, find_workflow, load_workflow_from_str,
     parse_workflow_command_args,
 };
-use tracing_subscriber::EnvFilter;
 
 /// Project selected by the top-level `--project-root`. Platform auth helpers
 /// are called from many command handlers; retaining the parsed root here keeps
@@ -1891,7 +1890,7 @@ async fn main() -> Result<()> {
     // deadlocks at "Igniting core..."). Stderr is captured to
     // ~/.prism/logs/backend.log by the TUI's spawn.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(prism_runtime::log_filter())
         .with_writer(std::io::stderr)
         .init();
 

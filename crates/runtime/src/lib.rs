@@ -1565,3 +1565,58 @@ mod tests {
         );
     }
 }
+
+/// The tracing filter every PRISM binary installs.
+///
+/// `EnvFilter::from_default_env()` carries a default directive of ERROR, so
+/// with `RUST_LOG` unset every `tracing::warn!` in the workspace — 219 of
+/// them — was discarded by the shipped binary. Ten doc comments promising
+/// "never silent" were false on the direct-CLI path, including the notice
+/// that all tool approvals are bypassed; the same code was loud through the
+/// TUI only because the TUI injects `RUST_LOG=info` into the backend it
+/// spawns. Three call sites had worked around it individually. The default
+/// is now WARN; an explicit `RUST_LOG` still wins, so nothing regresses for
+/// an operator who set one.
+#[must_use]
+pub fn log_filter() -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .from_env_lossy()
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use tracing_subscriber::filter::LevelFilter;
+
+    /// With no `RUST_LOG`, a warning must get through; an explicit `RUST_LOG`
+    /// must still be honoured in both directions.
+    #[test]
+    fn warnings_are_visible_by_default_and_rust_log_still_wins() {
+        let _env = crate::offline::test_support::env_lock();
+        let previous = std::env::var_os("RUST_LOG");
+        // SAFETY: the env lock serialises every env mutation in this binary.
+        unsafe { std::env::remove_var("RUST_LOG") };
+        assert_eq!(
+            super::log_filter().max_level_hint(),
+            Some(LevelFilter::WARN),
+            "with RUST_LOG unset, warn! must not be discarded"
+        );
+        unsafe { std::env::set_var("RUST_LOG", "error") };
+        assert_eq!(
+            super::log_filter().max_level_hint(),
+            Some(LevelFilter::ERROR)
+        );
+        unsafe { std::env::set_var("RUST_LOG", "debug") };
+        assert_eq!(
+            super::log_filter().max_level_hint(),
+            Some(LevelFilter::DEBUG)
+        );
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+}
