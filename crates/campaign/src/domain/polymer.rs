@@ -347,7 +347,6 @@ impl Domain for PolymerDomain {
                  electrical-insulation target set {TARGET_PROPERTIES:?}"
             );
         }
-        let objective = goal.objective.to_ascii_lowercase();
         let value = properties
             .get(property)
             .and_then(serde_json::Value::as_f64)
@@ -360,13 +359,7 @@ impl Domain for PolymerDomain {
                     .unwrap_or("the evaluator supplied no citable method or measured value");
                 anyhow::anyhow!("{EVALUATION_TOOL} reported '{property}' unavailable: {reason}")
             })?;
-        Ok(
-            if objective.contains("minimize") || objective.contains("minimise") {
-                -value
-            } else {
-                value
-            },
-        )
+        super::signed_by_direction(goal, property, value)
     }
 
     fn summarize_properties(&self, properties: &serde_json::Value) -> String {
@@ -438,6 +431,7 @@ mod tests {
                         elements: Vec::new(),
                         objective: String::new(),
                         target_property: None,
+                        target_direction: None,
                         constraints: Vec::new(),
                         seeds: Vec::new(),
                     },
@@ -453,6 +447,7 @@ mod tests {
             elements: Vec::new(),
             objective: String::new(),
             target_property: None,
+            target_direction: None,
             constraints: Vec::new(),
             seeds: Vec::new(),
         }

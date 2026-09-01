@@ -196,6 +196,7 @@ async fn nbmotaw_alloy_campaign_transcript_is_unchanged() {
         // CONTRACT CHANGE: the reward property is declared, not parsed from
         // the objective's English words.
         target_property: Some("Tm_estimate_K".into()),
+        target_direction: Some(prism_campaign::Direction::Maximize),
         constraints: Vec::new(),
         seeds: vec!["NbMoTaW".into()],
     };
@@ -245,6 +246,7 @@ async fn absent_polymer_plugin_reports_the_rdkit_install_hint() {
         // CONTRACT CHANGE: the reward property is declared, not parsed from
         // the objective's English words.
         target_property: Some("glass_transition_temperature_k".into()),
+        target_direction: Some(prism_campaign::Direction::Maximize),
         constraints: Vec::new(),
         seeds: vec![
             json!({
@@ -293,6 +295,7 @@ async fn polymer_campaign_computes_only_cited_tg_and_reports_other_targets_unava
         // CONTRACT CHANGE: the reward property is declared, not parsed from
         // the objective's English words.
         target_property: Some("glass_transition_temperature_k".into()),
+        target_direction: Some(prism_campaign::Direction::Maximize),
         constraints: Vec::new(),
         seeds: vec![seed],
     };

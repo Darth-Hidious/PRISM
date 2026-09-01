@@ -614,14 +614,7 @@ impl Domain for AlloyDomain {
                             "{EVALUATION_TOOL} returned no numeric '{property}' declared as the goal's target_property"
                         )
                     })?;
-                let objective = goal.objective.to_ascii_lowercase();
-                return Ok(
-                    if objective.contains("minimize") || objective.contains("minimise") {
-                        -value
-                    } else {
-                        value
-                    },
-                );
+                return super::signed_by_direction(goal, property, value);
             }
 
             // Existing alloy policy: high entropy and, when available, lower
@@ -787,6 +780,7 @@ mod reward_specification {
             elements: Vec::new(),
             objective: String::new(),
             target_property: None,
+            target_direction: None,
             constraints: Vec::new(),
             seeds: Vec::new(),
         }
@@ -829,6 +823,7 @@ mod reward_specification {
     fn a_target_property_outside_the_alloy_registry_is_refused() {
         let mut goal = bare_goal();
         goal.target_property = Some("glass_transition_temperature_k".into());
+        goal.target_direction = Some(crate::Direction::Maximize);
         let props = serde_json::json!({"glass_transition_temperature_k": 450.0});
         let error = ALLOY_DOMAIN
             .compute_reward(&goal, &CampaignConfig::default(), &props)

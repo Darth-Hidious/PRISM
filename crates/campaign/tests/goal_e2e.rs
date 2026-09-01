@@ -218,6 +218,7 @@ fn test_goal() -> CampaignGoal {
         elements: vec!["W".into(), "Mo".into(), "Ta".into(), "Nb".into()],
         objective: "maximize mixing entropy".into(),
         target_property: None,
+        target_direction: None,
         constraints: vec![],
         seeds: vec![],
     }
@@ -261,6 +262,7 @@ async fn non_unit_llm_composition_never_reaches_evaluator_or_checkpoint() {
             .collect(),
         objective: "maximize melting point".into(),
         target_property: None,
+        target_direction: None,
         constraints: vec![],
         seeds: vec![],
     };
@@ -319,6 +321,7 @@ async fn hea_goal_rejects_near_pure_melting_point_exploit() {
             .collect(),
         objective: "maximize melting point".into(),
         target_property: None,
+        target_direction: None,
         constraints: vec![],
         seeds: vec![
             "W0.995 Re0.005".into(),

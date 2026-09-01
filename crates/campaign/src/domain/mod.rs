@@ -334,6 +334,27 @@ pub(crate) fn validate_spec_vocabulary(
     Ok(())
 }
 
+/// The reward sign a declared target property earns, from the goal's
+/// DECLARED direction. Both domains used to read it off the objective text
+/// with `objective.contains("minimize")`; a differently worded or non-English
+/// objective ranked as maximize and a campaign returned its worst candidates
+/// as best. A declared property with no declared direction is refused here,
+/// by name, before any budget is spent ranking on a guessed sign.
+pub fn signed_by_direction(
+    goal: &crate::CampaignGoal,
+    property: &str,
+    value: f64,
+) -> anyhow::Result<f64> {
+    match goal.target_direction {
+        Some(crate::Direction::Maximize) => Ok(value),
+        Some(crate::Direction::Minimize) => Ok(-value),
+        None => anyhow::bail!(
+            "goal declares target_property {property:?} but no target_direction — declare \
+             \"maximize\" or \"minimize\"; the sign is never inferred from the objective text"
+        ),
+    }
+}
+
 pub(crate) fn ensure_in_registry(
     domain_id: &str,
     registry: &[(&'static str, &'static str)],
@@ -558,6 +579,7 @@ mod tests {
             elements: Vec::new(),
             objective: String::new(),
             target_property: None,
+            target_direction: None,
             constraints: Vec::new(),
             seeds: Vec::new(),
         }
@@ -592,6 +614,7 @@ mod tests {
 
         let mut goal = bare_goal();
         goal.target_property = Some("Tm_estimate_K".into());
+        goal.target_direction = Some(crate::Direction::Maximize);
         let error = polymer
             .validate_config(&crate::CampaignConfig::default(), &goal)
             .expect_err("an alloy key must not pass polymer validation");
@@ -609,6 +632,7 @@ mod tests {
             .expect("alloy vocabulary passes on the alloy domain");
         let mut polymer_goal = bare_goal();
         polymer_goal.target_property = Some("glass_transition_temperature_k".into());
+        polymer_goal.target_direction = Some(crate::Direction::Maximize);
         polymer
             .validate_config(&crate::CampaignConfig::default(), &polymer_goal)
             .expect("polymer vocabulary passes on the polymer domain");
@@ -649,5 +673,32 @@ mod tests {
             ..Default::default()
         };
         assert!(polymer.validate_config(&config, &bare_goal()).is_err());
+    }
+
+    /// The sign comes from the declaration, never from the words. "lower the
+    /// density" with no declared direction is refused, not maximized.
+    #[test]
+    fn the_reward_sign_is_declared_never_inferred_from_the_objective() {
+        let mut goal = crate::CampaignGoal {
+            description: "d".into(),
+            elements: Vec::new(),
+            objective: "lower the density".into(),
+            target_property: Some("density_g_cm3".into()),
+            target_direction: None,
+            constraints: Vec::new(),
+            seeds: Vec::new(),
+        };
+        let err = signed_by_direction(&goal, "density_g_cm3", 7.9).unwrap_err();
+        assert!(err.to_string().contains("target_direction"), "{err:#}");
+        goal.target_direction = Some(crate::Direction::Minimize);
+        assert_eq!(
+            signed_by_direction(&goal, "density_g_cm3", 7.9).unwrap(),
+            -7.9
+        );
+        goal.target_direction = Some(crate::Direction::Maximize);
+        assert_eq!(
+            signed_by_direction(&goal, "density_g_cm3", 7.9).unwrap(),
+            7.9
+        );
     }
 }

@@ -28,6 +28,7 @@
 //!     elements: vec!["W".into(), "Mo".into(), "Ta".into(), "Nb".into(), "Cr".into(), "V".into()],
 //!     objective: "maximize creep resistance".into(),
 //!     target_property: Some("Tm_estimate_K".into()),
+//!     target_direction: Some(prism_campaign::Direction::Maximize),
 //!     constraints: vec!["density < 12 g/cm³".into(), "melting_point > 2000K".into()],
 //!     seeds: vec![],
 //! };
@@ -153,6 +154,27 @@ fn evidence_token(evidence_class: EvidenceClass) -> String {
 // ── Configuration ───────────────────────────────────────────────────
 
 /// The user's discovery goal — what the campaign is trying to find.
+/// Which way a declared target property is better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Maximize,
+    Minimize,
+}
+
+impl std::str::FromStr for Direction {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "maximize" | "maximise" | "max" => Ok(Self::Maximize),
+            "minimize" | "minimise" | "min" => Ok(Self::Minimize),
+            other => anyhow::bail!(
+                "target direction must be \"maximize\" or \"minimize\", got {other:?}"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CampaignGoal {
     /// Natural-language description of what to discover.
@@ -174,6 +196,16 @@ pub struct CampaignGoal {
     /// `compute_reward`).
     #[serde(default)]
     pub target_property: Option<String>,
+    /// Which way `target_property` is better. DECLARED, like the property —
+    /// it used to be read off the objective text with
+    /// `objective.contains("minimize")`, twenty lines under a comment
+    /// congratulating the code for removing exactly that: "lower the
+    /// density", "reduce thermal conductivity" and "minimieren" all ranked as
+    /// maximize, and a campaign burned its budget returning the worst
+    /// candidates as best, with no error. A declared property with no
+    /// declared direction is refused; the sign is never inferred.
+    #[serde(default)]
+    pub target_direction: Option<Direction>,
     /// Hard constraints (e.g. "density < 12 g/cm³").
     #[serde(default)]
     pub constraints: Vec<String>,
@@ -672,6 +704,7 @@ impl CampaignState {
             elements: Vec::new(),
             objective: String::new(),
             target_property: None,
+            target_direction: None,
             constraints: Vec::new(),
             seeds: Vec::new(),
         };
@@ -2986,6 +3019,7 @@ mod tests {
             ],
             objective: "maximize strength-to-weight ratio".into(),
             target_property: None,
+            target_direction: None,
             constraints: vec!["density < 5 g/cm³".into()],
             seeds: vec!["Ti0.9 Al0.06 V0.04".into()],
         }
@@ -3078,6 +3112,7 @@ mod tests {
                 .collect(),
             objective: "maximize strength".into(),
             target_property: None,
+            target_direction: None,
             constraints: vec![],
             seeds: vec![],
         };
@@ -3145,6 +3180,7 @@ mod tests {
                     .collect(),
                 objective: "maximize melting point".into(),
                 target_property: None,
+                target_direction: None,
                 constraints: vec![],
                 seeds: vec![],
             },
@@ -3618,6 +3654,7 @@ mod tests {
 
         let mut goal = test_goal();
         goal.target_property = Some("Tm_estimate_K".into());
+        goal.target_direction = Some(crate::Direction::Maximize);
         let mut campaign = Campaign::new(goal, CampaignConfig::default(), "no-derive-1".into());
         assert!(campaign.derive_reward_spec().await.unwrap().is_none());
 
@@ -3677,6 +3714,7 @@ mod tests {
             elements: Vec::new(),
             objective: String::new(),
             target_property: Some("glass_transition_temperature_k".into()),
+            target_direction: Some(crate::Direction::Maximize),
             constraints: Vec::new(),
             seeds: vec![r#"{"representation":"monomer","monomer":"ethylene"}"#.into()],
         };
@@ -3766,6 +3804,7 @@ mod tests {
         let mut goal = test_goal();
         goal.objective = "maximize melting point".into();
         goal.target_property = Some("Tm_estimate_K".into());
+        goal.target_direction = Some(crate::Direction::Maximize);
         let campaign = Campaign::new(goal, CampaignConfig::default(), "c1".into());
 
         let reward = campaign

@@ -941,6 +941,12 @@ enum CampaignCommands {
         /// English words.
         #[arg(long)]
         target_property: Option<String>,
+        /// Which way `--target-property` is better: `maximize` or `minimize`.
+        /// Required alongside `--target-property`. Declared, never inferred
+        /// from the objective's words — "lower the density" used to rank as
+        /// maximize.
+        #[arg(long)]
+        target_direction: Option<String>,
         /// Weighted reward over SEVERAL declared properties, repeatable:
         /// `--reward-weight Tm_estimate_K=1 --reward-weight delta_S_mix_J_per_molK=100`.
         ///
@@ -2283,6 +2289,7 @@ async fn main() -> Result<()> {
                     elements,
                     objective,
                     target_property,
+                    target_direction,
                     reward_weight,
                     max_iterations,
                     batch_size,
@@ -2310,11 +2317,26 @@ async fn main() -> Result<()> {
                         })
                         .unwrap_or_default();
 
+                    // The direction is declared, never read off the objective's
+                    // words: "lower the density" once ranked as maximize and a
+                    // campaign spent its budget returning the worst candidates
+                    // as best. Refused here, before anything is spent.
+                    let target_direction = target_direction
+                        .as_deref()
+                        .map(str::parse::<prism_campaign::Direction>)
+                        .transpose()?;
+                    if target_property.is_some() && target_direction.is_none() {
+                        bail!(
+                            "--target-property requires --target-direction maximize|minimize: \
+                             the reward's sign is declared, not inferred from the objective text"
+                        );
+                    }
                     let campaign_goal = CampaignGoal {
                         description: goal.clone(),
                         elements: elements_vec,
                         objective: objective.clone().unwrap_or_default(),
                         target_property: target_property.clone(),
+                        target_direction,
                         constraints: Vec::new(),
                         seeds: Vec::new(),
                     };
@@ -13376,6 +13398,7 @@ async fn run_batch_campaign_entrypoint(project_root: &Path) -> Result<bool> {
                 elements: inputs.elements.into_vec(),
                 objective: inputs.objective,
                 target_property: None,
+                target_direction: None,
                 constraints: inputs.constraints.into_vec(),
                 seeds: inputs.seeds.into_vec(),
             },
