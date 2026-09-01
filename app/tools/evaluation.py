@@ -89,6 +89,22 @@ TIER_EVIDENCE_SOURCES = {
     TIER_QE: EvidenceSource.EXECUTION,
 }
 
+def evidence_source_for(tier: int, block: dict) -> EvidenceSource:
+    """The evidence source a tier's result block earns.
+
+    A tier that ran to `status: ok` earns the tier's source — EXECUTION for
+    MACE/CALPHAD/QE, whose ceiling is REFERENCE_VALIDATED (green). Unless the
+    backend that produced it is synthetic: a FakeBackend "relaxation" is a
+    lookup table plus hash noise, and it reached here as `status: ok` and was
+    labelled reference-validated under the real MACE model signature and
+    licence — stub numbers reported as validated physics. A synthetic result
+    is a model assertion, whatever its status.
+    """
+    if block.get("status") != "ok" or block.get("synthetic"):
+        return EvidenceSource.MODEL_ASSERTION
+    return TIER_EVIDENCE_SOURCES[tier]
+
+
 TIER_METHODS = {
     TIER_EMPIRICAL: (
         "Yang (Ω, δ) + Guo/Liu (VEC) empirical screening — heuristic "
@@ -473,6 +489,11 @@ def _run_tier1(candidate: dict, elems: list[str], fracs: list[float]) -> dict:
         "status": "ok",
         "job_id": job_id,
         "cache_hit": bool(handle.cache_hit),
+        # Which backend produced these numbers, and whether it computed them.
+        # Without this a FakeBackend relaxation was indistinguishable from a
+        # real one by the time evidence was stamped.
+        "backend": result.get("backend"),
+        "synthetic": bool(result.get("synthetic", False)),
         "model": sig,
         "structure": {"phase": phase, "n_atoms": n_atoms, "atom_counts": counts},
         "properties": props,
@@ -903,11 +924,12 @@ def evaluate_candidate(candidate: dict, tier: int = 0) -> dict:
                 block = _failed(f"tier {t} crashed: {e}")
             block.setdefault("tier", t)
             block.setdefault("name", label)
-            production_source = (
-                TIER_EVIDENCE_SOURCES[t]
-                if block.get("status") == "ok"
-                else EvidenceSource.MODEL_ASSERTION
-            )
+            production_source = evidence_source_for(t, block)
+            if block.get("synthetic"):
+                block["evidence_note"] = (
+                    f"backend {block.get('backend')!r} is synthetic — these numbers "
+                    "were not computed and are not evidence"
+                )
             properties = block.get("properties")
             if (
                 isinstance(properties, dict)

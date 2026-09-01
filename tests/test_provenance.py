@@ -218,3 +218,34 @@ def test_real_backend_provenance_still_names_the_resolved_weights(monkeypatch):
     ][0]
     assert potential["repo_id"] == expected_repo
     assert potential["license"] == expected_licence
+
+
+async def test_the_stored_result_says_which_backend_ran_and_whether_it_computed(tmp_path, monkeypatch):
+    """`_run_tier1` reads `rec.result`, not the provenance file. The runner
+    popped `backend_details` off the result before storing it, so nothing on
+    the result said FakeBackend had produced it, and evaluation stamped its
+    numbers as executed evidence. The stored result must carry both facts."""
+    monkeypatch.setenv("HF_TOKEN", "hf_fake_token_DO_NOT_LEAK_ME_42")
+    from app.tools.simulation.mace import auth
+    auth.reset_cache_for_tests()
+    store = JobStore(tmp_path / "jobs.db")
+    backends = {"fake": FakeBackend()}
+    runner = JobRunner(store=store, backends=backends, cache_root=tmp_path / "cache")
+    inp = RelaxStructureInput(
+        composition=Composition(atoms={"Fe": 50, "Ti": 50}),
+        phase="bcc",
+        n_atoms=100,
+        options=PrimitiveOptions(backend="fake"),
+    )
+    handle = await tprim.relax_structure(inp, runner, backends)
+    deadline = asyncio.get_event_loop().time() + 5.0
+    while True:
+        rec = store.get(handle.job_id)
+        if rec and rec.status == "succeeded":
+            break
+        if asyncio.get_event_loop().time() > deadline:
+            raise TimeoutError("job did not finish")
+        await asyncio.sleep(0.02)
+    assert rec.result["backend"] == "fake", rec.result
+    assert rec.result["synthetic"] is True, "a fake backend's result must say so"
+    assert "backend_details" not in rec.result, "the details still belong to provenance only"

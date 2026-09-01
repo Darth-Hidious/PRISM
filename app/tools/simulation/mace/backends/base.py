@@ -44,6 +44,13 @@ class Backend(ABC):
     """
 
     name: str = ""
+    # True for a backend whose numbers are NOT the product of a computation
+    # (lookup tables, hash noise). The runner copies this onto every result it
+    # writes, and evaluation refuses to stamp a synthetic result as executed
+    # evidence: a FakeBackend relaxation reached the ladder as `status: ok`
+    # and was labelled `reference_validated` under the real MACE licence —
+    # stub numbers reported as validated physics.
+    synthetic: bool = False
 
     @abstractmethod
     def execute(self, job: BackendJob, progress: ProgressCb | None = None) -> dict[str, Any]:

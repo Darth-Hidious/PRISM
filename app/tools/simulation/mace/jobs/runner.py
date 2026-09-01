@@ -207,6 +207,13 @@ class JobRunner:
         cif_text = result.pop("cif_text", None)
         traj_json = result.pop("traj_json", None)
         backend_details = result.pop("backend_details", {})
+        # The DETAILS (paths, seeds, hosts) belong in provenance only; WHICH
+        # backend produced the numbers, and whether it computed them at all,
+        # must stay on the result — evaluation reads the result, not the
+        # provenance file, and without these it labelled FakeBackend output
+        # as executed evidence.
+        result["backend"] = backend.name
+        result["synthetic"] = bool(getattr(backend, "synthetic", False))
 
         if cif_text:
             self.cache.write_structure_cif(cache_key, cif_text)

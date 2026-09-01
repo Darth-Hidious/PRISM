@@ -39,6 +39,7 @@ _V_REF: dict[str, float] = {
 
 class FakeBackend(Backend):
     name = "fake"
+    synthetic = True
 
     def __init__(self) -> None:
         self._cancelled: set[str] = set()

@@ -347,3 +347,19 @@ def test_tools_register_and_dispatch_tier0():
     status_tool = reg.get("evaluation_tier_status")
     st = status_tool.func()
     assert set(st["tiers"]) == {"0", "1", "2", "3"}
+
+
+def test_a_synthetic_backend_result_is_never_executed_evidence():
+    """A FakeBackend tier reached `status: ok` and was stamped GREEN
+    (reference_validated) under the real MACE licence. Stub numbers must
+    never earn the EXECUTION source, whatever their status."""
+    from app.tools.evidence import EvidenceClass, EvidenceSource, stamp_evidence
+
+    real = {"status": "ok", "backend": "local", "synthetic": False}
+    fake = {"status": "ok", "backend": "fake", "synthetic": True}
+    failed = {"status": "failed"}
+    assert ev.evidence_source_for(ev.TIER_MACE, real) is EvidenceSource.EXECUTION
+    assert ev.evidence_source_for(ev.TIER_MACE, fake) is EvidenceSource.MODEL_ASSERTION
+    assert ev.evidence_source_for(ev.TIER_MACE, failed) is EvidenceSource.MODEL_ASSERTION
+    stamped = stamp_evidence({}, ev.evidence_source_for(ev.TIER_MACE, fake))
+    assert stamped is not EvidenceClass.REFERENCE_VALIDATED, stamped

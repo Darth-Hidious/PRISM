@@ -100,3 +100,12 @@ def test_phonon_temperatures_propagate() -> None:
     assert r["temperatures_K"] == [0.0, 500.0, 1500.0]
     assert len(r["F_vib_eV_per_atom"]) == 3
     assert r["is_dynamically_stable"] is True
+
+
+def test_the_fake_backend_declares_itself_synthetic() -> None:
+    """The runner copies `synthetic` onto every result; evaluation refuses to
+    stamp a synthetic result as executed evidence. A fake that does not say
+    so would be labelled reference_validated again."""
+    fb = FakeBackend()
+    assert fb.name == "fake"
+    assert fb.synthetic is True
