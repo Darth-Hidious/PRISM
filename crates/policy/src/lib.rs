@@ -227,20 +227,33 @@ impl PolicyEngine {
             .context("failed to serialize policy input")?;
         self.engine.set_input(regorus_input);
 
-        // Evaluate the main allow rule
+        // Evaluate the main allow rule. An evaluation ERROR is not "no rule
+        // matched": it is a policy that could not be consulted, and the
+        // decision must say so rather than report "no policy rule allows
+        // this action" and send the operator to debug a rule's logic when
+        // the file did not load.
+        let mut violations = Vec::new();
         let allowed = match self.engine.eval_rule("data.prism.policy.allow".into()) {
             Ok(val) => val_to_bool(&val),
-            Err(_) => {
-                // If no allow rule matches, default deny
+            Err(error) => {
+                violations.push(format!("policy allow rule failed to evaluate: {error:#}"));
                 false
             }
         };
 
-        // Collect denial reasons
-        let violations = match self.engine.eval_rule("data.prism.policy.deny".into()) {
-            Ok(val) => val_to_string_set(&val),
-            Err(_) => Vec::new(),
-        };
+        // Collect denial reasons. A deny rule that fails to EVALUATE yielded
+        // no violations, so a matching allow plus a broken deny returned
+        // Allow — an error in the rule meant to refuse became a grant. On a
+        // security boundary that is the one outcome the fail-closed doctrine
+        // exists to prevent; the error is itself a violation.
+        match self.engine.eval_rule("data.prism.policy.deny".into()) {
+            Ok(val) => violations.extend(val_to_string_set(&val)),
+            Err(error) => {
+                violations.push(format!(
+                    "policy deny rule failed to evaluate — refusing: {error:#}"
+                ));
+            }
+        }
 
         // Collect obligations
         let obligations = match self
@@ -266,14 +279,20 @@ impl PolicyEngine {
             decision.obligations = obligations;
             Ok(decision)
         } else {
-            let reason = if reason.is_empty() {
-                if violations.is_empty() {
+            // A refused decision leads with WHY it was refused. The policy's
+            // own `reason` rule explains the allow that matched — used verbatim
+            // here it produced a Deny whose message read "allowed: alice has
+            // admin role", and dropped the violations that refused it.
+            let reason = if violations.is_empty() {
+                if reason.is_empty() {
                     "no policy rule allows this action".to_string()
                 } else {
-                    violations.join("; ")
+                    reason
                 }
+            } else if reason.is_empty() {
+                violations.join("; ")
             } else {
-                reason
+                format!("{} (policy reason: {reason})", violations.join("; "))
             };
             Ok(PolicyDecision::deny(reason, violations))
         }
@@ -482,6 +501,46 @@ mod tests {
             context: serde_json::json!({}),
         };
         assert!(engine.require(&input).is_err());
+    }
+
+    /// A deny rule that fails to EVALUATE must refuse, not vanish.
+    ///
+    /// `evaluate()` mapped a deny-rule error to "no violations", so a matching
+    /// `allow` plus a broken `deny` returned Allow — an error in the rule
+    /// meant to refuse became a grant, on a security boundary. The existing
+    /// fail-closed test hand-built an `Err` that `evaluate` itself could not
+    /// produce; this one loads a real policy whose deny rule divides by zero
+    /// at evaluation time, beside an allow that genuinely matches.
+    #[test]
+    fn a_deny_rule_that_fails_to_evaluate_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("broken.rego"),
+            "package prism.policy\n\nimport rego.v1\n\n\
+             deny contains msg if {\n    x := 1 / 0\n    msg := sprintf(\"never %v\", [x])\n}\n",
+        )
+        .unwrap();
+        let mut engine = PolicyEngine::new().unwrap();
+        engine
+            .load_directory(dir.path())
+            .expect("the broken rule compiles; it fails only when run");
+        let input = PolicyInput {
+            action: "workflow.execute".into(),
+            principal: "alice".into(),
+            role: "admin".into(), // the default policy ALLOWS an admin
+            resource: "wf-1".into(),
+            context: serde_json::json!({}),
+        };
+        let decision = engine.evaluate(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "a deny rule the engine could not run must refuse, not disappear: {decision:?}"
+        );
+        assert!(
+            decision.reason.contains("deny rule failed to evaluate"),
+            "the reason must name the failure, not 'no rule allows': {}",
+            decision.reason
+        );
     }
 
     #[test]
