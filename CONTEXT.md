@@ -28,6 +28,11 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 - `polymers.ttl` (6542 classes / 6172 relations) PROMOTED 1 Sep on owner say-so; installed at `.prism/ontologies/polymers.ttl`.
 - Ontology binds AFTER extraction; `value`/`unit` are never required fields.
 
+## State 2026-09-02 01:40
+- `cargo clippy --workspace --all-targets -D warnings`: CLEAN (0 warnings) at `cc94a5dd`.
+- Paper 1 DONE: 0.4995 vs baseline 0.1583 (same paper); 11.3 min. Remaining 19 running (background task b6gzfg3og, ~11 min/paper). See playbook §13.10.
+- End-to-end LitXBench run IN PROGRESS: baseline `out-current` overall F1 0.3789 (19 papers). Outputs → `~/Downloads/prism-gold-eval/harness/out-unmuzzle/` (local, never the repo); scratch store `$SCRATCHPAD/litx/prov.db`; JATS served by `python3 -m http.server 8765` in `harness/jats/`; runner `$SCRATCHPAD/litx/run_rest.sh`; score with `PRISM_OUT_DIR=out-unmuzzle ../.venv/bin/python score.py`.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. Owner decision open: author domain/range for the 5 EMMO properties in the materialised TTL (currently unseeded, now honestly reported).
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
