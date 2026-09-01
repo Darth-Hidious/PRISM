@@ -1206,6 +1206,13 @@ async fn persist_paper_identities(tool: &str, result: &Value) {
         return;
     }
     let Some(payload) = cli_payload(result) else {
+        // The envelope was cut (its stdout carries `[Output truncated]`), so
+        // the JSON cannot be parsed and NO identity from this search reaches
+        // the graph. The model was told what it found; the graph was not.
+        tracing::warn!(
+            tool,
+            "search result exceeded the envelope; its paper identities were NOT persisted"
+        );
         return;
     };
     let records = paper_records(&payload);
@@ -1216,15 +1223,17 @@ async fn persist_paper_identities(tool: &str, result: &Value) {
     let store = match prism_provenance::ProvenanceStore::open(&db_path).await {
         Ok(store) => store,
         Err(error) => {
-            tracing::debug!("paper identities not persisted: {error:#}");
+            tracing::warn!(
+                tool,
+                "paper identities not persisted — store did not open: {error:#}"
+            );
             return;
         }
     };
     let mut written = 0usize;
-    for record in records {
-        let Some(key) = paper_key(record) else {
-            continue;
-        };
+    let mut failed = 0usize;
+    let (keyed, unkeyed) = identity_plan(&records);
+    for (key, record) in keyed {
         let title = record
             .get("title")
             .and_then(Value::as_str)
@@ -1246,14 +1255,42 @@ async fn persist_paper_identities(tool: &str, result: &Value) {
             .write_extracted_entity(&key, "Paper", Some(props), "local")
             .await
         {
-            tracing::debug!("paper {key} not persisted: {error:#}");
+            tracing::warn!("paper {key} not persisted: {error:#}");
+            failed += 1;
             continue;
         }
         written += 1;
     }
-    if written > 0 {
-        tracing::debug!("persisted {written} paper identities from {tool}");
+    // Every record either reached the graph or is counted here. The old
+    // lines were `debug!` on success only: a search of 45 papers that
+    // persisted 33 said nothing about the 12, and a later session searched
+    // for what it believed it already had.
+    if unkeyed > 0 || failed > 0 {
+        tracing::warn!(
+            tool,
+            written,
+            unkeyed,
+            failed,
+            "paper identities: {unkeyed} record(s) carried no usable identity and {failed} write(s) failed"
+        );
+    } else if written > 0 {
+        tracing::info!("persisted {written} paper identities from {tool}");
     }
+}
+
+/// Which records CAN be persisted, and how many cannot. A record needs a DOI,
+/// an arXiv id, a PMC id, or a source plus source id; one without any is
+/// counted, not silently skipped.
+fn identity_plan<'a>(records: &[&'a Value]) -> (Vec<(String, &'a Value)>, usize) {
+    let mut keyed = Vec::new();
+    let mut unkeyed = 0usize;
+    for record in records {
+        match paper_key(record) {
+            Some(key) => keyed.push((key, *record)),
+            None => unkeyed += 1,
+        }
+    }
+    (keyed, unkeyed)
 }
 
 // ── Saturation signal ─────────────────────────────────────────────
@@ -7283,6 +7320,19 @@ mod tests {
     /// burns the turn proving it cannot comply.
     /// `prior_art_search` answers `{papers, patents}`; the digest read only
     /// `papers`, so forty patents vanished with no count and no marker.
+    /// A record with no usable identity is COUNTED, not silently skipped. The
+    /// model is told "45 found"; the graph must not quietly hold 33.
+    #[test]
+    fn records_without_an_identity_are_counted_not_dropped_silently() {
+        let keyed = paper(Some("10.1/a"), "arxiv", "x1");
+        let mut bare = paper(None, "", "");
+        bare["title"] = serde_json::json!("A paper with no identifier at all");
+        let records = vec![&keyed, &bare];
+        let (plan, unkeyed) = identity_plan(&records);
+        assert_eq!(plan.len(), 1, "the keyed record is planned");
+        assert_eq!(unkeyed, 1, "the bare record is counted as unkeyed");
+    }
+
     #[test]
     fn a_prior_art_digest_carries_its_patents_and_counts_them() {
         let papers: Vec<Value> = (0..5)
