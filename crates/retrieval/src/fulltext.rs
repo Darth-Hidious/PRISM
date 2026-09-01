@@ -73,9 +73,15 @@ impl Fulltext {
 /// Fetch the best available full text for a paper.
 ///
 /// Priority: PMC JATS (structured) > declared JATS URL > declared PDF/other
-/// URL (sniffed). Returns `Ok(None)` when nothing is advertised — an absent
-/// full text is reported as absent, never papered over.
+/// URL (sniffed). Returns `Ok(None)` ONLY when nothing is advertised — an
+/// absent full text is reported as absent. A full text that IS advertised and
+/// could not be fetched is an `Err` naming what failed: a 403 from a bot wall,
+/// a timeout, a parse failure. Those three used to collapse into the same
+/// `Ok(None)` as genuine absence, and the CLI rendered every one as
+/// `no_fulltext_available` — telling the model a paper it could read had no
+/// full text, with no retry and no way to tell the cases apart.
 pub async fn fetch_fulltext(ctx: &FetchCtx, paper: &Paper) -> Result<Option<Fulltext>> {
+    let mut failures: Vec<String> = Vec::new();
     // Priority 1: PMC open-access JATS (structured) when we know the PMCID.
     if let Some(pmcid) = paper.external_ids.get("pmc") {
         match fetch_pmc_jats(ctx, pmcid).await {
@@ -85,10 +91,10 @@ pub async fn fetch_fulltext(ctx: &FetchCtx, paper: &Paper) -> Result<Option<Full
             }
             Err(e) => {
                 tracing::warn!("PMC JATS fetch failed for {pmcid}: {e:#}");
+                failures.push(format!("PMC JATS for {pmcid}: {e:#}"));
             }
         }
     }
-
     // Priority 2: whatever full-text location the metadata advertised.
     if let Some(url) = &paper.fulltext_url {
         let declared_format = paper.fulltext_format;
@@ -108,15 +114,24 @@ pub async fn fetch_fulltext(ctx: &FetchCtx, paper: &Paper) -> Result<Option<Full
                     }
                     Err(e) => {
                         tracing::warn!("full-text parse failed for {url}: {e:#}");
+                        failures.push(format!("parse of {url} as {format:?}: {e:#}"));
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("full-text download failed for {url}: {e:#}");
+                failures.push(format!("download of {url}: {e:#}"));
             }
         }
     }
-    Ok(None)
+    if failures.is_empty() {
+        Ok(None)
+    } else {
+        anyhow::bail!(
+            "full text is advertised but could not be fetched — {}",
+            failures.join("; ")
+        )
+    }
 }
 
 /// Resolve a PMCID to its JATS full text via the PMC OA web service:
@@ -1231,5 +1246,73 @@ mod tests {
         encoder.write_all(&tarball).unwrap();
         let package = encoder.finish().unwrap();
         assert!(extract_nxml(&package).is_err());
+    }
+
+    /// A full text that is ADVERTISED and could not be fetched is not an
+    /// absent one. A 403 from a bot wall, a timeout and a parse failure all
+    /// collapsed into the same `Ok(None)` as genuine absence, and the CLI
+    /// rendered every one as `no_fulltext_available` — telling the model a
+    /// paper it could read had no full text.
+    #[tokio::test]
+    async fn a_failed_fetch_is_an_error_not_an_absence() {
+        use crate::cache::DiskCache;
+        use crate::ratelimit::RateLimiter;
+        use crate::sources::FetchCtx;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        fn bare_paper(fulltext_url: Option<String>) -> Paper {
+            Paper {
+                source: "test".into(),
+                source_id: "t1".into(),
+                title: "t".into(),
+                authors: Vec::new(),
+                year: None,
+                published: None,
+                doi: None,
+                external_ids: Default::default(),
+                abstract_text: None,
+                url: "https://example.test/t1".into(),
+                fulltext_format: fulltext_url.as_ref().map(|_| FulltextFormat::Pdf),
+                fulltext_url,
+                journal: None,
+            }
+        }
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(403).set_body_string("bot wall"))
+            .mount(&server)
+            .await;
+        let ctx = FetchCtx {
+            client: reqwest::Client::new(),
+            headers: reqwest::header::HeaderMap::new(),
+            mailto: None,
+            limit: 1,
+            base_overrides: HashMap::new(),
+            limiters: HashMap::new(),
+            cache: None::<DiskCache>,
+            max_attempts: 1,
+            cache_hits: std::sync::Mutex::new(HashMap::new()),
+            network_fetches: std::sync::atomic::AtomicUsize::new(0),
+            cache_fetches: std::sync::atomic::AtomicUsize::new(0),
+            fulltext_limiter: Arc::new(RateLimiter::new(std::time::Duration::ZERO)),
+            extra_headers: HashMap::new(),
+        };
+
+        let walled = bare_paper(Some(format!("{}/paper.pdf", server.uri())));
+        let err = fetch_fulltext(&ctx, &walled)
+            .await
+            .expect_err("an advertised full text that 403s is a fetch failure, not an absence");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("could not be fetched"), "{msg}");
+        assert!(msg.contains("403"), "the real reason must survive: {msg}");
+
+        let silent = bare_paper(None);
+        assert!(
+            fetch_fulltext(&ctx, &silent).await.unwrap().is_none(),
+            "a paper that advertises nothing is honestly absent"
+        );
     }
 }
