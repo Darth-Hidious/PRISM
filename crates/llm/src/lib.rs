@@ -2265,9 +2265,14 @@ impl LlmClient {
                         full_content.push_str(delta);
                     } else if let Some(delta) = reasoning_delta {
                         // Reasoning tokens — is_reasoning=true so the
-                        // agent loop can emit them as ui.thinking.delta
+                        // agent loop can emit them as ui.thinking.delta.
+                        // They are NOT part of the answer: this arm also
+                        // pushed them into `full_content`, which becomes
+                        // `message.content`, is stored, and is re-sent on
+                        // every later request — the model's private
+                        // chain-of-thought re-entering history as its public
+                        // reply, under a comment saying it must never.
                         on_delta(delta, true);
-                        full_content.push_str(delta);
                     }
 
                     // Extract streaming tool calls

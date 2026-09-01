@@ -584,3 +584,41 @@ async fn a_reported_usage_survives_a_trailing_null_chunk() {
     assert_eq!(usage.prompt_tokens, 100);
     assert_eq!(usage.completion_tokens, 7);
 }
+
+/// Reasoning tokens reach the UI as thinking and must NOT reach
+/// `message.content`, which is stored and re-sent as the model's own words.
+#[tokio::test]
+async fn reasoning_tokens_never_enter_the_message_content() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think about seals\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"PTFE is the answer.\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_string();
+    let server = tokio::spawn(serve_once(listener, sse));
+    let client = LlmClient::new(config(format!("http://127.0.0.1:{port}/v1")));
+    let mut thinking = String::new();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.chat_with_tools_streaming(&user("hello"), &[], |delta, is_reasoning| {
+            if is_reasoning {
+                thinking.push_str(delta);
+            }
+        }),
+    )
+    .await
+    .expect("turn timed out")
+    .expect("stream parses");
+    let _ = server.await.unwrap();
+    assert_eq!(
+        response.message.content.as_deref(),
+        Some("PTFE is the answer."),
+        "content must be the answer alone"
+    );
+    assert!(
+        thinking.contains("let me think"),
+        "reasoning still reaches the UI as thinking"
+    );
+}
