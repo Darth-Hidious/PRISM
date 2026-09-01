@@ -64,6 +64,9 @@ prism-tui = { path = "../tui" }
 url.workspace = true
 
 [dev-dependencies]
+# Arms the live-store guard for this crate's test targets (see
+# crates/agent/Cargo.toml): without it, tests here can open ~/.prism.
+prism-agent = { path = "../agent", features = ["test-guard"] }
 tempfile.workspace = true
 mockito.workspace = true
 wiremock.workspace = true

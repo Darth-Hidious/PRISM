@@ -28,6 +28,13 @@ mod session_index;
 pub mod skills;
 pub mod subagent;
 pub mod task;
+/// Whether this build of `prism-agent` carries the live-store guard. A crate
+/// whose tests route provenance writes through this crate must arm it via
+/// `features = ["test-guard"]` on its dev-dependency — otherwise `cargo test
+/// -p <that crate>` builds an unguarded agent and can open `~/.prism`.
+/// Downstream tripwires assert on this so the arming cannot be quietly lost.
+pub const TEST_GUARD_ARMED: bool = cfg!(feature = "test-guard");
+
 #[cfg(any(test, feature = "test-guard"))]
 pub mod testsupport;
 pub mod tool_catalog;

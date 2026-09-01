@@ -20,3 +20,8 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 prism-llm = { path = "../llm" }
 prism-agent = { path = "../agent" }
 prism-python-bridge = { path = "../python-bridge" }
+
+[dev-dependencies]
+# Arms the live-store guard for this crate's test targets (see
+# crates/agent/Cargo.toml): without it, tests here can open ~/.prism.
+prism-agent = { path = "../agent", features = ["test-guard"] }
