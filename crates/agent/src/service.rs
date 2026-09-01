@@ -295,10 +295,7 @@ impl ChatService {
         store.set_project_cwd(Some(&tool_server_config.project_root));
         let sessions_dir = store.dir().to_path_buf();
         let owners_path = sessions_dir.join("http_chat_owners.json");
-        let owners = std::fs::read_to_string(&owners_path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<BTreeMap<String, String>>(&text).ok())
-            .unwrap_or_default();
+        let owners = load_owners(&owners_path);
 
         Ok(Self {
             inner: tokio::sync::Mutex::new(ChatInner {
@@ -892,15 +889,62 @@ impl ChatService {
     fn record_owner(&self, session_id: &str, user_id: &str) {
         let mut owners = self.owners.lock().unwrap_or_else(|e| e.into_inner());
         owners.insert(session_id.to_string(), user_id.to_string());
-        match serde_json::to_string_pretty(&*owners) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&self.owners_path, json) {
-                    tracing::warn!(error = %e, "failed to persist chat session owners");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to serialize chat session owners"),
+        if let Err(e) = write_owners(&self.owners_path, &owners) {
+            tracing::warn!(error = %e, "failed to persist chat session owners");
         }
     }
+}
+
+/// The session-owner map, from disk.
+///
+/// This was `read_to_string(..).ok().and_then(parse.ok()).unwrap_or_default()`:
+/// a read error and a parse error alike became an EMPTY map with no log. A
+/// file truncated by a crash mid-write then made `user_owns` false for every
+/// session, `chat_inner` answered `SessionNotFound`, and `list_sessions`
+/// filtered them all out — every conversation on disk, intact, reported to
+/// the user as not found. A missing file is the first run and is fine. A file
+/// that exists and will not parse is set aside under a `.corrupt-<ts>` name so
+/// the next `record_owner` cannot overwrite the evidence, and the operator is
+/// told which file and why.
+fn load_owners(path: &std::path::Path) -> BTreeMap<String, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "chat session owners file could not be read — every session will answer 'not found' until it can");
+            return BTreeMap::new();
+        }
+    };
+    match serde_json::from_str::<BTreeMap<String, String>>(&text) {
+        Ok(owners) => owners,
+        Err(e) => {
+            let aside = path.with_extension(format!(
+                "json.corrupt-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            ));
+            let moved = std::fs::rename(path, &aside).is_ok();
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                set_aside = moved,
+                "chat session owners file is corrupt; every existing session will answer 'not found' until ownership is restored"
+            );
+            BTreeMap::new()
+        }
+    }
+}
+
+/// Atomic: write beside, then rename over. A crash mid-`fs::write` left a
+/// truncated file, which is exactly what `load_owners` then could not parse.
+fn write_owners(path: &std::path::Path, owners: &BTreeMap<String, String>) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(owners)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Headless approval policy: allow only tools the request explicitly
@@ -1121,5 +1165,46 @@ mod tests {
             approval_decision(&empty, "execute_bash"),
             ApprovalResponse::Deny
         ));
+    }
+
+    /// A corrupt owners file must be set aside and said, never silently read
+    /// as "nobody owns anything"; a missing one is the first run.
+    #[test]
+    fn a_corrupt_owners_file_is_set_aside_not_silently_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http_chat_owners.json");
+        assert!(super::load_owners(&path).is_empty(), "missing = first run");
+        std::fs::write(&path, "{\"s1\": \"alice\", \"s2\": \"bo").unwrap(); // truncated mid-write
+        let owners = super::load_owners(&path);
+        assert!(owners.is_empty());
+        assert!(
+            !path.exists(),
+            "the corrupt file must be moved aside, not left to be overwritten"
+        );
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
+            .collect();
+        assert_eq!(
+            aside.len(),
+            1,
+            "the evidence is preserved under a .corrupt-<ts> name"
+        );
+    }
+
+    /// The write is atomic and round-trips; no temp file is left behind.
+    #[test]
+    fn owners_are_written_atomically_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("http_chat_owners.json");
+        let mut owners = BTreeMap::new();
+        owners.insert("s1".to_string(), "alice".to_string());
+        super::write_owners(&path, &owners).unwrap();
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "no temp file left behind"
+        );
+        assert_eq!(super::load_owners(&path), owners);
     }
 }
