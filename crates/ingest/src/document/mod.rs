@@ -308,9 +308,20 @@ async fn escalate(
             if !damaged.iter().any(|(n, _)| *n == page.number) {
                 continue;
             }
-            let sound = text_layer_damage(&page.text, damage_policy).is_none()
-                && !is_degenerate(&page.text, damage_policy);
-            if !sound {
+            // A recovered page is judged for DEGENERACY only — a repetition
+            // loop, control-character garbage. It is not judged by
+            // `text_layer_damage`, whose sparse-text rule ("under 120 chars is
+            // probably a figure page") is a statement about TEXT LAYERS. That
+            // rule is exactly what sent the page to a vision model; applied to
+            // the model's answer it rejected a correct 48-character figure
+            // transcription with no note, and a re-run paid to discard it
+            // again.
+            if is_degenerate(&page.text, damage_policy) {
+                tracing::warn!(
+                    page = page.number,
+                    adapter = adapter.id(),
+                    "recovery rejected: the adapter's output is degenerate; the page stays damaged"
+                );
                 continue;
             }
             let Some(slot) = pages.iter_mut().find(|p| p.number == page.number) else {
@@ -579,6 +590,51 @@ mod tests {
 
     /// THE point of the plane: a page whose text layer is broken is rescued
     /// by the next adapter, and the sound pages are NOT re-read.
+    /// A correct SHORT recovery must be accepted. The page that escalated was
+    /// flagged `sparse` — the text layer had only a caption's worth of
+    /// characters, "probably a figure page" — and vision transcribed exactly
+    /// that figure: forty-odd characters. The replacement loop then judged the
+    /// transcription by the same sparse rule and dropped it with no note, so
+    /// the one page vision exists to recover was the one it could never win.
+    #[tokio::test]
+    async fn a_short_but_correct_recovery_is_accepted() {
+        let sparse = (2u32, "Fig. 5".to_string()); // under the 120-char floor
+        let text = scripted(
+            "text-layer",
+            Modality::TextLayer,
+            true,
+            vec![sound(1), sparse, sound(3)],
+        );
+        let transcription = "Fig. 5. UTS vs temperature. 1140 MPa at 298 K.".to_string();
+        assert!(
+            transcription.len() < 120,
+            "the fixture must sit under the sparse floor"
+        );
+        let vision = scripted(
+            "vision",
+            Modality::Vision,
+            true,
+            vec![(2, transcription.clone())],
+        );
+        let (outcome, _adapters) = read_with(vec![text, vision], Policy::default()).await;
+        let page2 = outcome
+            .understanding
+            .pages
+            .iter()
+            .find(|p| p.number == 2)
+            .expect("page 2 present");
+        assert_eq!(
+            page2.text, transcription,
+            "vision's short, correct answer must replace the sparse page"
+        );
+        assert_eq!(
+            outcome.unrecovered().count(),
+            0,
+            "the recovered page must not still read as damaged: {:?}",
+            outcome.unrecovered().collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn only_damaged_pages_escalate_and_they_get_recovered() {
         let broken = (2u32, "\u{01}\u{1a}(%\u{18}))\u{01}9&\u{16}(".to_string());
