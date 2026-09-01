@@ -4306,12 +4306,7 @@ pub(crate) async fn run_turn_inner(
             // A policy layer that turns itself off when its rules will not
             // parse is worse than none, because the operator believes it is on.
             let Some(pe) = policy.as_mut() else {
-                let denied_msg = format!(
-                    "Tool '{tool_name}' refused: the OPA policy engine failed to \
-                     initialize and policy cannot be bypassed (fail-closed). \
-                     Check ~/.prism/policies and .prism/policies for invalid \
-                     .rego files."
-                );
+                let denied_msg = crate::protocol::policy_unavailable_message(tool_name);
                 emit(AgentEvent::ToolCallResult {
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),

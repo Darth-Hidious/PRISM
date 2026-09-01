@@ -1577,6 +1577,32 @@ fn short_first_line(s: &str) -> String {
     format!("{clipped}…")
 }
 
+/// Why the OPA policy engine failed to load, if it did. Recorded once at
+/// session start and read by every refusal, so a user sees the `.rego` error
+/// that is blocking them instead of a generic instruction to go looking.
+static POLICY_LOAD_ERROR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub(crate) fn record_policy_load_error(error: &str) {
+    if let Ok(mut slot) = POLICY_LOAD_ERROR.write() {
+        *slot = Some(error.to_string());
+    }
+}
+
+/// The fail-closed refusal for a tool call made while no policy engine is
+/// loaded. Shared by the protocol and the agent loop so the two cannot drift,
+/// and carries the recorded load error when there is one.
+pub(crate) fn policy_unavailable_message(tool_name: &str) -> String {
+    let mut message = format!(
+        "Tool '{tool_name}' refused: the OPA policy engine failed to initialize and \
+         policy cannot be bypassed (fail-closed). Check ~/.prism/policies and \
+         .prism/policies for invalid .rego files."
+    );
+    if let Some(error) = POLICY_LOAD_ERROR.read().ok().and_then(|slot| slot.clone()) {
+        message.push_str(&format!(" Load error: {error}"));
+    }
+    message
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_manual_tool_call(
     command_label: &str,
@@ -1701,11 +1727,7 @@ async fn execute_manual_tool_call(
     // no-policies-configured case. Skipping the gate there means one malformed
     // file silently disables enforcement while telling nobody.
     let Some(pe) = policy_engine.as_mut() else {
-        let message = format!(
-            "Tool '{tool_name}' refused: the OPA policy engine failed to \
-             initialize and policy cannot be bypassed (fail-closed). Check \
-             ~/.prism/policies and .prism/policies for invalid .rego files."
-        );
+        let message = policy_unavailable_message(tool_name);
         emit_agent_event(AgentEvent::ToolCallResult {
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -9052,7 +9074,16 @@ async fn run_server_core(
             Some(pe)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "OPA policy engine failed to load — running without policies");
+            // Not "running without policies": with no engine every tool call
+            // is refused fail-closed (see `policy_unavailable_message`). Say
+            // so, at the level a session that cannot use tools deserves, and
+            // keep the reason so each refusal can name it.
+            tracing::error!(
+                error = %e,
+                "OPA policy engine failed to load — every tool call will be refused \
+                 (fail-closed) until the .rego files load"
+            );
+            record_policy_load_error(&e.to_string());
             None
         }
     };
@@ -11197,6 +11228,18 @@ mod tests {
 #[cfg(test)]
 mod card_payload_tests {
     use super::*;
+
+    #[test]
+    fn a_policy_refusal_names_the_load_error_that_caused_it() {
+        record_policy_load_error("~/.prism/policies/bad.rego: unexpected token at line 3");
+        let message = policy_unavailable_message("web");
+        assert!(message.contains("Tool 'web' refused"), "{message}");
+        assert!(message.contains("fail-closed"), "{message}");
+        assert!(
+            message.contains("bad.rego: unexpected token at line 3"),
+            "the refusal must carry the recorded load error: {message}"
+        );
+    }
 
     /// The TUI's `/gh` panel reached api.github.com under hard offline.
     ///
