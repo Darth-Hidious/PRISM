@@ -613,34 +613,73 @@ impl NodeConfig {
     }
 
     /// Load config with standard search order: defaults < global < project.
+    ///
+    /// Every diagnostic goes to stderr. Losing a hand-written override
+    /// silently is worse than losing it loudly — `providers.rs` and
+    /// `chat_config.rs` already follow that rule; this loader did not.
     pub fn load(project_root: Option<&Path>) -> Self {
-        let mut config = Self::default();
-
-        // Global: ~/.prism/prism.toml
-        if let Some(home) = std::env::var_os("HOME") {
-            let global = PathBuf::from(home).join(".prism").join("prism.toml");
-            if global.exists()
-                && let Ok(gc) = Self::from_file(&global)
-            {
-                config = gc;
-                tracing::debug!(path = %global.display(), "loaded global config");
-            }
-        }
-
-        // Project: .prism/prism.toml or <project_root>/.prism/prism.toml
+        let global = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".prism").join("prism.toml"));
         let root = project_root
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let project = root.join(".prism").join("prism.toml");
-        if project.exists()
-            && let Ok(pc) = Self::from_file(&project)
-        {
-            // Merge: project overrides global (simple: just replace)
-            config = pc;
-            tracing::debug!(path = %project.display(), "loaded project config");
+        let (config, diagnostics) = Self::load_from_paths(global.as_deref(), Some(&project));
+        for line in diagnostics {
+            eprintln!("warning: {line}");
         }
-
         config
+    }
+
+    /// The loader behind [`Self::load`], with its diagnostics returned rather
+    /// than printed, so the two things it must get right are testable.
+    ///
+    /// A file that does not parse is REPORTED, not skipped. It was `if let
+    /// Ok(..)` with no `Err` arm: one stray comma silently discarded the whole
+    /// file, and with it `[ontology] id`, so every fact in the run was
+    /// classified against the default vocabulary and stamped with its version
+    /// IRI in provenance — certifying the wrong answer, with no diagnostic.
+    ///
+    /// A project file overrides the global file SECTION BY SECTION. It was
+    /// whole-struct replacement (`config = pc`) behind a comment promising a
+    /// merge: because every section is `#[serde(default)]`, a project file
+    /// containing only `[ingest]` parsed cleanly and erased `[llm]`,
+    /// `[ontology]`, `[auth]` and `[platform]` from the global file. Merging
+    /// at the TOML table's top level gives exactly what the search order
+    /// promised — a key a file states wins; a key it omits is inherited.
+    pub fn load_from_paths(global: Option<&Path>, project: Option<&Path>) -> (Self, Vec<String>) {
+        let mut table = toml::Table::new();
+        let mut diagnostics = Vec::new();
+        for (label, path) in [("global", global), ("project", project)] {
+            let Some(path) = path else { continue };
+            if !path.exists() {
+                continue;
+            }
+            let parsed = std::fs::read_to_string(path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| toml::from_str::<toml::Table>(&text).map_err(Into::into));
+            match parsed {
+                Ok(layer) => {
+                    table.extend(layer);
+                    tracing::debug!(path = %path.display(), "loaded {label} config");
+                }
+                Err(error) => diagnostics.push(format!(
+                    "ignoring {label} config {}: {error:#} — every setting in that file is \
+                     being IGNORED, including [ontology] and [llm]",
+                    path.display()
+                )),
+            }
+        }
+        let config = match table.try_into::<Self>() {
+            Ok(config) => config,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "merged config does not fit NodeConfig: {error:#} — falling back to defaults"
+                ));
+                Self::default()
+            }
+        };
+        (config, diagnostics)
     }
 
     /// Resolve the API key for a model service section, checking env vars.
@@ -666,6 +705,45 @@ impl NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One stray comma must not silently revert the active ontology.
+    #[test]
+    fn a_malformed_config_file_is_reported_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("prism.toml");
+        std::fs::write(&bad, "[ontology]\nid = \"custom\",\n").unwrap();
+        let (config, diagnostics) = NodeConfig::load_from_paths(Some(&bad), None);
+        assert_eq!(config.ontology.id, NodeConfig::default().ontology.id);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("prism.toml"), "{}", diagnostics[0]);
+        assert!(diagnostics[0].contains("IGNORED"), "{}", diagnostics[0]);
+    }
+
+    /// A project file that states only `[node]` must not erase the global
+    /// `[ontology]` — that is the whole-struct replacement that reverted
+    /// every run to the default vocabulary.
+    #[test]
+    fn a_project_file_overrides_only_the_keys_it_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let project = dir.path().join("project.toml");
+        std::fs::write(
+            &global,
+            "[node]\nport = 7001\n\n[ontology]\nid = \"custom-ontology\"\n",
+        )
+        .unwrap();
+        std::fs::write(&project, "[node]\nport = 9002\n").unwrap();
+        let (config, diagnostics) = NodeConfig::load_from_paths(Some(&global), Some(&project));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            config.ontology.id, "custom-ontology",
+            "a section the project file does not mention must be inherited"
+        );
+        assert_eq!(
+            config.node.port, 9002,
+            "a section the project file states must win"
+        );
+    }
 
     #[test]
     fn default_config_is_valid() {
