@@ -1086,6 +1086,17 @@ pub struct RecalledFact {
     pub tenant: String,
 }
 
+/// A recall and an account of what the filter kept back.
+#[derive(Debug, Clone, Default)]
+pub struct RecallReport {
+    pub facts: Vec<RecalledMaterialFact>,
+    /// Matching facts the filter excluded, keyed by stored verification
+    /// status (`""` for rows that never recorded one — those are never
+    /// withheld by the trusted filter, so the key appears only under a
+    /// status-specific filter).
+    pub withheld: std::collections::BTreeMap<String, usize>,
+}
+
 /// Additive read shape for conditioned, evidence-classed facts. The legacy
 /// [`RecalledFact`] remains unchanged so external struct literals and old
 /// consumers continue to compile; new scientific reads use this complete
@@ -5238,6 +5249,51 @@ impl ProvenanceStore {
     /// filter — the review surface: `Any` reads everything,
     /// `Status(s)` pulls exactly one status (say, every
     /// `subject_not_verbatim` fact awaiting a reviewer).
+    /// `recall_with_context_filtered` plus what it left out: how many
+    /// matching facts the filter withheld, keyed by their stored
+    /// verification status. A recall that silently narrows to the trusted
+    /// subset reads as "nothing else is known"; the count makes the narrowing
+    /// a statement the caller can print.
+    pub async fn recall_with_context_report(
+        &self,
+        query: &str,
+        tenants: &[&str],
+        limit: i64,
+        filter: VerificationFilter,
+    ) -> Result<RecallReport> {
+        let facts = self
+            .recall_with_context_filtered(query, tenants, limit, filter)
+            .await?;
+        let mut withheld = std::collections::BTreeMap::new();
+        if !tenants.is_empty() {
+            let pattern = format!("%{query}%");
+            let sql = format!(
+                "SELECT COALESCE(verification_status, ''), COUNT(*) \
+                 FROM prov_assertion \
+                 WHERE tenant IN ({}) AND (subject LIKE ?{} OR object LIKE ?{}) \
+                   AND NOT ({}) \
+                 GROUP BY 1",
+                tenant_placeholders(1, tenants.len()),
+                tenants.len() + 1,
+                tenants.len() + 2,
+                filter.sql_clause("verification_status"),
+            );
+            let mut params = tenant_params(tenants);
+            params.push(Value::Text(pattern.clone()));
+            params.push(Value::Text(pattern));
+            let mut rows = self.conn.query(&sql, params).await?;
+            while let Some(row) = rows.next().await? {
+                let status = get_str(&row, 0)?;
+                let count = match row.get_value(1)? {
+                    Value::Integer(n) => usize::try_from(n).unwrap_or(0),
+                    _ => 0,
+                };
+                withheld.insert(status, count);
+            }
+        }
+        Ok(RecallReport { facts, withheld })
+    }
+
     pub async fn recall_with_context_filtered(
         &self,
         query: &str,
@@ -12828,6 +12884,62 @@ mod tests {
     /// explicit filter — with the check's reason intact. Rows with no
     /// recorded status stay visible by default, or every fact written
     /// before this column existed would silently vanish.
+    #[tokio::test]
+    async fn a_narrowed_recall_reports_how_many_facts_it_withheld() {
+        let db = TempDb::new();
+        let store = ProvenanceStore::open(&db.path).await.unwrap();
+        let prov = test_prov();
+        for (name, status) in [
+            ("GroundedRecall", Some(VerificationStatus::Grounded)),
+            (
+                "WeakRecallOne",
+                Some(VerificationStatus::SubjectNotVerbatim),
+            ),
+            (
+                "WeakRecallTwo",
+                Some(VerificationStatus::SubjectNotVerbatim),
+            ),
+            ("LegacyRecall", None),
+        ] {
+            store
+                .write_fact(&verified_fact(name, status, None), &prov)
+                .await
+                .unwrap();
+        }
+        let trusted = store
+            .recall_with_context_report("Recall", &["t1"], 10, VerificationFilter::Trusted)
+            .await
+            .unwrap();
+        let names: Vec<&str> = trusted.facts.iter().map(|f| f.subject.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "grounded + legacy are the trusted read: {names:?}"
+        );
+        assert_eq!(
+            trusted.withheld.values().sum::<usize>(),
+            2,
+            "both weak facts must be counted as withheld: {:?}",
+            trusted.withheld
+        );
+        assert_eq!(
+            trusted.withheld.len(),
+            1,
+            "one status was withheld: {:?}",
+            trusted.withheld
+        );
+        let all = store
+            .recall_with_context_report("Recall", &["t1"], 10, VerificationFilter::Any)
+            .await
+            .unwrap();
+        assert_eq!(all.facts.len(), 4);
+        assert!(
+            all.withheld.is_empty(),
+            "an unfiltered read withholds nothing: {:?}",
+            all.withheld
+        );
+    }
+
     #[tokio::test]
     async fn weak_facts_are_stored_findable_and_excluded_from_the_default_read() {
         let db = TempDb::new();

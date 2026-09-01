@@ -13930,6 +13930,9 @@ struct LocalOntologyResults {
     nodes: Vec<prism_provenance::GraphNode>,
     edges: Vec<prism_provenance::GraphEdge>,
     facts: Vec<prism_provenance::RecalledMaterialFact>,
+    /// Matching facts the verification filter kept back, by stored status.
+    /// Printed, so a narrowed read never looks like the whole store.
+    withheld: std::collections::BTreeMap<String, usize>,
 }
 
 /// The tenant set a CLI read spans: local plus every mesh tenant present
@@ -14019,11 +14022,11 @@ async fn local_ontology_lookup(
     // tenant reach the printer instead of being fetched and thrown away.
     // The default filter is the TRUSTED subset; `--include-unverified`
     // widens it to everything, statuses shown.
-    let facts = match store
-        .recall_with_context_filtered(text, &tenants, limit, verification)
+    let prism_provenance::RecallReport { facts, withheld } = match store
+        .recall_with_context_report(text, &tenants, limit, verification)
         .await
     {
-        Ok(facts) => facts,
+        Ok(report) => report,
         // Same rule as the neighbour read: a failed recall is not an absence
         // of facts, and must not be reported as one.
         Err(e) => {
@@ -14041,6 +14044,7 @@ async fn local_ontology_lookup(
         nodes,
         edges,
         facts,
+        withheld,
     }))
 }
 
@@ -14261,6 +14265,29 @@ fn format_local_ontology(results: &LocalOntologyResults) -> String {
                 peer_tag(&fact.tenant)
             );
         }
+    }
+    if !results.withheld.is_empty() {
+        let total: usize = results.withheld.values().sum();
+        let by_status = results
+            .withheld
+            .iter()
+            .map(|(status, n)| {
+                format!(
+                    "{n} {}",
+                    if status.is_empty() {
+                        "unrecorded"
+                    } else {
+                        status
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "\n{total} matching fact(s) withheld by verification status ({by_status}); \
+             `--include-unverified` shows them."
+        );
     }
     out
 }
@@ -19625,6 +19652,33 @@ data:\n\
     }
 
     #[test]
+    fn a_narrowed_query_says_how_many_facts_it_withheld() {
+        let mut results = LocalOntologyResults {
+            nodes: vec![test_node("Ti-6Al-4V", "local")],
+            edges: vec![],
+            facts: vec![test_recalled_fact("tensile strength", "local")],
+            withheld: [("subject_not_verbatim".to_string(), 2usize)]
+                .into_iter()
+                .collect(),
+        };
+        let out = format_local_ontology(&results);
+        assert!(
+            out.contains("2 matching fact(s) withheld") && out.contains("2 subject_not_verbatim"),
+            "the count and its status must be printed:\n{out}"
+        );
+        assert!(
+            out.contains("--include-unverified"),
+            "must say how to see them:\n{out}"
+        );
+        results.withheld.clear();
+        let out = format_local_ontology(&results);
+        assert!(
+            !out.contains("withheld"),
+            "nothing withheld, nothing claimed:\n{out}"
+        );
+    }
+
+    #[test]
     fn local_ontology_formatting_matches_neo4j_shape() {
         let results = LocalOntologyResults {
             nodes: vec![test_node("Ti-6Al-4V", "local")],
@@ -19638,6 +19692,7 @@ data:\n\
                 confidence: None,
             }],
             facts: vec![test_recalled_fact("tensile strength", "local")],
+            withheld: Default::default(),
         };
         let out = format_local_ontology(&results);
         // Entity lines display the declared extraction type, independently
@@ -19685,6 +19740,7 @@ data:\n\
                 test_recalled_fact("tensile strength", "local"),
                 test_recalled_fact("elongation", "mesh:node-a"),
             ],
+            withheld: Default::default(),
         };
         let out = format_local_ontology(&results);
 
@@ -19733,6 +19789,7 @@ data:\n\
             ],
             edges: vec![],
             facts: vec![test_recalled_fact("Olivine", "local@matkg")],
+            withheld: Default::default(),
         };
         let out = format_local_ontology(&results);
         assert!(out.contains("  [Alloy] LiFePO4  [matkg]\n"), "got: {out}");
