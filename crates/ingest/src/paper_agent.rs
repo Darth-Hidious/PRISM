@@ -812,6 +812,10 @@ pub async fn run_paper_agent_sample(
     let mut rejection_streak_len = 0usize;
 
     for turn in 1..=turn_budget {
+        // A run is minutes to tens of minutes of silence at the default log
+        // level, and nothing below WARN existed to say it was alive. One line
+        // per turn under `RUST_LOG=info` is the heartbeat.
+        tracing::info!(turn, turn_budget, "paper agent turn");
         // Mid-run clock and coverage: pure information from state the loop
         // already holds. Decides nothing, so it cannot misfire.
         inject_status_reminder_if_due(
@@ -2499,6 +2503,7 @@ fn execute_tool(
     policy: PaperAgentPolicy,
     gate: &mut FinishGate<'_>,
 ) -> (PaperToolOutcome, bool) {
+    tracing::info!(tool = name, "paper agent tool call");
     match name {
         "search_ontology" => (workspace.search_ontology(arguments), false),
         "read_ontology" => (workspace.read_ontology(arguments), false),
