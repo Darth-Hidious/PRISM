@@ -33,7 +33,7 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 - Paper 1 DONE: 0.4995 vs baseline 0.1583 (same paper); 11.3 min. Remaining 19 running (background task b6gzfg3og, ~11 min/paper). See playbook §13.10.
 - End-to-end LitXBench run IN PROGRESS: baseline `out-current` overall F1 0.3789 (19 papers). Outputs → `~/Downloads/prism-gold-eval/harness/out-unmuzzle/` (local, never the repo); scratch store `$SCRATCHPAD/litx/prov.db`; JATS served by `python3 -m http.server 8765` in `harness/jats/`; runner `$SCRATCHPAD/litx/run_rest.sh`; score with `PRISM_OUT_DIR=out-unmuzzle ../.venv/bin/python score.py`.
 
-- reasoning-content replay landed (`4e83c197` mechanism, `d5d7fae4` config knob, default OFF). A/B pending: `$SCRATCHPAD/litx/run_ab.sh` after the main run; compare rejections + F1 on the same 4 papers (playbook §13.10).
+- reasoning-content replay landed (`4e83c197` mechanism, `d5d7fae4` config knob, default OFF). A/B DONE (4 papers): replay cuts malformed tool calls 23→8 (baseline 11), turns/calls down, F1 unchanged, fewer claims (80 vs 105/115). Default stays OFF; owner decision: provider-aware default for z.ai (playbook §13.10).
 
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. Owner decision open: author domain/range for the 5 EMMO properties in the materialised TTL (currently unseeded, now honestly reported).
