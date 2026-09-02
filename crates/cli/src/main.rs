@@ -1892,6 +1892,56 @@ fn should_sync_tools(
     ) && boot_checks::platform_configured(credentials)
 }
 
+/// Where this process's own tracing output goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogSink {
+    Stderr,
+    File(std::path::PathBuf),
+}
+
+/// The TUI owns the terminal, so its log must not be written to it. Every
+/// other command keeps stderr (the backend's stderr is a captured pipe).
+fn log_sink_for(command: Option<&Commands>) -> LogSink {
+    match command {
+        None | Some(Commands::Tui { .. }) => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            LogSink::File(
+                std::path::PathBuf::from(home)
+                    .join(".prism")
+                    .join("logs")
+                    .join("tui.log"),
+            )
+        }
+        Some(_) => LogSink::Stderr,
+    }
+}
+
+fn install_tracing(sink: LogSink) -> Result<()> {
+    match sink {
+        LogSink::Stderr => tracing_subscriber::fmt()
+            .with_env_filter(prism_runtime::log_filter())
+            .with_writer(std::io::stderr)
+            .init(),
+        LogSink::File(path) => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("could not create {}", dir.display()))?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("could not open {}", path.display()))?;
+            tracing_subscriber::fmt()
+                .with_env_filter(prism_runtime::log_filter())
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install the process-wide rustls CryptoProvider before ANY TLS can happen.
@@ -1905,10 +1955,6 @@ async fn main() -> Result<()> {
     // over stdout, and any log line there corrupts the protocol (the TUI
     // deadlocks at "Igniting core..."). Stderr is captured to
     // ~/.prism/logs/backend.log by the TUI's spawn.
-    tracing_subscriber::fmt()
-        .with_env_filter(prism_runtime::log_filter())
-        .with_writer(std::io::stderr)
-        .init();
 
     // Project `.env` (the documented `.env.example` contract: provider API
     // keys, LLM_PROVIDER, LLM_MODEL) becomes env-var fallbacks for every
@@ -1924,6 +1970,15 @@ async fn main() -> Result<()> {
     prism_ingest::llm::hydrate_env_from_api_keys();
 
     let mut cli = Cli::parse();
+    // Tracing goes to STDERR, never stdout: `prism backend` speaks JSON-RPC
+    // over stdout, and any log line there corrupts the protocol (the TUI
+    // deadlocks at "Igniting core..."). The backend's stderr is captured to
+    // ~/.prism/logs/backend.log by the TUI's spawn — but the TUI process
+    // ITSELF owns the terminal, and a WARN written to its stderr scrolls the
+    // screen under ratatui: the next partial redraw lands rows off and stamps
+    // fragments into the hint line. When this process is the TUI, its own log
+    // goes to a file beside the backend's.
+    install_tracing(log_sink_for(cli.command.as_ref()))?;
     // Apply the environment policy before resolving Python or constructing
     // any detached task. The environment variable is the hard-offline
     // control plane; the flag is only a convenient way to set it.
@@ -20218,6 +20273,35 @@ data:\n\
     fn needs_python(argv: &[&str]) -> bool {
         let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?} must parse: {e}"));
         command_needs_python(cli.command.as_ref())
+    }
+
+    /// The TUI process owns the terminal: a WARN on its stderr scrolls the
+    /// screen under ratatui and the next redraw paints fragments into the
+    /// hint line (seen live: "⏎ talk to th-73.396"). Its log is a file.
+    #[test]
+    fn the_tui_logs_to_a_file_not_its_own_screen() {
+        for argv in [["prism"].as_slice(), &["prism", "tui"]] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match log_sink_for(cli.command.as_ref()) {
+                LogSink::File(path) => assert!(
+                    path.ends_with(std::path::Path::new("logs").join("tui.log")),
+                    "{argv:?}: {}",
+                    path.display()
+                ),
+                LogSink::Stderr => panic!("{argv:?} would log onto the TUI screen"),
+            }
+        }
+        for argv in [
+            ["prism", "status"].as_slice(),
+            &["prism", "papers", "search", "--query", "q"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(
+                log_sink_for(cli.command.as_ref()),
+                LogSink::Stderr,
+                "{argv:?}"
+            );
+        }
     }
 
     /// The one that mattered most: `prism login` is the FIRST command a new
