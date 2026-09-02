@@ -41,6 +41,8 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 
 - 2026-09-02 pm: WAL warn once/store (`7c5a6d3c`), no default tool-call ceiling (`e688a0e9`), DGM log line (`8d584378`). Mesh + AG-UI forks: both audited DO-NOT-LAND, findings sent to writers. `hea_descriptors` works; red badge = ungrounded input, by design.
 
+- Fork state 2026-09-02 14:10: mesh `feat/mesh-iroh-transport` @0ee47fb7 — two re-audits DO NOT LAND/FIX FIRST (identity-plumbing regression, credential relaxation, cancellation, knobs, fan-out honesty); writer on round 3; DESIGN-ONLY Friday. AG-UI `feat/agui-tui` @9a1b2b52 — my gate green (1,322 lib + 284 cli bins, clippy clean, merge preview clean) but my tui-driver walk found a home-screen typing regression (keys eaten as navigation; raw echo after view switch); re-audits: CIF FIX FIRST (multi-block merge, unterminated `;` → 0 sites, occupancy 0 → atom), marks FIX FIRST (slot wires untested, id injection, no bound, retraction gaps). Writer has all three rounds queued. DEMO BINARY = installed 10:22 build of THIS branch.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
