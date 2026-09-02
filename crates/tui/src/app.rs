@@ -777,6 +777,9 @@ pub struct App {
     /// Parsed structures by cache key, filled when a CIF arrives on either
     /// lane. The panel draws from this; the CIF text is what it came from.
     pub structure_views: std::collections::HashMap<String, crate::structure_view::StructureView>,
+    /// Handles the reader marked for the agent: shown in the workspace and
+    /// prefixed to every message sent, so both work from the same objects.
+    pub marks: crate::marks::Marks,
     /// Resolved reference bodies, by id. A second hover is instant; the first
     /// is what pays. Nothing is fetched until a pointer actually lands.
     ref_cache: std::collections::HashMap<String, RefPanelState>,
@@ -934,6 +937,7 @@ impl App {
             selected_line: None,
             ref_panel: None,
             structure_views: std::collections::HashMap::new(),
+            marks: crate::marks::Marks::default(),
             ref_cache: std::collections::HashMap::new(),
             ref_fetch: None,
             ref_fetch_rpc_id: None,
@@ -1217,6 +1221,17 @@ impl App {
         // screen, so it is what "go back" means while it is up.
         if key.code == KeyCode::Esc && self.ref_panel.is_some() {
             self.ref_panel = None;
+            return;
+        }
+        // `m` marks the open reference for the agent — unless the reader is
+        // typing, where an `m` is an `m`. Clicking the open panel's reference
+        // again does the same thing everywhere, including in the input.
+        if key.code == KeyCode::Char('m')
+            && key.modifiers.is_empty()
+            && self.focus != Focus::Input
+            && self.ref_panel.is_some()
+        {
+            self.toggle_mark_for_panel();
             return;
         }
 
@@ -1554,6 +1569,71 @@ impl App {
         true
     }
 
+    /// Mark or unmark the reference whose panel is open, and say which.
+    pub fn toggle_mark_for_panel(&mut self) {
+        let Some(panel) = &self.ref_panel else {
+            return;
+        };
+        let Some(kind) = panel.kind else {
+            self.toast(
+                "this reference is not registered, so it cannot be marked".to_string(),
+                ToastKind::Info,
+            );
+            return;
+        };
+        let mark = crate::marks::Mark {
+            id: panel.id.clone(),
+            kind,
+            label: panel.label.clone(),
+        };
+        let label = panel.label.clone();
+        if self.marks.toggle(mark) {
+            self.toast(format!("marked for agent: {label}"), ToastKind::Ok);
+        } else {
+            self.toast(format!("unmarked: {label}"), ToastKind::Info);
+        }
+    }
+
+    /// The message as the backend receives it: the reader's text, with the
+    /// standing goal, the tagged objects and the marked handles prefixed as
+    /// context. The chat shows the clean text; the agent sees what the reader
+    /// is working from. Pure over `self`, so the shape is testable without a
+    /// backend.
+    pub fn outgoing_payload(&self, trimmed: &str) -> String {
+        let mut payload = trimmed.to_string();
+        if let Some(goal) = &self.goal {
+            payload = format!("[Standing goal: {goal}]\n\n{payload}");
+        }
+        // Inject tagged objects so the LLM can see what the user pointed at.
+        let tagged: Vec<&WorkspaceObject> = self.objects.iter().filter(|o| o.tagged).collect();
+        if !tagged.is_empty() {
+            let mut ctx = String::from("[Tagged objects]\n");
+            for obj in &tagged {
+                ctx.push_str(&format!(
+                    "- {} {} ({:?})",
+                    obj.kind.as_str(),
+                    obj.label,
+                    obj.status,
+                ));
+                if let Some((cur, tot)) = obj.progress {
+                    ctx.push_str(&format!(" [{cur}/{tot}]"));
+                }
+                if let Some(detail) = &obj.detail {
+                    ctx.push_str(&format!(": {detail}"));
+                }
+                ctx.push('\n');
+            }
+            payload = format!("{ctx}\n{payload}");
+        }
+        // Marked handles: the identities the agent's tools resolve. Sent on
+        // every message while marked, so a mark made before one question is
+        // still in hand for the next.
+        if let Some(block) = self.marks.context_block() {
+            payload = format!("{block}\n{payload}");
+        }
+        payload
+    }
+
     /// Act on a click.
     ///
     /// A click on a workspace tab or row selects it — the same state the
@@ -1576,6 +1656,19 @@ impl App {
                 // would be unreachable entirely. Clicking works everywhere,
                 // and a click is what "point at it" means to most people.
                 let id = id.clone();
+                // A second click on the reference whose panel is already open
+                // and pinned is the mark: "this one — work with it". The
+                // first click opens; the reader sees what it is before
+                // handing it to the agent.
+                let already_open = self
+                    .ref_panel
+                    .as_ref()
+                    .is_some_and(|p| p.pinned && p.id == id);
+                if already_open {
+                    self.toggle_mark_for_panel();
+                    self.hovered = Some(crate::hit_map::HitTarget::Reference { id });
+                    return;
+                }
                 self.open_reference_panel(&id, column, row);
                 if let Some(panel) = &mut self.ref_panel {
                     panel.pinned = true;
@@ -4678,31 +4771,7 @@ impl App {
             // Inject the standing goal so it actually steers the agent. The
             // chat shows the user's clean text; the backend receives it with
             // the goal prefixed as context on every turn (survives compaction).
-            let mut payload = trimmed.to_string();
-            if let Some(goal) = &self.goal {
-                payload = format!("[Standing goal: {goal}]\n\n{payload}");
-            }
-            // Inject tagged objects so the LLM can see what the user pointed at.
-            let tagged: Vec<&WorkspaceObject> = self.objects.iter().filter(|o| o.tagged).collect();
-            if !tagged.is_empty() {
-                let mut ctx = String::from("[Tagged objects]\n");
-                for obj in &tagged {
-                    ctx.push_str(&format!(
-                        "- {} {} ({:?})",
-                        obj.kind.as_str(),
-                        obj.label,
-                        obj.status,
-                    ));
-                    if let Some((cur, tot)) = obj.progress {
-                        ctx.push_str(&format!(" [{cur}/{tot}]"));
-                    }
-                    if let Some(detail) = &obj.detail {
-                        ctx.push_str(&format!(": {detail}"));
-                    }
-                    ctx.push('\n');
-                }
-                payload = format!("{ctx}\n{payload}");
-            }
+            let payload = self.outgoing_payload(trimmed);
             self.backend.send_message(&payload)
         };
         if let Err(error) = dispatched {
@@ -6194,6 +6263,76 @@ pub fn clamp_scroll(offset: u16, content_height: u16, viewport: u16) -> u16 {
 mod tests {
     use super::*;
     use crate::backend::FakeScenario;
+
+    fn app_with_open_structure_panel(id: &str) -> App {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.ref_panel = Some(RefPanel {
+            id: id.to_string(),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: RefPanelState::Fetching,
+            anchor: (4, 4),
+            pinned: true,
+        });
+        app
+    }
+
+    /// A mark is shared state: every message the reader sends carries the
+    /// marked handles, as identities the agent's tools can resolve, ahead of
+    /// the reader's own words — and stops carrying them once unmarked.
+    #[test]
+    fn marks_ride_every_message_the_reader_sends() {
+        let id = "cache://0f7a1c2e9b4d/structure.cif";
+        let mut app = app_with_open_structure_panel(id);
+        app.toggle_mark_for_panel();
+        assert!(app.marks.is_marked(id));
+        let payload = app.outgoing_payload("what is its density?");
+        assert!(payload.starts_with("[Marked for you]\n"), "{payload}");
+        assert!(
+            payload.contains(&format!("- structure {id} (TiAl)")),
+            "{payload}"
+        );
+        assert!(payload.ends_with("what is its density?"), "{payload}");
+        app.toggle_mark_for_panel();
+        assert!(!app.marks.is_marked(id));
+        assert_eq!(
+            app.outgoing_payload("what is its density?"),
+            "what is its density?"
+        );
+    }
+
+    /// The first click opens the reference so the reader sees what it is;
+    /// the second click on the same open reference marks it; a third unmarks.
+    #[test]
+    fn a_second_click_on_an_open_reference_marks_it() {
+        let id = "cache://0f7a1c2e9b4d/structure.cif";
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.references.insert(crate::refs::ReferenceEntry {
+            id: id.to_string(),
+            kind: crate::refs::RefKind::Structure,
+            tokens: vec!["TiAl".to_string()],
+        });
+        app.hit_map.borrow_mut().push(
+            ratatui::layout::Rect::new(10, 5, 4, 1),
+            crate::hit_map::HitTarget::Reference { id: id.to_string() },
+        );
+        app.pointer_pressed(11, 5);
+        assert!(
+            app.ref_panel
+                .as_ref()
+                .is_some_and(|p| p.pinned && p.id == id),
+            "the first click opens the reference, pinned"
+        );
+        assert!(!app.marks.is_marked(id), "opening is not marking");
+        app.pointer_pressed(11, 5);
+        assert!(
+            app.marks.is_marked(id),
+            "the second click marks it for the agent"
+        );
+        assert!(app.ref_panel.is_some(), "the panel stays up while marking");
+        app.pointer_pressed(11, 5);
+        assert!(!app.marks.is_marked(id), "the third click unmarks");
+    }
 
     #[test]
     fn credential_viewer_fully_redacts_identity_secrets() {

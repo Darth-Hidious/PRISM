@@ -42,6 +42,7 @@ pub mod keymap;
 pub mod knowledge;
 pub mod latex;
 pub mod markdown;
+pub mod marks;
 pub mod msg;
 pub mod notebook;
 pub mod refs;

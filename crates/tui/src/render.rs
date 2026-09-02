@@ -1374,6 +1374,27 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(clip(goal, w.saturating_sub(4)), Style::default().fg(t.text)),
         ]));
     }
+    // What the reader has marked for the agent — shared state, kept in view.
+    // One line per handle: its kind and the words the reader saw. Absent
+    // when nothing is marked; a strip that says "nothing" costs a line to
+    // say nothing.
+    if !app.marks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" ★ marked for agent ({})", app.marks.len()),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        )));
+        for mark in app.marks.iter() {
+            let kind = crate::marks::kind_word(mark.kind);
+            lines.push(Line::from(vec![
+                Span::styled("   ● ", Style::default().fg(t.reference)),
+                Span::styled(format!("{kind} "), Style::default().fg(t.muted)),
+                Span::styled(
+                    clip(&mark.label, w.saturating_sub(7 + kind.len())),
+                    Style::default().fg(t.text),
+                ),
+            ]));
+        }
+    }
     lines.push(Line::raw(""));
 
     // Which entry each line belongs to, filled as the tab's rows are built.
@@ -5213,6 +5234,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// Opens BESIDE the word, never over it: a panel covering the thing you are
 /// pointing at makes you move the pointer to read it, which closes it. Clamped
 /// into the frame so a reference near the right edge still shows its body.
+/// The panel's mark state, as a span on its header line: what a click on
+/// the reference does next. Marked handles say so; unmarked ones say how.
+fn mark_hint_span(app: &App, id: &str, t: Theme) -> Span<'static> {
+    if app.marks.is_marked(id) {
+        Span::styled(
+            "  ★ marked for agent",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("  click again · m: mark", Style::default().fg(t.dim))
+    }
+}
+
 /// The cache key a structure reference names, whichever form the id takes
 /// (`cache://KEY` or `cache://KEY/structure.cif`).
 fn structure_panel_key(id: &str) -> Option<&str> {
@@ -5276,6 +5310,7 @@ fn draw_structure_panel(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  structure", Style::default().fg(t.muted)),
+        mark_hint_span(app, &panel.id, t),
     ])];
     for h in &header {
         top.push(Line::from(Span::styled(
@@ -5439,6 +5474,7 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
             },
             Style::default().fg(t.muted),
         ),
+        mark_hint_span(app, &panel.id, t),
     ]));
 
     for b in body.iter().take(plan.body_shown) {
@@ -5502,6 +5538,51 @@ mod tests {
     use super::*;
     use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
+
+    /// What the reader marked stays in view: the workspace shows a strip
+    /// naming each marked handle, and the open panel says it is marked.
+    #[test]
+    fn marked_handles_are_shown_in_the_workspace_and_on_their_panel() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        let id = "cache://0f7a1c2e9b4d/structure.cif";
+        app.marks.toggle(crate::marks::Mark {
+            id: id.to_string(),
+            kind: crate::refs::RefKind::Structure,
+            label: "TiAl gamma".to_string(),
+        });
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: id.to_string(),
+            label: "TiAl gamma".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Fetching,
+            anchor: (10, 4),
+            pinned: true,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("marked for agent (1)"),
+            "strip missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("structure TiAl gamma"),
+            "mark row missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("★ marked for agent"),
+            "panel header missing:\n{screen}"
+        );
+    }
 
     /// Hovering a structure shows the structure: formula, cell, space group,
     /// the atoms in the cell as a drawing — not the CIF text it came from.
