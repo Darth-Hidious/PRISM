@@ -113,6 +113,39 @@ _PATH_COMMANDS = {
     "wc",
     "[",
 }
+# Paths (relative to the project root) that `rm`, `find -delete` and
+# `find -exec` may never target: the root itself, the git history and the
+# PRISM record (config, ontologies, task logs). Measured before this existed,
+# `rm -rf .`, `rm -rf *` and `rm -rf .git` all passed validation — the guard
+# only asked whether a path stayed INSIDE the project, and the project itself
+# is inside the project.
+_PROTECTED_ROOTS = ("", ".git", ".prism")
+# Commands that run their arguments as a command. The guard used to judge the
+# first token literally, so `env rm -rf /` and `timeout 5 rm -rf /` were
+# `env` and `timeout` to it — commands it had no opinion about.
+_WRAPPER_COMMANDS = {
+    "env", "command", "builtin", "nice", "time", "timeout", "ionice",
+    "caffeinate", "stdbuf", "setsid", "unbuffer", "chronic",
+}
+_WRAPPER_FLAGS_WITH_VALUES = {
+    "-u", "-C", "-S", "--unset", "--chdir", "--split-string",  # env
+    "-n", "--adjustment",                                       # nice, ionice
+    "-s", "-k", "--signal", "--kill-after",                     # timeout
+    "-c", "-p",                                                 # ionice, unbuffer
+    "-t", "-w",                                                 # caffeinate
+    "-i", "-o", "-e",                                           # stdbuf
+}
+# Commands whose arguments name things to change. `xargs` hands them paths
+# read from stdin at run time, which no static check can see.
+_MUTATING_COMMANDS = {
+    "rm", "rmdir", "mv", "cp", "ln", "mkdir", "touch", "tee", "chmod", "chown",
+    "truncate", "dd",
+}
+# Nothing a materials-research repo needs formats a disk.
+_WIPE_COMMANDS = {"dd", "shred", "diskutil", "wipefs", "fdisk", "sfdisk", "parted"}
+_WIPE_COMMAND_PREFIXES = ("mkfs", "newfs")
+_XARGS_FLAGS_WITH_VALUES = {"-I", "-L", "-n", "-P", "-s", "-d", "-a", "-E", "-R", "-S", "-J"}
+_FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 _BASH_TASKS: dict[str, dict[str, Any]] = {}
 _BASH_TASKS_LOCK = threading.Lock()
 
@@ -693,6 +726,129 @@ def _validate_redirections(tokens: Sequence[str]) -> str | None:
     return None
 
 
+def _program_name(token: str) -> str:
+    """`/bin/rm`, `./rm` and `rm` are the same program to the guard."""
+    return token.rsplit("/", 1)[-1] if "/" in token else token
+
+
+def _peel_wrappers(tokens: Sequence[str]) -> list[str]:
+    """Strip `env`, `nice`, `timeout` … down to the command they would run."""
+    tokens = list(tokens)
+    while tokens and _program_name(tokens[0]) in _WRAPPER_COMMANDS:
+        wrapper = _program_name(tokens[0])
+        rest = tokens[1:]
+        idx = 0
+        while idx < len(rest):
+            token = rest[idx]
+            if token == "--":
+                idx += 1
+                break
+            if token.startswith("-") and token != "-":
+                if token in _WRAPPER_FLAGS_WITH_VALUES:
+                    idx += 1
+                idx += 1
+                continue
+            if wrapper == "env" and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                idx += 1
+                continue
+            break
+        if wrapper == "timeout" and idx < len(rest):
+            idx += 1  # the duration
+        inner = rest[idx:]
+        if not inner:
+            return tokens  # `env` alone prints the environment; harmless
+        tokens = inner
+    return tokens
+
+
+def _protected_root_error(path_str: str, verb: str) -> str | None:
+    """Refuse the project root, `.git`, `.prism` and any glob over the root."""
+    stripped = path_str.rstrip("/") or "/"
+    try:
+        candidate = Path(stripped).expanduser()
+        resolved = candidate.resolve() if candidate.is_absolute() else (_ALLOWED_BASE / candidate).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved == _ALLOWED_BASE:
+        return (
+            f"{verb} would delete the project root itself ({path_str}). "
+            "Name the files or the subdirectory to delete instead."
+        )
+    for protected in _PROTECTED_ROOTS[1:]:
+        root = _ALLOWED_BASE / protected
+        if resolved == root or root in resolved.parents:
+            return (
+                f"{verb} may not touch {protected} ({path_str}): it holds the project's "
+                "history and record. Name a path outside it instead."
+            )
+    if any(char in stripped for char in "*?[") and resolved.parent == _ALLOWED_BASE:
+        return (
+            f"{verb} with a glob at the project root ({path_str}) would delete every "
+            "top-level entry. Name the directory to delete instead."
+        )
+    return None
+
+
+def _rm_error(args: Sequence[str]) -> str | None:
+    for path_str in _collect_positionals(args):
+        error = _protected_root_error(path_str, "rm")
+        if error:
+            return error
+    return None
+
+
+def _find_error(args: Sequence[str]) -> str | None:
+    """`-delete` and `-exec` make find a deleter; hold it to rm's rules."""
+    roots = _find_paths(args)
+    destructive = "-delete" in args or any(token in _FIND_EXEC_ACTIONS for token in args)
+    if destructive:
+        for root in roots:
+            error = _protected_root_error(root, "find -delete/-exec")
+            if error:
+                return error
+    for idx, token in enumerate(args):
+        if token not in _FIND_EXEC_ACTIONS:
+            continue
+        inner: list[str] = []
+        for later in args[idx + 1:]:
+            if later in {";", "+"}:
+                break
+            inner.append(roots[0] if later == "{}" else later)
+        if not inner:
+            return "find -exec is missing a command."
+        error = _validate_segment(inner)
+        if error:
+            return error
+    return None
+
+
+def _xargs_error(args: Sequence[str]) -> str | None:
+    idx = 0
+    while idx < len(args) and args[idx].startswith("-") and args[idx] != "-":
+        if args[idx] in _XARGS_FLAGS_WITH_VALUES:
+            idx += 1
+        idx += 1
+    inner = [token for token in args[idx:] if token != "{}"]
+    if not inner:
+        return None  # xargs alone echoes its input
+    program = _program_name(_peel_wrappers(inner)[0])
+    if program in _MUTATING_COMMANDS or program in _DISALLOWED_COMMANDS:
+        return (
+            f"xargs would hand '{program}' paths read at run time, which PRISM cannot "
+            "check. Run it on named paths instead."
+        )
+    return _validate_segment(inner)
+
+
+def _awk_error(args: Sequence[str]) -> str | None:
+    program = next(
+        (token for token in args if not token.startswith("-") or token == "-"), ""
+    )
+    if "system(" in program or "|" in program:
+        return "awk programs may not run shell commands in execute_bash."
+    return None
+
+
 def _validate_paths(command: str, args: Sequence[str]) -> str | None:
     if command == "cd":
         if not args:
@@ -701,12 +857,18 @@ def _validate_paths(command: str, args: Sequence[str]) -> str | None:
     if command in {"grep", "rg"}:
         candidates = _grep_like_paths(command, args)
     elif command == "find":
+        error = _find_error(args)
+        if error:
+            return error
         candidates = _find_paths(args)
     elif command == "sed":
         candidates = _sed_paths(args)
         if isinstance(candidates, str):
             return candidates
     elif command == "awk":
+        error = _awk_error(args)
+        if error:
+            return error
         candidates = _awk_paths(args)
     elif command == "git":
         return _git_error(args)
@@ -714,7 +876,12 @@ def _validate_paths(command: str, args: Sequence[str]) -> str | None:
         candidates = _collect_positionals(args, {"-n", "-c", "--lines", "--bytes"})
     elif command == "tee":
         candidates = _collect_positionals(args, {"-a"})
-    elif command in {"mkdir", "touch", "rm", "rmdir", "cp", "mv", "ln", "test", "["}:
+    elif command in {"rm", "rmdir"}:
+        error = _rm_error(args)
+        if error:
+            return error
+        candidates = _collect_positionals(args)
+    elif command in {"mkdir", "touch", "cp", "mv", "ln", "test", "["}:
         candidates = _collect_positionals(args)
     else:
         candidates = _collect_positionals(args)
@@ -740,25 +907,37 @@ def _validate_command(command: str) -> str | None:
     if any(token == "&" for token in tokens):
         return "Background commands are not supported in execute_bash yet."
     for segment in _split_segments(tokens):
-        command_tokens = _strip_env_assignments(segment)
-        if not command_tokens:
-            continue
-        base_command = command_tokens[0]
-        if base_command in _DISALLOWED_COMMANDS:
-            return f"Command '{base_command}' is not supported in execute_bash."
-        if base_command in _NETWORK_COMMANDS:
-            return f"Network command '{base_command}' is not supported in execute_bash."
-        if base_command in {"python", "python3"} and "-c" in command_tokens[1:]:
-            return "Inline Python execution belongs in execute_python, not execute_bash."
-        if base_command == "node" and any(flag in command_tokens[1:] for flag in {"-e", "--eval"}):
-            return "Inline Node.js evaluation is not supported in execute_bash."
-        error = _validate_redirections(command_tokens)
+        error = _validate_segment(_strip_env_assignments(segment))
         if error:
             return error
-        if base_command in _PATH_COMMANDS:
-            error = _validate_paths(base_command, command_tokens[1:])
-            if error:
-                return error
+    return None
+
+
+def _validate_segment(command_tokens: Sequence[str]) -> str | None:
+    """Judge one pipeline segment by the program it would actually run."""
+    command_tokens = _peel_wrappers(command_tokens)
+    if not command_tokens:
+        return None
+    base_command = _program_name(command_tokens[0])
+    if base_command in _DISALLOWED_COMMANDS:
+        return f"Command '{base_command}' is not supported in execute_bash."
+    if base_command in _NETWORK_COMMANDS:
+        return f"Network command '{base_command}' is not supported in execute_bash."
+    if base_command in _WIPE_COMMANDS or base_command.startswith(_WIPE_COMMAND_PREFIXES):
+        return f"'{base_command}' can destroy a disk and is not supported in execute_bash."
+    if base_command in {"python", "python3"} and "-c" in command_tokens[1:]:
+        return "Inline Python execution belongs in execute_python, not execute_bash."
+    if base_command == "node" and any(flag in command_tokens[1:] for flag in {"-e", "--eval"}):
+        return "Inline Node.js evaluation is not supported in execute_bash."
+    if base_command == "xargs":
+        return _xargs_error(command_tokens[1:])
+    error = _validate_redirections(command_tokens)
+    if error:
+        return error
+    if base_command in _PATH_COMMANDS:
+        error = _validate_paths(base_command, command_tokens[1:])
+        if error:
+            return error
     return None
 
 
@@ -873,7 +1052,9 @@ def create_bash_tools(registry: ToolRegistry) -> None:
             "progress and tail stdout/stderr, and stop_bash_task to cancel a "
             "running task. "
             "Commands that require privilege escalation, networking, shell "
-            "nesting, or paths outside the project are blocked."
+            "nesting, or paths outside the project are blocked, and so is "
+            "deleting the project root, .git or .prism (by rm, find -delete, "
+            "find -exec or xargs), however the command is spelled or wrapped."
         ),
         input_schema={
             "type": "object",

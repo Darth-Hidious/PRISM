@@ -167,3 +167,111 @@ class TestBashToolRegistration:
         # Old names must be gone
         assert "list_bash_tasks" not in names
         assert "read_bash_task" not in names
+
+
+class TestRmSafeguard:
+    """The guard judges what a command DOES, not how it is spelled.
+
+    Measured before this class existed: of twenty catastrophic shapes only the
+    literal `rm -rf /` was refused. `/bin/rm -rf /`, `env rm -rf /`,
+    `echo / | xargs rm -rf`, `find . -exec rm -rf / \\;` and `rm -rf .` all
+    passed validation, because the guard matched the first token literally
+    and only asked whether paths stayed inside the project.
+    """
+
+    @staticmethod
+    def _verdict(command: str, base) -> str | None:
+        with patch("app.tools.bash._ALLOWED_BASE", base.resolve()):
+            return bash_module._validate_command(command)
+
+    def test_rm_never_targets_the_project_root_or_its_record(self, tmp_path):
+        (tmp_path / "build").mkdir()
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".prism").mkdir()
+        for command in (
+            "rm -rf .",
+            "rm -rf ./",
+            "rm -rf *",
+            "rm -r -f .",
+            "rm --recursive --force .",
+            "rm -fr .git",
+            "rm .git/HEAD",
+            "rm -rf .prism",
+            f"rm -rf {tmp_path}",
+        ):
+            error = self._verdict(command, tmp_path)
+            assert error is not None, command
+            assert "project root" in error or ".git" in error or ".prism" in error, (command, error)
+        assert self._verdict("rm -rf build", tmp_path) is None
+        assert self._verdict("rm build/a.o", tmp_path) is None
+
+    def test_the_program_name_is_judged_not_its_spelling(self, tmp_path):
+        for command in (
+            "/bin/rm -rf /",
+            "/bin/bash -c 'rm -rf /'",
+            "/usr/bin/sudo rm -rf /",
+            "/bin/rm -rf .",
+        ):
+            assert self._verdict(command, tmp_path) is not None, command
+
+    def test_wrappers_are_peeled_to_the_command_they_run(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        for command in (
+            "env rm -rf /",
+            "env -i FOO=1 rm -rf /",
+            "command rm -rf /",
+            "nice -n 5 rm -rf /",
+            "timeout 5 rm -rf /",
+            "time rm -rf /",
+            "env bash -c 'rm -rf /'",
+        ):
+            assert self._verdict(command, tmp_path) is not None, command
+        assert self._verdict("env FOO=1 ls src", tmp_path) is None
+        assert self._verdict("timeout 30 ls src", tmp_path) is None
+
+    def test_xargs_cannot_feed_a_mutating_command(self, tmp_path):
+        for command in (
+            "echo / | xargs rm -rf",
+            "ls | xargs -I{} rm -rf {}",
+            "ls | xargs -0 mv -t /tmp",
+        ):
+            error = self._verdict(command, tmp_path)
+            assert error is not None, command
+            assert "xargs" in error, (command, error)
+        assert self._verdict("ls | xargs wc -l", tmp_path) is None
+
+    def test_find_delete_and_exec_obey_the_rm_rules(self, tmp_path):
+        (tmp_path / "build").mkdir()
+        (tmp_path / "src").mkdir()
+        for command in (
+            "find . -delete",
+            "find . -name '*.o' -delete",
+            "find . -exec rm -rf / \\;",
+            "find . -exec rm -rf {} +",
+            "find src -exec bash -c 'rm -rf /' \\;",
+            "find build -execdir rm -rf / \\;",
+        ):
+            assert self._verdict(command, tmp_path) is not None, command
+        assert self._verdict("find build -name '*.o' -delete", tmp_path) is None
+        assert self._verdict("find src -exec grep -l x {} +", tmp_path) is None
+        assert self._verdict("find . -name '*.rs'", tmp_path) is None
+
+    def test_awk_cannot_shell_out(self, tmp_path):
+        (tmp_path / "x").write_text("a b\n")
+        assert self._verdict("awk 'BEGIN{system(\"rm -rf /\")}' x", tmp_path) is not None
+        assert self._verdict("awk '{print $1 | \"sh\"}' x", tmp_path) is not None
+        assert self._verdict("awk '{print $1}' x", tmp_path) is None
+
+    def test_disk_wipers_are_not_shell_commands_here(self, tmp_path):
+        for command in (
+            "dd if=/dev/zero of=/dev/disk0",
+            "diskutil eraseDisk JHFS+ X disk0",
+            "shred -u notes.txt",
+            "mkfs.ext4 /dev/sdb",
+        ):
+            assert self._verdict(command, tmp_path) is not None, command
+
+    def test_a_refusal_says_what_to_do_instead(self, tmp_path):
+        error = self._verdict("rm -rf .", tmp_path)
+        assert error is not None
+        assert "instead" in error.lower() or "name the" in error.lower(), error
