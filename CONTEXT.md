@@ -38,7 +38,7 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 - Replay default ON (`864756b4`); TUI log to file (`40a457e4`). Forks: mesh-over-iroh, AG-UI (structure view, marks, openable entities). Owner: top up credits (-73.4 cr), rotate pasted Gemini key, launch `run_gemini.sh` from own shell. Write the demo script Thursday.
 
 ## Next Steps
-1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. Owner decision open: author domain/range for the 5 EMMO properties in the materialised TTL (currently unseeded, now honestly reported).
+1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
 2. Then the LitXBench eval (`~/Downloads/prism-gold-eval/harness/`), scratch DB.
 3. Merge to main; tag only after.
