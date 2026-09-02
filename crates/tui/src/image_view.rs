@@ -50,6 +50,9 @@ impl ImageDrawError {
 
 /// Times [`ImageView::detect`] has queried the terminal this process.
 static DETECTIONS: AtomicUsize = AtomicUsize::new(0);
+/// How many times the graphics query — the one that spawns a stdin-reading
+/// thread — has actually been sent. See [`ImageView::queries`].
+static QUERIES: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether PRISM is running inside tmux or GNU screen.
 ///
@@ -98,13 +101,29 @@ pub struct ImageView {
 const CACHE_ENTRIES: usize = 16;
 
 impl ImageView {
-    /// Ask the terminal what it can draw.
+    /// Ask the terminal what it can draw — but only a terminal that has
+    /// already answered one question.
     ///
-    /// Falls back to halfblocks when the query fails — over a pipe, in CI, or
-    /// on a terminal that ignores the query. Halfblocks need no protocol
-    /// support at all, so this cannot end in "no image".
+    /// `terminal_answered` is the verdict of [`ImageView::terminal_answers`],
+    /// run by the caller on its own thread before this. Falls back to
+    /// halfblocks when the query fails — over a pipe, in CI, or on a terminal
+    /// that ignores the query. Halfblocks need no protocol support at all, so
+    /// this cannot end in "no image".
+    ///
+    /// The query is `from_query_stdio`, which spawns a thread that reads
+    /// stdin until the terminal answers a Device Status Report and gives up
+    /// waiting for that thread after its timeout — but cannot stop it. A
+    /// terminal that answers device attributes answers the status report
+    /// too, so the thread ends on its own. A terminal that stays silent (a
+    /// headless driver, a CI pty) would leave it ORPHANED on stdin: it
+    /// swallows the first keystrokes as "the reply", then dies and restores
+    /// the termios it saved when it started. Measured 2026-09-02 under the
+    /// tui-driver: no key reached the event loop at all, and after the first
+    /// one every further key echoed raw across the frame. A silent terminal
+    /// is therefore never queried, and the caller turns raw mode on before
+    /// asking, so even a thread that outlives a slow answer restores raw.
     #[must_use]
-    pub fn detect() -> Self {
+    pub fn detect(terminal_answered: bool) -> Self {
         DETECTIONS.fetch_add(1, Ordering::Relaxed);
         // Inside a multiplexer the query is not just useless, it is HARMFUL.
         //
@@ -120,12 +139,36 @@ impl ImageView {
         // not a failure: the picture still draws, coarsely. A terminal that
         // can do better is still detected when PRISM runs outside a
         // multiplexer.
-        let picker = if in_multiplexer() {
+        let picker = if in_multiplexer() || !terminal_answered {
             Picker::halfblocks()
         } else {
+            QUERIES.fetch_add(1, Ordering::Relaxed);
             Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
         };
         Self::with_picker(picker)
+    }
+
+    /// Whether the terminal answers questions at all.
+    ///
+    /// One primary-device-attributes round trip on the calling thread,
+    /// bounded by crossterm's own timeout, through crossterm's own event
+    /// reader — so a keystroke typed meanwhile is kept for the event loop,
+    /// not lost. Every real terminal answers; a headless pty that does not
+    /// would also never answer the graphics query, and is not asked it.
+    #[must_use]
+    pub fn terminal_answers() -> bool {
+        crossterm::terminal::supports_keyboard_enhancement().is_ok()
+    }
+
+    /// How many times the graphics query itself has been sent this process.
+    ///
+    /// The query is the only thing that spawns the stdin-reading thread, so a
+    /// test can prove a silent terminal never gets one: the fallback and a
+    /// successful query both end in a working `Picker`, and this count is
+    /// the only observable difference.
+    #[must_use]
+    pub fn queries() -> usize {
+        QUERIES.load(Ordering::Relaxed)
     }
 
     /// How many times the terminal has been queried this process.
@@ -356,6 +399,24 @@ mod tests {
         assert!(!multiplexer_from(false, false, Some("xterm-kitty")));
         assert!(!multiplexer_from(false, false, Some("xterm-256color")));
         assert!(!multiplexer_from(false, false, None));
+    }
+
+    /// A terminal that did not answer the device-attributes handshake is
+    /// never sent the graphics query: that query's reader thread would wait
+    /// on stdin for a reply that never comes, eat the first keystrokes, and
+    /// restore the pre-query termios under the running TUI. The count of
+    /// queries is the only observable difference — both paths end in a
+    /// working picker — so the count is what is asserted.
+    #[test]
+    fn a_silent_terminal_is_never_asked_what_it_can_draw() {
+        let before = ImageView::queries();
+        let view = ImageView::detect(false);
+        assert_eq!(
+            ImageView::queries(),
+            before,
+            "a silent terminal must not be sent the graphics query"
+        );
+        assert_eq!(view.protocol(), ProtocolType::Halfblocks);
     }
 
     /// Halfblocks are the floor, not an error: on a terminal with no graphics

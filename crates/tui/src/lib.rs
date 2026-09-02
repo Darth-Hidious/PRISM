@@ -191,8 +191,15 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
         original_hook(info);
     }));
 
+    // Setup terminal. Raw mode goes on FIRST — before the graphics query
+    // below — because that query's reader thread restores, on its way out,
+    // whatever termios it found when it started. Found cooked, it turned a
+    // running TUI back to cooked mode: every keystroke echoed raw across the
+    // frame. Found raw, the worst it can restore is raw.
+    enable_raw_mode()?;
+
     // Ask the terminal what graphics it can draw BEFORE anything else owns
-    // stdin or stdout.
+    // stdin or stdout — and only if it answers questions at all.
     //
     // The query writes an escape sequence and waits for the terminal to answer
     // on stdin. Run later — from inside the render closure, as it first was —
@@ -201,10 +208,10 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // parses as Alt+`_` followed by plain `G`, `i`, `=` and digits, and those
     // reach the prompt and the transcript key map. Here there is no event
     // reader yet and no frame in flight, so the reply can only go one place.
-    let image_view = image_view::ImageView::detect();
+    // A terminal that never answers is never asked: its reader thread would
+    // outlive the query and eat the first keystrokes off stdin.
+    let image_view = image_view::ImageView::detect(image_view::ImageView::terminal_answers());
 
-    // Setup terminal
-    enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Bracketed paste turns a pasted block into ONE event instead of one key
     // per character. Without it the loop redraws the whole screen between
