@@ -192,7 +192,7 @@ pub struct LlmConfig {
     /// (z.ai's "preserved thinking") do better multi-turn tool use with it;
     /// others (DeepSeek's API, for one) reject the field in input with a 400.
     /// Off by default; the operator turns it on per endpoint.
-    #[serde(default)]
+    #[serde(default = "default_replay_reasoning_content")]
     pub replay_reasoning_content: bool,
     /// Ask this endpoint NOT to deliberate, for callers whose answer is a
     /// short verdict rather than a derivation.
@@ -286,9 +286,29 @@ fn default_read_idle_timeout_secs() -> u64 {
     0
 }
 
+/// The model gets its own reasoning back on the next turn. Withholding it
+/// is a muzzle: a thinking model that cannot see what it worked out a turn
+/// ago re-derives it, or forgets which line it meant to quote. Endpoints that
+/// reject the field in input get one retry without it and are remembered.
+fn default_replay_reasoning_content() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod no_muzzle_on_the_knowledge_path {
     use super::*;
+
+    /// A thinking model gets its own reasoning back on the next turn. The
+    /// endpoint that rejects the field is handled by a retry, not by
+    /// withholding the reasoning from every model everywhere.
+    #[test]
+    fn the_model_gets_its_own_reasoning_back_by_default() {
+        assert!(
+            default_replay_reasoning_content(),
+            "withholding a model's reasoning from itself is a muzzle — off is the operator's choice"
+        );
+        assert!(LlmConfig::default().replay_reasoning_content);
+    }
 
     /// PRISM imposes NO deadline on a thinking model. Both the total deadline
     /// and the idle ceiling default to "never"; only an operator sets one.
@@ -382,7 +402,7 @@ impl Default for LlmConfig {
             // answers to one question, and the harsher one always wins.
             timeout_secs: default_timeout_secs(),
             read_idle_timeout_secs: default_read_idle_timeout_secs(),
-            replay_reasoning_content: false,
+            replay_reasoning_content: default_replay_reasoning_content(),
             context_window: None,
             max_output_tokens: None,
             streaming: true,
@@ -443,6 +463,32 @@ fn hydrate_env_from_map(map: &serde_json::Map<String, serde_json::Value>) {
             unsafe { std::env::set_var(name, v) };
         }
     }
+}
+
+/// Does any message in the request body carry replayed `reasoning_content`?
+fn body_replays_reasoning(body: &serde_json::Value) -> bool {
+    body["messages"]
+        .as_array()
+        .is_some_and(|ms| ms.iter().any(|m| m.get("reasoning_content").is_some()))
+}
+
+fn strip_replayed_reasoning(body: &mut serde_json::Value) {
+    if let Some(ms) = body["messages"].as_array_mut() {
+        for m in ms {
+            if let Some(o) = m.as_object_mut() {
+                o.remove("reasoning_content");
+            }
+        }
+    }
+}
+
+/// A 400/422 is the endpoint rejecting the request's shape — the only
+/// failures worth retrying with a field removed.
+fn refused_a_field(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|e| e.downcast_ref::<retry::HttpStatus>())
+        .is_some_and(|h| h.status == 400 || h.status == 422)
 }
 
 // ── Client ───────────────────────────────────────────────────────────
@@ -632,6 +678,10 @@ pub struct LlmClient {
     /// which result belonged to which call, so earlier results were
     /// misattributed or dropped when the next turn was rendered.
     local_call_counter: std::sync::atomic::AtomicU64,
+    /// Set once an endpoint has refused a replayed `reasoning_content` (HTTP
+    /// 400/422): the field is stripped for the rest of this client's life
+    /// instead of failing every later turn or retrying every time.
+    reasoning_replay_refused: std::sync::atomic::AtomicBool,
 }
 
 /// The chat-completions endpoint for an OpenAI-compatible base URL.
@@ -757,6 +807,7 @@ impl LlmClient {
             backend,
             config,
             local_call_counter: std::sync::atomic::AtomicU64::new(0),
+            reasoning_replay_refused: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1026,8 +1077,41 @@ impl LlmClient {
     /// The history as it goes on the wire. `reasoning_content` is stripped
     /// from every message unless the operator asked for it to be replayed —
     /// providers disagree about whether the field may appear in input.
+    /// Send `body`; if the endpoint refuses it with a 400/422 and the body
+    /// carried replayed reasoning, strip the reasoning, remember the refusal,
+    /// and send once more. Anything else is the caller's error.
+    async fn send_or_strip_reasoning<F, Fut>(
+        &self,
+        body: &serde_json::Value,
+        send: F,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn(serde_json::Value) -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response>>,
+    {
+        match send(body.clone()).await {
+            Ok(resp) => Ok(resp),
+            Err(error) if body_replays_reasoning(body) && refused_a_field(&error) => {
+                tracing::warn!(
+                    "endpoint refused replayed reasoning_content; retrying without it and \
+                     stripping it for the rest of this session: {error:#}"
+                );
+                self.reasoning_replay_refused
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let mut plain = body.clone();
+                strip_replayed_reasoning(&mut plain);
+                send(plain).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn wire_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
-        if self.config.replay_reasoning_content {
+        if self.config.replay_reasoning_content
+            && !self
+                .reasoning_replay_refused
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             return messages.to_vec();
         }
         messages
@@ -1282,7 +1366,10 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
-        let resp = self.post(&url, &body).await?;
+        let url = &url;
+        let resp = self
+            .send_or_strip_reasoning(&body, |b| async move { self.post(url, &b).await })
+            .await?;
         let data: serde_json::Value = resp.json().await.context("bad chat response")?;
 
         let choice = &data["choices"][0];
@@ -2260,7 +2347,12 @@ impl LlmClient {
         // As above: retry only until the stream is open. A mid-stream failure
         // stays fatal, because replaying it would duplicate what the user has
         // already seen and pay for the turn twice.
-        let resp = self.send_retrying("llm.stream", &url, &body, false).await?;
+        let url = &url;
+        let resp = self
+            .send_or_strip_reasoning(&body, |b| async move {
+                self.send_retrying("llm.stream", url, &b, false).await
+            })
+            .await?;
 
         // Parse SSE stream
         let mut full_reasoning = String::new();

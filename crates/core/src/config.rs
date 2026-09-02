@@ -183,7 +183,7 @@ pub struct LlmSection {
     /// Thinking providers that want their reasoning back (z.ai's preserved
     /// thinking) do better multi-turn tool use with it; others reject the
     /// field in input. Off unless the operator says so for this endpoint.
-    #[serde(default)]
+    #[serde(default = "default_replay_reasoning_content")]
     pub replay_reasoning_content: bool,
 }
 
@@ -215,9 +215,13 @@ impl Default for LlmSection {
             api_key_env: default_api_key_env(),
             timeout_secs: default_llm_timeout(),
             max_output_tokens: None,
-            replay_reasoning_content: false,
+            replay_reasoning_content: default_replay_reasoning_content(),
         }
     }
+}
+
+fn default_replay_reasoning_content() -> bool {
+    true
 }
 
 fn default_llm_kind() -> String {
@@ -767,14 +771,17 @@ mod tests {
     }
 
     #[test]
-    fn replay_reasoning_content_is_off_unless_the_operator_says_so() {
+    fn replay_reasoning_content_is_on_unless_the_operator_says_no() {
         let config: NodeConfig = toml::from_str("[llm]\nmodel = \"m\"\n").unwrap();
-        assert!(!config.llm.replay_reasoning_content, "default is off");
-        let config: NodeConfig =
-            toml::from_str("[llm]\nreplay_reasoning_content = true\n").unwrap();
         assert!(
             config.llm.replay_reasoning_content,
-            "the operator turned it on"
+            "on by default: the model keeps its reasoning"
+        );
+        let config: NodeConfig =
+            toml::from_str("[llm]\nreplay_reasoning_content = false\n").unwrap();
+        assert!(
+            !config.llm.replay_reasoning_content,
+            "the operator turned it off"
         );
     }
 

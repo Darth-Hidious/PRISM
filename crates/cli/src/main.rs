@@ -20761,16 +20761,16 @@ data:\n\
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = tempfile::tempdir().expect("home tempdir");
         let _restore_home = HomeGuard::isolated(home.path());
-        let off = project_with_ontology_config("[llm]\nmodel = \"m\"\n");
+        let plain = project_with_ontology_config("[llm]\nmodel = \"m\"\n");
+        let cfg = build_llm_config(plain.path(), Some("http://127.0.0.1:9"), Some("m"), None)
+            .expect("config builds");
+        assert!(cfg.replay_reasoning_content, "on by default");
+        let off = project_with_ontology_config("[llm]\nreplay_reasoning_content = false\n");
         let cfg = build_llm_config(off.path(), Some("http://127.0.0.1:9"), Some("m"), None)
             .expect("config builds");
-        assert!(!cfg.replay_reasoning_content, "off by default");
-        let on = project_with_ontology_config("[llm]\nreplay_reasoning_content = true\n");
-        let cfg = build_llm_config(on.path(), Some("http://127.0.0.1:9"), Some("m"), None)
-            .expect("config builds");
         assert!(
-            cfg.replay_reasoning_content,
-            "the operator turned it on for this project"
+            !cfg.replay_reasoning_content,
+            "the operator turned it off for this project"
         );
     }
 

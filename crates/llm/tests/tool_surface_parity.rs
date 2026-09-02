@@ -682,3 +682,68 @@ async fn reasoning_is_replayed_only_when_the_operator_asks() {
         }
     }
 }
+
+/// An endpoint that rejects replayed reasoning (HTTP 400) gets one retry
+/// without it, and the client remembers: later turns are sent stripped from
+/// the start. Nobody else pays for that endpoint's rule.
+#[tokio::test]
+async fn an_endpoint_that_refuses_replayed_reasoning_is_retried_once_and_remembered() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"line 12\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"noted\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(serve_many(
+        listener,
+        vec![
+            (200, sse.clone()),
+            (
+                400,
+                "{\"error\":\"unknown field reasoning_content\"}".to_string(),
+            ),
+            (200, sse.clone()),
+            (200, sse.clone()),
+        ],
+    ));
+    let client = LlmClient::new(config(format!("http://127.0.0.1:{port}/v1")));
+    let mut history = user("where is the quote?");
+    let first = client
+        .chat_with_tools_streaming(&history, &[], |_, _| {})
+        .await
+        .expect("first turn");
+    history.push(first.message.clone());
+    history.extend(user("and the value?"));
+    let second = client
+        .chat_with_tools_streaming(&history, &[], |_, _| {})
+        .await
+        .expect("the 400 must be survived by one retry without the field");
+    history.push(second.message.clone());
+    history.extend(user("and the unit?"));
+    let _third = client
+        .chat_with_tools_streaming(&history, &[], |_, _| {})
+        .await
+        .expect("third turn");
+    let bodies = server.await.unwrap();
+    assert!(
+        bodies[1]["messages"][1].get("reasoning_content").is_some(),
+        "the first attempt replays by default: {}",
+        bodies[1]["messages"][1]
+    );
+    assert!(
+        bodies[2]["messages"][1].get("reasoning_content").is_none(),
+        "the retry is stripped: {}",
+        bodies[2]["messages"][1]
+    );
+    assert!(
+        bodies[3]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("reasoning_content").is_none()),
+        "the refusal is remembered — the next turn is stripped from the start: {}",
+        bodies[3]["messages"]
+    );
+}
