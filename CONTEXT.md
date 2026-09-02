@@ -34,6 +34,9 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 
 - reasoning-content replay landed (`4e83c197` mechanism, `d5d7fae4` config knob, default OFF). A/B DONE (4 papers): replay cuts malformed tool calls 23→8 (baseline 11), turns/calls down, F1 unchanged, fewer claims (80 vs 105/115). Default stays OFF; owner decision: provider-aware default for z.ai (playbook §13.10).
 
+## Demo Friday 2026-09-04
+- Replay default ON (`864756b4`); TUI log to file (`40a457e4`). Forks: mesh-over-iroh, AG-UI (structure view, marks, openable entities). Owner: top up credits (-73.4 cr), rotate pasted Gemini key, launch `run_gemini.sh` from own shell. Write the demo script Thursday.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. Owner decision open: author domain/range for the 5 EMMO properties in the materialised TTL (currently unseeded, now honestly reported).
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
