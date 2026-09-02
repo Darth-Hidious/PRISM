@@ -5407,8 +5407,58 @@ fn draw_structure_panel(
         Rect::new(inner.x, inner.y, inner.width, top_h),
     );
 
+    // The bottom — site table, sources, ontology — is what the panel is FOR;
+    // it is reserved before the drawing takes a row. In a short terminal the
+    // drawing shrinks, then says it is not drawn, then goes; the table stays,
+    // and whatever of it still does not fit is counted.
+    let mut bottom: Vec<Line<'static>> = Vec::new();
+    for s in &sites {
+        bottom.push(Line::from(Span::styled(
+            clip(s, iw),
+            Style::default().fg(t.text),
+        )));
+    }
+    bottom.push(Line::from(Span::styled(
+        "sources",
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    for src in prov.sources.iter().take(SOURCES_SHOWN) {
+        bottom.push(Line::from(Span::styled(
+            format!("  {}", clip(src, iw.saturating_sub(2))),
+            Style::default().fg(t.dim),
+        )));
+    }
+    // Anything withheld is COUNTED, the same rule the site table follows.
+    if let Some(hidden) = prov
+        .sources
+        .len()
+        .checked_sub(SOURCES_SHOWN)
+        .filter(|n| *n > 0)
+    {
+        bottom.push(Line::from(Span::styled(
+            format!("  +{hidden} more"),
+            Style::default().fg(t.muted),
+        )));
+    }
+    bottom.push(Line::from(Span::styled(
+        "ontology",
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    bottom.push(Line::from(Span::styled(
+        format!("  {}", clip(&prov.placement, iw.saturating_sub(2))),
+        Style::default().fg(t.dim),
+    )));
+    let bottom_needed = u16::try_from(bottom.len()).unwrap_or(u16::MAX);
+
     let cy = inner.y + top_h;
-    let ch = canvas_h.min(inner.height.saturating_sub(top_h));
+    let avail = inner.height.saturating_sub(top_h);
+    let free_for_canvas = avail.saturating_sub(bottom_needed);
+    let ch = if free_for_canvas >= crate::structure_view::MIN_CANVAS_ROWS {
+        canvas_h.min(free_for_canvas)
+    } else {
+        // One row to say the cell is not drawn — if even one row is free.
+        free_for_canvas.min(1)
+    };
     if ch >= crate::structure_view::MIN_CANVAS_ROWS {
         let (xb, yb) = view.balanced_bounds(inner.width, ch);
         f.render_widget(
@@ -5433,45 +5483,19 @@ fn draw_structure_panel(
     }
 
     let by = cy + ch;
-    let bh = inner.height.saturating_sub(top_h + ch);
+    let bh = avail.saturating_sub(ch);
     if bh > 0 {
-        let mut bottom: Vec<Line<'static>> = Vec::new();
-        for s in &sites {
+        // Even the reserved bottom can outrun a very short panel. What does
+        // not fit is counted in its last row, never cut in silence.
+        let shown = usize::from(bh);
+        if bottom.len() > shown {
+            let withheld = bottom.len() - shown + 1;
+            bottom.truncate(shown.saturating_sub(1));
             bottom.push(Line::from(Span::styled(
-                clip(s, iw),
-                Style::default().fg(t.text),
-            )));
-        }
-        bottom.push(Line::from(Span::styled(
-            "sources",
-            Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
-        )));
-        for src in prov.sources.iter().take(SOURCES_SHOWN) {
-            bottom.push(Line::from(Span::styled(
-                format!("  {}", clip(src, iw.saturating_sub(2))),
-                Style::default().fg(t.dim),
-            )));
-        }
-        // Anything withheld is COUNTED, the same rule the site table follows.
-        if let Some(hidden) = prov
-            .sources
-            .len()
-            .checked_sub(SOURCES_SHOWN)
-            .filter(|n| *n > 0)
-        {
-            bottom.push(Line::from(Span::styled(
-                format!("  +{hidden} more"),
+                format!("  +{withheld} more lines"),
                 Style::default().fg(t.muted),
             )));
         }
-        bottom.push(Line::from(Span::styled(
-            "ontology",
-            Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
-        )));
-        bottom.push(Line::from(Span::styled(
-            format!("  {}", clip(&prov.placement, iw.saturating_sub(2))),
-            Style::default().fg(t.dim),
-        )));
         f.render_widget(
             Paragraph::new(bottom),
             Rect::new(inner.x, by, inner.width, bh),
@@ -6092,6 +6116,168 @@ Al1 Al 0.75 0.75 0.75
         assert!(
             !screen.contains("_cell_length_a"),
             "the CIF text must not be what the reader sees:\n{screen}"
+        );
+    }
+
+    /// An app with one parsed structure and its panel open, pinned, at
+    /// `anchor`, in the given state.
+    fn structure_panel_app(cif: &str, state: crate::app::RefPanelState, anchor: (u16, u16)) -> App {
+        use crate::backend::FAKE_TIAL_CACHE_KEY;
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.structure_views.insert(
+            FAKE_TIAL_CACHE_KEY.to_string(),
+            crate::structure_view::parse_cif(cif).expect("the CIF parses"),
+        );
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state,
+            anchor,
+            pinned: true,
+        });
+        app
+    }
+
+    /// The screen as rows of text.
+    fn screen_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn is_braille(c: char) -> bool {
+        ('\u{2800}'..='\u{28FF}').contains(&c)
+    }
+
+    /// A 75-column formula is clipped at the panel's 62 — and used to take
+    /// the site count and the disorder marker with it. They have their own
+    /// line now, and survive.
+    #[test]
+    fn a_long_formula_does_not_take_the_site_count_with_it() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let long = "Al1 Ti1 Cr1 Mn1 Fe1 Co1 Ni1 Cu1 Zn1 Ga1 Ge1 As1 Se1 Br1 Rb1 Sr1 Zr1 Nb1 Mo1";
+        assert!(long.len() >= 75, "{} cols", long.len());
+        let cif = FAKE_TIAL_CIF.replace("\"Al1 Ti1\"", &format!("\"{long}\""));
+        assert_ne!(cif, FAKE_TIAL_CIF, "the fixture's formula must be replaced");
+        let app = structure_panel_app(&cif, crate::app::RefPanelState::Ready(cif.clone()), (10, 4));
+        let rows = screen_rows(&app, 140, 42);
+        assert!(
+            rows.iter().any(|r| r.contains("2 sites")),
+            "the site count must survive a long formula:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// The drawing keeps the cell's own proportions in the pane. Bounds
+    /// stretched to the pane's shape drew a cubic cell as a slab twice as
+    /// wide as it is high.
+    #[test]
+    fn the_panel_draws_the_cell_to_scale_not_to_the_pane() {
+        let cube = "\
+data_cube
+_chemical_formula_sum \"Fe\"
+_cell_length_a 3.0
+_cell_length_b 3.0
+_cell_length_c 3.0
+_space_group_name_H-M_alt \"P 1\"
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Fe1 0.0 0.0 0.0
+";
+        let view = crate::structure_view::parse_cif(cube).expect("parses");
+        let (xb, yb) = view.bounds();
+        let expected = (xb[1] - xb[0]) / (yb[1] - yb[0]);
+        let app = structure_panel_app(
+            cube,
+            crate::app::RefPanelState::Ready(cube.to_string()),
+            (10, 4),
+        );
+        let rows = screen_rows(&app, 140, 42);
+        let mut cols = (usize::MAX, 0usize);
+        let mut lines = (usize::MAX, 0usize);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                if is_braille(c) {
+                    cols = (cols.0.min(x), cols.1.max(x));
+                    lines = (lines.0.min(y), lines.1.max(y));
+                }
+            }
+        }
+        assert!(cols.0 < usize::MAX, "no cell drawn:\n{}", rows.join("\n"));
+        let drawn = ((cols.1 - cols.0 + 1) as f64 * 2.0) / ((lines.1 - lines.0 + 1) as f64 * 4.0);
+        assert!(
+            (drawn / expected - 1.0).abs() < 0.35,
+            "drawn aspect {drawn:.2} vs the cell's own {expected:.2}:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// In a terminal too short for the whole panel the drawing gives way,
+    /// not the table: the cell is SAID not drawn, and sites, sources and
+    /// ontology are still on screen. Tall enough, both are.
+    #[test]
+    fn a_short_terminal_keeps_the_table_and_says_the_cell_is_not_drawn() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let app = structure_panel_app(
+            FAKE_TIAL_CIF,
+            crate::app::RefPanelState::Ready(FAKE_TIAL_CIF.to_string()),
+            (10, 1),
+        );
+        let tall = screen_rows(&app, 140, 42);
+        assert!(
+            tall.iter().any(|r| r.chars().any(is_braille))
+                && tall.iter().any(|r| r.contains("ontology")),
+            "tall: both the drawing and the table:\n{}",
+            tall.join("\n")
+        );
+        let short = screen_rows(&app, 140, 20);
+        let text = short.join("\n");
+        assert!(
+            !short.iter().any(|r| r.chars().any(is_braille)),
+            "a cell squeezed into too few rows must not be drawn:\n{text}"
+        );
+        assert!(
+            text.contains("cell not drawn — needs"),
+            "the missing drawing must be said:\n{text}"
+        );
+        assert!(
+            text.contains("sources") && text.contains("ontology"),
+            "the table must survive the short terminal:\n{text}"
+        );
+    }
+
+    /// A refetch that failed while a cell is cached says so over the cell.
+    #[test]
+    fn a_failed_refetch_says_so_over_the_cached_cell() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let app = structure_panel_app(
+            FAKE_TIAL_CIF,
+            crate::app::RefPanelState::Failed("backend went away".to_string()),
+            (10, 4),
+        );
+        let rows = screen_rows(&app, 140, 42);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("fetch failed — backend went away")),
+            "the failure must be said over the cached cell:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.chars().any(is_braille)),
+            "the cached cell is still shown:\n{}",
+            rows.join("\n")
         );
     }
 

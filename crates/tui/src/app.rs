@@ -5169,26 +5169,33 @@ impl App {
                 cif,
                 truncated,
             } => {
-                // Both lanes draw from the parsed structure; a CIF that does
-                // not parse stays text, and the log says why.
-                match crate::structure_view::parse_cif(&cif) {
+                // Both lanes draw from the parsed structure. A CIF that does
+                // not parse stays text and SAYS why — and takes any earlier
+                // drawing of the same key with it: a cell parsed from a
+                // previous fetch, left under a newer CIF that does not parse,
+                // would be drawn as if it were this file.
+                let not_drawable = match crate::structure_view::parse_cif(&cif) {
                     Ok(view) => {
                         self.structure_views.insert(cache_key.clone(), view);
+                        None
                     }
-                    Err(why) => tracing::debug!(%cache_key, "CIF not drawable: {why}"),
+                    Err(why) => {
+                        self.structure_views.remove(&cache_key);
+                        Some(why)
+                    }
+                };
+                let mut text = match &not_drawable {
+                    Some(why) => format!("not drawable — {why}\n\n{cif}"),
+                    None => cif.clone(),
+                };
+                if truncated {
+                    text.push_str("\n\n[truncated]");
                 }
                 // A hover fetch and the Enter-key detail view are separate
                 // lanes. Try the hover lane FIRST: if this response answers a
                 // pointer, it is not the detail view's and must not fall
                 // through to the guard below, which would drop it.
-                if self.resolve_reference(
-                    &cache_key,
-                    RefPanelState::Ready(if truncated {
-                        format!("{cif}\n\n[truncated]")
-                    } else {
-                        cif.clone()
-                    }),
-                ) {
+                if self.resolve_reference(&cache_key, RefPanelState::Ready(text)) {
                     return;
                 }
                 if self.structure_fetch_key.as_deref() != Some(cache_key.as_str()) {
@@ -6697,6 +6704,47 @@ mod tests {
         );
         assert_eq!(app.focus, Focus::Input);
         assert_eq!(app.input.lines().join("\n"), sentence);
+    }
+
+    /// A cell parsed from an earlier fetch must not be drawn under a newer
+    /// CIF that does not parse: the drawing goes with the failure, and the
+    /// panel says why the file is not drawable.
+    #[test]
+    fn a_cif_that_stops_parsing_takes_its_stale_drawing_with_it() {
+        use crate::backend::{FAKE_TIAL_CACHE_KEY, FAKE_TIAL_CIF};
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        let fetched = |cif: &str| AgentMsg::StructureFetched {
+            session_id: "s".to_string(),
+            cache_key: FAKE_TIAL_CACHE_KEY.to_string(),
+            cif: cif.to_string(),
+            truncated: false,
+        };
+        let id = format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif");
+        let mut panel = app_with_open_structure_panel(&id);
+        std::mem::swap(&mut app.ref_panel, &mut panel.ref_panel);
+        // The panel's fetch is in flight, as after a hover.
+        app.ref_fetch = Some((id.clone(), FAKE_TIAL_CACHE_KEY.to_string()));
+        app.apply_agent_msg(fetched(FAKE_TIAL_CIF));
+        assert!(
+            app.structure_views.contains_key(FAKE_TIAL_CACHE_KEY),
+            "the first fetch draws"
+        );
+        app.ref_panel.as_mut().expect("panel").state = RefPanelState::Fetching;
+        app.ref_fetch = Some((id.clone(), FAKE_TIAL_CACHE_KEY.to_string()));
+        app.apply_agent_msg(fetched("data_broken\n_cell_length_a 4.0\n"));
+        assert!(
+            !app.structure_views.contains_key(FAKE_TIAL_CACHE_KEY),
+            "a drawing from an earlier fetch must not survive a CIF that does not parse"
+        );
+        let text = match &app.ref_panel.as_ref().expect("panel").state {
+            RefPanelState::Ready(text) => text.clone(),
+            _ => panic!("the panel must show the fetched text"),
+        };
+        assert!(
+            text.starts_with("not drawable — "),
+            "the panel must say why the file is not drawable: {text}"
+        );
     }
 
     fn app_with_open_structure_panel(id: &str) -> App {

@@ -14,7 +14,8 @@ expression: rendered
 │tool:        structure_import                                   │ │
 │                                                                │ │
 │── structure ──                                                 │ │
-│Al1 Ti1  ·  2 sites                                             │ │
+│Al1 Ti1                                                         │ │
+│2 sites                                                         │ │
 │asymmetric unit — symmetry operations not applied               │ │
 │space group  P 4/m m m                                          │ │
 │a b c  4.005  4.005  4.171 Å                                    │ │
@@ -24,7 +25,6 @@ expression: rendered
 │                                                                │ │
 │                         ⢀⣀⡠⠤⠒⠒⢹⠒⠤⡀                             │ │
 │                   ⣀⠤⠤⠒⠊⠉⠁     ⢸  ⠈⠑⠢⣀                          │ │
-│                   ⡏⠑⠢⣀        ⢸      ⠑⠢⣄                       │ │
 └────────────────────────────────────────────────────────────────┘ │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │type a message…  (press i to focus · ↵ send)                    │ │

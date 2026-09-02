@@ -52,6 +52,16 @@ pub struct Position {
 }
 
 impl Position {
+    /// Total occupancy on this position.
+    pub fn filled(&self) -> f64 {
+        self.occupants.iter().map(|(_, o)| o).sum()
+    }
+
+    /// Listed, but empty: nothing sits here.
+    pub fn is_vacant(&self) -> bool {
+        self.filled() <= 1e-6
+    }
+
     /// The species with the largest share — what the drawing colours it by.
     pub fn dominant(&self) -> &str {
         self.occupants
@@ -90,6 +100,9 @@ pub struct StructureView {
     pub lattice: [[f64; 3]; 3],
     pub sites: Vec<Site>,
     pub symmetry: SymmetryState,
+    /// How many `data_` blocks the file carries. Only the first is read;
+    /// the header says so when there are more.
+    pub blocks: usize,
 }
 
 // ── CIF tokens ──────────────────────────────────────────────────────
@@ -107,25 +120,44 @@ enum Token {
     Tag(String),
     Value(String),
     Loop,
-    /// `data_…` / `save_…` — a block boundary, never data.
-    Block,
+    /// An unquoted `data_…` / `save_…` token, wherever it stands — a block
+    /// boundary, never data. The lowercased word is kept so a data block can
+    /// be told from a save frame, and named when it cuts a loop.
+    Block(String),
 }
 
-fn tokenize(text: &str) -> Vec<Token> {
+/// Tokens, or the reason the file cannot be tokenized. An unterminated text
+/// field is refused by name: read to the end of the file it would swallow
+/// every atom after it, and a cell with no atoms would then parse as a
+/// structure with no atoms.
+fn tokenize(text: &str) -> Result<Vec<Token>, String> {
     let mut out = Vec::new();
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut n = 0;
+    while n < lines.len() {
+        let line = lines[n];
+        n += 1;
         // A `;` in column 1 opens a text field that runs to the next `;` in
         // column 1. Everything between is ONE value — prose, a citation, a
         // whole paragraph containing things that look like tags.
         if let Some(first) = line.strip_prefix(';') {
+            let opened_on = n;
             let mut body = first.to_string();
-            for l in lines.by_ref() {
+            let mut closed = false;
+            while n < lines.len() {
+                let l = lines[n];
+                n += 1;
                 if l.starts_with(';') {
+                    closed = true;
                     break;
                 }
                 body.push('\n');
                 body.push_str(l);
+            }
+            if !closed {
+                return Err(format!(
+                    "CIF text field opened with ';' on line {opened_on} is never closed"
+                ));
             }
             out.push(Token::Value(body));
             continue;
@@ -165,7 +197,7 @@ fn tokenize(text: &str) -> Vec<Token> {
             if lower == "loop_" {
                 out.push(Token::Loop);
             } else if lower.starts_with("data_") || lower.starts_with("save_") {
-                out.push(Token::Block);
+                out.push(Token::Block(lower));
             } else if let Some(tag) = word.strip_prefix('_') {
                 out.push(Token::Tag(tag.to_ascii_lowercase()));
             } else {
@@ -173,7 +205,27 @@ fn tokenize(text: &str) -> Vec<Token> {
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Occupancy as written, or the reason it cannot be used. Absent, `?` and
+/// `.` are the CIF spellings of "not stated" and mean a full site. A number
+/// is honoured as written — `0` is a vacancy, not a full site — and one
+/// outside 0..=1 is refused by name: it is not an occupancy at all.
+fn parse_occupancy(cell: &str, row: &str) -> Result<f64, String> {
+    let cell = cell.trim();
+    if cell.is_empty() || cell == "?" || cell == "." {
+        return Ok(1.0);
+    }
+    match parse_f64(cell) {
+        Some(o) if o.is_finite() && (0.0..=1.0).contains(&o) => Ok(o),
+        Some(o) => Err(format!(
+            "CIF occupancy {o} on row {row:?} is not between 0 and 1"
+        )),
+        None => Err(format!(
+            "CIF occupancy {cell:?} on row {row:?} is unreadable"
+        )),
+    }
 }
 
 fn strip_uncertainty(token: &str) -> &str {
@@ -320,7 +372,12 @@ pub fn species_color(symbol: &str) -> Color {
 /// draw, and an atom loop whose rows do not add up is a parse failure, never
 /// a structure that happens to have no atoms.
 pub fn parse_cif(text: &str) -> Result<StructureView, String> {
-    let tokens = tokenize(text);
+    let tokens = tokenize(text)?;
+    // Only the FIRST data block is read. A CIF can carry several — a
+    // refinement series, a family of polymorphs — and reading them as one
+    // file merged every block's atoms into one cell and called it the
+    // material. The rest are counted and said, never silently merged.
+    let mut data_blocks = 0usize;
     let mut lengths = [None::<f64>; 3];
     let mut angles = [None::<f64>; 3];
     let mut formula = None;
@@ -359,6 +416,16 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                     continue;
                 }
                 if !values.len().is_multiple_of(tags.len()) {
+                    // An unquoted token beginning `data_` or `save_` is a
+                    // block header wherever it stands — that is the CIF
+                    // grammar, not a choice. One inside a loop row cuts the
+                    // loop; the cause is named, not reported as a miscount.
+                    if let Some(Token::Block(name)) = tokens.get(i) {
+                        return Err(format!(
+                            "CIF loop is cut mid-row by a `{name}` block header — a value that \
+                             begins data_ or save_ must be quoted"
+                        ));
+                    }
                     return Err(format!(
                         "CIF loop has {} values for {} columns — the rows do not add up",
                         values.len(),
@@ -396,6 +463,10 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                             .filter(|s| !s.is_empty())
                             .map(species_from_label)
                             .unwrap_or_else(|| species_from_label(&label));
+                        let occupancy = match occ_col {
+                            Some(c) => parse_occupancy(cell(c), &row.join(" "))?,
+                            None => 1.0,
+                        };
                         sites.push(Site {
                             label: if label.is_empty() {
                                 species.clone()
@@ -404,11 +475,7 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                             },
                             species,
                             frac: [x, y, z],
-                            occupancy: occ_col
-                                .map(cell)
-                                .and_then(parse_f64)
-                                .filter(|o| o.is_finite() && *o > 0.0)
-                                .unwrap_or(1.0),
+                            occupancy,
                         });
                     }
                 } else if let Some(op) = column("space_group_symop_operation_xyz")
@@ -448,7 +515,21 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                 }
                 i += 2;
             }
-            _ => i += 1,
+            Token::Block(name) => {
+                if name.starts_with("data_") {
+                    data_blocks += 1;
+                    if data_blocks > 1 {
+                        // Count what follows; read none of it.
+                        data_blocks += tokens[i + 1..]
+                            .iter()
+                            .filter(|t| matches!(t, Token::Block(n) if n.starts_with("data_")))
+                            .count();
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            Token::Value(_) => i += 1,
         }
     }
 
@@ -470,6 +551,12 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
     // material.
     if saw_atom_loop && sites.is_empty() {
         return Err("CIF lists an atom loop but no site could be read from it".to_string());
+    }
+    // A cell with no atoms is not a structure. Whatever swallowed the atom
+    // loop — a stray block header, a field that never closed — the answer is
+    // a refusal, never an empty cell drawn as the material.
+    if sites.is_empty() {
+        return Err("CIF has no atom sites".to_string());
     }
     let named_p1 = space_group
         .as_deref()
@@ -493,6 +580,7 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
         lattice: lattice_from_params(lengths, angles),
         sites,
         symmetry,
+        blocks: data_blocks.max(1),
     })
 }
 
@@ -521,11 +609,19 @@ impl StructureView {
         out
     }
 
-    /// True when any position is shared or partly filled.
+    /// True when any position is shared or partly filled. A vacancy is not
+    /// disorder — it is an absence, counted by [`StructureView::vacancies`].
     pub fn is_disordered(&self) -> bool {
         self.positions().iter().any(|p| {
-            p.occupants.len() > 1 || p.occupants.iter().map(|(_, o)| o).sum::<f64>() < 1.0 - 1e-6
+            let filled = p.filled();
+            p.occupants.len() > 1 || (filled > 1e-6 && filled < 1.0 - 1e-6)
         })
+    }
+
+    /// Positions the file lists with nothing on them — occupancy 0. They stay
+    /// in the table, are said in the header, and are never drawn as atoms.
+    pub fn vacancies(&self) -> usize {
+        self.positions().iter().filter(|p| p.is_vacant()).count()
     }
 
     /// Species in first-seen order with their total occupancy across the
@@ -566,18 +662,32 @@ impl StructureView {
             (None, Some(n)) => format!("No. {n}"),
             (None, None) => "unknown".to_string(),
         };
+        // The formula has its own line: a long one clipped at the panel
+        // width took the site count and the disorder marker with it.
+        let mut out = vec![
+            self.formula
+                .as_deref()
+                .unwrap_or("formula unknown")
+                .to_string(),
+        ];
         let positions = self.positions().len();
-        let mut first = format!(
-            "{}  ·  {positions} site{}",
-            self.formula.as_deref().unwrap_or("formula unknown"),
-            if positions == 1 { "" } else { "s" }
-        );
+        let mut count = format!("{positions} site{}", if positions == 1 { "" } else { "s" });
         if self.is_disordered() {
-            first.push_str("  ·  disordered");
+            count.push_str("  ·  disordered");
         }
-        let mut out = vec![first];
+        let vacant = self.vacancies();
+        if vacant > 0 {
+            count.push_str(&format!("  ·  {vacant} vacant"));
+        }
+        out.push(count);
         if let Some(note) = self.symmetry_note() {
             out.push(note.to_string());
+        }
+        if self.blocks > 1 {
+            out.push(format!(
+                "first of {} data blocks — the others are not shown",
+                self.blocks
+            ));
         }
         out.push(format!("space group  {sg}"));
         out.push(format!(
@@ -691,8 +801,13 @@ impl StructureView {
             });
         }
         // Atoms after edges, so they sit on top; one Points call per species
-        // so each keeps its colour.
-        let positions = self.positions();
+        // so each keeps its colour. A vacancy is nothing, and nothing is
+        // drawn for it — the header counts it instead.
+        let positions: Vec<Position> = self
+            .positions()
+            .into_iter()
+            .filter(|p| !p.is_vacant())
+            .collect();
         let mut species: Vec<&str> = Vec::new();
         for position in &positions {
             let dominant = position.dominant();
@@ -852,7 +967,7 @@ loop_
         assert_eq!(v.sites[1].label, "Fe2");
         assert_eq!(v.sites[1].species, "Fe");
         assert!(
-            v.header_lines()[0].starts_with("Fe2  ·  2 sites"),
+            v.header_lines()[1].starts_with("2 sites"),
             "{:?}",
             v.header_lines()
         );
@@ -985,12 +1100,12 @@ Co1 Co 0.0 0.0 0.0 0.25
         assert_eq!(v.positions().len(), 1, "one crystallographic site");
         assert!(v.is_disordered());
         assert!(
-            v.header_lines()[0].contains("1 site"),
+            v.header_lines()[1].contains("1 site"),
             "{:?}",
             v.header_lines()
         );
         assert!(
-            v.header_lines()[0].contains("disordered"),
+            v.header_lines()[1].contains("disordered"),
             "{:?}",
             v.header_lines()
         );
@@ -1210,5 +1325,133 @@ Fe1 Fe 0.0 0.0 0.0
             "one shown, the remainder counted: {lines:?}"
         );
         assert!(lines[1].contains("+1 more"));
+    }
+
+    /// A CIF with several data blocks is several structures. Only the first
+    /// is read; the rest are counted and said, never merged into one cell.
+    #[test]
+    fn only_the_first_data_block_is_read_and_the_rest_are_counted() {
+        let more = "\
+data_second
+_cell_length_a 9.0
+_cell_length_b 9.0
+_cell_length_c 9.0
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Fe1 0.0 0.0 0.0
+data_third
+_cell_length_a 1.0
+";
+        let v = parse_cif(&format!("{TIAL}{more}")).expect("the first block parses");
+        assert_eq!(v.lengths, [4.005, 4.005, 4.171], "the first block's cell");
+        assert_eq!(
+            v.sites.len(),
+            2,
+            "the later blocks' atoms must not merge in"
+        );
+        assert_eq!(v.blocks, 3);
+        let header = v.header_lines();
+        assert!(
+            header
+                .iter()
+                .any(|l| l == "first of 3 data blocks — the others are not shown"),
+            "{header:?}"
+        );
+        let one = parse_cif(TIAL).expect("parses");
+        assert_eq!(one.blocks, 1);
+        assert!(one.header_lines().iter().all(|l| !l.contains("data block")));
+    }
+
+    /// An unquoted `data_…` token is a block header wherever it stands —
+    /// that is the CIF grammar. One inside a loop row cuts the loop, and the
+    /// refusal names THAT, not a miscount of rows. Quoted, it is a value.
+    #[test]
+    fn a_block_header_inside_a_loop_row_is_refused_by_its_real_cause() {
+        let cut = TIAL.replace("Al1 Al 0.5", "Al1 data_al 0.5");
+        let err = parse_cif(&cut).expect_err("a loop cut mid-row cannot parse");
+        assert!(
+            err.contains("cut mid-row by a `data_al` block header") && err.contains("quoted"),
+            "{err}"
+        );
+        let quoted = TIAL.replace("Al1 Al 0.5", "'data_al' Al 0.5");
+        let v = parse_cif(&quoted).expect("quoted, it is a label");
+        assert_eq!(v.sites.len(), 2);
+        assert_eq!(v.sites[1].label, "data_al");
+        assert_eq!(v.blocks, 1);
+    }
+
+    /// A text field that never closes is refused by name. Read to the end of
+    /// the file it would swallow every atom after it.
+    #[test]
+    fn an_unterminated_text_field_is_refused_by_name() {
+        let cif = TIAL.replace("loop_\n", "_publ_section_comment\n;\nnever closed\nloop_\n");
+        let err = parse_cif(&cif).expect_err("an open text field cannot parse");
+        assert!(
+            err.contains("never closed") && err.contains("line 11"),
+            "{err}"
+        );
+    }
+
+    /// A cell with no atoms is not a structure, whatever swallowed them.
+    #[test]
+    fn a_cell_with_no_atoms_is_not_a_structure() {
+        let cell_only: String = TIAL.lines().take(9).collect::<Vec<_>>().join("\n");
+        let err = parse_cif(&cell_only).expect_err("no atoms, no structure");
+        assert_eq!(err, "CIF has no atom sites");
+    }
+
+    /// Occupancy is honoured as written. Zero is a vacancy: it stays in the
+    /// table, the header says so, and the drawing shows exactly what it
+    /// would show if the row were absent — nothing.
+    #[test]
+    fn occupancy_zero_is_a_vacancy_said_and_not_drawn() {
+        let centre = "  Fe  Fe2       1.0  0.5  0.5  0.5  1.0000\n";
+        let vacant = ASE_P1.replace(centre, "  Fe  Fe2       1.0  0.5  0.5  0.5  0.0000\n");
+        let v = parse_cif(&vacant).expect("parses");
+        assert_eq!(v.sites.len(), 2, "the vacancy stays in the table");
+        assert_eq!(v.sites[1].occupancy, 0.0);
+        assert_eq!(v.vacancies(), 1);
+        assert!(!v.is_disordered(), "a vacancy is not disorder");
+        let header = v.header_lines();
+        assert!(header.iter().any(|l| l.contains("1 vacant")), "{header:?}");
+        let full = parse_cif(ASE_P1).expect("parses").text_render(60, 14);
+        let without_the_row = parse_cif(&ASE_P1.replace(centre, ""))
+            .expect("parses")
+            .text_render(60, 14);
+        let drawn = v.text_render(60, 14);
+        assert_ne!(drawn, full, "a vacancy must not be drawn as an atom");
+        assert_eq!(
+            drawn, without_the_row,
+            "a vacancy draws exactly as if the row were absent"
+        );
+    }
+
+    /// An occupancy outside 0..=1 is not an occupancy; `?` and `.` are the
+    /// CIF spellings of "not stated" and mean a full site.
+    #[test]
+    fn an_occupancy_outside_zero_to_one_is_refused_and_unknown_is_full() {
+        let centre = "0.5  0.5  0.5  1.0000";
+        let over = ASE_P1.replace(centre, "0.5  0.5  0.5  1.2000");
+        let err = parse_cif(&over).expect_err("1.2 is not an occupancy");
+        assert!(
+            err.contains("1.2") && err.contains("not between 0 and 1"),
+            "{err}"
+        );
+        for unknown in ["?", "."] {
+            let cif = ASE_P1.replace(centre, &format!("0.5  0.5  0.5  {unknown}"));
+            let v = parse_cif(&cif).expect("not stated is a full site");
+            assert_eq!(v.sites[1].occupancy, 1.0, "{unknown}");
+        }
+    }
+
+    /// The formula has its own line, so the site count survives any width.
+    #[test]
+    fn the_site_count_is_never_on_the_formula_line() {
+        let lines = parse_cif(TIAL).expect("parses").header_lines();
+        assert_eq!(lines[0], "Al1 Ti1");
+        assert_eq!(lines[1], "2 sites");
     }
 }
