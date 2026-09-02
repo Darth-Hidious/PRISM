@@ -6675,6 +6675,30 @@ mod tests {
         );
     }
 
+    /// The home screen is a launcher, not a muzzle: a printable key on it is
+    /// the reader starting to type, exactly as before the workspace learned
+    /// keys. Sidebar keys are only routed once the reader Tabbed into it.
+    #[test]
+    fn typing_on_the_home_screen_reaches_the_prompt() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        assert!(app.home.open, "the home screen is open at launch");
+        let sentence = "Look up the crystal structures of MgB2 and TiAl.";
+        for c in sentence.chars() {
+            let mods = if c.is_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), mods));
+        }
+        assert!(
+            !app.home.open,
+            "the first printable key closes the home screen"
+        );
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.input.lines().join("\n"), sentence);
+    }
+
     fn app_with_open_structure_panel(id: &str) -> App {
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
         app.ref_panel = Some(RefPanel {
