@@ -845,6 +845,21 @@ impl ProvenanceStore {
         }
     }
 
+    /// Paths already warned about. The mode is a property of the FILE, so the
+    /// warning is news once — every open of the same store repeats it. Measured
+    /// 2026-09-02 on a live session: 176 copies of this one line in an hour,
+    /// against a single real error, on a screen the TUI owns. A signal repeated
+    /// until it is ignored is worse than no signal.
+    fn first_wal_warning_for(path: &str) -> bool {
+        static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        WARNED
+            .get_or_init(Default::default)
+            .lock()
+            .map(|mut seen| seen.insert(path.to_string()))
+            .unwrap_or(true)
+    }
+
     async fn open_attempt(path_str: &str) -> Result<Self> {
         let _open_guard = STORE_OPEN_LOCK.lock().await;
         let db = turso::Builder::new_local(path_str)
@@ -906,7 +921,10 @@ impl ProvenanceStore {
                 resulting_mode = text.to_ascii_lowercase();
             }
         }
-        if !resulting_mode.is_empty() && resulting_mode != "delete" {
+        if !resulting_mode.is_empty()
+            && resulting_mode != "delete"
+            && ProvenanceStore::first_wal_warning_for(path_str)
+        {
             tracing::warn!(
                 mode = %resulting_mode,
                 path = %path_str,
@@ -3240,6 +3258,26 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The store's journal mode is a property of the file: news once, noise
+    /// forever after. A live session logged 176 copies of that one warning in
+    /// an hour and buried the single real error under them.
+    #[test]
+    fn the_wal_warning_is_news_once_per_store() {
+        let path = format!("/tmp/wal-warning-{}.db", std::process::id());
+        assert!(
+            ProvenanceStore::first_wal_warning_for(&path),
+            "the first open says it"
+        );
+        assert!(
+            !ProvenanceStore::first_wal_warning_for(&path),
+            "every later open stays quiet"
+        );
+        assert!(
+            ProvenanceStore::first_wal_warning_for(&format!("{path}.other")),
+            "a different store is its own news"
+        );
+    }
 
     fn repair_item(id: &str, class: &str) -> RepairItem {
         RepairItem {
