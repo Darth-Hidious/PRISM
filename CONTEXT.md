@@ -39,6 +39,8 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 
 - Pushed to origin+private 2026-09-02. Fork branches awaiting audits: `feat/mesh-iroh-transport` (f4863fba), `feat/agui-tui` (859de78f); worktrees under `PRISM/.claude/worktrees/`. Owner: tag v1.1.0-alpha.1 + push to private; set default branch.
 
+- 2026-09-02 pm: WAL warn once/store (`7c5a6d3c`), no default tool-call ceiling (`e688a0e9`), DGM log line (`8d584378`). Mesh + AG-UI forks: both audited DO-NOT-LAND, findings sent to writers. `hea_descriptors` works; red badge = ungrounded input, by design.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
