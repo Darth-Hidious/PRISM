@@ -1903,7 +1903,7 @@ enum LogSink {
 /// other command keeps stderr (the backend's stderr is a captured pipe).
 fn log_sink_for(command: Option<&Commands>) -> LogSink {
     match command {
-        None | Some(Commands::Tui { .. }) => {
+        None | Some(Commands::Tui { .. }) | Some(Commands::Resume { .. }) => {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             LogSink::File(
                 std::path::PathBuf::from(home)
@@ -22748,5 +22748,27 @@ data:\n\
         let report = row_coverage_report(result).expect("extraction ran");
         assert!(report.contains("2 of 2 row(s)"), "{report}");
         assert!(report.contains("2 batch(es)"), "{report}");
+    }
+}
+
+#[cfg(test)]
+mod resume_log_sink_tests {
+    use super::*;
+
+    /// `prism resume` owns the terminal exactly as `prism` does. Measured on the
+    /// installed 10:22 build: the WAL warning was painted across the session
+    /// picker and tore the frame after a resume, because only the two TUI
+    /// spellings were routed to the log file.
+    #[test]
+    fn resume_logs_to_the_file_like_the_tui() {
+        for id in [None, Some("20260902_115638_28401e1b".to_string())] {
+            assert!(
+                matches!(
+                    log_sink_for(Some(&Commands::Resume { id })),
+                    LogSink::File(_)
+                ),
+                "prism resume must not log onto its own screen"
+            );
+        }
     }
 }
