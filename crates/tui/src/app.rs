@@ -864,6 +864,17 @@ pub struct App {
     pub notebook: NotebookPane,
 }
 
+/// Tokens per second over the visible-text window — or nothing, until the
+/// window is long enough to mean anything. The first text after a thinking
+/// phase arrives as a flush: thousands of estimated tokens inside a few
+/// milliseconds, and the status bar read "~10119.2 tok/s" for a model that
+/// streams a hundred. A rate needs a window; below this floor there is none.
+pub const THROUGHPUT_WINDOW_FLOOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub fn throughput(tokens: u64, window: std::time::Duration) -> Option<f64> {
+    (window >= THROUGHPUT_WINDOW_FLOOR).then(|| tokens as f64 / window.as_secs_f64())
+}
+
 impl App {
     pub fn new(backend: BackendHandle) -> Self {
         let mut input = TextArea::default();
@@ -5086,11 +5097,10 @@ impl App {
                 self.output_bytes += text.len() as u64;
                 self.tokens_received = self.output_bytes / 4;
 
-                if let (Some(first), Some(last)) = (self.first_text_time, self.last_token_time) {
-                    let elapsed = last.duration_since(first).as_secs_f64();
-                    if elapsed > 0.0 {
-                        self.tokens_per_sec = self.tokens_received as f64 / elapsed;
-                    }
+                if let (Some(first), Some(last)) = (self.first_text_time, self.last_token_time)
+                    && let Some(rate) = throughput(self.tokens_received, last.duration_since(first))
+                {
+                    self.tokens_per_sec = rate;
                 }
 
                 self.append_assistant_text(&text);
@@ -6155,6 +6165,19 @@ pub fn clamp_scroll(offset: u16, content_height: u16, viewport: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flush of text inside a few milliseconds is not a rate. Nothing is
+    /// reported until the window is real; then it is tokens over that window.
+    #[test]
+    fn throughput_needs_a_real_window() {
+        use std::time::Duration;
+        assert_eq!(
+            throughput(4000, Duration::from_millis(40)),
+            None,
+            "a flush is not a rate"
+        );
+        assert_eq!(throughput(400, Duration::from_secs(4)), Some(100.0));
+    }
     use crate::backend::FakeScenario;
 
     #[test]
