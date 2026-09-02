@@ -1378,19 +1378,24 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     // One line per handle: its kind and the words the reader saw. Absent
     // when nothing is marked; a strip that says "nothing" costs a line to
     // say nothing.
+    let mut mark_rows: Vec<(usize, String)> = Vec::new();
     if !app.marks.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!(" ★ marked for agent ({})", app.marks.len()),
+            format!(" ★ marked for agent ({})  click to unmark", app.marks.len()),
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         )));
         for mark in app.marks.iter() {
             let kind = crate::marks::kind_word(mark.kind);
+            mark_rows.push((lines.len(), mark.id.clone()));
             lines.push(Line::from(vec![
+                // The reference colour is this codebase's promise that a word
+                // is a handle. The strip rows ARE handles — clicking one
+                // unmarks it — so they wear it and claim their cells below.
                 Span::styled("   ● ", Style::default().fg(t.reference)),
                 Span::styled(format!("{kind} "), Style::default().fg(t.muted)),
                 Span::styled(
                     clip(&mark.label, w.saturating_sub(7 + kind.len())),
-                    Style::default().fg(t.text),
+                    crate::refs::mark_style(t),
                 ),
             ]));
         }
@@ -1426,6 +1431,9 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     {
         let mut marks: Vec<usize> = rows.iter().map(|(line, _)| *line).collect();
         marks.push(tabs_line_index);
+        // The marked-strip rows need measuring too, or `screen_row` cannot
+        // place them and their hit regions are never pushed.
+        marks.extend(mark_rows.iter().map(|(line, _)| *line));
         marks.sort_unstable();
         marks.dedup();
         let mut row_of: Vec<(usize, u16)> = Vec::with_capacity(marks.len());
@@ -1450,6 +1458,17 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let mut map = app.hit_map.borrow_mut();
+        // The marked strip's rows are handles: clicking one takes the mark
+        // back where it is shown, instead of sending the reader to find the
+        // orange word again.
+        for (line, id) in &mark_rows {
+            if let Some(row) = screen_row(*line) {
+                map.push(
+                    Rect::new(inner.x, row, inner.width, 1),
+                    HitTarget::MarkRow { id: id.clone() },
+                );
+            }
+        }
         if let Some(row) = screen_row(tabs_line_index) {
             for (tab, col, width) in tab_spans {
                 map.push(
@@ -5269,13 +5288,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// the reference does next. Marked handles say so; unmarked ones say how.
 fn mark_hint_span(app: &App, id: &str, t: Theme) -> Span<'static> {
     if app.marks.is_marked(id) {
-        Span::styled(
+        return Span::styled(
             "  ★ marked for agent",
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled("  click again · m: mark", Style::default().fg(t.dim))
+        );
     }
+    // `m` is a literal `m` while the reader is typing, so offering it there
+    // would be an instruction that does nothing.
+    let hint = if app.focus == crate::app::Focus::Input {
+        "  click again to mark"
+    } else {
+        "  click again · m: mark"
+    };
+    Span::styled(hint, Style::default().fg(t.dim))
 }
 
 /// The cache key a structure reference names, whichever form the id takes
@@ -5303,9 +5328,25 @@ fn draw_structure_panel(
     let legend = view.legend();
     let sites = view.site_lines(6);
     let prov = app.reference_provenance(&panel.id);
+    // A refetch that failed while a cell is cached must SAY it failed. Showing
+    // the cached cell alone reads as a fresh, successful read.
+    let failure = match &panel.state {
+        crate::app::RefPanelState::Failed(why) => Some(format!("fetch failed — {why}")),
+        crate::app::RefPanelState::NotResolvable(why) => Some(why.clone()),
+        _ => None,
+    };
+    let legend_h = legend_lines(&legend, usize::from(width.saturating_sub(2)), t).len();
     let canvas_h: u16 = 12;
-    let top_len = u16::try_from(1 + header.len() + 1).unwrap_or(6);
-    let bottom_len = u16::try_from(sites.len() + 1 + prov.sources.len().min(3) + 2).unwrap_or(8);
+    let top_len =
+        u16::try_from(1 + header.len() + legend_h + usize::from(failure.is_some())).unwrap_or(6);
+    let bottom_len = u16::try_from(
+        sites.len()
+            + 1
+            + prov.sources.len().min(SOURCES_SHOWN)
+            + 2
+            + usize::from(prov.sources.len() > SOURCES_SHOWN),
+    )
+    .unwrap_or(8);
     let height = (top_len + canvas_h + bottom_len + 2).min(area.height.max(3));
 
     let (px, py) = panel.anchor;
@@ -5343,21 +5384,23 @@ fn draw_structure_panel(
         Span::styled("  structure", Style::default().fg(t.muted)),
         mark_hint_span(app, &panel.id, t),
     ])];
+    if let Some(why) = &failure {
+        top.push(Line::from(Span::styled(
+            clip(why, iw),
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        )));
+    }
     for h in &header {
         top.push(Line::from(Span::styled(
             clip(h, iw),
             Style::default().fg(t.text),
         )));
     }
-    let mut legend_spans: Vec<Span<'static>> = Vec::new();
-    for (label, color) in &legend {
-        legend_spans.push(Span::styled("● ", Style::default().fg(*color)));
-        legend_spans.push(Span::styled(
-            format!("{label}  "),
-            Style::default().fg(t.text),
-        ));
+    // The legend wraps: a six-element alloy ran off the right edge and lost
+    // species that the drawing was colouring by.
+    for line in legend_lines(&legend, iw, t) {
+        top.push(line);
     }
-    top.push(Line::from(legend_spans));
     let top_h = u16::try_from(top.len()).unwrap_or(6).min(inner.height);
     f.render_widget(
         Paragraph::new(top),
@@ -5366,8 +5409,8 @@ fn draw_structure_panel(
 
     let cy = inner.y + top_h;
     let ch = canvas_h.min(inner.height.saturating_sub(top_h));
-    if ch > 0 {
-        let (xb, yb) = view.bounds();
+    if ch >= crate::structure_view::MIN_CANVAS_ROWS {
+        let (xb, yb) = view.balanced_bounds(inner.width, ch);
         f.render_widget(
             Canvas::default()
                 .marker(Marker::Braille)
@@ -5375,6 +5418,16 @@ fn draw_structure_panel(
                 .x_bounds(xb)
                 .y_bounds(yb)
                 .paint(|ctx| view.paint(ctx, t.dim)),
+            Rect::new(inner.x, cy, inner.width, ch),
+        );
+    } else if ch > 0 {
+        // A cell squeezed into four rows deforms, and into two it is a smear
+        // that reads as the structure. Say what is missing instead.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                clip(&crate::structure_view::short_canvas_note(ch), iw),
+                Style::default().fg(t.warn),
+            ))),
             Rect::new(inner.x, cy, inner.width, ch),
         );
     }
@@ -5393,10 +5446,22 @@ fn draw_structure_panel(
             "sources",
             Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
         )));
-        for src in prov.sources.iter().take(3) {
+        for src in prov.sources.iter().take(SOURCES_SHOWN) {
             bottom.push(Line::from(Span::styled(
                 format!("  {}", clip(src, iw.saturating_sub(2))),
                 Style::default().fg(t.dim),
+            )));
+        }
+        // Anything withheld is COUNTED, the same rule the site table follows.
+        if let Some(hidden) = prov
+            .sources
+            .len()
+            .checked_sub(SOURCES_SHOWN)
+            .filter(|n| *n > 0)
+        {
+            bottom.push(Line::from(Span::styled(
+                format!("  +{hidden} more"),
+                Style::default().fg(t.muted),
             )));
         }
         bottom.push(Line::from(Span::styled(
@@ -5414,10 +5479,44 @@ fn draw_structure_panel(
     }
 
     let mut map = app.hit_map.borrow_mut();
+    // The panel claims every cell it covers. Without this the pointer fell
+    // through to whatever the panel was drawn over — hovering inside a panel
+    // re-targeted the sidebar formula underneath, and two clicks marked a
+    // structure the reader never pointed at.
+    map.push(rect, HitTarget::RefPanelBody);
     map.push(
         Rect::new(rect.x + 1, rect.y, 7.min(rect.width.saturating_sub(1)), 1),
         HitTarget::RefPanelClose,
     );
+}
+
+/// How many provenance sources a panel shows before counting the rest.
+const SOURCES_SHOWN: usize = 3;
+
+/// The species legend, wrapped to the panel width. Every species the drawing
+/// colours by must be readable, or the colours mean nothing.
+fn legend_lines(legend: &[(String, Color)], width: usize, t: Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (label, color) in legend {
+        // `● ` is two cells, the label, then two spaces of separation.
+        let cost = label.width() + 4;
+        if used + cost > width && !spans.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        spans.push(Span::styled("● ", Style::default().fg(*color)));
+        spans.push(Span::styled(
+            format!("{label}  "),
+            Style::default().fg(t.text),
+        ));
+        used += cost;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -5556,8 +5655,12 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(t.panel));
     f.render_widget(Paragraph::new(lines).block(block), rect);
 
-    // The close control is the title cell run, so clicking it dismisses.
     let mut map = app.hit_map.borrow_mut();
+    // The panel claims every cell it covers, exactly as the structure panel
+    // does. Without this the pointer fell through to whatever lay beneath —
+    // a click inside a paper's panel marked the sidebar row underneath it.
+    map.push(rect, HitTarget::RefPanelBody);
+    // The close control is the title cell run, so clicking it dismisses.
     map.push(
         Rect::new(rect.x + 1, rect.y, 7.min(rect.width.saturating_sub(1)), 1),
         HitTarget::RefPanelClose,
@@ -5569,6 +5672,277 @@ mod tests {
     use super::*;
     use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
+
+    /// The same rule for the DRAWN panel, which takes its own code path: a
+    /// structure panel covering a sidebar row must own those cells too.
+    #[test]
+    fn a_structure_panel_owns_the_cells_it_covers() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![
+                serde_json::json!({"cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                                   "formula": "TiAl", "n_atoms": 2,
+                                   "composition": {"Al": 1, "Ti": 1}, "source": "user_import"}),
+                serde_json::json!({"cache_key": "bbb", "cache_ref": "cache://bbb/structure.cif",
+                                   "formula": "MgB2", "n_atoms": 3,
+                                   "composition": {"B": 2, "Mg": 1}, "source": "user_import"}),
+            ],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        app.structure_views.insert(
+            "aaa".to_string(),
+            crate::structure_view::parse_cif(crate::backend::FAKE_TIAL_CIF).expect("parses"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut under = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find("MgB2") {
+                under = Some((u16::try_from(row[..byte].chars().count()).unwrap(), y));
+                break;
+            }
+        }
+        let (ux, uy) = under.expect("the MgB2 row is on screen");
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Ready("cif".to_string()),
+            anchor: (ux.saturating_sub(4), uy.saturating_sub(2)),
+            pinned: true,
+        });
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let map = app.hit_map.borrow();
+        match map.at(ux, uy) {
+            Some(HitTarget::RefPanelBody | HitTarget::RefPanelClose) => {}
+            Some(HitTarget::Reference { id }) => panic!(
+                "({ux},{uy}) is inside the open structure panel but resolves to {id} behind it"
+            ),
+            other => panic!("the structure panel must own its cells, got {other:?}"),
+        }
+    }
+
+    /// A panel that withholds must say how much, and a legend that runs off
+    /// the edge loses the species the drawing is coloured by.
+    #[test]
+    fn the_panel_counts_what_it_withholds_and_wraps_its_legend() {
+        let hea = "\
+data_hea
+_chemical_formula_sum \"Cr Mn Fe Co Ni Al\"
+_cell_length_a 3.59
+_cell_length_b 3.59
+_cell_length_c 3.59
+_space_group_name_H-M_alt \"P 1\"
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Cr1 Cr 0.0 0.0 0.0
+Mn1 Mn 0.5 0.5 0.0
+Fe1 Fe 0.5 0.0 0.5
+Co1 Co 0.0 0.5 0.5
+Ni1 Ni 0.25 0.25 0.25
+Al1 Al 0.75 0.75 0.75
+";
+        let view = crate::structure_view::parse_cif(hea).expect("parses");
+        let probe = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        let t = probe.theme();
+        // Six species cannot fit one 62-column line: they wrap rather than
+        // running off the edge.
+        let lines = legend_lines(&view.legend(), 30, t);
+        assert!(lines.len() > 1, "a six-element legend must wrap: {lines:?}");
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.width() <= 30, "a legend line overflows: {text:?}");
+        }
+        let shown: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        for species in ["Cr", "Mn", "Fe", "Co", "Ni", "Al"] {
+            assert!(
+                shown.contains(species),
+                "{species} is missing from the legend: {shown}"
+            );
+        }
+        // A panel with more sources than it shows counts the remainder.
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.structure_views.insert("aaa".to_string(), view);
+        // A structure row with tool, source and timestamp gives the panel
+        // four provenance lines — one more than it shows.
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                "tool": "structure_import", "formula": "HEA", "n_atoms": 6,
+                "composition": {"Cr": 1}, "source": "user_import",
+                "created_at": "2026-09-02T00:00:00Z"})],
+        });
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "HEA".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Fetching,
+            anchor: (4, 3),
+            pinned: true,
+        });
+        let sources = app
+            .reference_provenance("cache://aaa/structure.cif")
+            .sources
+            .len();
+        assert!(
+            sources > SOURCES_SHOWN,
+            "the panel must have more sources than it shows: {sources}"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 44)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains(&format!("+{} more", sources - SOURCES_SHOWN)),
+            "withheld sources must be counted:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ni×1"),
+            "every species must reach the screen:\n{screen}"
+        );
+    }
+
+    /// The panel is drawn OVER the screen, so it must own its cells. Without
+    /// that, hovering inside an open panel re-targeted whatever lay beneath
+    /// it — clicking TiAl's panel marked the MgB2 row underneath.
+    #[test]
+    fn an_open_panel_owns_the_cells_it_covers() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![
+                serde_json::json!({"cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                                   "formula": "TiAl", "n_atoms": 2,
+                                   "composition": {"Al": 1, "Ti": 1}, "source": "user_import"}),
+                serde_json::json!({"cache_key": "bbb", "cache_ref": "cache://bbb/structure.cif",
+                                   "formula": "MgB2", "n_atoms": 3,
+                                   "composition": {"B": 2, "Mg": 1}, "source": "user_import"}),
+            ],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        // First, with no panel: find where the MgB2 row's formula lives and
+        // confirm it answers as its own reference.
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut under = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find("MgB2") {
+                under = Some((u16::try_from(row[..byte].chars().count()).unwrap(), y));
+                break;
+            }
+        }
+        let (ux, uy) = under.expect("the MgB2 row is on screen");
+        assert!(
+            matches!(app.hit_map.borrow().at(ux, uy), Some(HitTarget::Reference { id }) if id.contains("bbb")),
+            "the row beneath must be a reference before the panel covers it"
+        );
+        // Now open TiAl's panel anchored so it covers that very cell.
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Fetching,
+            anchor: (ux.saturating_sub(4), uy.saturating_sub(2)),
+            pinned: true,
+        });
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let map = app.hit_map.borrow();
+        match map.at(ux, uy) {
+            Some(HitTarget::RefPanelBody | HitTarget::RefPanelClose) => {}
+            Some(HitTarget::Reference { id }) => {
+                panic!("({ux},{uy}) is inside the open panel but still resolves to {id} behind it")
+            }
+            other => panic!("the panel must own the cells it covers, got {other:?}"),
+        }
+    }
+
+    /// Orange means "I can open this" — the promise the whole affordance
+    /// rests on. Nothing tested that the handles actually wear it.
+    #[test]
+    fn handles_are_painted_in_the_reference_style() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                "formula": "TiAl", "n_atoms": 2,
+                "composition": {"Al": 1, "Ti": 1}, "source": "user_import"})],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        app.marks.toggle(crate::marks::Mark {
+            id: "cache://aaa/structure.cif".to_string(),
+            kind: crate::refs::RefKind::Structure,
+            label: "TiAl".to_string(),
+        });
+        let expected = crate::refs::mark_style(app.theme());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Every cell of every "TiAl" — the workspace row's formula and the
+        // marked strip's row — must carry the reference colour AND its
+        // underline: the two halves of the convention.
+        let mut checked = 0usize;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            let Some(byte) = row.find("TiAl") else {
+                continue;
+            };
+            let col = u16::try_from(row[..byte].chars().count()).unwrap();
+            for dx in 0..4u16 {
+                let cell = &buf[(col + dx, y)];
+                assert_eq!(
+                    cell.fg,
+                    expected.fg.unwrap(),
+                    "a handle must wear the reference colour at ({}, {y})",
+                    col + dx
+                );
+                assert!(
+                    cell.modifier.contains(Modifier::UNDERLINED),
+                    "a handle must be underlined at ({}, {y})",
+                    col + dx
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected the row formula and the marked strip, saw {checked}"
+        );
+    }
 
     /// A structure listed in the workspace is a handle: its formula is
     /// registered as a reference and its cells answer the pointer as one,

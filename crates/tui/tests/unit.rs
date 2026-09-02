@@ -2504,7 +2504,9 @@ async fn fake_backend_send_message_emits_text_deltas() {
     backend.recv().await.unwrap(); // status
 
     // Send a message — should enqueue response events
-    backend.send_message("hello").unwrap();
+    backend
+        .send_message("hello", serde_json::json!([]))
+        .unwrap();
 
     // Collect all response events
     let mut methods = Vec::new();
@@ -2540,7 +2542,7 @@ async fn fake_backend_response_text_contains_fake_message() {
     let mut backend = FakeBackend::new(FakeScenario::BasicChat);
     backend.recv().await.unwrap(); // welcome
     backend.recv().await.unwrap(); // status
-    backend.send_message("test").unwrap();
+    backend.send_message("test", serde_json::json!([])).unwrap();
 
     // Collect all text deltas and concatenate
     let mut full_text = String::new();
@@ -2611,7 +2613,9 @@ async fn fake_backend_events_parse_correctly() {
     );
 
     // Send message and check response events parse
-    backend.send_message("hello").unwrap();
+    backend
+        .send_message("hello", serde_json::json!([]))
+        .unwrap();
     let delta = backend.recv().await.unwrap();
     let parsed = parse_notification(&delta);
     assert!(
@@ -2644,7 +2648,7 @@ async fn app_with_fake_backend_produces_assistant_text() {
 
     // Simulate user sending a message
     app.push_user("hello");
-    let _ = app.backend.send_message("hello");
+    let _ = app.backend.send_message("hello", serde_json::json!([]));
 
     // Apply response events
     let mut received_text = String::new();
@@ -2803,7 +2807,7 @@ async fn all_scenarios_emit_status() {
 async fn streaming_answer_emits_multiple_text_deltas() {
     let mut backend = FakeBackend::new(FakeScenario::StreamingAnswer);
     drain_startup(&mut backend).await;
-    backend.send_message("test").unwrap();
+    backend.send_message("test", serde_json::json!([])).unwrap();
     let methods = collect_until_turn_complete(&mut backend).await;
     let delta_count = methods.iter().filter(|m| *m == "ui.text.delta").count();
     assert!(
@@ -2818,7 +2822,7 @@ async fn streaming_answer_emits_multiple_text_deltas() {
 async fn thinking_stream_emits_thinking_and_text_deltas() {
     let mut backend = FakeBackend::new(FakeScenario::ThinkingStream);
     drain_startup(&mut backend).await;
-    backend.send_message("test").unwrap();
+    backend.send_message("test", serde_json::json!([])).unwrap();
     let methods = collect_until_turn_complete(&mut backend).await;
     assert!(
         methods.iter().any(|m| m == "ui.thinking.delta"),
@@ -2836,7 +2840,9 @@ async fn thinking_stream_emits_thinking_and_text_deltas() {
 async fn tool_success_emits_tool_start_and_card() {
     let mut backend = FakeBackend::new(FakeScenario::ToolSuccess);
     drain_startup(&mut backend).await;
-    backend.send_message("sample alloy").unwrap();
+    backend
+        .send_message("sample alloy", serde_json::json!([]))
+        .unwrap();
     let methods = collect_until_turn_complete(&mut backend).await;
     assert!(
         methods.iter().any(|m| m == "ui.tool.start"),
@@ -2850,7 +2856,7 @@ async fn tool_success_emits_tool_start_and_card() {
 async fn tool_success_card_parses_as_result() {
     let mut backend = FakeBackend::new(FakeScenario::ToolSuccess);
     drain_startup(&mut backend).await;
-    backend.send_message("test").unwrap();
+    backend.send_message("test", serde_json::json!([])).unwrap();
     // Find the card event
     while let Some(msg) = backend.recv().await {
         if msg.get("method").and_then(|m| m.as_str()) == Some("ui.card") {
@@ -2872,7 +2878,9 @@ async fn tool_success_card_parses_as_result() {
 async fn tool_error_emits_tool_start_and_error_card() {
     let mut backend = FakeBackend::new(FakeScenario::ToolError);
     drain_startup(&mut backend).await;
-    backend.send_message("submit job").unwrap();
+    backend
+        .send_message("submit job", serde_json::json!([]))
+        .unwrap();
     let methods = collect_until_turn_complete(&mut backend).await;
     assert!(
         methods.iter().any(|m| m == "ui.tool.start"),
@@ -2885,7 +2893,7 @@ async fn tool_error_emits_tool_start_and_error_card() {
 async fn tool_error_card_parses_as_error() {
     let mut backend = FakeBackend::new(FakeScenario::ToolError);
     drain_startup(&mut backend).await;
-    backend.send_message("test").unwrap();
+    backend.send_message("test", serde_json::json!([])).unwrap();
     while let Some(msg) = backend.recv().await {
         if msg.get("method").and_then(|m| m.as_str()) == Some("ui.card") {
             let parsed = parse_notification(&msg);
@@ -2906,7 +2914,9 @@ async fn tool_error_card_parses_as_error() {
 async fn approval_required_emits_prompt_with_rich_fields() {
     let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
     drain_startup(&mut backend).await;
-    backend.send_message("run compute").unwrap();
+    backend
+        .send_message("run compute", serde_json::json!([]))
+        .unwrap();
 
     // The first event should be ui.prompt
     let msg = backend.recv().await.unwrap();
@@ -2942,7 +2952,7 @@ async fn approval_required_emits_prompt_with_rich_fields() {
 async fn approval_required_send_y_emits_tool_success() {
     let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
     drain_startup(&mut backend).await;
-    backend.send_message("run").unwrap();
+    backend.send_message("run", serde_json::json!([])).unwrap();
     backend.recv().await.unwrap(); // prompt
 
     backend.send_approval("y", "test_tool").unwrap();
@@ -2958,7 +2968,7 @@ async fn approval_required_send_y_emits_tool_success() {
 async fn approval_required_send_n_emits_status() {
     let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
     drain_startup(&mut backend).await;
-    backend.send_message("run").unwrap();
+    backend.send_message("run", serde_json::json!([])).unwrap();
     backend.recv().await.unwrap(); // prompt
 
     backend.send_approval("n", "test_tool").unwrap();
@@ -2973,7 +2983,7 @@ async fn approval_required_send_n_emits_status() {
 async fn approval_required_send_a_emits_permissions_and_card() {
     let mut backend = FakeBackend::new(FakeScenario::ApprovalRequired);
     drain_startup(&mut backend).await;
-    backend.send_message("run").unwrap();
+    backend.send_message("run", serde_json::json!([])).unwrap();
     backend.recv().await.unwrap(); // prompt
 
     backend.send_approval("a", "test_tool").unwrap();
@@ -2991,7 +3001,9 @@ async fn approval_required_send_a_emits_permissions_and_card() {
 async fn cost_metrics_emits_cost_with_token_counts() {
     let mut backend = FakeBackend::new(FakeScenario::CostMetrics);
     drain_startup(&mut backend).await;
-    backend.send_message("show cost").unwrap();
+    backend
+        .send_message("show cost", serde_json::json!([]))
+        .unwrap();
 
     let msg = backend.recv().await.unwrap();
     assert_eq!(msg.get("method").and_then(|m| m.as_str()), Some("ui.cost"));
@@ -3017,7 +3029,9 @@ async fn cost_metrics_emits_cost_with_token_counts() {
 async fn backend_warning_error_emits_warning_and_error() {
     let mut backend = FakeBackend::new(FakeScenario::BackendWarningError);
     drain_startup(&mut backend).await;
-    backend.send_message("trigger error").unwrap();
+    backend
+        .send_message("trigger error", serde_json::json!([]))
+        .unwrap();
 
     let msg1 = backend.recv().await.unwrap();
     assert_eq!(
@@ -3050,7 +3064,9 @@ async fn backend_warning_error_emits_warning_and_error() {
 async fn ansi_injection_events_contain_ansi() {
     let mut backend = FakeBackend::new(FakeScenario::AnsiInjection);
     drain_startup(&mut backend).await;
-    backend.send_message("inject").unwrap();
+    backend
+        .send_message("inject", serde_json::json!([]))
+        .unwrap();
 
     // First event: text delta with ANSI
     let msg = backend.recv().await.unwrap();
@@ -3078,7 +3094,7 @@ async fn ansi_injection_app_state_is_sanitized() {
 
     // Send a message to trigger the ansi_injection response
     app.push_user("inject");
-    let _ = app.backend.send_message("inject");
+    let _ = app.backend.send_message("inject", serde_json::json!([]));
 
     // Apply all response events (with timeout for scenarios that
     // don't emit ui.turn.complete).
@@ -3111,7 +3127,7 @@ async fn all_scenarios_events_parse_without_unknown() {
         let scenario = FakeScenario::from_name(scenario_name).unwrap();
         let mut backend = FakeBackend::new(scenario);
         drain_startup(&mut backend).await;
-        backend.send_message("test").unwrap();
+        backend.send_message("test", serde_json::json!([])).unwrap();
 
         // Collect events with a timeout — some scenarios (e.g.
         // approval_required) don't emit ui.turn.complete after

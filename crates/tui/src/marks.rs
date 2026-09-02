@@ -67,19 +67,92 @@ impl Marks {
         self.items.len()
     }
 
-    /// The block prefixed to the reader's next message, or nothing when
-    /// nothing is marked. One line per handle: kind, identity, the label the
-    /// reader saw. The identity is what the agent's tools resolve.
-    pub fn context_block(&self) -> Option<String> {
-        if self.items.is_empty() {
-            return None;
-        }
-        let mut block = String::from("[Marked for you]\n");
-        for m in &self.items {
-            block.push_str(&format!("- {} {} ({})\n", kind_word(m.kind), m.id, m.label));
-        }
-        Some(block)
+    /// Drop a mark by id. Used when the reader clicks a strip row, and when
+    /// the object behind a mark disappears from the session.
+    pub fn remove(&mut self, id: &str) -> bool {
+        let before = self.items.len();
+        self.items.retain(|m| m.id != id);
+        before != self.items.len()
     }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Drop marks whose handle no longer exists, returning what was dropped.
+    /// A structure that has left the cache still rode every message before
+    /// this — a handle pointing at nothing, presented to the model as a thing
+    /// the reader is working on.
+    pub fn prune(&mut self, live: impl Fn(&Mark) -> bool) -> Vec<Mark> {
+        let (kept, dropped): (Vec<Mark>, Vec<Mark>) =
+            std::mem::take(&mut self.items).into_iter().partition(&live);
+        self.items = kept;
+        dropped
+    }
+
+    /// The marked set as it goes on the wire: kind, identity, label. Sent as
+    /// its own field on every message, so the agent can hold it as a
+    /// replaceable slot instead of a growing history of prefixes.
+    pub fn wire(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.items
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "kind": kind_word(m.kind),
+                        "id": m.id,
+                        "label": m.label,
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+/// A label as it is safe to show and to send: one line, no control bytes.
+///
+/// `sanitize_for_render` strips escapes but keeps newlines, which is right
+/// for prose and wrong for a label. A label is ONE line of screen text and
+/// one field on the wire, and a newline inside it is exactly what let a
+/// hostile object label forge a second block inside the user's own message.
+pub fn sanitize_label(raw: &str) -> String {
+    crate::sanitize::sanitize_for_render(raw)
+        .replace(['\n', '\r'], " ")
+        .trim()
+        .to_string()
+}
+
+/// Whether an id is something the agent can actually act on.
+///
+/// A mark is a handle the model resolves with the tools it already has: a
+/// cache key, a DOI, a file it can open, a tool it can call. An object id
+/// like `sim-42` is none of those — marking it put a line in the model's
+/// context that resolves to nothing, under a kind word (`file`) that the
+/// panel itself contradicted.
+pub fn actionable_identity(id: &str, kind: RefKind) -> Result<(), String> {
+    let ok = match kind {
+        RefKind::Structure => id.starts_with("cache://"),
+        // A DOI is `10.<registrant>/<suffix>`, however it is prefixed.
+        RefKind::Doi => {
+            let bare = id
+                .trim_start_matches("doi:")
+                .trim_start_matches("https://doi.org/");
+            bare.starts_with("10.") && bare.contains('/')
+        }
+        RefKind::FileLine => id.starts_with("file://"),
+        RefKind::Tool => id.starts_with("tool://"),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(match kind {
+        RefKind::Structure => {
+            format!("{id} is not a cached structure, so there is nothing to open")
+        }
+        RefKind::Doi => format!("{id} is not a DOI, so the paper cannot be resolved"),
+        RefKind::FileLine => format!("{id} is not a file path the agent can read"),
+        RefKind::Tool => format!("{id} is not a tool the agent can call"),
+    })
 }
 
 #[cfg(test)]
@@ -115,21 +188,61 @@ mod tests {
     }
 
     #[test]
-    fn the_context_block_carries_kind_identity_and_label_or_nothing() {
+    fn the_wire_form_carries_kind_identity_and_label() {
         let mut marks = Marks::default();
-        assert_eq!(marks.context_block(), None, "nothing marked, nothing sent");
+        assert_eq!(
+            marks.wire(),
+            serde_json::json!([]),
+            "nothing marked, nothing sent"
+        );
         marks.toggle(structure("cache://abc/structure.cif", "TiAl"));
         marks.toggle(Mark {
             id: "doi:10.1038/ncomms10602".to_string(),
             kind: RefKind::Doi,
             label: "Fracture toughness of CrCoNi".to_string(),
         });
-        let block = marks.context_block().unwrap();
         assert_eq!(
-            block,
-            "[Marked for you]\n\
-             - structure cache://abc/structure.cif (TiAl)\n\
-             - paper doi:10.1038/ncomms10602 (Fracture toughness of CrCoNi)\n"
+            marks.wire(),
+            serde_json::json!([
+                {"kind": "structure", "id": "cache://abc/structure.cif", "label": "TiAl"},
+                {"kind": "paper", "id": "doi:10.1038/ncomms10602",
+                 "label": "Fracture toughness of CrCoNi"},
+            ])
         );
+    }
+
+    /// A mark is a handle the model can resolve. An object id that resolves
+    /// to nothing was marked anyway, as a `file` the panel itself denied.
+    #[test]
+    fn only_identities_the_agent_can_resolve_may_be_marked() {
+        assert!(actionable_identity("cache://abc/structure.cif", RefKind::Structure).is_ok());
+        assert!(actionable_identity("10.1038/ncomms10602", RefKind::Doi).is_ok());
+        assert!(actionable_identity("doi:10.1038/x", RefKind::Doi).is_ok());
+        assert!(actionable_identity("file:///tmp/a.rs", RefKind::FileLine).is_ok());
+        assert!(actionable_identity("tool://web", RefKind::Tool).is_ok());
+        // The shapes that used to be marked and could not be acted on.
+        let why = actionable_identity("sim-42", RefKind::FileLine).unwrap_err();
+        assert!(why.contains("sim-42") && why.contains("file path"), "{why}");
+        assert!(actionable_identity("job-7", RefKind::Structure).is_err());
+        assert!(actionable_identity("Ti-6Al-4V", RefKind::Doi).is_err());
+    }
+
+    #[test]
+    fn a_mark_can_be_taken_back_and_a_dead_handle_is_pruned() {
+        let mut marks = Marks::default();
+        marks.toggle(structure("cache://a", "A"));
+        marks.toggle(structure("cache://b", "B"));
+        assert!(marks.remove("cache://a"));
+        assert!(
+            !marks.remove("cache://a"),
+            "removing twice is not an error, just false"
+        );
+        marks.toggle(structure("cache://c", "C"));
+        let dropped = marks.prune(|m| m.id == "cache://b");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].id, "cache://c");
+        assert_eq!(marks.len(), 1);
+        marks.clear();
+        assert!(marks.is_empty());
     }
 }

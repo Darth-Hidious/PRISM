@@ -10,6 +10,7 @@ pub mod embeddings;
 pub mod execution_contract;
 pub mod hooks;
 pub mod influence;
+pub mod marked;
 pub mod mcp;
 pub mod meta_tools;
 pub mod models;

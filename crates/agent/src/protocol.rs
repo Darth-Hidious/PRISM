@@ -9335,6 +9335,16 @@ async fn run_server_core(
                     emit_error(-32602, "Missing params.text", id);
                     continue;
                 }
+                // The marked set is a SLOT, replaced on every message —
+                // including an empty one, which is how unmarking reaches the
+                // model. It never enters the durable message history; the
+                // turn loop rebuilds its block from here each iteration.
+                crate::marked::set_marked(
+                    params
+                        .get("marks")
+                        .map(crate::marked::from_json)
+                        .unwrap_or_default(),
+                );
 
                 emit_response(id, serde_json::json!({ "status": "ok" }));
 

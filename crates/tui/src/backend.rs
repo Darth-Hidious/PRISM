@@ -332,8 +332,14 @@ impl RealBackend {
         Ok(backend)
     }
 
-    pub fn send_message(&mut self, text: &str) -> Result<u64> {
-        self.send_request("input.message", serde_json::json!({"text": text}))
+    /// Send the reader's message and, alongside it, the CURRENT marked set.
+    /// The marks travel as their own field — never inside `text` — because
+    /// they are a replaceable slot on the agent side, not durable history.
+    pub fn send_message(&mut self, text: &str, marks: serde_json::Value) -> Result<u64> {
+        self.send_request(
+            "input.message",
+            serde_json::json!({"text": text, "marks": marks}),
+        )
     }
 
     pub fn send_command(&mut self, command: &str) -> Result<u64> {
@@ -422,6 +428,9 @@ pub struct FakeBackend {
     next_id: u64,
     scenario: FakeScenario,
     session_id: String,
+    /// The marks that rode the last message — what a test reads to check
+    /// what actually went on the wire.
+    last_marks: Value,
 }
 
 impl FakeBackend {
@@ -436,9 +445,15 @@ impl FakeBackend {
             next_id: 1,
             scenario,
             session_id: "fake-session".to_string(),
+            last_marks: Value::Null,
         };
         backend.enqueue_startup();
         backend
+    }
+
+    /// The marks field of the most recent `input.message`.
+    pub fn last_marks(&self) -> &Value {
+        &self.last_marks
     }
 
     fn next_id(&mut self) -> u64 {
@@ -963,8 +978,9 @@ impl FakeBackend {
         Ok(())
     }
 
-    pub fn send_message(&mut self, text: &str) -> Result<u64> {
+    pub fn send_message(&mut self, text: &str, marks: serde_json::Value) -> Result<u64> {
         let id = self.next_id();
+        self.last_marks = marks;
         self.enqueue_response(text);
         Ok(id)
     }
@@ -1133,11 +1149,20 @@ impl BackendHandle {
         }
     }
 
-    pub fn send_message(&mut self, text: &str) -> Result<u64> {
+    /// The marks the fake backend last received — test-only introspection.
+    #[must_use]
+    pub fn fake_last_marks(&self) -> Option<&Value> {
         match self {
-            Self::Real(b) => b.send_message(text),
-            Self::Fake(b) => b.send_message(text),
-            Self::Native(b) => b.send_message(text),
+            Self::Fake(b) => Some(b.last_marks()),
+            _ => None,
+        }
+    }
+
+    pub fn send_message(&mut self, text: &str, marks: serde_json::Value) -> Result<u64> {
+        match self {
+            Self::Real(b) => b.send_message(text, marks),
+            Self::Fake(b) => b.send_message(text, marks),
+            Self::Native(b) => b.send_message(text, marks),
         }
     }
 
@@ -1280,8 +1305,14 @@ impl NativeBackend {
         anyhow::bail!("init failed — no response from native session")
     }
 
-    pub fn send_message(&mut self, text: &str) -> Result<u64> {
-        self.send_request("input.message", serde_json::json!({"text": text}))
+    /// Send the reader's message and, alongside it, the CURRENT marked set.
+    /// The marks travel as their own field — never inside `text` — because
+    /// they are a replaceable slot on the agent side, not durable history.
+    pub fn send_message(&mut self, text: &str, marks: serde_json::Value) -> Result<u64> {
+        self.send_request(
+            "input.message",
+            serde_json::json!({"text": text, "marks": marks}),
+        )
     }
 
     pub fn send_command(&mut self, command: &str) -> Result<u64> {
