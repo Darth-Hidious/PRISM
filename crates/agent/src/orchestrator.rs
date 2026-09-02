@@ -1843,6 +1843,14 @@ pub(crate) fn execute_orchestrate_agents<'a>(
                     .await
                     .unwrap_or_default();
                 let ranked = crate::branch_policy::rank(&yields, &expansions);
+                // The policy is otherwise invisible: this is the only line that
+                // says, on a live run, that branch selection happened and over
+                // how many branches.
+                tracing::info!(
+                    branches = ranked.len(),
+                    session = %ctx.session_id,
+                    "branch policy ranked the research DAG (Darwin Gödel Machine selection)"
+                );
                 crate::branch_policy::feedback_block(&ranked).map(|block| {
                     json!({
                         "ranked": ranked.iter().map(|c| json!({
