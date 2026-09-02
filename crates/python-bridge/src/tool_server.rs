@@ -29,30 +29,32 @@ pub struct ToolServer {
     pub env: BTreeMap<String, String>,
 }
 
-/// Default ceiling on how long the agent waits for ANY tool-server response.
-///
-/// The Python tools have their own internal deadlines (e.g.
-/// materials_search's timeout_seconds), but without a ceiling a wedged or
-/// looping tool could pin the agent forever.
-///
-/// 60s is the DEFAULT, not a law. It was documented as "generous — it only
-/// fires when something is genuinely broken", and that turned out to be false:
-/// a plain `structure` build for tungsten exceeded it on an ordinary run and
-/// took the following tool call down with it. Legitimate scientific work is
-/// allowed to be slow, so the operator can raise the ceiling — see
-/// [`call_timeout`]. What is never allowed is an unattributable response,
-/// which is why exceeding the ceiling still desynchronizes the handle.
-pub const DEFAULT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often an unbounded call says it is still running. Not a ceiling: the
+/// line is the operator's signal that a tool is slow, and their cue to set
+/// one if they want it.
+pub const CALL_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The operator's response ceiling: `PRISM_TOOL_CALL_TIMEOUT_SECS`, else
-/// [`DEFAULT_CALL_TIMEOUT`].
+/// NONE.
+///
+/// There used to be a 60 s default, documented as "generous — it only fires
+/// when something is genuinely broken". That was false twice over: a plain
+/// `structure` build for tungsten exceeded it on an ordinary run, and on
+/// 2026-09-02 it fired in a live session and took the next call down with it
+/// ("tool server pipe desynchronized") — the only real error of that day.
+/// Legitimate scientific work is allowed to be slow; PRISM imposes no
+/// deadline on it. The operator may. A wedged tool is not silent either: an
+/// unbounded call logs a heartbeat every [`CALL_HEARTBEAT`].
+///
+/// What is never allowed is an unattributable response, which is why a call
+/// that exceeds an OPERATOR-set ceiling still desynchronizes the handle.
 ///
 /// Read per call rather than cached so a long-running session can be retuned
 /// without a restart. A value that is not a positive integer is ignored in
-/// favour of the default: a malformed ceiling must not silently become "no
-/// ceiling" (the agent would hang) or "zero" (every call would fail).
+/// favour of the default: a malformed ceiling must not become "zero" (every
+/// call would fail instantly).
 #[must_use]
-pub fn call_timeout() -> std::time::Duration {
+pub fn call_timeout() -> Option<std::time::Duration> {
     parse_call_timeout(
         std::env::var("PRISM_TOOL_CALL_TIMEOUT_SECS")
             .ok()
@@ -63,13 +65,13 @@ pub fn call_timeout() -> std::time::Duration {
 /// [`call_timeout`]'s decision, separated from the environment so it is
 /// testable without mutating global state.
 #[must_use]
-pub fn parse_call_timeout(raw: Option<&str>) -> std::time::Duration {
+pub fn parse_call_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
     match raw.map(str::trim) {
         Some(value) if !value.is_empty() => match value.parse::<u64>() {
-            Ok(secs) if secs > 0 => std::time::Duration::from_secs(secs),
-            _ => DEFAULT_CALL_TIMEOUT,
+            Ok(secs) if secs > 0 => Some(std::time::Duration::from_secs(secs)),
+            _ => None,
         },
-        _ => DEFAULT_CALL_TIMEOUT,
+        _ => None,
     }
 }
 
@@ -159,7 +161,7 @@ impl ToolServer {
 
 impl ToolServerHandle {
     /// Send a JSON request and read one JSON-line response, waiting at most
-    /// [`call_timeout`] (see [`DEFAULT_CALL_TIMEOUT`] for why a ceiling exists
+    /// [`call_timeout`] (see [`call_timeout`] for why a ceiling exists
     /// and why the operator may raise it).
     pub async fn call(&mut self, request: &Value) -> Result<Value, PythonBridgeError> {
         self.call_with_timeout(request, call_timeout()).await
@@ -176,7 +178,7 @@ impl ToolServerHandle {
     pub async fn call_with_timeout(
         &mut self,
         request: &Value,
-        timeout_dur: std::time::Duration,
+        timeout_dur: Option<std::time::Duration>,
     ) -> Result<Value, PythonBridgeError> {
         if let Some(reason) = self.desynchronized {
             return Err(PythonBridgeError::Desynchronized { reason });
@@ -196,23 +198,30 @@ impl ToolServerHandle {
         }
 
         let mut response_line = String::new();
-        let bytes_read = match tokio::time::timeout(
-            timeout_dur,
-            self.stdout.read_line(&mut response_line),
-        )
-        .await
-        {
-            // The response is still owed on the pipe — a later call would
-            // read THIS call's late response as its own.
-            Err(_elapsed) => {
-                self.desynchronized = Some("timed out with its response still owed on the pipe");
-                return Err(PythonBridgeError::Timeout(timeout_dur));
+        let started = std::time::Instant::now();
+        let read = self.stdout.read_line(&mut response_line);
+        tokio::pin!(read);
+        let outcome = loop {
+            let slice = timeout_dur.unwrap_or(CALL_HEARTBEAT);
+            match tokio::time::timeout(slice, &mut read).await {
+                Ok(result) => break result,
+                Err(_elapsed) if timeout_dur.is_some() => {
+                    self.desynchronized =
+                        Some("timed out with its response still owed on the pipe");
+                    return Err(PythonBridgeError::Timeout(slice));
+                }
+                Err(_elapsed) => tracing::info!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "tool call still running — no ceiling is set (PRISM_TOOL_CALL_TIMEOUT_SECS)"
+                ),
             }
-            Ok(Err(e)) => {
+        };
+        let bytes_read = match outcome {
+            Err(e) => {
                 self.desynchronized = Some("failed mid-read");
                 return Err(e.into());
             }
-            Ok(Ok(n)) => n,
+            Ok(n) => n,
         };
         if bytes_read == 0 {
             self.desynchronized = Some("lost its worker (stdout closed mid-call)");
@@ -431,7 +440,7 @@ for line in sys.stdin:
             "method": "call_tool", "tool": "echo", "args": { "token": "caller-A" },
         });
         let err = worker
-            .call_with_timeout(&slow, std::time::Duration::from_millis(100))
+            .call_with_timeout(&slow, Some(std::time::Duration::from_millis(100)))
             .await
             .expect_err("the 1.5s response cannot beat a 100ms deadline");
         assert!(matches!(err, PythonBridgeError::Timeout(_)), "got: {err}");
@@ -457,6 +466,49 @@ for line in sys.stdin:
         worker.shutdown().await.expect("shutdown worker");
     }
 
+    /// The 60 s default ceiling killed legitimate calls (a tungsten structure
+    /// build; a live session on 2026-09-02). With no operator ceiling a slow
+    /// tool is simply waited for — here a 1.5 s reply against no deadline.
+    #[tokio::test]
+    async fn without_an_operator_ceiling_a_slow_tool_is_waited_for() {
+        let Some(python_bin) = python_executable() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let project = tempfile::tempdir().expect("temp project");
+        let app = project.path().join("app");
+        std::fs::create_dir_all(&app).expect("create app package");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        // Sleeps 1.5s per request, then echoes the request's token.
+        std::fs::write(
+            app.join("tool_server.py"),
+            r#"import json, sys, time
+for line in sys.stdin:
+    request = json.loads(line)
+    time.sleep(1.5)
+    sys.stdout.write(json.dumps({"result": {"token": request.get("args", {}).get("token")}}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .expect("write worker");
+
+        let server = ToolServer {
+            python_bin,
+            project_root: project.path().to_path_buf(),
+            env: BTreeMap::new(),
+        };
+        let mut worker = server.spawn().await.expect("spawn worker");
+        let slow = serde_json::json!({
+            "method": "call_tool", "tool": "echo", "args": { "token": "patient" },
+        });
+        let reply = worker
+            .call_with_timeout(&slow, None)
+            .await
+            .expect("no ceiling: the reply arrives when the tool is done");
+        assert!(reply.to_string().contains("patient"), "{reply}");
+        assert!(!worker.is_desynchronized(), "a slow reply is not a fault");
+    }
+
     /// The ceiling documented itself as only firing "when something is
     /// genuinely broken". A real `structure` build for tungsten exceeded it,
     /// so an operator must be able to raise it. Pinning the default here as
@@ -465,19 +517,18 @@ for line in sys.stdin:
     fn the_operator_can_raise_the_response_ceiling() {
         assert_eq!(
             parse_call_timeout(Some("900")),
-            std::time::Duration::from_secs(900),
-            "an explicit ceiling must be honoured, not clamped to the default"
+            Some(std::time::Duration::from_secs(900)),
+            "an explicit ceiling must be honoured"
         );
         assert_eq!(
             parse_call_timeout(Some("  900  ")),
-            std::time::Duration::from_secs(900),
+            Some(std::time::Duration::from_secs(900)),
             "surrounding whitespace is not a malformed value"
         );
-        assert_eq!(parse_call_timeout(None), DEFAULT_CALL_TIMEOUT);
         assert_eq!(
-            DEFAULT_CALL_TIMEOUT,
-            std::time::Duration::from_secs(60),
-            "the default is 60s; changing it is a deliberate act, not a drift"
+            parse_call_timeout(None),
+            None,
+            "no ceiling unless the operator sets one"
         );
     }
 
@@ -485,7 +536,7 @@ for line in sys.stdin:
     /// forever on a wedged tool) or "zero" (every call would fail instantly).
     /// Both failure modes are worse than ignoring the value.
     #[test]
-    fn a_malformed_ceiling_falls_back_rather_than_disabling_the_bound() {
+    fn a_malformed_ceiling_is_ignored_not_turned_into_zero() {
         for raw in [
             "0",
             "-5",
@@ -497,8 +548,8 @@ for line in sys.stdin:
         ] {
             assert_eq!(
                 parse_call_timeout(Some(raw)),
-                DEFAULT_CALL_TIMEOUT,
-                "{raw:?} must fall back to the default ceiling"
+                None,
+                "{raw:?} must be ignored, leaving no ceiling"
             );
         }
     }
@@ -545,7 +596,7 @@ for line in sys.stdin:
             "method": "call_tool", "tool": "echo", "args": { "token": "caller-A" },
         });
         worker
-            .call_with_timeout(&slow, std::time::Duration::from_millis(100))
+            .call_with_timeout(&slow, Some(std::time::Duration::from_millis(100)))
             .await
             .expect_err("the 1.5s response cannot beat a 100ms deadline");
         assert!(
@@ -566,7 +617,7 @@ for line in sys.stdin:
             "method": "call_tool", "tool": "echo", "args": { "token": "caller-B" },
         });
         let response = worker
-            .call_with_timeout(&fresh, std::time::Duration::from_secs(10))
+            .call_with_timeout(&fresh, Some(std::time::Duration::from_secs(10)))
             .await
             .expect("the replacement child answers");
         assert_eq!(
@@ -632,14 +683,14 @@ for line in sys.stdin:
 
         let request = serde_json::json!({ "method": "call_tool", "tool": "env", "args": {} });
         worker
-            .call_with_timeout(&request, std::time::Duration::from_millis(100))
+            .call_with_timeout(&request, Some(std::time::Duration::from_millis(100)))
             .await
             .expect_err("the 1.5s response cannot beat a 100ms deadline");
         assert!(worker.is_desynchronized());
         assert!(worker.recover().await.expect("respawn the clean worker"));
 
         let response = worker
-            .call_with_timeout(&request, std::time::Duration::from_secs(10))
+            .call_with_timeout(&request, Some(std::time::Duration::from_secs(10)))
             .await
             .expect("the replacement answers");
         assert_eq!(

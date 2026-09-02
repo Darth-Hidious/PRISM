@@ -76,7 +76,7 @@ pub struct ToolServerPoolPolicy {
     /// [`PythonBridgeError::PoolExhausted`]. Queueing briefly is normal (a
     /// full pool is the bound doing its job); waiting forever would turn a
     /// leaked or wedged lane into a silent hang. Default **90s**: one full
-    /// per-call ceiling ([`crate::tool_server::DEFAULT_CALL_TIMEOUT`], 60s)
+    /// per-call ceiling an operator might set (60 s was the old default)
     /// plus margin, so an acquire queued behind one worst-case call still
     /// succeeds, and anything slower surfaces as the named, actionable error
     /// instead of a stall.
@@ -542,7 +542,7 @@ for line in sys.stdin:
                 "args": probe_args("stale-A", 1500),
             });
             let err = lane
-                .call_with_timeout(&request, Duration::from_millis(200))
+                .call_with_timeout(&request, Some(Duration::from_millis(200)))
                 .await
                 .expect_err("the slow call must time out");
             assert!(
