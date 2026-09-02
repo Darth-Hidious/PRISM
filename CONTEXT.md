@@ -30,8 +30,7 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 
 ## State 2026-09-02 01:40
 - `cargo clippy --workspace --all-targets -D warnings`: CLEAN (0 warnings) at `cc94a5dd`.
-- Paper 1 DONE: 0.4995 vs baseline 0.1583 (same paper); 11.3 min. Remaining 19 running (background task b6gzfg3og, ~11 min/paper). See playbook §13.10.
-- End-to-end LitXBench run IN PROGRESS: baseline `out-current` overall F1 0.3789 (19 papers). Outputs → `~/Downloads/prism-gold-eval/harness/out-unmuzzle/` (local, never the repo); scratch store `$SCRATCHPAD/litx/prov.db`; JATS served by `python3 -m http.server 8765` in `harness/jats/`; runner `$SCRATCHPAD/litx/run_rest.sh`; score with `PRISM_OUT_DIR=out-unmuzzle ../.venv/bin/python score.py`.
+- End-to-end LitXBench run DONE 2026-09-02: unmuzzled 0.3625 vs baseline 0.3789 (19 papers, like-for-like, inside run-to-run noise); 4-paper A/B shows reasoning replay cuts malformed tool calls 23→8 at equal F1. Details playbook §13.10. Was: baseline `out-current` overall F1 0.3789 (19 papers). Outputs → `~/Downloads/prism-gold-eval/harness/out-unmuzzle/` (local, never the repo); scratch store `$SCRATCHPAD/litx/prov.db`; JATS served by `python3 -m http.server 8765` in `harness/jats/`; runner `$SCRATCHPAD/litx/run_rest.sh`; score with `PRISM_OUT_DIR=out-unmuzzle ../.venv/bin/python score.py`.
 
 - reasoning-content replay landed (`4e83c197` mechanism, `d5d7fae4` config knob, default OFF). A/B DONE (4 papers): replay cuts malformed tool calls 23→8 (baseline 11), turns/calls down, F1 unchanged, fewer claims (80 vs 105/115). Default stays OFF; owner decision: provider-aware default for z.ai (playbook §13.10).
 
