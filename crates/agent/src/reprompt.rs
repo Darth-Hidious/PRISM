@@ -622,12 +622,14 @@ async fn classify(
             content: Some(CLASSIFIER_SYSTEM.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         ChatMessage {
             role: "user".to_string(),
             content: Some(user_message.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
     let response = match client.chat_with_tools(&messages, &[]).await {
@@ -1497,12 +1499,14 @@ mod tests {
             content: Some(text.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         };
         let user = ChatMessage {
             role: "user".to_string(),
             content: Some("find companies in Poland".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         };
 
         assert!(!has_prior_context(std::slice::from_ref(&user)));

@@ -919,6 +919,7 @@ pub async fn run_paper_agent_sample(
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
             continue;
         };
@@ -1008,6 +1009,7 @@ pub async fn run_paper_agent_sample(
                 ),
                 tool_calls: None,
                 tool_call_id: Some(call.id.clone()),
+                reasoning_content: None,
             });
             sample_trace.tool_calls.push(PaperToolCallTrace {
                 call_id: call.id.clone(),
@@ -1345,12 +1347,14 @@ when done."
             content: Some(system),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         ChatMessage {
             role: "user".to_string(),
             content: Some(format!("Untrusted paper metadata:\n{metadata}")),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ]
 }
@@ -2365,6 +2369,7 @@ fn inject_status_reminder_if_due(
         )),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
 }
 
@@ -3268,6 +3273,7 @@ mod tests {
                 content: text.map(str::to_string),
                 tool_calls: Some(tool_calls),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             usage: Some(UsageInfo {
                 prompt_tokens: usage.0,

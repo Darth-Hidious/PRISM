@@ -2402,6 +2402,7 @@ pub(crate) fn restore_history_and_transcript_from_messages(
                 .get("tool_call_id")
                 .and_then(|v| v.as_str())
                 .map(|value| value.to_string()),
+            reasoning_content: None,
         });
 
         let mut entry = TranscriptEntry::new(role, content);
@@ -10441,6 +10442,7 @@ mod tests {
                 content: Some("old request".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "system".to_string(),
@@ -10450,12 +10452,14 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("new request".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
 
@@ -10476,6 +10480,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -10489,12 +10494,14 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
                 content: Some("fn main() {}".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
             },
         ];
 

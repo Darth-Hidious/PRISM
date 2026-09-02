@@ -918,12 +918,14 @@ mod live {
                 content: Some(BENCHMARK_SYSTEM.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some(user.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ]
     }

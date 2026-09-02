@@ -139,6 +139,7 @@ async fn approval_gate_outcome(
                 content: Some(denied_msg),
                 tool_calls: None,
                 tool_call_id: Some(call_id.to_string()),
+                reasoning_content: None,
             });
             ApprovalGateOutcome::Denied
         }
@@ -2314,6 +2315,7 @@ pub(crate) fn compact_history(history: &mut Vec<ChatMessage>, summary: &str, kee
         content: Some(format!("[Conversation context compacted]\n{summary}")),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
     history.extend(recent);
 }
@@ -2373,6 +2375,7 @@ fn iteration_messages(
         content: Some(preamble.join("\n\n")),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
     messages.extend(history.iter().cloned());
     if let Some(selection) = selected_prompt {
@@ -2381,6 +2384,7 @@ fn iteration_messages(
             content: Some(selection.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     messages
@@ -3142,6 +3146,7 @@ pub async fn run_turn(
                 content: Some(user_message.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
             transcript.append(TranscriptEntry::new("user", user_message));
             history.push(ChatMessage {
@@ -3149,6 +3154,7 @@ pub async fn run_turn(
                 content: Some(refusal.clone()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
             transcript.append(TranscriptEntry::new("assistant", &refusal));
             emit(AgentEvent::TextDelta {
@@ -3206,6 +3212,7 @@ pub(crate) async fn run_turn_inner(
         content: Some(user_message.to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
     transcript.append(TranscriptEntry::new("user", user_message));
 
@@ -3282,6 +3289,7 @@ pub(crate) async fn run_turn_inner(
                 content: Some(hint),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
         crate::reprompt::Preflight::Ask { question, key } => {
@@ -3299,6 +3307,7 @@ pub(crate) async fn run_turn_inner(
                 content: Some(question.clone()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
             transcript.append(TranscriptEntry::new("assistant", question.as_str()));
             let estimated_cost = run_metrics.cost_usd;
@@ -3915,6 +3924,7 @@ pub(crate) async fn run_turn_inner(
                         ),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                     continue;
                 }
@@ -4081,6 +4091,7 @@ pub(crate) async fn run_turn_inner(
                             )),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         });
                         continue;
                     }
@@ -4132,6 +4143,7 @@ pub(crate) async fn run_turn_inner(
                             content: Some(format!("{CAPABILITY_GAP_NOTE}{names}")),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         });
                         continue;
                     }
@@ -4224,6 +4236,7 @@ pub(crate) async fn run_turn_inner(
                     content: Some(error_msg),
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
                 });
                 continue;
             }
@@ -4256,6 +4269,7 @@ pub(crate) async fn run_turn_inner(
                     content: Some(error_msg),
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
                 });
                 continue;
             }
@@ -4287,6 +4301,7 @@ pub(crate) async fn run_turn_inner(
                     content: Some(error_msg),
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
                 });
                 continue;
             }
@@ -4322,6 +4337,7 @@ pub(crate) async fn run_turn_inner(
                     content: Some(denied_msg),
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
                 });
                 continue;
             };
@@ -4354,6 +4370,7 @@ pub(crate) async fn run_turn_inner(
                             content: Some(denied_msg),
                             tool_calls: None,
                             tool_call_id: Some(call_id.clone()),
+                            reasoning_content: None,
                         });
                         continue;
                     }
@@ -4727,6 +4744,7 @@ pub(crate) async fn run_turn_inner(
                     content: Some(advisory),
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
                 });
                 // Advisory, not abort: the streak resets so the model gets a
                 // clear run at whatever it does next rather than being nagged
@@ -4762,6 +4780,7 @@ pub(crate) async fn run_turn_inner(
                     content: Some(abort_msg),
                     tool_calls: None,
                     tool_call_id: Some(call_id.clone()),
+                    reasoning_content: None,
                 });
                 continue;
             }
@@ -4795,6 +4814,7 @@ pub(crate) async fn run_turn_inner(
                         content: Some(abort_msg),
                         tool_calls: None,
                         tool_call_id: Some(call_id.clone()),
+                        reasoning_content: None,
                     });
                     continue;
                 }
@@ -4867,6 +4887,7 @@ pub(crate) async fn run_turn_inner(
                             content: Some(merged_content),
                             tool_calls: None,
                             tool_call_id: Some(call_id.clone()),
+                            reasoning_content: None,
                         });
                         continue;
                     }
@@ -4947,6 +4968,7 @@ pub(crate) async fn run_turn_inner(
                 content: Some(content.clone()),
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
+                reasoning_content: None,
             });
 
             // ── h13. Append to transcript ─────────────────────────
@@ -6548,12 +6570,14 @@ mod tests {
                 content: Some("find alloys".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: Some("now compute the elastic tensor".into()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
         let q = routing_query("find alloys", &history);
@@ -6996,24 +7020,28 @@ mod tests {
                 content: Some("one".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some("two".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
                 content: Some("three".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some("four".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
 
@@ -7257,6 +7285,7 @@ mod tests {
             content: Some("x".to_string()),
             tool_calls: calls.then(Vec::new),
             tool_call_id: id.map(str::to_string),
+            reasoning_content: None,
         };
         // user, assistant(tool_calls), tool, tool, user
         let mut history = vec![
@@ -7852,6 +7881,7 @@ mod tests {
             content: Some("x".repeat(chars)),
             tool_calls: None,
             tool_call_id: Some(call_id.to_string()),
+            reasoning_content: None,
         }
     }
 
@@ -7868,6 +7898,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -7877,6 +7908,7 @@ mod tests {
             content: Some("next".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 

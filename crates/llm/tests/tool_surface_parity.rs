@@ -117,6 +117,7 @@ fn user(text: &str) -> Vec<ChatMessage> {
         content: Some(text.to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }]
 }
 
@@ -621,4 +622,63 @@ async fn reasoning_tokens_never_enter_the_message_content() {
         thinking.contains("let me think"),
         "reasoning still reaches the UI as thinking"
     );
+    assert_eq!(
+        response.message.reasoning_content.as_deref(),
+        Some("let me think about seals"),
+        "reasoning is kept, in its own field"
+    );
+}
+
+/// What goes back on the wire is the operator's call: by default an
+/// assistant turn's reasoning is stripped from the history (some providers
+/// reject the field in input); with `replay_reasoning_content` it is sent as
+/// its own field, never folded into `content`.
+#[tokio::test]
+async fn reasoning_is_replayed_only_when_the_operator_asks() {
+    let sse = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"quote is on line 12\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"noted\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    )
+    .to_string();
+    for replay in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_many(
+            listener,
+            vec![(200, sse.clone()), (200, sse.clone())],
+        ));
+        let mut cfg = config(format!("http://127.0.0.1:{port}/v1"));
+        cfg.replay_reasoning_content = replay;
+        let client = LlmClient::new(cfg);
+        let mut history = user("where is the quote?");
+        let first = client
+            .chat_with_tools_streaming(&history, &[], |_, _| {})
+            .await
+            .expect("first turn");
+        history.push(first.message.clone());
+        history.extend(user("and the value?"));
+        let _second = client
+            .chat_with_tools_streaming(&history, &[], |_, _| {})
+            .await
+            .expect("second turn");
+        let bodies = server.await.unwrap();
+        let assistant = &bodies[1]["messages"][1];
+        assert_eq!(assistant["role"], "assistant", "{assistant}");
+        assert_eq!(
+            assistant["content"], "noted",
+            "content is the answer alone: {assistant}"
+        );
+        if replay {
+            assert_eq!(
+                assistant["reasoning_content"], "quote is on line 12",
+                "the operator asked for replay: {assistant}"
+            );
+        } else {
+            assert!(
+                assistant.get("reasoning_content").is_none(),
+                "off by default: {assistant}"
+            );
+        }
+    }
 }

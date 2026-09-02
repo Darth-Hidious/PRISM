@@ -165,6 +165,7 @@ async fn marc27_turn_recovers_when_the_provider_rejects_tool_schemas() {
         content: Some("What is the melting point of titanium?".to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
 
     let resp = client

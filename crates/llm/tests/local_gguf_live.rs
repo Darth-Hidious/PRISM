@@ -117,6 +117,7 @@ async fn embedded_gguf_streams_real_token_pieces() {
         content: Some("Reply with exactly one short greeting.".to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
     let mut streamed = String::new();
     let response = client
@@ -155,6 +156,7 @@ async fn pinned_gemma_manifest_template_and_generation_proof() {
         content: Some("Reply with one word: READY".to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
 
     let identity = match client.local_model_identity().await.unwrap() {
@@ -231,6 +233,7 @@ async fn embedded_gguf_multistep_turn_uses_all_production_meta_tools() {
         ),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
     let first = client
         .chat_with_tools_streaming(&messages, &tools, |piece, is_reasoning| {
@@ -264,6 +267,7 @@ async fn embedded_gguf_multistep_turn_uses_all_production_meta_tools() {
         content: Some(first_result.to_string()),
         tool_calls: None,
         tool_call_id: Some(first_call[0].id.clone()),
+        reasoning_content: None,
     });
     let mut second_streamed = String::new();
     let second = client
@@ -305,6 +309,7 @@ async fn embedded_gguf_multistep_turn_uses_all_production_meta_tools() {
         content: Some(second_result.to_string()),
         tool_calls: None,
         tool_call_id: Some(second_call[0].id.clone()),
+        reasoning_content: None,
     });
     let final_response = client
         .chat_with_tools_streaming(&follow_up, &tools, |piece, is_reasoning| {

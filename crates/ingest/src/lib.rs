@@ -230,6 +230,7 @@ mod tests {
             // 0 = never. PRISM imposes no deadline on a thinking model; the
             // operator opts in. See `default_read_idle_timeout_secs`.
             read_idle_timeout_secs: 0,
+            replay_reasoning_content: false,
             context_window: None,
             max_output_tokens: None,
             credential_kind: None,

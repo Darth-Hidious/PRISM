@@ -187,6 +187,13 @@ pub struct LlmConfig {
     /// `0` (default) = never; only an operator may bound a thinking model.
     #[serde(default = "default_read_idle_timeout_secs")]
     pub read_idle_timeout_secs: u64,
+    /// Replay each assistant turn's `reasoning_content` in the history sent
+    /// on later requests. Thinking providers that want their reasoning back
+    /// (z.ai's "preserved thinking") do better multi-turn tool use with it;
+    /// others (DeepSeek's API, for one) reject the field in input with a 400.
+    /// Off by default; the operator turns it on per endpoint.
+    #[serde(default)]
+    pub replay_reasoning_content: bool,
     /// Ask this endpoint NOT to deliberate, for callers whose answer is a
     /// short verdict rather than a derivation.
     ///
@@ -375,6 +382,7 @@ impl Default for LlmConfig {
             // answers to one question, and the harsher one always wins.
             timeout_secs: default_timeout_secs(),
             read_idle_timeout_secs: default_read_idle_timeout_secs(),
+            replay_reasoning_content: false,
             context_window: None,
             max_output_tokens: None,
             streaming: true,
@@ -449,6 +457,12 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCallResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// The model's reasoning for this turn, when the provider streamed it
+    /// (`reasoning_content` deltas). Kept apart from `content`, which is the
+    /// answer and is what gets stored. Whether it goes back on the wire in
+    /// later turns is `LlmConfig::replay_reasoning_content`'s decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -822,6 +836,7 @@ impl LlmClient {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             usage: Some(usage),
             generation_metrics: Some(generation_metrics),
@@ -851,6 +866,7 @@ impl LlmClient {
                     content: (!generation.text.is_empty()).then_some(generation.text),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 usage: Some(usage),
                 generation_metrics: Some(generation_metrics),
@@ -884,6 +900,7 @@ impl LlmClient {
                     content: Some(text.to_string()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 usage: Some(usage),
                 generation_metrics: Some(generation_metrics),
@@ -921,6 +938,7 @@ impl LlmClient {
                         content: Some(content.to_string()),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                     usage: Some(usage),
                     generation_metrics: Some(generation_metrics),
@@ -1005,6 +1023,22 @@ impl LlmClient {
             .to_string()
     }
 
+    /// The history as it goes on the wire. `reasoning_content` is stripped
+    /// from every message unless the operator asked for it to be replayed —
+    /// providers disagree about whether the field may appear in input.
+    fn wire_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        if self.config.replay_reasoning_content {
+            return messages.to_vec();
+        }
+        messages
+            .iter()
+            .map(|m| ChatMessage {
+                reasoning_content: None,
+                ..m.clone()
+            })
+            .collect()
+    }
+
     /// Generate text with a system + user message.
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
         let local_messages = [
@@ -1013,12 +1047,14 @@ impl LlmClient {
                 content: Some(system.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some(user.to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
         if let Some(local) = self.local_backend() {
@@ -1225,6 +1261,7 @@ impl LlmClient {
                     content: Some(text),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 usage: None,
                 generation_metrics: None,
@@ -1236,7 +1273,7 @@ impl LlmClient {
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages,
+            "messages": self.wire_messages(messages),
             "temperature": 0.1,
         });
         let mut body = self.with_operator_output_cap(body, est);
@@ -1272,6 +1309,7 @@ impl LlmClient {
                 content,
                 tool_calls,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             usage,
             generation_metrics: None,
@@ -1412,6 +1450,7 @@ impl LlmClient {
                 )),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }];
             let serialized = serde_json::to_value(&messages)?;
             let generation = local
@@ -2189,6 +2228,7 @@ impl LlmClient {
                         Some(tool_calls)
                     },
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 usage: usage_info,
                 generation_metrics: None,
@@ -2200,7 +2240,7 @@ impl LlmClient {
             + Self::estimate_tokens(&serde_json::to_value(tools).unwrap_or_default());
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages,
+            "messages": self.wire_messages(messages),
             "temperature": 0.1,
             "stream": true,
             // Without this an OpenAI-shaped server streams `"usage": null` on
@@ -2223,6 +2263,7 @@ impl LlmClient {
         let resp = self.send_retrying("llm.stream", &url, &body, false).await?;
 
         // Parse SSE stream
+        let mut full_reasoning = String::new();
         let mut full_content = String::new();
         let mut native_calls = ToolCallAccumulator::default();
         let mut usage_info: Option<UsageInfo> = None;
@@ -2273,6 +2314,7 @@ impl LlmClient {
                         // chain-of-thought re-entering history as its public
                         // reply, under a comment saying it must never.
                         on_delta(delta, true);
+                        full_reasoning.push_str(delta);
                     }
 
                     // Extract streaming tool calls
@@ -2310,6 +2352,11 @@ impl LlmClient {
                 },
                 tool_calls,
                 tool_call_id: None,
+                reasoning_content: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
             },
             usage: usage_info,
             generation_metrics: None,

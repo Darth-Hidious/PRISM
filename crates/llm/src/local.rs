@@ -1860,12 +1860,14 @@ mod tests {
                 content: Some("system prompt".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("Find a material tool, then recall its result.".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -1879,12 +1881,14 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
                 content: Some("materials_search is available".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
             },
         ];
         let rendered = render_messages(&messages, &tools, Some(NativeToolProtocol::Lfm)).unwrap();
@@ -1928,12 +1932,14 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
                 content: Some("found".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_7".to_string()),
+                reasoning_content: None,
             },
         ];
         let rendered = render_gemma_messages(&messages).unwrap();

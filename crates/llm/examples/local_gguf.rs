@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         content: Some(prompt),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
     let mut token_index = 0_usize;
     let response = client
