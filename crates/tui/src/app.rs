@@ -1964,9 +1964,41 @@ impl App {
                 self.workspace_expanded = !self.workspace_expanded;
             }
             KeyCode::Char('t') => self.toggle_object_tag(),
+            KeyCode::Char('o') => self.open_selected_structure_panel(),
+            // `m` marks the open panel's reference from the workspace too —
+            // the home screen routes workspace keys here before the global
+            // `m` handler runs, and a reader on the Structures tab has the
+            // panel they just opened with `o` in front of them.
+            KeyCode::Char('m') => self.toggle_mark_for_panel(),
             KeyCode::Char('?') => self.open_which_key(),
             KeyCode::Char('i') | KeyCode::Esc => self.focus = Focus::Input,
             _ => {}
+        }
+    }
+
+    /// `o` on a structure row opens its panel — the drawn structure — pinned,
+    /// so a keyboard reader reaches what a pointer reaches (macOS Terminal
+    /// reports no pointer motion at all). `m` then marks it for the agent.
+    fn open_selected_structure_panel(&mut self) {
+        if self.workspace_tab != WorkspaceTab::Structures {
+            return;
+        }
+        let StructuresStoreState::Ready(rows) = &self.structure_store else {
+            return;
+        };
+        let Some(structure) = rows.get(self.workspace_selected) else {
+            return;
+        };
+        let id = structure
+            .cache_ref
+            .clone()
+            .unwrap_or_else(|| format!("cache://{}/structure.cif", structure.cache_key));
+        // Anchored at the top of the transcript column: the panel has no
+        // pointer cell to sit beside, and the top-left is where a reader's
+        // eye goes when a key opens something.
+        self.open_reference_panel(&id, 2, 2);
+        if let Some(panel) = &mut self.ref_panel {
+            panel.pinned = true;
         }
     }
 
@@ -4015,6 +4047,21 @@ impl App {
     /// toast rather than a fabricated pane.
     fn handle_home_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The workspace sidebar is drawn beside the home screen, and Tab is
+        // how a keyboard reader reaches it. While it has focus its keys are
+        // its keys — `j`, `k`, `o` are not "start typing". Without this the
+        // sidebar was unreachable by keyboard until a first message was sent.
+        if key.code == KeyCode::Tab && !ctrl {
+            self.focus = match self.focus {
+                Focus::Input => Focus::Workspace,
+                _ => Focus::Input,
+            };
+            return;
+        }
+        if self.focus == Focus::Workspace {
+            self.handle_workspace_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Enter => self.close_home(),
             KeyCode::Char('c') if ctrl => self.close_home(),
@@ -6284,6 +6331,55 @@ pub fn clamp_scroll(offset: u16, content_height: u16, viewport: u16) -> u16 {
 mod tests {
     use super::*;
     use crate::backend::FakeScenario;
+
+    /// A keyboard reader reaches what a pointer reaches: on the Structures
+    /// tab, `o` opens the selected structure's panel pinned and `m` marks it.
+    #[test]
+    fn o_opens_the_selected_structure_from_the_keyboard_and_m_marks_it() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "0f7a1c2e9b4d4a6f",
+                "cache_ref": "cache://0f7a1c2e9b4d4a6f/structure.cif",
+                "tool": "structure_import",
+                "formula": "TiAl",
+                "n_atoms": 2,
+                "composition": {"Al": 1, "Ti": 1},
+                "source": "user_import",
+            })],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        app.focus = Focus::Workspace;
+        app.workspace_selected = 0;
+        // A frame wide enough for the sidebar: below that width the workspace
+        // is not drawn and its focus is handed back to the input.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        assert!(
+            matches!(app.structure_store, StructuresStoreState::Ready(ref rows) if rows.len() == 1),
+            "the listed structure must be in the store: {:?}",
+            app.structure_store
+        );
+        assert_eq!(app.focus, Focus::Workspace);
+        assert_eq!(app.workspace_tab, WorkspaceTab::Structures);
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let id = "cache://0f7a1c2e9b4d4a6f/structure.cif";
+        assert!(
+            app.ref_panel
+                .as_ref()
+                .is_some_and(|p| p.pinned && p.id == id),
+            "o must open the selected structure's panel, pinned: {:?}",
+            app.ref_panel.as_ref().map(|p| p.id.clone())
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(
+            app.marks.is_marked(id),
+            "m must mark the open structure for the agent"
+        );
+    }
 
     fn app_with_open_structure_panel(id: &str) -> App {
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
