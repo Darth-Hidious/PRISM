@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 /// Three structures with distinct provenance (a user import, a database
 /// lookup, a relaxation) — different epistemic objects, each carrying its
 /// own `source` verbatim.
-const FAKE_TIAL_CACHE_KEY: &str =
+pub(crate) const FAKE_TIAL_CACHE_KEY: &str =
     "0f7a1c2e9b4d4a6f8c1e3b5d7f9a0c2e4b6d8f0a1c3e5b7d9f0a2c4e6b8d0f1a";
 const FAKE_MGB2_CACHE_KEY: &str =
     "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809";
@@ -33,7 +33,7 @@ const FAKE_W_CACHE_KEY: &str = "9e8d7c6b5a4938271605f4e3d2c1b0a99e8d7c6b5a493827
 
 /// The CIF served for [`FAKE_TIAL_CACHE_KEY`] — small, deterministic, and
 /// shaped like ASE's CIF writer output (what `structure_import` stores).
-const FAKE_TIAL_CIF: &str = "\
+pub(crate) const FAKE_TIAL_CIF: &str = "\
 data_TiAl
 _chemical_formula_sum \"Al1 Ti1\"
 _chemical_name_common \"TiAl gamma\"

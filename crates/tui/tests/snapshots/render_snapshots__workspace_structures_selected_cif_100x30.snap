@@ -1,6 +1,5 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 1663
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -14,18 +13,18 @@ expression: rendered
 │ref:         cache://0f7a1c2e9b4d4a6f/structure.cif             │ │
 │tool:        structure_import                                   │ │
 │                                                                │ │
-│── CIF ──                                                       │ │
-│data_TiAl                                                       │ │
-│_chemical_formula_sum "Al1 Ti1"                                 │ │
-│_chemical_name_common "TiAl gamma"                              │ │
-│_cell_length_a 4.005                                            │ │
-│_cell_length_b 4.005                                            │ │
-│_cell_length_c 4.171                                            │ │
-│_cell_angle_alpha 90.0                                          │ │
-│_cell_angle_beta 90.0                                           │ │
-│_cell_angle_gamma 90.0                                          │ │
-│_symmetry_space_group_name_H-M "P 4/m m m"                      │ │
-│loop_                                                           │ │
+│── structure ──                                                 │ │
+│Al1 Ti1  ·  2 sites listed (asymmetric unit; symmetry not expand│ │
+│space group  P 4/m m m                                          │ │
+│a b c  4.005  4.005  4.171 Å                                    │ │
+│α β γ  90.00°  90.00°  90.00°                                   │ │
+│species      Ti×1  Al×1                                         │ │
+│                                                                │ │
+│                                                                │ │
+│                   ⢀⣀⣀⣀⣀⠤⠤⠤⠤⠒⠒⠒⠒⠊⠉⢹⠑⠒⠢⠤⢄⣀⡀                      │ │
+│    ⣀⣀⡠⠤⠤⠤⠤⠒⠒⠒⠒⠉⠉⠉⠉⠁              ⢸      ⠈⠉⠑⠒⠢⠤⣀⣀               │ │
+│    ⡇⠉⠉⠒⠒⠤⠤⣀⣀                     ⢸              ⠉⠉⠒⠒⢤⣤⣀        │ │
+│    ⡇        ⠉⠉⠒⠢⠤⢄⣀⡀             ⢸ ⣀⣀⣀⣀⡠⠤⠤⠤⠤⠒⠒⠒⠒⠉⠉⠉⠉⠁ ⢸        │ │
 └────────────────────────────────────────────────────────────────┘ │
 ┌ Prompt ────────────────────────────────────────────────────────┐ │
 │type a message…  (press i to focus · ↵ send)                    │ │

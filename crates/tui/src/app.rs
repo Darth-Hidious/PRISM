@@ -774,6 +774,9 @@ pub struct App {
     /// Opened by `pointer_moved`, never by the renderer — resolution is a
     /// side effect and the renderer only gets `&App`.
     pub ref_panel: Option<RefPanel>,
+    /// Parsed structures by cache key, filled when a CIF arrives on either
+    /// lane. The panel draws from this; the CIF text is what it came from.
+    pub structure_views: std::collections::HashMap<String, crate::structure_view::StructureView>,
     /// Resolved reference bodies, by id. A second hover is instant; the first
     /// is what pays. Nothing is fetched until a pointer actually lands.
     ref_cache: std::collections::HashMap<String, RefPanelState>,
@@ -930,6 +933,7 @@ impl App {
             references: crate::refs::ReferenceRegistry::default(),
             selected_line: None,
             ref_panel: None,
+            structure_views: std::collections::HashMap::new(),
             ref_cache: std::collections::HashMap::new(),
             ref_fetch: None,
             ref_fetch_rpc_id: None,
@@ -2302,7 +2306,11 @@ impl App {
 
     /// Detail body for the CIF view: the meta PRISM actually has (missing
     /// fields read `unknown` — never invented), then the verbatim CIF text.
-    fn structure_detail_body(structure: &WorkspaceStructure, cif_body: String) -> String {
+    fn structure_detail_body(
+        structure: &WorkspaceStructure,
+        view: Option<&crate::structure_view::StructureView>,
+        cif_body: String,
+    ) -> String {
         let atoms = structure
             .n_atoms
             .map(|count| count.to_string())
@@ -2319,6 +2327,24 @@ impl App {
         }
         if let Some(name) = &structure.name {
             body.push_str(&format!("name:        {name}\n"));
+        }
+        if let Some(view) = view {
+            body.push_str("\n── structure ──\n");
+            for line in view.header_lines() {
+                body.push_str(&line);
+                body.push('\n');
+            }
+            let legend: Vec<String> = view.legend().into_iter().map(|(l, _)| l).collect();
+            body.push_str(&format!("species      {}\n\n", legend.join("  ")));
+            for line in view.text_render(60, 14) {
+                body.push_str(&line);
+                body.push('\n');
+            }
+            body.push('\n');
+            for line in view.site_lines(40) {
+                body.push_str(&line);
+                body.push('\n');
+            }
         }
         body.push_str("\n── CIF ──\n");
         body.push_str(&cif_body);
@@ -4918,6 +4944,14 @@ impl App {
                 cif,
                 truncated,
             } => {
+                // Both lanes draw from the parsed structure; a CIF that does
+                // not parse stays text, and the log says why.
+                match crate::structure_view::parse_cif(&cif) {
+                    Ok(view) => {
+                        self.structure_views.insert(cache_key.clone(), view);
+                    }
+                    Err(why) => tracing::debug!(%cache_key, "CIF not drawable: {why}"),
+                }
                 // A hover fetch and the Enter-key detail view are separate
                 // lanes. Try the hover lane FIRST: if this response answers a
                 // pointer, it is not the detail view's and must not fall
@@ -4944,7 +4978,11 @@ impl App {
                 // allocation held by the TUI (see StructurePolicy::cif_bytes).
                 let cif_body = format_cif_body(&cif, self.structure_policy.cif_bytes, truncated);
                 let body = match self.structure_row(&cache_key) {
-                    Some(structure) => Self::structure_detail_body(&structure, cif_body),
+                    Some(structure) => Self::structure_detail_body(
+                        &structure,
+                        self.structure_views.get(&cache_key),
+                        cif_body,
+                    ),
                     None => cif_body,
                 };
                 if self.view.open {

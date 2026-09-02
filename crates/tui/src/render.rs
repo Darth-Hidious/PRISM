@@ -22,7 +22,9 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::Canvas;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, Widget, Wrap,
 };
@@ -5211,10 +5213,158 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// Opens BESIDE the word, never over it: a panel covering the thing you are
 /// pointing at makes you move the pointer to read it, which closes it. Clamped
 /// into the frame so a reference near the right edge still shows its body.
+/// The cache key a structure reference names, whichever form the id takes
+/// (`cache://KEY` or `cache://KEY/structure.cif`).
+fn structure_panel_key(id: &str) -> Option<&str> {
+    id.strip_prefix("cache://")
+        .map(|k| k.split('/').next().unwrap_or(k))
+        .filter(|k| !k.is_empty())
+}
+
+/// The reference panel for a structure: what the formula stands for, drawn.
+/// Header (formula, sites, space group, cell), the species legend, the unit
+/// cell with its atoms as a Braille projection, the site table, and the same
+/// provenance sections the text panel shows.
+fn draw_structure_panel(
+    f: &mut Frame,
+    app: &App,
+    panel: &crate::app::RefPanel,
+    view: &crate::structure_view::StructureView,
+    area: Rect,
+) {
+    let t = app.theme();
+    let width = 64u16.min(area.width.saturating_sub(2)).max(24);
+    let header = view.header_lines();
+    let legend = view.legend();
+    let sites = view.site_lines(6);
+    let prov = app.reference_provenance(&panel.id);
+    let canvas_h: u16 = 12;
+    let top_len = u16::try_from(1 + header.len() + 1).unwrap_or(6);
+    let bottom_len = u16::try_from(sites.len() + 1 + prov.sources.len().min(3) + 2).unwrap_or(8);
+    let height = (top_len + canvas_h + bottom_len + 2).min(area.height.max(3));
+
+    let (px, py) = panel.anchor;
+    let x = if px + width < area.x + area.width {
+        px
+    } else {
+        (area.x + area.width).saturating_sub(width)
+    };
+    let y = if py + 1 + height < area.y + area.height {
+        py + 1
+    } else {
+        py.saturating_sub(height)
+    };
+    let rect = Rect::new(x, y.max(area.y), width, height);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.reference))
+        .title(" × esc ")
+        .style(Style::default().bg(t.panel));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let iw = usize::from(inner.width);
+
+    let mut top: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled(
+            panel.label.clone(),
+            Style::default()
+                .fg(t.reference)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  structure", Style::default().fg(t.muted)),
+    ])];
+    for h in &header {
+        top.push(Line::from(Span::styled(
+            clip(h, iw),
+            Style::default().fg(t.text),
+        )));
+    }
+    let mut legend_spans: Vec<Span<'static>> = Vec::new();
+    for (label, color) in &legend {
+        legend_spans.push(Span::styled("● ", Style::default().fg(*color)));
+        legend_spans.push(Span::styled(
+            format!("{label}  "),
+            Style::default().fg(t.text),
+        ));
+    }
+    top.push(Line::from(legend_spans));
+    let top_h = u16::try_from(top.len()).unwrap_or(6).min(inner.height);
+    f.render_widget(
+        Paragraph::new(top),
+        Rect::new(inner.x, inner.y, inner.width, top_h),
+    );
+
+    let cy = inner.y + top_h;
+    let ch = canvas_h.min(inner.height.saturating_sub(top_h));
+    if ch > 0 {
+        let (xb, yb) = view.bounds();
+        f.render_widget(
+            Canvas::default()
+                .marker(Marker::Braille)
+                .background_color(t.panel)
+                .x_bounds(xb)
+                .y_bounds(yb)
+                .paint(|ctx| view.paint(ctx, t.dim)),
+            Rect::new(inner.x, cy, inner.width, ch),
+        );
+    }
+
+    let by = cy + ch;
+    let bh = inner.height.saturating_sub(top_h + ch);
+    if bh > 0 {
+        let mut bottom: Vec<Line<'static>> = Vec::new();
+        for s in &sites {
+            bottom.push(Line::from(Span::styled(
+                clip(s, iw),
+                Style::default().fg(t.text),
+            )));
+        }
+        bottom.push(Line::from(Span::styled(
+            "sources",
+            Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+        )));
+        for src in prov.sources.iter().take(3) {
+            bottom.push(Line::from(Span::styled(
+                format!("  {}", clip(src, iw.saturating_sub(2))),
+                Style::default().fg(t.dim),
+            )));
+        }
+        bottom.push(Line::from(Span::styled(
+            "ontology",
+            Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+        )));
+        bottom.push(Line::from(Span::styled(
+            format!("  {}", clip(&prov.placement, iw.saturating_sub(2))),
+            Style::default().fg(t.dim),
+        )));
+        f.render_widget(
+            Paragraph::new(bottom),
+            Rect::new(inner.x, by, inner.width, bh),
+        );
+    }
+
+    let mut map = app.hit_map.borrow_mut();
+    map.push(
+        Rect::new(rect.x + 1, rect.y, 7.min(rect.width.saturating_sub(1)), 1),
+        HitTarget::RefPanelClose,
+    );
+}
+
 fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     let Some(panel) = &app.ref_panel else {
         return;
     };
+    if matches!(panel.kind, Some(crate::refs::RefKind::Structure))
+        && let Some(key) = structure_panel_key(&panel.id)
+        && let Some(view) = app.structure_views.get(key)
+    {
+        draw_structure_panel(f, app, panel, view, area);
+        return;
+    }
     let t = app.theme();
     let width = 56u16.min(area.width.saturating_sub(2)).max(12);
     let body: Vec<String> = match &panel.state {
@@ -5352,6 +5502,58 @@ mod tests {
     use super::*;
     use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
+
+    /// Hovering a structure shows the structure: formula, cell, space group,
+    /// the atoms in the cell as a drawing — not the CIF text it came from.
+    #[test]
+    fn a_structure_reference_panel_draws_the_cell_not_the_cif() {
+        use crate::backend::{FAKE_TIAL_CACHE_KEY, FAKE_TIAL_CIF};
+        let mut app = App::new(BackendHandle::fake(FakeScenario::StructuresCache));
+        app.structure_views.insert(
+            FAKE_TIAL_CACHE_KEY.to_string(),
+            crate::structure_view::parse_cif(FAKE_TIAL_CIF).expect("the fake CIF parses"),
+        );
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Ready(FAKE_TIAL_CIF.to_string()),
+            anchor: (10, 4),
+            pinned: true,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("Al1 Ti1"), "formula missing:\n{screen}");
+        assert!(
+            screen.contains("P 4/m m m"),
+            "space group missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("a b c"),
+            "cell parameters missing:\n{screen}"
+        );
+        assert!(screen.contains("Ti×1"), "legend missing:\n{screen}");
+        assert!(
+            screen
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "no cell drawn:\n{screen}"
+        );
+        assert!(
+            !screen.contains("_cell_length_a"),
+            "the CIF text must not be what the reader sees:\n{screen}"
+        );
+    }
 
     /// The workspace tab strip must never be wider than the panel it sits in.
     /// The panel paragraph wraps, so a single column of overflow does not
