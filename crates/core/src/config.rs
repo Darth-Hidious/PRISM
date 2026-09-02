@@ -179,6 +179,12 @@ pub struct LlmSection {
     /// exist on this path until this field.
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// Replay each assistant turn's `reasoning_content` in later requests.
+    /// Thinking providers that want their reasoning back (z.ai's preserved
+    /// thinking) do better multi-turn tool use with it; others reject the
+    /// field in input. Off unless the operator says so for this endpoint.
+    #[serde(default)]
+    pub replay_reasoning_content: bool,
 }
 
 impl std::fmt::Debug for LlmSection {
@@ -209,6 +215,7 @@ impl Default for LlmSection {
             api_key_env: default_api_key_env(),
             timeout_secs: default_llm_timeout(),
             max_output_tokens: None,
+            replay_reasoning_content: false,
         }
     }
 }
@@ -757,6 +764,18 @@ mod tests {
         assert_eq!(config.ontology.llm_provider, "platform");
         assert_eq!(config.indexer.mode, "platform");
         assert_eq!(config.searcher.mode, "platform");
+    }
+
+    #[test]
+    fn replay_reasoning_content_is_off_unless_the_operator_says_so() {
+        let config: NodeConfig = toml::from_str("[llm]\nmodel = \"m\"\n").unwrap();
+        assert!(!config.llm.replay_reasoning_content, "default is off");
+        let config: NodeConfig =
+            toml::from_str("[llm]\nreplay_reasoning_content = true\n").unwrap();
+        assert!(
+            config.llm.replay_reasoning_content,
+            "the operator turned it on"
+        );
     }
 
     #[test]

@@ -6651,6 +6651,7 @@ pub(crate) fn build_llm_config(
         // diagnostic tells users to raise. It existed in the message but not
         // in the config until 2026-08-10.
         max_output_tokens: llm.max_output_tokens,
+        replay_reasoning_content: llm.replay_reasoning_content,
         // THE MODEL'S REAL CONTEXT WINDOW, resolved from the registry that
         // already knows it rather than left `None`.
         //
@@ -20749,6 +20750,28 @@ data:\n\
         let cfg = build_llm_config(dir.path(), Some("http://127.0.0.1:9"), Some("m"), None)
             .expect("config must build");
         assert_eq!(cfg.max_output_tokens, None);
+    }
+
+    /// The replay knob is the operator's, per endpoint: it lives in the
+    /// project's `[llm]` section and must reach the client config verbatim.
+    #[test]
+    fn replay_reasoning_content_reaches_the_client_config_from_the_llm_section() {
+        let _guard = boot_checks::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _restore_home = HomeGuard::isolated(home.path());
+        let off = project_with_ontology_config("[llm]\nmodel = \"m\"\n");
+        let cfg = build_llm_config(off.path(), Some("http://127.0.0.1:9"), Some("m"), None)
+            .expect("config builds");
+        assert!(!cfg.replay_reasoning_content, "off by default");
+        let on = project_with_ontology_config("[llm]\nreplay_reasoning_content = true\n");
+        let cfg = build_llm_config(on.path(), Some("http://127.0.0.1:9"), Some("m"), None)
+            .expect("config builds");
+        assert!(
+            cfg.replay_reasoning_content,
+            "the operator turned it on for this project"
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
