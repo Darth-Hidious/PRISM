@@ -1478,6 +1478,35 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
                 },
             );
         }
+        // A structure row's formula is a handle. Its cells answer as the
+        // reference (pushed after the row, so they win the newest-first
+        // lookup); the rest of the row still selects. Pointing at the formula
+        // opens the structure panel; the row keeps keyboard parity.
+        if app.workspace_tab == WorkspaceTab::Structures
+            && let StructuresStoreState::Ready(structures) = &app.structure_store
+        {
+            // Prefix ("▸ " or "  ") and glyph ("◇ ") precede the formula.
+            let lead = u16::try_from(2 + ObjectKind::Structure.glyph().width() + 1).unwrap_or(4);
+            for (line, entry) in rows.iter() {
+                let (Some(top), Some(structure)) = (screen_row(*line), structures.get(*entry))
+                else {
+                    continue;
+                };
+                let id = structure
+                    .cache_ref
+                    .clone()
+                    .unwrap_or_else(|| format!("cache://{}/structure.cif", structure.cache_key));
+                let formula = clip(structure.formula_display(), w.saturating_sub(6));
+                let width = u16::try_from(formula.width()).unwrap_or(0);
+                if width == 0 || lead >= inner.width {
+                    continue;
+                }
+                map.push(
+                    Rect::new(inner.x + lead, top, width.min(inner.width - lead), 1),
+                    HitTarget::Reference { id },
+                );
+            }
+        }
     }
 
     let para = Paragraph::new(lines)
@@ -2213,9 +2242,11 @@ fn build_structures_lines(
                 format!("{} ", ObjectKind::Structure.glyph()),
                 Style::default().fg(t.dim),
             ),
+            // The formula is a handle — hover or click opens the structure —
+            // so it wears the one colour that means "I can open this".
             Span::styled(
                 clip(structure.formula_display(), w.saturating_sub(6)).to_string(),
-                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+                crate::refs::mark_style(t).add_modifier(Modifier::BOLD),
             ),
         ]));
 
@@ -5538,6 +5569,60 @@ mod tests {
     use super::*;
     use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
+
+    /// A structure listed in the workspace is a handle: its formula is
+    /// registered as a reference and its cells answer the pointer as one,
+    /// so hovering or clicking the formula opens the structure — while the
+    /// rest of the row still selects.
+    #[test]
+    fn structure_rows_are_openable_handles() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "0f7a1c2e9b4d4a6f",
+                "cache_ref": "cache://0f7a1c2e9b4d4a6f/structure.cif",
+                "tool": "structure_import",
+                "formula": "TiAl",
+                "n_atoms": 2,
+                "composition": {"Al": 1, "Ti": 1},
+                "source": "user_import",
+            })],
+        });
+        let id = "cache://0f7a1c2e9b4d4a6f/structure.cif";
+        assert!(
+            app.references.get(id).is_some(),
+            "a listed structure must be registered as a reference"
+        );
+        app.workspace_tab = WorkspaceTab::Structures;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Find the formula on screen, then ask the hit map what its cells are.
+        let mut found = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find("TiAl") {
+                let col = u16::try_from(row[..byte].chars().count()).unwrap();
+                found = Some((col, y));
+                break;
+            }
+        }
+        let (col, row) = found.expect("the formula is on screen");
+        let map = app.hit_map.borrow();
+        match map.at(col, row) {
+            Some(HitTarget::Reference { id: hit }) => assert_eq!(hit, id),
+            other => panic!("the formula's cells must answer as the reference, got {other:?}"),
+        }
+        match map.at(col.saturating_sub(3), row) {
+            Some(HitTarget::WorkspaceRow { .. }) => {}
+            other => panic!("the rest of the row must still select, got {other:?}"),
+        }
+    }
 
     /// What the reader marked stays in view: the workspace shows a strip
     /// naming each marked handle, and the open panel says it is marked.

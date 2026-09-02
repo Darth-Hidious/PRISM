@@ -4992,6 +4992,27 @@ impl App {
                 if let StructuresStoreState::Ready(rows) = &self.structure_store {
                     self.workspace_selected =
                         self.workspace_selected.min(rows.len().saturating_sub(1));
+                    // Every listed structure is a handle: its formula in the
+                    // workspace, its cache ref anywhere in the transcript, and
+                    // the short form the renderer prints all resolve to it. A
+                    // structure the reader can see but not open would be an
+                    // orange word that lies.
+                    let handles: Vec<(String, String)> = rows
+                        .iter()
+                        .map(|r| {
+                            let id = r.cache_ref.clone().unwrap_or_else(|| {
+                                format!("cache://{}/structure.cif", r.cache_key)
+                            });
+                            (id, r.formula_display().to_string())
+                        })
+                        .collect();
+                    for (id, formula) in handles {
+                        self.references.insert(crate::refs::ReferenceEntry {
+                            tokens: vec![formula, id.clone(), crate::refs::id_sigil(&id)],
+                            id,
+                            kind: crate::refs::RefKind::Structure,
+                        });
+                    }
                 } else {
                     self.workspace_selected = 0;
                 }
