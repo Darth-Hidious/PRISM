@@ -89,7 +89,7 @@
   },
   "license": "CC-BY-4.0",
   "license_url": "https://creativecommons.org/licenses/by/4.0/legalcode",
-  "materialised_sha256": "a23f61b52e1fd8b9b3dc222742d7072ba575f9c58ec401b9c24a17eeef947313",
+  "materialised_sha256": "970cb908534189e16a3a8b3e730d45d8f3ae2a3efe6711e255e0f0fb2bfdfb30",
   "modifications": "PRISM selected and deterministically re-serialized the required declarations and named ancestry, and added the documented OWL-entailed ChemicalElement-to-ChemicalSpecies subclass conclusion. The upstream source files are not modified.",
   "ontology_iri": "https://w3id.org/emmo/emmo",
   "prefixes": {

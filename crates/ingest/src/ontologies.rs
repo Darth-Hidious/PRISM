@@ -1923,23 +1923,54 @@ mod tests {
     /// endpoint declarations at all. Silence, never a guessed edge: the
     /// read surface must not invent connectivity the ontology never stated.
     #[test]
-    fn relations_without_declared_endpoints_touch_nothing() {
+    fn declared_endpoints_are_the_only_edges() {
+        // The bundled EMMO 1.0.3 subset now carries the domains and ranges its
+        // source declares (transcribed verbatim): four of its five object
+        // properties are typed, `isPartOf` is not — upstream declares none.
         let emmo = EmmoOntology;
+        let typed: Vec<&str> = emmo
+            .ontology_properties()
+            .iter()
+            .filter(|r| !r.domains.is_empty() && !r.ranges.is_empty())
+            .filter_map(|r| r.pref_label.as_deref())
+            .collect();
+        for name in [
+            "hasChemicalSpecies",
+            "manufacturedWith",
+            "hasConstituent",
+            "hasProperty",
+        ] {
+            assert!(typed.contains(&name), "{name} is typed upstream: {typed:?}");
+        }
+        let is_part_of = emmo
+            .ontology_properties()
+            .iter()
+            .find(|r| r.pref_label.as_deref() == Some("isPartOf"))
+            .expect("isPartOf is declared");
         assert!(
-            emmo.ontology_properties()
-                .iter()
-                .all(|relation| relation.domains.is_empty() && relation.ranges.is_empty()),
-            "this pin assumes the bundled EMMO declares no endpoints; if it \
-             gained some, assert the new edges instead of deleting this test"
+            is_part_of.domains.is_empty() && is_part_of.ranges.is_empty(),
+            "isPartOf declares no endpoints upstream and must not be given any here"
         );
-        let material = emmo
-            .class_for_label("Material")
-            .expect("Material is declared")
-            .iri
-            .clone();
+        // Edges come from declared endpoints only — never a guess. Substance is
+        // hasChemicalSpecies's declared domain, so it is touched; a class no
+        // property names is touched by nothing.
+        let substance =
+            Iri::new("https://w3id.org/emmo#EMMO_bc37743c_37c4_4ec7_9d58_d1aae5567352".to_string())
+                .unwrap();
+        assert!(emmo.class(&substance).is_some(), "Substance is declared");
+        let symbolic =
+            Iri::new("https://w3id.org/emmo#EMMO_057e7d57_aff0_49de_911a_8861d85cef40".to_string())
+                .unwrap();
+        assert!(emmo.class(&symbolic).is_some(), "Symbolic is declared");
         let set = OntologySet::single(Arc::new(emmo));
         assert!(
-            set.relations_touching(&material).is_empty(),
+            set.relations_touching(&substance)
+                .iter()
+                .any(|r| r.relation.pref_label.as_deref() == Some("hasChemicalSpecies")),
+            "a declared domain is an edge"
+        );
+        assert!(
+            set.relations_touching(&symbolic).is_empty(),
             "no declared endpoints must mean no edges — never a guess"
         );
     }

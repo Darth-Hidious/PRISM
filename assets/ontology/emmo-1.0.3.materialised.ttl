@@ -279,6 +279,8 @@
 
 <https://w3id.org/emmo#EMMO_7aec67a4_fb96_47c6_80a3_8fea557b2cbb> a owl:ObjectProperty
     ; skos:prefLabel "hasChemicalSpecies"@en
+    ; rdfs:domain <https://w3id.org/emmo#EMMO_bc37743c_37c4_4ec7_9d58_d1aae5567352>
+    ; rdfs:range <https://w3id.org/emmo#EMMO_cbcf8fe6_6da6_49e0_ab4d_00f737ea9689>
     .
 
 <https://w3id.org/emmo#EMMO_a8bd7094_6b40_47af_b1f4_a69d81a3afbd> a owl:ObjectProperty
@@ -287,13 +289,44 @@
 
 <https://w3id.org/emmo#EMMO_b1c64830_45c7_499d_9a72_68f517d57823> a owl:ObjectProperty
     ; skos:prefLabel "manufacturedWith"@en
+    ; rdfs:domain <https://w3id.org/emmo#EMMO_86ca9b93_1183_4b65_81b8_c0fcd3bba5ad>
+    ; rdfs:range <https://w3id.org/emmo#EMMO_a4d66059_5dd3_4b90_b4cb_10960559441b>
     .
 
 <https://w3id.org/emmo#EMMO_dba27ca1_33c9_4443_a912_1519ce4c39ec> a owl:ObjectProperty
     ; skos:prefLabel "hasConstituent"@en
+    ; rdfs:domain <https://w3id.org/emmo#EMMO_90ae56e4_d197_49b6_be1a_0049e4756606>
+    ; rdfs:range <https://w3id.org/emmo#EMMO_ceaaf9f7_fd11_424b_8fda_9afa186af186>
     .
 
 <https://w3id.org/emmo#EMMO_e1097637_70d2_4895_973f_2396f04fa204> a owl:ObjectProperty
     ; skos:prefLabel "hasProperty"@en
+    ; rdfs:domain <https://w3id.org/emmo#EMMO_6f5af708_f825_4feb_a0d1_a8d813d3022b>
+    ; rdfs:range <https://w3id.org/emmo#EMMO_b7bcff25_ffc3_474e_9ab5_01b1664bd4ba>
     .
 
+# Domain/range classes of the object properties above, transcribed from the
+# EMMO 1.0.3 source (IRIs and labels verbatim); a parent is named only when it
+# is itself in this subset. Nothing here is PRISM's invention.
+
+<https://w3id.org/emmo#EMMO_86ca9b93_1183_4b65_81b8_c0fcd3bba5ad> a owl:Class
+    ; skos:prefLabel "ManufacturedProduct"@en
+    .
+
+<https://w3id.org/emmo#EMMO_a4d66059_5dd3_4b90_b4cb_10960559441b> a owl:Class
+    ; skos:prefLabel "Manufacturing"@en
+    .
+
+<https://w3id.org/emmo#EMMO_90ae56e4_d197_49b6_be1a_0049e4756606> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_e04884d9_eda6_487e_93d5_7722d7eda96b>
+    ; skos:prefLabel "Object"@en
+    .
+
+<https://w3id.org/emmo#EMMO_ceaaf9f7_fd11_424b_8fda_9afa186af186> a owl:Class
+    ; skos:prefLabel "Constituent"@en
+    .
+
+<https://w3id.org/emmo#EMMO_6f5af708_f825_4feb_a0d1_a8d813d3022b> a owl:Class
+    ; rdfs:subClassOf <https://w3id.org/emmo#EMMO_b803f122_4acb_4064_9d71_c1e5fd091fc9>
+    ; skos:prefLabel "Referent"@en
+    .

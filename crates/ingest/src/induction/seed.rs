@@ -551,6 +551,37 @@ mod tests {
         );
     }
 
+    /// The shipped EMMO subset used to declare no domain or range for any of
+    /// its five object properties — the materialiser had dropped them — so
+    /// the built-in base seeded zero relations. Four are typed upstream
+    /// (`chemistry.ttl`, `manufacturing.ttl`, `persistence.ttl`,
+    /// `semiotics.ttl`) and are now transcribed verbatim; `isPartOf` declares
+    /// none upstream and stays untyped, said so.
+    #[test]
+    fn the_shipped_emmo_seeds_its_typed_relations() {
+        let base: Arc<dyn Ontology> = Arc::new(crate::ontologies::EmmoOntology);
+        let seed = seed_from(&[base]).expect("the built-in base seeds");
+        let labels: Vec<&str> = seed.relations.iter().map(|r| r.label.as_str()).collect();
+        for expected in [
+            "hasChemicalSpecies",
+            "manufacturedWith",
+            "hasConstituent",
+            "hasProperty",
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "{expected} must seed as a typed relation: {labels:?}"
+            );
+        }
+        assert!(
+            seed.notes
+                .iter()
+                .any(|n| n.contains("\"isPartOf\"") && n.contains("declares no domain or range")),
+            "isPartOf is untyped upstream and must be reported as such: {:?}",
+            seed.notes
+        );
+    }
+
     #[test]
     fn a_seeded_class_keeps_its_base_identity_and_its_parent() {
         let base: Arc<dyn Ontology> = Arc::new(Fake {
