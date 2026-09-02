@@ -54,13 +54,15 @@ coverage.xml
 *.pot
 # Sphinx documentation
 docs/_build/
-# Generated docs (plans, designs) — but allow committed harness docs
-docs/
+# Generated docs (plans) — but allow committed harness docs. `docs/*` (not
+# `docs/`) so the re-includes below can fire: git never descends into an
+# excluded directory, and with `docs/` every doc in the repo had to be
+# force-added while these five lines silently did nothing.
+docs/*
 !docs/tui-mcp-verification.md
 !docs/examples/
-!docs/examples/**
 !docs/templates/
-!docs/templates/**
+!docs/design/
 # PyBuilder
 target/
 # Jupyter Notebook
