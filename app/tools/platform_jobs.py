@@ -273,6 +273,9 @@ def create_platform_jobs_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_platform_jobs,
+        # Read/cancel dispatcher: status and events are pure reads. Silence
+        # means GATED now, so declare it.
+        requires_approval=False,
     ))
 
     registry.register(Tool(

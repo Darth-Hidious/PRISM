@@ -385,6 +385,9 @@ def create_calphad_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_calphad,
+        # Catalog/IO dispatcher: no compute, no spend. Silence means GATED
+        # now, so declare it.
+        requires_approval=False,
     ))
 
     registry.register(Tool(

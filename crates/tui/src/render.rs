@@ -2687,20 +2687,22 @@ fn scroll_window(sel: usize, total: usize, viewport: usize) -> (usize, usize) {
 }
 
 fn fmt_time(ts: f64) -> String {
-    // Render a unix timestamp as a short UTC date-time. Best-effort.
+    // Render a unix timestamp as the reader's LOCAL wall time. The old
+    // hand-rolled calendar (epoch days ÷ 365 / ÷ 30, day = days % 30)
+    // ignored leap years, month lengths, and the time zone: session
+    // 20260902_141501 rendered as "2026-09-29 12:15" — 27 days late and 2
+    // hours off in UTC+2. chrono already does the civil calendar and the
+    // zone conversion; let it.
     if ts <= 0.0 {
         return String::new();
     }
-    let secs = ts as i64;
-    let days = secs / 86400;
-    let (y, mo, d) = (
-        (days / 365) + 1970,
-        ((days % 365) / 30) + 1,
-        (days % 30) + 1,
-    );
-    let hh = (secs % 86400) / 3600;
-    let mm = (secs % 3600) / 60;
-    format!("{y}-{mo:02}-{d:02} {hh:02}:{mm:02}")
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 // ── View panel (tabbed / scrollable results) ──────────────────────
@@ -5469,5 +5471,40 @@ mod tests {
         // A single glyph wider than the whole width still emits (no infinite
         // loop, nothing dropped).
         assert_eq!(wrap_plain("🚀", 1), vec!["🚀"]);
+    }
+
+    /// Session-picker dates must be the LOCAL wall time of the session's
+    /// `created_at`. The hand-rolled calendar (epoch days ÷ 365/30, day =
+    /// days % 30) showed 20260902_141501 as "2026-09-29 12:15" — 27 days
+    /// into the future and, because it printed UTC, 2 hours off in a UTC+2
+    /// locale. A fixed timestamp must round-trip: parse the displayed
+    /// string back as a local time and recover the same epoch.
+    #[test]
+    fn session_picker_dates_are_local_wall_time_of_created_at() {
+        use chrono::TimeZone;
+        // 2026-09-02T12:15:01Z — 14:15 local in UTC+2, matching the
+        // session id 20260902_141501 from the bug report.
+        let ts = 1_788_351_301.0_f64;
+        let shown = fmt_time(ts);
+        let naive = chrono::NaiveDateTime::parse_from_str(&shown, "%Y-%m-%d %H:%M")
+            .unwrap_or_else(|e| panic!("picker date {shown:?} is not a parseable date-time: {e}"));
+        let back = chrono::Local
+            .from_local_datetime(&naive)
+            .single()
+            .unwrap_or_else(|| panic!("picker date {shown:?} does not exist in the local zone"));
+        assert!(
+            (back.timestamp() - ts as i64).abs() < 60,
+            "displayed {shown:?} round-trips to epoch {} but the session was \
+             created at {} — {}s off",
+            back.timestamp(),
+            ts as i64,
+            back.timestamp() - ts as i64,
+        );
+    }
+
+    #[test]
+    fn fmt_time_is_empty_for_missing_timestamps() {
+        assert_eq!(fmt_time(0.0), "");
+        assert_eq!(fmt_time(-5.0), "");
     }
 }

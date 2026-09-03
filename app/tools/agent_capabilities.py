@@ -81,4 +81,7 @@ def create_agent_capabilities_tool(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_agent_capabilities,
+        # Read-only self-discovery: spends nothing, writes nothing. Silence
+        # means GATED now, so declare it.
+        requires_approval=False,
     ))

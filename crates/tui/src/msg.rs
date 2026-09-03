@@ -55,6 +55,15 @@ pub enum AgentMsg {
     /// `ui.session.changed` — authoritative current session after clear,
     /// resume, or fork.
     SessionChanged { session_id: String },
+    /// `ui.transcript.snapshot` — the restored transcript after a resume.
+    /// The backend cleared its history and reloaded it from the session
+    /// log; this carries the restored lines so the TUI can replace its
+    /// own (live-events-only) transcript buffer wholesale. Without it a
+    /// resumed session renders as an empty chat.
+    TranscriptSnapshot {
+        session_id: String,
+        messages: Vec<Value>,
+    },
 
     // ── Workspace artifacts ─────────────────────────────────────────
     /// Healthy response from the session-scoped artifact store. An empty
@@ -370,6 +379,18 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 session_id: session_id.to_string(),
             },
             _ => AgentMsg::Unknown(msg.clone()),
+        },
+        "ui.transcript.snapshot" => AgentMsg::TranscriptSnapshot {
+            session_id: params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            messages: params
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
         },
 
         // ── Workspace artifacts ─────────────────────────────────────

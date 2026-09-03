@@ -172,6 +172,9 @@ def create_platform_status_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_policy_evaluate,
+        # Read-only policy check: spends nothing, writes nothing. Silence
+        # means GATED now, so declare it.
+        requires_approval=False,
     ))
 
     registry.register(Tool(
@@ -189,6 +192,8 @@ def create_platform_status_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_usage_status,
+        # Read-only usage query. Silence means GATED now, so declare it.
+        requires_approval=False,
     ))
 
     registry.register(Tool(
@@ -207,4 +212,6 @@ def create_platform_status_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_billing_balance,
+        # Read-only billing query. Silence means GATED now, so declare it.
+        requires_approval=False,
     ))

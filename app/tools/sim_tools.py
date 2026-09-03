@@ -893,6 +893,9 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_structure,
+        # Cheap CPU structure ops: spends nothing, does not leave the
+        # machine. Silence means GATED now, so declare it.
+        requires_approval=False,
     ))
 
     # --- Unified: sim_run (2 → 1) ------------------------------------------
@@ -982,6 +985,9 @@ def create_simulation_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_sim_job,
+        # Job mgmt is cheap polling/cleanup. Silence means GATED now, so
+        # declare it.
+        requires_approval=False,
     ))
 
     # --- Standalone (kept) -------------------------------------------------

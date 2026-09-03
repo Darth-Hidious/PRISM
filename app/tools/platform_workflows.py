@@ -211,6 +211,9 @@ def create_platform_workflows_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_platform_workflows,
+        # Read/cancel dispatcher: spends nothing, writes nothing. Silence
+        # means GATED now, so declare it.
+        requires_approval=False,
     ))
 
     registry.register(Tool(

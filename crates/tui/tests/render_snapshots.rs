@@ -1082,6 +1082,18 @@ fn snapshot_view_panel_100x30() {
 /// Snapshot: session picker populated from a fake ui.session.list.
 #[test]
 fn snapshot_session_picker_100x30() {
+    // Picker rows show `created_at` in the reader's LOCAL zone, so the
+    // snapshot pins TZ or it would differ from machine to machine.
+    // Serialized: TZ is process-global and tests run in parallel; no other
+    // snapshot renders a timestamp.
+    static TZ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let tz_guard = TZ_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prev_tz = std::env::var("TZ").ok();
+    // SAFETY: serialized by TZ_LOCK; restored before the guard drops.
+    unsafe { std::env::set_var("TZ", "UTC") };
+
     let mut app = app_with_welcome();
     app.open_sessions();
     app.apply_agent_msg(prism_tui::msg::AgentMsg::SessionList {
@@ -1094,6 +1106,16 @@ fn snapshot_session_picker_100x30() {
     freeze_metrics(&mut app);
 
     let rendered = render_app_to_string(&app, 100, 30);
+
+    // SAFETY: same lock as the set above.
+    unsafe {
+        match prev_tz {
+            Some(value) => std::env::set_var("TZ", value),
+            None => std::env::remove_var("TZ"),
+        }
+    }
+    drop(tz_guard);
+
     assert_no_terminal_controls(&rendered);
     insta::assert_snapshot!("session_picker_100x30", rendered);
 }

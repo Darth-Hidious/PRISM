@@ -799,6 +799,30 @@ fn slash_command_routes_to_send_command() {
     assert!(app.messages.iter().any(|m| m.text == "/tools"));
 }
 
+/// `/sessions` typed at the prompt must still open the picker when its list
+/// arrives — the stale-reply guard keys off the pending-fetch flag, so the
+/// typed path has to raise that flag when it sends.
+#[test]
+fn typed_sessions_command_still_opens_the_picker() {
+    let mut app = test_app();
+    app.input.insert_str("/sessions");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.session_picker.loading,
+        "typed /sessions marks the fetch pending"
+    );
+    app.handle_backend_message(&json!({
+        "jsonrpc": "2.0",
+        "method": "ui.session.list",
+        "params": {"sessions": [{"session_id": "sess-1", "turn_count": 2}]},
+    }));
+    assert!(!app.session_picker.loading, "the reply completes the fetch");
+    assert!(
+        app.session_picker.open,
+        "the reply to a typed /sessions opens the picker"
+    );
+}
+
 #[test]
 fn esc_blurs_from_input_to_chat() {
     let mut app = test_app();
@@ -1520,6 +1544,11 @@ fn session_list_empty_does_not_open_picker() {
 #[test]
 fn session_list_non_empty_opens_picker() {
     let mut app = test_app();
+    // The list completes a fetch that was actually started — `open_sessions`
+    // or `/sessions` typed at the prompt marks it pending. A list with no
+    // pending fetch is a stale reply and must not grab the screen (see
+    // `picking_a_session_keeps_the_picker_closed_against_a_stale_list`).
+    app.session_picker.loading = true;
     app.apply_agent_msg(AgentMsg::SessionList {
         sessions: vec![
             json!({"session_id": "s1"}),
