@@ -168,6 +168,9 @@ pub const COUNT_W: usize = 5;
 /// `2026-09-02 14:10 UTC` — a fetch time to the minute, zone said.
 pub const FETCHED_W: usize = 20;
 const FLOOR: usize = 8;
+/// An origin column narrower than this cuts words in half, so below it the
+/// origin is drawn full-width under its descriptor instead.
+const MIN_INLINE_ORIGIN: usize = 24;
 
 #[must_use]
 pub fn layout(width: usize, badge: &str) -> Layout {
@@ -264,18 +267,30 @@ pub fn reason_line(badge: &str, class: Option<EvidenceClass>) -> String {
 
 pub const DESCRIPTOR_NAME_W: usize = 22;
 pub const DESCRIPTOR_VALUE_W: usize = 12;
-pub const DESCRIPTOR_UNIT_W: usize = 12;
+// Wide enough for the units materials tools actually emit —
+// "electrons/atom" (14) and "dimensionless" (13) are the long ones. At 12
+// the first rendered as "electrons/a…", which is not a unit anybody can
+// read, and a clipped unit misstates what the number is.
+pub const DESCRIPTOR_UNIT_W: usize = 14;
 
 /// The descriptor card's header line.
 #[must_use]
-pub fn descriptor_header() -> String {
-    format!(
-        "{} {} {} {}",
+pub fn descriptor_header(width: usize) -> String {
+    let head = format!(
+        "{} {} {}",
         fit("DESCRIPTOR", DESCRIPTOR_NAME_W),
         fit("VALUE", DESCRIPTOR_VALUE_W),
-        fit("UNIT", DESCRIPTOR_UNIT_W),
-        "COMPUTED FROM"
-    )
+        fit("UNIT", DESCRIPTOR_UNIT_W)
+    );
+    // Only advertise the column when the origin is actually drawn in one.
+    // Narrower than that, the origin gets its own full-width lines below each
+    // descriptor, and a "COMPUTED FROM" heading there pointed at nothing and
+    // spilled its second word onto a line of its own.
+    if width.saturating_sub(head.width() + 1) >= MIN_INLINE_ORIGIN {
+        format!("{head} COMPUTED FROM")
+    } else {
+        head.trim_end().to_string()
+    }
 }
 
 /// One descriptor as lines: name, value, unit, and the origin the tool gave
@@ -290,7 +305,18 @@ pub fn descriptor_lines(row: &DescriptorRow, width: usize) -> Vec<String> {
         fit(&row.value, DESCRIPTOR_VALUE_W),
         fit(row.unit.as_deref().unwrap_or("—"), DESCRIPTOR_UNIT_W)
     );
-    let room = width.saturating_sub(lead.width()).max(FLOOR);
+    // A column narrower than this cannot hold a source name without cutting
+    // words in half — "Takeuchi & Inoue (2005) pair table" became
+    // "(2005) pai". Below it the origin gets the full width on its own lines
+    // instead, indented under the descriptor it belongs to.
+    const BLOCK_INDENT: usize = 4;
+    let inline_room = width.saturating_sub(lead.width());
+    let inline = inline_room >= MIN_INLINE_ORIGIN;
+    let room = if inline {
+        inline_room
+    } else {
+        width.saturating_sub(BLOCK_INDENT).max(FLOOR)
+    };
     let origin = row
         .origin
         .as_deref()
@@ -313,19 +339,20 @@ pub fn descriptor_lines(row: &DescriptorRow, width: usize) -> Vec<String> {
     if !current.is_empty() {
         chunks.push(current);
     }
-    let indent = " ".repeat(lead.width());
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(n, chunk)| {
-            let chunk = fit(&chunk, room).trim_end().to_string();
-            if n == 0 {
-                format!("{lead}{chunk}")
-            } else {
-                format!("{indent}{chunk}")
-            }
-        })
-        .collect()
+    let indent = " ".repeat(if inline { lead.width() } else { BLOCK_INDENT });
+    let mut lines: Vec<String> = Vec::new();
+    if !inline {
+        lines.push(lead.trim_end().to_string());
+    }
+    for (n, chunk) in chunks.into_iter().enumerate() {
+        let chunk = fit(&chunk, room).trim_end().to_string();
+        if inline && n == 0 {
+            lines.push(format!("{lead}{chunk}"));
+        } else {
+            lines.push(format!("{indent}{chunk}"));
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -400,12 +427,21 @@ mod tests {
             let line = format!("{cell}{rest}");
             assert_eq!(cell.width(), l.source, "{width}: {cell:?}");
             assert!(line.width() <= width.max(60), "{width}: {line:?}");
-            let count_col = header.find("COUNT").unwrap();
-            assert_eq!(
-                &line[count_col..count_col + COUNT_W].trim(),
-                &"1",
-                "{line:?}"
-            );
+            // The header is ASCII, so its byte offset is a column offset;
+            // the row is not — it clips with "…" — so walk columns, never
+            // bytes. Slicing bytes here panicked mid-ellipsis.
+            // The header clips with "…" too at narrow widths, so its byte
+            // offset is not its column offset either. Measure both in columns.
+            let count_col = header[..header.find("COUNT").unwrap()].width();
+            let mut col = 0usize;
+            let mut cell_at_count = String::new();
+            for ch in line.chars() {
+                if col >= count_col && col < count_col + COUNT_W {
+                    cell_at_count.push(ch);
+                }
+                col += ch.to_string().width();
+            }
+            assert_eq!(cell_at_count.trim(), "1", "{line:?}");
             assert!(line.contains("2026-09-02 14:10 UTC"), "{line:?}");
         }
         let l = layout(64, "[YELLOW screening]");
@@ -414,11 +450,21 @@ mod tests {
             cell.trim_end().ends_with('…'),
             "a clipped cell says so: {cell:?}"
         );
+        // At a readable width the phrase is there whole. Squeezed, it is
+        // clipped like any other cell — still said, still visibly clipped,
+        // never blank, and the openable panel carries it in full.
+        let wide = layout(120, "[unclassified]");
         assert!(
-            row_cells(&rows[1], "[unclassified]", l)
+            row_cells(&rows[1], "[unclassified]", wide)
                 .1
                 .contains("kind not reported"),
             "an unreported kind is said, not blank"
+        );
+        let squeezed = row_cells(&rows[1], "[unclassified]", layout(64, "[unclassified]")).1;
+        assert!(squeezed.contains("kind not"), "{squeezed:?}");
+        assert!(
+            squeezed.contains('…'),
+            "a clipped cell says so: {squeezed:?}"
         );
     }
 
@@ -448,8 +494,11 @@ mod tests {
         assert!(vec_lines[0].starts_with("VEC "), "{vec_lines:?}");
         assert!(vec_lines[0].contains("8.0"));
         assert!(vec_lines[0].contains("electrons/atom"));
+        // Rejoin without the wrap indent — that is what the eye does. Joining
+        // the padded lines splits the origin at whatever column it wrapped.
+        let unwrapped = |ls: &[String]| ls.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
         assert!(
-            vec_lines.join(" ").contains("(Guo & Liu 2011)"),
+            unwrapped(&vec_lines).contains("(Guo & Liu 2011)"),
             "the origin must survive whole: {vec_lines:?}"
         );
         assert!(vec_lines.iter().all(|l| l.width() <= 96), "{vec_lines:?}");
@@ -459,7 +508,10 @@ mod tests {
         assert!(narrow.len() > 1, "{narrow:?}");
         assert!(narrow.iter().all(|l| l.width() <= 70), "{narrow:?}");
         assert!(narrow[1].starts_with("    "), "{narrow:?}");
-        assert!(narrow.join(" ").contains("(Guo & Liu 2011)"), "{narrow:?}");
+        assert!(
+            unwrapped(&narrow).contains("(Guo & Liu 2011)"),
+            "{narrow:?}"
+        );
         let omega = descriptor_lines(&d[1], 96);
         assert!(omega[0].contains("not computed"));
         assert!(

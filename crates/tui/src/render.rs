@@ -715,7 +715,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     if !descriptors.is_empty() {
                         lines.push(Line::from(vec![
                             Span::raw(indent),
-                            Span::styled(crate::sources::descriptor_header(), bold),
+                            Span::styled(crate::sources::descriptor_header(width), bold),
                         ]));
                         for row in descriptors {
                             let style = if row.origin.is_some() {
