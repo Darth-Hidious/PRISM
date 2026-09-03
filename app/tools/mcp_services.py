@@ -264,6 +264,9 @@ def create_mcp_services_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_mcp_services,
+        # Read-only (list/get): spends nothing, writes nothing. Silence
+        # means GATED now, so declare it.
+        requires_approval=False,
     ))
 
     registry.register(Tool(

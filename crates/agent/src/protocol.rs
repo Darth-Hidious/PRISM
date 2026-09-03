@@ -2415,6 +2415,36 @@ pub(crate) fn restore_history_and_transcript_from_messages(
     }
 }
 
+/// Publish the restored transcript after a resume. The handlers above
+/// rebuild history and the in-process transcript, but a frontend builds its
+/// own view from live events only — without this snapshot `prism resume`
+/// renders an empty chat ("no activity yet") even though the model can see
+/// the whole conversation. Shape mirrors what was restored: entries with a
+/// non-empty role and content, tool results carrying their tool name.
+fn emit_transcript_snapshot(sid: &str, messages: &[serde_json::Value]) {
+    let restored: Vec<serde_json::Value> = messages
+        .iter()
+        .filter_map(|msg| {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if role.is_empty() || content.is_empty() {
+                return None;
+            }
+            let mut entry = serde_json::json!({ "role": role, "content": content });
+            if let Some(tool_name) = msg.get("tool_name").and_then(|v| v.as_str())
+                && !tool_name.is_empty()
+            {
+                entry["tool_name"] = serde_json::json!(tool_name);
+            }
+            Some(entry)
+        })
+        .collect();
+    emit_notification(
+        "ui.transcript.snapshot",
+        serde_json::json!({ "session_id": sid, "messages": restored }),
+    );
+}
+
 // Compaction replaces older history with a synthetic system summary. `/context`
 // should report from that visible boundary onward because that is the history
 // slice the model actually sees on subsequent turns.
@@ -8416,6 +8446,10 @@ async fn handle_command(
                     restore_history_and_transcript_from_messages(
                         history, transcript, scratchpad, &messages,
                     );
+                    // Ship the restored lines to the frontend; its transcript
+                    // is built from live events and would otherwise stay
+                    // empty ("no activity yet").
+                    emit_transcript_snapshot(&sid, &messages);
                     crate::hooks::set_provenance_ctx(&sid, "");
                     if let Some(runtime_state) = session_store.load_runtime_state(&sid) {
                         let (restored_mode, restored_overrides, restored_plan_state) =
@@ -8474,6 +8508,8 @@ async fn handle_command(
                     restore_history_and_transcript_from_messages(
                         history, transcript, scratchpad, &messages,
                     );
+                    // Same contract as `/resume`: deliver the restored lines.
+                    emit_transcript_snapshot(&sid, &messages);
                     crate::hooks::set_provenance_ctx(&sid, "");
                     if let Some(runtime_state) = session_store.load_runtime_state(&sid) {
                         let (restored_mode, restored_overrides, restored_plan_state) =
@@ -9743,6 +9779,40 @@ async fn run_server_core(
 
 #[cfg(test)]
 mod tests {
+    /// A resume must ship the restored lines to the frontend. A UI
+    /// transcript built from live events alone renders "(no activity
+    /// yet)" without this snapshot — that was the `prism resume` bug.
+    #[test]
+    fn resume_emits_transcript_snapshot_with_restored_lines() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Find me a refractory alloy."}),
+            serde_json::json!({"role": "assistant", "content": "MoNbTaW."}),
+            serde_json::json!({"role": "tool", "tool_name": "calphad", "content": "scan ok"}),
+            serde_json::json!({"role": "system", "content": ""}),
+            serde_json::json!({"content": "no role"}),
+        ];
+        let emitted =
+            super::capture_emissions(|| super::emit_transcript_snapshot("sess-1", &messages));
+        assert_eq!(emitted.len(), 1, "exactly one snapshot notification");
+        let note = &emitted[0];
+        assert_eq!(note["method"].as_str(), Some("ui.transcript.snapshot"));
+        assert_eq!(note["params"]["session_id"].as_str(), Some("sess-1"));
+        let msgs = note["params"]["messages"]
+            .as_array()
+            .expect("messages must be an array");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "entries with an empty role or content are dropped, like the restore itself"
+        );
+        assert_eq!(msgs[0]["role"].as_str(), Some("user"));
+        assert_eq!(msgs[1]["content"].as_str(), Some("MoNbTaW."));
+        assert_eq!(
+            msgs[2]["tool_name"].as_str(),
+            Some("calphad"),
+            "tool results keep their tool name"
+        );
+    }
     /// A materials hit must be identified by its formula, not by "untitled".
     ///
     /// The card's title chain read `title` then `name` — the shape of a web or

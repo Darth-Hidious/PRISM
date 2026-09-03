@@ -3670,6 +3670,10 @@ impl App {
 
     fn close_sessions(&mut self) {
         self.session_picker.open = false;
+        // Closing ends the fetch. A list that arrives after this is stale
+        // data, not a reason to repaint the picker over whatever the user
+        // is looking at now.
+        self.session_picker.loading = false;
     }
 
     pub fn session_filtered_indices(&self) -> Vec<usize> {
@@ -4658,6 +4662,11 @@ impl App {
         }
 
         let dispatched = if trimmed.starts_with('/') {
+            if trimmed == "/sessions" {
+                // The list response opens the picker; mark the fetch pending
+                // so that reply is distinguishable from a stale one.
+                self.session_picker.loading = true;
+            }
             self.backend.send_command(trimmed)
         } else {
             // Inject the standing goal so it actually steers the agent. The
@@ -4757,7 +4766,9 @@ impl App {
                 }
             }
             AgentMsg::SessionList { sessions, .. } => {
-                // Populate the session picker; open it if not already.
+                // Populate the session picker. Open it only if a fetch was
+                // actually pending.
+                let fetch_pending = self.session_picker.loading;
                 self.session_picker.sessions = sessions;
                 self.session_picker.loading = false;
                 self.session_picker.selected = 0;
@@ -4765,12 +4776,58 @@ impl App {
                 if self.session_picker.sessions.is_empty() {
                     self.toast("no saved sessions", ToastKind::Info);
                     self.session_picker.open = false;
-                } else if !self.session_picker.open {
+                } else if fetch_pending && !self.session_picker.open {
+                    // The list completes a fetch we started (`open_sessions`
+                    // or `/sessions` typed at the prompt). A list that
+                    // arrives with no pending fetch is a stale reply to
+                    // something the user already closed — it must not
+                    // resurrect the overlay over the home view.
                     self.session_picker.open = true;
                 }
             }
             AgentMsg::SessionChanged { session_id } => {
                 self.set_session_scope(&session_id);
+            }
+            AgentMsg::TranscriptSnapshot {
+                session_id,
+                messages,
+            } => {
+                // A resume replaced the backend's history wholesale; mirror
+                // it here so the transcript pane shows the restored
+                // conversation instead of staying live-events-only (the bug
+                // that made `prism resume <id>` open "(no activity yet)").
+                self.messages.clear();
+                for msg in messages {
+                    let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+                    let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+                    if content.is_empty() {
+                        continue;
+                    }
+                    let clean = sanitize_for_render(content);
+                    let line_role = match role {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "tool" => Role::Tool,
+                        _ => Role::System,
+                    };
+                    let kind = match line_role {
+                        Role::System => LineKind::Status(clean.clone()),
+                        _ => LineKind::Text,
+                    };
+                    self.push_message(ChatLine {
+                        role: line_role,
+                        text: clean,
+                        kind,
+                    });
+                }
+                if !session_id.trim().is_empty() {
+                    self.set_session_scope(&session_id);
+                }
+                // The restored history is on screen now — the launch screen
+                // has served its purpose and must not sit on top of it.
+                self.close_home();
+                self.session_picker.loading = false;
+                self.auto_scroll = true;
             }
             AgentMsg::ArtifactsListed {
                 session_id,
@@ -6358,6 +6415,161 @@ mod tests {
         app2.handle_key(key(KeyCode::Char('t')));
         assert!(!app2.home.open, "'t' closes the home");
         assert!(app2.tools_window.open, "'t' opens the tools window");
+    }
+
+    /// `prism resume <id>` must land on the restored conversation, not on
+    /// the launch screen: both turns of the resumed session appear in the
+    /// transcript and the Mission Control home is gone. Regression: the
+    /// backend restored history internally but never shipped it to the TUI,
+    /// so resume opened "(no activity yet)" with an empty transcript.
+    #[tokio::test]
+    async fn resume_restores_history_and_leaves_home() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        assert!(app.home.open, "home opens on launch");
+        // Feed the startup notifications (welcome + status) through.
+        for _ in 0..2 {
+            let msg = app.backend.recv().await.expect("startup event");
+            app.handle_backend_message(&msg);
+        }
+
+        app.resume_session("sess-2");
+
+        // Drain the resume events up to (and including) turn complete.
+        loop {
+            let msg = app.backend.recv().await.expect("resume event");
+            let done = msg.get("method").and_then(|m| m.as_str()) == Some("ui.turn.complete");
+            app.handle_backend_message(&msg);
+            if done {
+                break;
+            }
+        }
+
+        // Turn 1 restored.
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m.role, Role::User) && m.text.contains("refractory")),
+            "resumed user turn 1 must be in the transcript"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m.role, Role::Assistant) && m.text.contains("MoNbTaW")),
+            "resumed assistant turn 1 must be in the transcript"
+        );
+        // Turn 2 restored.
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m.role, Role::User) && m.text.contains("melting point")),
+            "resumed user turn 2 must be in the transcript"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m.role, Role::Assistant) && m.text.contains("2630 C")),
+            "resumed assistant turn 2 must be in the transcript"
+        );
+        assert!(
+            !app.home.open,
+            "resumed history must close the launch screen"
+        );
+    }
+
+    /// Closing the session picker must END its fetch state, and a list that
+    /// arrives after the close must not resurrect the overlay. Pre-fix,
+    /// `close_sessions` left `loading` true and the `SessionList` handler
+    /// reopened any closed picker, so a late response painted the picker
+    /// ("fetching sessions…" / the "Esc close" footer) back over whatever the
+    /// user was looking at — the reported "header stays on fetching sessions"
+    /// after the picker closed.
+    #[tokio::test]
+    async fn closing_the_picker_ends_its_fetch_and_a_late_list_does_not_reopen_it() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        for _ in 0..2 {
+            let msg = app.backend.recv().await.expect("startup event");
+            app.handle_backend_message(&msg);
+        }
+
+        // Fetch starts; the picker says "fetching sessions…".
+        app.open_sessions();
+        assert!(app.session_picker.open);
+        assert!(app.session_picker.loading);
+
+        // The user closes the picker before the fetch completes.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.session_picker.open, "Esc closes the picker");
+        assert!(
+            !app.session_picker.loading,
+            "closing the picker must clear its pending-fetch state"
+        );
+
+        // The fetch completes late. The data still lands…
+        loop {
+            let msg = app.backend.recv().await.expect("sessions event");
+            let done = msg.get("method").and_then(|m| m.as_str()) == Some("ui.turn.complete");
+            app.handle_backend_message(&msg);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(app.session_picker.sessions.len(), 3, "the list still lands");
+        assert!(
+            !app.session_picker.open,
+            "a late list must not reopen a picker the user closed"
+        );
+    }
+
+    /// Selecting a session (Enter) closes the picker; a stale or duplicate
+    /// session list arriving afterwards must not repaint the picker over the
+    /// resumed conversation (the "Esc close line left painted over the home
+    /// view" symptom).
+    #[tokio::test]
+    async fn picking_a_session_keeps_the_picker_closed_against_a_stale_list() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        for _ in 0..2 {
+            let msg = app.backend.recv().await.expect("startup event");
+            app.handle_backend_message(&msg);
+        }
+        app.open_sessions();
+        loop {
+            let msg = app.backend.recv().await.expect("sessions event");
+            let done = msg.get("method").and_then(|m| m.as_str()) == Some("ui.turn.complete");
+            app.handle_backend_message(&msg);
+            if done {
+                break;
+            }
+        }
+        assert!(app.session_picker.open);
+        assert!(!app.session_picker.loading, "fetch complete clears loading");
+
+        // Enter selects the focused session and resumes it.
+        app.handle_key(key(KeyCode::Enter));
+        loop {
+            let msg = app.backend.recv().await.expect("resume event");
+            let done = msg.get("method").and_then(|m| m.as_str()) == Some("ui.turn.complete");
+            app.handle_backend_message(&msg);
+            if done {
+                break;
+            }
+        }
+        assert!(!app.session_picker.open, "Enter closes the picker");
+        assert!(
+            !app.home.open,
+            "the resumed history replaced the launch screen"
+        );
+
+        // A stale list races in. It must not paint the picker back over the
+        // resumed session.
+        app.handle_backend_message(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "ui.session.list",
+            "params": {"sessions": [{"session_id": "sess-9", "turn_count": 1}]},
+        }));
+        assert!(
+            !app.session_picker.open,
+            "a stale list must not repaint the picker over the resumed session"
+        );
     }
 
     #[test]

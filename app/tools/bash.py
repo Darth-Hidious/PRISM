@@ -1139,6 +1139,9 @@ def create_bash_tools(registry: ToolRegistry) -> None:
             "additionalProperties": False,
         },
         func=_bash_task,
+        # Read-only inspection (list/read): spends nothing, writes nothing.
+        # Silence means GATED now, so declare it.
+        requires_approval=False,
     ))
     registry.register(Tool(
         name="stop_bash_task",

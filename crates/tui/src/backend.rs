@@ -841,6 +841,41 @@ impl FakeBackend {
             self.notify("ui.turn.complete", serde_json::json!({}));
             return;
         }
+        // Resume: `/resume <id>` → deterministic `ui.session.changed` +
+        // `ui.transcript.snapshot` (two restored turns), mirroring what the
+        // real backend emits after reloading a session log. Bare `/resume`
+        // resolves to the latest fake session, like the backend resolves
+        // "latest".
+        if command == "/resume" || command.starts_with("/resume ") {
+            let reference = command.strip_prefix("/resume").unwrap().trim();
+            let session_id = if reference.is_empty() {
+                "sess-3"
+            } else {
+                reference
+            };
+            self.notify(
+                "ui.session.changed",
+                serde_json::json!({"session_id": session_id}),
+            );
+            self.notify(
+                "ui.transcript.snapshot",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "messages": [
+                        {"role": "user", "content": "Find me a refractory high-entropy alloy."},
+                        {"role": "assistant", "content": "MoNbTaW is a strong candidate from the CALPHAD scan."},
+                        {"role": "user", "content": "What is its melting point?"},
+                        {"role": "assistant", "content": "About 2630 C at equiatomic composition."},
+                    ],
+                }),
+            );
+            self.notify(
+                "ui.text.delta",
+                serde_json::json!({"text": format!("Resumed session {} (4 messages)", session_id)}),
+            );
+            self.notify("ui.turn.complete", serde_json::json!({}));
+            return;
+        }
         // Session picker: `/sessions` → deterministic `ui.session.list`.
         if command == "/sessions" {
             let sessions = vec![
