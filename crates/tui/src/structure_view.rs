@@ -103,6 +103,9 @@ pub struct StructureView {
     /// How many `data_` blocks the file carries. Only the first is read;
     /// the header says so when there are more.
     pub blocks: usize,
+    /// Sites whose occupancy was written a little above one and read as
+    /// full: the label and the value as written, for the header to say.
+    pub over_full: Vec<(String, f64)>,
 }
 
 // ── CIF tokens ──────────────────────────────────────────────────────
@@ -120,10 +123,15 @@ enum Token {
     Tag(String),
     Value(String),
     Loop,
-    /// An unquoted `data_…` / `save_…` token, wherever it stands — a block
-    /// boundary, never data. The lowercased word is kept so a data block can
-    /// be told from a save frame, and named when it cuts a loop.
-    Block(String),
+    /// One of the grammar's reserved words — `data_…`, `save_…`, `global_`,
+    /// `stop_` — wherever it stands: a block boundary, never data. The
+    /// lowercased word is kept so a data block can be told from the rest and
+    /// named when it cuts a loop. `inline` is true when values followed it
+    /// on its own line, which no boundary does and every cut loop row does.
+    Block {
+        name: String,
+        inline: bool,
+    },
 }
 
 /// Tokens, or the reason the file cannot be tokenized. An unterminated text
@@ -162,6 +170,10 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             out.push(Token::Value(body));
             continue;
         }
+        // A reserved word on this line, if one was read, so a value that
+        // follows it on the same line can mark it as a cut loop row rather
+        // than a boundary.
+        let mut block_at: Option<usize> = None;
         let mut chars = line.chars().peekable();
         while let Some(&c) = chars.peek() {
             if c.is_whitespace() {
@@ -176,11 +188,26 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                 let quote = c;
                 chars.next();
                 let mut value = String::new();
+                let mut closed = false;
                 while let Some(ch) = chars.next() {
                     if ch == quote && chars.peek().is_none_or(|n| n.is_whitespace()) {
+                        closed = true;
                         break;
                     }
                     value.push(ch);
+                }
+                // A quote that never closes ran to the end of its line and
+                // was reported as rows that did not add up. It is refused
+                // by line, like a text field that never closes.
+                if !closed {
+                    return Err(format!(
+                        "CIF quoted value opened with {quote} on line {n} is never closed"
+                    ));
+                }
+                if let Some(at) = block_at
+                    && let Some(Token::Block { inline, .. }) = out.get_mut(at)
+                {
+                    *inline = true;
                 }
                 out.push(Token::Value(value));
                 continue;
@@ -194,13 +221,29 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                 chars.next();
             }
             let lower = word.to_ascii_lowercase();
+            // CIF 1.1 reserves five words, case-insensitively: `data_`,
+            // `loop_`, `global_`, `save_`, `stop_`. An unquoted token that
+            // begins with one is that word, wherever it stands.
             if lower == "loop_" {
                 out.push(Token::Loop);
-            } else if lower.starts_with("data_") || lower.starts_with("save_") {
-                out.push(Token::Block(lower));
+            } else if lower.starts_with("data_")
+                || lower.starts_with("save_")
+                || lower == "global_"
+                || lower == "stop_"
+            {
+                block_at = Some(out.len());
+                out.push(Token::Block {
+                    name: lower,
+                    inline: false,
+                });
             } else if let Some(tag) = word.strip_prefix('_') {
                 out.push(Token::Tag(tag.to_ascii_lowercase()));
             } else {
+                if let Some(at) = block_at
+                    && let Some(Token::Block { inline, .. }) = out.get_mut(at)
+                {
+                    *inline = true;
+                }
                 out.push(Token::Value(word));
             }
         }
@@ -212,20 +255,40 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
 /// `.` are the CIF spellings of "not stated" and mean a full site. A number
 /// is honoured as written — `0` is a vacancy, not a full site — and one
 /// outside 0..=1 is refused by name: it is not an occupancy at all.
-fn parse_occupancy(cell: &str, row: &str) -> Result<f64, String> {
+fn parse_occupancy(cell: &str, row: &str) -> Result<Occupancy, String> {
     let cell = cell.trim();
     if cell.is_empty() || cell == "?" || cell == "." {
-        return Ok(1.0);
+        return Ok(Occupancy {
+            value: 1.0,
+            read_as_full: None,
+        });
     }
     match parse_f64(cell) {
-        Some(o) if o.is_finite() && (0.0..=1.0).contains(&o) => Ok(o),
+        Some(o) if o.is_finite() && (0.0..=1.0).contains(&o) => Ok(Occupancy {
+            value: o,
+            read_as_full: None,
+        }),
+        // Deposited CIFs land a little above one routinely — a refinement
+        // that converged at 1.02 is a full site, not a broken file. Read as
+        // full, and said in the header. Two and above is no occupancy.
+        Some(o) if o.is_finite() && o > 1.0 && o < 2.0 => Ok(Occupancy {
+            value: 1.0,
+            read_as_full: Some(o),
+        }),
         Some(o) => Err(format!(
-            "CIF occupancy {o} on row {row:?} is not between 0 and 1"
+            "CIF occupancy {o} on row {row:?} is not an occupancy — it must be between 0 and 1"
         )),
         None => Err(format!(
             "CIF occupancy {cell:?} on row {row:?} is unreadable"
         )),
     }
+}
+
+/// An occupancy as it will be used, with the value it was written as when
+/// that was not the same.
+struct Occupancy {
+    value: f64,
+    read_as_full: Option<f64>,
 }
 
 fn strip_uncertainty(token: &str) -> &str {
@@ -385,6 +448,7 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
     let mut space_group_number = None;
     let mut symops: Vec<String> = Vec::new();
     let mut sites = Vec::new();
+    let mut over_full: Vec<(String, f64)> = Vec::new();
     let mut saw_atom_loop = false;
 
     let mut i = 0;
@@ -420,10 +484,10 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                     // block header wherever it stands — that is the CIF
                     // grammar, not a choice. One inside a loop row cuts the
                     // loop; the cause is named, not reported as a miscount.
-                    if let Some(Token::Block(name)) = tokens.get(i) {
+                    if let Some(Token::Block { name, .. }) = tokens.get(i) {
                         return Err(format!(
                             "CIF loop is cut mid-row by a `{name}` block header — a value that \
-                             begins data_ or save_ must be quoted"
+                             begins data_, save_, global_ or stop_ must be quoted"
                         ));
                     }
                     return Err(format!(
@@ -464,7 +528,18 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                             .map(species_from_label)
                             .unwrap_or_else(|| species_from_label(&label));
                         let occupancy = match occ_col {
-                            Some(c) => parse_occupancy(cell(c), &row.join(" "))?,
+                            Some(c) => {
+                                let read = parse_occupancy(cell(c), &row.join(" "))?;
+                                if let Some(written) = read.read_as_full {
+                                    let who = if label.is_empty() {
+                                        species.clone()
+                                    } else {
+                                        label.clone()
+                                    };
+                                    over_full.push((who, written));
+                                }
+                                read.value
+                            }
                             None => 1.0,
                         };
                         sites.push(Site {
@@ -515,14 +590,26 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
                 }
                 i += 2;
             }
-            Token::Block(name) => {
+            Token::Block { name, inline } => {
+                // A reserved word with values after it on its own line is
+                // not a boundary — no boundary has any — it is a loop row
+                // that began with one. Refused by name, never counted as a
+                // second block the header would then report.
+                if *inline {
+                    return Err(format!(
+                        "CIF loop is cut by a `{name}` block header followed by values on its \
+                         line — a value that begins data_, save_, global_ or stop_ must be quoted"
+                    ));
+                }
                 if name.starts_with("data_") {
                     data_blocks += 1;
                     if data_blocks > 1 {
                         // Count what follows; read none of it.
                         data_blocks += tokens[i + 1..]
                             .iter()
-                            .filter(|t| matches!(t, Token::Block(n) if n.starts_with("data_")))
+                            .filter(|t| {
+                                matches!(t, Token::Block { name: n, .. } if n.starts_with("data_"))
+                            })
                             .count();
                         break;
                     }
@@ -581,6 +668,7 @@ pub fn parse_cif(text: &str) -> Result<StructureView, String> {
         sites,
         symmetry,
         blocks: data_blocks.max(1),
+        over_full,
     })
 }
 
@@ -689,6 +777,9 @@ impl StructureView {
                 self.blocks
             ));
         }
+        for (label, written) in &self.over_full {
+            out.push(format!("occupancy {written} on {label} read as full"));
+        }
         out.push(format!("space group  {sg}"));
         out.push(format!(
             "a b c  {:.3}  {:.3}  {:.3} Å",
@@ -753,8 +844,11 @@ impl StructureView {
                 ys.push(y);
             }
         }
-        for s in &self.sites {
-            let (x, y) = project(cartesian(self.lattice, s.frac));
+        // Only what is drawn sets the bounds. A vacancy far outside the cell
+        // used to stretch the extents while `paint` drew nothing for it, and
+        // the cell collapsed into a corner of its own pane.
+        for p in self.positions().iter().filter(|p| !p.is_vacant()) {
+            let (x, y) = project(cartesian(self.lattice, p.frac));
             xs.push(x);
             ys.push(y);
         }
@@ -1434,10 +1528,24 @@ _cell_length_a 1.0
     #[test]
     fn an_occupancy_outside_zero_to_one_is_refused_and_unknown_is_full() {
         let centre = "0.5  0.5  0.5  1.0000";
-        let over = ASE_P1.replace(centre, "0.5  0.5  0.5  1.2000");
-        let err = parse_cif(&over).expect_err("1.2 is not an occupancy");
+        // A little above one is a refinement that converged there: read as
+        // full, said in the header. Two and above is not an occupancy.
+        let over = ASE_P1.replace(centre, "0.5  0.5  0.5  1.0200");
+        let v = parse_cif(&over).expect("1.02 is a full site");
+        assert_eq!(v.sites[1].occupancy, 1.0);
+        assert_eq!(v.over_full, vec![("Fe2".to_string(), 1.02)]);
         assert!(
-            err.contains("1.2") && err.contains("not between 0 and 1"),
+            v.header_lines()
+                .iter()
+                .any(|l| l == "occupancy 1.02 on Fe2 read as full"),
+            "{:?}",
+            v.header_lines()
+        );
+        assert!(!v.is_disordered(), "a full site is not disorder");
+        let far = ASE_P1.replace(centre, "0.5  0.5  0.5  2.5000");
+        let err = parse_cif(&far).expect_err("2.5 is not an occupancy");
+        assert!(
+            err.contains("2.5") && err.contains("not an occupancy"),
             "{err}"
         );
         for unknown in ["?", "."] {
@@ -1453,5 +1561,76 @@ _cell_length_a 1.0
         let lines = parse_cif(TIAL).expect("parses").header_lines();
         assert_eq!(lines[0], "Al1 Ti1");
         assert_eq!(lines[1], "2 sites");
+    }
+
+    /// A vacancy is nothing, and nothing sets no bounds: a vacancy far
+    /// outside the cell must not stretch the drawing until the cell is a
+    /// dot in a corner. The drawing is byte-identical with and without it.
+    #[test]
+    fn a_vacancy_sets_no_bounds() {
+        let with_far_vacancy = ASE_P1.replace(
+            "  Fe  Fe2       1.0  0.5  0.5  0.5  1.0000\n",
+            "  Fe  Fe2       1.0  0.5  0.5  0.5  1.0000\n  Fe  Fe3       1.0  3.0  3.0  3.0  0.0000\n",
+        );
+        let stretched = parse_cif(&with_far_vacancy).expect("parses");
+        assert_eq!(stretched.vacancies(), 1);
+        assert_eq!(
+            stretched.text_render(60, 14),
+            parse_cif(ASE_P1).expect("parses").text_render(60, 14),
+            "a vacancy must not move the bounds"
+        );
+        assert_eq!(
+            stretched.bounds(),
+            parse_cif(ASE_P1).expect("parses").bounds()
+        );
+    }
+
+    /// The grammar reserves five words. Each is a boundary wherever it
+    /// stands; one followed by values on its own line is a loop row that
+    /// began with it, refused by name — never a second block for the header
+    /// to count.
+    #[test]
+    fn every_reserved_word_is_a_boundary_and_a_cut_row_is_refused_by_name() {
+        for word in ["global_", "stop_", "save_x", "data_oops"] {
+            let cut = TIAL.replace("Al1 Al 0.5", &format!("{word} Al 0.5"));
+            let err = parse_cif(&cut).expect_err(word);
+            assert!(
+                err.contains(&format!("`{word}`")) && err.contains("quoted"),
+                "{word}: {err}"
+            );
+            assert!(!err.contains("data blocks"), "{word}: {err}");
+        }
+        // The same words alone on a line after the loop are boundaries: the
+        // structure before them parses, and nothing is counted as a block.
+        for word in ["global_", "stop_", "save_frame"] {
+            let bounded = format!("{TIAL}{word}\n");
+            let v = parse_cif(&bounded).expect(word);
+            assert_eq!(v.sites.len(), 2, "{word}");
+            assert_eq!(v.blocks, 1, "{word}");
+        }
+        assert!(
+            parse_cif(&format!("{TIAL}data_two\n"))
+                .expect("parses")
+                .blocks
+                == 2
+        );
+    }
+
+    /// A quote that never closes is refused by line, like a text field that
+    /// never closes — not reported as rows that do not add up.
+    #[test]
+    fn an_unterminated_quote_is_refused_by_line() {
+        let cif = TIAL.replace(
+            "_chemical_formula_sum \"Al1 Ti1\"",
+            "_chemical_formula_sum \"Al1 Ti1",
+        );
+        let err = parse_cif(&cif).expect_err("an open quote cannot parse");
+        assert!(
+            err.contains("never closed") && err.contains("line 2"),
+            "{err}"
+        );
+        let apostrophe = TIAL.replace("Al1 Al 0.5", "'Al1 Al 0.5");
+        let err = parse_cif(&apostrophe).expect_err("an open apostrophe cannot parse");
+        assert!(err.contains("line 17"), "{err}");
     }
 }

@@ -5405,11 +5405,9 @@ fn draw_structure_panel(
     for line in legend_lines(&legend, iw, t) {
         top.push(line);
     }
-    let top_h = u16::try_from(top.len()).unwrap_or(6).min(inner.height);
-    f.render_widget(
-        Paragraph::new(top),
-        Rect::new(inner.x, inner.y, inner.width, top_h),
-    );
+    // Not drawn yet: the table below is reserved first, and the top takes
+    // what is left of the height after it — see the layout after `bottom`.
+    let top_total = top.len();
 
     // The bottom — site table, sources, ontology — is what the panel is FOR;
     // it is reserved before the drawing takes a row. In a short terminal the
@@ -5454,6 +5452,16 @@ fn draw_structure_panel(
     )));
     let bottom_needed = u16::try_from(bottom.len()).unwrap_or(u16::MAX);
 
+    // The table first, then the disclosures, then the drawing. The top used
+    // to take every row it wanted before the table was reserved, so below
+    // eleven rows the site table, sources and ontology vanished with no
+    // count. Now the top takes what the table leaves, and whatever of the
+    // top still does not fit is counted in its last row — the same rule the
+    // table follows.
+    let bottom_h = bottom_needed.min(inner.height);
+    let top_h = u16::try_from(top_total)
+        .unwrap_or(u16::MAX)
+        .min(inner.height.saturating_sub(bottom_h));
     let cy = inner.y + top_h;
     let avail = inner.height.saturating_sub(top_h);
     let free_for_canvas = avail.saturating_sub(bottom_needed);
@@ -5463,6 +5471,29 @@ fn draw_structure_panel(
         // One row to say the cell is not drawn — if even one row is free.
         free_for_canvas.min(1)
     };
+    // The top's last row counts what it withholds — and says when the
+    // drawing found no row at all, so its absence is never silent either.
+    let drawing_gone = ch == 0;
+    let shown = usize::from(top_h);
+    if shown > 0 && (top_total > shown || drawing_gone) {
+        let kept = shown - 1;
+        let withheld = top_total.saturating_sub(kept);
+        top.truncate(kept);
+        let mut count = format!("  +{withheld} more lines");
+        if drawing_gone {
+            count.push_str(" · cell not drawn");
+        }
+        top.push(Line::from(Span::styled(
+            count,
+            Style::default().fg(t.muted),
+        )));
+    }
+    if top_h > 0 {
+        f.render_widget(
+            Paragraph::new(top),
+            Rect::new(inner.x, inner.y, inner.width, top_h),
+        );
+    }
     if ch >= crate::structure_view::MIN_CANVAS_ROWS {
         let (xb, yb) = view.balanced_bounds(inner.width, ch);
         f.render_widget(
@@ -6121,6 +6152,44 @@ Al1 Al 0.75 0.75 0.75
             !screen.contains("_cell_length_a"),
             "the CIF text must not be what the reader sees:\n{screen}"
         );
+    }
+
+    /// At every height the table survives: the drawing goes first, then
+    /// says it is not drawn, then the disclosures are counted. Sources and
+    /// ontology are on screen at sixteen, twelve and ten rows, and nothing
+    /// is cut in silence.
+    #[test]
+    fn at_every_height_the_table_survives_and_the_rest_is_counted() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let app = structure_panel_app(
+            FAKE_TIAL_CIF,
+            crate::app::RefPanelState::Ready(FAKE_TIAL_CIF.to_string()),
+            (10, 1),
+        );
+        for height in [16u16, 12, 10] {
+            let rows = screen_rows(&app, 140, height);
+            let text = rows.join("\n");
+            assert!(
+                text.contains("sources") && text.contains("ontology"),
+                "{height} rows: the table must survive:\n{text}"
+            );
+            assert!(
+                !rows.iter().any(|r| r.chars().any(is_braille)),
+                "{height} rows: too short to draw the cell:\n{text}"
+            );
+            assert!(
+                text.contains("cell not drawn"),
+                "{height} rows: the missing drawing must be said:\n{text}"
+            );
+            assert!(
+                text.contains("more lines"),
+                "{height} rows: the disclosures that did not fit must be counted:\n{text}"
+            );
+        }
+        // Twenty rows leave a row for the note itself; the table is whole.
+        let twenty = screen_rows(&app, 140, 20).join("\n");
+        assert!(twenty.contains("cell not drawn — needs"), "{twenty}");
+        assert!(twenty.contains("ontology"), "{twenty}");
     }
 
     /// The systems panel says which graphics protocol is in use and, when

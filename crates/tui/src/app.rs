@@ -5174,23 +5174,29 @@ impl App {
                 // drawing of the same key with it: a cell parsed from a
                 // previous fetch, left under a newer CIF that does not parse,
                 // would be drawn as if it were this file.
-                let not_drawable = match crate::structure_view::parse_cif(&cif) {
+                // A CIF the backend cut at its own byte cap is not a broken
+                // file: its text is incomplete, and a drawing from an earlier
+                // complete read is still the structure. Only a COMPLETE CIF
+                // that does not parse takes the drawing with it.
+                let text = match crate::structure_view::parse_cif(&cif) {
                     Ok(view) => {
                         self.structure_views.insert(cache_key.clone(), view);
-                        None
+                        if truncated {
+                            format!("{cif}\n\n[truncated]")
+                        } else {
+                            cif.clone()
+                        }
                     }
+                    Err(_) if truncated => format!(
+                        "truncated by the backend — the text below is not the whole file; \
+                         the drawing, where there is one, is from the last complete read\n\n\
+                         {cif}\n\n[truncated]"
+                    ),
                     Err(why) => {
                         self.structure_views.remove(&cache_key);
-                        Some(why)
+                        format!("not drawable — {why}\n\n{cif}")
                     }
                 };
-                let mut text = match &not_drawable {
-                    Some(why) => format!("not drawable — {why}\n\n{cif}"),
-                    None => cif.clone(),
-                };
-                if truncated {
-                    text.push_str("\n\n[truncated]");
-                }
                 // A hover fetch and the Enter-key detail view are separate
                 // lanes. Try the hover lane FIRST: if this response answers a
                 // pointer, it is not the detail view's and must not fall
@@ -6745,6 +6751,50 @@ mod tests {
             text.starts_with("not drawable — "),
             "the panel must say why the file is not drawable: {text}"
         );
+    }
+
+    /// A refetch the backend cut at its own byte cap keeps the drawing from
+    /// the last complete read and says the TEXT is truncated; it does not
+    /// blame the file.
+    #[test]
+    fn a_truncated_refetch_keeps_the_drawing_and_says_the_text_is_cut() {
+        use crate::backend::{FAKE_TIAL_CACHE_KEY, FAKE_TIAL_CIF};
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        let id = format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif");
+        let mut panel = app_with_open_structure_panel(&id);
+        std::mem::swap(&mut app.ref_panel, &mut panel.ref_panel);
+        app.ref_fetch = Some((id.clone(), FAKE_TIAL_CACHE_KEY.to_string()));
+        app.apply_agent_msg(AgentMsg::StructureFetched {
+            session_id: "s".to_string(),
+            cache_key: FAKE_TIAL_CACHE_KEY.to_string(),
+            cif: FAKE_TIAL_CIF.to_string(),
+            truncated: false,
+        });
+        assert!(app.structure_views.contains_key(FAKE_TIAL_CACHE_KEY));
+        app.ref_panel.as_mut().expect("panel").state = RefPanelState::Fetching;
+        app.ref_fetch = Some((id.clone(), FAKE_TIAL_CACHE_KEY.to_string()));
+        // The same file, cut mid-loop by the backend's cap.
+        let cut = &FAKE_TIAL_CIF[..FAKE_TIAL_CIF.len() / 2];
+        app.apply_agent_msg(AgentMsg::StructureFetched {
+            session_id: "s".to_string(),
+            cache_key: FAKE_TIAL_CACHE_KEY.to_string(),
+            cif: cut.to_string(),
+            truncated: true,
+        });
+        assert!(
+            app.structure_views.contains_key(FAKE_TIAL_CACHE_KEY),
+            "a truncated refetch must not take the drawing from the last complete read"
+        );
+        let text = match &app.ref_panel.as_ref().expect("panel").state {
+            RefPanelState::Ready(text) => text.clone(),
+            _ => panic!("the panel must show the fetched text"),
+        };
+        assert!(
+            text.starts_with("truncated by the backend"),
+            "the text must be said to be cut, not the file blamed: {text}"
+        );
+        assert!(!text.contains("not drawable"), "{text}");
     }
 
     fn app_with_open_structure_panel(id: &str) -> App {
