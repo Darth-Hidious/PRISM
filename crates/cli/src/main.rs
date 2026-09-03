@@ -1901,6 +1901,18 @@ enum LogSink {
 
 /// The TUI owns the terminal, so its log must not be written to it. Every
 /// other command keeps stderr (the backend's stderr is a captured pipe).
+/// `prism --resume [id]` IS `prism resume [id]`: promote the flag to the
+/// command so one code path serves both spellings. Until this existed the
+/// flag set `PRISM_RESUME_ID` / `PRISM_RESUME_PICKER`, which nothing in the
+/// workspace read, so `prism --resume <id>` silently opened a fresh session.
+fn promote_resume_flag(cli: &mut Cli) {
+    if cli.command.is_none()
+        && let Some(id) = cli.resume.take()
+    {
+        cli.command = Some(Commands::Resume { id });
+    }
+}
+
 fn log_sink_for(command: Option<&Commands>) -> LogSink {
     match command {
         None | Some(Commands::Tui { .. }) | Some(Commands::Resume { .. }) => {
@@ -2049,15 +2061,6 @@ async fn main() -> Result<()> {
     // Top-level flag shortcuts (--resume, --model, --auto-approve) when no
     // subcommand is given: they launch the TUI with the specified options.
     if cli.command.is_none() {
-        if let Some(resume_id) = cli.resume.take() {
-            // `prism --resume` or `prism --resume <id>` → acts like `prism resume`
-            unsafe {
-                match resume_id.as_deref() {
-                    Some(raw_id) => std::env::set_var("PRISM_RESUME_ID", raw_id),
-                    None => std::env::set_var("PRISM_RESUME_PICKER", "1"),
-                }
-            }
-        }
         // --model override: set env var that build_llm_config reads
         if let Some(ref model) = cli.model {
             unsafe {
@@ -2071,6 +2074,7 @@ async fn main() -> Result<()> {
             }
         }
     }
+    promote_resume_flag(&mut cli);
 
     // Tool auto-sync: on every prism invocation, kick off a background
     // task that pulls tool updates from the configured provider marketplace. This is
@@ -22770,5 +22774,34 @@ mod resume_log_sink_tests {
                 "prism resume must not log onto its own screen"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `prism --resume <id>` set an environment variable that nothing in the
+    /// workspace read, so it silently opened a fresh session — the flag was a
+    /// lie. It must become the very command `prism resume` runs, so one code
+    /// path serves both spellings.
+    #[test]
+    fn the_resume_flag_is_the_resume_command() {
+        let mut cli = Cli::parse_from(["prism", "--resume", "20260902_115638_28401e1b"]);
+        promote_resume_flag(&mut cli);
+        assert!(
+            matches!(&cli.command, Some(Commands::Resume { id: Some(id) }) if id == "20260902_115638_28401e1b"),
+            "an id on the flag must resume that session"
+        );
+        let mut picker = Cli::parse_from(["prism", "--resume"]);
+        promote_resume_flag(&mut picker);
+        assert!(
+            matches!(&picker.command, Some(Commands::Resume { id: None })),
+            "the bare flag must open the picker"
+        );
+        let mut plain = Cli::parse_from(["prism"]);
+        promote_resume_flag(&mut plain);
+        assert!(plain.command.is_none(), "no flag, no promotion");
     }
 }
