@@ -45,6 +45,10 @@ pub enum RefKind {
     /// reader sees when they ask "why did it do that?" — and it was the only
     /// coloured word that resolved to nothing.
     Tool,
+    /// A source a tool result named (`provenance://<card>/<row>`): the
+    /// database, engine or file a number came from. Opens the tool's own
+    /// record of that source, held by the app since the result arrived.
+    Provenance,
 }
 
 /// One referenceable thing, and the words that stand for it in prose.

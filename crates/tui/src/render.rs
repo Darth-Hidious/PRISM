@@ -655,6 +655,83 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     }
                     lines.push(Line::from(spans));
                 }
+                // ── Where the data came from, BEFORE the result body ────
+                // Every finished result gets the table: a row per source the
+                // tool named, each an openable reference, or one bold line
+                // saying the tool named none. A descriptor set gets its card
+                // under it, each value beside where it was computed from. A
+                // reader watching a live session must never have to wonder
+                // what they are looking at.
+                if let LineKind::ToolResult {
+                    success: true,
+                    tool_name,
+                    evidence_class,
+                    sources,
+                    descriptors,
+                    ..
+                } = kind
+                {
+                    let indent = "    ";
+                    let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
+                    let width = usize::from(area.width.saturating_sub(4));
+                    let bold = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
+                    if sources.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                crate::sources::not_reported_line(tool_name),
+                                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    } else {
+                        let badge = evidence_token(*evidence_class);
+                        let layout = crate::sources::layout(width, &badge);
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(crate::sources::header_line(layout), bold),
+                        ]));
+                        for row in sources {
+                            let (cell, rest) = crate::sources::row_cells(row, &badge, layout);
+                            let visible = cell.trim_end().to_string();
+                            let pad = " ".repeat(cell.len().saturating_sub(visible.len()));
+                            let end = indent_cols
+                                .saturating_add(u16::try_from(visible.width()).unwrap_or(u16::MAX));
+                            reference_marks.push((lines.len(), indent_cols, end, row.id.clone()));
+                            lines.push(Line::from(vec![
+                                Span::raw(indent),
+                                Span::styled(visible, crate::refs::mark_style(t)),
+                                Span::raw(pad),
+                                Span::styled(rest, Style::default().fg(t.text)),
+                            ]));
+                        }
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                crate::sources::reason_line(&badge, *evidence_class),
+                                Style::default().fg(evidence_color(*evidence_class, t)),
+                            ),
+                        ]));
+                    }
+                    if !descriptors.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(crate::sources::descriptor_header(), bold),
+                        ]));
+                        for row in descriptors {
+                            let style = if row.origin.is_some() {
+                                Style::default().fg(t.text)
+                            } else {
+                                Style::default().fg(t.warn).add_modifier(Modifier::BOLD)
+                            };
+                            for text in crate::sources::descriptor_lines(row, width) {
+                                lines.push(Line::from(vec![
+                                    Span::raw(indent),
+                                    Span::styled(text, style),
+                                ]));
+                            }
+                        }
+                    }
+                }
                 let rest: Vec<&str> = body.collect();
                 if render_body_as_markdown && !rest.join("").trim().is_empty() {
                     // Width is reduced by the 4-column indent so a table sizes
@@ -5659,6 +5736,7 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
                 Some(crate::refs::RefKind::Doi) => "  paper",
                 Some(crate::refs::RefKind::FileLine) => "  source",
                 Some(crate::refs::RefKind::Tool) => "  tool",
+                Some(crate::refs::RefKind::Provenance) => "  source",
                 None => "  unregistered",
             },
             Style::default().fg(t.muted),

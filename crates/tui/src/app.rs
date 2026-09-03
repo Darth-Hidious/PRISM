@@ -75,6 +75,13 @@ pub enum LineKind {
         /// Which DELEGATED agent produced this result, when any did.
         /// `None` is the parent's own work — never a guessed label.
         agent: Option<String>,
+        /// Where the data came from, one row per source the tool named.
+        /// Empty means the tool stamped no source, and the transcript says
+        /// so in the same bold — it never guesses one.
+        sources: Vec<crate::sources::SourceRow>,
+        /// Each descriptor the tool returned with where it was computed
+        /// from, as the tool listed them.
+        descriptors: Vec<crate::sources::DescriptorRow>,
     },
     Approval {
         tool_name: String,
@@ -777,6 +784,14 @@ pub struct App {
     /// Parsed structures by cache key, filled when a CIF arrives on either
     /// lane. The panel draws from this; the CIF text is what it came from.
     pub structure_views: std::collections::HashMap<String, crate::structure_view::StructureView>,
+    /// The tool's own record for every source a result card named, by the
+    /// `provenance://` id its table row opens under. Filled when the card
+    /// arrives, so opening a source costs no round trip and cannot disagree
+    /// with the table the reader saw.
+    pub source_records: std::collections::HashMap<String, String>,
+    /// How many result cards this session has numbered — the first half of a
+    /// `provenance://` id, stable when the transcript is trimmed.
+    pub source_seq: u64,
     /// Handles the reader marked for the agent: shown in the workspace and
     /// prefixed to every message sent, so both work from the same objects.
     pub marks: crate::marks::Marks,
@@ -937,6 +952,8 @@ impl App {
             selected_line: None,
             ref_panel: None,
             structure_views: std::collections::HashMap::new(),
+            source_records: std::collections::HashMap::new(),
+            source_seq: 0,
             marks: crate::marks::Marks::default(),
             ref_cache: std::collections::HashMap::new(),
             ref_fetch: None,
@@ -1549,6 +1566,16 @@ impl App {
                 // and cannot disagree with what the reader was shown.
                 RefPanelState::Ready(self.tool_reference_report(name))
             }
+            Some(crate::refs::RefKind::Provenance) => match self.source_records.get(id) {
+                // Held since the card arrived: the tool's own record of this
+                // source, shown whole. No round trip, nothing to disagree
+                // with the table the reader clicked.
+                Some(record) => RefPanelState::Ready(record.clone()),
+                None => RefPanelState::NotResolvable(
+                    "this source record is no longer held — the session it came from is gone"
+                        .to_string(),
+                ),
+            },
             None => {
                 RefPanelState::NotResolvable("this reference is no longer registered".to_string())
             }
@@ -3444,6 +3471,7 @@ impl App {
         // hand the model a handle from a conversation it cannot see.
         self.marks.clear();
         self.structure_views.clear();
+        self.source_records.clear();
         self.session_id = None;
         self.artifact_store = ArtifactStoreState::Loading;
         self.artifact_refresh_at = None;
@@ -5468,6 +5496,22 @@ impl App {
                 // The agent name is backend-supplied text too — same rule.
                 let clean_agent = agent.map(|a| sanitize_for_render(&a));
                 let text = format!("{token} {clean_name}: {clean_content}");
+                // Where the data came from, as the tool stamped it and the
+                // engine carried it. Each source row is an openable reference
+                // whose record is held here from now on; the transcript draws
+                // the table from these rows and says by name when there are
+                // none.
+                self.source_seq += 1;
+                let sources = crate::sources::source_rows(data.as_ref(), self.source_seq);
+                for row in &sources {
+                    self.references.insert(crate::refs::ReferenceEntry {
+                        id: row.id.clone(),
+                        kind: crate::refs::RefKind::Provenance,
+                        tokens: vec![row.source.clone()],
+                    });
+                    self.source_records.insert(row.id.clone(), row.panel_text());
+                }
+                let descriptors = crate::sources::descriptor_rows(data.as_ref());
                 if !success {
                     self.push_message(ChatLine {
                         role: Role::Tool,
@@ -5486,6 +5530,8 @@ impl App {
                             evidence_class,
                             image_paths,
                             agent: clean_agent,
+                            sources,
+                            descriptors,
                         },
                     });
                 }
@@ -6797,6 +6843,60 @@ mod tests {
         assert!(!text.contains("not drawable"), "{text}");
     }
 
+    /// A source row is an openable reference like everything else that is
+    /// orange: it has a hit region where it is drawn, and opening it shows
+    /// the tool's own record of that source, held since the card arrived.
+    #[test]
+    fn a_source_row_is_an_openable_record() {
+        use crate::hit_map::HitTarget;
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.apply_agent_msg(AgentMsg::ToolCard {
+            tool_name: "lookup_structure".to_string(),
+            content: "found Si".to_string(),
+            card_type: "results".to_string(),
+            elapsed_ms: Some(12),
+            call_id: None,
+            provenance_id: None,
+            data: Some(serde_json::json!({
+                "sources": [{
+                    "source": "Materials Project",
+                    "kind": "crystal structure and computed properties",
+                    "count": 1,
+                    "fetched": "2026-09-02T14:10:03+00:00",
+                    "status": "success",
+                    "record": {"endpoint": "https://api.materialsproject.org", "status": "success"}
+                }]
+            })),
+            agent: None,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 42)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let mut found = None;
+        for y in 0..42u16 {
+            for x in 0..140u16 {
+                if let Some(HitTarget::Reference { id }) = app.hit_map.borrow().at(x, y)
+                    && id.as_str() == "provenance://1/0"
+                {
+                    found = Some((x, y));
+                }
+            }
+        }
+        let (x, y) = found.expect("the source cell must be a hit region");
+        app.open_reference_panel("provenance://1/0", x, y);
+        let panel = app.ref_panel.as_ref().expect("the panel opens");
+        assert_eq!(panel.kind, Some(crate::refs::RefKind::Provenance));
+        assert_eq!(panel.label, "Materials Project");
+        match &panel.state {
+            RefPanelState::Ready(text) => {
+                assert!(text.contains("api.materialsproject.org"), "{text}");
+                assert!(text.starts_with("source:   Materials Project"), "{text}");
+            }
+            _ => panic!("the record is held locally and opens at once"),
+        }
+    }
+
     fn app_with_open_structure_panel(id: &str) -> App {
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
         app.ref_panel = Some(RefPanel {
@@ -6928,6 +7028,8 @@ mod tests {
                     evidence_class: None,
                     image_paths: Vec::new(),
                     agent: None,
+                    sources: Vec::new(),
+                    descriptors: Vec::new(),
                 },
             });
         }

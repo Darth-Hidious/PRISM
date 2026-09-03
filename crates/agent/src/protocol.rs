@@ -6277,6 +6277,18 @@ fn build_tool_card_payload(
             serde_json::json!(evidence.color()),
         );
     }
+    // Where the data came from and where each descriptor was computed from,
+    // read off the result's own stamps. The card's `content` is the tool's
+    // summary when it has one, and the summary is where the origin used to
+    // vanish; these ride beside it so the reader always sees the source.
+    let sources = crate::source_table::source_rows(content);
+    if !sources.is_empty() {
+        data.insert("sources".to_string(), Value::Array(sources));
+    }
+    let descriptors = crate::source_table::descriptor_rows(content);
+    if !descriptors.is_empty() {
+        data.insert("descriptors".to_string(), Value::Array(descriptors));
+    }
     (display_content, Value::Object(data.clone()))
 }
 
@@ -10704,6 +10716,53 @@ mod tests {
             data.get("evidence_color").is_none(),
             "no class, no derived color: {data}"
         );
+    }
+
+    /// The card carries the result's own source rows and descriptor rows
+    /// beside the summary, so the TUI can say where the data came from
+    /// without re-parsing a content string it may never receive whole.
+    #[test]
+    fn the_card_carries_the_sources_and_descriptors_the_tool_stamped() {
+        let content = serde_json::json!({
+            "formula": "Si",
+            "data_kind": "crystal structure and computed properties",
+            "fetched_at_iso8601": "2026-09-02T14:10:03+00:00",
+            "providers_queried": [{"provider": "Materials Project", "status": "success",
+                                   "result_count": 1}],
+            "descriptor_provenance": [{"name": "VEC", "value": 8.0, "unit": "electrons/atom",
+                                       "origin": "table _VEC (Guo & Liu 2011)"}]
+        })
+        .to_string();
+        let payload = build_ui_card_payload(
+            "call-1",
+            "lookup_structure",
+            &content,
+            Some("found Si"),
+            None,
+            12,
+            false,
+        );
+        let data = &payload["data"];
+        assert_eq!(data["sources"][0]["source"], "Materials Project");
+        assert_eq!(data["sources"][0]["count"], 1);
+        assert_eq!(data["descriptors"][0]["name"], "VEC");
+        assert_eq!(
+            data["descriptors"][0]["origin"],
+            "table _VEC (Guo & Liu 2011)"
+        );
+        // A result that stamped nothing gets no rows — the TUI says so by
+        // name; nothing here invents a source.
+        let bare = build_ui_card_payload(
+            "c",
+            "execute_python",
+            r#"{"stdout": "42"}"#,
+            None,
+            None,
+            1,
+            false,
+        );
+        assert!(bare["data"].get("sources").is_none(), "{bare}");
+        assert!(bare["data"].get("descriptors").is_none());
     }
 
     /// The ui.card top level obeys the same rule as `data` — both fields the

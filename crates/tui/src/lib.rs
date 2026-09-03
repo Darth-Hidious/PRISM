@@ -55,6 +55,7 @@ pub mod refs;
 #[doc(hidden)]
 pub mod render;
 pub mod sanitize;
+pub mod sources;
 pub mod structure_view;
 pub mod structures;
 pub mod theme;

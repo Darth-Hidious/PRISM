@@ -447,6 +447,9 @@ def _lookup_structure_tool() -> Tool:
                 "formula": formula,
                 "found": False,
                 "providers_summary": res.get("providers_summary", {}),
+                "providers_queried": res.get("providers_queried", []),
+                "fetched_at_iso8601": res.get("fetched_at_iso8601"),
+                "data_kind": "crystal structure + properties",
                 "note": "no structures found in the federation for this query",
             }
         # Best hit = the one with the most populated properties.
@@ -477,6 +480,13 @@ def _lookup_structure_tool() -> Tool:
                 if m.get("id") != best.get("id")
             ],
             "providers_summary": res.get("providers_summary", {}),
+            # The fetch record, as the federation reported it: which provider
+            # answered, with what, and when. The UI's source table is built
+            # from this and nothing else — a lookup that drops it shows the
+            # reader a structure with no origin.
+            "providers_queried": res.get("providers_queried", []),
+            "fetched_at_iso8601": res.get("fetched_at_iso8601"),
+            "data_kind": "crystal structure + properties",
         }
 
     return Tool(

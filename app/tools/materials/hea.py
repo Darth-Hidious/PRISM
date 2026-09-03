@@ -549,12 +549,73 @@ def compute_hea_descriptors(
         "fractions": fracs,
         "expanded_composition": _explicit_composition(elems, fracs),
     }
+    # Where every descriptor came from, as this function knows it: the table
+    # or the library property each one was computed from. The UI shows this
+    # beside the value; a number with no origin is a number a reader cannot
+    # check.
+    result["descriptor_provenance"] = descriptor_provenance(result)
     stamp_evidence(
         result,
         EvidenceSource.CITED_COMPUTATION,
         [coerce_evidence_class(input_evidence_class)],
     )
     return result
+
+
+#: Descriptor name → (unit, origin). The origin names the table or library
+#: property the value was computed from — the same names the module's own
+#: tables and the pymatgen calls carry, so a reader can go and look.
+_DESCRIPTOR_ORIGINS: dict[str, tuple[str, str]] = {
+    "delta_H_mix_kJ_per_mol": (
+        "kJ/mol",
+        "Miedema binary mixing enthalpies, Takeuchi & Inoue (2005) pair table "
+        "(_PAIR_DATA in app/tools/materials/hea.py); 4·Σ c_i c_j ΔH_ij",
+    ),
+    "delta_S_mix_J_per_molK": (
+        "J/(mol·K)",
+        "ideal configurational entropy −R Σ c_i ln c_i from the input fractions",
+    ),
+    "omega": (
+        "dimensionless",
+        "Yang & Zhang Ω = Tm·ΔS_mix/|ΔH_mix|, Tm from pymatgen Element.melting_point",
+    ),
+    "VEC": (
+        "electrons/atom",
+        "valence electron concentration table _VEC in app/tools/materials/hea.py "
+        "(Guo & Liu 2011); Σ c_i VEC_i",
+    ),
+    "delta_radius_pct": (
+        "%",
+        "Goldschmidt CN12 metallic radii from pymatgen Element.metallic_radius",
+    ),
+    "delta_chi": (
+        "dimensionless",
+        "Pauling electronegativity from pymatgen Element.X",
+    ),
+    "Tm_estimate_K": (
+        "K",
+        "rule-of-mixtures melting point from pymatgen Element.melting_point",
+    ),
+}
+
+
+def descriptor_provenance(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """One record per descriptor in ``result``: name, value, unit, origin.
+
+    A descriptor whose value is ``None`` is listed too, with its origin — the
+    reader sees which table failed to cover the composition rather than a
+    silently shorter list (``data_gaps`` says why).
+    """
+    return [
+        {
+            "name": name,
+            "value": result.get(name),
+            "unit": unit,
+            "origin": origin,
+        }
+        for name, (unit, origin) in _DESCRIPTOR_ORIGINS.items()
+        if name in result
+    ]
 
 
 def create_hea_tools(registry: ToolRegistry) -> None:

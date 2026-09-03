@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 890
+assertion_line: 896
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -17,7 +17,7 @@ expression: rendered
                                                                    │
   ✓ [GREEN reference_validated] compute_submit: Job submitted      │
 (auto-approved for session)                                        │
-                                                                   │
+    SOURCE NOT REPORTED BY compute_submit                          │
                                                                    │
                                                                    │
                                                                    │

@@ -36,6 +36,7 @@ pub fn kind_word(kind: RefKind) -> &'static str {
         RefKind::Doi => "paper",
         RefKind::FileLine => "file",
         RefKind::Tool => "tool",
+        RefKind::Provenance => "source",
     }
 }
 
@@ -141,6 +142,7 @@ pub fn actionable_identity(id: &str, kind: RefKind) -> Result<(), String> {
         }
         RefKind::FileLine => id.starts_with("file://"),
         RefKind::Tool => id.starts_with("tool://"),
+        RefKind::Provenance => id.starts_with("provenance://"),
     };
     if ok {
         return Ok(());
@@ -152,6 +154,7 @@ pub fn actionable_identity(id: &str, kind: RefKind) -> Result<(), String> {
         RefKind::Doi => format!("{id} is not a DOI, so the paper cannot be resolved"),
         RefKind::FileLine => format!("{id} is not a file path the agent can read"),
         RefKind::Tool => format!("{id} is not a tool the agent can call"),
+        RefKind::Provenance => format!("{id} is not a source a tool result named"),
     })
 }
 

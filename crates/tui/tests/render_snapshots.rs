@@ -3020,6 +3020,8 @@ fn a_tool_that_only_ever_failed_is_still_reachable_by_its_name() {
             evidence_class: None,
             image_paths: Vec::new(),
             agent: None,
+            sources: Vec::new(),
+            descriptors: Vec::new(),
         },
     });
     // Any later result runs the same registration pass a live session runs,
@@ -3835,4 +3837,104 @@ fn a_lane_whose_tool_failed_is_marked_failed_not_running() {
             .any(|l| l.starts_with("  Bhabha") && l.ends_with(" running")),
         "the live lane says running: {rendered}"
     );
+}
+
+/// An app past the home screen with one finished result card applied,
+/// carrying whatever `data` the engine put on it.
+fn app_with_result_card(tool_name: &str, content: &str, data: serde_json::Value) -> App {
+    let mut app = fake_app();
+    app.apply_agent_msg(AgentMsg::Welcome {
+        version: "2.7.1-fake".into(),
+        tool_count: 99,
+        session_id: None,
+    });
+    app.push_user("Look up MgB2");
+    app.apply_agent_msg(AgentMsg::ToolCard {
+        tool_name: tool_name.into(),
+        content: content.into(),
+        card_type: "results".into(),
+        elapsed_ms: Some(12),
+        call_id: None,
+        provenance_id: None,
+        data: Some(data),
+        agent: None,
+    });
+    app.apply_agent_msg(AgentMsg::TurnComplete);
+    app.tokens_per_sec = 0.0;
+    app.first_token_time = None;
+    app.last_token_time = None;
+    app.tokens_received = 0;
+    app
+}
+
+/// Snapshot: a fetch result says, in a table before its body, where the
+/// data came from — one row per provider asked, failed ones included, each
+/// with the kind of data, the count, the evidence badge and the fetch time.
+#[test]
+fn snapshot_tool_result_source_table_100x30() {
+    let app = app_with_result_card(
+        "lookup_structure",
+        "found MgB2 (mp-763) — P6/mmm, 3 atoms",
+        serde_json::json!({
+            "evidence_class": "screening",
+            "sources": [
+                {"source": "Materials Project", "kind": "crystal structure and computed properties",
+                 "count": 1, "fetched": "2026-09-02T14:10:03+00:00", "status": "success",
+                 "record": {"endpoint": "https://api.materialsproject.org", "status": "success"}},
+                {"source": "OQMD", "kind": "crystal structure and computed properties",
+                 "count": 0, "fetched": "2026-09-02T14:10:03+00:00", "status": "timeout",
+                 "record": {"status": "timeout", "error": "Timed out after 8s"}}
+            ]
+        }),
+    );
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("tool_result_source_table_100x30", rendered);
+}
+
+/// Snapshot: a result whose tool stamped no source says so, by name, in the
+/// same bold — never a blank line, never a guessed source.
+#[test]
+fn snapshot_tool_result_source_not_reported_100x30() {
+    let app = app_with_result_card(
+        "execute_python",
+        "stdout: 42",
+        serde_json::json!({"summary": "stdout: 42"}),
+    );
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    assert!(
+        rendered.contains("SOURCE NOT REPORTED BY execute_python"),
+        "{rendered}"
+    );
+    insta::assert_snapshot!("tool_result_source_not_reported_100x30", rendered);
+}
+
+/// Snapshot: a descriptor set gets its card — each descriptor's value, unit
+/// and the table or library property it was computed from, as the tool
+/// listed them; one it could not compute is listed with its origin still.
+#[test]
+fn snapshot_tool_result_descriptor_card_100x30() {
+    let app = app_with_result_card(
+        "hea_descriptors",
+        "CoCrFeMnNi: solid_solution, VEC=8.0",
+        serde_json::json!({
+            "evidence_class": "screening",
+            "sources": [
+                {"source": "hea_descriptors tables", "kind": "computed: HEA formability descriptors",
+                 "count": null, "fetched": null, "status": "computed", "record": {}}
+            ],
+            "descriptors": [
+                {"name": "delta_H_mix_kJ_per_mol", "value": -4.16, "unit": "kJ/mol",
+                 "origin": "Miedema binary mixing enthalpies, Takeuchi & Inoue (2005) pair table"},
+                {"name": "VEC", "value": 8.0, "unit": "electrons/atom",
+                 "origin": "valence electron concentration table _VEC (Guo & Liu 2011)"},
+                {"name": "omega", "value": null, "unit": "dimensionless",
+                 "origin": "Yang & Zhang Ω = Tm·ΔS_mix/|ΔH_mix|, Tm from pymatgen Element.melting_point"}
+            ]
+        }),
+    );
+    let rendered = render_app_to_string(&app, 100, 30);
+    assert_no_terminal_controls(&rendered);
+    insta::assert_snapshot!("tool_result_descriptor_card_100x30", rendered);
 }

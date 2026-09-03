@@ -13,6 +13,38 @@ def test_parse_composition_formula():
     assert all(abs(f - 0.2) < 1e-6 for f in fracs)
 
 
+def test_every_descriptor_says_where_it_came_from():
+    """Each descriptor the tool reports carries its unit and the table or
+    library property it was computed from — a number with no origin is a
+    number a reader cannot check. A descriptor the tables could not cover is
+    listed with its origin and a None value, never dropped."""
+    from app.tools.materials.hea import descriptor_provenance
+
+    result = compute_hea_descriptors(
+        ["Co", "Cr", "Fe", "Mn", "Ni"], [0.2, 0.2, 0.2, 0.2, 0.2]
+    )
+    rows = result["descriptor_provenance"]
+    assert rows == descriptor_provenance(result)
+    by_name = {row["name"]: row for row in rows}
+    for key in (
+        "delta_H_mix_kJ_per_mol", "delta_S_mix_J_per_molK", "omega", "VEC",
+        "delta_radius_pct", "delta_chi", "Tm_estimate_K",
+    ):
+        assert key in by_name, f"{key} has no provenance row"
+        row = by_name[key]
+        assert row["value"] == result[key]
+        assert row["unit"], f"{key} has no unit"
+        assert row["origin"] and len(row["origin"]) > 20, f"{key} has no origin"
+    assert "Takeuchi" in by_name["delta_H_mix_kJ_per_mol"]["origin"]
+    assert "Element.metallic_radius" in by_name["delta_radius_pct"]["origin"]
+    # A composition the enthalpy table does not cover: the row stays, the
+    # value is None, and the origin still says which table was consulted.
+    gap = compute_hea_descriptors(["Ba", "Li"], [0.5, 0.5])
+    gap_rows = {row["name"]: row for row in gap["descriptor_provenance"]}
+    assert gap_rows["delta_H_mix_kJ_per_mol"]["value"] is None
+    assert "Takeuchi" in gap_rows["delta_H_mix_kJ_per_mol"]["origin"]
+
+
 def test_parse_composition_dict():
     elems, fracs = _parse_composition({"Nb": 0.25, "Mo": 0.25, "Ta": 0.25, "W": 0.25})
     assert len(elems) == 4

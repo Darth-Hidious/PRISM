@@ -1,17 +1,17 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 365
+assertion_line: 3892
 expression: rendered
 ---
- ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
+ ‹ back  New session    Ctrl-P · ?                                 │ Workspace
 · PRISM ready                                                      │ [Act] Too Fil Obj Str Art
                                                                    │ 1 tools · 1 ✓
 ❯ You                                                              │
-▌ sample alloy                                                     │  1. prompt "sample alloy" •
-                                                                   │  2. tool sample_material ✓
-  ⚙ Running sample_material                                        │
-  ✓ [YELLOW screening] sample_material: W0.3 Mo0.2 Ta0.3 Nb0.2     │
-    SOURCE NOT REPORTED BY sample_material                         │
+▌ Look up MgB2                                                     │  1. prompt "Look up MgB2" •
+                                                                   │  2. tool lookup_structure ✓
+  ✓ [YELLOW screening] lookup_structure: found MgB2 (mp-763) —     │
+P6/mmm, 3 atoms                                                    │
+    SOURCE NOT REPORTED BY lookup_structure                        │
                                                                    │
                                                                    │
                                                                    │
@@ -32,4 +32,4 @@ expression: rendered
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: fake-backend   [INPUT]    Ctrl-C quit              │
+  Ready  model: —   [INPUT]    Ctrl-C quit                         │

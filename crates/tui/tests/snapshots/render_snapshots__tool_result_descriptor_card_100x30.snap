@@ -1,0 +1,34 @@
+---
+source: crates/tui/tests/render_snapshots.rs
+expression: rendered
+---
+ ‹ back  New session    Ctrl-P · ?                                 │ Workspace
+❯ You                                                            ▲ │ [Act] Too Fil Obj Str Art
+▌ Look up MgB2                                                   ║ │ 1 tools · 1 ✓
+                                                                 █ │
+  ✓ [YELLOW screening] hea_descriptors: CoCrFeMnNi:              █ │  1. prompt "Look up MgB2" •
+solid_solution, VEC=8.0                                          █ │  2. tool hea_descriptors ✓
+    SOURCE   KIND OF… COUNT EVIDENCE           FETCHED           █ │
+    hea_des… compute…     — [YELLOW screening] not reported      █ │
+    evidence [YELLOW screening]: computed by a cited method      █ │
+    DESCRIPTOR             VALUE        UNIT         COMPUTED FRO█ │
+    delta_H_mix_kJ_per_mol -4.16        kJ/mol       Miedema     █ │
+                                                     binary mixin█ │
+                                                     enthalpies, █ │
+                                                     Takeuchi &  █ │
+                                                     Inoue (2005)█ │
+                                                     pair table  █ │
+    VEC                    8.0          electrons/a… valence     █ │
+                                                     electron    █ │
+                                                     concentratio█ │
+                                                     table _VEC  █ │
+                                                     (Guo & Liu  ║ │
+                                                     2011)       ║ │
+    omega                  not computed dimensionle… Yang & Zhang║ │
+                                                     Ω =         ▼ │
+┌ Prompt ────────────────────────────────────────────────────────┐ │
+│ Type a message... (Enter=send, /help, Ctrl-C=quit)             │ │
+│                                                                │ │
+│                                                                │ │
+└────────────────────────────────────────────────────────────────┘ │
+  Ready  model: —   [INPUT]    Ctrl-C quit                         │
