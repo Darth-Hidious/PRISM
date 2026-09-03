@@ -65,6 +65,23 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
   Mesh round 4 (F1 refusal-path leak, F2 dead 429) queued, design-only for
   the demo.
 
+- 2026-09-03 pm: hover-panel complaints reproduced in the driver and fixed
+  (`dc5d8bbd`, `b209ae30`): the panel was a fixed 56/64/92 columns regardless
+  of terminal size, `clip`ped every line to an ellipsis, had NO scroll state
+  (so arrows moved the list BEHIND it and the panel went stale while looking
+  live), and capped sources at 3 behind a "+1 more" no key could reach. Now:
+  flexes to the room available (max 104), wraps (hard-wraps unbreakable
+  tokens), owns Up/Down/PageUp/PageDown/Home/End while open, position in the
+  title (`↑↓ 13-22/40`), every source listed. Verified on the installed
+  binary at 140x30/20/12. RESIDUAL, said not hidden: only the lower section
+  scrolls, so on a very short terminal the structure panel's header still
+  collapses to "+N more lines · cell not drawn" and those lines are not
+  reachable by key; the drawing sits between top and bottom as a Canvas, so
+  one continuous scroll needs the composition reworked. INSTALL RULE: always
+  delete-then-copy (see memory install-must-replace-not-overwrite) — an
+  in-place overwrite makes macOS SIGKILL the binary (exit 137) while the same
+  bytes run elsewhere.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
