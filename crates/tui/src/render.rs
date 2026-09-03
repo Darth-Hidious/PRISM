@@ -3343,6 +3343,10 @@ fn draw_status_window(f: &mut Frame, app: &App) {
     ));
     lines.push(kv("mode", mode));
     lines.push(kv("session", clip(&app.session_title, 36)));
+    // Which graphics protocol figures are drawn with and, when the terminal
+    // was not the one that decided, why: a coarse figure over ssh is
+    // "halfblocks — remote session, not probed", not a bad plot.
+    lines.push(kv("graphics", app.image_view().graphics_note()));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Usage",
@@ -6116,6 +6120,26 @@ Al1 Al 0.75 0.75 0.75
         assert!(
             !screen.contains("_cell_length_a"),
             "the CIF text must not be what the reader sees:\n{screen}"
+        );
+    }
+
+    /// The systems panel says which graphics protocol is in use and, when
+    /// the terminal was not asked, why — so a coarse figure over ssh reads
+    /// as a decision, not a defect.
+    #[test]
+    fn the_systems_panel_says_why_graphics_are_coarse() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.set_image_view(crate::image_view::ImageView::from_policy(
+            crate::image_view::Probe::Halfblocks("remote session — not probed"),
+        ));
+        app.open_status_window();
+        let rows = screen_rows(&app, 140, 42);
+        assert!(
+            rows.iter().any(|r| r.contains("graphics")
+                && r.contains("halfblocks — remote session — not probed")),
+            "the panel must say why:\n{}",
+            rows.join("\n")
         );
     }
 
