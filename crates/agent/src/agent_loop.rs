@@ -125,6 +125,7 @@ async fn approval_gate_outcome(
         Some(ApprovalResponse::Deny) | None => {
             let denied_msg = format!("Tool '{tool_name}' denied by user.");
             emit(AgentEvent::ToolCallResult {
+                raw_result: None,
                 call_id: call_id.to_string(),
                 tool_name: tool_name.to_string(),
                 content: denied_msg.clone(),
@@ -807,6 +808,18 @@ async fn finish_root_agent_run(
 ///
 /// Returns `None` when this is not a countable search result, leaving the
 /// normal large-result path to handle it.
+/// The tool's own output to carry beside the model-facing content, or `None`
+/// when they are the same string.
+///
+/// A search is digested before it reaches the model, and the UI card is built
+/// from what this returns — so without it the card parses prose and the source
+/// table says SOURCE NOT REPORTED however carefully the tool declared its
+/// databases. Carrying a copy when nothing was digested would double every
+/// card's payload for no gain, so identical strings return `None`.
+fn raw_for_card(content: &str, raw: &str) -> Option<String> {
+    (content != raw).then(|| raw.to_string())
+}
+
 fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
     if !SEARCH_TOOLS.contains(&tool) {
         return None;
@@ -4231,6 +4244,7 @@ pub(crate) async fn run_turn_inner(
             if pre_result.abort {
                 let error_msg = format!("Blocked by hook: {}", pre_result.reason);
                 emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
@@ -4264,6 +4278,7 @@ pub(crate) async fn run_turn_inner(
             ) {
                 let error_msg = format!("Skill invocation blocked: {error}");
                 emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
@@ -4296,6 +4311,7 @@ pub(crate) async fn run_turn_inner(
             if permission_decision.blocked {
                 let error_msg = format!("Tool '{tool_name}' is blocked by permission policy.");
                 emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: error_msg.clone(),
@@ -4332,6 +4348,7 @@ pub(crate) async fn run_turn_inner(
             let Some(pe) = policy.as_mut() else {
                 let denied_msg = crate::protocol::policy_unavailable_message(tool_name);
                 emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: denied_msg.clone(),
@@ -4365,6 +4382,7 @@ pub(crate) async fn run_turn_inner(
                         let denied_msg =
                             format!("Tool '{tool_name}' denied by OPA policy: {reason}");
                         emit(AgentEvent::ToolCallResult {
+                            raw_result: None,
                             call_id: call_id.clone(),
                             tool_name: tool_name.clone(),
                             content: denied_msg.clone(),
@@ -4739,6 +4757,7 @@ pub(crate) async fn run_turn_inner(
                      making progress on the question."
                 );
                 emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: advisory.clone(),
@@ -4775,6 +4794,7 @@ pub(crate) async fn run_turn_inner(
                     DOOM_LOOP_WINDOW
                 );
                 emit(AgentEvent::ToolCallResult {
+                    raw_result: None,
                     call_id: call_id.clone(),
                     tool_name: tool_name.clone(),
                     content: abort_msg.clone(),
@@ -4809,6 +4829,7 @@ pub(crate) async fn run_turn_inner(
                          the gap from memory.",
                     );
                     emit(AgentEvent::ToolCallResult {
+                        raw_result: None,
                         call_id: call_id.clone(),
                         tool_name: tool_name.clone(),
                         content: abort_msg.clone(),
@@ -4861,6 +4882,7 @@ pub(crate) async fn run_turn_inner(
                             true,
                         );
                         emit(AgentEvent::ToolCallResult {
+                            raw_result: None,
                             call_id: call_id.clone(),
                             tool_name: canonical_tool.to_string(),
                             content: real_content.clone(),
@@ -4877,6 +4899,7 @@ pub(crate) async fn run_turn_inner(
                         // role:"tool" messages with the same tool_call_id is a
                         // protocol violation for strict OpenAI-compat backends.
                         emit(AgentEvent::ToolCallResult {
+                            raw_result: None,
                             call_id: call_id.clone(),
                             tool_name: canonical_tool.to_string(),
                             content: directive.clone(),
@@ -4961,6 +4984,9 @@ pub(crate) async fn run_turn_inner(
 
             // ── h11. Emit ToolCallResult ──────────────────────────
             emit(AgentEvent::ToolCallResult {
+                // The card reads its source table from the tool's own output,
+                // not from the digest the model is given.
+                raw_result: raw_for_card(&content, &content_after_hooks),
                 call_id: call_id.clone(),
                 tool_name: tool_name.clone(),
                 content: content.clone(),
@@ -5869,6 +5895,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolCallResult {
+                raw_result: None,
                 tool_name,
                 is_error: true,
                 content,
@@ -8099,6 +8126,25 @@ mod tests {
         assert!(
             !digest.contains("word word word"),
             "abstracts do NOT survive: {digest}"
+        );
+    }
+
+    /// The card needs the tool's own output whenever the model was given a
+    /// digest instead. Dropping this left the source table empty for every
+    /// search — the tool declared its databases and no one read them.
+    #[test]
+    fn a_digest_carries_the_raw_output_and_an_undigested_result_does_not() {
+        let raw = r#"{"count":33,"sources":[{"source":"arxiv"}]}"#;
+        let digest = "33 result(s), 33 not seen before in this session.";
+        assert_eq!(
+            raw_for_card(digest, raw).as_deref(),
+            Some(raw),
+            "a digested result must carry what it was digested FROM"
+        );
+        assert_eq!(
+            raw_for_card(raw, raw),
+            None,
+            "nothing was digested, so there is nothing to carry twice"
         );
     }
 

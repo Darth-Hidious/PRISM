@@ -1649,6 +1649,7 @@ async fn execute_manual_tool_call(
                        transcript: &mut TranscriptStore,
                        preview: Option<String>| {
         emit_agent_event(AgentEvent::ToolCallResult {
+            raw_result: None,
             call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
             content: message.clone(),
@@ -1706,6 +1707,7 @@ async fn execute_manual_tool_call(
     if permission_decision.blocked {
         let message = format!("Tool '{tool_name}' is blocked by the current permission mode.");
         emit_agent_event(AgentEvent::ToolCallResult {
+            raw_result: None,
             call_id: call_id.clone(),
             tool_name: tool_name.to_string(),
             content: message.clone(),
@@ -1729,6 +1731,7 @@ async fn execute_manual_tool_call(
     let Some(pe) = policy_engine.as_mut() else {
         let message = policy_unavailable_message(tool_name);
         emit_agent_event(AgentEvent::ToolCallResult {
+            raw_result: None,
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
             content: message.clone(),
@@ -1761,6 +1764,7 @@ async fn execute_manual_tool_call(
         };
         if let Some(message) = denied {
             emit_agent_event(AgentEvent::ToolCallResult {
+                raw_result: None,
                 call_id: call_id.clone(),
                 tool_name: tool_name.to_string(),
                 content: message.clone(),
@@ -1841,6 +1845,7 @@ async fn execute_manual_tool_call(
     );
 
     emit_agent_event(AgentEvent::ToolCallResult {
+        raw_result: None,
         call_id: call_id.clone(),
         tool_name: tool_name.to_string(),
         content: raw_content,
@@ -5950,6 +5955,7 @@ fn emit_agent_event(event: AgentEvent) {
             emit_notification("ui.tool.start", start);
         }
         AgentEvent::ToolCallResult {
+            raw_result,
             call_id,
             tool_name,
             content,
@@ -5973,6 +5979,7 @@ fn emit_agent_event(event: AgentEvent) {
                 &call_id,
                 &tool_name,
                 &content,
+                raw_result.as_deref(),
                 summary.as_deref(),
                 preview.as_deref(),
                 elapsed_ms,
@@ -6244,13 +6251,21 @@ fn build_ui_card_payload(
     call_id: &str,
     tool_name: &str,
     content: &str,
+    // The tool's own output when `content` is a digest of it, so the source
+    // table reads JSON rather than the prose the model was given.
+    raw_result: Option<&str>,
     summary: Option<&str>,
     preview: Option<&str>,
     elapsed_ms: u64,
     is_error: bool,
 ) -> Value {
-    let (display_content, extra_data) =
-        build_tool_card_payload(tool_name, content, preview, summary);
+    let (display_content, extra_data) = build_tool_card_payload_from(
+        tool_name,
+        content,
+        raw_result.unwrap_or(content),
+        preview,
+        summary,
+    );
     let mut data = serde_json::Map::new();
     data.insert("call_id".to_string(), serde_json::json!(call_id));
     if let Some(summary) = summary {
@@ -6285,6 +6300,29 @@ fn build_ui_card_payload(
         payload["evidence_color"] = serde_json::json!(evidence.color());
     }
     payload
+}
+
+/// The card's content and its structured data, where the two come from
+/// DIFFERENT strings.
+///
+/// A search result is digested before it reaches the model, and the card used
+/// to be built from that digest — so the extractor was handed prose and every
+/// search rendered "SOURCE NOT REPORTED" however carefully the tool had
+/// declared its databases. The reader sees `display`; the table is read from
+/// `raw`, the tool's own output.
+fn build_tool_card_payload_from(
+    tool_name: &str,
+    display: &str,
+    raw: &str,
+    preview: Option<&str>,
+    summary: Option<&str>,
+) -> (String, Value) {
+    let (shown, _) = build_tool_card_payload(tool_name, display, preview, summary);
+    if raw == display {
+        return build_tool_card_payload(tool_name, display, preview, summary);
+    }
+    let (_, data) = build_tool_card_payload(tool_name, raw, preview, summary);
+    (shown, data)
 }
 
 fn build_tool_card_payload(
@@ -7191,6 +7229,7 @@ fn spawn_agent_turn(
                             }
                         }
                         AgentEvent::ToolCallResult {
+                            raw_result: None,
                             call_id,
                             tool_name,
                             content,
@@ -10842,6 +10881,44 @@ mod tests {
     /// The card carries the result's own source rows and descriptor rows
     /// beside the summary, so the TUI can say where the data came from
     /// without re-parsing a content string it may never receive whole.
+    /// A search result is DIGESTED before it reaches the model — twenty
+    /// abstracts are not re-sent on every later request — and the card was
+    /// built from that digest, so the extractor was handed prose and every
+    /// search rendered "SOURCE NOT REPORTED" no matter what the tool
+    /// declared. The reader must see the tool's account even when the model
+    /// is given a summary.
+    #[test]
+    fn a_digested_result_still_shows_the_sources_the_tool_declared() {
+        let raw = serde_json::json!({
+            "count": 33,
+            "sources": [
+                {"source": "arxiv", "kind": "peer-reviewed literature metadata",
+                 "count": 21, "fetched": "2026-09-03T10:00:00+00:00", "status": "ok",
+                 "record": {"status": "ok"}},
+                {"source": "semantic_scholar", "kind": "peer-reviewed literature metadata",
+                 "count": 12, "fetched": "2026-09-03T10:00:00+00:00", "status": "ok",
+                 "record": {"status": "ok"}}
+            ]
+        })
+        .to_string();
+        let digest = "33 result(s), 33 not seen before in this session.\n  • Oxidation of …";
+
+        let (display, data) =
+            super::build_tool_card_payload_from("prior_art_search", digest, &raw, None, None);
+
+        assert!(
+            display.starts_with("33 result(s)"),
+            "the reader still sees the digest, not the raw payload: {display}"
+        );
+        let sources = data
+            .get("sources")
+            .and_then(serde_json::Value::as_array)
+            .expect("the declared sources survive the digest");
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert_eq!(sources[0]["source"], "arxiv");
+        assert_eq!(sources[0]["count"], 21);
+    }
+
     #[test]
     fn the_card_carries_the_sources_and_descriptors_the_tool_stamped() {
         let content = serde_json::json!({
@@ -10858,6 +10935,7 @@ mod tests {
             "call-1",
             "lookup_structure",
             &content,
+            None,
             Some("found Si"),
             None,
             12,
@@ -10879,6 +10957,7 @@ mod tests {
             r#"{"stdout": "42"}"#,
             None,
             None,
+            None,
             1,
             false,
         );
@@ -10895,6 +10974,7 @@ mod tests {
             "call-2",
             "find_tools",
             r#"{"tools":["a","b","c","d","e"]}"#,
+            None,
             Some("find_tools: 5 results"),
             None,
             8,
@@ -10919,6 +10999,7 @@ mod tests {
             "call-1",
             "hea_descriptors",
             raw,
+            None,
             Some("hea_descriptors: completed"),
             None,
             12,
@@ -12206,6 +12287,7 @@ mod workspace_planes_tests {
 
         let emissions = capture_emissions(|| {
             emit_agent_event(AgentEvent::ToolCallResult {
+                raw_result: None,
                 call_id: "call-1".to_string(),
                 tool_name: "structure_import".to_string(),
                 content,

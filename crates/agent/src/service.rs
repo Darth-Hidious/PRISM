@@ -761,6 +761,7 @@ impl ChatService {
                 });
             }
             AgentEvent::ToolCallResult {
+                raw_result: _,
                 call_id,
                 tool_name,
                 content,

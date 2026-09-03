@@ -133,6 +133,14 @@ pub enum AgentEvent {
         /// their questions, so no call was reproducible and a failure taught
         /// nothing.
         tool_args: serde_json::Value,
+        /// The tool's own output, when `content` is not it.
+        ///
+        /// A search result is digested before it reaches the model, and the
+        /// UI card was built from that digest — prose, not JSON — so every
+        /// search rendered "SOURCE NOT REPORTED" however carefully the tool
+        /// had declared its databases. The card reads its table from here
+        /// when it is present, while the reader still sees the digest.
+        raw_result: Option<String>,
         summary: Option<String>,
         preview: Option<String>,
         elapsed_ms: u64,
