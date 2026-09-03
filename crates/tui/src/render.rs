@@ -5406,7 +5406,14 @@ fn draw_structure_panel(
     area: Rect,
 ) {
     let t = app.theme();
-    let width = 64u16.min(area.width.saturating_sub(2)).max(24);
+    // Flex to the room available. At a fixed 64 a cache reference was clipped
+    // even when the terminal had room to show it whole.
+    const STRUCTURE_PANEL_MAX_W: u16 = 104;
+    let room = area.width.saturating_sub(2);
+    let width = area.width.saturating_sub(4).clamp(
+        24.min(room),
+        STRUCTURE_PANEL_MAX_W.min(room).max(24.min(room)),
+    );
     let header = view.header_lines();
     let legend = view.legend();
     let sites = view.site_lines(6);
@@ -5504,10 +5511,15 @@ fn draw_structure_panel(
         Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
     )));
     for src in prov.sources.iter().take(SOURCES_SHOWN) {
-        bottom.push(Line::from(Span::styled(
-            format!("  {}", clip(src, iw.saturating_sub(2))),
-            Style::default().fg(t.dim),
-        )));
+        for (n, part) in panel_body_lines(src, iw.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            bottom.push(Line::from(Span::styled(
+                format!("{}{part}", if n == 0 { "  " } else { "    " }),
+                Style::default().fg(t.dim),
+            )));
+        }
     }
     // Anything withheld is COUNTED, the same rule the site table follows.
     if let Some(hidden) = prov
@@ -5525,10 +5537,15 @@ fn draw_structure_panel(
         "ontology",
         Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
     )));
-    bottom.push(Line::from(Span::styled(
-        format!("  {}", clip(&prov.placement, iw.saturating_sub(2))),
-        Style::default().fg(t.dim),
-    )));
+    for (n, part) in panel_body_lines(&prov.placement, iw.saturating_sub(2))
+        .into_iter()
+        .enumerate()
+    {
+        bottom.push(Line::from(Span::styled(
+            format!("{}{part}", if n == 0 { "  " } else { "    " }),
+            Style::default().fg(t.dim),
+        )));
+    }
     let bottom_needed = u16::try_from(bottom.len()).unwrap_or(u16::MAX);
 
     // The table first, then the disclosures, then the drawing. The top used
@@ -5596,24 +5613,46 @@ fn draw_structure_panel(
         );
     }
 
+    let mut bottom_scrolled: Option<(usize, usize, usize)> = None;
     let by = cy + ch;
     let bh = avail.saturating_sub(ch);
     if bh > 0 {
         // Even the reserved bottom can outrun a very short panel. What does
         // not fit is counted in its last row, never cut in silence.
+        // The site table, sources and ontology scroll: they are the part that
+        // outruns the panel, and before this the keys that should have moved
+        // them moved the list behind the panel instead. The drawing and the
+        // header stay put, so the reader keeps their bearings.
         let shown = usize::from(bh);
+        let max_scroll = bottom.len().saturating_sub(shown);
+        let offset = panel.scroll.min(max_scroll);
         if bottom.len() > shown {
-            let withheld = bottom.len() - shown + 1;
-            bottom.truncate(shown.saturating_sub(1));
-            bottom.push(Line::from(Span::styled(
-                format!("  +{withheld} more lines"),
-                Style::default().fg(t.muted),
-            )));
+            bottom_scrolled = Some((offset + 1, (offset + shown).min(bottom.len()), bottom.len()));
         }
         f.render_widget(
-            Paragraph::new(bottom),
+            Paragraph::new(bottom).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
             Rect::new(inner.x, by, inner.width, bh),
         );
+        // The border was painted before the layout was known, so the position
+        // is written onto the title row now. A panel that continues below the
+        // fold has to say so; otherwise it just stops and reads as complete.
+        if let Some((from, to, total)) = bottom_scrolled {
+            let label = format!(" ↑↓ {from}-{to}/{total} ");
+            let lx = rect.x + 9;
+            let room = rect
+                .width
+                .saturating_sub(10)
+                .min(u16::try_from(label.width()).unwrap_or(u16::MAX));
+            if room > 0 {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        label,
+                        Style::default().fg(t.reference),
+                    ))),
+                    Rect::new(lx, rect.y, room, 1),
+                );
+            }
+        }
     }
 
     let mut map = app.hit_map.borrow_mut();
@@ -5657,6 +5696,28 @@ fn legend_lines(legend: &[(String, Color)], width: usize, t: Theme) -> Vec<Line<
     lines
 }
 
+/// One panel line, wrapped to the panel's width so nothing is lost off the
+/// right edge. The panel is where a value is read in full — a clipped cache
+/// reference or DOI is a value nobody can look up — so this hard-wraps rather
+/// than eliding, including tokens with nowhere to break.
+fn panel_body_lines(text: &str, width: usize) -> Vec<String> {
+    wrap_plain(text, width)
+}
+
+/// The slice of `lines` visible at `scroll`, and where the reader is when the
+/// panel does not fit. Scrolling past the end stops at the last full window
+/// rather than running off into blank rows.
+fn panel_window(lines: &[String], height: usize, scroll: usize) -> (Vec<String>, Option<String>) {
+    if lines.len() <= height {
+        return (lines.to_vec(), None);
+    }
+    let max_scroll = lines.len().saturating_sub(height);
+    let start = scroll.min(max_scroll);
+    let end = (start + height).min(lines.len());
+    let label = format!("{}-{}/{}", start + 1, end, lines.len());
+    (lines[start..end].to_vec(), Some(label))
+}
+
 fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     let Some(panel) = &app.ref_panel else {
         return;
@@ -5669,7 +5730,16 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let t = app.theme();
-    let width = 56u16.min(area.width.saturating_sub(2)).max(12);
+    // Flex to the room available instead of a fixed 56. A panel exists to show
+    // a value in full; 56 columns forced a cache reference or a DOI to be
+    // clipped even when the terminal had room to spare. Capped so prose does
+    // not run to an unreadable line length.
+    const PANEL_MAX_W: u16 = 104;
+    let room = area.width.saturating_sub(2);
+    let width = area
+        .width
+        .saturating_sub(4)
+        .clamp(12.min(room), PANEL_MAX_W.min(room).max(12.min(room)));
     let body: Vec<String> = match &panel.state {
         crate::app::RefPanelState::Fetching => {
             vec!["fetching…".to_string()]
@@ -5679,13 +5749,13 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         // become 12 lines that look complete.
         crate::app::RefPanelState::Ready(text) => text
             .lines()
-            .map(|l| clip(l, width.saturating_sub(2) as usize))
+            .flat_map(|l| panel_body_lines(l, width.saturating_sub(2) as usize))
             .collect(),
         crate::app::RefPanelState::Failed(why) => {
-            vec![clip(why, width.saturating_sub(2) as usize)]
+            panel_body_lines(why, width.saturating_sub(2) as usize)
         }
         crate::app::RefPanelState::NotResolvable(why) => {
-            vec![clip(why, width.saturating_sub(2) as usize)]
+            panel_body_lines(why, width.saturating_sub(2) as usize)
         }
     };
     // Header + id + body + borders.
@@ -5746,19 +5816,13 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         mark_hint_span(app, &panel.id, t),
     ]));
 
-    for b in body.iter().take(plan.body_shown) {
+    // Every line goes in. What does not fit is reachable by scrolling and the
+    // title says where the reader is, which beats a "+N more lines" marker
+    // pointing at something no key could reach.
+    for b in &body {
         lines.push(Line::from(Span::styled(
             b.clone(),
             Style::default().fg(t.text),
-        )));
-    }
-    // Anything withheld is COUNTED on screen. A preview that stops without
-    // saying so reads as the whole thing.
-    let hidden = plan.body_hidden(body.len());
-    if hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("  +{hidden} more lines"),
-            Style::default().fg(t.muted),
         )));
     }
 
@@ -5770,29 +5834,56 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         "sources",
         Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
     )));
-    for src in prov.sources.iter().take(plan.sources_shown) {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", clip(src, width.saturating_sub(4) as usize)),
-            Style::default().fg(t.dim),
-        )));
+    for src in &prov.sources {
+        for (n, part) in panel_body_lines(src, width.saturating_sub(4) as usize)
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(Line::from(Span::styled(
+                format!("{}{part}", if n == 0 { "  " } else { "    " }),
+                Style::default().fg(t.dim),
+            )));
+        }
     }
     lines.push(Line::from(Span::styled(
         "ontology",
         Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {}",
-            clip(&prov.placement, width.saturating_sub(4) as usize)
-        ),
-        Style::default().fg(t.dim),
-    )));
+    for (n, part) in panel_body_lines(&prov.placement, width.saturating_sub(4) as usize)
+        .into_iter()
+        .enumerate()
+    {
+        lines.push(Line::from(Span::styled(
+            format!("{}{part}", if n == 0 { "  " } else { "    " }),
+            Style::default().fg(t.dim),
+        )));
+    }
+    // What fits, at wherever the reader has scrolled to. The title carries the
+    // position, so a panel that continues below the fold says so instead of
+    // just stopping.
+    let visible_rows = rect.height.saturating_sub(2) as usize;
+    let rendered: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+        .collect();
+    let (_, position) = panel_window(&rendered, visible_rows, panel.scroll);
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let offset = panel.scroll.min(max_scroll);
+    let title = match &position {
+        Some(pos) => format!(" × esc  ↑↓ scroll  {pos} "),
+        None => " × esc ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(t.reference))
-        .title(" × esc ")
+        .title(title)
         .style(Style::default().bg(t.panel));
-    f.render_widget(Paragraph::new(lines).block(block), rect);
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((offset as u16, 0))
+            .block(block),
+        rect,
+    );
 
     let mut map = app.hit_map.borrow_mut();
     // The panel claims every cell it covers, exactly as the structure panel
@@ -5850,6 +5941,7 @@ mod tests {
         }
         let (ux, uy) = under.expect("the MgB2 row is on screen");
         app.ref_panel = Some(crate::app::RefPanel {
+            scroll: 0,
             id: "cache://aaa/structure.cif".to_string(),
             label: "TiAl".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -5928,6 +6020,7 @@ Al1 Al 0.75 0.75 0.75
                 "created_at": "2026-09-02T00:00:00Z"})],
         });
         app.ref_panel = Some(crate::app::RefPanel {
+            scroll: 0,
             id: "cache://aaa/structure.cif".to_string(),
             label: "HEA".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -6007,6 +6100,7 @@ Al1 Al 0.75 0.75 0.75
         );
         // Now open TiAl's panel anchored so it covers that very cell.
         app.ref_panel = Some(crate::app::RefPanel {
+            scroll: 0,
             id: "cache://aaa/structure.cif".to_string(),
             label: "TiAl".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -6149,6 +6243,7 @@ Al1 Al 0.75 0.75 0.75
             label: "TiAl gamma".to_string(),
         });
         app.ref_panel = Some(crate::app::RefPanel {
+            scroll: 0,
             id: id.to_string(),
             label: "TiAl gamma".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -6193,6 +6288,7 @@ Al1 Al 0.75 0.75 0.75
             crate::structure_view::parse_cif(FAKE_TIAL_CIF).expect("the fake CIF parses"),
         );
         app.ref_panel = Some(crate::app::RefPanel {
+            scroll: 0,
             id: format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
             label: "TiAl".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -6302,6 +6398,7 @@ Al1 Al 0.75 0.75 0.75
             crate::structure_view::parse_cif(cif).expect("the CIF parses"),
         );
         app.ref_panel = Some(crate::app::RefPanel {
+            scroll: 0,
             id: format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
             label: "TiAl".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -6537,6 +6634,48 @@ Fe1 0.0 0.0 0.0
 
         assert!(clipped.width() <= 4, "{clipped:?} overflowed");
         assert!(!clipped.ends_with('\u{200d}'), "split a joined emoji");
+    }
+
+    /// The hover panel exists to show a value in full. Clipping a cache
+    /// reference to "cache://0f7a…" shows a value nobody can look up, and the
+    /// panel is the one place the whole thing must be readable.
+    #[test]
+    fn a_panel_line_wraps_instead_of_losing_its_tail() {
+        let id = "cache://0f7a1c2e9b4d4a6f8c1e3b5d7f9a0c2e4b6d8f0a1c3e5b7d9f0a2c4e6b8d0f";
+        let lines = panel_body_lines(id, 30);
+        assert!(lines.len() > 1, "a long value wraps: {lines:?}");
+        assert_eq!(lines.concat(), id, "no glyph is lost to the wrap");
+        assert!(
+            lines.iter().all(|l| !l.contains('…')),
+            "the panel never elides: {lines:?}"
+        );
+        assert!(lines.iter().all(|l| l.width() <= 30), "{lines:?}");
+    }
+
+    /// A panel taller than its room scrolls, and says where the reader is.
+    /// Before this it simply stopped, and the keys moved the list behind it.
+    #[test]
+    fn a_panel_window_scrolls_and_says_its_position() {
+        let lines: Vec<String> = (1..=40).map(|n| format!("line {n}")).collect();
+        let (shown, pos) = panel_window(&lines, 10, 0);
+        assert_eq!(shown.len(), 10);
+        assert_eq!(shown[0], "line 1");
+        assert_eq!(pos.as_deref(), Some("1-10/40"));
+
+        let (shown, pos) = panel_window(&lines, 10, 12);
+        assert_eq!(shown[0], "line 13", "the window moved with the scroll");
+        assert_eq!(pos.as_deref(), Some("13-22/40"));
+
+        // Scrolling past the end stops at the last full window, never blank.
+        let (shown, pos) = panel_window(&lines, 10, 999);
+        assert_eq!(shown[0], "line 31", "{shown:?}");
+        assert_eq!(shown.len(), 10);
+        assert_eq!(pos.as_deref(), Some("31-40/40"));
+
+        // Everything fits: no position label, because there is nothing to say.
+        let (shown, pos) = panel_window(&lines[..4], 10, 0);
+        assert_eq!(shown.len(), 4);
+        assert_eq!(pos, None);
     }
 
     #[test]

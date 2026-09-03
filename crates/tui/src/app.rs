@@ -1077,6 +1077,26 @@ impl App {
             return;
         }
 
+        // An open reference panel takes the scroll keys. Before this they went
+        // to whatever list was BEHIND the panel: pressing Down moved the
+        // sidebar selection while the panel kept showing the old entity, so
+        // the panel went stale while looking live, and its content below the
+        // fold was unreachable by any key.
+        if self.ref_panel.is_some()
+            && let Some(delta) = match key.code {
+                KeyCode::Down => Some(1isize),
+                KeyCode::Up => Some(-1),
+                KeyCode::PageDown => Some(10),
+                KeyCode::PageUp => Some(-10),
+                KeyCode::Home => Some(isize::MIN),
+                KeyCode::End => Some(isize::MAX),
+                _ => None,
+            }
+        {
+            self.scroll_ref_panel(delta);
+            return;
+        }
+
         // The which-key panel (`?`) intercepts keys while open: j/k scroll,
         // `?`/q/Esc/Ctrl-C close it. Like the palette, Ctrl-C here cancels
         // the panel rather than quitting the app.
@@ -1482,6 +1502,20 @@ impl App {
     ///
     /// Re-hovering the same reference is a no-op beyond moving the anchor, so
     /// drifting a pixel inside a word does not re-request anything.
+    /// Move the open panel's window. The upper bound is clamped at render
+    /// time against the real line count, which only the renderer knows; here
+    /// we keep it non-negative and let a large value mean "the end".
+    pub fn scroll_ref_panel(&mut self, delta: isize) {
+        if let Some(panel) = self.ref_panel.as_mut() {
+            panel.scroll = match delta {
+                isize::MIN => 0,
+                isize::MAX => usize::MAX,
+                d if d < 0 => panel.scroll.saturating_sub(d.unsigned_abs()),
+                d => panel.scroll.saturating_add(d as usize),
+            };
+        }
+    }
+
     fn open_reference_panel(&mut self, id: &str, column: u16, row: u16) {
         if let Some(open) = &mut self.ref_panel
             && open.id == id
@@ -1499,6 +1533,7 @@ impl App {
             None => self.begin_reference_fetch(id, kind),
         };
         self.ref_panel = Some(RefPanel {
+            scroll: 0,
             id: id.to_string(),
             label,
             kind,
@@ -6565,7 +6600,62 @@ mod tests {
     use super::*;
 
     /// A flush of text inside a few milliseconds is not a rate. Nothing is
-    /// reported until the window is real; then it is tokens over that window.
+    /// reported until the window is real; then it is tokens over that window.    /// An open panel takes the scroll keys. They used to reach the list
+    /// BEHIND it: Down moved the sidebar selection while the panel went on
+    /// showing the old entity, so the panel read as live while being stale,
+    /// and anything below its fold could not be reached at all.
+    #[test]
+    fn an_open_panel_takes_the_scroll_keys_from_the_list_behind_it() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![
+                serde_json::json!({"cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                                   "formula": "TiAl", "n_atoms": 2,
+                                   "composition": {"Al": 1, "Ti": 1}, "source": "user_import"}),
+                serde_json::json!({"cache_key": "bbb", "cache_ref": "cache://bbb/structure.cif",
+                                   "formula": "MgB2", "n_atoms": 3,
+                                   "composition": {"Mg": 1, "B": 2}, "source": "materials_project"}),
+            ],
+        });
+        app.ref_panel = Some(RefPanel {
+            scroll: 0,
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: RefPanelState::Ready("one\ntwo\nthree".to_string()),
+            anchor: (10, 5),
+            pinned: true,
+        });
+        let before = app.workspace_selected;
+
+        app.handle_key(crossterm::event::KeyEvent::from(KeyCode::Down));
+        assert_eq!(
+            app.ref_panel.as_ref().unwrap().scroll,
+            1,
+            "Down scrolls the panel"
+        );
+        assert_eq!(
+            app.workspace_selected, before,
+            "and does not move the list behind it"
+        );
+
+        app.handle_key(crossterm::event::KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.ref_panel.as_ref().unwrap().scroll, 0);
+        app.handle_key(crossterm::event::KeyEvent::from(KeyCode::Up));
+        assert_eq!(
+            app.ref_panel.as_ref().unwrap().scroll,
+            0,
+            "scrolling up at the top stays at the top"
+        );
+        app.handle_key(crossterm::event::KeyEvent::from(KeyCode::End));
+        assert_eq!(app.ref_panel.as_ref().unwrap().scroll, usize::MAX);
+        app.handle_key(crossterm::event::KeyEvent::from(KeyCode::Home));
+        assert_eq!(app.ref_panel.as_ref().unwrap().scroll, 0);
+        assert_eq!(app.workspace_selected, before, "still not the list");
+    }
+
     #[test]
     fn throughput_needs_a_real_window() {
         use std::time::Duration;
@@ -6680,6 +6770,7 @@ mod tests {
         );
         // And what rides the wire carries the same sanitized text.
         app.ref_panel = Some(RefPanel {
+            scroll: 0,
             id: "cache://real/structure.cif".to_string(),
             label: token.clone(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -6714,6 +6805,7 @@ mod tests {
         );
         // Even reached directly, it is refused rather than marked as a file.
         app.ref_panel = Some(RefPanel {
+            scroll: 0,
             id: "sim-42".to_string(),
             label: "MACE relaxation".to_string(),
             kind: Some(crate::refs::RefKind::FileLine),
@@ -6980,6 +7072,7 @@ mod tests {
     fn app_with_open_structure_panel(id: &str) -> App {
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
         app.ref_panel = Some(RefPanel {
+            scroll: 0,
             id: id.to_string(),
             label: "TiAl".to_string(),
             kind: Some(crate::refs::RefKind::Structure),
@@ -8597,6 +8690,10 @@ pub struct RefPanel {
     /// Screen cell the pointer was on, so the panel can open beside the word
     /// rather than over it.
     pub anchor: (u16, u16),
+    /// How far the reader has scrolled. A panel taller than its room used to
+    /// simply stop, and the arrow keys moved the list BEHIND it, so the panel
+    /// went stale while looking live.
+    pub scroll: usize,
     /// Opened by a CLICK, so it stays until dismissed.
     ///
     /// A hover panel closes when the pointer leaves the word, which is right
