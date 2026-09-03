@@ -30,6 +30,44 @@ pub fn source_rows(content: &str) -> Vec<Value> {
     let fetched = fetched_stamp(object);
     let mut rows = Vec::new();
 
+    // A tool that DECLARES its sources is believed as it stands. This is the
+    // shape a tool emits when it knows exactly which databases it asked —
+    // `prior_art_search` gets a per-source status list from the retrieval
+    // engine — and it is carried through unchanged so the reader sees the
+    // tool's own account, not a reconstruction.
+    //
+    // Only well-formed declarations count. Several tools use `sources` for
+    // their INPUT (which backends to use), and a list of names is not a
+    // provenance record, so anything without a `source` string is skipped
+    // rather than half-read into a row that says less than nothing.
+    if let Some(declared) = object.get("sources").and_then(Value::as_array) {
+        for entry in declared {
+            let Some(e) = entry.as_object() else {
+                continue;
+            };
+            let Some(name) = e.get("source").and_then(Value::as_str) else {
+                continue;
+            };
+            let mut row = serde_json::json!({ "source": name });
+            for key in ["kind", "count", "fetched", "status", "record"] {
+                if let Some(v) = e.get(key) {
+                    row[key] = v.clone();
+                }
+            }
+            // Fall back to the card's own stamps only where the tool said
+            // nothing, never over what it did say.
+            if row.get("kind").is_none_or(Value::is_null)
+                && let Some(kind) = data_kind.as_ref()
+            {
+                row["kind"] = serde_json::json!(kind);
+            }
+            if row.get("fetched").is_none_or(Value::is_null) && !fetched.is_null() {
+                row["fetched"] = fetched.clone();
+            }
+            rows.push(row);
+        }
+    }
+
     // The federation's query log: one row per provider that was asked,
     // including the ones that failed — a reader deserves to know who was
     // asked and did not answer.
@@ -179,6 +217,60 @@ pub fn descriptor_rows(content: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A tool that DECLARES its sources is believed. `prior_art_search` knows
+    /// which databases it asked — the engine hands it a per-source status
+    /// list — and says so in a `sources` array. The extractor only knew about
+    /// `providers_queried` and a provenance block, so a search that named its
+    /// four databases still reached the reader as "SOURCE NOT REPORTED".
+    #[test]
+    fn a_declared_sources_array_is_carried_through() {
+        let content = serde_json::json!({
+            "count": 14,
+            "sources": [
+                {"source": "arxiv", "kind": "peer-reviewed literature metadata",
+                 "count": 8, "fetched": "2026-09-03T10:00:00+00:00",
+                 "status": "ok", "record": {"status": "ok", "cache_hit": false}},
+                {"source": "chemrxiv", "kind": "peer-reviewed literature metadata",
+                 "count": null, "fetched": "2026-09-03T10:00:00+00:00",
+                 "status": "timeout", "record": {"status": "timeout", "error": "deadline"}}
+            ]
+        })
+        .to_string();
+
+        let rows = super::source_rows(&content);
+        assert_eq!(rows.len(), 2, "both declared sources survive: {rows:?}");
+        assert_eq!(rows[0]["source"], "arxiv");
+        assert_eq!(rows[0]["count"], 8);
+        assert_eq!(rows[0]["kind"], "peer-reviewed literature metadata");
+        assert_eq!(rows[0]["fetched"], "2026-09-03T10:00:00+00:00");
+        // The one that failed is kept, with its reason, and does NOT report
+        // zero results — it returned no answer, which is a different fact.
+        assert_eq!(rows[1]["source"], "chemrxiv");
+        assert_eq!(rows[1]["status"], "timeout");
+        assert!(rows[1]["count"].is_null(), "{:?}", rows[1]);
+        assert_eq!(rows[1]["record"]["error"], "deadline");
+    }
+
+    /// A declaration entry that does not name its source is skipped rather
+    /// than half-read into a row that says less than nothing. The plain
+    /// list-of-names form keeps working — that is what a cache and an import
+    /// carry, and it is handled further down.
+    #[test]
+    fn a_declaration_without_a_source_name_is_skipped() {
+        let content = serde_json::json!({"sources": [{"note": "no source name"}]}).to_string();
+        assert!(
+            super::source_rows(&content).is_empty(),
+            "{:?}",
+            super::source_rows(&content)
+        );
+        // Unchanged: a list of names is still a list of sources.
+        let content = serde_json::json!({"sources": ["arxiv", "semantic_scholar"]}).to_string();
+        let rows = super::source_rows(&content);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["source"], "arxiv");
+    }
+
     use super::*;
 
     /// The federation's query log becomes one row per provider asked, failed
