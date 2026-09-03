@@ -27,6 +27,7 @@ from pathlib import Path
 from app.tools import spawn
 from app.tools.base import Tool, ToolRegistry
 from app.tools.evidence import EvidenceSource, stamp_evidence
+from app.tools._provenance import utc_now_iso
 
 
 def _compact_abstract(text, limit: int = 400) -> str:
@@ -131,6 +132,7 @@ def _literature_search_impl(**kwargs) -> dict:
     # engine's state, not by the rendered string: a fully-cached zero-hit
     # success renders "cache (0 results)" and a startswith("ok") check would
     # report it as a failure.
+    declared_sources = _literature_search_impl.declare_sources(outcome)
     source_status = {}
     ok_sources = 0
     for status in outcome.get("source_status", []):
@@ -147,6 +149,10 @@ def _literature_search_impl(**kwargs) -> dict:
 
     out = {
         "results": results,
+        # Which databases were actually asked, and what each one gave back.
+        # The UI's source table reads this; without it a reader sees results
+        # with no way to tell one database from five, or which never answered.
+        "sources": declared_sources,
         "count": len(results),
         "source": "literature",
         "source_status": source_status,
@@ -215,6 +221,43 @@ def _patent_search_impl(**kwargs) -> dict:
     }
 
 
+def _declare_literature_sources(outcome: dict) -> list[dict]:
+    """The engine's per-source status, in the shape the source table reads.
+
+    Every source consulted is named — including the ones that failed, because
+    dropping them turns "four databases, two answered" into "two databases".
+    A source that timed out or errored reports `count: None`: it did not
+    return zero results, it returned no answer, and a plain 0 reads as
+    "searched, found nothing".
+    """
+    fetched = utc_now_iso()
+    declared = []
+    for status in outcome.get("source_status", []) or []:
+        state = status.get("status", "error")
+        answered = state == "ok"
+        record = {"status": state}
+        if status.get("error"):
+            record["error"] = status["error"]
+        if "cache_hit" in status:
+            record["cache_hit"] = bool(status.get("cache_hit"))
+        if status.get("endpoint"):
+            record["endpoint"] = status["endpoint"]
+        declared.append(
+            {
+                "source": status.get("source", "unknown"),
+                "kind": "peer-reviewed literature metadata",
+                "count": status.get("count", 0) if answered else None,
+                "fetched": fetched,
+                "status": state,
+                "record": record,
+            }
+        )
+    return declared
+
+
+_literature_search_impl.declare_sources = _declare_literature_sources
+
+
 def _prior_art_search(**kwargs) -> dict:
     """Federated prior-art lookup.
 
@@ -252,6 +295,9 @@ def _prior_art_search(**kwargs) -> dict:
         "papers": [],
         "patents": [],
         "eastern": [],
+        # Only branches that were actually consulted add entries here, so the
+        # table never shows a database that was never asked.
+        "sources": [],
         # `None` until a backend actually answers; each branch below sets its
         # own count, and any left `None` were not searched.
         "counts": {"papers": None, "patents": None, "eastern": None},
@@ -286,6 +332,7 @@ def _prior_art_search(**kwargs) -> dict:
                 sources=kwargs.get("sources"),  # arxiv / semantic_scholar override
             )
             out["papers"] = lit.get("results", [])
+            out["sources"].extend(lit.get("sources", []) or [])
             out["counts"]["papers"] = lit.get("count", 0)
             out["source_status"] = lit.get("source_status", {})
             # Relevance applies only to the literature branch of this
