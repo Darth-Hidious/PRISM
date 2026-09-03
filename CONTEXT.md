@@ -43,6 +43,28 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 
 - Fork state 2026-09-02 14:10: mesh `feat/mesh-iroh-transport` @0ee47fb7 — two re-audits DO NOT LAND/FIX FIRST (identity-plumbing regression, credential relaxation, cancellation, knobs, fan-out honesty); writer on round 3; DESIGN-ONLY Friday. AG-UI `feat/agui-tui` @9a1b2b52 — my gate green (1,322 lib + 284 cli bins, clippy clean, merge preview clean) but my tui-driver walk found a home-screen typing regression (keys eaten as navigation; raw echo after view switch); re-audits: CIF FIX FIRST (multi-block merge, unterminated `;` → 0 sites, occupancy 0 → atom), marks FIX FIRST (slot wires untested, id injection, no bound, retraction gaps). Writer has all three rounds queued. DEMO BINARY = installed 10:22 build of THIS branch.
 
+- 2026-09-02 pm (later): execute_bash guard hardened (`1eb3b03f`: program name judged, wrappers peeled, root/.git/.prism protected, find/xargs/awk inner validation, wipers refused; 19 of 20 rm -rf shapes passed before). Probe fix cherry-picked `0fa687be` (silent terminal never asked) — AUDIT says it adds a 2 s stall on silent terminals/tmux and can still eat a key over slow ssh: writer doing a follow-up commit (P1–P4) for re-cherry-pick. `prism resume` logs to file `ebbc4599`. gitignore docs re-includes real `d4171585`. Resume defects REPRODUCED: history not shown after resume, picker dates +27d/−2h, header stuck "fetching sessions" → with pi (Qwen 3.8 max, `pi -p`, worktree `/Volumes/Samsung SSD 1TB/pi-resume-wt`, report /tmp/pi-resume-report.md) together with the 11 pre-existing `requires_approval is False` failures (default None since `8763ad26`). Audits: interaction graph ×2 FIX FIRST (frame refusals absent, hull differentiable via fit/hessian, MP_FRAME constant, energy_kind default, spinodal grid bias) → writer fixing before round 2 (DFT collaborator interface); AG-UI FIX FIRST (P1–P4 probe, S1–S7 structure) → writer; mesh round 3 (3 commits, 33/33 mutants) → re-audit running. Second audits (AG-UI B, mesh F) after fixes. Disk: every writer/auditor on its own target; internal 26 GiB, SSD 60 GiB; demo binary still the 10:22 build → reinstall after pi + probe follow-up land.
+
+- 2026-09-03: CREDITS RAN OUT mid-session; five Fable agents died at once. Work
+  preserved as WIP commits before anything else (AG-UI `1da413d5`, mesh
+  `f20f9bac`). Landed since, each gated: pi's four resume/approval fixes
+  (`52f148fb`, merged `c6a96ff5`), `prism --resume` actually resuming
+  (`e02bc527`), the resume notice as a system line not model output
+  (`e4c7698f`), AG-UI round 4 merged (`89f5a265` → `30cb6589`) and its three
+  remaining defects fixed (`c90d407f`: unit column 12→14 so `electrons/atom`
+  is not clipped, origin falls back to full-width lines below ~24 columns
+  instead of cutting words in half, width-aware header). Demo binary
+  `prism 1.1.0` installed 11:31 and driver-verified: resume restores history,
+  picker dates correct, source table and descriptor card read at 140 columns.
+  HAZARD REPEATED: my first AG-UI gate was green from a SHARED cargo target
+  (demo branch's binary); two tests had been failing all along. Isolated
+  target since. Open audits recorded in `AUDIT_FINDINGS_2026-09-03.md`:
+  interaction-graph fix round FIX FIRST, DFT collaborator interface DO NOT
+  LAND (arbitrary write via the `system` argument, tar-slip, no ingest
+  containment, frame check defaults to self-certification). Neither merged.
+  Mesh round 4 (F1 refusal-path leak, F2 dead 429) queued, design-only for
+  the demo.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
