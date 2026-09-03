@@ -166,6 +166,39 @@ def test_lookup_structure_returns_best_hit():
     assert out["other_hits"]
 
 
+def test_lookup_structure_carries_the_fetch_record_through():
+    """The federation's own record of the fetch — which provider answered,
+    with what, and when — reaches the caller unchanged, found or not. The
+    UI's source table is built from it; a lookup that dropped it showed a
+    structure with no origin."""
+    from app.tools.base import ToolRegistry
+    from app.tools.materials import create_materials_informatics_tools
+
+    reg = ToolRegistry()
+    create_materials_informatics_tools(reg)
+    lookup = reg.get("lookup_structure")
+    queried = [{
+        "provider": "Materials Project", "provider_id": "mp", "status": "success",
+        "ok": True, "result_count": 1, "endpoint": "https://api.materialsproject.org",
+    }]
+    fake_ms = MagicMock()
+    fake_ms.func.return_value = {
+        "materials": [_fake_material("Si", band_gap=1.0)],
+        "providers_summary": {"succeeded": 1, "failed": 0},
+        "providers_queried": queried,
+        "fetched_at_iso8601": "2026-09-02T14:10:03Z",
+    }
+    with patch("app.tools.materials._shared.get_shared_registry") as mock_reg:
+        mock_reg.return_value = MagicMock(get=MagicMock(return_value=fake_ms))
+        found = lookup.func(formula="Si")
+        fake_ms.func.return_value["materials"] = []
+        missing = lookup.func(formula="Xx")
+    for out in (found, missing):
+        assert out["providers_queried"] == queried
+        assert out["fetched_at_iso8601"] == "2026-09-02T14:10:03Z"
+        assert out["data_kind"] == "crystal structure + properties"
+
+
 def test_screen_requires_at_least_one_filter():
     """screen_materials errors honestly with no filters (not an empty search)."""
     from app.tools.base import ToolRegistry

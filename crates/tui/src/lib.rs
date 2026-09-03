@@ -42,6 +42,7 @@ pub mod keymap;
 pub mod knowledge;
 pub mod latex;
 pub mod markdown;
+pub mod marks;
 pub mod msg;
 pub mod notebook;
 pub mod refs;
@@ -54,6 +55,8 @@ pub mod refs;
 #[doc(hidden)]
 pub mod render;
 pub mod sanitize;
+pub mod sources;
+pub mod structure_view;
 pub mod structures;
 pub mod theme;
 pub mod toast;
@@ -63,7 +66,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode},
 };
 use ratatui::Terminal;
 use std::io;
@@ -196,7 +199,9 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // whatever termios it found when it started. Found cooked, it turned a
     // running TUI back to cooked mode: every keystroke echoed raw across the
     // frame. Found raw, the worst it can restore is raw.
-    enable_raw_mode()?;
+    // The token is the proof: the handshake and the probe below take it, so
+    // this line cannot be moved under them without failing to compile.
+    let raw = image_view::RawModeOn::enable()?;
 
     // Ask the terminal what graphics it can draw BEFORE anything else owns
     // stdin or stdout — and only if it answers questions at all.
@@ -210,20 +215,28 @@ pub async fn run_with_config(config: RunConfig) -> Result<()> {
     // reader yet and no frame in flight, so the reply can only go one place.
     // A terminal that never answers is never asked: its reader thread would
     // outlive the query and eat the first keystrokes off stdin.
-    let image_view = image_view::ImageView::detect(image_view::ImageView::terminal_answers());
+    // A multiplexer and a remote session are settled without the handshake
+    // and never pay its two seconds; a silent terminal pays them once and is
+    // then left alone.
+    let image_view = image_view::ImageView::detect(&raw);
 
     let mut stdout = io::stdout();
     // Bracketed paste turns a pasted block into ONE event instead of one key
     // per character. Without it the loop redraws the whole screen between
     // every character of a paste, and a pasted research question arrived
     // truncated — "Screen refra" out of a full sentence.
-    execute!(
+    // Raw mode is already on: a failure here must take it off again on the
+    // way out, or the shell the reader lands back in has no echo.
+    if let Err(error) = execute!(
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
         Hide
-    )?;
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     // Terminal::new() queries the cursor position via `\x1b[6n` (DSR).
     // Some PTY environments (pexpect, CI runners, non-interactive pipes)

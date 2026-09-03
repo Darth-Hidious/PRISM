@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from app.tools._provenance import utc_now_iso
 from app.tools.base import Tool, ToolRegistry
 from app.tools.search_engine.engine import SearchEngine
 from app.tools.search_engine.providers.registry import ProviderRegistry
@@ -327,6 +328,11 @@ def _materials_search_factory(provider_registry: ProviderRegistry):
         return {
             "materials": [m.model_dump(mode="json") for m in result.materials],
             "count": len(result.materials),
+            # What this is and when it was fetched, said by the tool that
+            # fetched it. The UI's source table reads these; without them a
+            # reader sees numbers and cannot say where they came from.
+            "data_kind": "materials: structure + properties",
+            "fetched_at_iso8601": utc_now_iso(),
             # Partial is a third state: False whenever any consulted provider
             # failed, timed out, sat behind an open circuit, was offline-
             # blocked, or returned truncated data. A caller citing this

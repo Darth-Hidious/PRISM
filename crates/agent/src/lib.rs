@@ -10,6 +10,7 @@ pub mod embeddings;
 pub mod execution_contract;
 pub mod hooks;
 pub mod influence;
+pub mod marked;
 pub mod mcp;
 pub mod meta_tools;
 pub mod models;
@@ -26,6 +27,7 @@ pub mod service;
 pub mod session;
 mod session_index;
 pub mod skills;
+pub mod source_table;
 pub mod subagent;
 pub mod task;
 /// Whether this build of `prism-agent` carries the live-store guard. A crate

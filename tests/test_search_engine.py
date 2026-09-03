@@ -229,6 +229,13 @@ def test_s1_tool_output_surfaces_ok_status_warnings_summary():
     assert by_id["ok-prov"]["status"] == "success"
     assert by_id["bad-prov"]["ok"] is False, "timeout must be ok=False (the S1 fix)"
     assert by_id["bad-prov"]["status"] == "timeout"
+    # The result says what it is and when it was fetched: the UI's source
+    # table is built from these, and a reader must never be left to guess.
+    assert out["data_kind"].startswith("materials")
+    from datetime import datetime
+
+    fetched = datetime.fromisoformat(out["fetched_at_iso8601"])
+    assert fetched.tzinfo is not None, "a fetch time without a zone is not a time"
     assert by_id["bad-prov"]["error"] == "Timed out after 5s"
     # warnings must reach the output (old code dropped them)
     assert out["warnings"] == ["Provider 'bad-prov' failed: TimeoutError"]

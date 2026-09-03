@@ -22,7 +22,9 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::Canvas;
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, Widget, Wrap,
 };
@@ -652,6 +654,83 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                         }
                     }
                     lines.push(Line::from(spans));
+                }
+                // ── Where the data came from, BEFORE the result body ────
+                // Every finished result gets the table: a row per source the
+                // tool named, each an openable reference, or one bold line
+                // saying the tool named none. A descriptor set gets its card
+                // under it, each value beside where it was computed from. A
+                // reader watching a live session must never have to wonder
+                // what they are looking at.
+                if let LineKind::ToolResult {
+                    success: true,
+                    tool_name,
+                    evidence_class,
+                    sources,
+                    descriptors,
+                    ..
+                } = kind
+                {
+                    let indent = "    ";
+                    let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
+                    let width = usize::from(area.width.saturating_sub(4));
+                    let bold = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
+                    if sources.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                crate::sources::not_reported_line(tool_name),
+                                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    } else {
+                        let badge = evidence_token(*evidence_class);
+                        let layout = crate::sources::layout(width, &badge);
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(crate::sources::header_line(layout), bold),
+                        ]));
+                        for row in sources {
+                            let (cell, rest) = crate::sources::row_cells(row, &badge, layout);
+                            let visible = cell.trim_end().to_string();
+                            let pad = " ".repeat(cell.len().saturating_sub(visible.len()));
+                            let end = indent_cols
+                                .saturating_add(u16::try_from(visible.width()).unwrap_or(u16::MAX));
+                            reference_marks.push((lines.len(), indent_cols, end, row.id.clone()));
+                            lines.push(Line::from(vec![
+                                Span::raw(indent),
+                                Span::styled(visible, crate::refs::mark_style(t)),
+                                Span::raw(pad),
+                                Span::styled(rest, Style::default().fg(t.text)),
+                            ]));
+                        }
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(
+                                crate::sources::reason_line(&badge, *evidence_class),
+                                Style::default().fg(evidence_color(*evidence_class, t)),
+                            ),
+                        ]));
+                    }
+                    if !descriptors.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent),
+                            Span::styled(crate::sources::descriptor_header(), bold),
+                        ]));
+                        for row in descriptors {
+                            let style = if row.origin.is_some() {
+                                Style::default().fg(t.text)
+                            } else {
+                                Style::default().fg(t.warn).add_modifier(Modifier::BOLD)
+                            };
+                            for text in crate::sources::descriptor_lines(row, width) {
+                                lines.push(Line::from(vec![
+                                    Span::raw(indent),
+                                    Span::styled(text, style),
+                                ]));
+                            }
+                        }
+                    }
                 }
                 let rest: Vec<&str> = body.collect();
                 if render_body_as_markdown && !rest.join("").trim().is_empty() {
@@ -1372,6 +1451,32 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(clip(goal, w.saturating_sub(4)), Style::default().fg(t.text)),
         ]));
     }
+    // What the reader has marked for the agent — shared state, kept in view.
+    // One line per handle: its kind and the words the reader saw. Absent
+    // when nothing is marked; a strip that says "nothing" costs a line to
+    // say nothing.
+    let mut mark_rows: Vec<(usize, String)> = Vec::new();
+    if !app.marks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" ★ marked for agent ({})  click to unmark", app.marks.len()),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        )));
+        for mark in app.marks.iter() {
+            let kind = crate::marks::kind_word(mark.kind);
+            mark_rows.push((lines.len(), mark.id.clone()));
+            lines.push(Line::from(vec![
+                // The reference colour is this codebase's promise that a word
+                // is a handle. The strip rows ARE handles — clicking one
+                // unmarks it — so they wear it and claim their cells below.
+                Span::styled("   ● ", Style::default().fg(t.reference)),
+                Span::styled(format!("{kind} "), Style::default().fg(t.muted)),
+                Span::styled(
+                    clip(&mark.label, w.saturating_sub(7 + kind.len())),
+                    crate::refs::mark_style(t),
+                ),
+            ]));
+        }
+    }
     lines.push(Line::raw(""));
 
     // Which entry each line belongs to, filled as the tab's rows are built.
@@ -1403,6 +1508,9 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
     {
         let mut marks: Vec<usize> = rows.iter().map(|(line, _)| *line).collect();
         marks.push(tabs_line_index);
+        // The marked-strip rows need measuring too, or `screen_row` cannot
+        // place them and their hit regions are never pushed.
+        marks.extend(mark_rows.iter().map(|(line, _)| *line));
         marks.sort_unstable();
         marks.dedup();
         let mut row_of: Vec<(usize, u16)> = Vec::with_capacity(marks.len());
@@ -1427,6 +1535,17 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let mut map = app.hit_map.borrow_mut();
+        // The marked strip's rows are handles: clicking one takes the mark
+        // back where it is shown, instead of sending the reader to find the
+        // orange word again.
+        for (line, id) in &mark_rows {
+            if let Some(row) = screen_row(*line) {
+                map.push(
+                    Rect::new(inner.x, row, inner.width, 1),
+                    HitTarget::MarkRow { id: id.clone() },
+                );
+            }
+        }
         if let Some(row) = screen_row(tabs_line_index) {
             for (tab, col, width) in tab_spans {
                 map.push(
@@ -1454,6 +1573,35 @@ fn draw_workspace(f: &mut Frame, app: &App, area: Rect) {
                     index: *entry,
                 },
             );
+        }
+        // A structure row's formula is a handle. Its cells answer as the
+        // reference (pushed after the row, so they win the newest-first
+        // lookup); the rest of the row still selects. Pointing at the formula
+        // opens the structure panel; the row keeps keyboard parity.
+        if app.workspace_tab == WorkspaceTab::Structures
+            && let StructuresStoreState::Ready(structures) = &app.structure_store
+        {
+            // Prefix ("▸ " or "  ") and glyph ("◇ ") precede the formula.
+            let lead = u16::try_from(2 + ObjectKind::Structure.glyph().width() + 1).unwrap_or(4);
+            for (line, entry) in rows.iter() {
+                let (Some(top), Some(structure)) = (screen_row(*line), structures.get(*entry))
+                else {
+                    continue;
+                };
+                let id = structure
+                    .cache_ref
+                    .clone()
+                    .unwrap_or_else(|| format!("cache://{}/structure.cif", structure.cache_key));
+                let formula = clip(structure.formula_display(), w.saturating_sub(6));
+                let width = u16::try_from(formula.width()).unwrap_or(0);
+                if width == 0 || lead >= inner.width {
+                    continue;
+                }
+                map.push(
+                    Rect::new(inner.x + lead, top, width.min(inner.width - lead), 1),
+                    HitTarget::Reference { id },
+                );
+            }
         }
     }
 
@@ -2190,9 +2338,11 @@ fn build_structures_lines(
                 format!("{} ", ObjectKind::Structure.glyph()),
                 Style::default().fg(t.dim),
             ),
+            // The formula is a handle — hover or click opens the structure —
+            // so it wears the one colour that means "I can open this".
             Span::styled(
                 clip(structure.formula_display(), w.saturating_sub(6)).to_string(),
-                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+                crate::refs::mark_style(t).add_modifier(Modifier::BOLD),
             ),
         ]));
 
@@ -3272,6 +3422,10 @@ fn draw_status_window(f: &mut Frame, app: &App) {
     ));
     lines.push(kv("mode", mode));
     lines.push(kv("session", clip(&app.session_title, 36)));
+    // Which graphics protocol figures are drawn with and, when the terminal
+    // was not the one that decided, why: a coarse figure over ssh is
+    // "halfblocks — remote session, not probed", not a bad plot.
+    lines.push(kv("graphics", app.image_view().graphics_note()));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Usage",
@@ -5213,10 +5367,307 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// Opens BESIDE the word, never over it: a panel covering the thing you are
 /// pointing at makes you move the pointer to read it, which closes it. Clamped
 /// into the frame so a reference near the right edge still shows its body.
+/// The panel's mark state, as a span on its header line: what a click on
+/// the reference does next. Marked handles say so; unmarked ones say how.
+fn mark_hint_span(app: &App, id: &str, t: Theme) -> Span<'static> {
+    if app.marks.is_marked(id) {
+        return Span::styled(
+            "  ★ marked for agent",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        );
+    }
+    // `m` is a literal `m` while the reader is typing, so offering it there
+    // would be an instruction that does nothing.
+    let hint = if app.focus == crate::app::Focus::Input {
+        "  click again to mark"
+    } else {
+        "  click again · m: mark"
+    };
+    Span::styled(hint, Style::default().fg(t.dim))
+}
+
+/// The cache key a structure reference names, whichever form the id takes
+/// (`cache://KEY` or `cache://KEY/structure.cif`).
+fn structure_panel_key(id: &str) -> Option<&str> {
+    id.strip_prefix("cache://")
+        .map(|k| k.split('/').next().unwrap_or(k))
+        .filter(|k| !k.is_empty())
+}
+
+/// The reference panel for a structure: what the formula stands for, drawn.
+/// Header (formula, sites, space group, cell), the species legend, the unit
+/// cell with its atoms as a Braille projection, the site table, and the same
+/// provenance sections the text panel shows.
+fn draw_structure_panel(
+    f: &mut Frame,
+    app: &App,
+    panel: &crate::app::RefPanel,
+    view: &crate::structure_view::StructureView,
+    area: Rect,
+) {
+    let t = app.theme();
+    let width = 64u16.min(area.width.saturating_sub(2)).max(24);
+    let header = view.header_lines();
+    let legend = view.legend();
+    let sites = view.site_lines(6);
+    let prov = app.reference_provenance(&panel.id);
+    // A refetch that failed while a cell is cached must SAY it failed. Showing
+    // the cached cell alone reads as a fresh, successful read.
+    let failure = match &panel.state {
+        crate::app::RefPanelState::Failed(why) => Some(format!("fetch failed — {why}")),
+        crate::app::RefPanelState::NotResolvable(why) => Some(why.clone()),
+        _ => None,
+    };
+    let legend_h = legend_lines(&legend, usize::from(width.saturating_sub(2)), t).len();
+    let canvas_h: u16 = 12;
+    let top_len =
+        u16::try_from(1 + header.len() + legend_h + usize::from(failure.is_some())).unwrap_or(6);
+    let bottom_len = u16::try_from(
+        sites.len()
+            + 1
+            + prov.sources.len().min(SOURCES_SHOWN)
+            + 2
+            + usize::from(prov.sources.len() > SOURCES_SHOWN),
+    )
+    .unwrap_or(8);
+    let height = (top_len + canvas_h + bottom_len + 2).min(area.height.max(3));
+
+    let (px, py) = panel.anchor;
+    let x = if px + width < area.x + area.width {
+        px
+    } else {
+        (area.x + area.width).saturating_sub(width)
+    };
+    let y = if py + 1 + height < area.y + area.height {
+        py + 1
+    } else {
+        py.saturating_sub(height)
+    };
+    let rect = Rect::new(x, y.max(area.y), width, height);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.reference))
+        .title(" × esc ")
+        .style(Style::default().bg(t.panel));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let iw = usize::from(inner.width);
+
+    let mut top: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled(
+            panel.label.clone(),
+            Style::default()
+                .fg(t.reference)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  structure", Style::default().fg(t.muted)),
+        mark_hint_span(app, &panel.id, t),
+    ])];
+    if let Some(why) = &failure {
+        top.push(Line::from(Span::styled(
+            clip(why, iw),
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        )));
+    }
+    for h in &header {
+        top.push(Line::from(Span::styled(
+            clip(h, iw),
+            Style::default().fg(t.text),
+        )));
+    }
+    // The legend wraps: a six-element alloy ran off the right edge and lost
+    // species that the drawing was colouring by.
+    for line in legend_lines(&legend, iw, t) {
+        top.push(line);
+    }
+    // Not drawn yet: the table below is reserved first, and the top takes
+    // what is left of the height after it — see the layout after `bottom`.
+    let top_total = top.len();
+
+    // The bottom — site table, sources, ontology — is what the panel is FOR;
+    // it is reserved before the drawing takes a row. In a short terminal the
+    // drawing shrinks, then says it is not drawn, then goes; the table stays,
+    // and whatever of it still does not fit is counted.
+    let mut bottom: Vec<Line<'static>> = Vec::new();
+    for s in &sites {
+        bottom.push(Line::from(Span::styled(
+            clip(s, iw),
+            Style::default().fg(t.text),
+        )));
+    }
+    bottom.push(Line::from(Span::styled(
+        "sources",
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    for src in prov.sources.iter().take(SOURCES_SHOWN) {
+        bottom.push(Line::from(Span::styled(
+            format!("  {}", clip(src, iw.saturating_sub(2))),
+            Style::default().fg(t.dim),
+        )));
+    }
+    // Anything withheld is COUNTED, the same rule the site table follows.
+    if let Some(hidden) = prov
+        .sources
+        .len()
+        .checked_sub(SOURCES_SHOWN)
+        .filter(|n| *n > 0)
+    {
+        bottom.push(Line::from(Span::styled(
+            format!("  +{hidden} more"),
+            Style::default().fg(t.muted),
+        )));
+    }
+    bottom.push(Line::from(Span::styled(
+        "ontology",
+        Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
+    )));
+    bottom.push(Line::from(Span::styled(
+        format!("  {}", clip(&prov.placement, iw.saturating_sub(2))),
+        Style::default().fg(t.dim),
+    )));
+    let bottom_needed = u16::try_from(bottom.len()).unwrap_or(u16::MAX);
+
+    // The table first, then the disclosures, then the drawing. The top used
+    // to take every row it wanted before the table was reserved, so below
+    // eleven rows the site table, sources and ontology vanished with no
+    // count. Now the top takes what the table leaves, and whatever of the
+    // top still does not fit is counted in its last row — the same rule the
+    // table follows.
+    let bottom_h = bottom_needed.min(inner.height);
+    let top_h = u16::try_from(top_total)
+        .unwrap_or(u16::MAX)
+        .min(inner.height.saturating_sub(bottom_h));
+    let cy = inner.y + top_h;
+    let avail = inner.height.saturating_sub(top_h);
+    let free_for_canvas = avail.saturating_sub(bottom_needed);
+    let ch = if free_for_canvas >= crate::structure_view::MIN_CANVAS_ROWS {
+        canvas_h.min(free_for_canvas)
+    } else {
+        // One row to say the cell is not drawn — if even one row is free.
+        free_for_canvas.min(1)
+    };
+    // The top's last row counts what it withholds — and says when the
+    // drawing found no row at all, so its absence is never silent either.
+    let drawing_gone = ch == 0;
+    let shown = usize::from(top_h);
+    if shown > 0 && (top_total > shown || drawing_gone) {
+        let kept = shown - 1;
+        let withheld = top_total.saturating_sub(kept);
+        top.truncate(kept);
+        let mut count = format!("  +{withheld} more lines");
+        if drawing_gone {
+            count.push_str(" · cell not drawn");
+        }
+        top.push(Line::from(Span::styled(
+            count,
+            Style::default().fg(t.muted),
+        )));
+    }
+    if top_h > 0 {
+        f.render_widget(
+            Paragraph::new(top),
+            Rect::new(inner.x, inner.y, inner.width, top_h),
+        );
+    }
+    if ch >= crate::structure_view::MIN_CANVAS_ROWS {
+        let (xb, yb) = view.balanced_bounds(inner.width, ch);
+        f.render_widget(
+            Canvas::default()
+                .marker(Marker::Braille)
+                .background_color(t.panel)
+                .x_bounds(xb)
+                .y_bounds(yb)
+                .paint(|ctx| view.paint(ctx, t.dim)),
+            Rect::new(inner.x, cy, inner.width, ch),
+        );
+    } else if ch > 0 {
+        // A cell squeezed into four rows deforms, and into two it is a smear
+        // that reads as the structure. Say what is missing instead.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                clip(&crate::structure_view::short_canvas_note(ch), iw),
+                Style::default().fg(t.warn),
+            ))),
+            Rect::new(inner.x, cy, inner.width, ch),
+        );
+    }
+
+    let by = cy + ch;
+    let bh = avail.saturating_sub(ch);
+    if bh > 0 {
+        // Even the reserved bottom can outrun a very short panel. What does
+        // not fit is counted in its last row, never cut in silence.
+        let shown = usize::from(bh);
+        if bottom.len() > shown {
+            let withheld = bottom.len() - shown + 1;
+            bottom.truncate(shown.saturating_sub(1));
+            bottom.push(Line::from(Span::styled(
+                format!("  +{withheld} more lines"),
+                Style::default().fg(t.muted),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(bottom),
+            Rect::new(inner.x, by, inner.width, bh),
+        );
+    }
+
+    let mut map = app.hit_map.borrow_mut();
+    // The panel claims every cell it covers. Without this the pointer fell
+    // through to whatever the panel was drawn over — hovering inside a panel
+    // re-targeted the sidebar formula underneath, and two clicks marked a
+    // structure the reader never pointed at.
+    map.push(rect, HitTarget::RefPanelBody);
+    map.push(
+        Rect::new(rect.x + 1, rect.y, 7.min(rect.width.saturating_sub(1)), 1),
+        HitTarget::RefPanelClose,
+    );
+}
+
+/// How many provenance sources a panel shows before counting the rest.
+const SOURCES_SHOWN: usize = 3;
+
+/// The species legend, wrapped to the panel width. Every species the drawing
+/// colours by must be readable, or the colours mean nothing.
+fn legend_lines(legend: &[(String, Color)], width: usize, t: Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (label, color) in legend {
+        // `● ` is two cells, the label, then two spaces of separation.
+        let cost = label.width() + 4;
+        if used + cost > width && !spans.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        spans.push(Span::styled("● ", Style::default().fg(*color)));
+        spans.push(Span::styled(
+            format!("{label}  "),
+            Style::default().fg(t.text),
+        ));
+        used += cost;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
 fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
     let Some(panel) = &app.ref_panel else {
         return;
     };
+    if matches!(panel.kind, Some(crate::refs::RefKind::Structure))
+        && let Some(key) = structure_panel_key(&panel.id)
+        && let Some(view) = app.structure_views.get(key)
+    {
+        draw_structure_panel(f, app, panel, view, area);
+        return;
+    }
     let t = app.theme();
     let width = 56u16.min(area.width.saturating_sub(2)).max(12);
     let body: Vec<String> = match &panel.state {
@@ -5287,10 +5738,12 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
                 Some(crate::refs::RefKind::Doi) => "  paper",
                 Some(crate::refs::RefKind::FileLine) => "  source",
                 Some(crate::refs::RefKind::Tool) => "  tool",
+                Some(crate::refs::RefKind::Provenance) => "  source",
                 None => "  unregistered",
             },
             Style::default().fg(t.muted),
         ),
+        mark_hint_span(app, &panel.id, t),
     ]));
 
     for b in body.iter().take(plan.body_shown) {
@@ -5341,8 +5794,12 @@ fn draw_ref_panel(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(t.panel));
     f.render_widget(Paragraph::new(lines).block(block), rect);
 
-    // The close control is the title cell run, so clicking it dismisses.
     let mut map = app.hit_map.borrow_mut();
+    // The panel claims every cell it covers, exactly as the structure panel
+    // does. Without this the pointer fell through to whatever lay beneath —
+    // a click inside a paper's panel marked the sidebar row underneath it.
+    map.push(rect, HitTarget::RefPanelBody);
+    // The close control is the title cell run, so clicking it dismisses.
     map.push(
         Rect::new(rect.x + 1, rect.y, 7.min(rect.width.saturating_sub(1)), 1),
         HitTarget::RefPanelClose,
@@ -5354,6 +5811,648 @@ mod tests {
     use super::*;
     use crate::backend::{BackendHandle, FakeScenario};
     use unicode_width::UnicodeWidthStr;
+
+    /// The same rule for the DRAWN panel, which takes its own code path: a
+    /// structure panel covering a sidebar row must own those cells too.
+    #[test]
+    fn a_structure_panel_owns_the_cells_it_covers() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![
+                serde_json::json!({"cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                                   "formula": "TiAl", "n_atoms": 2,
+                                   "composition": {"Al": 1, "Ti": 1}, "source": "user_import"}),
+                serde_json::json!({"cache_key": "bbb", "cache_ref": "cache://bbb/structure.cif",
+                                   "formula": "MgB2", "n_atoms": 3,
+                                   "composition": {"B": 2, "Mg": 1}, "source": "user_import"}),
+            ],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        app.structure_views.insert(
+            "aaa".to_string(),
+            crate::structure_view::parse_cif(crate::backend::FAKE_TIAL_CIF).expect("parses"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut under = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find("MgB2") {
+                under = Some((u16::try_from(row[..byte].chars().count()).unwrap(), y));
+                break;
+            }
+        }
+        let (ux, uy) = under.expect("the MgB2 row is on screen");
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Ready("cif".to_string()),
+            anchor: (ux.saturating_sub(4), uy.saturating_sub(2)),
+            pinned: true,
+        });
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let map = app.hit_map.borrow();
+        match map.at(ux, uy) {
+            Some(HitTarget::RefPanelBody | HitTarget::RefPanelClose) => {}
+            Some(HitTarget::Reference { id }) => panic!(
+                "({ux},{uy}) is inside the open structure panel but resolves to {id} behind it"
+            ),
+            other => panic!("the structure panel must own its cells, got {other:?}"),
+        }
+    }
+
+    /// A panel that withholds must say how much, and a legend that runs off
+    /// the edge loses the species the drawing is coloured by.
+    #[test]
+    fn the_panel_counts_what_it_withholds_and_wraps_its_legend() {
+        let hea = "\
+data_hea
+_chemical_formula_sum \"Cr Mn Fe Co Ni Al\"
+_cell_length_a 3.59
+_cell_length_b 3.59
+_cell_length_c 3.59
+_space_group_name_H-M_alt \"P 1\"
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Cr1 Cr 0.0 0.0 0.0
+Mn1 Mn 0.5 0.5 0.0
+Fe1 Fe 0.5 0.0 0.5
+Co1 Co 0.0 0.5 0.5
+Ni1 Ni 0.25 0.25 0.25
+Al1 Al 0.75 0.75 0.75
+";
+        let view = crate::structure_view::parse_cif(hea).expect("parses");
+        let probe = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        let t = probe.theme();
+        // Six species cannot fit one 62-column line: they wrap rather than
+        // running off the edge.
+        let lines = legend_lines(&view.legend(), 30, t);
+        assert!(lines.len() > 1, "a six-element legend must wrap: {lines:?}");
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(text.width() <= 30, "a legend line overflows: {text:?}");
+        }
+        let shown: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        for species in ["Cr", "Mn", "Fe", "Co", "Ni", "Al"] {
+            assert!(
+                shown.contains(species),
+                "{species} is missing from the legend: {shown}"
+            );
+        }
+        // A panel with more sources than it shows counts the remainder.
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.structure_views.insert("aaa".to_string(), view);
+        // A structure row with tool, source and timestamp gives the panel
+        // four provenance lines — one more than it shows.
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                "tool": "structure_import", "formula": "HEA", "n_atoms": 6,
+                "composition": {"Cr": 1}, "source": "user_import",
+                "created_at": "2026-09-02T00:00:00Z"})],
+        });
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "HEA".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Fetching,
+            anchor: (4, 3),
+            pinned: true,
+        });
+        let sources = app
+            .reference_provenance("cache://aaa/structure.cif")
+            .sources
+            .len();
+        assert!(
+            sources > SOURCES_SHOWN,
+            "the panel must have more sources than it shows: {sources}"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 44)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains(&format!("+{} more", sources - SOURCES_SHOWN)),
+            "withheld sources must be counted:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ni×1"),
+            "every species must reach the screen:\n{screen}"
+        );
+    }
+
+    /// The panel is drawn OVER the screen, so it must own its cells. Without
+    /// that, hovering inside an open panel re-targeted whatever lay beneath
+    /// it — clicking TiAl's panel marked the MgB2 row underneath.
+    #[test]
+    fn an_open_panel_owns_the_cells_it_covers() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![
+                serde_json::json!({"cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                                   "formula": "TiAl", "n_atoms": 2,
+                                   "composition": {"Al": 1, "Ti": 1}, "source": "user_import"}),
+                serde_json::json!({"cache_key": "bbb", "cache_ref": "cache://bbb/structure.cif",
+                                   "formula": "MgB2", "n_atoms": 3,
+                                   "composition": {"B": 2, "Mg": 1}, "source": "user_import"}),
+            ],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        // First, with no panel: find where the MgB2 row's formula lives and
+        // confirm it answers as its own reference.
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut under = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find("MgB2") {
+                under = Some((u16::try_from(row[..byte].chars().count()).unwrap(), y));
+                break;
+            }
+        }
+        let (ux, uy) = under.expect("the MgB2 row is on screen");
+        assert!(
+            matches!(app.hit_map.borrow().at(ux, uy), Some(HitTarget::Reference { id }) if id.contains("bbb")),
+            "the row beneath must be a reference before the panel covers it"
+        );
+        // Now open TiAl's panel anchored so it covers that very cell.
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: "cache://aaa/structure.cif".to_string(),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Fetching,
+            anchor: (ux.saturating_sub(4), uy.saturating_sub(2)),
+            pinned: true,
+        });
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let map = app.hit_map.borrow();
+        match map.at(ux, uy) {
+            Some(HitTarget::RefPanelBody | HitTarget::RefPanelClose) => {}
+            Some(HitTarget::Reference { id }) => {
+                panic!("({ux},{uy}) is inside the open panel but still resolves to {id} behind it")
+            }
+            other => panic!("the panel must own the cells it covers, got {other:?}"),
+        }
+    }
+
+    /// Orange means "I can open this" — the promise the whole affordance
+    /// rests on. Nothing tested that the handles actually wear it.
+    #[test]
+    fn handles_are_painted_in_the_reference_style() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "aaa", "cache_ref": "cache://aaa/structure.cif",
+                "formula": "TiAl", "n_atoms": 2,
+                "composition": {"Al": 1, "Ti": 1}, "source": "user_import"})],
+        });
+        app.workspace_tab = WorkspaceTab::Structures;
+        app.marks.toggle(crate::marks::Mark {
+            id: "cache://aaa/structure.cif".to_string(),
+            kind: crate::refs::RefKind::Structure,
+            label: "TiAl".to_string(),
+        });
+        let expected = crate::refs::mark_style(app.theme());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Every cell of every "TiAl" — the workspace row's formula and the
+        // marked strip's row — must carry the reference colour AND its
+        // underline: the two halves of the convention.
+        let mut checked = 0usize;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            let Some(byte) = row.find("TiAl") else {
+                continue;
+            };
+            let col = u16::try_from(row[..byte].chars().count()).unwrap();
+            for dx in 0..4u16 {
+                let cell = &buf[(col + dx, y)];
+                assert_eq!(
+                    cell.fg,
+                    expected.fg.unwrap(),
+                    "a handle must wear the reference colour at ({}, {y})",
+                    col + dx
+                );
+                assert!(
+                    cell.modifier.contains(Modifier::UNDERLINED),
+                    "a handle must be underlined at ({}, {y})",
+                    col + dx
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected the row formula and the marked strip, saw {checked}"
+        );
+    }
+
+    /// A structure listed in the workspace is a handle: its formula is
+    /// registered as a reference and its cells answer the pointer as one,
+    /// so hovering or clicking the formula opens the structure — while the
+    /// rest of the row still selects.
+    #[test]
+    fn structure_rows_are_openable_handles() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::StructuresListed {
+            session_id: "s".to_string(),
+            structures: vec![serde_json::json!({
+                "cache_key": "0f7a1c2e9b4d4a6f",
+                "cache_ref": "cache://0f7a1c2e9b4d4a6f/structure.cif",
+                "tool": "structure_import",
+                "formula": "TiAl",
+                "n_atoms": 2,
+                "composition": {"Al": 1, "Ti": 1},
+                "source": "user_import",
+            })],
+        });
+        let id = "cache://0f7a1c2e9b4d4a6f/structure.cif";
+        assert!(
+            app.references.get(id).is_some(),
+            "a listed structure must be registered as a reference"
+        );
+        app.workspace_tab = WorkspaceTab::Structures;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Find the formula on screen, then ask the hit map what its cells are.
+        let mut found = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(byte) = row.find("TiAl") {
+                let col = u16::try_from(row[..byte].chars().count()).unwrap();
+                found = Some((col, y));
+                break;
+            }
+        }
+        let (col, row) = found.expect("the formula is on screen");
+        let map = app.hit_map.borrow();
+        match map.at(col, row) {
+            Some(HitTarget::Reference { id: hit }) => assert_eq!(hit, id),
+            other => panic!("the formula's cells must answer as the reference, got {other:?}"),
+        }
+        match map.at(col.saturating_sub(3), row) {
+            Some(HitTarget::WorkspaceRow { .. }) => {}
+            other => panic!("the rest of the row must still select, got {other:?}"),
+        }
+    }
+
+    /// What the reader marked stays in view: the workspace shows a strip
+    /// naming each marked handle, and the open panel says it is marked.
+    #[test]
+    fn marked_handles_are_shown_in_the_workspace_and_on_their_panel() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        let id = "cache://0f7a1c2e9b4d/structure.cif";
+        app.marks.toggle(crate::marks::Mark {
+            id: id.to_string(),
+            kind: crate::refs::RefKind::Structure,
+            label: "TiAl gamma".to_string(),
+        });
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: id.to_string(),
+            label: "TiAl gamma".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Fetching,
+            anchor: (10, 4),
+            pinned: true,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            screen.contains("marked for agent (1)"),
+            "strip missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("structure TiAl gamma"),
+            "mark row missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("★ marked for agent"),
+            "panel header missing:\n{screen}"
+        );
+    }
+
+    /// Hovering a structure shows the structure: formula, cell, space group,
+    /// the atoms in the cell as a drawing — not the CIF text it came from.
+    #[test]
+    fn a_structure_reference_panel_draws_the_cell_not_the_cif() {
+        use crate::backend::{FAKE_TIAL_CACHE_KEY, FAKE_TIAL_CIF};
+        let mut app = App::new(BackendHandle::fake(FakeScenario::StructuresCache));
+        app.structure_views.insert(
+            FAKE_TIAL_CACHE_KEY.to_string(),
+            crate::structure_view::parse_cif(FAKE_TIAL_CIF).expect("the fake CIF parses"),
+        );
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state: crate::app::RefPanelState::Ready(FAKE_TIAL_CIF.to_string()),
+            anchor: (10, 4),
+            pinned: true,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("Al1 Ti1"), "formula missing:\n{screen}");
+        assert!(
+            screen.contains("P 4/m m m"),
+            "space group missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("a b c"),
+            "cell parameters missing:\n{screen}"
+        );
+        assert!(screen.contains("Ti×1"), "legend missing:\n{screen}");
+        assert!(
+            screen
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "no cell drawn:\n{screen}"
+        );
+        assert!(
+            !screen.contains("_cell_length_a"),
+            "the CIF text must not be what the reader sees:\n{screen}"
+        );
+    }
+
+    /// At every height the table survives: the drawing goes first, then
+    /// says it is not drawn, then the disclosures are counted. Sources and
+    /// ontology are on screen at sixteen, twelve and ten rows, and nothing
+    /// is cut in silence.
+    #[test]
+    fn at_every_height_the_table_survives_and_the_rest_is_counted() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let app = structure_panel_app(
+            FAKE_TIAL_CIF,
+            crate::app::RefPanelState::Ready(FAKE_TIAL_CIF.to_string()),
+            (10, 1),
+        );
+        for height in [16u16, 12, 10] {
+            let rows = screen_rows(&app, 140, height);
+            let text = rows.join("\n");
+            assert!(
+                text.contains("sources") && text.contains("ontology"),
+                "{height} rows: the table must survive:\n{text}"
+            );
+            assert!(
+                !rows.iter().any(|r| r.chars().any(is_braille)),
+                "{height} rows: too short to draw the cell:\n{text}"
+            );
+            assert!(
+                text.contains("cell not drawn"),
+                "{height} rows: the missing drawing must be said:\n{text}"
+            );
+            assert!(
+                text.contains("more lines"),
+                "{height} rows: the disclosures that did not fit must be counted:\n{text}"
+            );
+        }
+        // Twenty rows leave a row for the note itself; the table is whole.
+        let twenty = screen_rows(&app, 140, 20).join("\n");
+        assert!(twenty.contains("cell not drawn — needs"), "{twenty}");
+        assert!(twenty.contains("ontology"), "{twenty}");
+    }
+
+    /// The systems panel says which graphics protocol is in use and, when
+    /// the terminal was not asked, why — so a coarse figure over ssh reads
+    /// as a decision, not a defect.
+    #[test]
+    fn the_systems_panel_says_why_graphics_are_coarse() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.set_image_view(crate::image_view::ImageView::from_policy(
+            crate::image_view::Probe::Halfblocks("remote session — not probed"),
+        ));
+        app.open_status_window();
+        let rows = screen_rows(&app, 140, 42);
+        assert!(
+            rows.iter().any(|r| r.contains("graphics")
+                && r.contains("halfblocks — remote session — not probed")),
+            "the panel must say why:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// An app with one parsed structure and its panel open, pinned, at
+    /// `anchor`, in the given state.
+    fn structure_panel_app(cif: &str, state: crate::app::RefPanelState, anchor: (u16, u16)) -> App {
+        use crate::backend::FAKE_TIAL_CACHE_KEY;
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.structure_views.insert(
+            FAKE_TIAL_CACHE_KEY.to_string(),
+            crate::structure_view::parse_cif(cif).expect("the CIF parses"),
+        );
+        app.ref_panel = Some(crate::app::RefPanel {
+            id: format!("cache://{FAKE_TIAL_CACHE_KEY}/structure.cif"),
+            label: "TiAl".to_string(),
+            kind: Some(crate::refs::RefKind::Structure),
+            state,
+            anchor,
+            pinned: true,
+        });
+        app
+    }
+
+    /// The screen as rows of text.
+    fn screen_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn is_braille(c: char) -> bool {
+        ('\u{2800}'..='\u{28FF}').contains(&c)
+    }
+
+    /// A 75-column formula is clipped at the panel's 62 — and used to take
+    /// the site count and the disorder marker with it. They have their own
+    /// line now, and survive.
+    #[test]
+    fn a_long_formula_does_not_take_the_site_count_with_it() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let long = "Al1 Ti1 Cr1 Mn1 Fe1 Co1 Ni1 Cu1 Zn1 Ga1 Ge1 As1 Se1 Br1 Rb1 Sr1 Zr1 Nb1 Mo1";
+        assert!(long.len() >= 75, "{} cols", long.len());
+        let cif = FAKE_TIAL_CIF.replace("\"Al1 Ti1\"", &format!("\"{long}\""));
+        assert_ne!(cif, FAKE_TIAL_CIF, "the fixture's formula must be replaced");
+        let app = structure_panel_app(&cif, crate::app::RefPanelState::Ready(cif.clone()), (10, 4));
+        let rows = screen_rows(&app, 140, 42);
+        assert!(
+            rows.iter().any(|r| r.contains("2 sites")),
+            "the site count must survive a long formula:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// The drawing keeps the cell's own proportions in the pane. Bounds
+    /// stretched to the pane's shape drew a cubic cell as a slab twice as
+    /// wide as it is high.
+    #[test]
+    fn the_panel_draws_the_cell_to_scale_not_to_the_pane() {
+        let cube = "\
+data_cube
+_chemical_formula_sum \"Fe\"
+_cell_length_a 3.0
+_cell_length_b 3.0
+_cell_length_c 3.0
+_space_group_name_H-M_alt \"P 1\"
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Fe1 0.0 0.0 0.0
+";
+        let view = crate::structure_view::parse_cif(cube).expect("parses");
+        let (xb, yb) = view.bounds();
+        let expected = (xb[1] - xb[0]) / (yb[1] - yb[0]);
+        let app = structure_panel_app(
+            cube,
+            crate::app::RefPanelState::Ready(cube.to_string()),
+            (10, 4),
+        );
+        let rows = screen_rows(&app, 140, 42);
+        let mut cols = (usize::MAX, 0usize);
+        let mut lines = (usize::MAX, 0usize);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                if is_braille(c) {
+                    cols = (cols.0.min(x), cols.1.max(x));
+                    lines = (lines.0.min(y), lines.1.max(y));
+                }
+            }
+        }
+        assert!(cols.0 < usize::MAX, "no cell drawn:\n{}", rows.join("\n"));
+        let drawn = ((cols.1 - cols.0 + 1) as f64 * 2.0) / ((lines.1 - lines.0 + 1) as f64 * 4.0);
+        assert!(
+            (drawn / expected - 1.0).abs() < 0.35,
+            "drawn aspect {drawn:.2} vs the cell's own {expected:.2}:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// In a terminal too short for the whole panel the drawing gives way,
+    /// not the table: the cell is SAID not drawn, and sites, sources and
+    /// ontology are still on screen. Tall enough, both are.
+    #[test]
+    fn a_short_terminal_keeps_the_table_and_says_the_cell_is_not_drawn() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let app = structure_panel_app(
+            FAKE_TIAL_CIF,
+            crate::app::RefPanelState::Ready(FAKE_TIAL_CIF.to_string()),
+            (10, 1),
+        );
+        let tall = screen_rows(&app, 140, 42);
+        assert!(
+            tall.iter().any(|r| r.chars().any(is_braille))
+                && tall.iter().any(|r| r.contains("ontology")),
+            "tall: both the drawing and the table:\n{}",
+            tall.join("\n")
+        );
+        let short = screen_rows(&app, 140, 20);
+        let text = short.join("\n");
+        assert!(
+            !short.iter().any(|r| r.chars().any(is_braille)),
+            "a cell squeezed into too few rows must not be drawn:\n{text}"
+        );
+        assert!(
+            text.contains("cell not drawn — needs"),
+            "the missing drawing must be said:\n{text}"
+        );
+        assert!(
+            text.contains("sources") && text.contains("ontology"),
+            "the table must survive the short terminal:\n{text}"
+        );
+    }
+
+    /// A refetch that failed while a cell is cached says so over the cell.
+    #[test]
+    fn a_failed_refetch_says_so_over_the_cached_cell() {
+        use crate::backend::FAKE_TIAL_CIF;
+        let app = structure_panel_app(
+            FAKE_TIAL_CIF,
+            crate::app::RefPanelState::Failed("backend went away".to_string()),
+            (10, 4),
+        );
+        let rows = screen_rows(&app, 140, 42);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("fetch failed — backend went away")),
+            "the failure must be said over the cached cell:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.chars().any(is_braille)),
+            "the cached cell is still shown:\n{}",
+            rows.join("\n")
+        );
+    }
 
     /// The workspace tab strip must never be wider than the panel it sits in.
     /// The panel paragraph wraps, so a single column of overflow does not

@@ -73,6 +73,85 @@ fn multiplexer_from(tmux: bool, sty: bool, term: Option<&str>) -> bool {
     tmux || sty || term.is_some_and(|t| t.starts_with("screen") || t.starts_with("tmux"))
 }
 
+/// Whether this session arrived over ssh.
+///
+/// A remote terminal is never probed. The graphics query's reader thread
+/// blocks in a plain `read` on stdin until the terminal answers the last of
+/// its questions (ratatui-image 11.0.6, `picker.rs`, `query_stdio_capabilities`);
+/// over a slow link the device-attributes handshake can come back inside
+/// crossterm's two seconds while the kitty and cell-size answers are still in
+/// flight, and the thread then eats the reader's next keystroke as "the
+/// reply". Halfblocks are bounded and honest: the figure still draws, the
+/// systems panel says why it is coarse, and no thread ever owns stdin.
+fn remote_session() -> bool {
+    remote_from(
+        std::env::var_os("SSH_CONNECTION").is_some(),
+        std::env::var_os("SSH_TTY").is_some(),
+    )
+}
+
+/// The rule itself, taking its inputs rather than reading the environment.
+fn remote_from(ssh_connection: bool, ssh_tty: bool) -> bool {
+    ssh_connection || ssh_tty
+}
+
+/// What to do about the terminal's graphics: ask it, or settle for
+/// halfblocks and say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// Halfblocks, with the reason the terminal was not asked (or answered
+    /// nothing) — shown in the systems panel, so a coarse figure is
+    /// explainable.
+    Halfblocks(&'static str),
+    /// Ask the terminal.
+    Query,
+}
+
+/// The decision, taking its inputs rather than reading the environment, and
+/// taking the handshake as a closure so it is paid ONLY when it decides
+/// something: a multiplexer and a remote session are settled before it,
+/// and never wait its two seconds.
+///
+/// Inside a multiplexer the query is not just useless, it is harmful: tmux
+/// and screen do not forward it, so its reader thread hit the timeout and
+/// then turned raw mode off underneath the TUI (measured 2026-08-26). A
+/// remote session is not asked for the reason on [`remote_session`]. A
+/// terminal that stays silent to the handshake would stay silent to the
+/// query too, and leave the same thread parked on stdin.
+#[must_use]
+pub fn probe_policy(multiplexed: bool, remote: bool, answers: impl FnOnce() -> bool) -> Probe {
+    if multiplexed {
+        return Probe::Halfblocks("multiplexer — not probed");
+    }
+    if remote {
+        return Probe::Halfblocks("remote session — not probed");
+    }
+    if !answers() {
+        return Probe::Halfblocks("terminal did not answer — not probed");
+    }
+    Probe::Query
+}
+
+/// Proof that raw mode is on.
+///
+/// Only [`RawModeOn::enable`] makes one, and the handshake and the probe
+/// take it by reference, so the compiler holds the order: raw mode first,
+/// then anything that reads the terminal's answers. The graphics query's
+/// reader thread restores, on its way out, whatever termios it found when
+/// it started — found cooked, it dropped a running TUI to cooked mode. And
+/// crossterm's handshake disables raw mode on its way out when it found it
+/// off. Swapping the two calls in `run_with_config` used to be a one-line
+/// change that every test survived; now it does not compile.
+pub struct RawModeOn(());
+
+impl RawModeOn {
+    /// Turn raw mode on and hand back the proof.
+    pub fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self(()))
+    }
+}
+
 /// Terminal graphics capability plus a decode cache.
 ///
 /// One per app. [`Picker::from_query_stdio`] talks to the terminal with escape
@@ -81,6 +160,9 @@ fn multiplexer_from(tmux: bool, sty: bool, term: Option<&str>) -> bool {
 /// the frame being drawn.
 pub struct ImageView {
     picker: Picker,
+    /// Why the terminal was not asked, or answered nothing, when it was not
+    /// — `None` when the protocol came from the terminal's own answer.
+    reason: Option<&'static str>,
     /// Decoded protocol per path. A plot file is written once and then drawn
     /// on every frame while the pane is open; decoding a PNG 60 times a second
     /// would be the most expensive thing in the TUI.
@@ -122,30 +204,37 @@ impl ImageView {
     /// one every further key echoed raw across the frame. A silent terminal
     /// is therefore never queried, and the caller turns raw mode on before
     /// asking, so even a thread that outlives a slow answer restores raw.
+    ///
+    /// The decision is [`probe_policy`], taken lazily: a multiplexer and a
+    /// remote session are never asked anything, so they never pay the
+    /// handshake's two-second timeout either. `raw` is the proof that raw
+    /// mode is already on — see [`RawModeOn`] for why the order is held by
+    /// the type and not by a comment.
     #[must_use]
-    pub fn detect(terminal_answered: bool) -> Self {
+    pub fn detect(raw: &RawModeOn) -> Self {
         DETECTIONS.fetch_add(1, Ordering::Relaxed);
-        // Inside a multiplexer the query is not just useless, it is HARMFUL.
-        //
-        // `from_query_stdio` spawns a thread that enables raw mode, writes the
-        // query, waits for a reply, and disables raw mode on its way out.
-        // tmux and screen do not forward that query, so the wait always hits
-        // its 2s timeout -- and the orphaned thread then turns raw mode OFF
-        // underneath the TUI that has meanwhile finished starting. Measured
-        // 2026-08-26 in tmux: every keystroke echoed into the status line and
-        // the prompt never received a character. The binary was unusable.
-        //
-        // Halfblocks need no query and no thread. They are a working floor,
-        // not a failure: the picture still draws, coarsely. A terminal that
-        // can do better is still detected when PRISM runs outside a
-        // multiplexer.
-        let picker = if in_multiplexer() || !terminal_answered {
-            Picker::halfblocks()
-        } else {
-            QUERIES.fetch_add(1, Ordering::Relaxed);
-            Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
-        };
-        Self::with_picker(picker)
+        Self::from_policy(probe_policy(in_multiplexer(), remote_session(), || {
+            Self::terminal_answers(raw)
+        }))
+    }
+
+    /// Carry out a probe decision: halfblocks with the reason it was not
+    /// probed, or the graphics query itself.
+    #[must_use]
+    pub fn from_policy(policy: Probe) -> Self {
+        match policy {
+            Probe::Halfblocks(reason) => Self::with_reason(Picker::halfblocks(), Some(reason)),
+            Probe::Query => {
+                QUERIES.fetch_add(1, Ordering::Relaxed);
+                match Picker::from_query_stdio() {
+                    Ok(picker) => Self::with_reason(picker, None),
+                    Err(_) => Self::with_reason(
+                        Picker::halfblocks(),
+                        Some("terminal did not answer the graphics query"),
+                    ),
+                }
+            }
+        }
     }
 
     /// Whether the terminal answers questions at all.
@@ -155,8 +244,15 @@ impl ImageView {
     /// reader — so a keystroke typed meanwhile is kept for the event loop,
     /// not lost. Every real terminal answers; a headless pty that does not
     /// would also never answer the graphics query, and is not asked it.
+    ///
+    /// Takes the raw-mode proof because crossterm's handshake, finding raw
+    /// mode OFF, turns it on for the round trip and off again on the way out
+    /// (crossterm 0.28.1, `terminal/sys/unix.rs`, `supports_keyboard_enhancement`).
+    /// Called before the TUI's own `enable_raw_mode`, that is harmless;
+    /// called after it, that would drop the running TUI to cooked mode with
+    /// every test green. The token makes the wrong order fail to compile.
     #[must_use]
-    pub fn terminal_answers() -> bool {
+    pub fn terminal_answers(_raw: &RawModeOn) -> bool {
         crossterm::terminal::supports_keyboard_enhancement().is_ok()
     }
 
@@ -197,8 +293,16 @@ impl ImageView {
     /// drawing without a terminal to query.
     #[must_use]
     pub fn with_picker(picker: Picker) -> Self {
+        Self::with_reason(picker, None)
+    }
+
+    /// A picker plus why it is the one in use when the terminal was not the
+    /// one that decided.
+    #[must_use]
+    pub fn with_reason(picker: Picker, reason: Option<&'static str>) -> Self {
         Self {
             picker,
+            reason,
             cache: RefCell::new(HashMap::new()),
             order: RefCell::new(Vec::new()),
         }
@@ -216,6 +320,18 @@ impl ImageView {
     #[must_use]
     pub fn is_true_graphics(&self) -> bool {
         !matches!(self.picker.protocol_type(), ProtocolType::Halfblocks)
+    }
+
+    /// The protocol in use and, when the terminal was not the one that
+    /// decided, why — for the systems panel: "halfblocks — remote session,
+    /// not probed" explains a coarse figure; "halfblocks" alone does not.
+    #[must_use]
+    pub fn graphics_note(&self) -> String {
+        let protocol = format!("{:?}", self.picker.protocol_type()).to_ascii_lowercase();
+        match self.reason {
+            Some(reason) => format!("{protocol} — {reason}"),
+            None => protocol,
+        }
     }
 
     /// Draw `path` into `area`.
@@ -409,14 +525,49 @@ mod tests {
     /// working picker — so the count is what is asserted.
     #[test]
     fn a_silent_terminal_is_never_asked_what_it_can_draw() {
+        assert_eq!(
+            probe_policy(false, false, || false),
+            Probe::Halfblocks("terminal did not answer — not probed")
+        );
         let before = ImageView::queries();
-        let view = ImageView::detect(false);
+        let view =
+            ImageView::from_policy(Probe::Halfblocks("terminal did not answer — not probed"));
         assert_eq!(
             ImageView::queries(),
             before,
-            "a silent terminal must not be sent the graphics query"
+            "a halfblocks verdict must not send the graphics query"
         );
         assert_eq!(view.protocol(), ProtocolType::Halfblocks);
+        assert_eq!(
+            view.graphics_note(),
+            "halfblocks — terminal did not answer — not probed"
+        );
+        assert_eq!(ImageView::halfblocks().graphics_note(), "halfblocks");
+    }
+
+    /// A multiplexer and a remote session are settled before the handshake
+    /// and never pay its two seconds: the handshake closure is not invoked.
+    /// A terminal that answers is asked.
+    #[test]
+    fn a_multiplexer_or_remote_session_never_waits_for_the_handshake() {
+        assert_eq!(
+            probe_policy(true, false, || panic!("a multiplexer must not be asked")),
+            Probe::Halfblocks("multiplexer — not probed")
+        );
+        assert_eq!(
+            probe_policy(false, true, || panic!("a remote session must not be asked")),
+            Probe::Halfblocks("remote session — not probed")
+        );
+        assert_eq!(probe_policy(false, false, || true), Probe::Query);
+    }
+
+    /// A session that arrived over ssh is remote, by either variable sshd
+    /// sets; a local one is not.
+    #[test]
+    fn ssh_variables_mean_a_remote_session() {
+        assert!(remote_from(true, false), "SSH_CONNECTION set");
+        assert!(remote_from(false, true), "SSH_TTY set");
+        assert!(!remote_from(false, false));
     }
 
     /// Halfblocks are the floor, not an error: on a terminal with no graphics

@@ -33,6 +33,14 @@ pub enum HitTarget {
     TranscriptMessage { index: usize },
     /// The close control on the reference panel.
     RefPanelClose,
+    /// Anywhere else inside an open reference panel. The panel is drawn OVER
+    /// the screen, so it must own its cells: without this the pointer fell
+    /// through to whatever lay beneath, and a click inside a panel marked a
+    /// structure the reader never pointed at.
+    RefPanelBody,
+    /// One row of the marked-for-agent strip — clicking it unmarks that
+    /// handle, so a mark can be taken back where it is shown.
+    MarkRow { id: String },
     /// A marked reference inside rendered text — the thing hovering resolves.
     /// Holds only the reference, never the payload: what it points at is
     /// fetched when the pointer arrives, not when the text was written.

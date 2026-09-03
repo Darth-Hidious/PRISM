@@ -2344,6 +2344,7 @@ fn iteration_messages(
     task_block: Option<&str>,
     capability_menu: Option<&str>,
     discovery_prompt: Option<&str>,
+    marked_block: Option<&str>,
     session_memory: Option<&str>,
     saturation: Option<&str>,
     traj_steps: &[String],
@@ -2366,6 +2367,7 @@ fn iteration_messages(
         .chain(task_block.map(str::to_string))
         .chain(capability_menu.map(str::to_string))
         .chain(discovery_prompt.map(str::to_string))
+        .chain(marked_block.map(str::to_string))
         .chain(session_memory.map(str::to_string))
         .chain(saturation.map(str::to_string))
         .chain(trajectory_block(traj_steps))
@@ -3330,6 +3332,10 @@ pub(crate) async fn run_turn_inner(
     // local Turso open — the same cost the provenance hook already pays per
     // tool call). Missing store/session degrades to no block, never an error.
     let session_memory: Option<String> = load_session_memory().await;
+    // What the reader has marked in the interface, as a REPLACEABLE slot
+    // rebuilt from the current marks — never appended to durable history.
+    // See `crate::marked`.
+    let marked_block: Option<String> = crate::marked::marked_block();
     // Task-driven research context (TOOL_SURFACE_SPEC §5.1): when a task is
     // present, inject its deterministic TASK CONTEXT block every iteration so
     // the model carries the goal/plan-position/artifacts/notes across the
@@ -3453,6 +3459,7 @@ pub(crate) async fn run_turn_inner(
             task_block.as_deref(),
             None,
             turn_skill_context.discovery_prompt.as_deref(),
+            marked_block.as_deref(),
             session_memory.as_deref(),
             saturation_block.as_deref(),
             &traj_steps,
@@ -3518,6 +3525,7 @@ pub(crate) async fn run_turn_inner(
                 task_block.as_deref(),
                 capability_menu.as_deref(),
                 turn_skill_context.discovery_prompt.as_deref(),
+                marked_block.as_deref(),
                 session_memory.as_deref(),
                 saturation_block.as_deref(),
                 &traj_steps,
@@ -3586,6 +3594,7 @@ pub(crate) async fn run_turn_inner(
                     task_block.as_deref(),
                     capability_menu.as_deref(),
                     turn_skill_context.discovery_prompt.as_deref(),
+                    marked_block.as_deref(),
                     session_memory.as_deref(),
                     saturation_block.as_deref(),
                     &traj_steps,
@@ -5061,6 +5070,49 @@ pub fn tools_to_definitions(tools_json: &serde_json::Value) -> Vec<ToolDefinitio
 
 #[cfg(test)]
 mod tests {
+    /// What the reader marked reaches the model in the PREAMBLE, where it is
+    /// rebuilt each turn — not in the durable message history, where an
+    /// unmarked object could never be taken back.
+    #[test]
+    fn marked_block_reaches_the_model_in_the_replaceable_preamble() {
+        let _guard = crate::marked::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::marked::set_marked(vec![crate::marked::MarkedHandle {
+            kind: "structure".to_string(),
+            id: "cache://abc".to_string(),
+            label: "TiAl".to_string(),
+        }]);
+        let block = crate::marked::marked_block();
+        let history = vec![super::ChatMessage {
+            role: "user".to_string(),
+            content: Some("what is its density?".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let messages = super::iteration_messages(
+            "SYSTEM",
+            None,
+            None,
+            None,
+            block.as_deref(),
+            None,
+            None,
+            &[],
+            &history,
+            None,
+        );
+        let preamble = messages[0].content.clone().unwrap_or_default();
+        assert_eq!(messages[0].role, "system");
+        assert!(preamble.contains("MARKED BY THE USER"), "{preamble}");
+        assert!(preamble.contains("cache://abc"), "{preamble}");
+        // The user's own message is untouched: the marks are not in it.
+        let user = messages[1].content.clone().unwrap_or_default();
+        assert_eq!(user, "what is its density?");
+        crate::marked::set_marked(Vec::new());
+    }
+
     fn worked(calls: usize) -> RoundYield {
         RoundYield {
             calls,
