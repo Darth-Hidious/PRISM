@@ -673,7 +673,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                 {
                     let indent = "    ";
                     let indent_cols = u16::try_from(indent.width()).unwrap_or(u16::MAX);
-                    let width = usize::from(area.width.saturating_sub(4));
+                    let width = transcript_content_width(area.width);
                     let bold = Style::default().fg(t.text).add_modifier(Modifier::BOLD);
                     if sources.is_empty() {
                         lines.push(Line::from(vec![
@@ -744,7 +744,11 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
                     // is not annotated leaves the reference system reachable
                     // only through prose that happens to repeat the id.
                     let (annotated, refs) = crate::refs::annotate_references(
-                        markdown::markdown_lines(&rest.join("\n"), t, area.width.saturating_sub(4)),
+                        markdown::markdown_lines(
+                            &rest.join("\n"),
+                            t,
+                            u16::try_from(transcript_content_width(area.width)).unwrap_or(u16::MAX),
+                        ),
                         &app.references,
                         t,
                     );
@@ -1793,6 +1797,18 @@ fn workspace_stats_line(app: &App, t: Theme) -> Option<Line<'static>> {
         spans.push(Span::styled(" · ▶ working", Style::default().fg(t.warn)));
     }
     Some(Line::from(spans))
+}
+
+/// Columns a transcript line may actually use: the pane minus its 4-column
+/// indent, and minus one for the scrollbar.
+///
+/// The scrollbar is rendered onto the SAME rect as the transcript, on its
+/// right edge, so content sized to the full width had its last glyph painted
+/// over. It showed up as a character quietly missing from the end of every
+/// wrapped line — "Takeuchi & Inoue" as "Takeuch" — which reads as a typo in
+/// the data rather than a layout fault.
+fn transcript_content_width(area_width: u16) -> usize {
+    usize::from(area_width.saturating_sub(5))
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -5948,6 +5964,20 @@ mod tests {
             ),
             other => panic!("the structure panel must own its cells, got {other:?}"),
         }
+    }
+
+    /// The transcript shares its rectangle with the scrollbar, which paints
+    /// the rightmost column. Content sized to the full width had its last
+    /// glyph overwritten: "Takeuchi & Inoue" rendered as "Takeuch" with the
+    /// "i" gone under the scrollbar, on every wrapped line.
+    #[test]
+    fn transcript_content_leaves_the_scrollbar_its_column() {
+        // 4 columns of indent on the left, one for the scrollbar on the right.
+        assert_eq!(transcript_content_width(100), 95);
+        assert_eq!(transcript_content_width(40), 35);
+        // Never underflows on a hostile terminal size.
+        assert_eq!(transcript_content_width(4), 0);
+        assert_eq!(transcript_content_width(0), 0);
     }
 
     /// A panel that withholds must say how much, and a legend that runs off

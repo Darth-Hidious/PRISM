@@ -19,11 +19,11 @@ solid_solution, VEC=8.0                                            │
         Miedema binary mixing enthalpies, Takeuchi & Inoue (2005)  │
         pair table                                                 │
     VEC                    8.0          electrons/atom             │
-        valence electron concentration table _VEC (Guo & Liu 2011) │
+        valence electron concentration table _VEC (Guo & Liu       │
+        2011)                                                      │
     omega                  not computed dimensionless              │
         Yang & Zhang Ω = Tm·ΔS_mix/|ΔH_mix|, Tm from pymatgen      │
         Element.melting_point                                      │
-                                                                   │
                                                                    │
                                                                    │
                                                                    │
