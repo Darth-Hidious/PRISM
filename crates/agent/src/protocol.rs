@@ -2421,7 +2421,7 @@ pub(crate) fn restore_history_and_transcript_from_messages(
 /// renders an empty chat ("no activity yet") even though the model can see
 /// the whole conversation. Shape mirrors what was restored: entries with a
 /// non-empty role and content, tool results carrying their tool name.
-fn emit_transcript_snapshot(sid: &str, messages: &[serde_json::Value]) {
+fn emit_transcript_snapshot_with_notice(sid: &str, messages: &[serde_json::Value], notice: &str) {
     let restored: Vec<serde_json::Value> = messages
         .iter()
         .filter_map(|msg| {
@@ -2439,6 +2439,10 @@ fn emit_transcript_snapshot(sid: &str, messages: &[serde_json::Value]) {
             Some(entry)
         })
         .collect();
+    let mut restored = restored;
+    if !notice.is_empty() {
+        restored.push(serde_json::json!({ "role": "system", "content": notice }));
+    }
     emit_notification(
         "ui.transcript.snapshot",
         serde_json::json!({ "session_id": sid, "messages": restored }),
@@ -8449,7 +8453,20 @@ async fn handle_command(
                     // Ship the restored lines to the frontend; its transcript
                     // is built from live events and would otherwise stay
                     // empty ("no activity yet").
-                    emit_transcript_snapshot(&sid, &messages);
+                    // The confirmation is a system notice about the session,
+                    // not model output. Sent as a text delta it was appended
+                    // to the last restored assistant line; it rides with the
+                    // snapshot instead, as its own system line.
+                    let resume_notice = if load_plan_snapshot(slash_ctx, &sid).is_some() {
+                        format!(
+                            "Resumed session {} ({} messages). A plan snapshot is available; use `/plan` to inspect it.",
+                            sid,
+                            messages.len()
+                        )
+                    } else {
+                        format!("Resumed session {} ({} messages)", sid, messages.len())
+                    };
+                    emit_transcript_snapshot_with_notice(&sid, &messages, &resume_notice);
                     crate::hooks::set_provenance_ctx(&sid, "");
                     if let Some(runtime_state) = session_store.load_runtime_state(&sid) {
                         let (restored_mode, restored_overrides, restored_plan_state) =
@@ -8474,20 +8491,6 @@ async fn handle_command(
                         plan_state,
                         llm_config,
                         slash_ctx,
-                    );
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": if load_plan_snapshot(slash_ctx, &sid).is_some() {
-                                format!(
-                                    "Resumed session {} ({} messages). A plan snapshot is available; use `/plan` to inspect it.",
-                                    sid,
-                                    messages.len()
-                                )
-                            } else {
-                                format!("Resumed session {} ({} messages)", sid, messages.len())
-                            }
-                        }),
                     );
                 }
                 None => {
@@ -8509,7 +8512,20 @@ async fn handle_command(
                         history, transcript, scratchpad, &messages,
                     );
                     // Same contract as `/resume`: deliver the restored lines.
-                    emit_transcript_snapshot(&sid, &messages);
+                    // The confirmation is a system notice about the session,
+                    // not model output. Sent as a text delta it was appended
+                    // to the last restored assistant line; it rides with the
+                    // snapshot instead, as its own system line.
+                    let resume_notice = if load_plan_snapshot(slash_ctx, &sid).is_some() {
+                        format!(
+                            "Resumed session {} ({} messages). A plan snapshot is available; use `/plan` to inspect it.",
+                            sid,
+                            messages.len()
+                        )
+                    } else {
+                        format!("Resumed session {} ({} messages)", sid, messages.len())
+                    };
+                    emit_transcript_snapshot_with_notice(&sid, &messages, &resume_notice);
                     crate::hooks::set_provenance_ctx(&sid, "");
                     if let Some(runtime_state) = session_store.load_runtime_state(&sid) {
                         let (restored_mode, restored_overrides, restored_plan_state) =
@@ -8534,20 +8550,6 @@ async fn handle_command(
                         plan_state,
                         llm_config,
                         slash_ctx,
-                    );
-                    emit_notification(
-                        "ui.text.delta",
-                        serde_json::json!({
-                            "text": if load_plan_snapshot(slash_ctx, &sid).is_some() {
-                                format!(
-                                    "Resumed session {} ({} messages). A plan snapshot is available; use `/plan` to inspect it.",
-                                    sid,
-                                    messages.len()
-                                )
-                            } else {
-                                format!("Resumed session {} ({} messages)", sid, messages.len())
-                            }
-                        }),
                     );
                 }
                 None => {
@@ -9791,8 +9793,9 @@ mod tests {
             serde_json::json!({"role": "system", "content": ""}),
             serde_json::json!({"content": "no role"}),
         ];
-        let emitted =
-            super::capture_emissions(|| super::emit_transcript_snapshot("sess-1", &messages));
+        let emitted = super::capture_emissions(|| {
+            super::emit_transcript_snapshot_with_notice("sess-1", &messages, "")
+        });
         assert_eq!(emitted.len(), 1, "exactly one snapshot notification");
         let note = &emitted[0];
         assert_eq!(note["method"].as_str(), Some("ui.transcript.snapshot"));
@@ -9811,6 +9814,54 @@ mod tests {
             msgs[2]["tool_name"].as_str(),
             Some("calphad"),
             "tool results keep their tool name"
+        );
+    }
+
+    /// The resume confirmation is a system notice, not model output. Sent as
+    /// a `ui.text.delta` it was appended to whatever the last restored
+    /// assistant line was, so a real resume rendered
+    /// "…from disk first, verbatim:Resumed session 2026… (12 messages)" —
+    /// two unrelated sentences welded together. It belongs in the snapshot,
+    /// as its own system line.
+    #[test]
+    fn the_resume_notice_is_a_system_line_not_model_output() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "Find me a refractory alloy."}),
+            serde_json::json!({"role": "assistant", "content": "Showing the file, verbatim:"}),
+        ];
+        let emitted = super::capture_emissions(|| {
+            super::emit_transcript_snapshot_with_notice(
+                "sess-1",
+                &messages,
+                "Resumed session sess-1 (2 messages)",
+            )
+        });
+        assert!(
+            !emitted
+                .iter()
+                .any(|note| note["method"].as_str() == Some("ui.text.delta")),
+            "a system notice must not travel on the model-output channel"
+        );
+        let snapshot = emitted
+            .iter()
+            .find(|note| note["method"].as_str() == Some("ui.transcript.snapshot"))
+            .expect("the snapshot carries the notice");
+        let msgs = snapshot["params"]["messages"].as_array().expect("array");
+        let last = msgs.last().expect("the notice is the last line");
+        assert_eq!(
+            last["role"].as_str(),
+            Some("system"),
+            "the notice is a system line"
+        );
+        assert_eq!(
+            last["content"].as_str(),
+            Some("Resumed session sess-1 (2 messages)"),
+            "the notice text is carried whole"
+        );
+        assert_eq!(
+            msgs[msgs.len() - 2]["content"].as_str(),
+            Some("Showing the file, verbatim:"),
+            "the restored assistant line keeps its own line"
         );
     }
     /// A materials hit must be identified by its formula, not by "untitled".
