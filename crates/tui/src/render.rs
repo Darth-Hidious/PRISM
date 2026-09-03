@@ -5398,6 +5398,19 @@ fn structure_panel_key(id: &str) -> Option<&str> {
 /// Header (formula, sites, space group, cell), the species legend, the unit
 /// cell with its atoms as a Braille projection, the site table, and the same
 /// provenance sections the text panel shows.
+/// Every source, wrapped to the panel. They used to stop at three with a
+/// "+1 more" marker, which named the remainder but gave no way to reach it;
+/// the section scrolls now, so the cap only withheld evidence.
+fn structure_panel_source_lines(sources: &[String], width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for src in sources {
+        for (n, part) in panel_body_lines(src, width).into_iter().enumerate() {
+            out.push(format!("{}{part}", if n == 0 { "  " } else { "    " }));
+        }
+    }
+    out
+}
+
 fn draw_structure_panel(
     f: &mut Frame,
     app: &App,
@@ -5432,9 +5445,9 @@ fn draw_structure_panel(
     let bottom_len = u16::try_from(
         sites.len()
             + 1
-            + prov.sources.len().min(SOURCES_SHOWN)
-            + 2
-            + usize::from(prov.sources.len() > SOURCES_SHOWN),
+            + structure_panel_source_lines(&prov.sources, usize::from(width.saturating_sub(4)))
+                .len()
+            + 2,
     )
     .unwrap_or(8);
     let height = (top_len + canvas_h + bottom_len + 2).min(area.height.max(3));
@@ -5510,28 +5523,8 @@ fn draw_structure_panel(
         "sources",
         Style::default().fg(t.muted).add_modifier(Modifier::BOLD),
     )));
-    for src in prov.sources.iter().take(SOURCES_SHOWN) {
-        for (n, part) in panel_body_lines(src, iw.saturating_sub(2))
-            .into_iter()
-            .enumerate()
-        {
-            bottom.push(Line::from(Span::styled(
-                format!("{}{part}", if n == 0 { "  " } else { "    " }),
-                Style::default().fg(t.dim),
-            )));
-        }
-    }
-    // Anything withheld is COUNTED, the same rule the site table follows.
-    if let Some(hidden) = prov
-        .sources
-        .len()
-        .checked_sub(SOURCES_SHOWN)
-        .filter(|n| *n > 0)
-    {
-        bottom.push(Line::from(Span::styled(
-            format!("  +{hidden} more"),
-            Style::default().fg(t.muted),
-        )));
+    for line in structure_panel_source_lines(&prov.sources, iw.saturating_sub(2)) {
+        bottom.push(Line::from(Span::styled(line, Style::default().fg(t.dim))));
     }
     bottom.push(Line::from(Span::styled(
         "ontology",
@@ -5666,9 +5659,6 @@ fn draw_structure_panel(
         HitTarget::RefPanelClose,
     );
 }
-
-/// How many provenance sources a panel shows before counting the rest.
-const SOURCES_SHOWN: usize = 3;
 
 /// The species legend, wrapped to the panel width. Every species the drawing
 /// colours by must be readable, or the colours mean nothing.
@@ -6033,8 +6023,9 @@ Al1 Al 0.75 0.75 0.75
             .sources
             .len();
         assert!(
-            sources > SOURCES_SHOWN,
-            "the panel must have more sources than it shows: {sources}"
+            sources > 3,
+            "the fixture must exceed the cap this panel used to have (3) for \
+             the assertion below to be worth making: {sources}"
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 44)).unwrap();
@@ -6048,9 +6039,22 @@ Al1 Al 0.75 0.75 0.75
                     + "\n"
             })
             .collect();
+        // Sources are no longer withheld at all: the section scrolls, so the
+        // old cap of three — and its "+N more" marker, which named a
+        // remainder no key could reach — only hid evidence.
+        for src in &app
+            .reference_provenance("cache://aaa/structure.cif")
+            .sources
+        {
+            let head: String = src.chars().take(18).collect();
+            assert!(
+                screen.contains(&head),
+                "every source must reach the screen, missing {src}:\n{screen}"
+            );
+        }
         assert!(
-            screen.contains(&format!("+{} more", sources - SOURCES_SHOWN)),
-            "withheld sources must be counted:\n{screen}"
+            !screen.contains(" more\n") || !screen.contains("sources"),
+            "no unreachable remainder under sources:\n{screen}"
         );
         assert!(
             screen.contains("Ni×1"),
