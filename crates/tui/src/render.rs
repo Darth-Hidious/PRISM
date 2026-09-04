@@ -1065,12 +1065,20 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         .min(u16::MAX as u32) as u16;
     let max_scroll = content_lines.saturating_sub(viewport);
     app.view_max_scroll.set(max_scroll);
-    let effective_scroll = if let Some(rows) = anchor_rows {
-        // The reader's own turn goes to the top and the reply fills downward.
-        // Clamped to `max_scroll` so a turn near the end of a short transcript
-        // does not try to scroll past the final row.
-        rows.min(max_scroll)
-    } else if app.auto_scroll {
+    let effective_scroll = if anchor_rows.is_some() || app.auto_scroll {
+        // Follow the tail. The reader's own turn used to be pinned at the top
+        // with the reply filling downward, so a reply taller than the screen
+        // grew out of sight: three live research runs ended with a 37-item
+        // tool card filling the screen and the model's final answer below the
+        // fold, unseen, while the status bar said Ready. The newest text is
+        // what the reader is waiting for. The question does not go missing:
+        // the title bar carries the current turn and the sidebar lists it.
+        // (While a reply still fits the screen, its turn sits inside the last
+        // viewport anyway, so pinning and following were the same offset —
+        // the anchor never changed what was drawn except in the case that hid
+        // the answer.) `anchor_user_turn` still means "the reader has not
+        // taken over since their turn", which is how a first scroll knows
+        // where to resume from.
         max_scroll
     } else {
         crate::app::clamp_scroll(app.scroll_offset, content_lines, viewport)
@@ -5978,6 +5986,48 @@ mod tests {
         // Never underflows on a hostile terminal size.
         assert_eq!(transcript_content_width(4), 0);
         assert_eq!(transcript_content_width(0), 0);
+    }
+
+    /// The reader's own turn is pinned at the top while the reply fits, and
+    /// the moment the reply outgrows the screen the view must follow it.
+    /// Three live research runs ended with a 37-item tool card filling the
+    /// screen and the model's final answer sitting below the fold, unseen,
+    /// while the status bar said Ready — the anchor outranked auto-follow no
+    /// matter how far the reply had run.
+    #[test]
+    fn a_reply_that_outgrows_the_screen_is_followed_not_pinned_under_the_prompt() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.messages.push(crate::app::ChatLine {
+            role: Role::User,
+            text: "Search the literature for oxidation resistance.".to_string(),
+            kind: LineKind::Text,
+        });
+        app.anchor_user_turn.set(true);
+        app.append_assistant_text("Short answer.");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert_eq!(
+            app.view_scroll.get(),
+            0,
+            "a reply that fits keeps the reader's turn at the top"
+        );
+
+        for n in 0..80 {
+            app.append_assistant_text(&format!("result line {n}\n"));
+        }
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let max = app.view_max_scroll.get();
+        assert!(
+            max > 0,
+            "the reply must have outgrown the screen for this test to mean anything"
+        );
+        assert_eq!(
+            app.view_scroll.get(),
+            max,
+            "a reply that outgrows the screen is followed to its tail, not left below the fold"
+        );
     }
 
     /// A panel that withholds must say how much, and a legend that runs off

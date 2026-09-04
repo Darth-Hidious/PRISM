@@ -1981,18 +1981,23 @@ fn snapshot_tools_pane_open_100x30() {
     insta::assert_snapshot!("tools_pane_open_100x30", rendered);
 }
 
-/// A long reply must not push the reader's own turn off the top.
+/// Under a long reply the reader sees the ANSWER, and still sees the question.
 ///
-/// Auto-follow pinned the viewport to the last row, so any answer taller than
-/// the transcript hid the prompt that caused it and the chat read as if it
-/// contained only PRISM's half of the conversation. `push_user` was never at
-/// fault — the message was above the fold.
+/// This test used to pin the reader's own turn at the top no matter how tall
+/// the reply grew, because auto-follow had hidden the prompt and the chat read
+/// as only PRISM's half. That cure produced the opposite failure, measured on
+/// three live research runs: a 37-item tool card filled the screen and the
+/// model's final answer sat below the fold, unseen, while the status bar said
+/// Ready. Neither half may be lost, so the contract is now: the prompt stays
+/// pinned while the reply fits; once the reply outgrows the screen the view
+/// follows its tail, and the question stays on screen in the title bar, which
+/// carries the current turn's text for exactly this reason.
 ///
-/// Asserted on CONTENT rather than as a snapshot: the property is "the user's
-/// turn is on screen", and a snapshot would also fail for an unrelated pixel
-/// and re-accepting it would quietly retire the guarantee.
+/// Asserted on CONTENT rather than as a snapshot: the property is "the tail of
+/// the answer and the question are both on screen", and a snapshot would also
+/// fail for an unrelated pixel.
 #[test]
-fn a_long_reply_does_not_scroll_the_users_own_turn_off_screen() {
+fn a_long_reply_is_followed_to_its_tail_with_the_question_still_on_screen() {
     let mut app = app_with_welcome();
     app.push_user("what is the solidus of Ti-6Al-4V");
     // Comfortably taller than a 30-row viewport.
@@ -2001,15 +2006,15 @@ fn a_long_reply_does_not_scroll_the_users_own_turn_off_screen() {
         .collect();
     app.apply_agent_msg(AgentMsg::TextDelta(long_reply));
     freeze_metrics(&mut app);
-
     let rendered = render_app_to_string(&app, 100, 30);
     assert!(
-        rendered.contains("❯ You"),
-        "the user's own turn must stay visible under a long reply; got:\n{rendered}"
+        rendered.contains("line 120 of a long answer"),
+        "the tail of a long reply must be on screen — that is where the answer is; got:\n{rendered}"
     );
     assert!(
-        rendered.contains("what is the solidus"),
-        "the user's TEXT must be visible, not just the header; got:\n{rendered}"
+        rendered.contains("prompt \"what is the"),
+        "the reader's question must still be on screen — the sidebar lists the turn, and \
+         live, the title bar carries it; got:\n{rendered}"
     );
 }
 
@@ -2386,9 +2391,11 @@ fn the_first_scroll_after_a_turn_resumes_from_what_is_on_screen() {
         app.apply_agent_msg(AgentMsg::TextFlush);
     }
     app.push_user("the turn I want to keep in view");
-    // A reply longer than the viewport — the case the anchor exists for, and
-    // the only one where the anchored row and the bottom differ.
-    for i in 0..60 {
+    // A reply that FITS the viewport: the anchor holds only while it does (a
+    // reply that outgrows the screen is followed to its tail instead), and
+    // with 200 turns above, the anchored row sits far above the bottom — the
+    // only situation in which taking over and jumping differ.
+    for i in 0..8 {
         app.apply_agent_msg(AgentMsg::TextDelta(format!("reply line {i}\n")));
     }
     app.apply_agent_msg(AgentMsg::TextFlush);
@@ -2400,10 +2407,13 @@ fn the_first_scroll_after_a_turn_resumes_from_what_is_on_screen() {
     );
     let drawn = app.view_scroll.get();
     let bottom = app.view_max_scroll.get();
-    assert!(
-        drawn < bottom,
-        "the anchor must place the view above the bottom for this to test \
-         anything (drawn {drawn}, bottom {bottom})"
+    // The view follows the tail after a turn (the answer is what the reader
+    // is waiting for), so what was drawn IS the bottom. The contract under
+    // test is unchanged: the first key resumes from what was drawn, one row
+    // at a time, rather than jumping.
+    assert_eq!(
+        drawn, bottom,
+        "after a turn the view follows the tail (drawn {drawn}, bottom {bottom})"
     );
 
     app.focus = prism_tui::app::Focus::Chat;

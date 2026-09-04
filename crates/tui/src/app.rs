@@ -6600,7 +6600,38 @@ mod tests {
     use super::*;
 
     /// A flush of text inside a few milliseconds is not a rate. Nothing is
-    /// reported until the window is real; then it is tokens over that window.    /// An open panel takes the scroll keys. They used to reach the list
+    /// reported until the window is real; then it is tokens over that window.    /// The answer that follows a tool round must reach the transcript. Three
+    /// live runs ended with the tool card as the last thing on screen while
+    /// the session file held the model's final answer, so whichever side
+    /// drops it, the TUI's own contract is pinned here: a text delta after a
+    /// tool card opens a new assistant line and is rendered.
+    #[test]
+    fn text_after_a_tool_card_reaches_the_transcript() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.session_id = Some("s".to_string());
+        app.apply_agent_msg(crate::msg::AgentMsg::ToolCard {
+            tool_name: "prior_art_search".to_string(),
+            content: "37 result(s), 37 not seen before in this session.".to_string(),
+            card_type: "results".to_string(),
+            elapsed_ms: Some(1200),
+            call_id: Some("c1".to_string()),
+            provenance_id: None,
+            data: Some(serde_json::json!({"count": 37})),
+            agent: None,
+        });
+        app.apply_agent_msg(crate::msg::AgentMsg::TextDelta(
+            "Search complete — 37 results, all new to this session.".to_string(),
+        ));
+        let last = app.messages.last().expect("a line was rendered");
+        assert!(
+            matches!(last.role, Role::Assistant) && matches!(last.kind, LineKind::Text),
+            "the answer after a tool card must be its own assistant line, got {:?}",
+            last.kind
+        );
+        assert!(last.text.starts_with("Search complete"), "{}", last.text);
+    }
+
+    /// An open panel takes the scroll keys. They used to reach the list
     /// BEHIND it: Down moved the sidebar selection while the panel went on
     /// showing the old entity, so the panel read as live while being stale,
     /// and anything below its fold could not be reached at all.
