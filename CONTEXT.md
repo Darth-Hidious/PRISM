@@ -82,6 +82,32 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
   in-place overwrite makes macOS SIGKILL the binary (exit 137) while the same
   bytes run elsewhere.
 
+- 2026-09-04 (demo day): "answer never arrives" ROOT-CAUSED — it did arrive; the
+  transcript pinned the prompt at the top (deliberate earlier choice) and the
+  answer sat below a 37-item tool card, unseen; End does nothing in prompt
+  focus. Fixed `fd23f8fa`: the view follows the tail; the question stays in
+  the title bar (live) and the sidebar. Two older tests refined to that
+  contract, one tiny snapshot moved. Headless `prism research --depth 0` prints
+  the full answer (34 papers) — the loop was never the problem. SOURCE TABLE for
+  searches now real (`e0301691` tool declares sources; `330c35fc` card extractor
+  reads a `sources` array; `94017dcc` the tool-result event carries the raw JSON
+  beside the model's digest): nine databases named per search with per-source
+  counts, `—` for a source that did not answer vs `0` for searched-and-empty.
+  Hover panel: flex width ≤104, wraps (no ellipsis), scrolls (Up/Down/PgUp/
+  PgDn/Home/End, position in title), every source listed (`dc5d8bbd`,
+  `b209ae30`); transcript stops writing its last column under the scrollbar
+  (`a69fa3cc`). HARNESS LESSON: `cargo test <filter>` is a SUBSTRING, not a
+  regex — a regex filter ran zero tests and read as "mutation survived";
+  gates must check the mutation exit and that ≥1 test ran. STILL OPEN for
+  research-readiness: prior_art_search declares no evidence class
+  ([unclassified]); kind column clips ("peer-reviewed literature meta…");
+  status bar shows "[thinking · Ctrl-T]" next to Ready after the turn (an
+  affordance that reads as stuck); the header collapses to "+N more lines" on
+  very short structure panels with no key to reach them; two Semantic Scholar/
+  ChemRxiv sources returned no answer in every run today (`—`) — provider-side,
+  now visible. Interaction-graph audits (FIX FIRST / DO NOT LAND) unchanged in
+  AUDIT_FINDINGS_2026-09-03.md; mesh round 4 unstarted (writer dead, WIP kept).
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
