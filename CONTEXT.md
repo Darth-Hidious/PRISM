@@ -114,6 +114,24 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
   now visible. Interaction-graph audits (FIX FIRST / DO NOT LAND) unchanged in
   AUDIT_FINDINGS_2026-09-03.md; mesh round 4 unstarted (writer dead, WIP kept).
 
+- 2026-09-05 00:03: `1beb141d` — background work is on screen (`ui.activity`
+  channel: id/text/done; announced today: neural tool-index warm, embedding
+  model load, all three compaction sites; `announce_activity` works from a
+  spawned task) and `recall` NEVER refuses (below 10% budget it serves a
+  ≥2,000-char slice with a `budget_note`; the refusal path is deleted, not
+  knobbed). ERROR CENSUS (last 7 days of sessions): 26/80 tool results were
+  errors — 14 recall refusals (ALL the retired cumulative-budget bug, last on
+  08-31) and 6 worker-timeout/desync (ALL before the no-ceiling fix on 09-02);
+  since 09-01 the only tool errors are the model's own apply_patch/notebook
+  mistakes and one WARN leaking into a papers_ingest result. LIVE (00:10):
+  follow-the-answer and the Ctrl-T wording confirmed on the installed build.
+  OPEN: the footer is clipped at 140 cols ("Ctrl-C qu"), so the activity line
+  must move to its own strip above the prompt (test currently asserts the
+  footer); whether the warm activity was visible this turn is unconfirmed.
+  HARNESS: two false verdicts today — a regex test filter (substring!) and a
+  `^error` grep that called red tests "did not compile"; both fixed in the
+  chain and in memory `commit-gate-on-every-exit-code`.
+
 ## Next Steps
 1. §13 ranked lists CLOSED (T1–T19, B1–B15) except BOOKED B11 attempt-evidence + audit hash chain. EMMO domain/range DONE from upstream source (`21d84b31`); isPartOf untyped upstream.
    Tailcat (`tailscale/tailcat`) = mesh DATA PLANE only, never a PRISM tool; NOT installed; needs Mirdyne control plane first.
