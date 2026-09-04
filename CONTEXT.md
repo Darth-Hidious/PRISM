@@ -85,7 +85,9 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 - 2026-09-04 (demo day): "answer never arrives" ROOT-CAUSED — it did arrive; the
   transcript pinned the prompt at the top (deliberate earlier choice) and the
   answer sat below a 37-item tool card, unseen; End does nothing in prompt
-  focus. Fixed `fd23f8fa`: the view follows the tail; the question stays in
+  focus. Fixed `fd23f8fa` and DRIVEN LIVE on the installed build: the answer
+  ("Search done — two queries, 67 unique papers", 8 ranked hits with DOIs)
+  is on screen with no scrolling. Fixed: the view follows the tail; the question stays in
   the title bar (live) and the sidebar. Two older tests refined to that
   contract, one tiny snapshot moved. Headless `prism research --depth 0` prints
   the full answer (34 papers) — the loop was never the problem. SOURCE TABLE for
@@ -101,8 +103,12 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
   gates must check the mutation exit and that ≥1 test ran. STILL OPEN for
   research-readiness: prior_art_search declares no evidence class
   ([unclassified]); kind column clips ("peer-reviewed literature meta…");
-  status bar shows "[thinking · Ctrl-T]" next to Ready after the turn (an
-  affordance that reads as stuck); the header collapses to "+N more lines" on
+  the footer tag is FIXED (`82128837`: "[Ctrl-T: show reasoning]", an action
+  not a state; verified by test + accepted snapshot, not driven live — the
+  fake thinking_stream detour hit two NEW traps instead: on the home screen a
+  sentence starting with a lowercase hotkey letter (s/t) opens a panel instead
+  of typing, and the Status window does not close on Escape); the header
+  collapses to "+N more lines" on
   very short structure panels with no key to reach them; two Semantic Scholar/
   ChemRxiv sources returned no answer in every run today (`—`) — provider-side,
   now visible. Interaction-graph audits (FIX FIRST / DO NOT LAND) unchanged in
