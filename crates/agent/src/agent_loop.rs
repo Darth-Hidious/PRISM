@@ -835,7 +835,14 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    if records.is_empty() && patents.is_empty() {
+    // A search that found nothing but can name the databases it asked is
+    // still an answer — "these five said nothing" is a finding; a raw empty
+    // JSON is not.
+    let declares_sources = payload
+        .get("sources")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    if records.is_empty() && patents.is_empty() && !declares_sources {
         return None;
     }
     let mut out = if patents.is_empty() {
@@ -927,6 +934,7 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
             ));
         }
     }
+    out.push_str(&source_lines(&payload));
     for status in payload
         .get("source_status")
         .and_then(Value::as_array)
@@ -953,6 +961,62 @@ fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
          itself does not survive this conversation.\n",
     );
     Some(out)
+}
+
+/// Which databases a search asked, and what each said — for the model, in
+/// two lines. Driven live on 2026-09-05: asked to "name the databases you
+/// asked", the model spent four recall calls hunting for this, because the
+/// digest carried only the failures. The tool declares every database it
+/// asked (`sources`: a count, or `null` for no answer) and every branch it did
+/// not (`counts`: `null`), and a branch that failed says why (`*_error`).
+fn source_lines(payload: &Value) -> String {
+    let mut out = String::new();
+    let mut databases = Vec::new();
+    for src in payload
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = src.get("source").and_then(Value::as_str) else {
+            continue;
+        };
+        match src.get("count").and_then(Value::as_u64) {
+            Some(n) => databases.push(format!("{name} {n}")),
+            // `null` is "did not answer", never zero hits.
+            None => {
+                let status = src
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                databases.push(format!("{name} no answer ({status})"));
+            }
+        }
+    }
+    if !databases.is_empty() {
+        out.push_str(&format!("databases asked: {}\n", databases.join(" · ")));
+    }
+    if let Some(counts) = payload.get("counts").and_then(Value::as_object) {
+        let mut branches = Vec::new();
+        for name in ["papers", "patents", "eastern"] {
+            let Some(count) = counts.get(name) else {
+                continue;
+            };
+            let error = payload
+                .get(format!("{name}_error"))
+                .and_then(Value::as_str)
+                .filter(|e| !e.trim().is_empty());
+            match (error, count.as_u64()) {
+                (Some(e), _) => branches.push(format!("{name} error: {e}")),
+                (None, Some(n)) => branches.push(format!("{name} {n}")),
+                (None, None) => branches.push(format!("{name} not asked")),
+            }
+        }
+        if !branches.is_empty() {
+            out.push_str(&format!("branches: {}\n", branches.join(" · ")));
+        }
+    }
+    out
 }
 
 /// Hosts whose full text an unattended fetcher can actually retrieve.
@@ -7467,6 +7531,69 @@ mod tests {
         let (plan, unkeyed) = identity_plan(&records);
         assert_eq!(plan.len(), 1, "the keyed record is planned");
         assert_eq!(unkeyed, 1, "the bare record is counted as unkeyed");
+    }
+
+    #[test]
+    fn the_digest_names_every_database_asked_and_every_branch_not_asked() {
+        // Driven live on 2026-09-05: asked to "name the databases you asked",
+        // the model spent four recall calls hunting for the per-source status,
+        // because the digest carried only "[source X returned an error]". The
+        // tool declares every database it asked (count, or no answer) and
+        // every branch it did not ask; the digest must hand that over.
+        let papers: Vec<Value> = (0..3)
+            .map(|i| paper(Some(&format!("10.1/{i}")), "arxiv", "x"))
+            .collect();
+        let payload = serde_json::json!({
+            "papers": papers, "patents": [], "eastern": [],
+            "searched": ["papers"],
+            "counts": {"papers": 3, "patents": null, "eastern": null},
+            "sources": [
+                {"source": "arxiv", "kind": "literature metadata", "count": 3,
+                 "fetched": "2026-09-05T10:00:00+00:00", "status": "ok", "record": {}},
+                {"source": "semantic_scholar", "kind": "literature metadata", "count": null,
+                 "fetched": "2026-09-05T10:00:00+00:00", "status": "timeout",
+                 "record": {"error": "deadline exceeded"}},
+                {"source": "chemrxiv", "kind": "preprint metadata", "count": 0,
+                 "fetched": "2026-09-05T10:00:00+00:00", "status": "ok", "record": {}}
+            ]
+        });
+        let digest = search_digest("prior_art_search", &cli_envelope(payload), 3)
+            .expect("a search with results must produce a digest");
+        assert!(
+            digest.contains("arxiv 3"),
+            "a database that answered, with its count: {digest}"
+        );
+        assert!(
+            digest.contains("semantic_scholar no answer (timeout)"),
+            "a database that did not answer is not zero hits: {digest}"
+        );
+        assert!(
+            digest.contains("chemrxiv 0"),
+            "searched and empty IS zero: {digest}"
+        );
+        assert!(
+            digest.contains("patents not asked"),
+            "a branch never consulted: {digest}"
+        );
+        assert!(digest.contains("eastern not asked"), "{digest}");
+
+        // A branch that was asked and failed says so, with the reason.
+        let payload = serde_json::json!({
+            "papers": [], "patents": [], "eastern": [],
+            "searched": ["papers", "patents"],
+            "counts": {"papers": 0, "patents": 0, "eastern": null},
+            "patents_error": "no patent backend configured",
+            "sources": [
+                {"source": "arxiv", "kind": "literature metadata", "count": 0,
+                 "fetched": "2026-09-05T10:00:00+00:00", "status": "ok", "record": {}}
+            ]
+        });
+        let digest = search_digest("prior_art_search", &cli_envelope(payload), 0)
+            .expect("an empty search that names its databases is still a digest");
+        assert!(
+            digest.contains("patents error: no patent backend configured"),
+            "{digest}"
+        );
     }
 
     #[test]

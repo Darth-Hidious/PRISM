@@ -921,6 +921,47 @@ fn find_tools(args: &Value, catalog: &ToolCatalog) -> Value {
     })
 }
 
+/// What a recall result declares as its source: this session's durable
+/// memory, one entry per tool that wrote the recalled records. Driven live on
+/// 2026-09-05, every recall card read "SOURCE NOT REPORTED BY recall" —
+/// recall knows exactly where its records come from.
+fn recall_sources<'a>(tools: impl Iterator<Item = &'a str>) -> Value {
+    let mut by_tool: Vec<(String, u64)> = Vec::new();
+    for tool in tools {
+        match by_tool.iter_mut().find(|(name, _)| name == tool) {
+            Some((_, n)) => *n += 1,
+            None => by_tool.push((tool.to_string(), 1)),
+        }
+    }
+    let fetched = chrono::Utc::now().to_rfc3339();
+    if by_tool.is_empty() {
+        // Searched, and empty: zero, not silence.
+        return json!([{
+            "source": "durable memory",
+            "kind": "recalled record",
+            "count": 0,
+            "fetched": fetched,
+            "status": "ok",
+            "record": {},
+        }]);
+    }
+    Value::Array(
+        by_tool
+            .into_iter()
+            .map(|(tool, n)| {
+                json!({
+                    "source": "durable memory",
+                    "kind": format!("recalled {tool} record"),
+                    "count": n,
+                    "fetched": fetched,
+                    "status": "ok",
+                    "record": { "tool": tool },
+                })
+            })
+            .collect(),
+    )
+}
+
 async fn recall(
     args: &Value,
     store: Option<&ProvenanceStore>,
@@ -983,6 +1024,10 @@ async fn recall_with_backend(
             .await?;
         return Ok(match chain.into_iter().find(|r| r.id == id) {
             Some(rec) => {
+                // A record without a tool name is still one record.
+                let sources = recall_sources(std::iter::once(
+                    rec.tool_name.as_deref().unwrap_or("unknown tool"),
+                ));
                 let mut out = json!({
                     "id": rec.id,
                     "tool_name": rec.tool_name,
@@ -990,6 +1035,7 @@ async fn recall_with_backend(
                     "output": clip_value(rec.output_json, cap),
                     "status": rec.status,
                     "exit_code": rec.exit_code,
+                    "sources": sources,
                 });
                 if let Some(note) = &budget_note {
                     out["budget_note"] = json!(note);
@@ -1126,6 +1172,11 @@ async fn recall_with_backend(
     Ok(json!({
         "query": query,
         "count": matches.len(),
+        "sources": recall_sources(
+            matches
+                .iter()
+                .map(|m| m.get("tool_name").and_then(Value::as_str).unwrap_or("unknown tool")),
+        ),
         "matches": matches,
         "hint": if all_sessions || requested_session_id.is_some() {
             "call recall with a returned id and session_id to get that result's full output"
@@ -1838,6 +1889,47 @@ mod tests {
             clipped.contains("record is 100002 chars; showing first 64000"),
             "{clipped}"
         );
+    }
+
+    #[tokio::test]
+    async fn recall_declares_durable_memory_as_its_source() {
+        // Driven live on 2026-09-05: every recall card read "SOURCE NOT
+        // REPORTED BY recall". Recall knows exactly where its records come
+        // from — this session's durable memory — and which tool wrote each.
+        let (store, id) = seeded_store().await;
+        let out = recall(
+            &json!({ "query": "titanium" }),
+            Some(&store),
+            "sess-recall",
+            None,
+        )
+        .await
+        .unwrap();
+        let sources = out["sources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("recall by query must declare its sources: {out}"));
+        assert_eq!(sources[0]["source"], json!("durable memory"));
+        assert_eq!(sources[0]["count"], json!(1));
+        assert_eq!(sources[0]["status"], json!("ok"));
+        assert!(
+            sources[0]["kind"].as_str().unwrap().contains("file"),
+            "the kind names the tool that wrote the record: {}",
+            sources[0]
+        );
+        assert!(
+            sources[0]["fetched"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+
+        let out = recall(&json!({ "id": id }), Some(&store), "sess-recall", None)
+            .await
+            .unwrap();
+        let sources = out["sources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("recall by id must declare its sources: {out}"));
+        assert_eq!(sources[0]["source"], json!("durable memory"));
+        assert_eq!(sources[0]["count"], json!(1));
     }
 
     #[tokio::test]
