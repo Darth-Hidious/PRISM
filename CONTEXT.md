@@ -126,6 +126,7 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
   mistakes and one WARN leaking into a papers_ingest result. LIVE (00:10):
   follow-the-answer and the Ctrl-T wording confirmed on the installed build.
   DONE `30105116`: activity strip on its own row above the prompt (footer clips at 140 cols).
+DONE `f87cf6f6`: footer word derives from the turn (busy/working/Ready; text-flush wrote Ready mid-turn); footer trims optional groups so "Ctrl-C quit" survives narrow columns.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
