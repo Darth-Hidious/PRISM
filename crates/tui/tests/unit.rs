@@ -420,13 +420,16 @@ fn text_delta_tracks_streaming_metrics() {
 }
 
 #[test]
-fn text_flush_clears_waiting_state() {
+fn text_flush_clears_waiting_but_does_not_declare_the_turn_done() {
     let mut app = test_app();
     app.is_waiting = true;
     app.status_text = "Thinking…".into();
     app.apply_agent_msg(AgentMsg::TextFlush);
     assert!(!app.is_waiting);
-    assert_eq!(app.status_text, "Ready");
+    // A text segment ending is not the turn ending. The flush used to write
+    // "Ready" here — exactly when a tool call begins — so the footer read
+    // Ready for the whole of a running search (driven live, 2026-09-05).
+    assert_ne!(app.status_text, "Ready");
 }
 
 #[test]

@@ -14,4 +14,4 @@ running in deterministic test mode.    █
 │                                      │
 │                                      │
 └──────────────────────────────────────┘
-  Ready  model: fake-backend   [INPUT]
+  Ready  model: fake-backend     Ctrl-C

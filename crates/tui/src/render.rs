@@ -1292,8 +1292,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         &app.model
     };
+    // The word is derived from the turn, not from a string an event once
+    // wrote: the text-flush event used to write "Ready" when a text segment
+    // ended, which is exactly when a tool call begins, so the footer read
+    // Ready for the whole of a running search.
     let status = if app.is_waiting {
         "busy"
+    } else if app.turn_in_progress {
+        "working"
     } else {
         &app.status_text
     };
@@ -1383,6 +1389,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
     }
 
+    let focus_idx = spans.len();
     spans.push(Span::styled(focus_indicator, Style::default().fg(t.warn)));
     // What the reader can do with the line they just clicked. Selection is
     // only half of pointing: without this the mark appears and the reader is
@@ -1395,11 +1402,61 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(Span::styled("   Ctrl-C quit", Style::default().fg(t.muted)));
 
-    let line = Line::from(spans);
+    // A column too narrow for every word loses the least useful ones, never
+    // the last ones: at 140 columns with the sidebar this row read
+    // "Ctrl-C qu", and with throughput and cost shown it ended in
+    // "[Ctrl-T: show reas". Drop order: the focus tag (the prompt border
+    // already shows focus; a pending approval is a state, so it stays), the
+    // throughput, the cost, then the reasoning hint takes its short form.
+    let mut line = Line::from(spans);
+    let width = usize::from(area.width);
+    let trims = [
+        FooterTrim::Focus,
+        FooterTrim::Group("tok/s:"),
+        FooterTrim::Group("cost:"),
+        FooterTrim::ShortReasoning,
+    ];
+    for trim in trims {
+        if line.width() <= width {
+            break;
+        }
+        match trim {
+            FooterTrim::Focus if app.focus != Focus::Approval => {
+                line.spans.remove(focus_idx);
+            }
+            FooterTrim::Focus => {}
+            FooterTrim::Group(label) => remove_labelled_group(&mut line, label),
+            FooterTrim::ShortReasoning => {
+                for span in &mut line.spans {
+                    if span.content == "[Ctrl-T: show reasoning]" {
+                        span.content = "[Ctrl-T reasoning]".into();
+                    }
+                }
+            }
+        }
+    }
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(t.overlay_bg)),
         area,
     );
+}
+
+/// One step of making the footer fit, in the order they are tried.
+enum FooterTrim {
+    /// The focus tag; the prompt border already shows focus.
+    Focus,
+    /// A labelled group such as throughput or cost.
+    Group(&'static str),
+    /// The reasoning hint's short form.
+    ShortReasoning,
+}
+
+/// Remove a footer group `label`, " ", value, "  " (four spans) by its label.
+fn remove_labelled_group(line: &mut Line, label: &str) {
+    if let Some(i) = line.spans.iter().position(|s| s.content == label) {
+        let end = (i + 4).min(line.spans.len());
+        line.spans.drain(i..end);
+    }
 }
 
 /// Bordered prompt box — the prominent input (opencode-style), with the

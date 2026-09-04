@@ -658,7 +658,7 @@ pub struct App {
     pub is_waiting: bool,
     /// True from dispatch until the authoritative `ui.turn.complete` event.
     /// Unlike `is_waiting`, streaming deltas do not clear this lifecycle bit.
-    turn_in_progress: bool,
+    pub(crate) turn_in_progress: bool,
     pub approval_pending: Option<(String, String)>,
     /// Full code of a pending `notebook_exec` approval (from the prompt's
     /// `tool_args`). The kernel is SHARED with the human, so the popup must
@@ -5525,8 +5525,8 @@ impl App {
                 self.is_waiting = false;
             }
             AgentMsg::TextFlush => {
+                // Ends a text segment, not the turn: no status word here.
                 self.is_waiting = false;
-                self.status_text = "Ready".to_string();
             }
             AgentMsg::ToolStart {
                 tool_name,
@@ -6645,6 +6645,95 @@ mod tests {
     /// saw a quiet screen and could not tell whether the system was warming an
     /// index, seeding an ontology, or hung. A live activity is listed in the
     /// footer for as long as it runs, and leaves when it finishes.
+    #[test]
+    fn the_footer_does_not_say_ready_while_a_tool_is_still_running() {
+        // Driven live on 2026-09-05: the model's text segment ended, the
+        // text-flush event wrote "Ready", and the footer read Ready for the
+        // whole of a prior_art_search that was still running — the same
+        // lying signal as the fourteen-hour "thinking hidden", from the other
+        // direction.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.turn_in_progress = true;
+        app.is_waiting = false;
+        app.apply_agent_msg(crate::msg::AgentMsg::TextFlush);
+        app.apply_agent_msg(crate::msg::AgentMsg::ToolStart {
+            tool_name: "prior_art_search".to_string(),
+            verb: "Running".to_string(),
+            call_id: None,
+            preview: None,
+            approval_required: None,
+            agent: None,
+        });
+        let footer = footer_row(&app);
+        assert!(
+            !footer.contains("Ready"),
+            "a turn with a tool still running is not Ready: {footer:?}"
+        );
+        assert!(
+            footer.contains("working"),
+            "the footer names the state: {footer:?}"
+        );
+        app.apply_agent_msg(crate::msg::AgentMsg::TurnComplete);
+        let footer = footer_row(&app);
+        assert!(
+            footer.contains("Ready"),
+            "and after the turn it is: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn the_footer_keeps_its_last_words_at_140_columns() {
+        // At 140 columns with the sidebar the content column is 97 wide. With
+        // credits shown and reasoning collapsed the footer read "Ctrl-C qu".
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.model = "glm-5.3-flash".to_string();
+        app.credits = Some(-73_396);
+        app.apply_agent_msg(crate::msg::AgentMsg::ThinkingDelta("why".to_string()));
+        app.apply_agent_msg(crate::msg::AgentMsg::TextDelta("answer".to_string()));
+        app.apply_agent_msg(crate::msg::AgentMsg::TurnComplete);
+        let footer = footer_row(&app);
+        assert!(
+            footer.trim_end().ends_with("Ctrl-C quit"),
+            "the footer's last words survive a narrow column: {footer:?}"
+        );
+        assert!(footer.contains("Ready"), "{footer:?}");
+        assert!(
+            footer.contains("Ctrl-T"),
+            "the reasoning affordance survives too: {footer:?}"
+        );
+        // Live on 2026-09-05 with throughput and cost shown, the row ended in
+        // "[Ctrl-T: show reas": focus tag and quit hint both gone.
+        app.show_metrics = true;
+        app.tokens_per_sec = 16.6;
+        app.show_cost = true;
+        app.session_cost = 0.0062;
+        let footer = footer_row(&app);
+        assert!(
+            footer.trim_end().ends_with("Ctrl-C quit"),
+            "with metrics on, the last words still survive: {footer:?}"
+        );
+        assert!(footer.contains("Ready"), "{footer:?}");
+        assert!(
+            footer.contains("glm-5.3-flash"),
+            "the model is never dropped: {footer:?}"
+        );
+    }
+
+    /// The last row of a 140x20 frame, content column only (the sidebar's
+    /// divider and everything right of it are not the footer).
+    fn footer_row(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, buf.area.height - 1)].symbol().to_string())
+            .collect();
+        row.split('│').next().unwrap_or_default().to_string()
+    }
+
     #[test]
     fn a_live_background_activity_is_shown_and_clears_when_done() {
         let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));

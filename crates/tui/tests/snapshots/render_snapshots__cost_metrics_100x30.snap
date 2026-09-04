@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 518
+assertion_line: 522
 expression: rendered
 ---
  ‹ back  New session   ◆ fake-backend    Ctrl-P · ?                │ Workspace
@@ -32,4 +32,4 @@ expression: rendered
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: fake-backend  cost: $0.0500   [INPUT]    Ctrl-C qu │
+  Ready  model: fake-backend  cost: $0.0500     Ctrl-C quit        │

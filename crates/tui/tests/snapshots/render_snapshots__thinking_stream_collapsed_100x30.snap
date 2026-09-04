@@ -32,4 +32,4 @@ expression: rendered
 │                                                                │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
-  Ready  model: fake-backend  [Ctrl-T: show reasoning]   [INPUT]   │
+  Ready  model: fake-backend  [Ctrl-T reasoning]     Ctrl-C quit   │
