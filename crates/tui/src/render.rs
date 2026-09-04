@@ -43,11 +43,14 @@ struct FrameLayout {
     transcript: Rect,
     prompt: Rect,
     footer: Rect,
+    /// One row above the prompt naming background work in flight; absent
+    /// when nothing is running, so it never costs a transcript row for nothing.
+    activity: Option<Rect>,
     /// Right-hand Workspace panel, or `None` on a narrow terminal.
     sidebar: Option<Rect>,
 }
 
-fn frame_layout(area: Rect) -> FrameLayout {
+fn frame_layout(area: Rect, activity_strip: bool) -> FrameLayout {
     // Columns: left content column + right Workspace panel (opencode-style).
     // Below the threshold the sidebar is hidden entirely — a clipped sidebar
     // is worse than none, and the content column needs the room.
@@ -73,14 +76,18 @@ fn frame_layout(area: Rect) -> FrameLayout {
             .split(area)
     };
 
-    // Left column: header / transcript / prompt / footer.
+    // Left column: header / transcript / [activity strip] / prompt / footer.
+    // The strip is one row that exists only while background work is in
+    // flight. It lives here, not in the footer: at 140 columns the footer is
+    // already clipped ("Ctrl-C qu"), so anything added there is cut or cuts.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header bar
-            Constraint::Min(3),    // transcript
-            Constraint::Length(5), // bordered prompt box (1 + 3 + 1)
-            Constraint::Length(1), // footer
+            Constraint::Length(1),                         // header bar
+            Constraint::Min(3),                            // transcript
+            Constraint::Length(u16::from(activity_strip)), // activity strip
+            Constraint::Length(5),                         // bordered prompt box (1 + 3 + 1)
+            Constraint::Length(1),                         // footer
         ])
         .split(cols[0]);
 
@@ -88,8 +95,9 @@ fn frame_layout(area: Rect) -> FrameLayout {
         content: cols[0],
         header: chunks[0],
         transcript: chunks[1],
-        prompt: chunks[2],
-        footer: chunks[3],
+        activity: activity_strip.then(|| chunks[2]),
+        prompt: chunks[3],
+        footer: chunks[4],
         sidebar: (sidebar_w > 0).then(|| cols[1]),
     }
 }
@@ -103,8 +111,8 @@ fn frame_layout(area: Rect) -> FrameLayout {
 /// pane left the prompt box as the fragments `┌ Prompt` / `│ Type a` on the
 /// left edge and cut the sidebar's border out of every row it covered.
 /// Centring inside these bounds instead cannot reach either.
-fn overlay_bounds(area: Rect) -> Rect {
-    let l = frame_layout(area);
+fn overlay_bounds(area: Rect, activity_strip: bool) -> Rect {
+    let l = frame_layout(area, activity_strip);
     Rect::new(
         l.content.x,
         l.transcript.y,
@@ -121,7 +129,9 @@ fn overlay_bounds(area: Rect) -> Rect {
 /// notebook approval popup has to show every line of the cell it is asking
 /// you to run, and 72% of the content column is not 72% of the screen.
 fn overlay_area(f: &Frame, percent_x: u16, percent_y: u16) -> Rect {
-    let bounds = overlay_bounds(f.area());
+    // Overlays centre inside the transcript; the one-row activity strip
+    // moves that centre by at most a row, so it is ignored here.
+    let bounds = overlay_bounds(f.area(), false);
     let want = centered_rect(percent_x, percent_y, f.area());
     let width = want.width.min(bounds.width);
     let height = want.height.min(bounds.height);
@@ -149,10 +159,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         area,
     );
 
-    let layout = frame_layout(area);
+    let layout = frame_layout(area, !app.activities.is_empty());
 
     draw_header(f, app, layout.header);
     draw_chat(f, app, layout.transcript);
+    if let Some(strip) = layout.activity {
+        draw_activity_strip(f, app, strip);
+    }
     draw_prompt(f, app, layout.prompt);
     draw_footer(f, app, layout.footer);
     app.sidebar_visible.set(layout.sidebar.is_some());
@@ -204,7 +217,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         // The home panel lives in the content column so it shares an origin
         // and a width with the prompt box and footer stacked around it —
         // never over the workspace sidebar column.
-        draw_home(f, app, overlay_bounds(area));
+        draw_home(f, app, overlay_bounds(area, !app.activities.is_empty()));
     } else if let Some(modal) = app.modal {
         draw_modal(f, modal, app);
     }
@@ -281,7 +294,9 @@ fn draw_toasts(f: &mut Frame, app: &App) {
     if live.is_empty() {
         return;
     }
-    let bounds = overlay_bounds(f.area());
+    // Overlays centre inside the transcript; the one-row activity strip
+    // moves that centre by at most a row, so it is ignored here.
+    let bounds = overlay_bounds(f.area(), false);
     let count = live.len().min(5) as u16;
     // Narrow terminals hide the sidebar, so `bounds` can be narrower than the
     // toast's natural width; clamp rather than overflow the content column.
@@ -1253,6 +1268,22 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Background work in flight, on its own row above the prompt. A quiet
+/// screen must never mean an unknown state: whatever the backend is doing off
+/// the main turn is named here until it says it is done.
+fn draw_activity_strip(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
+    let text: Vec<&str> = app.activities.iter().map(|(_, s)| s.as_str()).collect();
+    let line = clip(&format!("⋯ {}", text.join(" · ")), usize::from(area.width));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            line,
+            Style::default().fg(t.reference),
+        ))),
+        area,
+    );
+}
+
 /// Footer — live status + hints (opencode bottom bar), replacing the old status bar.
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
@@ -1316,18 +1347,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!("${:.4}", app.session_cost),
             Style::default().fg(t.text),
-        ));
-        spans.push(Span::raw("  "));
-    }
-
-    // Background work in flight. A quiet screen must never mean an unknown
-    // state: whatever the backend is doing off the main turn is named here
-    // until it says it is done.
-    if !app.activities.is_empty() {
-        let text: Vec<&str> = app.activities.iter().map(|(_, t)| t.as_str()).collect();
-        spans.push(Span::styled(
-            format!("⋯ {}", text.join(" · ")),
-            Style::default().fg(t.reference),
         ));
         spans.push(Span::raw("  "));
     }
@@ -4840,7 +4859,7 @@ fn draw_form_pane(f: &mut Frame, app: &App) {
     // as broken. Cropped to the region an overlay may claim, like every
     // other overlay, so it cannot land on the prompt box or the sidebar.
     let screen = f.area();
-    let full = overlay_bounds(screen);
+    let full = overlay_bounds(screen, false);
     let height = (form.fields.len() as u16 + 5).min(full.height);
     let width = (screen.width * 64 / 100).max(40).min(full.width);
     let x = full.x + (full.width.saturating_sub(width)) / 2;

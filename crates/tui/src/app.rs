@@ -6659,31 +6659,53 @@ mod tests {
             text: "compacting the conversation".to_string(),
             done: false,
         });
-        let footer = |app: &App| -> String {
+        // The strip is the row directly above the prompt box; the footer is
+        // the last row and must keep its last words — at 140 columns it is
+        // already clipped, which is why the strip is not in it.
+        let rows = |app: &App| -> (String, String) {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
             terminal.draw(|f| crate::render::draw(f, app)).unwrap();
             let buf = terminal.backend().buffer().clone();
-            (0..buf.area.width)
-                .map(|x| buf[(x, buf.area.height - 1)].symbol().to_string())
-                .collect()
+            let row = |y: u16| -> String {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            };
+            // The prompt box (5 rows) sits above the 1-row footer, so its top
+            // border is at height-6 and the strip, when present, at height-7.
+            (row(buf.area.height - 7), row(buf.area.height - 1))
         };
-        let f = footer(&app);
-        assert!(f.contains("warming the tool index"), "{f:?}");
-        assert!(f.contains("compacting the conversation"), "{f:?}");
+        let (strip, footer) = rows(&app);
+        assert!(strip.contains("warming the tool index"), "{strip:?}");
+        assert!(strip.contains("compacting the conversation"), "{strip:?}");
+        assert!(
+            footer.contains("Ctrl-C quit"),
+            "the footer keeps its last words: {footer:?}"
+        );
         app.apply_agent_msg(crate::msg::AgentMsg::Activity {
             id: "warm-index".to_string(),
             text: String::new(),
             done: true,
         });
-        let f = footer(&app);
+        let (strip, _) = rows(&app);
         assert!(
-            !f.contains("warming the tool index"),
-            "a finished activity leaves: {f:?}"
+            !strip.contains("warming the tool index"),
+            "a finished activity leaves: {strip:?}"
         );
         assert!(
-            f.contains("compacting the conversation"),
-            "the other one stays: {f:?}"
+            strip.contains("compacting the conversation"),
+            "the other one stays: {strip:?}"
+        );
+        app.apply_agent_msg(crate::msg::AgentMsg::Activity {
+            id: "compact".to_string(),
+            text: String::new(),
+            done: true,
+        });
+        let (gone, _) = rows(&app);
+        assert!(
+            !gone.contains('⋯'),
+            "with nothing running the strip row is given back to the transcript: {gone:?}"
         );
     }
 
