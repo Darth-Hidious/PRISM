@@ -1320,16 +1320,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
     }
 
-    // Collapsed-thinking affordance. Reads as a hint (with its toggle key),
-    // not a status — the stress-test watcher flagged the old "[thinking
-    // hidden]" text as a stuck state because nothing said how to act on it.
+    // Collapsed-reasoning affordance. Reads as an INSTRUCTION, never as a
+    // state. The stress-test watcher flagged "[thinking hidden]" as a stuck
+    // state because nothing said how to act on it; "[thinking · Ctrl-T]"
+    // named the key but kept the word, and a reader watching a research run
+    // read it beside "Ready" as a model still thinking — in one session, for
+    // fourteen hours. "Thinking…" is the live status's own word and is
+    // reserved for it.
     let has_thinking = app
         .messages
         .iter()
         .any(|m| matches!(m.kind, LineKind::Thinking));
     if has_thinking && !app.thinking_expanded {
         spans.push(Span::styled(
-            "[thinking · Ctrl-T]",
+            "[Ctrl-T: show reasoning]",
             Style::default().fg(t.dim),
         ));
         spans.push(Span::raw("  "));
@@ -6027,6 +6031,35 @@ mod tests {
             app.view_scroll.get(),
             max,
             "a reply that outgrows the screen is followed to its tail, not left below the fold"
+        );
+    }
+
+    /// The collapsed-reasoning affordance must read as an instruction, never
+    /// as a state. It said "[thinking · Ctrl-T]" beside "Ready" after every
+    /// completed turn, and a reader watching a research run took it for a
+    /// model still thinking — for fourteen hours, in one session. "Thinking…"
+    /// is the live status's own word and stays reserved for it.
+    #[test]
+    fn a_hidden_reasoning_block_is_offered_not_reported_as_thinking() {
+        let mut app = App::new(BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.append_thinking_text("the model weighing which tool to call");
+        app.append_assistant_text("Search complete.");
+        app.status_text = "Ready".to_string();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let footer: String = (0..buf.area.width)
+            .map(|x| buf[(x, buf.area.height - 1)].symbol().to_string())
+            .collect();
+        assert!(
+            footer.contains("Ctrl-T: show reasoning"),
+            "the affordance names the action: {footer:?}"
+        );
+        assert!(
+            !footer.contains("thinking"),
+            "a finished turn must not say thinking anywhere in the footer: {footer:?}"
         );
     }
 
