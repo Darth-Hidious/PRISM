@@ -96,6 +96,15 @@ pub enum AgentEvent {
     },
     /// Signal the frontend to flush accumulated streaming text into chat history.
     TextFlush,
+    /// Background work the reader should be able to see: index warming,
+    /// embedding-model load, compaction, identity persistence. `done` clears
+    /// it. A reader watching a session go quiet after a compaction could not
+    /// tell whether anything was happening; now every such task says so.
+    Activity {
+        id: String,
+        text: String,
+        done: bool,
+    },
     /// Truthful per-request report of whether influence-ranked context was
     /// actually injected, or which fallback handled the request instead.
     ContextPriming {

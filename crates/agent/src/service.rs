@@ -737,6 +737,7 @@ impl ChatService {
                 assistant.delta(&text);
                 let _ = events.send(ChatEvent::Answer { text });
             }
+            AgentEvent::Activity { .. } => {}
             AgentEvent::TextFlush => {
                 if let Some(block) = assistant.flush() {
                     store.append_message("assistant", &block, "", "", None);

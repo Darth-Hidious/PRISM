@@ -672,6 +672,9 @@ pub struct App {
     pub approval_max_scroll: std::cell::Cell<u16>,
     pub should_quit: bool,
     pub status_text: String,
+    /// Background work in flight, by id, in arrival order. Rendered in the
+    /// footer while non-empty so a quiet screen never means an unknown state.
+    pub activities: Vec<(String, String)>,
     pub tool_count: u64,
     pub prism_version: String,
     // Streaming performance metrics. `tokens_received` is an ESTIMATE from
@@ -922,6 +925,7 @@ impl App {
             approval_max_scroll: std::cell::Cell::new(0),
             should_quit: false,
             status_text: "Ready".to_string(),
+            activities: Vec::new(),
             tool_count: 0,
             prism_version: String::new(),
             tokens_received: 0,
@@ -5475,6 +5479,12 @@ impl App {
                 self.session_mode = mode;
                 self.message_count = message_count;
             }
+            AgentMsg::Activity { id, text, done } => {
+                self.activities.retain(|(k, _)| *k != id);
+                if !done && !text.trim().is_empty() {
+                    self.activities.push((id, sanitize_for_render(&text)));
+                }
+            }
             AgentMsg::TextDelta(text) => {
                 let now = std::time::Instant::now();
                 if self.first_token_time.is_none() {
@@ -6629,6 +6639,52 @@ mod tests {
             last.kind
         );
         assert!(last.text.starts_with("Search complete"), "{}", last.text);
+    }
+
+    /// Background work is on screen while it runs. After a compaction a reader
+    /// saw a quiet screen and could not tell whether the system was warming an
+    /// index, seeding an ontology, or hung. A live activity is listed in the
+    /// footer for as long as it runs, and leaves when it finishes.
+    #[test]
+    fn a_live_background_activity_is_shown_and_clears_when_done() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.apply_agent_msg(crate::msg::AgentMsg::Activity {
+            id: "warm-index".to_string(),
+            text: "warming the tool index".to_string(),
+            done: false,
+        });
+        app.apply_agent_msg(crate::msg::AgentMsg::Activity {
+            id: "compact".to_string(),
+            text: "compacting the conversation".to_string(),
+            done: false,
+        });
+        let footer = |app: &App| -> String {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+            terminal.draw(|f| crate::render::draw(f, app)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.width)
+                .map(|x| buf[(x, buf.area.height - 1)].symbol().to_string())
+                .collect()
+        };
+        let f = footer(&app);
+        assert!(f.contains("warming the tool index"), "{f:?}");
+        assert!(f.contains("compacting the conversation"), "{f:?}");
+        app.apply_agent_msg(crate::msg::AgentMsg::Activity {
+            id: "warm-index".to_string(),
+            text: String::new(),
+            done: true,
+        });
+        let f = footer(&app);
+        assert!(
+            !f.contains("warming the tool index"),
+            "a finished activity leaves: {f:?}"
+        );
+        assert!(
+            f.contains("compacting the conversation"),
+            "the other one stays: {f:?}"
+        );
     }
 
     /// An open panel takes the scroll keys. They used to reach the list

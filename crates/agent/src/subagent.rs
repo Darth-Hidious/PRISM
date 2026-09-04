@@ -456,6 +456,9 @@ async fn execute_spawn_subagent_inner(
         // the subagent's tools exactly as it gates the parent's.
         let mut nested_emit = |event: AgentEvent| {
             match &event {
+                // Background-activity notices are the parent's to show; a
+                // subagent's are folded into its lane by the parent.
+                AgentEvent::Activity { .. } => {}
                 AgentEvent::TextDelta { text } => {
                     streamed_text.push_str(text);
                     return;

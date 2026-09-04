@@ -144,6 +144,14 @@ pub enum AgentMsg {
         mode: String,
         message_count: usize,
     },
+    /// Background work the backend is doing: shown while it runs, cleared on
+    /// `done`. Without it a session went quiet after a compaction and nothing
+    /// said whether anything was happening.
+    Activity {
+        id: String,
+        text: String,
+        done: bool,
+    },
 
     // ── Streaming ────────────────────────────────────────────────────
     /// `ui.text.delta` — a chunk of visible answer text.
@@ -622,6 +630,22 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
         },
 
         // ── Status ───────────────────────────────────────────────────
+        "ui.activity" => AgentMsg::Activity {
+            id: params
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            text: params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            done: params
+                .get("done")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
         "ui.status" => AgentMsg::Status {
             model: params
                 .get("model")

@@ -3021,11 +3021,22 @@ fn catalog_entries(catalog: &ToolCatalog) -> Vec<(String, String)> {
 /// process-global caches, so this is a no-op once warm; the whole-catalog embed
 /// (seconds on CPU) therefore never stalls a turn — the turn serves keyword
 /// until the index is ready, then flips to neural.
+/// Say what background work is running, from anywhere — including a spawned
+/// task with no `emit` in scope. `done` clears the line.
+pub(crate) fn announce_activity(id: &str, text: &str, done: bool) {
+    crate::protocol::emit_notification(
+        "ui.activity",
+        serde_json::json!({ "id": id, "text": text, "done": done }),
+    );
+}
+
 fn spawn_neural_warm(entries: Vec<(String, String)>) {
     tokio::spawn(async move {
+        announce_activity("warm-tool-index", "warming the tool index (neural)", false);
         if let Some(backend) = crate::embeddings::backend().await {
             let _ = crate::capability::global_index(entries, backend.as_ref()).await;
         }
+        announce_activity("warm-tool-index", "", true);
     });
 }
 
@@ -3686,8 +3697,14 @@ pub(crate) async fn run_turn_inner(
                 emit(AgentEvent::TextDelta {
                     text: "[context full — compacting and retrying]\n".to_string(),
                 });
+                announce_activity(
+                    "compact",
+                    "compacting the conversation — context full",
+                    false,
+                );
                 if let Some(summary) = transcript.compact(6) {
                     compact_history(&mut messages, &summary, 6);
+                    announce_activity("compact", "", true);
                 }
                 streamed_deltas.clear();
                 llm.chat_with_tools_streaming(
@@ -4194,6 +4211,14 @@ pub(crate) async fn run_turn_inner(
 
                 // Auto-compact if needed
                 if transcript.should_compact()
+                    && {
+                        announce_activity(
+                            "compact",
+                            "compacting the conversation — context full",
+                            false,
+                        );
+                        true
+                    }
                     && let Some(summary) = transcript.compact(6)
                 {
                     compact_history(history, &summary, 6);
@@ -5044,6 +5069,14 @@ pub(crate) async fn run_turn_inner(
             );
         }
         if transcript.needs_compaction_under_pressure()
+            && {
+                announce_activity(
+                    "compact",
+                    "compacting the conversation — context full",
+                    false,
+                );
+                true
+            }
             && let Some(summary) = transcript.compact(6)
         {
             tracing::debug!("compacting mid-turn under token pressure");

@@ -30,13 +30,18 @@ pub async fn backend() -> Option<Arc<dyn EmbedBackend>> {
     if let Some(b) = BACKEND.get() {
         return b.clone();
     }
-    tokio::task::spawn_blocking(|| {
+    // The cold load takes seconds on CPU and used to happen in silence; a
+    // reader watching a quiet screen could not tell it from a hang.
+    crate::agent_loop::announce_activity("embed-model", "loading the embedding model", false);
+    let loaded = tokio::task::spawn_blocking(|| {
         BACKEND
             .get_or_init(|| prism_embed::from_config().map(Arc::from))
             .clone()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    crate::agent_loop::announce_activity("embed-model", "", true);
+    loaded
 }
 
 /// Embed a freshly written provenance record and store the vector.

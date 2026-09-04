@@ -1320,6 +1320,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw("  "));
     }
 
+    // Background work in flight. A quiet screen must never mean an unknown
+    // state: whatever the backend is doing off the main turn is named here
+    // until it says it is done.
+    if !app.activities.is_empty() {
+        let text: Vec<&str> = app.activities.iter().map(|(_, t)| t.as_str()).collect();
+        spans.push(Span::styled(
+            format!("⋯ {}", text.join(" · ")),
+            Style::default().fg(t.reference),
+        ));
+        spans.push(Span::raw("  "));
+    }
+
     // Collapsed-reasoning affordance. Reads as an INSTRUCTION, never as a
     // state. The stress-test watcher flagged "[thinking hidden]" as a stuck
     // state because nothing said how to act on it; "[thinking · Ctrl-T]"

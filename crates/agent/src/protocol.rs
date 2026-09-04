@@ -100,7 +100,7 @@ fn notification_value(method: &str, params: Value) -> Value {
     })
 }
 
-fn emit_notification(method: &str, params: Value) {
+pub(crate) fn emit_notification(method: &str, params: Value) {
     emit_raw(&notification_value(method, params));
 }
 
@@ -5924,6 +5924,12 @@ fn emit_agent_event(event: AgentEvent) {
         AgentEvent::TextFlush => {
             emit_notification("ui.text.flush", serde_json::json!({ "text": "" }));
         }
+        AgentEvent::Activity { id, text, done } => {
+            emit_notification(
+                "ui.activity",
+                serde_json::json!({ "id": id, "text": text, "done": done }),
+            );
+        }
         AgentEvent::ContextPriming { iteration, status } => {
             emit_notification(
                 "ui.context.priming",
@@ -9842,6 +9848,41 @@ async fn run_server_core(
 
 #[cfg(test)]
 mod tests {
+    /// Background work must be visible. A reader watched a research session
+    /// go quiet after a compaction and could not tell whether anything was
+    /// happening: the tool index was warming, the embedding model loading,
+    /// the transcript being compacted, paper identities being persisted, and
+    /// none of it reached the screen. Every such task announces itself
+    /// through one channel, and says when it is done.
+    #[test]
+    fn a_background_activity_reaches_the_frontend_and_says_when_it_is_done() {
+        let emitted = super::capture_emissions(|| {
+            super::emit_agent_event(crate::types::AgentEvent::Activity {
+                id: "warm-index".to_string(),
+                text: "warming the tool index".to_string(),
+                done: false,
+            });
+            super::emit_agent_event(crate::types::AgentEvent::Activity {
+                id: "warm-index".to_string(),
+                text: "warming the tool index".to_string(),
+                done: true,
+            });
+        });
+        let acts: Vec<_> = emitted
+            .iter()
+            .filter(|n| n["method"].as_str() == Some("ui.activity"))
+            .collect();
+        assert_eq!(
+            acts.len(),
+            2,
+            "start and finish are both announced: {emitted:?}"
+        );
+        assert_eq!(acts[0]["params"]["id"], "warm-index");
+        assert_eq!(acts[0]["params"]["text"], "warming the tool index");
+        assert_eq!(acts[0]["params"]["done"], false);
+        assert_eq!(acts[1]["params"]["done"], true);
+    }
+
     /// A resume must ship the restored lines to the frontend. A UI
     /// transcript built from live events alone renders "(no activity
     /// yet)" without this snapshot — that was the `prism resume` bug.

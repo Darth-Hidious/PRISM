@@ -177,40 +177,50 @@ const RECALL_BY_ID_MAX_CHARS: usize = 64_000;
 /// room, and shrinks them as the turn fills — which is exactly when a large
 /// fetch is most likely to be the thing that kills the run.
 const RECALL_BUDGET_SHARE: f64 = 0.25;
-/// Below this share of the budget remaining, a by-id recall REFUSES.
+/// Below this share of the budget remaining, a by-id recall is served as a
+/// SLICE no smaller than [`RECALL_FLOOR_CHARS`], with a note saying why.
 ///
-/// At 90% used the right move is not a smaller fetch, it is to stop fetching:
-/// whatever the model is about to read, it will not have room to act on. The
-/// refusal says so and names the alternative, because a silent empty result
-/// would just be re-tried.
+/// It used to REFUSE here. That was a muzzle, and it fired twenty times in ten
+/// days: the model found papers, asked to read one back, and was told no —
+/// every time with the record sitting safely in durable memory. A closed door
+/// is re-tried; a small honest slice with the reason attached is acted on.
 const RECALL_BUDGET_FLOOR: f64 = 0.10;
+/// The smallest slice a tight turn still gets: enough to read a title, an
+/// abstract's opening and an id, never enough to blow the window.
+const RECALL_FLOOR_CHARS: usize = 2_000;
 
 /// The by-id character cap for this call, given the turn's remaining input
 /// budget. `None` remaining (no budget context — a slash command, a test)
-/// keeps the flat ceiling, which is the pre-existing behaviour.
-///
-/// Returns `Err(reason)` when the turn is too far gone to spend on a recall.
-fn recall_cap_for_budget(remaining: Option<TurnRemaining>) -> Result<usize, String> {
+/// keeps the flat ceiling, which is the pre-existing behaviour. Never refuses.
+fn recall_cap_for_budget(remaining: Option<TurnRemaining>) -> usize {
     let Some(rem) = remaining else {
-        return Ok(RECALL_BY_ID_MAX_CHARS);
+        return RECALL_BY_ID_MAX_CHARS;
     };
+    let allowed_tokens = (rem.remaining as f64 * RECALL_BUDGET_SHARE) as usize;
+    let by_share = allowed_tokens
+        .saturating_mul(prism_llm::CHARS_PER_TOKEN)
+        .min(RECALL_BY_ID_MAX_CHARS);
     if rem.share() < RECALL_BUDGET_FLOOR {
-        return Err(format!(
-            "refusing to recall: only {:.0}% of this turn's token budget is left \
-             ({} of {} tokens), and a full record would consume most of it. \
-             Everything recall returns is ALREADY stored durably — nothing is \
-             lost by not re-reading it. Write your answer from what you have, \
-             or ingest the paper so its facts become graph rows instead of \
-             conversation.",
+        by_share.clamp(RECALL_FLOOR_CHARS, RECALL_BY_ID_MAX_CHARS)
+    } else {
+        by_share
+    }
+}
+
+/// Why a recall came back small, when it did. `None` when there was room.
+fn recall_budget_note(remaining: Option<TurnRemaining>) -> Option<String> {
+    let rem = remaining?;
+    (rem.share() < RECALL_BUDGET_FLOOR).then(|| {
+        format!(
+            "recall cut to a slice: only {:.0}% of this turn's token budget is left \
+             ({} of {} tokens). The full record is stored durably and nothing is \
+             lost — recall it again with an offset for the rest, write from what \
+             you have, or ingest the paper so its facts become graph rows.",
             rem.share() * 100.0,
             rem.remaining,
             rem.total,
-        ));
-    }
-    let allowed_tokens = (rem.remaining as f64 * RECALL_BUDGET_SHARE) as usize;
-    Ok(allowed_tokens
-        .saturating_mul(prism_llm::CHARS_PER_TOKEN)
-        .min(RECALL_BY_ID_MAX_CHARS))
+        )
+    })
 }
 
 /// What is left of the turn's input budget, for sizing a recall.
@@ -964,10 +974,8 @@ async fn recall_with_backend(
         }
         // A full record is the single largest thing the model can pull into a
         // turn, so what it may cost depends on what the turn has left.
-        let cap = match recall_cap_for_budget(remaining) {
-            Ok(cap) => cap,
-            Err(reason) => return Ok(json!({ "error": reason })),
-        };
+        let cap = recall_cap_for_budget(remaining);
+        let budget_note = recall_budget_note(remaining);
         // `query_chain` starts at `id` and walks parents within the selected
         // session; the record itself is included, so find it in the chain.
         let chain = store
@@ -983,6 +991,9 @@ async fn recall_with_backend(
                     "status": rec.status,
                     "exit_code": rec.exit_code,
                 });
+                if let Some(note) = &budget_note {
+                    out["budget_note"] = json!(note);
+                }
                 // Say WHY it is short, or the model reads a budget trim as the
                 // record being small and stops looking for the rest.
                 if cap < RECALL_BY_ID_MAX_CHARS
@@ -1658,8 +1669,9 @@ mod tests {
         let big = TurnBudget::for_model(Some(1_000_000), None);
         let rem = recall_budget(&cost, &big).expect("a known window yields a budget");
         assert_eq!(rem.total, big.usable_context().unwrap());
-        assert!(
-            recall_cap_for_budget(Some(rem)).is_ok(),
+        assert_eq!(
+            recall_cap_for_budget(Some(rem)),
+            RECALL_BY_ID_MAX_CHARS,
             "180k cumulative on a 1M model is not 'budget exhausted'"
         );
         let unknown = TurnBudget::for_model(None, None);
@@ -1669,30 +1681,52 @@ mod tests {
         );
     }
 
+    /// Below the floor a recall is BOUNDED, never refused. The refusal was a
+    /// muzzle: twenty times in ten days the model found papers, asked to read
+    /// one back, and was told no — every time with the record sitting safely in
+    /// durable memory. A small, honest slice with a note beats a closed door.
+    #[test]
+    fn a_recall_below_the_floor_is_bounded_not_refused() {
+        // 2.5% of the turn left: the old rule refused here.
+        let tight = TurnRemaining::new(195_000, 200_000);
+        let cap = recall_cap_for_budget(Some(tight));
+        assert!(
+            cap >= RECALL_FLOOR_CHARS,
+            "a floor-sized slice is always served, got {cap}"
+        );
+        assert!(
+            cap < RECALL_BY_ID_MAX_CHARS,
+            "and it is a slice, not the whole ceiling"
+        );
+        let note =
+            recall_budget_note(Some(tight)).expect("a tight turn says why the slice is small");
+        assert!(note.contains("2%") || note.contains("3%"), "{note}");
+        assert!(
+            note.contains("durab"),
+            "the note reminds that nothing is lost: {note}"
+        );
+        // Plenty of room: no note, full quarter-share as before.
+        assert!(recall_budget_note(Some(TurnRemaining::new(10_000, 200_000))).is_none());
+    }
+
     #[test]
     fn a_recall_is_sized_by_what_the_turn_has_left() {
         // No budget context (slash command, test): unchanged behaviour.
-        assert_eq!(recall_cap_for_budget(None), Ok(RECALL_BY_ID_MAX_CHARS));
+        assert_eq!(recall_cap_for_budget(None), RECALL_BY_ID_MAX_CHARS);
 
         // Fresh turn — plenty of room, so the flat ceiling still binds.
         let fresh = TurnRemaining::new(0, 200_000);
-        assert_eq!(
-            recall_cap_for_budget(Some(fresh)),
-            Ok(RECALL_BY_ID_MAX_CHARS)
-        );
+        assert_eq!(recall_cap_for_budget(Some(fresh)), RECALL_BY_ID_MAX_CHARS);
 
         // Half spent: 100k left, a quarter of that is 25k tokens = 100k chars,
         // still above the ceiling.
         let half = TurnRemaining::new(100_000, 200_000);
-        assert_eq!(
-            recall_cap_for_budget(Some(half)),
-            Ok(RECALL_BY_ID_MAX_CHARS)
-        );
+        assert_eq!(recall_cap_for_budget(Some(half)), RECALL_BY_ID_MAX_CHARS);
 
         // Tight but usable: 30k left -> 7.5k tokens -> 30k chars, under the
         // ceiling, so the budget is what binds.
         let tight = TurnRemaining::new(170_000, 200_000);
-        let cap = recall_cap_for_budget(Some(tight)).expect("15% left is still spendable");
+        let cap = recall_cap_for_budget(Some(tight));
         assert!(
             cap < RECALL_BY_ID_MAX_CHARS && cap > 0,
             "the budget must bind before the constant does: {cap}"
@@ -1703,15 +1737,11 @@ mod tests {
         // MOMENT, so the sequence decays instead of nine equal 64k bites.
         let total = 200_000_u64;
         let mut used = 60_000_u64; // tool block + the searches that came first
-        let mut refused_at = None;
         for call in 1..=9 {
-            match recall_cap_for_budget(Some(TurnRemaining::new(used, total))) {
-                Ok(cap) => used += (cap / prism_llm::CHARS_PER_TOKEN) as u64,
-                Err(_) => {
-                    refused_at = Some(call);
-                    break;
-                }
-            }
+            let cap = recall_cap_for_budget(Some(TurnRemaining::new(used, total)));
+            used += (cap / prism_llm::CHARS_PER_TOKEN) as u64;
+            // Never refused: every call gets at least the floor slice.
+            assert!(cap >= RECALL_FLOOR_CHARS, "call {call}: cap {cap}");
             assert!(
                 used < total,
                 "recall #{call} pushed the turn to {used}/{total} — the sequence \
@@ -1719,29 +1749,28 @@ mod tests {
             );
         }
         // With the flat ceiling every call took 64k chars (16k tokens) and the
-        // ninth landed past 200k. Now the turn either survives all nine or is
-        // told to stop before it can spend itself to death.
+        // ninth landed past 200k. Now the slices decay to the floor and the
+        // turn survives all nine — no call is ever refused.
         assert!(
             used < total,
             "nine budget-sized recalls must not exhaust the turn: {used}/{total}"
         );
-        assert!(
-            refused_at.is_none() || refused_at.is_some_and(|c| c > 1),
-            "the floor must not fire on the first call of a turn with 70% left"
-        );
     }
 
-    /// Past the floor the answer is not a smaller fetch, it is "stop fetching".
+    /// Past the floor the answer is a small slice WITH the reason attached —
+    /// actionable, so it is acted on rather than retried as a failure.
     #[test]
-    fn a_nearly_spent_turn_refuses_to_recall_and_says_why() {
+    fn a_nearly_spent_turn_gets_a_floor_slice_and_the_reason() {
         let spent = TurnRemaining::new(195_000, 200_000); // 2.5% left
-        let reason = recall_cap_for_budget(Some(spent))
-            .expect_err("at 2.5% left a full record would consume what is left");
-
-        // The refusal has to be actionable, or it is just a failure the model
-        // retries. Name the two facts it needs: nothing is lost, and what to do.
-        assert!(reason.contains("ALREADY stored"), "{reason}");
-        assert!(reason.contains("ingest"), "{reason}");
+        let cap = recall_cap_for_budget(Some(spent));
+        assert!(
+            (RECALL_FLOOR_CHARS..RECALL_BY_ID_MAX_CHARS).contains(&cap),
+            "a slice no smaller than the floor and never the whole ceiling: {cap}"
+        );
+        let note = recall_budget_note(Some(spent)).expect("a tight turn explains its slice");
+        // Name the two facts the model needs: nothing is lost, and what to do.
+        assert!(note.contains("stored durably"), "{note}");
+        assert!(note.contains("ingest"), "{note}");
     }
 
     #[tokio::test]

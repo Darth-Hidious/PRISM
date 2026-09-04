@@ -1453,6 +1453,8 @@ impl ItemAgent for OrchestratedAgent {
                 // denial itself arrives as a visible ToolCallResult.
                 let mut nested_emit = |event: AgentEvent| {
                     match &event {
+                        // Background-activity notices are the parent's to show.
+                        AgentEvent::Activity { .. } => {}
                         AgentEvent::TextDelta { text } => {
                             streamed_text.push_str(text);
                             return;
