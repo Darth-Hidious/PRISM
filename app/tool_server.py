@@ -8,6 +8,7 @@ to stdout.  Methods: list_tools, call_tool, set_session_id.
 """
 import json
 import os
+from pathlib import Path
 import sys
 
 # CRITICAL: this worker writes line-delimited JSON-RPC to stdout. Some tools
@@ -31,6 +32,23 @@ def _env_flag(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def hydrate_env_from_saved_api_keys() -> list[str]:
+    """Load `~/.prism/api_keys.json` (written by the TUI's API-key window) into
+    the environment, without overriding anything already exported. Returns
+    the names newly set, so the caller can say what changed."""
+    path = Path(os.environ.get("HOME", str(Path.home()))) / ".prism" / "api_keys.json"
+    try:
+        saved = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    loaded: list[str] = []
+    for name, value in sorted(saved.items()) if isinstance(saved, dict) else []:
+        if isinstance(value, str) and value and not os.environ.get(name):
+            os.environ[name] = value
+            loaded.append(name)
+    return loaded
 
 
 def _handle(state: dict, request: dict) -> dict:
@@ -89,6 +107,10 @@ def _handle(state: dict, request: dict) -> dict:
         # picks up new AND edited plugins. Session state is configured on a
         # module, not held by the registry, so it survives the swap.
         before = {t.name for t in registry.list_tools()}
+        # Keys the TUI saved since this process was spawned. The environment
+        # is fixed at spawn; a key pasted mid-session reached no tool until a
+        # restart. A shell export still outranks the saved file.
+        keys_loaded = hydrate_env_from_saved_api_keys()
         try:
             rebuilt, _, _ = build_full_registry(
                 enable_mcp=state["enable_mcp"],
@@ -102,6 +124,7 @@ def _handle(state: dict, request: dict) -> dict:
         after = {t.name for t in rebuilt.list_tools()}
         return {
             "status": "ok",
+            "keys_loaded": keys_loaded,
             "count": len(after),
             "added": sorted(after - before),
             "removed": sorted(before - after),
