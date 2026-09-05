@@ -241,14 +241,7 @@ class JobRunner:
         self.cache.write_provenance(cache_key, prov)
         self.cache.write_meta(
             cache_key,
-            {
-                "tool_name": tool_name,
-                "source_job_id": job_id,
-                "head": head,
-                "phase": _phase_from_input(input_payload),
-                "composition": _composition_from_input(input_payload),
-                "n_atoms": _n_atoms_from_input(input_payload),
-            },
+            _structure_meta(tool_name, job_id, head, input_payload, cif_text),
         )
         prov_ref = f"cache://{cache_key}/provenance.json"
         result["provenance_ref"] = prov_ref
@@ -344,6 +337,61 @@ def _phase_from_input(ip: dict[str, Any]) -> str | None:
         or ip.get("matrix_phase")
         or (ip.get("structure") or {}).get("phase")
     )
+
+
+def _formula_from_cif(cif_text: str | None) -> str | None:
+    """The chemical formula of the cell in `cif_text`, read off the cell
+    itself — the one thing every job has in hand. `None` when there is no
+    cell or it does not parse; never a guess."""
+    if not cif_text:
+        return None
+    try:
+        import io
+
+        from ase.io import read as ase_read
+
+        atoms = ase_read(io.StringIO(cif_text), format="cif")
+    except Exception:
+        return None
+    try:
+        formula = atoms.get_chemical_formula(mode="metal")
+    except Exception:
+        return None
+    return formula or None
+
+
+def _structure_meta(
+    tool_name: str,
+    job_id: str,
+    head: str,
+    input_payload: dict[str, Any],
+    cif_text: str | None,
+) -> dict[str, Any]:
+    """What the cache entry says about itself. Seen live 2026-09-05: a relaxed
+    100-atom cell listed as "unknown · unknown · unknown" because the input
+    was a cache reference and the meta carried no formula — the cell's own
+    formula and atom count are written whenever a cell exists."""
+    meta: dict[str, Any] = {
+        "tool_name": tool_name,
+        "source_job_id": job_id,
+        "head": head,
+        "phase": _phase_from_input(input_payload),
+        "composition": _composition_from_input(input_payload),
+        "n_atoms": _n_atoms_from_input(input_payload),
+    }
+    formula = _formula_from_cif(cif_text)
+    if formula:
+        meta["formula"] = formula
+        if meta["n_atoms"] is None:
+            try:
+                import io
+
+                from ase.io import read as ase_read
+
+                meta["n_atoms"] = len(ase_read(io.StringIO(cif_text), format="cif"))
+            except Exception:
+                pass
+    return meta
 
 
 def _n_atoms_from_input(ip: dict[str, Any]) -> int | None:
