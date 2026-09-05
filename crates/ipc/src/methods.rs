@@ -38,6 +38,11 @@ pub const INPUT_COMMAND: &str = "input.command";
 /// Server → backend: response to an approval prompt.
 pub const INPUT_PROMPT_RESPONSE: &str = "input.prompt_response";
 
+/// Server → backend: stop the running turn. Answers `{"status": "stopping"}`
+/// when a turn was running (its `ui.turn.complete` then carries
+/// `cancelled: true`) or `{"status": "idle"}` when none was.
+pub const TURN_CANCEL: &str = "turn.cancel";
+
 /// Backend → server: welcome payload emitted after `init` (version, tool count).
 pub const UI_WELCOME: &str = "ui.welcome";
 

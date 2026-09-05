@@ -129,6 +129,12 @@ pub struct ToolServerHandle {
     /// corruption, not a glitch. Pool lanes discard + respawn the child;
     /// bare-handle owners must spawn a replacement.
     desynchronized: Option<&'static str>,
+    /// True from the moment a request is written until its response is read.
+    /// A `call` future dropped in that window — the turn was stopped — never
+    /// reaches the error paths above, yet leaves the response owed on the
+    /// pipe exactly as a timeout does. The next call finds the flag and
+    /// refuses; [`ToolServerHandle::recover`] replaces the child.
+    response_owed: bool,
     /// How this child was spawned, kept so a desynchronized handle can replace
     /// it with an IDENTICAL one — see [`ToolServerHandle::recover`].
     origin: ToolServer,
@@ -192,6 +198,7 @@ impl ToolServer {
             stdin,
             stdout: BufReader::new(stdout),
             desynchronized: None,
+            response_owed: false,
             origin: self.clone(),
             clean_environment: clear_environment,
         })
@@ -219,6 +226,7 @@ impl ToolServerHandle {
         request: &Value,
         timeout_dur: Option<std::time::Duration>,
     ) -> Result<Value, PythonBridgeError> {
+        self.note_abandoned_call();
         if let Some(reason) = self.desynchronized {
             return Err(PythonBridgeError::Desynchronized { reason });
         }
@@ -236,6 +244,9 @@ impl ToolServerHandle {
             return Err(e.into());
         }
 
+        // From here until the response is read, dropping this future leaves
+        // the response owed — see `response_owed`.
+        self.response_owed = true;
         let mut response_line = String::new();
         let started = std::time::Instant::now();
         let read = self.stdout.read_line(&mut response_line);
@@ -245,6 +256,7 @@ impl ToolServerHandle {
             match tokio::time::timeout(slice, &mut read).await {
                 Ok(result) => break result,
                 Err(_elapsed) if timeout_dur.is_some() => {
+                    self.response_owed = false;
                     self.desynchronized =
                         Some("timed out with its response still owed on the pipe");
                     return Err(PythonBridgeError::Timeout(slice));
@@ -255,6 +267,7 @@ impl ToolServerHandle {
                 ),
             }
         };
+        self.response_owed = false;
         let bytes_read = match outcome {
             Err(e) => {
                 self.desynchronized = Some("failed mid-read");
@@ -300,6 +313,7 @@ impl ToolServerHandle {
     /// does NOT survive: the replacement is a new process, and an owner that
     /// bound a session id to the old child must bind it again.
     pub async fn recover(&mut self) -> Result<bool, PythonBridgeError> {
+        self.note_abandoned_call();
         if self.desynchronized.is_none() {
             return Ok(false);
         }
@@ -317,7 +331,20 @@ impl ToolServerHandle {
 
     #[must_use]
     pub fn is_desynchronized(&self) -> bool {
-        self.desynchronized.is_some()
+        self.desynchronized.is_some() || self.response_owed
+    }
+
+    /// A previous call's future was dropped between its write and its read:
+    /// the response is still owed, so the handle is desynchronized exactly as
+    /// a timeout would leave it. Recorded here, lazily, because a dropped
+    /// future runs no code of its own.
+    fn note_abandoned_call(&mut self) {
+        if self.response_owed {
+            self.response_owed = false;
+            self.desynchronized.get_or_insert(
+                "was abandoned mid-call (the turn was stopped with its response still owed on the pipe)",
+            );
+        }
     }
 
     /// List all available tools from the Python registry.
@@ -504,6 +531,83 @@ for line in sys.stdin:
             err.to_string().contains("timed out"),
             "the refusal must name the original fault: {err}"
         );
+        worker.shutdown().await.expect("shutdown worker");
+    }
+
+    /// A `call` future dropped between its write and its read — the human
+    /// stopped the turn — runs none of the error paths, yet leaves the
+    /// response owed on the pipe exactly as a timeout does. The handle must
+    /// refuse the next call rather than hand it the abandoned call's line,
+    /// and `recover` must replace the child.
+    #[tokio::test]
+    async fn an_abandoned_call_desynchronizes_the_handle_and_recover_replaces_it() {
+        let Some(python_bin) = python_executable() else {
+            eprintln!("SKIP: python3 not on PATH");
+            return;
+        };
+        let project = tempfile::tempdir().expect("temp project");
+        let app = project.path().join("app");
+        std::fs::create_dir_all(&app).expect("create app package");
+        std::fs::write(app.join("__init__.py"), "").expect("write package marker");
+        // Sleeps 1.5s per request, then echoes the request's token.
+        std::fs::write(
+            app.join("tool_server.py"),
+            r#"import json, sys, time
+for line in sys.stdin:
+    request = json.loads(line)
+    time.sleep(1.5)
+    sys.stdout.write(json.dumps({"result": {"token": request.get("args", {}).get("token")}}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .expect("write worker");
+
+        let server = ToolServer {
+            python_bin,
+            project_root: project.path().to_path_buf(),
+            env: BTreeMap::new(),
+        };
+        let mut worker = server.spawn().await.expect("spawn worker");
+
+        // The stop lands 100 ms into the call: the future is DROPPED, with no
+        // deadline of its own and no error path run.
+        let slow = serde_json::json!({
+            "method": "call_tool", "tool": "echo", "args": { "token": "caller-A" },
+        });
+        let abandoned =
+            tokio::time::timeout(std::time::Duration::from_millis(100), worker.call(&slow)).await;
+        assert!(abandoned.is_err(), "the 1.5s reply cannot beat the stop");
+        assert!(
+            worker.is_desynchronized(),
+            "caller A's response is still owed on the pipe"
+        );
+
+        // Caller B on the same handle: without the refusal this would read
+        // caller A's late {"token": "caller-A"} line as B's response.
+        let fast = serde_json::json!({
+            "method": "call_tool", "tool": "echo", "args": { "token": "caller-B" },
+        });
+        let err = worker
+            .call(&fast)
+            .await
+            .expect_err("an abandoned pipe must refuse further calls");
+        assert!(
+            matches!(err, PythonBridgeError::Desynchronized { .. }),
+            "got: {err}"
+        );
+        assert!(
+            err.to_string().contains("abandoned"),
+            "the refusal must name the original fault: {err}"
+        );
+
+        // Recovery replaces the child; the fresh one answers B with B's line.
+        assert!(
+            worker.recover().await.expect("respawn the worker"),
+            "an abandoned handle is actually replaced"
+        );
+        assert!(!worker.is_desynchronized());
+        let response = worker.call(&fast).await.expect("the fresh child answers");
+        assert_eq!(response["result"]["token"], "caller-B");
         worker.shutdown().await.expect("shutdown worker");
     }
 

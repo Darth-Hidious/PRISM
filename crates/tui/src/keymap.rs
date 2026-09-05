@@ -180,7 +180,12 @@ pub static KEYMAP: &[KeyBinding] = &[
     // ── Input editing ───────────────────────────────────────────────
     KeyBinding {
         keys: "Enter",
-        description: "Send the message",
+        description: "Send the message (while a turn runs: hold it until the turn ends)",
+        category: "Input editing",
+    },
+    KeyBinding {
+        keys: "Esc",
+        description: "While a turn runs: stop it (a held message is discarded first)",
         category: "Input editing",
     },
     KeyBinding {

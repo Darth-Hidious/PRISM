@@ -776,6 +776,10 @@ async fn finish_root_agent_run(
     };
     let (status, last_error) = match result {
         Ok(()) => (prism_provenance::AgentRunStatus::Completed, None),
+        Err(error) if error.is::<TurnCancelled>() => (
+            prism_provenance::AgentRunStatus::Cancelled,
+            Some(error.to_string()),
+        ),
         Err(error) => (
             prism_provenance::AgentRunStatus::Failed,
             Some(format!("{error:#}")),
@@ -784,6 +788,52 @@ async fn finish_root_agent_run(
     ledger
         .finish(run_id, status, metrics, last_error.as_deref())
         .await;
+}
+
+/// The turn was stopped by the human (`turn.cancel`) before it finished.
+///
+/// Carried as the turn's error so every record closes the way a failed
+/// turn's does — the run ledger row ends `cancelled`, not `running` — and so
+/// the protocol can tell a stop from a fault when it reports the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnCancelled;
+
+impl std::fmt::Display for TurnCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("turn stopped by the user")
+    }
+}
+
+impl std::error::Error for TurnCancelled {}
+
+/// Answer every tool call in `history` that has no result with `note`.
+///
+/// A turn stopped between the model's request and the tool's answer leaves
+/// the assistant message's `tool_calls` unanswered, and providers reject the
+/// next request outright when a call has no result. The note stands in the
+/// tool's place and says what happened, so the record stays honest and the
+/// next turn can be sent. Returns how many calls were closed.
+pub fn close_dangling_tool_calls(history: &mut Vec<ChatMessage>, note: &str) -> usize {
+    let answered: std::collections::HashSet<&str> = history
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    let dangling: Vec<String> = history
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .filter(|call| !answered.contains(call.id.as_str()))
+        .map(|call| call.id.clone())
+        .collect();
+    for id in &dangling {
+        history.push(ChatMessage {
+            role: "tool".to_string(),
+            content: Some(note.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.clone()),
+            reasoning_content: None,
+        });
+    }
+    dangling.len()
 }
 
 // ── Large-result handling ─────────────────────────────────
@@ -3309,6 +3359,59 @@ pub async fn run_turn(
     policy: Option<&mut prism_policy::PolicyEngine>,
     subagent_lanes: Option<&prism_python_bridge::ToolServerPool>,
 ) -> Result<()> {
+    run_turn_until(
+        None,
+        llm,
+        tool_server,
+        command_tool_runtime,
+        history,
+        tool_catalog,
+        config,
+        user_message,
+        task,
+        transcript,
+        hooks,
+        permissions,
+        live_permission_overrides,
+        scratchpad,
+        emit,
+        approval_rx,
+        policy,
+        subagent_lanes,
+    )
+    .await
+}
+
+/// [`run_turn`] that the human can stop.
+///
+/// A message on `cancel` drops the turn where it stands — the model's
+/// stream closes, a running tool is abandoned — and the turn returns
+/// `Err(TurnCancelled)` at once, with its run ledger row closed as
+/// `cancelled`. The caller owns what the drop leaves behind: an unanswered
+/// tool call in `history` ([`close_dangling_tool_calls`]) and a tool server
+/// that may still owe a response ([`ToolServerHandle::recover`]). `None`, or
+/// a sender that is dropped without sending, never stops anything.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_until(
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    llm: &LlmClient,
+    tool_server: &mut ToolServerHandle,
+    command_tool_runtime: &CommandToolRuntime,
+    history: &mut Vec<ChatMessage>,
+    tool_catalog: &ToolCatalog,
+    config: &AgentConfig,
+    user_message: &str,
+    task: Option<&crate::task::ResearchTaskContext>,
+    transcript: &mut TranscriptStore,
+    hooks: &HookRegistry,
+    permissions: &ToolPermissionContext,
+    live_permission_overrides: Option<SharedPermissionOverrides>,
+    scratchpad: &mut Scratchpad,
+    emit: &mut (dyn FnMut(AgentEvent) + Send),
+    approval_rx: Option<SharedApprovalReceiver>,
+    policy: Option<&mut prism_policy::PolicyEngine>,
+    subagent_lanes: Option<&prism_python_bridge::ToolServerPool>,
+) -> Result<()> {
     let session_id = crate::hooks::provenance_session_id();
     let run =
         prism_provenance::new_agent_run(&session_id, "agent", &agent_run_label(user_message), None);
@@ -3330,7 +3433,7 @@ pub async fn run_turn(
     );
     let result = match turn_skill_context {
         Ok(turn_skill_context) => {
-            crate::skills::with_turn_skill_context(
+            let turn = crate::skills::with_turn_skill_context(
                 turn_skill_context,
                 run_turn_inner(
                     llm,
@@ -3354,8 +3457,21 @@ pub async fn run_turn(
                     &run.session_id,
                     &mut run_metrics,
                 ),
-            )
-            .await
+            );
+            // Resolves only on an actual stop order. No handle, or a holder
+            // that went away without sending, lets the turn run to its end.
+            let stop = async move {
+                if let Some(cancel) = cancel
+                    && cancel.await.is_ok()
+                {
+                    return;
+                }
+                std::future::pending::<()>().await
+            };
+            tokio::select! {
+                result = turn => result,
+                () = stop => Err(anyhow::Error::new(TurnCancelled)),
+            }
         }
         Err(error) => {
             // Refuse before reprompting or model inference. In particular, do
@@ -6017,6 +6133,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_stopped_turn_closes_the_tool_calls_it_left_unanswered() {
+        // A turn stopped between the model's request and the tool's answer
+        // leaves a tool call with no result; the next request would be
+        // rejected for it. The note stands in the tool's place.
+        let call = |id: &str| prism_llm::ToolCallResponse {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: prism_llm::FunctionCall {
+                name: "prior_art_search".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut history = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("q".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![call("a"), call("b")]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some("done".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("a".to_string()),
+                reasoning_content: None,
+            },
+        ];
+        assert_eq!(close_dangling_tool_calls(&mut history, "stopped"), 1);
+        let last = history.last().unwrap();
+        assert_eq!(last.role, "tool");
+        assert_eq!(last.tool_call_id.as_deref(), Some("b"));
+        assert_eq!(last.content.as_deref(), Some("stopped"));
+        // Every call answered: nothing is added.
+        assert_eq!(close_dangling_tool_calls(&mut history, "stopped"), 0);
+        assert_eq!(history.len(), 4);
+    }
 
     #[tokio::test]
     async fn active_run_heartbeat_refreshes_until_stopped() {

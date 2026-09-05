@@ -867,20 +867,34 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
             2 => "⠹",
             _ => "⠸",
         };
+        // The wait names the key that ends it — only while that key would:
+        // once the stop is asked for, the row says so instead.
+        let wait = if app.stop_requested {
+            " stopping…"
+        } else if app.esc_stops_turn() {
+            " waiting for response… · Esc stop"
+        } else {
+            " waiting for response…"
+        };
         lines.push(Line::from(vec![
             Span::styled("◆ ", Style::default().fg(t.accent)),
             Span::styled(
                 spinner,
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" waiting for response…", Style::default().fg(t.system)),
+            Span::styled(wait, Style::default().fg(t.system)),
         ]));
     } else if app.is_waiting {
         // Streaming — show pulse
+        let pulse = if app.stop_requested {
+            "stopping…"
+        } else {
+            "…"
+        };
         lines.push(Line::from(vec![
             Span::styled("◆ ", Style::default().fg(t.accent)),
             Span::styled(
-                "…",
+                pulse,
                 Style::default()
                     .fg(t.accent)
                     .add_modifier(Modifier::SLOW_BLINK),
@@ -1309,7 +1323,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     // wrote: the text-flush event used to write "Ready" when a text segment
     // ended, which is exactly when a tool call begins, so the footer read
     // Ready for the whole of a running search.
-    let status = if app.is_waiting {
+    let status = if app.stop_requested {
+        "stopping"
+    } else if app.is_waiting {
         "busy"
     } else if app.turn_in_progress {
         "working"
@@ -1518,6 +1534,8 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     "tool approval pending…  (y allow · a allow all · n/Esc deny)".to_string()
                 }
+            } else if let Some(hint) = app.queue_hint() {
+                hint
             } else {
                 "type a message…  (press i to focus · ↵ send)".to_string()
             }

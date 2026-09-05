@@ -395,6 +395,13 @@ impl RealBackend {
         Ok(())
     }
 
+    /// Stop the running turn. The backend answers with `ui.turn.complete`
+    /// carrying `cancelled: true` once the turn has actually stopped; until
+    /// then the turn is still running and its events keep arriving.
+    pub fn cancel_turn(&mut self) -> Result<u64> {
+        self.send_request("turn.cancel", serde_json::json!({}))
+    }
+
     pub async fn recv(&mut self) -> Option<Value> {
         self.rx.recv().await
     }
@@ -431,6 +438,9 @@ pub struct FakeBackend {
     /// The marks that rode the last message — what a test reads to check
     /// what actually went on the wire.
     last_marks: Value,
+    /// Every request method sent, in order — what a test reads to check
+    /// that a key did (or did not) reach the backend.
+    requests: Vec<String>,
 }
 
 impl FakeBackend {
@@ -446,6 +456,7 @@ impl FakeBackend {
             scenario,
             session_id: "fake-session".to_string(),
             last_marks: Value::Null,
+            requests: Vec::new(),
         };
         backend.enqueue_startup();
         backend
@@ -454,6 +465,11 @@ impl FakeBackend {
     /// The marks field of the most recent `input.message`.
     pub fn last_marks(&self) -> &Value {
         &self.last_marks
+    }
+
+    /// The request methods sent so far, oldest first.
+    pub fn requests(&self) -> &[String] {
+        &self.requests
     }
 
     fn next_id(&mut self) -> u64 {
@@ -1015,6 +1031,7 @@ impl FakeBackend {
 
     pub fn send_message(&mut self, text: &str, marks: serde_json::Value) -> Result<u64> {
         let id = self.next_id();
+        self.requests.push("input.message".to_string());
         self.last_marks = marks;
         self.enqueue_response(text);
         Ok(id)
@@ -1022,12 +1039,14 @@ impl FakeBackend {
 
     pub fn send_command(&mut self, command: &str) -> Result<u64> {
         let id = self.next_id();
+        self.requests.push("input.command".to_string());
         self.enqueue_command_response(command);
         Ok(id)
     }
 
     pub fn request_artifacts(&mut self, _limit: u64) -> Result<u64> {
         let id = self.next_id();
+        self.requests.push("workspace.artifacts.list".to_string());
         self.notify(
             "ui.artifacts.list",
             serde_json::json!({
@@ -1040,6 +1059,7 @@ impl FakeBackend {
 
     pub fn fetch_artifact(&mut self, artifact_id: &str) -> Result<u64> {
         let id = self.next_id();
+        self.requests.push("workspace.artifact.fetch".to_string());
         self.notify(
             "ui.artifact.error",
             serde_json::json!({
@@ -1055,6 +1075,7 @@ impl FakeBackend {
     /// "loading" — mirroring [`Self::request_artifacts`].
     pub fn request_structures(&mut self, _limit: u64) -> Result<u64> {
         let id = self.next_id();
+        self.requests.push("workspace.structures.list".to_string());
         let structures = if self.scenario == FakeScenario::StructuresCache {
             serde_json::json!(fake_structure_rows())
         } else {
@@ -1075,6 +1096,7 @@ impl FakeBackend {
     /// not-found error.
     pub fn fetch_structure(&mut self, cache_key: &str) -> Result<u64> {
         let id = self.next_id();
+        self.requests.push("workspace.structure.fetch".to_string());
         if self.scenario == FakeScenario::StructuresCache && cache_key == FAKE_TIAL_CACHE_KEY {
             self.notify(
                 "ui.structure.fetched",
@@ -1103,8 +1125,18 @@ impl FakeBackend {
         // Enqueue the deterministic approval response based on the
         // user's decision (y/n/a).  This lets the TUI test the full
         // approval lifecycle: prompt → user key → backend response.
+        self.requests.push("input.prompt_response".to_string());
         self.enqueue_approval_response(response);
         Ok(())
+    }
+
+    /// Stop the running turn: the fake answers at once with the same
+    /// completion the real backend sends when a turn is stopped.
+    pub fn cancel_turn(&mut self) -> Result<u64> {
+        let id = self.next_id();
+        self.requests.push("turn.cancel".to_string());
+        self.notify("ui.turn.complete", serde_json::json!({ "cancelled": true }));
+        Ok(id)
     }
 
     pub async fn recv(&mut self) -> Option<Value> {
@@ -1193,6 +1225,16 @@ impl BackendHandle {
         }
     }
 
+    /// The request methods the fake backend received, oldest first —
+    /// test-only introspection.
+    #[must_use]
+    pub fn fake_requests(&self) -> Option<&[String]> {
+        match self {
+            Self::Fake(b) => Some(b.requests()),
+            _ => None,
+        }
+    }
+
     pub fn send_message(&mut self, text: &str, marks: serde_json::Value) -> Result<u64> {
         match self {
             Self::Real(b) => b.send_message(text, marks),
@@ -1246,6 +1288,15 @@ impl BackendHandle {
             Self::Real(b) => b.send_approval(response, tool_name),
             Self::Fake(b) => b.send_approval(response, tool_name),
             Self::Native(b) => b.send_approval(response, tool_name),
+        }
+    }
+
+    /// Stop the running turn (`turn.cancel`).
+    pub fn cancel_turn(&mut self) -> Result<u64> {
+        match self {
+            Self::Real(b) => b.cancel_turn(),
+            Self::Fake(b) => b.cancel_turn(),
+            Self::Native(b) => b.cancel_turn(),
         }
     }
 
@@ -1391,6 +1442,11 @@ impl NativeBackend {
             serde_json::json!({"response": response, "tool_name": tool_name}),
         )?;
         Ok(())
+    }
+
+    /// Stop the running turn — see [`RealBackend::cancel_turn`].
+    pub fn cancel_turn(&mut self) -> Result<u64> {
+        self.send_request("turn.cancel", serde_json::json!({}))
     }
 
     pub async fn recv(&mut self) -> Option<Value> {

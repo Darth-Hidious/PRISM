@@ -7204,6 +7204,14 @@ fn build_tool_card_content(
     (content.to_string(), Value::Object(Default::default()))
 }
 
+/// What a tool call stopped by the human reads as in the model's history.
+const CANCELLED_TOOL_NOTE: &str =
+    "stopped: the user ended this turn before the tool answered; nothing was recorded for it";
+
+/// Run one turn on its own task. `cancel_rx` is the human's stop order
+/// (`turn.cancel`): the turn ends at once, the runtime comes back intact, and
+/// the completion carries `cancelled: true`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent_turn(
     mut runtime: ServerRuntime,
     user_text: String,
@@ -7214,6 +7222,7 @@ fn spawn_agent_turn(
     slash_ctx: SlashCommandContext,
     approval_rx: agent_loop::SharedApprovalReceiver,
     live_permission_overrides: SharedPermissionOverrides,
+    cancel_rx: oneshot::Receiver<()>,
 ) -> oneshot::Receiver<ServerRuntime> {
     let (result_tx, result_rx) = oneshot::channel();
 
@@ -7247,7 +7256,8 @@ fn spawn_agent_turn(
 
         let turn_result = command_tools::with_platform_access(
             CommandToolPlatformAccess::VerifiedNodeOwner,
-            agent_loop::run_turn(
+            agent_loop::run_turn_until(
+                Some(cancel_rx),
                 &llm,
                 &mut runtime.tool_server,
                 &runtime.command_tool_runtime,
@@ -7375,6 +7385,54 @@ fn spawn_agent_turn(
                 // Session titles are a display concern: when the policy says
                 // one is due, kick it off detached so it never blocks a turn.
                 maybe_spawn_title_generation(&mut runtime);
+            }
+            Err(error) if error.is::<agent_loop::TurnCancelled>() => {
+                // The human stopped the turn. What the reader saw is what gets
+                // written down — the prose that had streamed is kept — and
+                // what the stop cut short is closed honestly: a tool call
+                // left without an answer gets the note in the tool's place,
+                // and a tool server abandoned mid-call (its response still
+                // owed on the pipe) is replaced rather than read out of step.
+                if let Some(block) = assistant.flush() {
+                    runtime
+                        .session_store
+                        .append_message("assistant", &block, "", "", None);
+                }
+                let closed = agent_loop::close_dangling_tool_calls(
+                    &mut runtime.history,
+                    CANCELLED_TOOL_NOTE,
+                );
+                match runtime.tool_server.recover().await {
+                    Ok(true) => {
+                        if let Some(session_id) =
+                            runtime.session_store.current_id().map(str::to_string)
+                        {
+                            sync_tool_server_session(&mut runtime.tool_server, &session_id).await;
+                        }
+                        tracing::warn!("replaced the tool server abandoned by a stopped turn");
+                    }
+                    Ok(false) => {}
+                    Err(spawn_error) => tracing::error!(
+                        error = %spawn_error,
+                        "tool server abandoned by a stopped turn could not be replaced"
+                    ),
+                }
+                persist_runtime_state(
+                    &runtime.session_store,
+                    runtime.session_mode,
+                    &runtime.permission_overrides,
+                    &runtime.plan_state,
+                );
+                emit_status_snapshot(
+                    config.auto_approve,
+                    &runtime.transcript,
+                    runtime.session_mode,
+                    &runtime.plan_state,
+                    &runtime.llm_config,
+                    &slash_ctx,
+                );
+                tracing::info!(closed_tool_calls = closed, "agent turn stopped by the user");
+                emit_notification("ui.turn.complete", json!({ "cancelled": true }));
             }
             Err(error) => {
                 tracing::error!(error = %error, "agent turn failed");
@@ -9370,6 +9428,9 @@ async fn run_server_core(
         policy_engine,
     });
     let mut pending_turn: Option<oneshot::Receiver<ServerRuntime>> = None;
+    // The running turn's stop order (`turn.cancel`). One sender per turn, so
+    // a stop that lands after its turn ended cannot stop the next one.
+    let mut turn_cancel: Option<oneshot::Sender<()>> = None;
     let mut deferred_updates: Vec<DeferredRuntimeUpdate> = Vec::new();
     // Queue of messages that arrived while a turn was in progress.
     // These are processed when the current turn completes.
@@ -9423,6 +9484,8 @@ async fn run_server_core(
                                 &rt.permission_overrides,
                             )
                             .await;
+                            let (cancel_tx, cancel_rx) = oneshot::channel();
+                            turn_cancel = Some(cancel_tx);
                             pending_turn = Some(spawn_agent_turn(
                                 rt,
                                 queued_text,
@@ -9433,6 +9496,7 @@ async fn run_server_core(
                                 slash_ctx.clone(),
                                 Arc::clone(&approval_rx),
                                 Arc::clone(&live_permission_overrides),
+                                cancel_rx,
                             ));
                         }
                     }
@@ -9618,6 +9682,8 @@ async fn run_server_core(
                     &bundle.permission_overrides,
                 )
                 .await;
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                turn_cancel = Some(cancel_tx);
                 pending_turn = Some(spawn_agent_turn(
                     bundle,
                     text.to_string(),
@@ -9628,7 +9694,22 @@ async fn run_server_core(
                     slash_ctx.clone(),
                     Arc::clone(&approval_rx),
                     Arc::clone(&live_permission_overrides),
+                    cancel_rx,
                 ));
+            }
+
+            "turn.cancel" => {
+                // The human takes the turn back. Only a running turn can be
+                // stopped, and only through its own sender: a stop that lands
+                // after the turn ended answers `idle` and touches nothing.
+                let stopping = turn_active
+                    && turn_cancel
+                        .take()
+                        .is_some_and(|cancel| cancel.send(()).is_ok());
+                emit_response(
+                    id,
+                    json!({ "status": if stopping { "stopping" } else { "idle" } }),
+                );
             }
 
             "input.command" => {
@@ -9723,6 +9804,8 @@ async fn run_server_core(
                     &bundle.permission_overrides,
                 )
                 .await;
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                turn_cancel = Some(cancel_tx);
                 pending_turn = Some(spawn_agent_turn(
                     bundle,
                     text,
@@ -9733,6 +9816,7 @@ async fn run_server_core(
                     slash_ctx.clone(),
                     Arc::clone(&approval_rx),
                     Arc::clone(&live_permission_overrides),
+                    cancel_rx,
                 ));
             }
 

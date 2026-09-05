@@ -882,6 +882,15 @@ pub struct App {
     /// True from dispatch until the authoritative `ui.turn.complete` event.
     /// Unlike `is_waiting`, streaming deltas do not clear this lifecycle bit.
     pub(crate) turn_in_progress: bool,
+    /// Messages sent while a turn was running, oldest first. Held HERE, not
+    /// on the backend: the backend parks a mid-turn message silently and
+    /// answers `ok`, so the transcript used to show it as sent while it was
+    /// waiting. Dispatched in order when the turn ends; Esc in the prompt
+    /// discards them.
+    pub(crate) queued_messages: Vec<String>,
+    /// True from `turn.cancel` until the backend confirms the turn ended.
+    /// The footer pill reads "stopping" while set.
+    pub(crate) stop_requested: bool,
     pub approval_pending: Option<(String, String)>,
     /// Open tasks for a human — licences, accounts, subscriptions the agent
     /// hit and cannot obtain. One per source; the palette entry "Needs a
@@ -1183,10 +1192,15 @@ prism login --sso-domain <your-email-domain>\n  \
 prism login --sso-provider-id <connection id>   (several connections, or none registered for the domain)\n\
 Then restart the TUI. The token that comes back is the same one a passwordless login yields.";
 
+/// The prompt's resting hint.
+const PROMPT_PLACEHOLDER: &str = "Type a message... (Enter=send, /help, Ctrl-C=quit)";
+/// The prompt's hint while one message is held for the end of the turn.
+const QUEUED_PLACEHOLDER: &str = "queued: sends when this turn ends · Esc discard";
+
 impl App {
     pub fn new(backend: BackendHandle) -> Self {
         let mut input = TextArea::default();
-        input.set_placeholder_text("Type a message... (Enter=send, /help, Ctrl-C=quit)");
+        input.set_placeholder_text(PROMPT_PLACEHOLDER);
 
         Self {
             backend,
@@ -1203,6 +1217,8 @@ impl App {
             turn_cost: 0.0,
             is_waiting: false,
             turn_in_progress: false,
+            queued_messages: Vec::new(),
+            stop_requested: false,
             approval_pending: None,
             blockers: Vec::new(),
             needs_human_modal: None,
@@ -2282,13 +2298,14 @@ impl App {
     fn handle_input_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                // Submit the message
+                // Submit the message — or, while a turn runs, hold it (see
+                // `send_message`). Either way the box is cleared and its hint
+                // says which happened.
                 let text = self.input.lines().join("\n");
                 if !text.trim().is_empty() {
                     self.send_message(&text);
                     self.input = TextArea::default();
-                    self.input
-                        .set_placeholder_text("Type a message... (Enter=send, /help, Ctrl-C=quit)");
+                    self.refresh_prompt_placeholder();
                 }
             }
             _ => {
@@ -2364,10 +2381,74 @@ impl App {
                 self.input.move_cursor(CursorMove::End);
             }
             KeyCode::Esc => {
-                self.focus = Focus::Chat;
+                // Esc backs out of the newest thing first: a held message,
+                // then the running turn. Idle, it goes to the transcript.
+                if !self.queued_messages.is_empty() {
+                    self.discard_queued_messages();
+                } else if self.esc_stops_turn() {
+                    self.stop_turn();
+                } else if !self.turn_in_progress {
+                    self.focus = Focus::Chat;
+                }
+                // A stop already requested: nothing more to ask for.
             }
             _ => {}
         }
+    }
+
+    /// Whether Esc, pressed now in the prompt, stops the turn — the one
+    /// condition the key handler and the wait row's hint both read, so the
+    /// hint is never shown for a key that would do something else.
+    pub(crate) fn esc_stops_turn(&self) -> bool {
+        self.focus == Focus::Input
+            && self.turn_in_progress
+            && self.queued_messages.is_empty()
+            && !self.stop_requested
+    }
+
+    /// Ask the backend to stop the running turn. The pill reads "stopping"
+    /// until `ui.turn.complete` confirms; pressing again meanwhile asks
+    /// nothing twice.
+    fn stop_turn(&mut self) {
+        if self.stop_requested {
+            return;
+        }
+        match self.backend.cancel_turn() {
+            Ok(_) => self.stop_requested = true,
+            Err(error) => self.toast(format!("could not stop the turn: {error}"), ToastKind::Err),
+        }
+    }
+
+    /// Drop the messages held for the end of the turn.
+    fn discard_queued_messages(&mut self) {
+        let n = self.queued_messages.len();
+        self.queued_messages.clear();
+        self.refresh_prompt_placeholder();
+        let note = if n == 1 {
+            "held message discarded".to_string()
+        } else {
+            format!("{n} held messages discarded")
+        };
+        self.toast(note, ToastKind::Info);
+    }
+
+    /// The prompt's hint while messages are held, if any are.
+    pub(crate) fn queue_hint(&self) -> Option<String> {
+        match self.queued_messages.len() {
+            0 => None,
+            1 => Some(QUEUED_PLACEHOLDER.to_string()),
+            n => Some(format!(
+                "{n} queued: send when this turn ends · Esc discard"
+            )),
+        }
+    }
+
+    /// Make the empty prompt say what a message typed now will do.
+    fn refresh_prompt_placeholder(&mut self) {
+        let hint = self
+            .queue_hint()
+            .unwrap_or_else(|| PROMPT_PLACEHOLDER.to_string());
+        self.input.set_placeholder_text(hint);
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) {
@@ -4391,6 +4472,9 @@ impl App {
         // at are gone with it, and a mark surviving into a new session would
         // hand the model a handle from a conversation it cannot see.
         self.marks.clear();
+        // A message held for a session that is gone must not open the new one.
+        self.queued_messages.clear();
+        self.refresh_prompt_placeholder();
         self.structure_views.clear();
         self.source_records.clear();
         self.session_id = None;
@@ -6073,6 +6157,16 @@ impl App {
             return;
         }
 
+        // A turn is running: hold the message here rather than park it on the
+        // backend, which answers `ok` and says nothing more, so the transcript
+        // showed a bubble for a message that had not gone out. It goes out,
+        // in order, when the turn ends (`complete_turn`); Esc discards it.
+        if self.turn_in_progress {
+            self.queued_messages.push(trimmed.to_string());
+            self.refresh_prompt_placeholder();
+            return;
+        }
+
         self.push_user(trimmed);
 
         // Derive a session title from the first real user message (opencode-style),
@@ -6125,6 +6219,40 @@ impl App {
         self.first_text_time = None;
         self.last_token_time = None;
         self.tokens_per_sec = 0.0;
+    }
+
+    /// The authoritative end of a turn — `ui.turn.complete`, whether the
+    /// model finished or the human stopped it.
+    fn complete_turn(&mut self) {
+        self.clear_thinking_pulse();
+        self.is_waiting = false;
+        self.turn_in_progress = false;
+        self.stop_requested = false;
+        self.status_text = "Ready".to_string();
+        // Turn boundary — cheap-poll the credit balance next frame.
+        self.needs_credits_refresh = true;
+        self.schedule_artifact_refresh(self.artifact_policy.refresh_debounce);
+        if self.artifact_fetch_pending.is_some() && self.view.open {
+            self.artifact_fetch_retry_at =
+                Some(std::time::Instant::now() + self.artifact_policy.refresh_debounce);
+        }
+        // Structures the agent touched this turn surface here.
+        self.schedule_structure_refresh(self.structure_policy.refresh_debounce);
+        if self.structure_fetch_key.is_some() && self.view.open {
+            self.structure_fetch_retry_at =
+                Some(std::time::Instant::now() + self.structure_policy.refresh_debounce);
+        }
+        // A login/logout turn just finished — refresh account status.
+        if self.account.busy {
+            self.account.busy = false;
+            self.account.status = Self::read_account_status();
+        }
+        // Held messages go out now, in order. The first starts a turn; the
+        // rest are held again by `send_message` until that one ends.
+        for text in std::mem::take(&mut self.queued_messages) {
+            self.send_message(&text);
+        }
+        self.refresh_prompt_placeholder();
     }
 
     /// Handle an agent backend JSON-RPC message.
@@ -6894,29 +7022,12 @@ impl App {
                 self.turn_cost = turn_cost;
                 self.session_cost = session_cost;
             }
-            AgentMsg::TurnComplete => {
-                self.clear_thinking_pulse();
-                self.is_waiting = false;
-                self.turn_in_progress = false;
-                self.status_text = "Ready".to_string();
-                // Turn boundary — cheap-poll the credit balance next frame.
-                self.needs_credits_refresh = true;
-                self.schedule_artifact_refresh(self.artifact_policy.refresh_debounce);
-                if self.artifact_fetch_pending.is_some() && self.view.open {
-                    self.artifact_fetch_retry_at =
-                        Some(std::time::Instant::now() + self.artifact_policy.refresh_debounce);
-                }
-                // Structures the agent touched this turn surface here.
-                self.schedule_structure_refresh(self.structure_policy.refresh_debounce);
-                if self.structure_fetch_key.is_some() && self.view.open {
-                    self.structure_fetch_retry_at =
-                        Some(std::time::Instant::now() + self.structure_policy.refresh_debounce);
-                }
-                // A login/logout turn just finished — refresh account status.
-                if self.account.busy {
-                    self.account.busy = false;
-                    self.account.status = Self::read_account_status();
-                }
+            AgentMsg::TurnComplete => self.complete_turn(),
+            AgentMsg::TurnCancelled => {
+                // The human took the turn back. The transcript records it the
+                // way it records an approval outcome: as a system line.
+                self.push_system("[turn stopped]");
+                self.complete_turn();
             }
             AgentMsg::View { title, tabs } => {
                 self.artifact_fetch_pending = None;
@@ -6982,6 +7093,7 @@ impl App {
                 // A failed turn must not leave a bogus throughput reading.
                 self.is_waiting = false;
                 self.turn_in_progress = false;
+                self.stop_requested = false;
                 self.is_thinking = false;
                 self.status_text = "Ready".to_string();
                 self.reset_stream_metrics();
@@ -6990,6 +7102,7 @@ impl App {
                 self.push_error(&e);
                 self.is_waiting = false;
                 self.turn_in_progress = false;
+                self.stop_requested = false;
                 self.is_thinking = false;
                 self.status_text = "Ready".to_string();
                 self.reset_stream_metrics();
@@ -9624,6 +9737,180 @@ mod tests {
         );
     }
 
+    /// Every row of a 140x30 frame joined with newlines.
+    fn frame_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How many times the fake backend received `method`.
+    fn sent(app: &App, method: &str) -> usize {
+        app.backend
+            .fake_requests()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == method)
+            .count()
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn esc_in_the_prompt_stops_the_running_turn() {
+        // Finding 12: the only key that ended anything was Ctrl-C, and it
+        // quit. Esc in the prompt while a turn runs asks the backend to stop
+        // it; the pill says so until the backend confirms.
+        let mut app = fresh();
+        app.send_message("what is its density?");
+        assert!(app.turn_in_progress);
+        assert_eq!(app.focus, Focus::Input);
+        assert!(
+            frame_text(&app).contains("waiting for response… · Esc stop"),
+            "the wait names the key that ends it:\n{}",
+            frame_text(&app)
+        );
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            sent(&app, "turn.cancel"),
+            1,
+            "{:?}",
+            app.backend.fake_requests()
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Input,
+            "stopping is not leaving the prompt"
+        );
+        let footer = footer_row(&app);
+        assert!(footer.contains(" stopping "), "{footer:?}");
+        let frame = frame_text(&app);
+        assert!(
+            !frame.contains("Esc stop"),
+            "a key that has been pressed is not offered again:\n{frame}"
+        );
+        // A second Esc does not ask twice.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(sent(&app, "turn.cancel"), 1);
+
+        // The backend confirms: the turn is over and the transcript says why.
+        app.apply_agent_msg(AgentMsg::TurnCancelled);
+        assert!(!app.turn_in_progress);
+        assert!(!app.stop_requested);
+        assert!(footer_row(&app).contains("Ready"), "{:?}", footer_row(&app));
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|m| m.text.contains("turn stopped")),
+            "{:?}",
+            app.messages.last()
+        );
+
+        // Idle, Esc is still the way to the transcript.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(sent(&app, "turn.cancel"), 1, "idle Esc stops nothing");
+    }
+
+    #[test]
+    fn a_message_sent_mid_turn_is_held_until_the_turn_ends() {
+        // Finding 12: a mid-turn Enter was queued on the backend, which said
+        // `ok` and nothing else, while the TUI drew the bubble as sent.
+        let mut app = fresh();
+        app.send_message("what is its density?");
+        let bubbles = app.messages.len();
+        assert_eq!(sent(&app, "input.message"), 1);
+
+        type_text(&mut app, "and now?");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.messages.len(),
+            bubbles,
+            "no bubble for a message that has not gone out"
+        );
+        assert_eq!(sent(&app, "input.message"), 1, "held, not dispatched");
+        assert_eq!(app.queued_messages, vec!["and now?".to_string()]);
+        assert!(app.input.lines().join("").is_empty(), "the box is cleared");
+        assert!(
+            app.input.placeholder_text().contains("queued"),
+            "{:?}",
+            app.input.placeholder_text()
+        );
+        assert!(
+            frame_text(&app).contains("queued: sends when this turn ends · Esc discard"),
+            "{}",
+            frame_text(&app)
+        );
+        // Looking at the transcript instead, the prompt still says so.
+        app.focus = Focus::Chat;
+        assert!(
+            frame_text(&app).contains("queued: sends when this turn ends"),
+            "{}",
+            frame_text(&app)
+        );
+        app.focus = Focus::Input;
+
+        app.apply_agent_msg(AgentMsg::TurnComplete);
+        assert_eq!(
+            sent(&app, "input.message"),
+            2,
+            "dispatched when the turn ended"
+        );
+        assert_eq!(app.messages.len(), bubbles + 1);
+        assert_eq!(app.messages.last().unwrap().text, "and now?");
+        assert!(
+            app.turn_in_progress,
+            "the held message is a turn of its own"
+        );
+        assert!(app.queued_messages.is_empty());
+        assert!(!app.input.placeholder_text().contains("queued"));
+
+        app.apply_agent_msg(AgentMsg::TurnComplete);
+        assert_eq!(sent(&app, "input.message"), 2, "dispatched exactly once");
+    }
+
+    #[test]
+    fn esc_discards_a_held_message_before_it_stops_the_turn() {
+        // Esc backs out of the newest thing first: a held message, then the
+        // turn itself.
+        let mut app = fresh();
+        app.send_message("what is its density?");
+        type_text(&mut app, "and now?");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.queued_messages.len(), 1);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.queued_messages.is_empty());
+        assert_eq!(
+            sent(&app, "turn.cancel"),
+            0,
+            "the first Esc discards; it does not stop"
+        );
+        assert!(!app.input.placeholder_text().contains("queued"));
+        assert_eq!(app.focus, Focus::Input);
+
+        app.apply_agent_msg(AgentMsg::TurnComplete);
+        assert_eq!(
+            sent(&app, "input.message"),
+            1,
+            "a discarded message is never sent"
+        );
+    }
+
     /// The last row of a 140x20 frame, content column only (the sidebar's
     /// divider and everything right of it are not the footer).
     fn footer_row(app: &App) -> String {
@@ -10205,7 +10492,9 @@ mod tests {
             "the marked set must ride its own field"
         );
         // Unmarking reaches the agent as an EMPTY set, which is what makes
-        // the slot replaceable rather than a history of prefixes.
+        // the slot replaceable rather than a history of prefixes. (The first
+        // turn ends first: a message sent mid-turn is held, not dispatched.)
+        app.apply_agent_msg(AgentMsg::TurnComplete);
         app.toggle_mark_for_panel();
         app.send_message("and now?");
         assert_eq!(

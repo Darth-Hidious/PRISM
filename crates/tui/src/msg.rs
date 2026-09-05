@@ -181,6 +181,9 @@ pub enum AgentMsg {
     TextFlush,
     /// `ui.turn.complete` — the agent finished a full turn.
     TurnComplete,
+    /// `ui.turn.complete` with `cancelled: true` — the turn ended because
+    /// the human stopped it (`turn.cancel`), not because the model finished.
+    TurnCancelled,
 
     // ── Tool lifecycle ───────────────────────────────────────────────
     /// `ui.tool.start` — a tool call began.
@@ -744,7 +747,13 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
                 .to_string(),
         ),
         "ui.text.flush" => AgentMsg::TextFlush,
-        "ui.turn.complete" => AgentMsg::TurnComplete,
+        "ui.turn.complete" => {
+            if params.get("cancelled").and_then(Value::as_bool) == Some(true) {
+                AgentMsg::TurnCancelled
+            } else {
+                AgentMsg::TurnComplete
+            }
+        }
 
         // ── Tool lifecycle ───────────────────────────────────────────
         "ui.tool.start" => AgentMsg::ToolStart {
