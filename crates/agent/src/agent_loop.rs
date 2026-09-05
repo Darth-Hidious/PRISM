@@ -826,6 +826,36 @@ fn raw_for_card(content: &str, raw: &str) -> Option<String> {
     (content != raw).then(|| raw.to_string())
 }
 
+/// Whether the turn's wall-clock deadline has passed.
+fn deadline_reached(deadline_epoch_ms: Option<u64>, now_epoch_ms: u64) -> bool {
+    deadline_epoch_ms.is_some_and(|deadline| now_epoch_ms >= deadline)
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The instruction the model receives once the deadline has passed: answer
+/// now from what was found, say what was not searched, no more tool calls.
+fn synthesis_now_message(minutes_used: u64) -> ChatMessage {
+    ChatMessage {
+        role: "system".to_string(),
+        content: Some(format!(
+            "TIME BUDGET REACHED after {minutes_used} min. Synthesise the answer NOW from what \
+             has been found: state the findings with their citations (DOI, database id, \
+             source), then list what was not searched or is still unanswered as open items. \
+             No more tool calls this turn — none are offered. An honest partial answer with \
+             open items beats no answer."
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }
+}
+
 /// Announce every `needs_human` item in a tool result that has not been
 /// announced this session; returns how many were. An item is a task only if it
 /// names a source and a place to go — a wall with no door is just an error.
@@ -3552,7 +3582,28 @@ pub(crate) async fn run_turn_inner(
 
     // ── 2. TAOR iteration loop ────────────────────────────────────
     let iteration_cap = iteration_cap(config.max_iterations);
+    let turn_started = Instant::now();
+    let mut deadline_announced = false;
     for iteration in 0..iteration_cap {
+        // ── h0. The clock ──────────────────────────────────────
+        // A research turn that keeps finding tools to call never reaches the
+        // step cap in any useful time (measured: 59 calls in 15 min, killed
+        // from outside with no answer). Past the deadline the model is told
+        // once to synthesise, and this round and every later one offers no
+        // tools, so what was found becomes an answer.
+        let budget_exhausted = deadline_reached(config.turn_deadline_epoch_ms, now_epoch_ms());
+        if budget_exhausted && !deadline_announced {
+            deadline_announced = true;
+            let minutes = turn_started.elapsed().as_secs() / 60;
+            emit(AgentEvent::Activity {
+                id: "time_budget".to_string(),
+                text: format!(
+                    "time budget reached ({minutes} min) — synthesising from what was found; no more tool calls"
+                ),
+                done: false,
+            });
+            history.push(synthesis_now_message(minutes));
+        }
         // ── 2a. Budget check ──────────────────────────────────────
         if let Some(warning) = transcript.budget_warning() {
             emit(AgentEvent::TextDelta {
@@ -3650,10 +3701,16 @@ pub(crate) async fn run_turn_inner(
                 apply_tool_tier(fallback.definitions, &pinned_tools, config.core_tools_only);
         }
 
+        if budget_exhausted {
+            relevant_tools.clear();
+        }
         let mut capability_menu = influence_meta
             .is_none()
             .then(|| capability_menu_for_request(tool_catalog, &relevant_tools))
             .flatten();
+        if budget_exhausted {
+            capability_menu = None;
+        }
         let mut messages = if influence_meta.is_some() {
             influence_messages
         } else {
@@ -5963,6 +6020,28 @@ mod tests {
         assert!(tool_evidence_requires_success("apply_patch"));
         assert!(!tool_evidence_requires_success("execute_bash"));
         assert!(!tool_evidence_requires_success("recall"));
+    }
+
+    /// Measured 2026-09-05: a depth-1 research run made 59 tool calls in 15
+    /// minutes and was killed from outside with no answer at all — the loop
+    /// has a step cap and a stall detector, but no clock. Past the deadline
+    /// the model is told to synthesise from what it has and gets no tools.
+    #[test]
+    fn a_deadline_that_has_passed_forces_synthesis() {
+        assert!(!deadline_reached(None, 1_000), "no deadline, no forcing");
+        assert!(!deadline_reached(Some(2_000), 1_999));
+        assert!(deadline_reached(Some(2_000), 2_000));
+        assert!(deadline_reached(Some(2_000), 5_000));
+        let msg = synthesis_now_message(17);
+        assert_eq!(msg.role, "system");
+        let text = msg.content.clone().unwrap_or_default();
+        assert!(text.contains("17 min"), "{text}");
+        assert!(text.to_lowercase().contains("synthesise"), "{text}");
+        assert!(text.to_lowercase().contains("no more tool calls"), "{text}");
+        assert!(
+            text.to_lowercase().contains("not searched"),
+            "say what is open: {text}"
+        );
     }
 
     /// A tool that hit a licence or account wall says so in `needs_human`;

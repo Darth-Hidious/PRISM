@@ -602,6 +602,12 @@ enum Commands {
         /// Output as JSON (for piping to other tools / agents).
         #[arg(long)]
         json: bool,
+        /// Wall-clock budget in minutes. When it runs out the agent is told to
+        /// synthesise from what it has found and gets no more tools, so the
+        /// run ends with an answer and its open items. `0` = no clock (the
+        /// step cap still applies). Branches share the same deadline.
+        #[arg(long, default_value_t = 20)]
+        budget_min: u64,
     },
     /// Deploy a model or service to the hosted compute platform.
     Deploy {
@@ -4945,7 +4951,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Research { query, depth, json } => {
+        Commands::Research {
+            query,
+            depth,
+            json,
+            budget_min,
+        } => {
             // LOCAL. Research is not a separate system: it is this agent,
             // given a goal, with the DAG (`orchestrate_agents`), the whole
             // tool surface, and the notebook it always has.
@@ -4961,6 +4972,10 @@ async fn main() -> Result<()> {
                 .arg("backend")
                 .arg("--project-root")
                 .arg(&project_root)
+                .envs(
+                    turn_deadline_env(budget_min)
+                        .map(|ms| (prism_agent::types::TURN_DEADLINE_ENV, ms.to_string())),
+                )
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 // Kept, not discarded: a backend that panics says why HERE,
@@ -6876,6 +6891,19 @@ pub(crate) fn build_llm_config(
         &primary,
     );
     Ok(primary)
+}
+
+/// The absolute deadline `prism research --budget-min` hands its backend, as
+/// epoch milliseconds; `0` minutes means no clock.
+fn turn_deadline_env(budget_min: u64) -> Option<u64> {
+    if budget_min == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(now + budget_min * 60_000)
 }
 
 /// `[[fallbacks]]` from ~/.prism/config.toml resolved into complete client
@@ -19000,13 +19028,52 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Commands::Research { query, depth, json } => {
+            Commands::Research {
+                query,
+                depth,
+                json,
+                budget_min,
+            } => {
                 assert_eq!(query, "Find materials containing nickel");
                 assert_eq!(depth, 0);
                 assert!(json);
+                assert_eq!(budget_min, 20, "a research run has a clock by default");
             }
             _ => panic!("expected Research command"),
         }
+    }
+
+    #[test]
+    fn research_takes_a_time_budget_in_minutes() {
+        let cli = Cli::try_parse_from([
+            "prism",
+            "research",
+            "--depth",
+            "1",
+            "--budget-min",
+            "8",
+            "q",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Research {
+                budget_min, depth, ..
+            } => {
+                assert_eq!(budget_min, 8);
+                assert_eq!(depth, 1);
+            }
+            _ => panic!("expected Research command"),
+        }
+        assert_eq!(turn_deadline_env(0), None, "0 = no clock");
+        let d = turn_deadline_env(8).expect("a deadline");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            d > now + 7 * 60_000 && d <= now + 8 * 60_000 + 1_000,
+            "{d} vs {now}"
+        );
     }
 
     #[test]

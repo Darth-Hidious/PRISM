@@ -9188,6 +9188,8 @@ pub async fn build_agent_seed(
 
     let config = Arc::new(AgentConfig {
         system_prompt,
+        // `prism research --budget-min` sets this for the backend it spawns.
+        turn_deadline_epoch_ms: crate::types::turn_deadline_from_env(),
         ..Default::default()
     });
     let command_tool_runtime = CommandToolRuntime {

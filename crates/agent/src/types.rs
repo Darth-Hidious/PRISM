@@ -253,6 +253,13 @@ pub struct AgentConfig {
     /// in the one prompt, charged to the one budget.
     #[serde(default)]
     pub orchestration_forbidden: bool,
+    /// Wall-clock deadline for a turn, as epoch milliseconds. Once passed,
+    /// the model is told to synthesise from what it has and receives no
+    /// tools, so a research run ends with an answer instead of being killed
+    /// from outside with nothing. Branches inherit it (their config is a
+    /// clone of the parent's). `None` = no clock; the step cap still applies.
+    #[serde(default)]
+    pub turn_deadline_epoch_ms: Option<u64>,
 }
 
 impl Default for AgentConfig {
@@ -265,8 +272,25 @@ impl Default for AgentConfig {
             core_tools_only: false,
             subagent_depth: 0,
             orchestration_forbidden: false,
+            turn_deadline_epoch_ms: None,
         }
     }
+}
+
+/// The environment variable `prism research --budget-min` sets for the backend
+/// it spawns: an absolute deadline in epoch milliseconds.
+pub const TURN_DEADLINE_ENV: &str = "PRISM_TURN_DEADLINE_EPOCH_MS";
+
+/// Parse the deadline variable's value. Absent, blank, unparseable or zero
+/// means no deadline — a garbage value must never become a deadline of zero.
+pub fn parse_turn_deadline(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+}
+
+/// The deadline from this process's environment, if one was set.
+pub fn turn_deadline_from_env() -> Option<u64> {
+    parse_turn_deadline(std::env::var(TURN_DEADLINE_ENV).ok().as_deref())
 }
 
 #[cfg(test)]
@@ -341,5 +365,29 @@ mod tests {
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["type"], "TextDelta");
         assert_eq!(json["text"], "hello");
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// `prism research --budget-min` hands the backend an absolute deadline
+    /// through the environment; garbage or absence means no deadline — never
+    /// a deadline of zero that would end every turn before it starts.
+    #[test]
+    fn the_turn_deadline_comes_from_the_environment_or_not_at_all() {
+        assert_eq!(parse_turn_deadline(None), None);
+        assert_eq!(parse_turn_deadline(Some("")), None);
+        assert_eq!(parse_turn_deadline(Some("soon")), None);
+        assert_eq!(
+            parse_turn_deadline(Some("0")),
+            None,
+            "zero is not a deadline"
+        );
+        assert_eq!(
+            parse_turn_deadline(Some(" 1788600000000 ")),
+            Some(1_788_600_000_000)
+        );
     }
 }
