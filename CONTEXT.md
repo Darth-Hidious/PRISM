@@ -145,7 +145,8 @@ DONE `6730d420`: destructive words (rm/rmdir/delete/drop/…) no longer abort th
 DONE `1d86412c`: own inference does not fail — empty stream → one plain request + streaming retired; `[[fallbacks]]` in ~/.prism/config.toml tried on transport/5xx/429 (never on 4xx, never after partial text); switch announced in the activity strip. README documents it.
 DONE `68f85341`: balance refreshes itself after 2 idle min and says "stale" when a fetch failed; "Search sources & keys" opens on Semantic Scholar.
 DONE `b493e160`: `prism use fallback add|list|clear` (+ `/use fallback …`, palette "Add fallback model" form, "Fallback models", "Clear fallback models"); `use show` names the fallbacks.
-NEXT: model window lists fallbacks; SSO scope (Mirdyne provider exists in `prism login`; SAML/IdP is platform-side); bash.py `.git`/`.prism` deletion refusal — owner's call; CONTEXT.md ≤20 lines at session end.
+DONE `6d1fd1e6`: palette "Sign in with enterprise SSO" states `prism login --sso-domain` / `--sso-provider-id` (PRISM-side SAML exists; IdP/SAML connections are platform-side, outside this repo).
+NEXT: model window lists fallbacks; bash.py `.git`/`.prism` deletion refusal — owner's call; CONTEXT.md ≤20 lines at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
