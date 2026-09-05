@@ -11,7 +11,7 @@ expression: rendered
                                                                    │  2. tool lookup_structure ✓
   ✓ [YELLOW screening] lookup_structure: found MgB2 (mp-763) —     │      found MgB2 (mp-763) — P6/…
 P6/mmm, 3 atoms                                                    │
-    SOURCE   KIND OF… COUNT EVIDENCE           FETCHED             │
+    SOURCE   KIND OF… FOUND EVIDENCE           FETCHED             │
     Materia… crystal…     1 [YELLOW screening] 2026-09-02 14:10    │
 UTC                                                                │
     OQMD     crystal…     0 [YELLOW screening] 2026-09-02 14:10    │

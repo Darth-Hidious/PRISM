@@ -190,3 +190,28 @@ def test_the_eastern_branch_surfaces_what_a_human_must_do(monkeypatch):
     })
     out = search._prior_art_search(query="高温合金", source="eastern")
     assert out["needs_human"] == [task]
+
+
+def test_a_source_that_says_how_many_it_has_is_declared_with_its_total():
+    """Every source read "20" — the per-source cap — so the table could not
+    tell 20-of-20 from 20-of-2,123. When the engine reports how many the
+    database has, the row carries it as `total`."""
+    from app.tools.search import _declare_eastern_sources, _literature_search_impl
+
+    lit = _literature_search_impl.declare_sources({
+        "source_status": [
+            {"source": "openalex", "status": "ok", "count": 20, "available": 2123},
+            {"source": "arxiv", "status": "ok", "count": 20},
+        ]
+    })
+    by = {r["source"]: r for r in lit}
+    assert by["openalex"]["total"] == 2123
+    assert "total" not in by["arxiv"], "no total claimed when the source gave none"
+
+    east = _declare_eastern_sources({
+        "openalex:zh": "ok (20 of 43; language:zh; query in zh)",
+        "jstage": "ok (10 results); 2 kept after max_results trim",
+    })
+    by = {r["source"]: r for r in east}
+    assert by["openalex:zh"]["count"] == 20 and by["openalex:zh"]["total"] == 43
+    assert by["jstage"]["count"] == 10 and "total" not in by["jstage"]

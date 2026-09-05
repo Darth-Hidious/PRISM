@@ -247,16 +247,21 @@ def _declare_literature_sources(outcome: dict) -> list[dict]:
             record["cache_hit"] = bool(status.get("cache_hit"))
         if status.get("endpoint"):
             record["endpoint"] = status["endpoint"]
-        declared.append(
-            {
-                "source": status.get("source", "unknown"),
-                "kind": "peer-reviewed literature metadata",
-                "count": status.get("count", 0) if answered else None,
-                "fetched": fetched,
-                "status": state,
-                "record": record,
-            }
-        )
+        row = {
+            "source": status.get("source", "unknown"),
+            "kind": "peer-reviewed literature metadata",
+            "count": status.get("count", 0) if answered else None,
+            "fetched": fetched,
+            "status": state,
+            "record": record,
+        }
+        # How many the database HAS, when it said: the count is what came
+        # back under the per-source cap, and printed alone it reads as the
+        # whole (every source showed "20" — the cap, not the corpus).
+        total = status.get("available")
+        if isinstance(total, int) and total >= 0:
+            row["total"] = total
+        declared.append(row)
     return declared
 
 
@@ -273,15 +278,18 @@ def _declare_eastern_sources(status: dict) -> list[dict]:
     for name, line in (status or {}).items():
         line = str(line or "")
         if line.startswith("ok"):
-            m = re.match(r"ok \((\d+)", line)
-            rows.append({
+            m = re.match(r"ok \((\d+)(?: of (\d+))?", line)
+            row = {
                 "source": name,
                 "kind": "non-Western literature metadata",
                 "count": int(m.group(1)) if m else 0,
                 "fetched": fetched,
                 "status": "ok",
                 "record": {"status": "ok", "detail": line},
-            })
+            }
+            if m and m.group(2) is not None:
+                row["total"] = int(m.group(2))
+            rows.append(row)
             continue
         state = line.split(":", 1)[0].strip().lower()
         if state not in ("blocked", "skipped", "timeout", "error"):

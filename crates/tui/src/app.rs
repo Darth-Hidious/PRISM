@@ -1473,6 +1473,13 @@ impl App {
 
         // Esc closes the reference panel first: it is the newest thing on
         // screen, so it is what "go back" means while it is up.
+        if key.code == KeyCode::Enter
+            && let Some(id) = self.ref_panel.as_ref().map(|p| p.id.clone())
+            && let Some(url) = self.reference_url(&id)
+        {
+            self.open_in_browser(&url);
+            return;
+        }
         if key.code == KeyCode::Esc && self.ref_panel.is_some() {
             self.ref_panel = None;
             return;
@@ -5401,13 +5408,62 @@ impl App {
             .get(self.link_picker.selected)
             .cloned()
         {
-            self.push_system(&format!("Browser launch disabled; open manually: {url}"));
-            self.toast(
-                "browser launch disabled; URL shown in the transcript",
-                ToastKind::Info,
-            );
+            self.open_in_browser(&url);
         }
         self.link_picker.open = false;
+    }
+
+    /// Open a URL in the reader's browser. The owner reversed the earlier
+    /// "PRISM never opens a browser" rule on 2026-09-05: a scientist who sees
+    /// a DOI wants to click it. `PRISM_NO_BROWSER=1` keeps the old behaviour
+    /// (the URL is written to the transcript for manual opening), which is
+    /// also what tests and headless sessions get.
+    pub fn open_in_browser(&mut self, url: &str) {
+        if std::env::var("PRISM_NO_BROWSER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            self.push_system(&format!("Open in your browser: {url}"));
+            self.toast(
+                "URL written to the transcript (PRISM_NO_BROWSER=1)",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let (program, args) = browser_command(url);
+        match std::process::Command::new(program)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => {
+                self.push_system(&format!("[opened in your browser] {url}"));
+                let shown: String = url.chars().take(60).collect();
+                self.toast(format!("opened {shown}"), ToastKind::Ok);
+            }
+            Err(e) => {
+                self.push_system(&format!(
+                    "Could not open a browser ({e}); open manually: {url}"
+                ));
+                self.toast(
+                    "could not open a browser — URL is in the transcript",
+                    ToastKind::Warn,
+                );
+            }
+        }
+    }
+
+    /// The URL a reference stands for, when it can be opened: a DOI becomes
+    /// its doi.org page; a URL is itself.
+    pub fn reference_url(&self, id: &str) -> Option<String> {
+        if let Some(rest) = id.strip_prefix("doi:") {
+            return Some(format!("https://doi.org/{}", rest.trim()));
+        }
+        if id.starts_with("http://") || id.starts_with("https://") {
+            return Some(id.to_string());
+        }
+        None
     }
 
     /// Execute a catalog command by id. Reuses existing action paths so
@@ -6373,6 +6429,7 @@ impl App {
                 }
             }
             AgentMsg::TextDelta(text) => {
+                self.clear_thinking_pulse();
                 let now = std::time::Instant::now();
                 if self.first_token_time.is_none() {
                     self.first_token_time = Some(now);
@@ -6410,6 +6467,7 @@ impl App {
                 }
                 self.append_thinking_text(&text);
                 self.is_waiting = false;
+                self.pulse_thinking();
             }
             AgentMsg::TextFlush => {
                 // Ends a text segment, not the turn: no status word here.
@@ -6421,6 +6479,7 @@ impl App {
                 agent,
                 ..
             } => {
+                self.clear_thinking_pulse();
                 // `..` ignores call_id, preview, approval_required —
                 // current behavior only pushes a tool-start line.
                 // Sanitize tool_name and verb before formatting —
@@ -6601,6 +6660,7 @@ impl App {
                 self.session_cost = session_cost;
             }
             AgentMsg::TurnComplete => {
+                self.clear_thinking_pulse();
                 self.is_waiting = false;
                 self.turn_in_progress = false;
                 self.status_text = "Ready".to_string();
@@ -6981,6 +7041,36 @@ impl App {
 
     /// Append thinking/reasoning tokens to a separate thinking buffer.
     /// Rendered dimmed and collapsible.
+    /// The always-visible sign that the model is reasoning with reasoning
+    /// hidden: one strip entry with the running size and time, replaced on
+    /// every delta. The collapsed transcript line says the same thing, but
+    /// only to a reader looking at the tail.
+    fn pulse_thinking(&mut self) {
+        let chars = self
+            .messages
+            .last()
+            .filter(|m| matches!(m.kind, LineKind::Thinking))
+            .map(|m| m.text.chars().count())
+            .unwrap_or(0);
+        let secs = self
+            .first_token_time
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        self.activities.retain(|(k, _)| k != "thinking");
+        self.activities.push((
+            "thinking".to_string(),
+            format!(
+                "model reasoning… {chars} chars · {}:{:02} · Ctrl-T shows it",
+                secs / 60,
+                secs % 60
+            ),
+        ));
+    }
+
+    fn clear_thinking_pulse(&mut self) {
+        self.activities.retain(|(k, _)| k != "thinking");
+    }
+
     pub fn append_thinking_text(&mut self, delta: &str) {
         let clean = sanitize_for_render(delta);
         if let Some(last) = self.messages.last_mut()
@@ -7662,6 +7752,25 @@ fn fallback_add_command(form: &crate::form::Form) -> Result<String, &'static str
     Ok(build_slash_command(&args))
 }
 
+/// The launcher for a URL on this platform, as (program, arguments).
+pub fn browser_command(url: &str) -> (&'static str, Vec<String>) {
+    if cfg!(target_os = "macos") {
+        ("open", vec![url.to_string()])
+    } else if cfg!(target_os = "windows") {
+        (
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                url.to_string(),
+            ],
+        )
+    } else {
+        ("xdg-open", vec![url.to_string()])
+    }
+}
+
 fn node_up_command(form: &crate::form::Form) -> String {
     let mut args = vec!["node".to_string(), "up".to_string()];
     let name = form.text_value("name").trim().to_string();
@@ -8259,6 +8368,90 @@ mod tests {
             "the tab is labelled and active: {screen}"
         );
         assert!(screen.contains("RD-0120 preburner paper"), "{screen}");
+    }
+
+    /// "I can see the DOI but I cannot click it." A DOI reference resolves to
+    /// its doi.org page and Enter opens it; with the browser disabled the URL
+    /// goes to the transcript instead of nowhere.
+    #[test]
+    fn a_doi_on_screen_opens_its_page() {
+        let app = fresh();
+        assert_eq!(
+            app.reference_url("doi:10.1016/j.corsci.2017.08.015")
+                .as_deref(),
+            Some("https://doi.org/10.1016/j.corsci.2017.08.015")
+        );
+        assert_eq!(
+            app.reference_url("https://ntrs.nasa.gov/x").as_deref(),
+            Some("https://ntrs.nasa.gov/x")
+        );
+        assert_eq!(
+            app.reference_url("tool:web"),
+            None,
+            "only a DOI or a URL is openable"
+        );
+        let (program, args) = browser_command("https://doi.org/10.1/x");
+        assert!(!program.is_empty());
+        assert!(args.iter().any(|a| a == "https://doi.org/10.1/x"));
+
+        let mut app = fresh();
+        let _guard = env_guard("PRISM_NO_BROWSER", "1");
+        app.open_in_browser("https://doi.org/10.1/x");
+        let last = app
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(last.contains("https://doi.org/10.1/x"), "{last}");
+    }
+
+    struct EnvGuard(&'static str, Option<String>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.1.take() {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+    fn env_guard(key: &'static str, value: &str) -> EnvGuard {
+        let prev = std::env::var(key).ok();
+        unsafe { std::env::set_var(key, value) };
+        EnvGuard(key, prev)
+    }
+
+    /// A reader who had scrolled up saw a dead screen while the model reasoned
+    /// for minutes at 0.4 tok/s. The strip above the prompt says so, and stops
+    /// saying so the moment visible text arrives.
+    #[test]
+    fn hidden_reasoning_pulses_in_the_strip_until_text_arrives() {
+        let mut app = fresh();
+        app.apply_agent_msg(AgentMsg::ThinkingDelta(
+            "weighing the oxidiser-rich case".into(),
+        ));
+        app.apply_agent_msg(AgentMsg::ThinkingDelta(
+            " against hydrogen embrittlement".into(),
+        ));
+        let pulse: Vec<&(String, String)> = app
+            .activities
+            .iter()
+            .filter(|(k, _)| k == "thinking")
+            .collect();
+        assert_eq!(
+            pulse.len(),
+            1,
+            "one entry, replaced not appended: {:?}",
+            app.activities
+        );
+        assert!(pulse[0].1.contains("model reasoning…"), "{}", pulse[0].1);
+        assert!(pulse[0].1.contains("Ctrl-T"), "{}", pulse[0].1);
+        app.apply_agent_msg(AgentMsg::TextDelta("MCrAlY overlays".into()));
+        assert!(
+            !app.activities.iter().any(|(k, _)| k == "thinking"),
+            "cleared by visible text"
+        );
     }
 
     #[test]

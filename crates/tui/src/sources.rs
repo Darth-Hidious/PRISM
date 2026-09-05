@@ -22,6 +22,9 @@ pub struct SourceRow {
     pub source: String,
     pub kind: Option<String>,
     pub count: Option<u64>,
+    /// How many the database HAS, when it said; `count` is what came back
+    /// under the per-source cap.
+    pub total: Option<u64>,
     pub fetched: Option<String>,
     pub status: Option<String>,
     /// The tool's own record for this source, pretty-printed for the panel.
@@ -71,6 +74,7 @@ pub fn source_rows(data: Option<&Value>, seq: u64) -> Vec<SourceRow> {
                 source,
                 kind: clean(row.get("kind")),
                 count: row.get("count").and_then(Value::as_u64),
+                total: row.get("total").and_then(Value::as_u64),
                 fetched: clean(row.get("fetched")),
                 status: clean(row.get("status")),
                 record: sanitize_for_render(&record),
@@ -162,9 +166,15 @@ pub struct Layout {
     pub source: usize,
     pub kind: usize,
     pub evidence: usize,
+    /// Width of the FOUND column: wide enough for "20 of 2123" when the
+    /// screen allows, the bare count otherwise.
+    pub count: usize,
 }
 
-pub const COUNT_W: usize = 5;
+/// The FOUND column when there is room for "20 of 2123"; narrow screens
+/// fall back to [`COUNT_W_NARROW`] and show the bare count.
+pub const COUNT_W: usize = 10;
+pub const COUNT_W_NARROW: usize = 5;
 /// `2026-09-02 14:10 UTC` — a fetch time to the minute, zone said.
 pub const FETCHED_W: usize = 20;
 const FLOOR: usize = 8;
@@ -175,7 +185,11 @@ const MIN_INLINE_ORIGIN: usize = 24;
 #[must_use]
 pub fn layout(width: usize, badge: &str) -> Layout {
     let evidence = badge.width().max("EVIDENCE".len());
-    let fixed = COUNT_W + evidence + FETCHED_W + 4;
+    // "20 of 2123" needs ten columns; below ~88 columns that is paid for by
+    // the source and kind cells, which are already at their floor, so the
+    // narrow layout shows the bare count instead of overflowing the row.
+    let count = if width >= 88 { COUNT_W } else { COUNT_W_NARROW };
+    let fixed = count + evidence + FETCHED_W + 4;
     let free = width.saturating_sub(fixed).max(FLOOR * 2);
     let source = (free * 2 / 5).max(FLOOR);
     let kind = (free - source).max(FLOOR);
@@ -183,6 +197,7 @@ pub fn layout(width: usize, badge: &str) -> Layout {
         source,
         kind,
         evidence,
+        count,
     }
 }
 
@@ -213,12 +228,13 @@ pub fn fit(text: &str, w: usize) -> String {
 #[must_use]
 pub fn header_line(l: Layout) -> String {
     format!(
-        "{} {} {:>COUNT_W$} {} {}",
+        "{} {} {:>w$} {} {}",
         fit("SOURCE", l.source),
         fit("KIND OF DATA", l.kind),
-        "COUNT",
+        "FOUND",
         fit("EVIDENCE", l.evidence),
-        "FETCHED"
+        "FETCHED",
+        w = l.count
     )
 }
 
@@ -226,10 +242,12 @@ pub fn header_line(l: Layout) -> String {
 /// reference, and the rest of the line.
 #[must_use]
 pub fn row_cells(row: &SourceRow, badge: &str, l: Layout) -> (String, String) {
-    let count = row
-        .count
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "—".to_string());
+    let count = match (row.count, row.total) {
+        (Some(c), Some(t)) if t > c && l.count >= COUNT_W => Some(format!("{c} of {t}")),
+        (Some(c), _) => Some(c.to_string()),
+        (None, _) => None,
+    };
+    let count = count.unwrap_or_else(|| "—".to_string());
     let fetched = row
         .fetched
         .as_deref()
@@ -239,11 +257,12 @@ pub fn row_cells(row: &SourceRow, badge: &str, l: Layout) -> (String, String) {
     (
         fit(&row.source, l.source),
         format!(
-            " {} {:>COUNT_W$} {} {}",
+            " {} {:>w$} {} {}",
             fit(kind, l.kind),
-            fit(&count, COUNT_W).trim_end(),
+            fit(&count, l.count).trim_end(),
             fit(badge, l.evidence),
-            fetched
+            fetched,
+            w = l.count
         ),
     )
 }
@@ -357,6 +376,34 @@ pub fn descriptor_lines(row: &DescriptorRow, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// "What does twenty mean?" — every source printed the cap. With a total
+    /// the cell reads "20 of 2123"; without one it reads "20"; no answer "—".
+    #[test]
+    fn twenty_of_two_thousand_is_not_twenty() {
+        let rows = source_rows(
+            Some(&serde_json::json!({"sources": [
+                {"source": "openalex", "kind": "k", "count": 20, "total": 2123, "status": "ok"},
+                {"source": "arxiv", "kind": "k", "count": 20, "status": "ok"},
+                {"source": "chemrxiv", "kind": "k", "count": null, "status": "timeout"}
+            ]})),
+            1,
+        );
+        let l = layout(120, "[ORANGE research]");
+        let cell = |i: usize| {
+            let (left, right) = row_cells(&rows[i], "[ORANGE research]", l);
+            format!("{left}{right}")
+        };
+        assert!(cell(0).contains("20 of 2123"), "{}", cell(0));
+        assert!(
+            cell(1).contains(" 20 ") || cell(1).contains(" 20"),
+            "{}",
+            cell(1)
+        );
+        assert!(!cell(1).contains(" of "), "{}", cell(1));
+        assert!(cell(2).contains("—"), "{}", cell(2));
+        assert!(header_line(l).contains("FOUND"));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -432,16 +479,23 @@ mod tests {
             // bytes. Slicing bytes here panicked mid-ellipsis.
             // The header clips with "…" too at narrow widths, so its byte
             // offset is not its column offset either. Measure both in columns.
-            let count_col = header[..header.find("COUNT").unwrap()].width();
+            // The label sits right-aligned inside its field; the field starts
+            // COUNT_W minus the label's width before it.
+            let count_col =
+                header[..header.find("FOUND").unwrap()].width() + "FOUND".width() - l.count;
             let mut col = 0usize;
             let mut cell_at_count = String::new();
             for ch in line.chars() {
-                if col >= count_col && col < count_col + COUNT_W {
+                if col >= count_col && col < count_col + l.count {
                     cell_at_count.push(ch);
                 }
                 col += ch.to_string().width();
             }
-            assert_eq!(cell_at_count.trim(), "1", "{line:?}");
+            assert_eq!(
+                cell_at_count.trim(),
+                "1",
+                "{width}: header {header:?} row {line:?}"
+            );
             assert!(line.contains("2026-09-02 14:10 UTC"), "{line:?}");
         }
         let l = layout(64, "[YELLOW screening]");

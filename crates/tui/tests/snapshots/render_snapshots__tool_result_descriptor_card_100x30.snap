@@ -11,7 +11,7 @@ expression: rendered
                                                                    │  2. tool hea_descriptors ✓
   ✓ [YELLOW screening] hea_descriptors: CoCrFeMnNi:                │      CoCrFeMnNi: solid_solutio…
 solid_solution, VEC=8.0                                            │
-    SOURCE   KIND OF… COUNT EVIDENCE           FETCHED             │
+    SOURCE   KIND OF… FOUND EVIDENCE           FETCHED             │
     hea_des… compute…     — [YELLOW screening] not reported        │
     evidence [YELLOW screening]: computed by a cited method        │
     DESCRIPTOR             VALUE        UNIT                       │
