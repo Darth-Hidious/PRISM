@@ -1518,9 +1518,9 @@ fn summarize_manual_tool_result(
             let err_str = val.get("error").and_then(|v| v.as_str());
             if timed_out {
                 if let Some(code) = exit_code {
-                    return format!("{tool_name}: error — timed out (exit {code})");
+                    return format!("error — timed out (exit {code})");
                 }
-                return format!("{tool_name}: error — timed out");
+                return "error — timed out".to_string();
             }
             if let Some(code) = exit_code
                 && code != 0
@@ -1531,10 +1531,10 @@ fn summarize_manual_tool_result(
                         short_first_line(err)
                     );
                 }
-                return format!("{tool_name}: error — exit {code}");
+                return format!("error — exit {code}");
             }
             if let Some(err) = err_str {
-                return format!("{tool_name}: error — {}", short_first_line(err));
+                return format!("error — {}", short_first_line(err));
             }
         }
         let short = if content.chars().count() > 80 {
@@ -1542,7 +1542,7 @@ fn summarize_manual_tool_result(
         } else {
             content.to_string()
         };
-        return format!("{tool_name}: error — {short}");
+        return format!("error — {short}");
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(content) {
@@ -1553,16 +1553,16 @@ fn summarize_manual_tool_result(
                 .get("status")
                 .and_then(|item| item.as_str())
                 .unwrap_or("unknown");
-            return format!("{tool_name}: {task_id} ({status})");
+            return format!("{task_id} ({status})");
         }
         if let Some(tasks) = value.get("tasks").and_then(|item| item.as_array()) {
-            return format!("{tool_name}: {} tasks", tasks.len());
+            return format!("{} tasks", tasks.len());
         }
     }
 
     preview
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{tool_name}: completed"))
+        .unwrap_or_else(|| "completed".to_string())
 }
 
 /// First line of `s`, clipped to 80 chars (whole chars). Companion to the
@@ -1712,7 +1712,7 @@ async fn execute_manual_tool_call(
             tool_name: tool_name.to_string(),
             content: message.clone(),
             tool_args: args.clone(),
-            summary: Some(format!("{tool_name}: blocked")),
+            summary: Some("blocked".to_string()),
             preview,
             elapsed_ms: 0,
             is_error: true,
@@ -1736,7 +1736,7 @@ async fn execute_manual_tool_call(
             tool_name: tool_name.to_string(),
             content: message.clone(),
             tool_args: args.clone(),
-            summary: Some(format!("{tool_name}: policy engine unavailable")),
+            summary: Some("policy engine unavailable".to_string()),
             preview: None,
             elapsed_ms: 0,
             is_error: true,
@@ -1769,7 +1769,7 @@ async fn execute_manual_tool_call(
                 tool_name: tool_name.to_string(),
                 content: message.clone(),
                 tool_args: args.clone(),
-                summary: Some(format!("{tool_name}: denied by policy")),
+                summary: Some("denied by policy".to_string()),
                 preview,
                 elapsed_ms: 0,
                 is_error: true,
@@ -4633,7 +4633,7 @@ async fn handle_nodes_slash_command(args: &[String]) -> Result<bool> {
                 let registry = prism_client::node_registry::NodeRegistryClient::new(&platform);
                 match registry.list_nodes(None).await {
                     Ok(nodes) => (nodes, None),
-                    Err(error) => (Vec::new(), Some(format!("{error}"))),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
                 }
             }
             Err(error) => (Vec::new(), Some(format!("{error:#}"))),
@@ -5251,7 +5251,7 @@ async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContex
         .await
         {
             Ok(items) => emit(items, None),
-            Err(e) => emit(vec![], Some(format!("{e}"))),
+            Err(e) => emit(vec![], Some(e.to_string())),
         },
         "prs" => match gh_json(
             &repo,
@@ -5267,7 +5267,7 @@ async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContex
         .await
         {
             Ok(items) => emit(items, None),
-            Err(e) => emit(vec![], Some(format!("{e}"))),
+            Err(e) => emit(vec![], Some(e.to_string())),
         },
         "status" => match gh_json(
             &repo,
@@ -5283,7 +5283,7 @@ async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContex
         .await
         {
             Ok(items) => emit(items, None),
-            Err(e) => emit(vec![], Some(format!("{e}"))),
+            Err(e) => emit(vec![], Some(e.to_string())),
         },
         "bug" => {
             // `/gh bug <description>` → file a GitHub issue via `gh issue create`.
@@ -5301,7 +5301,7 @@ async fn handle_gh_slash_command(args: &[String], slash_ctx: &SlashCommandContex
                         vec![serde_json::json!({ "url": url, "title": title })],
                         None,
                     ),
-                    Err(e) => emit(vec![], Some(format!("{e}"))),
+                    Err(e) => emit(vec![], Some(e.to_string())),
                 }
             }
         }

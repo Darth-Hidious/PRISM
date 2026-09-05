@@ -16,12 +16,12 @@ expression: rendered
 │     /notebook open — Python cells; agent shares kernel         │ │
 │                                                                │ │
 │  SYSTEMS                                                       │ │
-│   ● model  —   s status                                        │ │
+│   ● model  —   S status                                        │ │
 │   ● session cost  $0.0000   as of last checkpoint              │ │
 │     credits  not reported (unauthed / not fetched)             │ │
 │     compute · nodes · knowledge · ingestion — open via ⌘K      │ │
 │                                                                │ │
-│  ⏎ talk to the agent    t tools    s systems    ⌘K commands    │ │
+│  ⏎ talk to the agent    T tools    S systems    ⌘K commands    │ │
 │? keys                                                          │ │
 │                                                                │ │
 │                                                                │ │

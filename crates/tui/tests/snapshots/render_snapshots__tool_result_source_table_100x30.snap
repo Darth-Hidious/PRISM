@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 3924
 expression: rendered
 ---
  ‹ back  New session    Ctrl-P · ?                                 │ Workspace
@@ -8,7 +9,7 @@ expression: rendered
 ❯ You                                                              │
 ▌ Look up MgB2                                                     │  1. prompt "Look up MgB2" •
                                                                    │  2. tool lookup_structure ✓
-  ✓ [YELLOW screening] lookup_structure: found MgB2 (mp-763) —     │
+  ✓ [YELLOW screening] lookup_structure: found MgB2 (mp-763) —     │      found MgB2 (mp-763) — P6/…
 P6/mmm, 3 atoms                                                    │
     SOURCE   KIND OF… COUNT EVIDENCE           FETCHED             │
     Materia… crystal…     1 [YELLOW screening] 2026-09-02 14:10    │

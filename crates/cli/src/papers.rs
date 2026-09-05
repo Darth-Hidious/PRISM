@@ -321,7 +321,17 @@ pub async fn handle(cmd: PapersCommands, project_root: &std::path::Path) -> Resu
             let engine =
                 with_relevance_stages(build_engine(source_ids, &mailto, no_cache), project_root);
             let outcome = engine.search(&query, limit).await;
-            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            // The engine's result plus what the source table and the evidence
+            // badge read: which databases were asked and what each returned,
+            // and that bibliographic records are literature evidence.
+            let mut value = serde_json::to_value(&outcome)?;
+            let declared = declare_sources(&outcome.source_status);
+            if let (Some(out), Some(add)) = (value.as_object_mut(), declared.as_object()) {
+                for (k, v) in add {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         PapersCommands::Sweep {
             query,
@@ -2581,5 +2591,83 @@ mod store_tests {
             !code.contains("extractor_unreachable"),
             "the probe's verdict is back"
         );
+    }
+}
+
+/// What the `papers` search declares beside its results: one `sources` row per
+/// database asked — `count` null when it did not answer, never zero — and the
+/// evidence class of bibliographic records from named databases, which is
+/// literature evidence ("research"). Driven live on 2026-09-05: without this
+/// the card read "SOURCE NOT REPORTED BY papers" and "[unclassified]".
+fn declare_sources(statuses: &[prism_retrieval::model::SourceStatus]) -> serde_json::Value {
+    let fetched = chrono::Utc::now().to_rfc3339();
+    let rows: Vec<serde_json::Value> = statuses
+        .iter()
+        .map(|s| {
+            let answered = s.status == "ok";
+            json!({
+                "source": s.source,
+                "kind": "literature metadata",
+                "count": if answered { json!(s.count) } else { serde_json::Value::Null },
+                "fetched": fetched,
+                "status": s.status,
+                "record": {
+                    "cache_hit": s.cache_hit,
+                    "latency_ms": s.latency_ms,
+                    "available": s.available,
+                    "error": s.error,
+                },
+            })
+        })
+        .collect();
+    json!({
+        "sources": rows,
+        "evidence_class": "research",
+        "evidence_color": "orange",
+    })
+}
+
+#[cfg(test)]
+mod source_declaration_tests {
+    use super::*;
+    use prism_retrieval::model::SourceStatus;
+
+    fn status(source: &str, status: &str, count: usize, error: Option<&str>) -> SourceStatus {
+        SourceStatus {
+            source: source.to_string(),
+            status: status.to_string(),
+            count,
+            available: None,
+            latency_ms: 12.0,
+            cache_hit: false,
+            error: error.map(str::to_string),
+            failure_kind: None,
+            empty_note: None,
+        }
+    }
+
+    #[test]
+    fn the_papers_search_declares_every_database_and_its_evidence_class() {
+        // Live 2026-09-05: the `papers` tool's card read "SOURCE NOT REPORTED
+        // BY papers" and "[unclassified]", although the engine hands it a
+        // per-source status list and every record is literature metadata.
+        let declared = declare_sources(&[
+            status("arxiv", "ok", 8, None),
+            status("chemrxiv", "timeout", 0, Some("deadline exceeded")),
+            status("doaj", "ok", 0, None),
+        ]);
+        let rows = declared["sources"].as_array().expect("a sources array");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["source"], "arxiv");
+        assert_eq!(rows[0]["count"], 8);
+        assert_eq!(rows[0]["status"], "ok");
+        assert!(rows[0]["kind"].as_str().is_some_and(|k| !k.is_empty()));
+        assert!(rows[0]["fetched"].as_str().is_some_and(|f| !f.is_empty()));
+        // No answer is null, never zero; searched-and-empty is zero.
+        assert!(rows[1]["count"].is_null(), "{}", rows[1]);
+        assert_eq!(rows[1]["record"]["error"], "deadline exceeded");
+        assert_eq!(rows[2]["count"], 0);
+        assert_eq!(declared["evidence_class"], "research");
+        assert_eq!(declared["evidence_color"], "orange");
     }
 }

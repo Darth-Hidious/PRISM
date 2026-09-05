@@ -172,6 +172,8 @@ def _literature_search_impl(**kwargs) -> dict:
         out["error"] = (
             "no papers retrieved because every source failed; see source_status"
         )
+    # Bibliographic records from named databases are literature evidence.
+    stamp_evidence(out, EvidenceSource.LITERATURE_EXTRACTION)
     return out
 
 
@@ -371,6 +373,7 @@ def _prior_art_search(**kwargs) -> dict:
                 # Surfaced per-source so literature results still flow.
                 out["patents_error"] = str(exc)
 
+    stamp_evidence(out, EvidenceSource.LITERATURE_EXTRACTION)
     return out
 
 

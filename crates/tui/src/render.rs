@@ -2202,6 +2202,15 @@ fn build_activity_lines(
             Span::raw(" "),
             Span::styled(glyph.to_string(), Style::default().fg(gcolor)),
         ]));
+        // What the tool FOUND, on its own dimmed line: the sidebar is too
+        // narrow to carry a name and a result side by side, and a result
+        // squeezed to "— …" says nothing.
+        if let Some(detail) = &it.detail {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", clip(detail, w.saturating_sub(6))),
+                Style::default().fg(t.dim),
+            )));
+        }
     }
 }
 
@@ -3642,7 +3651,7 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
         // Same reasoning as the header: the home view says the plane is
         // ready, not how many parts it has. `t` opens the full inventory
         // with the counts and the approval split intact.
-        lines.push(row("▣", "tools ready".to_string(), "t open"));
+        lines.push(row("▣", "tools ready".to_string(), "T open"));
         lines.push(muted(
             "location (cloud/local/remote) not reported — pending tool tags".to_string(),
         ));
@@ -3670,7 +3679,7 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
                     model
                 }
             ),
-            "s status",
+            "S status",
         ),
         row(
             "●",
@@ -3686,7 +3695,7 @@ fn draw_home(f: &mut Frame, app: &App, bounds: Rect) {
         muted("compute · nodes · knowledge · ingestion — open via ⌘K".to_string()),
         Line::raw(""),
         Line::from(Span::styled(
-            "  ⏎ talk to the agent    t tools    s systems    ⌘K commands    ? keys",
+            "  ⏎ talk to the agent    T tools    S systems    ⌘K commands    ? keys",
             Style::default().fg(t.muted),
         )),
     ]);

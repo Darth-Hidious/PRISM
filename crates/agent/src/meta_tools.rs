@@ -1028,6 +1028,14 @@ async fn recall_with_backend(
                 let sources = recall_sources(std::iter::once(
                     rec.tool_name.as_deref().unwrap_or("unknown tool"),
                 ));
+                // A recalled result keeps the class its producer declared;
+                // recall adds none of its own, so an undeclared one stays so.
+                let evidence_class = rec
+                    .output_json
+                    .as_ref()
+                    .and_then(|o| o.get("evidence_class"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let mut out = json!({
                     "id": rec.id,
                     "tool_name": rec.tool_name,
@@ -1037,6 +1045,9 @@ async fn recall_with_backend(
                     "exit_code": rec.exit_code,
                     "sources": sources,
                 });
+                if let Some(class) = evidence_class {
+                    out["evidence_class"] = json!(class);
+                }
                 if let Some(note) = &budget_note {
                     out["budget_note"] = json!(note);
                 }
@@ -1930,6 +1941,37 @@ mod tests {
             .unwrap_or_else(|| panic!("recall by id must declare its sources: {out}"));
         assert_eq!(sources[0]["source"], json!("durable memory"));
         assert_eq!(sources[0]["count"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn recall_by_id_carries_the_recalled_records_evidence_class() {
+        // A recalled screening result is still a screening result. Without
+        // this every recall card read [unclassified] — and painting it with a
+        // class of recall's own would be wrong in the other direction.
+        let store = ProvenanceStore::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut rec = new_record(
+            "sess-recall",
+            ActionType::ToolCall,
+            Actor::Agent,
+            Some("evaluate_candidate"),
+            None,
+            json!({ "alloy": "Ti-6Al-4V" }),
+        );
+        rec.output_json = Some(json!({ "reward": 0.8, "evidence_class": "screening" }));
+        store.record(&rec).await.unwrap();
+        let out = recall(&json!({ "id": rec.id }), Some(&store), "sess-recall", None)
+            .await
+            .unwrap();
+        assert_eq!(out["evidence_class"], json!("screening"), "{out}");
+
+        // A record that never declared one stays undeclared: no invented class.
+        let (store, id) = seeded_store().await;
+        let out = recall(&json!({ "id": id }), Some(&store), "sess-recall", None)
+            .await
+            .unwrap();
+        assert!(out.get("evidence_class").is_none(), "{out}");
     }
 
     #[tokio::test]

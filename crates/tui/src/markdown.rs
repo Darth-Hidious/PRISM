@@ -198,12 +198,13 @@ fn render_table(
 ) -> Vec<Line<'static>> {
     let ncols = header.len().max(1);
 
-    // Natural column widths = widest cell (header + data), min 1.
+    // Natural column widths = widest cell (header + data), min 1 — measured
+    // on the VISIBLE text: `**1**` is one column wide, not five.
     let mut widths: Vec<usize> = (0..ncols)
         .map(|c| {
-            let mut w = UnicodeWidthStr::width(cell_at(header, c));
+            let mut w = visible_width(cell_at(header, c), t);
             for r in rows {
-                w = w.max(UnicodeWidthStr::width(cell_at(r, c)));
+                w = w.max(visible_width(cell_at(r, c), t));
             }
             w.max(1)
         })
@@ -230,8 +231,11 @@ fn render_table(
         let mut spans = vec![Span::styled("│".to_string(), bstyle)];
         for (c, &w) in widths.iter().enumerate() {
             let align = aligns.get(c).copied().unwrap_or(Align::Left);
-            let text = fit_cell(cell_at(cells, c), w, align);
-            spans.push(Span::styled(format!(" {text} "), cell_style));
+            spans.push(Span::styled(" ".to_string(), cell_style));
+            // A cell is inline markdown like any paragraph: a model that
+            // writes `**1**` in a table meant bold, not asterisks.
+            spans.extend(fit_cell_spans(cell_at(cells, c), w, align, t, cell_style));
+            spans.push(Span::styled(" ".to_string(), cell_style));
             spans.push(Span::styled("│".to_string(), bstyle));
         }
         Line::from(spans)
@@ -276,36 +280,63 @@ fn table_border(widths: &[usize], left: char, mid: char, right: char) -> String 
     s
 }
 
-/// Fit `text` to exactly `w` display columns: pad per `align`, or truncate
-/// with a trailing `…` when it overflows.
-fn fit_cell(text: &str, w: usize, align: Align) -> String {
-    let tw = UnicodeWidthStr::width(text);
+/// Columns the cell occupies once its inline markers are rendered.
+fn visible_width(text: &str, t: Theme) -> usize {
+    inline_spans(text, t, Style::default())
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// A cell's inline spans padded or truncated to `w` columns, like [`fit_cell`]
+/// but keeping each span's style.
+fn fit_cell_spans(text: &str, w: usize, align: Align, t: Theme, base: Style) -> Vec<Span<'static>> {
+    let spans = inline_spans(text, t, base);
+    let tw: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     if tw <= w {
         let pad = w - tw;
-        return match align {
-            Align::Left => format!("{text}{}", " ".repeat(pad)),
-            Align::Right => format!("{}{text}", " ".repeat(pad)),
-            Align::Center => {
-                let l = pad / 2;
-                format!("{}{text}{}", " ".repeat(l), " ".repeat(pad - l))
-            }
+        let (left, right) = match align {
+            Align::Left => (0, pad),
+            Align::Right => (pad, 0),
+            Align::Center => (pad / 2, pad - pad / 2),
         };
-    }
-    // Truncate to w-1 columns, then append the ellipsis (width 1).
-    let mut acc = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + cw > w.saturating_sub(1) {
-            break;
+        let mut out = Vec::with_capacity(spans.len() + 2);
+        if left > 0 {
+            out.push(Span::styled(" ".repeat(left), base));
         }
-        acc.push(ch);
-        used += cw;
+        out.extend(spans);
+        if right > 0 {
+            out.push(Span::styled(" ".repeat(right), base));
+        }
+        return out;
     }
-    acc.push('…');
-    used += 1;
-    acc.push_str(&" ".repeat(w.saturating_sub(used)));
-    acc
+    // Truncate to w-1 columns across spans, then the ellipsis (width 1).
+    let limit = w.saturating_sub(1);
+    let mut out = Vec::new();
+    let mut used = 0;
+    'spans: for span in spans {
+        let mut acc = String::new();
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > limit {
+                if !acc.is_empty() {
+                    out.push(Span::styled(acc, span.style));
+                }
+                break 'spans;
+            }
+            acc.push(ch);
+            used += cw;
+        }
+        out.push(Span::styled(acc, span.style));
+    }
+    out.push(Span::styled(
+        format!("…{}", " ".repeat(w.saturating_sub(used + 1))),
+        base,
+    ));
+    out
 }
 
 /// Parse inline markdown (`**bold**`, `*italic*`, `` `code` ``,
@@ -505,6 +536,36 @@ pub fn extract_urls(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_table_cell_renders_its_inline_markdown() {
+        // Live 2026-09-05: a model wrote `| J-STAGE | **1**: "Thermal…" |` and
+        // the cell showed the asterisks. Cells go through the same inline
+        // parser as paragraphs; the column width is measured on the visible
+        // text, not the markers.
+        let md = "| Database | Returned |\n|---|---|\n| J-STAGE | **1** hit |\n";
+        let lines = markdown_lines(md, crate::theme::get(0), 60);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let row = text
+            .iter()
+            .find(|l| l.contains("J-STAGE"))
+            .unwrap_or_else(|| panic!("the data row is rendered: {text:?}"));
+        assert!(!row.contains("**"), "markers are not shown: {row:?}");
+        assert!(row.contains("1 hit"), "{row:?}");
+        let bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains('1') && s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(bold, "the bold cell text is bold");
+    }
     use super::*;
     use crate::theme;
 

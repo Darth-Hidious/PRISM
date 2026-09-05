@@ -442,6 +442,9 @@ pub struct ActivityEntry {
     pub msg_index: usize,
     /// Tool success for "tool" rows; `None` for prompt/file rows.
     pub ok: Option<bool>,
+    /// What the tool FOUND — the result's first line. Shown only when the
+    /// sidebar has room for it, so it never squeezes the tool's name.
+    pub detail: Option<String>,
 }
 
 /// One row of the Workspace *Files* tab (a file touched by a tool).
@@ -2184,6 +2187,7 @@ impl App {
                     label: format!("\"{}\"", m.text.trim()),
                     msg_index: i,
                     ok: None,
+                    detail: None,
                 }),
                 (
                     _,
@@ -2194,11 +2198,18 @@ impl App {
                         ..
                     },
                 ) => {
+                    // What it FOUND, not only that it ran: the result's first
+                    // line is the one-line answer, and the sidebar is where
+                    // the reader glances for it.
+                    let first = content.lines().next().map(str::trim).unwrap_or("");
+                    let detail =
+                        (!first.is_empty() && first != tool_name).then(|| first.to_string());
                     out.push(ActivityEntry {
                         kind: "tool",
                         label: tool_name.clone(),
                         msg_index: i,
                         ok: Some(*success),
+                        detail,
                     });
                     if is_file_tool(tool_name)
                         && let Some(path) = extract_path(content)
@@ -2208,6 +2219,7 @@ impl App {
                             label: path,
                             msg_index: i,
                             ok: None,
+                            detail: None,
                         });
                     }
                 }
@@ -4230,11 +4242,14 @@ impl App {
                 self.close_home();
                 self.open_palette();
             }
-            KeyCode::Char('t') => {
+            // Section shortcuts are SHIFTED letters. Lowercase letters are
+            // typing: "search for …" opened Status on its first letter and
+            // swallowed the rest, and no legend can make that expected.
+            KeyCode::Char('T') => {
                 self.close_home();
                 self.open_tools_window();
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('S') => {
                 self.close_home();
                 self.open_status_window();
             }
@@ -4242,14 +4257,14 @@ impl App {
                 self.close_home();
                 self.open_which_key();
             }
-            KeyCode::Char('w') => {
+            KeyCode::Char('W') => {
                 self.close_home();
                 self.toast(
                     "Workflows: no live run list wired yet — start one by talking to the agent.",
                     ToastKind::Info,
                 );
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('N') => {
                 self.close_home();
                 self.toast(
                     "In-app notebooks are coming — agent-watched + editable, running cloud/local/your hardware.",
@@ -4265,9 +4280,8 @@ impl App {
             // strength…" opened the Tools panel on the `t` of "What", and
             // "List 3 titanium alloys" opened Status on the `s` of "List".
             // The rest of the sentence vanished with no error and no echo.
-            // The bound keys above still win, so `t`/`s`/`?`/`w`/`n` are
-            // unchanged; only the previously-dead keys now do the obvious
-            // thing.
+            // The bound keys above are shifted, so every lowercase letter
+            // reaches the prompt.
             KeyCode::Char(c)
                 if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
             {
@@ -6646,6 +6660,80 @@ mod tests {
     /// index, seeding an ontology, or hung. A live activity is listed in the
     /// footer for as long as it runs, and leaves when it finishes.
     #[test]
+    fn on_the_home_screen_lowercase_letters_type_and_uppercase_letters_open_sections() {
+        // Typing "search for …" on the launch screen opened Status on the
+        // `s` and swallowed the rest. Plain letters are typing; a section
+        // shortcut is a deliberate shifted press.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        assert!(app.home.open);
+        for c in "search".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(!app.status_window.open, "lowercase s must not open Status");
+        assert!(!app.tools_window.open, "lowercase t must not open Tools");
+        assert_eq!(
+            app.input.lines().join(""),
+            "search",
+            "every typed letter reaches the prompt"
+        );
+
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.handle_key(key(KeyCode::Char('S')));
+        assert!(app.status_window.open, "S opens Status");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.status_window.open, "and Esc closes it");
+
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.handle_key(key(KeyCode::Char('T')));
+        assert!(app.tools_window.open, "T opens Tools");
+    }
+
+    #[test]
+    fn the_sidebar_tool_entry_says_what_the_tool_found() {
+        // "2. tool prior_art_search ✓" says a search ran, not what it found.
+        // The first line of the result is the one-line answer to that, and
+        // the sidebar is where the reader glances for it.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.apply_agent_msg(crate::msg::AgentMsg::ToolCard {
+            tool_name: "prior_art_search".to_string(),
+            content: "37 result(s), 20 not seen before in this session.\n  - A paper".to_string(),
+            card_type: "results".to_string(),
+            elapsed_ms: Some(1200),
+            call_id: Some("c1".to_string()),
+            provenance_id: None,
+            data: Some(serde_json::json!({"count": 37})),
+            agent: None,
+        });
+        let entries = app.derive_activity();
+        let tool = entries
+            .iter()
+            .find(|e| e.kind == "tool")
+            .expect("a tool entry");
+        assert_eq!(tool.label, "prior_art_search");
+        let detail = tool
+            .detail
+            .as_deref()
+            .expect("the entry carries the result's first line");
+        assert!(detail.contains("37 result(s)"), "{detail}");
+        assert!(!detail.contains("A paper"), "only the first line: {detail}");
+        // And the sidebar shows it when it has the room: 140 columns gives a
+        // 42-wide sidebar.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("37 result(s), 20 not seen"), "{screen}");
+    }
+
+    #[test]
     fn the_footer_does_not_say_ready_while_a_tool_is_still_running() {
         // Driven live on 2026-09-05: the model's text segment ended, the
         // text-flush event wrote "Ready", and the footer read Ready for the
@@ -7522,9 +7610,9 @@ mod tests {
         assert!(!app.should_quit, "Ctrl-C on the home must not quit");
         // A section letter jumps into that section's window and closes home.
         let mut app2 = App::new(BackendHandle::fake(FakeScenario::BasicChat));
-        app2.handle_key(key(KeyCode::Char('t')));
-        assert!(!app2.home.open, "'t' closes the home");
-        assert!(app2.tools_window.open, "'t' opens the tools window");
+        app2.handle_key(key(KeyCode::Char('T')));
+        assert!(!app2.home.open, "'T' closes the home");
+        assert!(app2.tools_window.open, "'T' opens the tools window");
     }
 
     /// `prism resume <id>` must land on the restored conversation, not on

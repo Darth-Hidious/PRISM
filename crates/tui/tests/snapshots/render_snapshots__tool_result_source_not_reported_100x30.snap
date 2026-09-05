@@ -1,5 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
+assertion_line: 3942
 expression: rendered
 ---
  ‹ back  New session    Ctrl-P · ?                                 │ Workspace
@@ -8,7 +9,7 @@ expression: rendered
 ❯ You                                                              │
 ▌ Look up MgB2                                                     │  1. prompt "Look up MgB2" •
                                                                    │  2. tool execute_python ✓
-  ✓ [unclassified] execute_python: stdout: 42                      │
+  ✓ [unclassified] execute_python: stdout: 42                      │      stdout: 42
     SOURCE NOT REPORTED BY execute_python                          │
                                                                    │
                                                                    │

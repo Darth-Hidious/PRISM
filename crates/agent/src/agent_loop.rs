@@ -2170,22 +2170,22 @@ fn summarize_tool_result(
             let err_str = val.get("error").and_then(|v| v.as_str());
             if timed_out {
                 if let Some(code) = exit_code {
-                    return format!("{tool_name}: error — timed out (exit {code})");
+                    return format!("error — timed out (exit {code})");
                 }
-                return format!("{tool_name}: error — timed out");
+                return "error — timed out".to_string();
             }
             if let Some(code) = exit_code
                 && code != 0
             {
                 if let Some(err) = err_str {
                     let err_short = first_line(err, 80);
-                    return format!("{tool_name}: error — exit {code}: {err_short}");
+                    return format!("error — exit {code}: {err_short}");
                 }
-                return format!("{tool_name}: error — exit {code}");
+                return format!("error — exit {code}");
             }
             if let Some(err) = err_str {
                 let err_short = first_line(err, 80);
-                return format!("{tool_name}: error — {err_short}");
+                return format!("error — {err_short}");
             }
         }
         // B1 FIX: byte-slicing at 60 panicked when the boundary landed
@@ -2193,7 +2193,7 @@ fn summarize_tool_result(
         // 60 aborted the whole turn). `first_line` is char-boundary-safe;
         // the fallback branch now uses the same helper.
         let preview = first_line(content, 80);
-        return format!("{tool_name}: error — {preview}");
+        return format!("error — {preview}");
     }
     // Try to parse as JSON for richer summaries
     if let Ok(val) = serde_json::from_str::<Value>(content) {
@@ -2201,28 +2201,28 @@ fn summarize_tool_result(
             let size_bytes = val.get("size_bytes").and_then(|v| v.as_u64());
             return match tool_name {
                 "read_file" => size_bytes
-                    .map(|size| format!("read_file: {path} ({size} bytes)"))
-                    .unwrap_or_else(|| format!("read_file: {path}")),
+                    .map(|size| format!("{path} ({size} bytes)"))
+                    .unwrap_or_else(|| path.to_string()),
                 "edit_file" => {
                     let replacements = val.get("replacements").and_then(|v| v.as_u64());
                     match (replacements, size_bytes) {
                         (Some(replacements), Some(size)) => {
-                            format!("edit_file: {path} ({replacements} replacements, {size} bytes)")
+                            format!("{path} ({replacements} replacements, {size} bytes)")
                         }
                         (Some(replacements), None) => {
-                            format!("edit_file: {path} ({replacements} replacements)")
+                            format!("{path} ({replacements} replacements)")
                         }
-                        _ => format!("edit_file: {path}"),
+                        _ => path.to_string(),
                     }
                 }
                 "write_file" => size_bytes
-                    .map(|size| format!("write_file: {path} ({size} bytes)"))
-                    .unwrap_or_else(|| format!("write_file: {path}")),
-                _ => format!("{tool_name}: {path}"),
+                    .map(|size| format!("{path} ({size} bytes)"))
+                    .unwrap_or_else(|| path.to_string()),
+                _ => path.to_string(),
             };
         }
         if let Some(count) = val.get("count").and_then(|v| v.as_u64()) {
-            return format!("{tool_name}: {count} results");
+            return format!("{count} results");
         }
         if let Some(task) = val.get("task")
             && let Some(task_id) = task.get("task_id").and_then(|value| value.as_str())
@@ -2231,16 +2231,16 @@ fn summarize_tool_result(
                 .get("status")
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown");
-            return format!("{tool_name}: {task_id} ({status})");
+            return format!("{task_id} ({status})");
         }
         if let Some(arr) = val.get("results").and_then(|v| v.as_array()) {
-            return format!("{tool_name}: {} results", arr.len());
+            return format!("{} results", arr.len());
         }
         if let Some(arr) = val.get("tasks").and_then(|v| v.as_array()) {
-            return format!("{tool_name}: {} tasks", arr.len());
+            return format!("{} tasks", arr.len());
         }
         if let Some(f) = val.get("filename").and_then(|v| v.as_str()) {
-            return format!("{tool_name}: saved to {f}");
+            return format!("saved to {f}");
         }
         if let Some(root) = val.get("root").and_then(|v| v.as_str())
             && let Some(stdout) = val.get("stdout").and_then(|v| v.as_str())
@@ -2249,18 +2249,18 @@ fn summarize_tool_result(
             match root {
                 "models" => {
                     if let Some(items) = parsed_stdout.as_array() {
-                        return format!("{tool_name}: {} models", items.len());
+                        return format!("{} models", items.len());
                     }
                     if let Some(model_id) = parsed_stdout
                         .get("model_id")
                         .and_then(|value| value.as_str())
                     {
-                        return format!("{tool_name}: {model_id}");
+                        return model_id.to_string();
                     }
                 }
                 "deploy" => {
                     if let Some(items) = parsed_stdout.as_array() {
-                        return format!("{tool_name}: {} deployments", items.len());
+                        return format!("{} deployments", items.len());
                     }
                     if let Some(status) =
                         parsed_stdout.get("status").and_then(|value| value.as_str())
@@ -2270,13 +2270,13 @@ fn summarize_tool_result(
                             .or_else(|| parsed_stdout.get("id"))
                             .and_then(|value| value.as_str())
                             .unwrap_or("deployment");
-                        return format!("{tool_name}: {deployment_id} ({status})");
+                        return format!("{deployment_id} ({status})");
                     }
                     if let Some(healthy) = parsed_stdout
                         .get("healthy")
                         .and_then(|value| value.as_bool())
                     {
-                        return format!("{tool_name}: healthy={healthy}");
+                        return format!("healthy={healthy}");
                     }
                 }
                 "discourse" => {
@@ -2284,7 +2284,7 @@ fn summarize_tool_result(
                         .get("specs")
                         .and_then(|value| value.as_array())
                     {
-                        return format!("{tool_name}: {} specs", items.len());
+                        return format!("{} specs", items.len());
                     }
                     if let Some(events) = parsed_stdout
                         .get("events")
@@ -2294,7 +2294,7 @@ fn summarize_tool_result(
                             .get("instance_id")
                             .and_then(|value| value.as_str())
                             .unwrap_or("instance");
-                        return format!("{tool_name}: {instance_id} ({} events)", events.len());
+                        return format!("{instance_id} ({} events)", events.len());
                     }
                     if let Some(status) =
                         parsed_stdout.get("status").and_then(|value| value.as_str())
@@ -2303,13 +2303,13 @@ fn summarize_tool_result(
                             .get("instance_id")
                             .and_then(|value| value.as_str())
                             .unwrap_or("instance");
-                        return format!("{tool_name}: {instance_id} ({status})");
+                        return format!("{instance_id} ({status})");
                     }
                     if let Some(turns) = parsed_stdout
                         .get("turns")
                         .and_then(|value| value.as_array())
                     {
-                        return format!("{tool_name}: {} turns", turns.len());
+                        return format!("{} turns", turns.len());
                     }
                 }
                 _ => {}
@@ -2322,20 +2322,20 @@ fn summarize_tool_result(
                 .unwrap_or(false);
             let exit_code = val.get("exit_code").and_then(|v| v.as_i64());
             if timed_out {
-                return format!("{tool_name}: timed out — {invocation}");
+                return format!("timed out — {invocation}");
             }
             if let Some(exit_code) = exit_code
                 && exit_code != 0
             {
-                return format!("{tool_name}: exit {exit_code} — {invocation}");
+                return format!("exit {exit_code} — {invocation}");
             }
-            return format!("{tool_name}: {invocation}");
+            return invocation.to_string();
         }
     }
     if let Some(preview) = preview {
         return preview.to_string();
     }
-    format!("{tool_name}: completed")
+    "completed".to_string()
 }
 
 /// First line of `s`, clipped to `max` chars (whole chars, not bytes). Used by
@@ -7030,7 +7030,7 @@ mod tests {
         // the whole turn. The fallback preview must be char-boundary-safe.
         let content = "失敗".repeat(40); // 3 bytes per char — byte 60 is mid-char
         let summary = summarize_tool_result("web", None, &content, true);
-        assert!(summary.starts_with("web: error — "));
+        assert!(summary.starts_with("error — "), "{summary:?}");
     }
 
     #[test]
@@ -7134,35 +7134,36 @@ mod tests {
     fn test_summarize_tool_result_error() {
         let summary = summarize_tool_result("search", None, "something went wrong", true);
         assert!(summary.contains("error"));
-        assert!(summary.contains("search"));
+        // The presenter adds the tool name; the summary never does.
+        assert!(!summary.contains("search"), "{summary:?}");
     }
 
     #[test]
     fn test_summarize_tool_result_with_count() {
         let content = r#"{"count": 42}"#;
         let summary = summarize_tool_result("search", None, content, false);
-        assert_eq!(summary, "search: 42 results");
+        assert_eq!(summary, "42 results");
     }
 
     #[test]
     fn test_summarize_tool_result_with_results_array() {
         let content = r#"{"results": [1, 2, 3]}"#;
         let summary = summarize_tool_result("query", None, content, false);
-        assert_eq!(summary, "query: 3 results");
+        assert_eq!(summary, "3 results");
     }
 
     #[test]
     fn test_summarize_tool_result_with_filename() {
         let content = r#"{"filename": "output.csv"}"#;
         let summary = summarize_tool_result("export", None, content, false);
-        assert_eq!(summary, "export: saved to output.csv");
+        assert_eq!(summary, "saved to output.csv");
     }
 
     #[test]
     fn test_summarize_tool_result_generic() {
         let content = r#"{"status": "ok"}"#;
         let summary = summarize_tool_result("run", None, content, false);
-        assert_eq!(summary, "run: completed");
+        assert_eq!(summary, "completed");
     }
 
     #[test]
@@ -7531,6 +7532,37 @@ mod tests {
         let (plan, unkeyed) = identity_plan(&records);
         assert_eq!(plan.len(), 1, "the keyed record is planned");
         assert_eq!(unkeyed, 1, "the bare record is counted as unkeyed");
+    }
+
+    #[test]
+    fn a_tool_summary_never_carries_the_tool_name() {
+        // Live 2026-09-05: "✓ [unclassified] recall: recall: 3 results" and
+        // "Running prior_art_search: prior_art_search: 37 results". Every
+        // presenter — the TUI card line, the transcript export, the
+        // compaction view — prefixes the tool name itself, so a summary that
+        // carries it is shown twice. The summary is the summary.
+        for (tool, content, want) in [
+            ("prior_art_search", r#"{"count": 37}"#, "37 results"),
+            ("recall", r#"{"results": [1, 2, 3]}"#, "3 results"),
+            (
+                "read_file",
+                r#"{"path": "a.txt", "size_bytes": 12}"#,
+                "a.txt (12 bytes)",
+            ),
+            (
+                "bash_task",
+                r#"{"task": {"task_id": "t1", "status": "running"}}"#,
+                "t1 (running)",
+            ),
+            ("plot", r#"{"filename": "x.png"}"#, "saved to x.png"),
+        ] {
+            let got = summarize_tool_result(tool, None, content, false);
+            assert_eq!(got, want, "tool {tool}");
+            assert!(!got.starts_with(tool), "tool {tool}: {got:?}");
+        }
+        let err = summarize_tool_result("execute_python", None, r#"{"error": "boom"}"#, true);
+        assert!(!err.starts_with("execute_python"), "{err:?}");
+        assert!(err.contains("boom"), "{err:?}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 source: crates/tui/tests/render_snapshots.rs
-assertion_line: 3961
+assertion_line: 3971
 expression: rendered
 ---
  ‹ back  New session    Ctrl-P · ?                                 │ Workspace
@@ -9,7 +9,7 @@ expression: rendered
 ❯ You                                                              │
 ▌ Look up MgB2                                                     │  1. prompt "Look up MgB2" •
                                                                    │  2. tool hea_descriptors ✓
-  ✓ [YELLOW screening] hea_descriptors: CoCrFeMnNi:                │
+  ✓ [YELLOW screening] hea_descriptors: CoCrFeMnNi:                │      CoCrFeMnNi: solid_solutio…
 solid_solution, VEC=8.0                                            │
     SOURCE   KIND OF… COUNT EVIDENCE           FETCHED             │
     hea_des… compute…     — [YELLOW screening] not reported        │

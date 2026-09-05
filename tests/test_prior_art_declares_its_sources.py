@@ -121,3 +121,21 @@ def test_the_literature_branch_carries_its_sources_up(monkeypatch):
         "the tool must carry the branch's declared sources into its result; "
         f"got {out['sources']!r}"
     )
+
+
+def test_the_search_result_itself_carries_an_evidence_class(monkeypatch):
+    """Each record was stamped; the result was not, so the card read [unclassified].
+
+    Bibliographic records from named databases are literature evidence:
+    the producer ceiling for literature extraction is "research".
+    """
+    import app.tools.search as search
+
+    monkeypatch.setattr(
+        search,
+        "_literature_search_impl",
+        lambda **kwargs: {"results": [], "count": 0, "sources": [], "source_status": {}, "relevance": None},
+    )
+    out = search._prior_art_search(query="anything", source="papers", max_results=1)
+    assert out.get("evidence_class") == "research", out.get("evidence_class")
+    assert out.get("evidence_color") == "orange"
