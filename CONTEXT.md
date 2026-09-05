@@ -147,7 +147,8 @@ DONE `68f85341`: balance refreshes itself after 2 idle min and says "stale" when
 DONE `b493e160`: `prism use fallback add|list|clear` (+ `/use fallback …`, palette "Add fallback model" form, "Fallback models", "Clear fallback models"); `use show` names the fallbacks.
 DONE `6d1fd1e6`: palette "Sign in with enterprise SSO" states `prism login --sso-domain` / `--sso-provider-id` (PRISM-side SAML exists; IdP/SAML connections are platform-side, outside this repo).
 DONE `98b815fa` `4ce38e3a`: form notes wrap under their column (or on indented lines when cramped); the form modal is as tall as its lines (the key-hint footer was being cut).
-NEXT: model window lists fallbacks; bash.py `.git`/`.prism` deletion refusal — owner's call; CONTEXT.md ≤20 lines at session end.
+DONE `e4137a21`: eastern literature routed by language (model passes `queries` {ru,zh,ja}); OpenAlex per-language = the reachable Chinese/Russian/Japanese source; concurrent under a 45 s deadline; CyberLeninka cached 24 h + retried; archive texts-only + relevance; eastern sources declared to the table. Live: 20 results in 1.9 s.
+NEXT: watch whether the model supplies `queries` on eastern searches (prompt nudge if not); model window lists fallbacks; bash.py `.git`/`.prism` refusal — owner's call; CONTEXT.md ≤20 lines at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
