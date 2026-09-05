@@ -54,7 +54,11 @@ def main() -> None:
         except json.JSONDecodeError as exc:
             response = {"error": f"invalid JSON: {exc}"}
         else:
-            response = _handle(registry, request)
+            # _handle takes the tool server's state dict, not a bare
+            # registry. Measured 2026-09-05: passing the registry raised
+            # TypeError on every request and the sidecar died, so CALPHAD
+            # read as "unavailable" instead of "broken".
+            response = _handle({"registry": registry}, request)
         _PROTOCOL_OUT.write(json.dumps(response) + "\n")
         _PROTOCOL_OUT.flush()
 
