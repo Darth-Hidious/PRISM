@@ -342,6 +342,9 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     "pyiron",
     "billing",
     "federation",
+    // The literature engine, in-app: the palette's papers forms dispatch
+    // `/papers search|sweep|full-text|corpus …` (parity, 2026-09-05).
+    "papers",
 ];
 
 pub fn builtin_help_text() -> String {
@@ -365,6 +368,10 @@ pub fn builtin_help_text() -> String {
     lines.push("Most `prism` CLI subcommands also work here:".to_string());
     lines.push("  /query \"...\" [--json]".to_string());
     lines.push("  /workflow list".to_string());
+    lines.push(
+        "  /papers search --query \"...\" [--sources a,b] [--limit n]  (also sweep | full-text | corpus)"
+            .to_string(),
+    );
     lines.push("  /marketplace search <query>".to_string());
     lines.push("  /models list [--provider google]".to_string());
     lines.push("  /gpus".to_string());
@@ -396,6 +403,17 @@ mod tests {
     /// with "Unsupported slash command root: use", because the allowlist that
     /// gates dispatch is a SECOND list that nothing kept in sync with the
     /// first. Found by typing it into the running TUI, not by any test.
+    #[test]
+    fn the_papers_engine_is_a_dispatchable_slash_root() {
+        // Parity, measured 2026-09-05: the palette's papers forms dispatch
+        // `/papers …`, so the root must pass the allowlist gate.
+        assert!(is_cli_backed_slash_root("papers"));
+        assert!(
+            builtin_help_text().contains("/papers search"),
+            "help advertises it too"
+        );
+    }
+
     #[test]
     fn every_slash_root_that_help_advertises_is_dispatchable() {
         let help = builtin_help_text();

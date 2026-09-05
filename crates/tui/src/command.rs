@@ -106,6 +106,38 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "papers.search",
+        title: "Search papers (engine)",
+        description: "Federated literature search — ten databases, no model",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "papers.sweep",
+        title: "Sweep the literature",
+        description: "Page through every source with a resumable checkpoint",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "papers.fulltext",
+        title: "Fetch full text",
+        description: "JATS or PDF by URL or PMC id, parsed to text",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "papers.corpus",
+        title: "Build a corpus",
+        description: "Every full text for a subject, written to a directory",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
         id: "compute.gpus",
         title: "Procure GPU compute",
         description: "Live GPU catalog with prices",
@@ -732,6 +764,10 @@ pub fn effect(id: &str) -> String {
         "sci.properties" | "sci.simulate" | "sci.predict" => "fills the prompt",
         "sci.research"
         | "browse.open"
+        | "papers.search"
+        | "papers.sweep"
+        | "papers.fulltext"
+        | "papers.corpus"
         | "node.up"
         | "goal.set"
         | "campaign.start"

@@ -19,9 +19,9 @@ expression: rendered
 │    Procure GPU compute     Live GPU catalog wit… opens a panel │ │
 │    Run simulation          Relax/MD via MACE… fills the prompt │ │
 │    Browse web page         Read a URL as text (H… opens a form │ │
-│    Goal status             Check a discovery cam… opens a form │ │
-│    List goals              Discovery camp… runs /campaign list │ │
-│  … 58 more — ↓ to scroll or type to filter                     │ │
+│    Build a corpus          Every full text for a… opens a form │ │
+│    Fetch full text         JATS or PDF by URL or… opens a form │ │
+│  … 62 more — ↓ to scroll or type to filter                     │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │

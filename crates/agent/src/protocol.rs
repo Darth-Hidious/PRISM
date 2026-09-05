@@ -1864,7 +1864,7 @@ async fn execute_manual_tool_call(
 
 fn command_timeout_for_root(root: &str) -> Duration {
     match root {
-        "workflow" | "ingest" | "query" | "run" | "research" | "deploy" | "publish" => {
+        "workflow" | "ingest" | "query" | "run" | "research" | "deploy" | "publish" | "papers" => {
             Duration::from_secs(300)
         }
         "node" | "mesh" => Duration::from_secs(60),
@@ -2209,6 +2209,71 @@ fn apply_deferred_runtime_updates(
         tools,
         &runtime.permission_overrides,
     );
+}
+
+/// The literature engine's JSON as a reader's page: how many papers, each
+/// with year, DOI and a full-text link when it has one, then which databases
+/// answered — a null count is "no answer", never zero.
+fn papers_view_text(value: &Value) -> String {
+    let papers = value
+        .get("papers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = format!("{} paper(s)\n", papers.len());
+    for p in &papers {
+        let title = p
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled)");
+        let year = p
+            .get("year")
+            .and_then(Value::as_i64)
+            .map(|y| format!(" ({y})"))
+            .unwrap_or_default();
+        let doi = p
+            .get("doi")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(|d| format!(" doi:{d}"))
+            .unwrap_or_default();
+        let source = p
+            .get("source")
+            .and_then(Value::as_str)
+            .map(|s| format!("  [{s}]"))
+            .unwrap_or_default();
+        out.push_str(&format!("  • {title}{year}{doi}{source}\n"));
+        if let Some(url) = p.get("fulltext_url").and_then(Value::as_str)
+            && !url.is_empty()
+        {
+            out.push_str(&format!("      full text: {url}\n"));
+        }
+    }
+    let mut asked = Vec::new();
+    for src in value
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = src.get("source").and_then(Value::as_str) else {
+            continue;
+        };
+        match src.get("count").and_then(Value::as_u64) {
+            Some(n) => asked.push(format!("{name} {n}")),
+            None => {
+                let status = src
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                asked.push(format!("{name} no answer ({status})"));
+            }
+        }
+    }
+    if !asked.is_empty() {
+        out.push_str(&format!("\ndatabases asked: {}\n", asked.join(" · ")));
+    }
+    out
 }
 
 fn emit_view(view_type: &str, title: &str, body: &str, tone: &str) {
@@ -8722,6 +8787,37 @@ async fn handle_command(
         // as a subprocess would print "\u{2713} Chat: ..." as if it took
         // effect now, when it actually only applies on the next launch —
         // an honest-looking lie. `show` has no such gap: it only reads.
+        // `/papers search|sweep|full-text|corpus …` — the literature engine
+        // in-app (parity, 2026-09-05). The CLI prints JSON; search and sweep
+        // are shown as a reader's page (papers, then the databases asked),
+        // the rest as the JSON they are.
+        _ if trimmed == "/papers" || trimmed.starts_with("/papers ") => {
+            let tokens = parse_command_tail(&trimmed[1..])?;
+            let sub = tokens.get(1).map(String::as_str).unwrap_or("");
+            match run_cli_backed_slash_command_json(&tokens, slash_ctx).await {
+                Ok(value) => {
+                    let body = if matches!(sub, "search" | "sweep") {
+                        papers_view_text(&value)
+                    } else {
+                        truncate_for_ui(
+                            &serde_json::to_string_pretty(&value).unwrap_or_default(),
+                            30_000,
+                        )
+                    };
+                    let title = match sub {
+                        "search" => "Papers — search",
+                        "sweep" => "Papers — sweep",
+                        "full-text" => "Papers — full text",
+                        "corpus" => "Papers — corpus",
+                        _ => "Papers",
+                    };
+                    emit_view("papers", title, &body, "info");
+                }
+                Err(e) => emit_view("papers", "Papers", &format!("{e}"), "warning"),
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
         _ if trimmed == "/use" || trimmed == "/use show" => {
             let raw =
                 spawn_prism_cli(&[String::from("use"), String::from("show")], slash_ctx).await?;
@@ -11009,6 +11105,42 @@ mod tests {
     /// The ui.card top level obeys the same rule as `data` — both fields the
     /// TUI consults must agree in silence, or the stamped one wins and paints
     /// the badge RED (the live defect).
+    #[test]
+    fn a_papers_result_reads_as_titles_and_the_databases_asked() {
+        // The engine prints JSON; the reader wants the count, the papers with
+        // year and DOI, and which databases answered — null count is "no
+        // answer", never zero.
+        let value = serde_json::json!({
+            "papers": [
+                {"title": "Creep of Cu-Cr-Nb", "year": 2021, "doi": "10.1/a",
+                 "fulltext_url": "https://arxiv.org/pdf/1.pdf", "source": "arxiv"},
+                {"title": "GRCop-42 hot fire", "year": 2019, "source": "ntrs"}
+            ],
+            "source_status": [
+                {"source": "arxiv", "status": "ok", "count": 1, "latency_ms": 10.0, "cache_hit": false},
+                {"source": "chemrxiv", "status": "error", "count": 0, "latency_ms": 5.0,
+                 "cache_hit": false, "error": "Cloudflare challenge"}
+            ],
+            "sources": [
+                {"source": "arxiv", "count": 1, "status": "ok"},
+                {"source": "chemrxiv", "count": null, "status": "error"}
+            ]
+        });
+        let text = super::papers_view_text(&value);
+        assert!(text.contains("2 paper(s)"), "{text}");
+        assert!(
+            text.contains("Creep of Cu-Cr-Nb (2021) doi:10.1/a"),
+            "{text}"
+        );
+        assert!(
+            text.contains("full text: https://arxiv.org/pdf/1.pdf"),
+            "{text}"
+        );
+        assert!(text.contains("GRCop-42 hot fire (2019)"), "{text}");
+        assert!(text.contains("arxiv 1"), "{text}");
+        assert!(text.contains("chemrxiv no answer (error)"), "{text}");
+    }
+
     #[test]
     fn ui_card_notification_omits_undeclared_evidence() {
         let params = build_ui_card_payload(

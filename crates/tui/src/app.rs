@@ -616,6 +616,13 @@ pub enum FormTarget {
     /// same verify-then-store path (`write_skill`) the agent uses — the
     /// skill is executed once and only saved if it exits cleanly.
     SkillCreate,
+    /// The literature engine, in-app (palette `papers.*`): one federated
+    /// search page, a resumable sweep, one paper's full text, a corpus of
+    /// full texts. Each submits the `/papers …` command a human could type.
+    PapersSearch,
+    PapersSweep,
+    PapersFulltext,
+    PapersCorpus,
     /// Read one web page as text via agent-browser (palette `browse.open`).
     /// Submit dispatches `/browse <url>`, which the backend runs through the
     /// SAME `agent-browser` path the agent's `web_browse` tool uses.
@@ -3003,6 +3010,30 @@ impl App {
                     self.form = Some(pane);
                 }
             },
+            FormTarget::PapersSearch
+            | FormTarget::PapersSweep
+            | FormTarget::PapersFulltext
+            | FormTarget::PapersCorpus => {
+                let composed = match pane.target {
+                    FormTarget::PapersSearch => papers_search_command(&pane.form),
+                    FormTarget::PapersSweep => papers_sweep_command(&pane.form),
+                    FormTarget::PapersFulltext => papers_fulltext_command(&pane.form),
+                    _ => papers_corpus_command(&pane.form),
+                };
+                match composed {
+                    Ok(cmd) => {
+                        let _ = self.backend.send_command(&cmd);
+                        self.toast(
+                            "asking the literature engine — the databases answer in their own time",
+                            ToastKind::Info,
+                        );
+                    }
+                    Err(msg) => {
+                        self.toast(msg, ToastKind::Warn);
+                        self.form = Some(pane);
+                    }
+                }
+            }
         }
     }
 
@@ -3107,6 +3138,66 @@ impl App {
             vec![FormField::text("url", "URL", "").with_note("agent-browser; no JavaScript")],
         );
         self.open_form(form, FormTarget::Browse);
+    }
+
+    /// Palette `papers.search` — one page of the federated literature search.
+    pub fn open_papers_search_form(&mut self) {
+        let form = Form::new(
+            "Search papers (engine)",
+            "search",
+            vec![
+                FormField::text("query", "Query", "").with_note("e.g. GRCop-42 creep copper alloy"),
+                FormField::text("sources", "Sources", "")
+                    .with_note("comma-separated; empty = every source (arxiv, openalex, crossref, pubmed, osti, ntrs, …)"),
+                FormField::text("limit", "Per-source limit", "").with_note("empty = 20"),
+            ],
+        );
+        self.open_form(form, FormTarget::PapersSearch);
+    }
+
+    /// Palette `papers.sweep` — page through every source with a checkpoint.
+    pub fn open_papers_sweep_form(&mut self) {
+        let form = Form::new(
+            "Sweep the literature",
+            "sweep",
+            vec![
+                FormField::text("query", "Query", ""),
+                FormField::text("sources", "Sources", "").with_note("empty = every source"),
+                FormField::text("max_pages", "Max pages per source", "").with_note("empty = 3"),
+            ],
+        );
+        self.open_form(form, FormTarget::PapersSweep);
+    }
+
+    /// Palette `papers.fulltext` — fetch and parse one paper's full text.
+    pub fn open_papers_fulltext_form(&mut self) {
+        let form = Form::new(
+            "Fetch a paper's full text",
+            "fetch",
+            vec![
+                FormField::text("url", "Full-text URL", "").with_note("JATS XML or PDF"),
+                FormField::text("pmc", "PMC id", "")
+                    .with_note("e.g. PMC5228121 — used when no URL"),
+            ],
+        );
+        self.open_form(form, FormTarget::PapersFulltext);
+    }
+
+    /// Palette `papers.corpus` — retrieve a subject's literature and write
+    /// every full text into a directory.
+    pub fn open_papers_corpus_form(&mut self) {
+        let form = Form::new(
+            "Build a corpus of full texts",
+            "build",
+            vec![
+                FormField::text("query", "Subject", "")
+                    .with_note("e.g. refractory high entropy alloy oxidation"),
+                FormField::text("out", "Directory", "").with_note("created if absent"),
+                FormField::text("max_docs", "Max documents", "")
+                    .with_note("empty or 0 = every paper retrieved"),
+            ],
+        );
+        self.open_form(form, FormTarget::PapersCorpus);
     }
 
     /// Palette `workflow.run` — name, optional `--set key=value` pairs, and
@@ -4792,6 +4883,10 @@ impl App {
             "theme.list" => self.open_theme_picker(),
             "gh.show" => self.open_gh(),
             "browse.open" => self.open_browse_form(),
+            "papers.search" => self.open_papers_search_form(),
+            "papers.sweep" => self.open_papers_sweep_form(),
+            "papers.fulltext" => self.open_papers_fulltext_form(),
+            "papers.corpus" => self.open_papers_corpus_form(),
             "account.show" => self.open_account(),
             "sessions.show" => self.open_sessions(),
             "tools.show" => self.open_tools_window(),
@@ -6397,6 +6492,109 @@ fn browse_command(form: &crate::form::Form) -> Result<String, &'static str> {
     Ok(build_slash_command(&["browse".to_string(), url]))
 }
 
+/// `/papers search --query <q> [--sources a,b] [--limit n]` from the
+/// `papers.search` form. Empty optional fields are left out so the CLI's own
+/// defaults apply (every source, 20 per source).
+fn papers_search_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let query = form.text_value("query").trim().to_string();
+    if query.is_empty() {
+        return Err("enter a query first");
+    }
+    let mut tokens = vec![
+        "papers".to_string(),
+        "search".to_string(),
+        "--query".to_string(),
+        query,
+    ];
+    push_sources(&mut tokens, form);
+    push_opt(&mut tokens, "--limit", &form.text_value("limit"));
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/papers sweep --query <q> [--sources a,b] [--max-pages n]`.
+fn papers_sweep_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let query = form.text_value("query").trim().to_string();
+    if query.is_empty() {
+        return Err("enter a query first");
+    }
+    let mut tokens = vec![
+        "papers".to_string(),
+        "sweep".to_string(),
+        "--query".to_string(),
+        query,
+    ];
+    push_sources(&mut tokens, form);
+    push_opt(&mut tokens, "--max-pages", &form.text_value("max_pages"));
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/papers full-text --url <u>` or `--pmc <id>`; the URL wins when both are given.
+fn papers_fulltext_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let url = form.text_value("url").trim().to_string();
+    let pmc = form.text_value("pmc").trim().to_string();
+    let mut tokens = vec!["papers".to_string(), "full-text".to_string()];
+    if !url.is_empty() {
+        tokens.push("--url".to_string());
+        tokens.push(url);
+    } else if !pmc.is_empty() {
+        tokens.push("--pmc".to_string());
+        tokens.push(pmc);
+    } else {
+        return Err("enter a full-text URL or a PMC id");
+    }
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/papers corpus --query <q> --out <dir> [--max-docs n]`.
+fn papers_corpus_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let query = form.text_value("query").trim().to_string();
+    if query.is_empty() {
+        return Err("enter a subject first");
+    }
+    let out = form.text_value("out").trim().to_string();
+    if out.is_empty() {
+        return Err("enter a directory for the corpus");
+    }
+    let mut tokens = vec![
+        "papers".to_string(),
+        "corpus".to_string(),
+        "--query".to_string(),
+        query,
+        "--out".to_string(),
+        out,
+    ];
+    let max_docs = form.text_value("max_docs").trim().to_string();
+    if !max_docs.is_empty() && max_docs != "0" {
+        tokens.push("--max-docs".to_string());
+        tokens.push(max_docs);
+    }
+    Ok(build_slash_command(&tokens))
+}
+
+/// `--sources a,b` from a comma-separated field, whitespace dropped, or nothing.
+fn push_sources(tokens: &mut Vec<String>, form: &crate::form::Form) {
+    let sources: Vec<String> = form
+        .text_value("sources")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !sources.is_empty() {
+        tokens.push("--sources".to_string());
+        tokens.push(sources.join(","));
+    }
+}
+
+/// `<flag> <value>` when the field is non-empty, nothing otherwise.
+fn push_opt(tokens: &mut Vec<String>, flag: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        tokens.push(flag.to_string());
+        tokens.push(value.to_string());
+    }
+}
+
 /// Build `/workflow show <name>` from the `workflow.show` form.
 fn workflow_show_command(form: &crate::form::Form) -> Result<String, &'static str> {
     let name = form.text_value("name").trim().to_string();
@@ -6782,6 +6980,156 @@ mod tests {
                     c.id
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_papers_engine_is_reachable_from_the_palette() {
+        // Parity, measured 2026-09-05: `prism papers` (search, sweep,
+        // full-text, corpus) had no palette entry. Each is a form that
+        // dispatches the same slash command a human could type.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        for id in [
+            "papers.search",
+            "papers.sweep",
+            "papers.fulltext",
+            "papers.corpus",
+        ] {
+            assert!(
+                crate::command::CATALOG.iter().any(|c| c.id == id),
+                "{id} must be in the catalog"
+            );
+            assert_eq!(crate::command::effect(id), "opens a form", "{id}");
+            assert!(app.dispatch_command(id), "{id} dispatches");
+            assert!(app.form.is_some(), "{id} opens a form");
+            app.form = None;
+        }
+    }
+
+    #[test]
+    fn papers_forms_compose_the_engine_commands() {
+        // Search: query is required; sources and limit ride along only when
+        // given, so the CLI's own defaults (every source, 20) apply otherwise.
+        let form = Form::new("t", "go", vec![FormField::text("query", "Query", "")]);
+        assert_eq!(papers_search_command(&form), Err("enter a query first"));
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("query", "Query", "GRCop-42 creep"),
+                FormField::text("sources", "Sources", " arxiv, osti "),
+                FormField::text("limit", "Limit", "5"),
+            ],
+        );
+        assert_eq!(
+            papers_search_command(&form).unwrap(),
+            "/papers search --query 'GRCop-42 creep' --sources arxiv,osti --limit 5"
+        );
+        // Sweep: max-pages instead of a single page.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("query", "Query", "ODS steel"),
+                FormField::text("sources", "Sources", ""),
+                FormField::text("max_pages", "Max pages", "2"),
+            ],
+        );
+        assert_eq!(
+            papers_sweep_command(&form).unwrap(),
+            "/papers sweep --query 'ODS steel' --max-pages 2"
+        );
+        // Full text: a URL or a PMC id, never neither, never both.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("url", "URL", ""),
+                FormField::text("pmc", "PMC id", ""),
+            ],
+        );
+        assert_eq!(
+            papers_fulltext_command(&form),
+            Err("enter a full-text URL or a PMC id")
+        );
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("url", "URL", ""),
+                FormField::text("pmc", "PMC id", "PMC5228121"),
+            ],
+        );
+        assert_eq!(
+            papers_fulltext_command(&form).unwrap(),
+            "/papers full-text --pmc PMC5228121"
+        );
+        // Corpus: query and an output directory.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("query", "Query", "refractory HEA oxidation"),
+                FormField::text("out", "Directory", "corpus/hea"),
+                FormField::text("max_docs", "Max documents", "0"),
+            ],
+        );
+        assert_eq!(
+            papers_corpus_command(&form).unwrap(),
+            "/papers corpus --query 'refractory HEA oxidation' --out corpus/hea"
+        );
+    }
+
+    #[test]
+    fn a_long_palette_title_is_clipped_to_its_column() {
+        // Live 2026-09-05: a 25-character title ran into its description
+        // ("full textJATS or PDF…") and pushed the row past the border. The
+        // title column is 24 wide; a title that does not fit is clipped, and
+        // every row ends where the frame does.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        app.open_palette();
+        for c in "full text".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        // The column itself, with a title that does not fit.
+        let cell = crate::render::palette_title_cell("Fetch a paper's full text");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(cell.as_str()),
+            24,
+            "{cell:?}"
+        );
+        assert!(cell.ends_with('…'), "{cell:?}");
+        let cell = crate::render::palette_title_cell("Short");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(cell.as_str()),
+            24,
+            "{cell:?}"
+        );
+        let palette_rows: Vec<&String> = rows.iter().filter(|r| r.contains("▸")).collect();
+        assert!(!palette_rows.is_empty(), "the filtered palette shows rows");
+        for r in &palette_rows {
+            assert!(
+                !r.contains("textJATS"),
+                "title and description never touch: {r:?}"
+            );
+            let trimmed = r.trim_end();
+            assert!(
+                trimmed.ends_with("│ │") || trimmed.ends_with('│'),
+                "the row ends at the frame: {r:?}"
+            );
         }
     }
 

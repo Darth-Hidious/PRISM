@@ -4466,6 +4466,14 @@ fn draw_gh_panel(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+/// The palette's title column, exactly 24 columns: a longer title is clipped
+/// with an ellipsis rather than running into its description (live
+/// 2026-09-05: "Fetch a paper's full textJATS or PDF…" pushed the row past
+/// the frame).
+pub(crate) fn palette_title_cell(title: &str) -> String {
+    format!("{:<24}", clip(title, 24))
+}
+
 fn draw_command_palette(f: &mut Frame, app: &App) {
     let t = app.theme();
     let area = overlay_area(f, 70, 60);
@@ -4565,8 +4573,10 @@ fn draw_command_palette(f: &mut Frame, app: &App) {
                         .min(44);
                     let mut spans = vec![
                         Span::styled(tag, Style::default().fg(t.muted)),
+                        // The title column is 24 wide; a longer title is clipped
+                        // rather than running into its description.
                         Span::styled(
-                            format!("{:<24}", c.title),
+                            palette_title_cell(c.title),
                             Style::default().fg(t.text).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(clip(c.description, desc_max), Style::default().fg(t.dim)),
