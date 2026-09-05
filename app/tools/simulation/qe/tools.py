@@ -25,40 +25,75 @@ from app.tools.simulation.qe.pseudos import resolve_pseudopotentials
 from app.tools.simulation.qe import runtime as qe_runtime
 
 
+STRUCTURE_FORMS = (
+    "a path to a file pymatgen can read (CIF/POSCAR/xyz), a cache:// reference from "
+    "structure_import or a MACE job, or a structure as a dict or JSON text — either "
+    "{lattice: 3x3 Å, species: [...], coords: [...], cartesian?: bool} or a pymatgen as_dict()"
+)
+
+
+def _structure_from_cache(ref: str):
+    """A `cache://` reference from structure_import / a MACE job, read from the
+    shared structure cache. Raises with the reason when it cannot be."""
+    from pymatgen.core import Structure
+
+    from app.tools.simulation.mace.cache import CacheStore
+    from app.tools.simulation.mace.cache.hashing import parse_cache_uri
+    from app.tools.simulation.mace.jobs.runner import get_cache_dir
+
+    key, _kind = parse_cache_uri(ref)
+    cif = CacheStore(get_cache_dir()).read_structure_cif(key)
+    if cif is None:
+        raise ValueError(f"no cached structure for {ref!r}")
+    return Structure.from_str(cif, fmt="cif")
+
+
 def _load_structure(spec: Union[str, Path, dict, object]):
-    """Build a pymatgen Structure from a tool argument.
+    """Build a pymatgen Structure from a tool argument, in every form the
+    tool's schema names (STRUCTURE_FORMS). Never invents coordinates.
 
-    Accepts:
-      - a path to any file pymatgen can read (CIF, POSCAR, xyz, ...),
-      - a dict ``{"lattice": [[...],[...],[...]], "species": [...],
-        "coords": [...], "cartesian": false}`` (fractional by default),
-      - a pymatgen Structure passed through unchanged.
-
-    Raises on anything else — never invents coordinates.
+    Measured 2026-09-05: the schema said "string", so the model sent
+    {lattice, species, coords} as JSON text and the loader treated it as a
+    filename ("Unrecognized extension"); a bare formula got the same error.
     """
+    import json
+
     from pymatgen.core import Lattice, Structure
 
     if isinstance(spec, Structure):
         return spec
-    if isinstance(spec, (str, Path)):
+    if isinstance(spec, Path):
         return Structure.from_file(str(spec))
+    if isinstance(spec, str):
+        text = spec.strip()
+        if text.startswith("cache://"):
+            return _structure_from_cache(text)
+        if text.startswith("{"):
+            try:
+                return _load_structure(json.loads(text))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"structure looks like JSON but does not parse: {exc}") from exc
+        if Path(text).is_file():
+            return Structure.from_file(text)
+        raise ValueError(
+            f"structure {spec!r} is neither a file that exists nor a structure: a formula alone "
+            f"does not define one. Pass {STRUCTURE_FORMS}."
+        )
     if isinstance(spec, dict):
-        for key in ("lattice", "species", "coords"):
-            if key not in spec:
-                raise ValueError(
-                    f"structure dict missing required key {key!r}; need "
-                    f"lattice, species, coords"
-                )
+        if "sites" in spec and ("lattice" in spec or "@module" in spec):
+            return Structure.from_dict(spec)
+        missing = [key for key in ("lattice", "species", "coords") if key not in spec]
+        if missing:
+            raise ValueError(
+                f"structure dict missing {missing}; pass {STRUCTURE_FORMS}"
+            )
         return Structure(
             Lattice(spec["lattice"]),
             spec["species"],
             spec["coords"],
             coords_are_cartesian=bool(spec.get("cartesian", False)),
         )
-    raise ValueError(
-        "structure must be a file path (CIF/POSCAR/...) or a dict with "
-        f"lattice/species/coords, got {type(spec).__name__}"
-    )
+    raise ValueError(f"structure must be {STRUCTURE_FORMS}; got {type(spec).__name__}")
 
 
 def _qe_resolve(**kwargs) -> dict:
@@ -234,8 +269,8 @@ def create_qe_tools(registry: ToolRegistry) -> None:
             "type": "object",
             "properties": {
                 "structure": {
-                    "type": "string",
-                    "description": "Structure to compute: a CIF/POSCAR path, a structure cache reference, or a formula the structure lookup resolves.",
+                    "type": ["string", "object"],
+                    "description": "Structure to compute: " + STRUCTURE_FORMS + ". A formula alone is refused.",
                 },
                 "calculation": {"type": "string", "enum": sorted(CALCULATION_TYPES), "description": "scf (default), relax, vc-relax, …"},
                 "ecutwfc_ry": {"type": "number", "exclusiveMinimum": 0, "description": "Wavefunction cutoff, Ry (default from settings)."},

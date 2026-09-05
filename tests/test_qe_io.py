@@ -511,3 +511,39 @@ def test_an_explicit_cutoff_wins_over_the_hints(tmp_path):
     out = qe_run(si_structure(), calculation="scf", settings=_settings(fake, pseudo, ecutwfc_ry=80.0), workdir=tmp_path / "run")
     cut = out["provenance"]["cutoffs"]
     assert cut["ecutwfc"] == 80.0 and "caller" in cut["source"], cut
+
+
+# ---------------------------------------------------------------------------
+# qe_run takes a structure in every form its schema names
+# ---------------------------------------------------------------------------
+
+def test_qe_run_accepts_the_structure_the_way_its_schema_invites():
+    """Run 3 of the SX500 research (2026-09-05): the schema said `structure`
+    is a string, so the model sent {lattice, species, coords} as JSON text;
+    the loader treated it as a filename ("Unrecognized extension") and the
+    run lost its one QE attempt. Run 2 sent the formula "Ni3Al" the schema
+    also invited and got the same error. A structure arrives as a file path,
+    a JSON string or dict of {lattice, species, coords}, or a pymatgen
+    as_dict(); a bare formula is refused with the accepted forms named."""
+    import json
+    from app.tools.simulation.qe.tools import _load_structure, create_qe_tools
+
+    fcc = {"lattice": [[0, 1.762, 1.762], [1.762, 0, 1.762], [1.762, 1.762, 0]], "species": ["Ni"], "coords": [[0, 0, 0]]}
+    from_text = _load_structure(json.dumps(fcc))
+    assert from_text.composition.reduced_formula == "Ni" and len(from_text) == 1
+    from_dict = _load_structure(fcc)
+    assert abs(from_dict.volume - from_text.volume) < 1e-9
+    from_pmg = _load_structure(si_structure().as_dict())
+    assert from_pmg.composition.reduced_formula == "Si" and len(from_pmg) == 2
+    with pytest.raises(ValueError) as exc:
+        _load_structure("Ni3Al")
+    msg = str(exc.value)
+    assert "Unrecognized extension" not in msg
+    assert "lattice" in msg and "cache" in msg.lower() and "Ni3Al" in msg, msg
+
+    registry = ToolRegistry()
+    create_qe_tools(registry)
+    schema = next(t for t in registry.list_tools() if t.name == "qe_run").input_schema
+    assert "object" in schema["properties"]["structure"]["type"], schema["properties"]["structure"]
+    desc = schema["properties"]["structure"]["description"].lower()
+    assert "lookup" not in desc and "refused" in desc, f"no promise the loader cannot keep: {desc}"
