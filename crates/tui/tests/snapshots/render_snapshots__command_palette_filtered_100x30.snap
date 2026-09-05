@@ -14,14 +14,14 @@ expression: rendered
 │  diagnostics ▸ Failed tool runs        runs /provenance failu… │ │
 │  marketplace ▸ Marketplace install     Install a… opens a form │ │
 │  marketplace ▸ Marketplace find        Semantic … opens a form │ │
+│  diagnostics ▸ Reload tools (hot)      Pic… runs /tools reload │ │
 │   navigation ▸ Workspace: Tools        Switch sidebar to … ←/→ │ │
 │  marketplace ▸ Marketplace publish     PRISM's o… opens a form │ │
 │  marketplace ▸ Marketplace search      Search do… opens a form │ │
 │      display ▸ Mission Control         The laun… opens a panel │ │
 │      science ▸ Promote ontology        DRAFT → A… opens a form │ │
 │      science ▸ Validate ontology       Parse and… opens a form │ │
-│      science ▸ Bind terms              Free-text… opens a form │ │
-│  … 46 more — ↓ to scroll or type to filter                     │ │
+│  … 48 more — ↓ to scroll or type to filter                     │ │
 │                                                                │ │
 └────────────────────────────────────────────────────────────────┘ │
                                                                    │

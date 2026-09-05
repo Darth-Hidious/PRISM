@@ -22,6 +22,7 @@ from app.tools.base import Tool, ToolRegistry
 from app.tools.simulation.qe.input_writer import CALCULATION_TYPES, write_input
 from app.tools.simulation.qe.output_parser import parse_output
 from app.tools.simulation.qe.pseudos import resolve_pseudopotentials
+from app.tools.simulation.qe import runtime as qe_runtime
 
 
 def _load_structure(spec: Union[str, Path, dict, object]):
@@ -177,9 +178,80 @@ _PARSE_DESCRIPTION = (
 )
 
 
+def _qe_status(**kwargs) -> dict:
+    return qe_runtime.status(config={})
+
+
+def _qe_run(**kwargs) -> dict:
+    structure = _load_structure(kwargs["structure"])
+    overrides = {k: kwargs[k] for k in qe_runtime.SETTINGS_KEYS if kwargs.get(k) is not None}
+    settings = qe_runtime.settings(config=overrides)
+    workdir = Path(kwargs.get("workdir") or (Path.home() / ".prism" / "qe" / "runs" / _run_stamp()))
+    return qe_runtime.qe_run(
+        structure,
+        calculation=kwargs.get("calculation", "scf"),
+        settings=settings,
+        workdir=workdir,
+        extra_input=kwargs.get("extra_input"),
+    )
+
+
+def _run_stamp() -> str:
+    import datetime as _dt
+
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+_RUN_DESCRIPTION = (
+    "Run Quantum ESPRESSO pw.x on a structure — write the input, run it on the "
+    "provisioned binary, parse the output. Returns total energy (eV), forces, "
+    "convergence, wall time, and a provenance block naming the binary, the "
+    "pseudopotential set and its manifest, cutoffs, k-points and smearing. "
+    "Evidence class is execution when the run converged. Defaults come from "
+    "`prism qe settings` (also in the command palette: Compute → QE settings); "
+    "any of them can be overridden per call. Unavailable when QE is not "
+    "provisioned — the result then names the remedy (`prism provision qe`), "
+    "never a guess."
+)
+
+
 def create_qe_tools(registry: ToolRegistry) -> None:
-    """Register the three QE I/O tools. Callers must have verified
-    ase + pymatgen are importable first (see check_qe_available)."""
+    """Register the QE tools. Callers must have verified ase + pymatgen are
+    importable first (see check_qe_available)."""
+    registry.register(Tool(
+        name="qe_status",
+        description=(
+            "Is Quantum ESPRESSO provisioned here? Binary, MPI launcher, "
+            "pseudopotential set (with its manifest) and the current run defaults."
+        ),
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        func=_qe_status,
+    ))
+    registry.register(Tool(
+        name="qe_run",
+        description=_RUN_DESCRIPTION,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "structure": {
+                    "type": "string",
+                    "description": "Structure to compute: a CIF/POSCAR path, a structure cache reference, or a formula the structure lookup resolves.",
+                },
+                "calculation": {"type": "string", "enum": sorted(CALCULATION_TYPES), "description": "scf (default), relax, vc-relax, …"},
+                "ecutwfc_ry": {"type": "number", "exclusiveMinimum": 0, "description": "Wavefunction cutoff, Ry (default from settings)."},
+                "ecutrho_ratio": {"type": "number", "exclusiveMinimum": 0, "description": "ecutrho / ecutwfc (default 4)."},
+                "kspacing_inv_angstrom": {"type": "number", "exclusiveMinimum": 0, "description": "Reciprocal k-point spacing in 1/Å (default 0.15)."},
+                "smearing": {"type": "string", "description": "QE smearing: mv, mp, gaussian, fd."},
+                "degauss_ry": {"type": "number", "exclusiveMinimum": 0},
+                "nproc": {"type": "integer", "minimum": 1, "description": "MPI processes (default: all cores)."},
+                "workdir": {"type": "string", "description": "Where to write pw.in/pw.out (default ~/.prism/qe/runs/<stamp>)."},
+                "extra_input": {"type": "object", "description": "Extra pw.x namelist entries, {section: {key: value}}."},
+            },
+            "required": ["structure"],
+            "additionalProperties": False,
+        },
+        func=_qe_run,
+    ))
     registry.register(Tool(
         name="qe_resolve_pseudopotentials",
         description=_RESOLVE_DESCRIPTION,

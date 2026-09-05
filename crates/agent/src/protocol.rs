@@ -1865,7 +1865,7 @@ async fn execute_manual_tool_call(
 fn command_timeout_for_root(root: &str) -> Duration {
     match root {
         "workflow" | "ingest" | "query" | "run" | "research" | "deploy" | "publish" | "papers"
-        | "ontology" | "matkg" | "predict" | "reverify" => Duration::from_secs(300),
+        | "ontology" | "matkg" | "predict" | "reverify" | "qe" => Duration::from_secs(300),
         "node" | "mesh" => Duration::from_secs(60),
         _ => Duration::from_secs(30),
     }
@@ -8788,9 +8788,16 @@ async fn handle_command(
         // an honest-looking lie. `show` has no such gap: it only reads.
         // The knowledge planes, in-app (parity, 2026-09-05): each runs the
         // CLI subcommand a human could type and shows its output as it is.
-        _ if ["ontology", "provenance", "reverify", "matkg", "predict"]
-            .iter()
-            .any(|r| trimmed == format!("/{r}") || trimmed.starts_with(&format!("/{r} "))) =>
+        _ if [
+            "ontology",
+            "provenance",
+            "reverify",
+            "matkg",
+            "predict",
+            "qe",
+        ]
+        .iter()
+        .any(|r| trimmed == format!("/{r}") || trimmed.starts_with(&format!("/{r} "))) =>
         {
             let tokens = parse_command_tail(&trimmed[1..])?;
             let root = tokens[0].clone();
@@ -8799,6 +8806,7 @@ async fn handle_command(
                 "provenance" => "Provenance",
                 "reverify" => "Re-verification",
                 "matkg" => "MatKG",
+                "qe" => "Quantum ESPRESSO",
                 _ => "Predict",
             };
             match run_cli_backed_slash_command(&tokens, slash_ctx).await {
@@ -8835,6 +8843,23 @@ async fn handle_command(
                     emit_view("papers", title, &body, "info");
                 }
                 Err(e) => emit_view("papers", "Papers", &format!("{e}"), "warning"),
+            }
+            emit_notification("ui.turn.complete", serde_json::json!({}));
+            Ok(true)
+        }
+        // `/tools reload` — rebuild the Python tool registry in place, so a
+        // capability provisioned or authored mid-session (QE, a plugin) is
+        // usable without restarting the kernel. The report names what
+        // appeared and what vanished; a failed rebuild keeps the old catalog.
+        _ if trimmed == "/tools reload" => {
+            match tool_server.reload_tools().await {
+                Ok(report) => emit_view(
+                    "tools",
+                    "Tools reloaded",
+                    &serde_json::to_string_pretty(&report).unwrap_or_default(),
+                    "info",
+                ),
+                Err(e) => emit_view("tools", "Tools reload failed", &format!("{e}"), "warning"),
             }
             emit_notification("ui.turn.complete", serde_json::json!({}));
             Ok(true)

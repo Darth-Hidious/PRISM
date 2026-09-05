@@ -642,6 +642,9 @@ pub enum FormTarget {
     DiscourseRun,
     Publish,
     Report,
+    /// Quantum ESPRESSO (palette `qe.settings`, `qe.run`).
+    QeSettings,
+    QeRun,
     /// Read one web page as text via agent-browser (palette `browse.open`).
     /// Submit dispatches `/browse <url>`, which the backend runs through the
     /// SAME `agent-browser` path the agent's `web_browse` tool uses.
@@ -3066,9 +3069,13 @@ impl App {
             | FormTarget::ScheduleCancel
             | FormTarget::DiscourseRun
             | FormTarget::Publish
-            | FormTarget::Report => {
+            | FormTarget::Report
+            | FormTarget::QeSettings
+            | FormTarget::QeRun => {
                 let f = &pane.form;
                 let composed = match pane.target {
+                    FormTarget::QeSettings => qe_settings_command(f),
+                    FormTarget::QeRun => qe_run_command(f),
                     FormTarget::ScheduleCreate => schedule_create_command(f),
                     FormTarget::ScheduleCancel => positional_command(
                         f,
@@ -3396,6 +3403,47 @@ impl App {
             ],
         );
         self.open_form(form, FormTarget::Report);
+    }
+
+    /// Palette `qe.settings` — the run defaults every pw.x run starts from.
+    pub fn open_qe_settings_form(&mut self) {
+        let form = Form::new(
+            "Quantum ESPRESSO settings — empty fields keep their value",
+            "save",
+            vec![
+                FormField::text("ecutwfc_ry", "Wavefunction cutoff (Ry)", "")
+                    .with_note("default 60; PseudoDojo standard set"),
+                FormField::text("kspacing_inv_angstrom", "k-point spacing (1/Å)", "")
+                    .with_note("default 0.15"),
+                FormField::text("smearing", "Smearing", "")
+                    .with_note("mv (default), mp, gaussian, fd"),
+                FormField::text("degauss_ry", "Degauss (Ry)", "").with_note("default 0.01"),
+                FormField::text("nproc", "MPI processes", "").with_note("default: all cores"),
+                FormField::text("pw_path", "pw.x path", "")
+                    .with_note("default ~/.prism/qe/bin/pw.x"),
+                FormField::text("pseudo_dir", "Pseudopotential directory", "")
+                    .with_note("default: the provisioned PseudoDojo set"),
+            ],
+        );
+        self.open_form(form, FormTarget::QeSettings);
+    }
+
+    /// Palette `qe.run` — one pw.x calculation on a structure.
+    pub fn open_qe_run_form(&mut self) {
+        let form = Form::new(
+            "Run Quantum ESPRESSO (pw.x)",
+            "run",
+            vec![
+                FormField::text("structure", "Structure", "")
+                    .with_note("CIF/POSCAR path, cache reference, or formula"),
+                FormField::text("calc", "Calculation", "")
+                    .with_note("scf (default), relax, vc-relax"),
+                FormField::text("ecutwfc_ry", "Cutoff override (Ry)", ""),
+                FormField::text("kspacing_inv_angstrom", "k-spacing override (1/Å)", ""),
+                FormField::text("nproc", "Processes override", ""),
+            ],
+        );
+        self.open_form(form, FormTarget::QeRun);
     }
 
     /// Palette `workflow.run` — name, optional `--set key=value` pairs, and
@@ -5183,6 +5231,14 @@ impl App {
             "discourse.run" => self.open_discourse_run_form(),
             "publish.artifact" => self.open_publish_form(),
             "report.bug" => self.open_report_form(),
+            "qe.status" => {
+                let _ = self.backend.send_command("/qe status");
+            }
+            "tools.reload" => {
+                let _ = self.backend.send_command("/tools reload");
+            }
+            "qe.settings" => self.open_qe_settings_form(),
+            "qe.run" => self.open_qe_run_form(),
             "account.show" => self.open_account(),
             "sessions.show" => self.open_sessions(),
             "tools.show" => self.open_tools_window(),
@@ -7008,6 +7064,54 @@ fn report_command(form: &crate::form::Form) -> Result<String, &'static str> {
     Ok(build_slash_command(&tokens))
 }
 
+/// The QE settings a form may set, in the order they are emitted.
+const QE_SETTING_FIELDS: &[&str] = &[
+    "ecutwfc_ry",
+    "kspacing_inv_angstrom",
+    "smearing",
+    "degauss_ry",
+    "nproc",
+    "pw_path",
+    "pseudo_dir",
+];
+
+/// `/qe settings [--set k=v]…` — only the fields the scientist filled in;
+/// nothing filled in is a plain show.
+fn qe_settings_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let mut tokens = vec!["qe".to_string(), "settings".to_string()];
+    for field in QE_SETTING_FIELDS {
+        let value = form.text_value(field).trim().to_string();
+        if !value.is_empty() {
+            tokens.push("--set".to_string());
+            tokens.push(format!("{field}={value}"));
+        }
+    }
+    Ok(build_slash_command(&tokens))
+}
+
+/// `/qe run --structure <s> [--calc c] [--set k=v]…` from the `qe.run` form.
+fn qe_run_command(form: &crate::form::Form) -> Result<String, &'static str> {
+    let structure = form.text_value("structure").trim().to_string();
+    if structure.is_empty() {
+        return Err("name a structure: a CIF path, a cache reference or a formula");
+    }
+    let mut tokens = vec![
+        "qe".to_string(),
+        "run".to_string(),
+        "--structure".to_string(),
+        structure,
+    ];
+    push_opt(&mut tokens, "--calc", &form.text_value("calc"));
+    for field in ["ecutwfc_ry", "kspacing_inv_angstrom", "nproc"] {
+        let value = form.text_value(field).trim().to_string();
+        if !value.is_empty() {
+            tokens.push("--set".to_string());
+            tokens.push(format!("{field}={value}"));
+        }
+    }
+    Ok(build_slash_command(&tokens))
+}
+
 /// Build `/workflow show <name>` from the `workflow.show` form.
 fn workflow_show_command(form: &crate::form::Form) -> Result<String, &'static str> {
     let name = form.text_value("name").trim().to_string();
@@ -7855,6 +7959,89 @@ mod tests {
         assert!(
             screen.contains("END"),
             "the tail of a long line is on screen, wrapped: {screen}"
+        );
+    }
+
+    #[test]
+    fn tools_can_be_hot_reloaded_from_the_palette() {
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        assert!(
+            crate::command::CATALOG
+                .iter()
+                .any(|c| c.id == "tools.reload")
+        );
+        assert_eq!(crate::command::effect("tools.reload"), "runs /tools reload");
+        assert!(app.dispatch_command("tools.reload"));
+    }
+
+    #[test]
+    fn quantum_espresso_is_reachable_from_the_palette() {
+        // QE as a standard run (2026-09-05): materials scientists see and
+        // change the run settings, and launch a run, from the palette.
+        let mut app = App::new(crate::backend::BackendHandle::fake(FakeScenario::BasicChat));
+        app.home.open = false;
+        assert!(crate::command::CATALOG.iter().any(|c| c.id == "qe.status"));
+        assert_eq!(crate::command::effect("qe.status"), "runs /qe status");
+        assert!(app.dispatch_command("qe.status"));
+        for id in ["qe.settings", "qe.run"] {
+            assert!(crate::command::CATALOG.iter().any(|c| c.id == id), "{id}");
+            assert_eq!(crate::command::effect(id), "opens a form", "{id}");
+            assert!(app.dispatch_command(id), "{id}");
+            assert!(app.form.is_some(), "{id} opens a form");
+            app.form = None;
+        }
+    }
+
+    #[test]
+    fn qe_forms_compose_settings_and_run_commands() {
+        // Settings: only the fields the scientist filled in are set.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("ecutwfc_ry", "Cutoff", "80"),
+                FormField::text("kspacing_inv_angstrom", "k-spacing", ""),
+                FormField::text("smearing", "Smearing", "mp"),
+                FormField::text("degauss_ry", "Degauss", ""),
+                FormField::text("nproc", "Processes", "8"),
+                FormField::text("pw_path", "pw.x", ""),
+                FormField::text("pseudo_dir", "Pseudopotentials", ""),
+            ],
+        );
+        assert_eq!(
+            qe_settings_command(&form).unwrap(),
+            "/qe settings --set ecutwfc_ry=80 --set smearing=mp --set nproc=8"
+        );
+        let empty = Form::new("t", "go", vec![FormField::text("ecutwfc_ry", "Cutoff", "")]);
+        assert_eq!(
+            qe_settings_command(&empty).unwrap(),
+            "/qe settings",
+            "nothing set = show"
+        );
+        // Run: structure required; calc and overrides ride along.
+        let form = Form::new(
+            "t",
+            "go",
+            vec![
+                FormField::text("structure", "Structure", "mp-149"),
+                FormField::text("calc", "Calculation", "relax"),
+                FormField::text("ecutwfc_ry", "Cutoff", "50"),
+                FormField::text("nproc", "Processes", ""),
+            ],
+        );
+        assert_eq!(
+            qe_run_command(&form).unwrap(),
+            "/qe run --structure mp-149 --calc relax --set ecutwfc_ry=50"
+        );
+        let form = Form::new(
+            "t",
+            "go",
+            vec![FormField::text("structure", "Structure", "")],
+        );
+        assert_eq!(
+            qe_run_command(&form),
+            Err("name a structure: a CIF path, a cache reference or a formula")
         );
     }
 

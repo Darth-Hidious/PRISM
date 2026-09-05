@@ -106,6 +106,38 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "tools.reload",
+        title: "Reload tools (hot)",
+        description: "Pick up provisioned or authored tools without a restart",
+        category: "Diagnostics",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "qe.status",
+        title: "QE status",
+        description: "Quantum ESPRESSO: binary, pseudopotentials, defaults",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "qe.settings",
+        title: "QE settings",
+        description: "Cutoff, k-spacing, smearing, processes — saved for every run",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
+        id: "qe.run",
+        title: "Run QE (pw.x)",
+        description: "Write, run and parse one calculation on a structure",
+        category: "Science",
+        keybind: "palette",
+        suggested: false,
+    },
+    Command {
         id: "schedule.list",
         title: "Schedules",
         description: "Every schedule, its state and last outcome",
@@ -950,6 +982,8 @@ pub fn effect(id: &str) -> String {
         | "discourse.run"
         | "publish.artifact"
         | "report.bug"
+        | "qe.settings"
+        | "qe.run"
         | "node.up"
         | "goal.set"
         | "campaign.start"
@@ -976,6 +1010,8 @@ pub fn effect(id: &str) -> String {
         "schedule.list" => "runs /schedule list",
         "discourse.list" => "runs /discourse list",
         "plugins.list" => "runs /plugins list",
+        "qe.status" => "runs /qe status",
+        "tools.reload" => "runs /tools reload",
         "node.status" => "runs /node status",
         "campaign.list" => "runs /campaign list",
         "workflow.list" => "runs /workflow list",

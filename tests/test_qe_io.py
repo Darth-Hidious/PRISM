@@ -342,12 +342,14 @@ def _registry():
     return reg
 
 
-def test_create_qe_tools_registers_three_tools():
+def test_create_qe_tools_registers_the_io_tools_and_the_runner():
     names = {t.name for t in _registry().list_tools()}
     assert names == {
         "qe_resolve_pseudopotentials",
         "qe_write_input",
         "qe_parse_output",
+        "qe_status",
+        "qe_run",
     }
 
 

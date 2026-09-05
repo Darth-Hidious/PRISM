@@ -355,6 +355,11 @@ enum Commands {
         #[command(subcommand)]
         command: PyironCommands,
     },
+    /// Quantum ESPRESSO as a standard run: status, settings, run (also in the palette).
+    Qe {
+        #[command(subcommand)]
+        command: QeCommands,
+    },
     /// Provision science Python extras or vendor wheels for an offline node.
     Provision {
         #[command(subcommand)]
@@ -1174,6 +1179,28 @@ enum NotebookCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum QeCommands {
+    /// Is Quantum ESPRESSO provisioned: binary, launcher, pseudopotential set, defaults.
+    Status,
+    /// Show, or set and show, the persisted run defaults (`--set ecutwfc_ry=60`).
+    Settings {
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+    /// Write, run and parse one pw.x calculation on a structure.
+    Run {
+        #[arg(long)]
+        structure: String,
+        #[arg(long, default_value = "scf")]
+        calc: String,
+        #[arg(long)]
+        workdir: Option<String>,
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum PyironCommands {
     /// Show PyIron installation status (version, venv health).
     Status,
@@ -1185,6 +1212,12 @@ enum PyironCommands {
 
 #[derive(Debug, Subcommand)]
 enum ProvisionCommands {
+    /// Quantum ESPRESSO: build pw.x from source into ~/.prism/qe and fetch a
+    /// pseudopotential set with a manifest. `--dry-run` prints the recipe.
+    Qe {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Install one science extra into the active PRISM Python environment.
     Extra {
         /// Extra name: qe, calphad, mace, precipitation, lpbf, simulation, or ml.
@@ -2754,6 +2787,49 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Qe { command } => {
+            let mut args: Vec<String> = vec!["-m".into(), "app.tools.simulation.qe.cli".into()];
+            match command {
+                QeCommands::Status => args.push("status".into()),
+                QeCommands::Settings { set } => {
+                    args.push("settings".into());
+                    for pair in set {
+                        args.push("--set".into());
+                        args.push(pair);
+                    }
+                }
+                QeCommands::Run {
+                    structure,
+                    calc,
+                    workdir,
+                    set,
+                } => {
+                    args.extend([
+                        "run".into(),
+                        "--structure".into(),
+                        structure,
+                        "--calc".into(),
+                        calc,
+                    ]);
+                    if let Some(w) = workdir {
+                        args.push("--workdir".into());
+                        args.push(w);
+                    }
+                    for pair in set {
+                        args.push("--set".into());
+                        args.push(pair);
+                    }
+                }
+            }
+            let status = std::process::Command::new(&python)
+                .args(&args)
+                .current_dir(&project_root)
+                .status()
+                .context("failed to start the QE command module")?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         Commands::Pyiron { command } => match command {
             PyironCommands::Status => match pyiron_cmd::status()? {
                 Some(v) => println!("PyIron {v} (venv: ~/.prism/venv)"),
@@ -2766,6 +2842,21 @@ async fn main() -> Result<()> {
             PyironCommands::Update => println!("{}", pyiron_cmd::update()?),
         },
         Commands::Provision { command } => match command {
+            ProvisionCommands::Qe { dry_run } => {
+                let mut args: Vec<String> =
+                    vec!["-m".into(), "app.tools.simulation.qe.provision".into()];
+                if dry_run {
+                    args.push("--dry-run".into());
+                }
+                let status = std::process::Command::new(&python)
+                    .args(&args)
+                    .current_dir(&project_root)
+                    .status()
+                    .context("failed to start the QE provisioning module")?;
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            }
             ProvisionCommands::Extra { name, wheelhouse } => {
                 prism_python_bridge::venv::install_extra(
                     &python,

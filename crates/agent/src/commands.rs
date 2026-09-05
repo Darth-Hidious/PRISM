@@ -352,6 +352,8 @@ const CLI_BACKED_ROOTS: &[&str] = &[
     "reverify",
     "matkg",
     "predict",
+    // Quantum ESPRESSO as a standard run (2026-09-05): `/qe status|settings|run`.
+    "qe",
 ];
 
 pub fn builtin_help_text() -> String {
@@ -386,6 +388,10 @@ pub fn builtin_help_text() -> String {
             .to_string(),
     );
     lines.push("  /matkg load <path>   /predict <model> [--task t] [--input json]".to_string());
+    lines.push(
+        "  /qe status | settings [--set k=v] | run --structure <S> [--calc scf] [--set k=v]"
+            .to_string(),
+    );
     lines.push("  /marketplace search <query>".to_string());
     lines.push("  /models list [--provider google]".to_string());
     lines.push("  /gpus".to_string());
@@ -417,6 +423,12 @@ mod tests {
     /// with "Unsupported slash command root: use", because the allowlist that
     /// gates dispatch is a SECOND list that nothing kept in sync with the
     /// first. Found by typing it into the running TUI, not by any test.
+    #[test]
+    fn quantum_espresso_is_a_dispatchable_slash_root() {
+        assert!(is_cli_backed_slash_root("qe"));
+        assert!(builtin_help_text().contains("/qe "), "help advertises it");
+    }
+
     #[test]
     fn the_knowledge_planes_are_dispatchable_slash_roots() {
         for root in ["ontology", "provenance", "reverify", "matkg", "predict"] {
