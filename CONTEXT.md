@@ -129,6 +129,8 @@ mutation-tested test each. Prior-session WIP is preserved untouched on `754eccca
 DONE `f87cf6f6`: footer word derives from the turn (busy/working/Ready; text-flush wrote Ready mid-turn); footer trims optional groups so "Ctrl-C quit" survives narrow columns.
 DONE `0c5e3ab3`: search digest carries "databases asked" + "branches" lines (model burned 4 recalls to name databases); recall declares durable memory as its source (was SOURCE NOT REPORTED).
 DONE `49793a4e`: summary never carries the tool name (was 'recall: recall: 3 results'); sidebar tool rows carry the result's first line; search results + papers CLI declare evidence class/sources; recall inherits class; home shortcuts are shifted letters; table cells inline-parsed.
+DONE `c275c49e`: OSTI.GOV is the tenth literature source (page/rows paging; total only in a header → available None).
+DONE `f92aea48`: palette rows show what Enter does (was 'palette'); key window offers Semantic Scholar/Lens/patent-table keys + palette entry search.keys; find_tools declares tool catalog; recall labels tool-less records by action type; footer drops credits before the quit hint.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
