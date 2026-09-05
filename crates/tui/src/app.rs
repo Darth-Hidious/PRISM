@@ -741,6 +741,16 @@ pub struct FormPane {
     pub target: FormTarget,
 }
 
+/// A wall only a human can pass, as the agent reported it: what to obtain,
+/// where (a link the human opens), and why the agent could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocker {
+    pub source: String,
+    pub what: String,
+    pub url: String,
+    pub reason: String,
+}
+
 /// Keys offered in the API-key window, in display order: LLM providers, then
 /// the search sources that need one. Every entry is saved to
 /// `~/.prism/api_keys.json` and hydrated into the environment at startup, so
@@ -781,6 +791,10 @@ pub struct App {
     /// Unlike `is_waiting`, streaming deltas do not clear this lifecycle bit.
     pub(crate) turn_in_progress: bool,
     pub approval_pending: Option<(String, String)>,
+    /// Open tasks for a human — licences, accounts, subscriptions the agent
+    /// hit and cannot obtain. One per source; the palette entry "Needs a
+    /// human" lists them with their links.
+    pub blockers: Vec<Blocker>,
     /// Why THIS call must be decided by a human (destructive tripwire). While
     /// set, 'a' approves this one call and whitelists nothing.
     pub approval_reason: Option<String>,
@@ -1072,6 +1086,7 @@ impl App {
             is_waiting: false,
             turn_in_progress: false,
             approval_pending: None,
+            blockers: Vec::new(),
             approval_reason: None,
             approval_code: None,
             approval_scroll: 0,
@@ -2552,6 +2567,31 @@ impl App {
                 self.request_artifact_fetch(&artifact.id);
             }
         }
+    }
+
+    /// Palette `human.needs`: every wall the agent hit that only a human can
+    /// pass, with what to obtain and the link. PRISM never opens a browser
+    /// itself; the link is shown for the human to open (Ctrl-P → Links also
+    /// lists it from the transcript).
+    pub fn open_needs_human_panel(&mut self) {
+        let body = if self.blockers.is_empty() {
+            "Nothing is waiting on a human right now.\n\nWhen the agent hits a licence, account or \
+             subscription wall it cannot pass, the source appears here with what to obtain and \
+             where — and a toast says so at the time."
+                .to_string()
+        } else {
+            let mut body = String::new();
+            for (i, b) in self.blockers.iter().enumerate() {
+                body.push_str(&format!(
+                    "{}. {}\n   what a human must obtain: {}\n   where: {}\n   why the agent could not: {}\n\n",
+                    i + 1, b.source, b.what, b.url, b.reason
+                ));
+            }
+            body.push_str("Open the link in your browser; once the account or licence exists, tell the \
+                           agent (or set the key under Ctrl-P → Search sources & keys) and search again.");
+            body
+        };
+        self.open_detail_view("Needs a human".to_string(), body);
     }
 
     /// Show `body` in the existing view panel (single tab, scrollable,
@@ -5474,6 +5514,7 @@ impl App {
             "links.open" => self.open_link_picker(),
             "cost.show" => self.modal = Some(Modal::Cost),
             "model.show" => self.open_model_picker(),
+            "human.needs" => self.open_needs_human_panel(),
             "account.sso" => self.push_system(SSO_SIGN_IN_NOTE),
             "model.fallback.add" => self.open_fallback_add_form(),
             "model.fallback.list" => {
@@ -6177,6 +6218,35 @@ impl App {
                 self.model = model;
                 self.session_mode = mode;
                 self.message_count = message_count;
+            }
+            AgentMsg::NeedsHuman {
+                source,
+                what,
+                url,
+                reason,
+            } => {
+                let source = sanitize_for_render(&source);
+                if self.blockers.iter().any(|b| b.source == source) {
+                    return;
+                }
+                let blocker = Blocker {
+                    source: source.clone(),
+                    what: sanitize_for_render(&what),
+                    url: sanitize_for_render(&url),
+                    reason: sanitize_for_render(&reason),
+                };
+                self.push_system(&format!(
+                    "[needs a human] {} — {}\n  where: {}\n  why: {}",
+                    blocker.source, blocker.what, blocker.url, blocker.reason
+                ));
+                self.toast(
+                    format!(
+                        "{} needs a human: {} — Ctrl-P → Needs a human",
+                        blocker.source, blocker.what
+                    ),
+                    ToastKind::Warn,
+                );
+                self.blockers.push(blocker);
             }
             AgentMsg::Activity { id, text, done } => {
                 self.activities.retain(|(k, _)| *k != id);
@@ -7870,6 +7940,92 @@ mod tests {
                 "with no room beside the value the note is not on the label row: {row:?}"
             );
         }
+    }
+
+    fn cnki_wall() -> AgentMsg {
+        AgentMsg::NeedsHuman {
+            source: "cnki".into(),
+            what: "an institutional CNKI licence (sold per database module)".into(),
+            url: "https://oversea.cnki.net/".into(),
+            reason: "robots.txt disallows /; www.cnki.net does not answer from here".into(),
+        }
+    }
+
+    /// "It should show in the command palette … a human needs to make an
+    /// account, with a link to the website." The wall arrives once, is
+    /// logged with the link, and the palette entry opens the list.
+    #[test]
+    fn a_licence_wall_becomes_a_task_for_a_human_with_the_link() {
+        let mut app = fresh();
+        app.apply_agent_msg(cnki_wall());
+        assert_eq!(app.blockers.len(), 1);
+        let last = app
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(last.contains("https://oversea.cnki.net/"), "{last}");
+        assert!(last.contains("needs a human"), "{last}");
+
+        app.dispatch_command("human.needs");
+        assert!(app.view.open);
+        let body = app
+            .view
+            .tabs
+            .first()
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        assert!(
+            body.contains("cnki") && body.contains("https://oversea.cnki.net/"),
+            "{body}"
+        );
+        assert!(body.contains("institutional CNKI licence"), "{body}");
+    }
+
+    #[test]
+    fn the_same_wall_is_announced_once() {
+        let mut app = fresh();
+        app.apply_agent_msg(cnki_wall());
+        app.apply_agent_msg(cnki_wall());
+        assert_eq!(
+            app.blockers.len(),
+            1,
+            "one task per source, however often it is hit"
+        );
+    }
+
+    #[test]
+    fn the_palette_counts_open_human_tasks() {
+        let mut app = fresh();
+        app.apply_agent_msg(cnki_wall());
+        app.open_palette();
+        app.palette.query = "Needs a human".into();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::render::draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("Needs a human (1)"), "{screen}");
+    }
+
+    #[test]
+    fn with_nothing_waiting_the_panel_says_so() {
+        let mut app = fresh();
+        app.dispatch_command("human.needs");
+        let body = app
+            .view
+            .tabs
+            .first()
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        assert!(body.contains("Nothing is waiting on a human"), "{body}");
     }
 
     #[test]

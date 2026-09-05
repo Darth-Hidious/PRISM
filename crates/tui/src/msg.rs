@@ -152,6 +152,14 @@ pub enum AgentMsg {
         text: String,
         done: bool,
     },
+    /// A wall only a human can pass: what to obtain, where, and why the
+    /// agent could not.
+    NeedsHuman {
+        source: String,
+        what: String,
+        url: String,
+        reason: String,
+    },
 
     // ── Streaming ────────────────────────────────────────────────────
     /// `ui.text.delta` — a chunk of visible answer text.
@@ -632,6 +640,28 @@ pub fn parse_notification(msg: &Value) -> AgentMsg {
         },
 
         // ── Status ───────────────────────────────────────────────────
+        "ui.needs_human" => AgentMsg::NeedsHuman {
+            source: params
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            what: params
+                .get("what")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            url: params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            reason: params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        },
         "ui.activity" => AgentMsg::Activity {
             id: params
                 .get("id")

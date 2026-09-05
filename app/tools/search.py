@@ -199,6 +199,7 @@ def _eastern_search_impl(**kwargs) -> dict:
         "count": len(results),
         "source": "eastern_literature",
         "source_status": out["source_status"],
+        "needs_human": out.get("needs_human", []),
     }
 
 
@@ -359,6 +360,9 @@ def _prior_art_search(**kwargs) -> dict:
             # "no Chinese results" is never mistaken for "nothing published".
             out["eastern_source_status"] = east.get("source_status", {})
             out["sources"].extend(_declare_eastern_sources(out["eastern_source_status"]))
+            # Licence / account walls, each with what a human must obtain and
+            # where. The agent loop announces these to the human once per source.
+            out["needs_human"] = east.get("needs_human", [])
         except Exception as exc:
             out["eastern_error"] = str(exc)
 

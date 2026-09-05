@@ -1455,6 +1455,9 @@ impl ItemAgent for OrchestratedAgent {
                     match &event {
                         // Background-activity notices are the parent's to show.
                         AgentEvent::Activity { .. } => {}
+                        // A child lane's licence wall is folded like its activity; the
+                        // parent's own tool calls announce theirs.
+                        AgentEvent::NeedsHuman { .. } => {}
                         AgentEvent::TextDelta { text } => {
                             streamed_text.push_str(text);
                             return;

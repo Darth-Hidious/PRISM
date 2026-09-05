@@ -826,6 +826,47 @@ fn raw_for_card(content: &str, raw: &str) -> Option<String> {
     (content != raw).then(|| raw.to_string())
 }
 
+/// Announce every `needs_human` item in a tool result that has not been
+/// announced this session; returns how many were. An item is a task only if it
+/// names a source and a place to go — a wall with no door is just an error.
+fn announce_needs_human(
+    payload: &Value,
+    seen: &mut std::collections::HashSet<String>,
+    emit: &mut dyn FnMut(AgentEvent),
+) -> usize {
+    let Some(items) = payload.get("needs_human").and_then(Value::as_array) else {
+        return 0;
+    };
+    let mut announced = 0;
+    for item in items {
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let url = item.get("url").and_then(Value::as_str).unwrap_or("").trim();
+        if source.is_empty() || url.is_empty() || !seen.insert(source.to_string()) {
+            continue;
+        }
+        emit(AgentEvent::NeedsHuman {
+            source: source.to_string(),
+            what: item
+                .get("what")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            url: url.to_string(),
+            reason: item
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        });
+        announced += 1;
+    }
+    announced
+}
+
 fn search_digest(tool: &str, result: &Value, fresh: usize) -> Option<String> {
     if !SEARCH_TOOLS.contains(&tool) {
         return None;
@@ -3446,6 +3487,8 @@ pub(crate) async fn run_turn_inner(
     // VS2-P1b: track consecutive FAILED code-exec calls per tool name. Resets
     // on any successful code-exec call. Mirrors empty_result_streak's pattern.
     let mut code_failure_streak: HashMap<String, usize> = HashMap::new();
+    let mut announced_needs_human: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // VS2-P1 FIX-6: reset the provenance repair-chain memory at turn start so a
     // new turn's first code run is not tagged repair_attempt pointing at last
     // turn's failure, and so an in-process subagent does not splice into the
@@ -5043,6 +5086,11 @@ pub(crate) async fn run_turn_inner(
                 }
             }
 
+            // ── h7b. What the agent cannot get itself ─────────────
+            // A licence or account wall reported by the tool becomes a task
+            // for the human — once per source per session, with the link.
+            announce_needs_human(&result_value, &mut announced_needs_human, emit);
+
             // ── h8. Large-result handling ─────────────────────────
             // A counted search collapses to its digest FIRST. h6 has already
             // persisted the full payload, so nothing is lost — and the twenty
@@ -5915,6 +5963,35 @@ mod tests {
         assert!(tool_evidence_requires_success("apply_patch"));
         assert!(!tool_evidence_requires_success("execute_bash"));
         assert!(!tool_evidence_requires_success("recall"));
+    }
+
+    /// A tool that hit a licence or account wall says so in `needs_human`;
+    /// the human hears about each source once per session, with the link.
+    #[test]
+    fn a_licence_wall_is_announced_once_per_source() {
+        let payload = serde_json::json!({
+            "eastern": [],
+            "needs_human": [
+                {"source": "cnki", "what": "an institutional CNKI licence",
+                 "url": "https://oversea.cnki.net/", "reason": "robots.txt disallows /"},
+                {"source": "wanfang", "what": "a Wanfang licence", "url": "https://www.wanfangdata.com.cn/"},
+                {"source": "broken", "what": "no url here"},
+                {"what": "no source here", "url": "https://x/"}
+            ]
+        });
+        let mut seen = std::collections::HashSet::new();
+        let mut events = Vec::new();
+        let n = announce_needs_human(&payload, &mut seen, &mut |e| events.push(e));
+        assert_eq!(n, 2, "items without a source or a url are not tasks");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::NeedsHuman { source, what, url, reason }
+                if source == "cnki" && what.contains("CNKI") && url.starts_with("https://") && reason.contains("robots")
+        )));
+        // The same wall on the next call is not announced again.
+        let again = announce_needs_human(&payload, &mut seen, &mut |e| events.push(e));
+        assert_eq!(again, 0);
+        assert_eq!(events.len(), 2);
     }
 
     /// The owner's rule for `rm -rf` and its kin: allow it, but only the

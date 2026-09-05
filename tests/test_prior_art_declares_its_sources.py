@@ -174,3 +174,19 @@ def test_the_eastern_branch_declares_its_sources(monkeypatch):
                         lambda **kw: seen.update(kw) or {"results": [], "count": 0, "source_status": {}})
     search._prior_art_search(query="x", source="eastern", queries={"zh": "高温合金"})
     assert seen["queries"] == {"zh": "高温合金"}
+
+
+def test_the_eastern_branch_surfaces_what_a_human_must_do(monkeypatch):
+    """A licence wall the collector reports must reach the tool result as
+    `needs_human` — that is what the agent loop announces to the human."""
+    import app.tools.search as search
+
+    task = {"source": "cnki", "what": "an institutional CNKI licence",
+            "url": "https://oversea.cnki.net/", "reason": "robots.txt disallows /; licence required"}
+    monkeypatch.setattr(search, "_eastern_search_impl", lambda **kw: {
+        "results": [], "count": 0, "source": "eastern_literature",
+        "source_status": {"cnki": "blocked: licence required. Not collected."},
+        "needs_human": [task],
+    })
+    out = search._prior_art_search(query="高温合金", source="eastern")
+    assert out["needs_human"] == [task]

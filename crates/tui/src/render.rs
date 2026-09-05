@@ -4486,6 +4486,16 @@ fn draw_gh_panel(f: &mut Frame, app: &App) {
 /// with an ellipsis rather than running into its description (live
 /// 2026-09-05: "Fetch a paper's full textJATS or PDF…" pushed the row past
 /// the frame).
+/// A palette title that carries live state: "Needs a human (2)" while two
+/// walls wait on a human. Everything else is the catalog title as written.
+fn palette_title(app: &App, c: &command::Command) -> String {
+    if c.id == "human.needs" && !app.blockers.is_empty() {
+        format!("{} ({})", c.title, app.blockers.len())
+    } else {
+        c.title.to_string()
+    }
+}
+
 pub(crate) fn palette_title_cell(title: &str) -> String {
     // 23 visible columns plus one of daylight: a 24-column title touched its
     // description ("Assertions to re-verifyBy verification status").
@@ -4684,7 +4694,7 @@ fn draw_command_palette(f: &mut Frame, app: &App) {
                         // The title column is 24 wide; a longer title is clipped
                         // rather than running into its description.
                         Span::styled(
-                            palette_title_cell(c.title),
+                            palette_title_cell(&palette_title(app, c)),
                             Style::default().fg(t.text).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(clip(c.description, desc_max), Style::default().fg(t.dim)),

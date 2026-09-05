@@ -107,7 +107,7 @@ class TestCollectorContract:
     def test_empty_query_returns_empty(self):
         c = EasternLiteratureCollector()
         assert c.collect(query="") == []
-        assert c.collect_with_status(query="") == {"results": [], "source_status": {}}
+        assert c.collect_with_status(query="") == {"results": [], "source_status": {}, "needs_human": []}
 
     def test_gated_source_names_the_blocker(self):
         """A licensed source must report WHY it is unavailable. An empty list
@@ -121,8 +121,23 @@ class TestCollectorContract:
         assert "subscription" in out["source_status"]["elibrary"]
 
     def test_every_gated_source_explains_itself(self):
-        for name, reason in GATED_SOURCES.items():
-            assert "Not collected" in reason, name
+        for name, entry in GATED_SOURCES.items():
+            assert "Not collected" in entry["reason"], name
+
+    def test_a_gated_source_says_what_a_human_must_do_and_where(self):
+        """The owner's rule: when the agent cannot get in, the human must be
+        told what to obtain and where — a link to the sign-up page — not just
+        that a door was shut."""
+        c = EasternLiteratureCollector()
+        out = c.collect_with_status(query="superalloy", sources=["cnki", "elibrary", "jstage"],
+                                    queries={"en": "superalloy"}, deadline_s=0.01)
+        tasks = {t["source"]: t for t in out["needs_human"]}
+        assert set(tasks) == {"cnki", "elibrary"}, "only the gated sources are human tasks"
+        for name, task in tasks.items():
+            assert task["url"].startswith("https://"), task
+            assert task["what"], task
+            assert task["reason"] == GATED_SOURCES[name]["reason"]
+        assert "oversea.cnki.net" in tasks["cnki"]["url"]
 
     def test_unknown_source_is_an_error_not_silence(self):
         c = EasternLiteratureCollector()

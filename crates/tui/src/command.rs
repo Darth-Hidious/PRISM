@@ -727,6 +727,14 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "human.needs",
+        title: "Needs a human",
+        description: "Accounts, licences or keys the agent cannot get itself — and where to get them",
+        category: "Session",
+        keybind: "",
+        suggested: false,
+    },
+    Command {
         id: "model.show",
         title: "Model",
         description: "Active model + how to switch",
@@ -1045,7 +1053,9 @@ pub fn effect(id: &str) -> String {
         "help.show" | "which_key.show" | "theme.list" | "gh.show" | "account.show"
         | "sessions.show" | "tools.show" | "status.show" | "home.show" | "config.show"
         | "apikey.show" | "search.keys" | "links.open" | "cost.show" | "model.show"
-        | "compute.gpus" | "nodes.show" | "mcp.show" | "settings.hub" => "opens a panel",
+        | "compute.gpus" | "nodes.show" | "mcp.show" | "settings.hub" | "human.needs" => {
+            "opens a panel"
+        }
         "node.stop" => "runs /node stop",
         "ontology.list" => "runs /ontology list",
         "ontology.proposals" => "runs /ontology proposals list",

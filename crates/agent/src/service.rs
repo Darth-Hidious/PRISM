@@ -738,6 +738,9 @@ impl ChatService {
                 let _ = events.send(ChatEvent::Answer { text });
             }
             AgentEvent::Activity { .. } => {}
+            // A child lane's licence wall is folded like its activity; the
+            // parent's own tool calls announce theirs.
+            AgentEvent::NeedsHuman { .. } => {}
             AgentEvent::TextFlush => {
                 if let Some(block) = assistant.flush() {
                     store.append_message("assistant", &block, "", "", None);

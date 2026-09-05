@@ -5994,6 +5994,17 @@ fn emit_agent_event(event: AgentEvent) {
                 serde_json::json!({ "id": id, "text": text, "done": done }),
             );
         }
+        AgentEvent::NeedsHuman {
+            source,
+            what,
+            url,
+            reason,
+        } => {
+            emit_notification(
+                "ui.needs_human",
+                serde_json::json!({ "source": source, "what": what, "url": url, "reason": reason }),
+            );
+        }
         AgentEvent::ContextPriming { iteration, status } => {
             emit_notification(
                 "ui.context.priming",

@@ -459,6 +459,9 @@ async fn execute_spawn_subagent_inner(
                 // Background-activity notices are the parent's to show; a
                 // subagent's are folded into its lane by the parent.
                 AgentEvent::Activity { .. } => {}
+                // A child lane's licence wall is folded like its activity; the
+                // parent's own tool calls announce theirs.
+                AgentEvent::NeedsHuman { .. } => {}
                 AgentEvent::TextDelta { text } => {
                     streamed_text.push_str(text);
                     return;

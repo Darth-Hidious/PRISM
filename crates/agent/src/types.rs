@@ -105,6 +105,15 @@ pub enum AgentEvent {
         text: String,
         done: bool,
     },
+    /// A tool hit a wall only a human can pass — a licence, an account, a
+    /// subscription. `what` a human must obtain, `url` where, `reason` why
+    /// the agent could not. Announced once per source per session.
+    NeedsHuman {
+        source: String,
+        what: String,
+        url: String,
+        reason: String,
+    },
     /// Truthful per-request report of whether influence-ranked context was
     /// actually injected, or which fallback handled the request instead.
     ContextPriming {

@@ -66,26 +66,38 @@ from app.tools.data_collectors.base_collector import DataCollector
 
 # Sources that exist but cannot be collected without credentials or a licence.
 # Reported verbatim so the owner sees the actual blocker and its price.
-GATED_SOURCES: Dict[str, str] = {
-    "elibrary": (
-        "eLIBRARY.RU (Russian Science Citation Index): robots.txt disallows "
-        "/querybox.asp and every *_items.asp listing — the search surface is "
-        "off limits to crawlers — and full text needs a paid institutional "
-        "subscription. Not collected. Licence is quoted per-organisation by "
-        "Научная электронная библиотека; no public price list."
-    ),
-    "cnki": (
-        "CNKI (中国知网): oversea.cnki.net/robots.txt read 'User-agent: * / "
-        "Disallow: /' when checked 2026-07-27 (the host intermittently returns "
-        "522 from outside CN), and www.cnki.net does not answer from here. "
-        "Access is an institutional licence sold per database module; no "
-        "public price list. Not collected."
-    ),
-    "wanfang": (
-        "Wanfang Data (万方数据): no reachable robots.txt and search sits "
-        "behind a login-gated SPA. Institutional licence required; no public "
-        "price list. Not collected."
-    ),
+GATED_SOURCES: Dict[str, Dict[str, str]] = {
+    "elibrary": {
+        "reason": (
+            "eLIBRARY.RU (Russian Science Citation Index): robots.txt disallows "
+            "/querybox.asp and every *_items.asp listing — the search surface is "
+            "off limits to crawlers — and full text needs a paid institutional "
+            "subscription. Not collected. Licence is quoted per-organisation by "
+            "Научная электронная библиотека; no public price list."
+        ),
+        "what": "an organisation subscription to eLIBRARY.RU (RSCI); quoted per organisation",
+        "url": "https://elibrary.ru/",
+    },
+    "cnki": {
+        "reason": (
+            "CNKI (中国知网): oversea.cnki.net/robots.txt read 'User-agent: * / "
+            "Disallow: /' when checked 2026-07-27 (the host intermittently returns "
+            "522 from outside CN), and www.cnki.net does not answer from here. "
+            "Access is an institutional licence sold per database module; no "
+            "public price list. Not collected."
+        ),
+        "what": "an institutional CNKI licence (sold per database module)",
+        "url": "https://oversea.cnki.net/",
+    },
+    "wanfang": {
+        "reason": (
+            "Wanfang Data (万方数据): no reachable robots.txt and search sits "
+            "behind a login-gated SPA. Institutional licence required; no public "
+            "price list. Not collected."
+        ),
+        "what": "an institutional Wanfang Data licence",
+        "url": "https://www.wanfangdata.com.cn/",
+    },
 }
 
 
@@ -205,9 +217,13 @@ class EasternLiteratureCollector(DataCollector):
         """Per-source outcomes alongside results, so a gated, skipped, late or
         failed source is named rather than showing up as a thinner list."""
         if not query:
-            return {"results": [], "source_status": {}}
+            return {"results": [], "source_status": {}, "needs_human": []}
         sources = list(sources or self.DEFAULT_SOURCES)
         langs = self._queries_by_language(query, queries)
+        # What the agent cannot obtain itself — a licence, an account — with
+        # the page where a human gets it. Announced to the human, not buried
+        # in a status string.
+        needs_human: List[Dict[str, str]] = []
         deadline = float(deadline_s or os.environ.get("PRISM_EASTERN_DEADLINE_S")
                          or self.DEFAULT_DEADLINE_S)
         handlers = {
@@ -220,7 +236,10 @@ class EasternLiteratureCollector(DataCollector):
         jobs: List[Tuple[str, object]] = []  # (status key, zero-arg callable), in order
         for src in sources:
             if src in GATED_SOURCES:
-                status[src] = f"blocked: {GATED_SOURCES[src]}"
+                gate = GATED_SOURCES[src]
+                status[src] = f"blocked: {gate['reason']}"
+                needs_human.append({"source": src, "what": gate["what"],
+                                    "url": gate["url"], "reason": gate["reason"]})
                 continue
             if src == "openalex":
                 for lang in self.OPENALEX_LANGUAGES:
@@ -285,7 +304,7 @@ class EasternLiteratureCollector(DataCollector):
             src = key.split(":", 1)[0]
             if hits and kept.get(src, 0) != len(hits) and not key.startswith("openalex:"):
                 status[key] += f"; {kept.get(src, 0)} kept after max_results trim"
-        return {"results": merged, "source_status": status}
+        return {"results": merged, "source_status": status, "needs_human": needs_human}
 
     @staticmethod
     def _interleave(per_source: List[List[Dict]], limit: int) -> List[Dict]:
