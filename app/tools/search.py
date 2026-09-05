@@ -370,7 +370,7 @@ def _prior_art_search(**kwargs) -> dict:
             out["sources"].extend(_declare_eastern_sources(out["eastern_source_status"]))
             # Licence / account walls, each with what a human must obtain and
             # where. The agent loop announces these to the human once per source.
-            out["needs_human"] = east.get("needs_human", [])
+            out.setdefault("needs_human", []).extend(east.get("needs_human", []))
         except Exception as exc:
             out["eastern_error"] = str(exc)
 
@@ -422,6 +422,18 @@ def _prior_art_search(**kwargs) -> dict:
                 # every one of them is a FAILED search, never an empty one.
                 # Surfaced per-source so literature results still flow.
                 out["patents_error"] = str(exc)
+                if "no patent backend is configured" in out["patents_error"]:
+                    # Not a bug and not the model's to fix: a token, an extract
+                    # or a login, obtained by a person. Surfaced like a licence
+                    # wall so the palette's "Needs a human" names it.
+                    out.setdefault("needs_human", []).append({
+                        "source": "patents",
+                        "what": "a patent search route: a Lens.org API token (LENS_API_TOKEN), a "
+                                "BigQuery extract in your own Google project (PRISM_PATENT_TABLE), "
+                                "or the hosted platform login",
+                        "url": "https://www.lens.org/lens/user/subscriptions",
+                        "reason": out["patents_error"],
+                    })
 
     stamp_evidence(out, EvidenceSource.LITERATURE_EXTRACTION)
     return out

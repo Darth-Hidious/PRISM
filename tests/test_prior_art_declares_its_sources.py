@@ -215,3 +215,21 @@ def test_a_source_that_says_how_many_it_has_is_declared_with_its_total():
     by = {r["source"]: r for r in east}
     assert by["openalex:zh"]["count"] == 20 and by["openalex:zh"]["total"] == 43
     assert by["jstage"]["count"] == 10 and "total" not in by["jstage"]
+
+
+def test_an_unconfigured_patent_backend_is_a_task_for_a_human(monkeypatch):
+    """The SX500 run listed "dedicated patent backend unconfigured" among its
+    failures and nobody was told what to obtain. Like a licence wall, this is
+    a human's task — a token, an extract, or a login — with where to get it."""
+    import app.tools.search as search
+
+    for k in ("PRISM_PATENT_BACKEND", "PRISM_PLATFORM_URL", "PRISM_PLATFORM_TOKEN",
+              "PRISM_PATENT_TABLE", "LENS_API_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    out = search._prior_art_search(query="oxidizer rich preburner alloy", source="patents", max_results=1)
+    assert "no patent backend is configured" in str(out.get("patents_error")), out.get("patents_error")
+    tasks = {t["source"]: t for t in out["needs_human"]}
+    assert "patents" in tasks, out["needs_human"]
+    assert tasks["patents"]["url"].startswith("https://"), tasks["patents"]
+    assert "Lens" in tasks["patents"]["what"], tasks["patents"]
+    assert "no patent backend" in tasks["patents"]["reason"]
