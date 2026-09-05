@@ -146,6 +146,7 @@ DONE `1d86412c`: own inference does not fail — empty stream → one plain requ
 DONE `68f85341`: balance refreshes itself after 2 idle min and says "stale" when a fetch failed; "Search sources & keys" opens on Semantic Scholar.
 DONE `b493e160`: `prism use fallback add|list|clear` (+ `/use fallback …`, palette "Add fallback model" form, "Fallback models", "Clear fallback models"); `use show` names the fallbacks.
 DONE `6d1fd1e6`: palette "Sign in with enterprise SSO" states `prism login --sso-domain` / `--sso-provider-id` (PRISM-side SAML exists; IdP/SAML connections are platform-side, outside this repo).
+DONE `98b815fa` `4ce38e3a`: form notes wrap under their column (or on indented lines when cramped); the form modal is as tall as its lines (the key-hint footer was being cut).
 NEXT: model window lists fallbacks; bash.py `.git`/`.prism` deletion refusal — owner's call; CONTEXT.md ≤20 lines at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
