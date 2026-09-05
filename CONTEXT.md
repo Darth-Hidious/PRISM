@@ -131,6 +131,7 @@ DONE `0c5e3ab3`: search digest carries "databases asked" + "branches" lines (mod
 DONE `49793a4e`: summary never carries the tool name (was 'recall: recall: 3 results'); sidebar tool rows carry the result's first line; search results + papers CLI declare evidence class/sources; recall inherits class; home shortcuts are shifted letters; table cells inline-parsed.
 DONE `c275c49e`: OSTI.GOV is the tenth literature source (page/rows paging; total only in a header → available None).
 DONE `f92aea48`: palette rows show what Enter does (was 'palette'); key window offers Semantic Scholar/Lens/patent-table keys + palette entry search.keys; find_tools declares tool catalog; recall labels tool-less records by action type; footer drops credits before the quit hint.
+DONE `bb3e6fdd`: Magnitude (local inference server, 127.0.0.1:10100/inference/v1) is a keyless loopback provider, swept like Ollama; key-window labels shortened. NOTE: /tmp/panel-target hit 55 GB and filled the disk (linker failed silently) — cleared incremental + stale deps; watch `df`.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
