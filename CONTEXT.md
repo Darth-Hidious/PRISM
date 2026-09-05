@@ -137,7 +137,9 @@ DONE `409d0849`: papers engine in the palette (search/sweep/full-text/corpus for
 DONE `18bb282f`: parity batch 3 — 13 palette entries (ontology list/bind/relations/validate/promote/proposals, provenance stats/failures, reverify list/run/history, matkg load, predict); five new CLI-backed roots; single-body ui.view renders as one tab (was empty for doctor/providers/billing/papers); palette title/hint cells clipped.
 DONE `2f5c97fa`: parity batch 4 — schedule list/create/cancel, discourse list/run, publish, report, plugins list (8 entries, 5 forms). All 47 CLI subcommands now have a palette or slash route except daemon-only ones (ipc-serve, backend, setup, tui).
 DONE: view panel wraps long lines (was cut at the edge).
-NEXT: live re-test on the installed build (papers view wrapped; provenance stats; schedule list); then CONTEXT.md trim to 20 lines at session end.
+DONE `4078e6b0`: panels wrap at spaces. DONE (tools): MACE tier accepts every fcc/bcc/hcp element (tables derived from ASE); LPBF map's evidence class follows property_sources (unsourced → RED, gaps named).
+DONE: disk — /tmp/panel-target debug wiped (46 GB) + brew/npm/uv caches; 52 GB free.
+NEXT: remaining research items — CALPHAD provisioning honesty (Ni-base TDB), read-to-store design note, source-language note; CONTEXT.md trim at session end.
   must move to its own strip above the prompt (test currently asserts the
   footer); whether the warm activity was visible this turn is unconfirmed.
   HARNESS: two false verdicts today — a regex test filter (substring!) and a
