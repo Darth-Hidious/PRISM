@@ -558,6 +558,14 @@ pub static CATALOG: &[Command] = &[
         suggested: false,
     },
     Command {
+        id: "account.sso",
+        title: "Sign in with enterprise SSO",
+        description: "SAML by email domain or connection id — the exact command",
+        category: "Account",
+        keybind: "prism login --sso-domain",
+        suggested: false,
+    },
+    Command {
         id: "sessions.show",
         title: "Sessions",
         description: "Resume a saved session",
@@ -993,6 +1001,7 @@ pub fn fuzzy_sorted(query: &str) -> Vec<&'static Command> {
 /// catalog so an entry without an effect fails the build's tests.
 pub fn effect(id: &str) -> String {
     let s = match id {
+        "account.sso" => "shows the command",
         "model.fallback.add" => "opens a form",
         "model.fallback.list" => "runs /use fallback list",
         "model.fallback.clear" => "runs /use fallback clear",

@@ -1042,6 +1042,15 @@ pub fn credits_refresh_due(
     !turn_in_progress && now.duration_since(last_fetch) >= CREDITS_IDLE_REFRESH
 }
 
+/// What the palette says for enterprise SSO. The SAML exchange runs in a
+/// browser between the organisation's identity provider and PRISM's — the TUI
+/// cannot host it, so it names the command that does.
+pub const SSO_SIGN_IN_NOTE: &str = "Enterprise SSO (SAML) is a terminal sign-in — the exchange runs between your \
+organisation's identity provider and PRISM's; PRISM never parses a SAML assertion.\n  \
+prism login --sso-domain <your-email-domain>\n  \
+prism login --sso-provider-id <connection id>   (several connections, or none registered for the domain)\n\
+Then restart the TUI. The token that comes back is the same one a passwordless login yields.";
+
 impl App {
     pub fn new(backend: BackendHandle) -> Self {
         let mut input = TextArea::default();
@@ -5465,6 +5474,7 @@ impl App {
             "links.open" => self.open_link_picker(),
             "cost.show" => self.modal = Some(Modal::Cost),
             "model.show" => self.open_model_picker(),
+            "account.sso" => self.push_system(SSO_SIGN_IN_NOTE),
             "model.fallback.add" => self.open_fallback_add_form(),
             "model.fallback.list" => {
                 let _ = self.backend.send_command("/use fallback list");
@@ -7770,6 +7780,20 @@ mod tests {
             fallback_add_command(&fallback_form("http://x/v1", "", "", "")).is_err(),
             "a model is required"
         );
+    }
+
+    #[test]
+    fn enterprise_sso_is_discoverable_from_the_palette() {
+        let mut app = fresh();
+        app.dispatch_command("account.sso");
+        let last = app
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(last.contains("--sso-domain"), "{last}");
+        assert!(last.contains("--sso-provider-id"), "{last}");
+        assert!(last.contains("never parses"), "{last}");
     }
 
     #[test]
