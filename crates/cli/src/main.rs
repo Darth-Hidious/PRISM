@@ -5023,6 +5023,9 @@ async fn main() -> Result<()> {
             use tokio::io::AsyncBufReadExt as _;
             // Drained on its own task: a full stderr pipe blocks the child,
             // and a blocked child never reaches `ui.turn.complete`.
+            // Elapsed seconds on every progress line: a run that never ends
+            // is only diagnosable if the lines say WHEN each lane acted.
+            let research_started = std::time::Instant::now();
             let stderr_task = tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(child_stderr).lines();
                 let mut kept = Vec::new();
@@ -5072,10 +5075,18 @@ async fn main() -> Result<()> {
                     // working sequentially.
                     Some("ui.tool.start") => {
                         if let Some(tool) = text_of("tool_name") {
+                            let t = research_started.elapsed().as_secs();
                             match text_of("agent") {
-                                Some(agent) => eprintln!("  [{agent}] {tool}"),
-                                None => eprintln!("  · {tool}"),
+                                Some(agent) => eprintln!("  [{t:>4}s] [{agent}] {tool}"),
+                                None => eprintln!("  [{t:>4}s] · {tool}"),
                             }
+                        }
+                    }
+                    Some("ui.activity") => {
+                        // The clock and other background facts, stamped like
+                        // the tool lines.
+                        if let Some(text) = text_of("text") {
+                            eprintln!("  [{:>4}s] ~ {text}", research_started.elapsed().as_secs());
                         }
                     }
                     // AN UNANSWERED PROMPT IS A DEADLOCK. The backend emits

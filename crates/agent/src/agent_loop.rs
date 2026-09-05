@@ -826,6 +826,30 @@ fn raw_for_card(content: &str, raw: &str) -> Option<String> {
     (content != raw).then(|| raw.to_string())
 }
 
+/// Rounds in which the model asked for tools after the deadline before the
+/// turn ends with whatever text it has written.
+const MAX_BUDGET_REFUSALS: usize = 2;
+
+const BUDGET_CUTOFF_NOTE: &str = "[Time budget spent and the model kept asking for tools; the \
+turn ends with what is written above. What was not searched is the open list.]";
+
+/// The tool result a call receives once the deadline has passed: a refusal,
+/// so the history stays well-formed (every call has its result) and the
+/// model is told, in the slot it is reading, to write the answer.
+fn budget_refusal_result(call_id: &str) -> ChatMessage {
+    ChatMessage {
+        role: "tool".to_string(),
+        content: Some(
+            "refused: the time budget is spent — no tool runs. Write the answer now from what \
+             has been found, with its citations, and list what was not searched as open items."
+                .to_string(),
+        ),
+        tool_calls: None,
+        tool_call_id: Some(call_id.to_string()),
+        reasoning_content: None,
+    }
+}
+
 /// Whether the turn's wall-clock deadline has passed.
 fn deadline_reached(deadline_epoch_ms: Option<u64>, now_epoch_ms: u64) -> bool {
     deadline_epoch_ms.is_some_and(|deadline| now_epoch_ms >= deadline)
@@ -3584,6 +3608,7 @@ pub(crate) async fn run_turn_inner(
     let iteration_cap = iteration_cap(config.max_iterations);
     let turn_started = Instant::now();
     let mut deadline_announced = false;
+    let mut budget_refusals = 0usize;
     for iteration in 0..iteration_cap {
         // ── h0. The clock ──────────────────────────────────────
         // A research turn that keeps finding tools to call never reaches the
@@ -4430,6 +4455,37 @@ pub(crate) async fn run_turn_inner(
                 return Ok(());
             }
         };
+
+        // ── 2g'. Past the deadline, no tool runs ──────────────────
+        // The offered list was empty, but a model can still emit a call for
+        // a tool it remembers, and the dispatcher would run it. Each call is
+        // answered with a refusal instead; after two such rounds the turn
+        // ends with the text written so far.
+        if budget_exhausted {
+            budget_refusals += 1;
+            for tool_call in &tool_calls {
+                history.push(budget_refusal_result(&tool_call.id));
+            }
+            if budget_refusals >= MAX_BUDGET_REFUSALS {
+                emit(AgentEvent::TextDelta {
+                    text: format!("\n\n{BUDGET_CUTOFF_NOTE}"),
+                });
+                emit(AgentEvent::TurnComplete {
+                    text: response.message.content.clone(),
+                    has_more: false,
+                    usage: response.usage.as_ref().map(|u| UsageInfo {
+                        input_tokens: u.prompt_tokens,
+                        output_tokens: u.completion_tokens,
+                        cache_creation_tokens: 0,
+                        cache_read_tokens: 0,
+                    }),
+                    total_usage: Some(total_usage),
+                    estimated_cost: Some(run_metrics.cost_usd),
+                });
+                return Ok(());
+            }
+            continue;
+        }
 
         // ── 2h. Process each tool call ────────────────────────────
         for tool_call in &tool_calls {
@@ -6020,6 +6076,28 @@ mod tests {
         assert!(tool_evidence_requires_success("apply_patch"));
         assert!(!tool_evidence_requires_success("execute_bash"));
         assert!(!tool_evidence_requires_success("recall"));
+    }
+
+    /// Measured 2026-09-05 (second run, budget 8 min): lanes kept calling
+    /// `recall` for five minutes past the clock. An empty offered list does
+    /// not stop a model that remembers a tool's name — the dispatcher runs
+    /// any catalog tool. Past the deadline a requested tool is REFUSED in a
+    /// well-formed tool result, and after two such rounds the turn ends.
+    #[test]
+    fn a_tool_call_past_the_deadline_is_refused_not_run() {
+        let refusal = budget_refusal_result("call-7");
+        assert_eq!(refusal.role, "tool");
+        assert_eq!(refusal.tool_call_id.as_deref(), Some("call-7"));
+        let text = refusal.content.clone().unwrap_or_default().to_lowercase();
+        assert!(text.starts_with("refused"), "{text}");
+        assert!(
+            text.contains("no tool runs") && text.contains("open items"),
+            "{text}"
+        );
+        assert_eq!(
+            MAX_BUDGET_REFUSALS, 2,
+            "two refused rounds, then the turn ends with its text"
+        );
     }
 
     /// Measured 2026-09-05: a depth-1 research run made 59 tool calls in 15
